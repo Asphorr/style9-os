@@ -57,7 +57,7 @@ static uint64_t		 pmap_leafs;		/* (p) live 4 KiB mappings */
 static struct spinlock	pmap_lock = SPINLOCK_INIT("pmap");
 
 static uint64_t	*table_va(uint64_t pte);
-static uint64_t	*ensure_table(uint64_t *parent, size_t idx);
+static uint64_t	*ensure_table(uint64_t *parent, size_t idx, bool user);
 static uint64_t	 leaf_flags(uint32_t prot);
 static bool	 pmap_kenter_locked(uint64_t va, uint64_t pa, uint32_t flags);
 
@@ -249,7 +249,7 @@ table_va(uint64_t pte)
  * mapping over a hugepage is a bug and would corrupt the boot map.
  */
 static uint64_t *
-ensure_table(uint64_t *parent, size_t idx)
+ensure_table(uint64_t *parent, size_t idx, bool user)
 {
 	uint64_t	 e, pa;
 	uint64_t	*tbl;
@@ -259,6 +259,18 @@ ensure_table(uint64_t *parent, size_t idx)
 	if (e & PTE_P) {
 		if (e & PTE_PS)
 			return (NULL);
+		/*
+		 * If a user leaf is going under an intermediate created
+		 * for kernel-only mappings, promote the US bit.  The
+		 * page-walk requires US along every level; an existing
+		 * US=0 intermediate would gate a user leaf below.  US=1
+		 * is harmless for kernel-only leaves -- the leaf US bit
+		 * is what gates ring-3 access at the page granularity.
+		 */
+		if (user && (e & PTE_US) == 0) {
+			parent[idx] |= PTE_US;
+			pmap_invlpg((uint64_t)(uintptr_t)parent);
+		}
 		return (table_va(e));
 	}
 
@@ -274,9 +286,10 @@ ensure_table(uint64_t *parent, size_t idx)
 	 * Intermediate entries are P + RW; the actual permission gate
 	 * lives at the leaf.  Letting RW propagate down means a writable
 	 * leaf is honoured; clearing RW here would shadow the leaf and
-	 * make every page read-only.
+	 * make every page read-only.  US is set on demand from the
+	 * caller's intent so ring-3 walks land on user leaves.
 	 */
-	parent[idx] = pa | PTE_P | PTE_RW;
+	parent[idx] = pa | PTE_P | PTE_RW | (user ? PTE_US : 0);
 	pmap_intermediates++;
 	return (tbl);
 }
@@ -291,6 +304,8 @@ leaf_flags(uint32_t prot)
 		f |= PTE_RW;
 	if (!(prot & VM_PROT_EXEC))
 		f |= PTE_NX;
+	if (prot & VM_PROT_USER)
+		f |= PTE_US;
 	if (prot & PMAP_NOCACHE)
 		f |= PTE_PCD | PTE_PWT;
 	if (prot & PMAP_GLOBAL)
@@ -304,19 +319,22 @@ pmap_kenter_locked(uint64_t va, uint64_t pa, uint32_t prot)
 {
 	uint64_t	*pdpt, *pd, *pt;
 	uint64_t	 old;
+	bool		 user;
 
 	KASSERT((va & PAGE_MASK) == 0, "pmap_kenter: unaligned VA");
 	KASSERT((pa & PAGE_MASK) == 0, "pmap_kenter: unaligned PA");
 
-	pdpt = ensure_table(pmap_kpml4, pml4_idx(va));
+	user = (prot & VM_PROT_USER) != 0;
+
+	pdpt = ensure_table(pmap_kpml4, pml4_idx(va), user);
 	if (pdpt == NULL)
 		return (false);
 
-	pd = ensure_table(pdpt, pdpt_idx(va));
+	pd = ensure_table(pdpt, pdpt_idx(va), user);
 	if (pd == NULL)
 		return (false);
 
-	pt = ensure_table(pd, pd_idx(va));
+	pt = ensure_table(pd, pd_idx(va), user);
 	if (pt == NULL)
 		return (false);
 

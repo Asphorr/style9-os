@@ -29,6 +29,7 @@
 #define	VM_PROT_READ		0x01	/* implicit on present mappings */
 #define	VM_PROT_WRITE		0x02
 #define	VM_PROT_EXEC		0x04
+#define	VM_PROT_USER		0x08	/* ring 3 may read the page     */
 
 #define	PMAP_NOCACHE		0x100	/* PCD/PWT for MMIO regions     */
 #define	PMAP_GLOBAL		0x200	/* set the G bit                */

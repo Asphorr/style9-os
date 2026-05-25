@@ -11,6 +11,9 @@ Built from scratch — no upstream tree, no glue from another OS.
 | layer | files | what |
 |---|---|---|
 | boot | `arch/amd64/boot.S`, `linker.ld` | MB2 header + PVH ELF note, 32→64 mode transition, identity-map low 1 GiB with 2 MiB huge pages |
+| gdt | `arch/amd64/gdt.c` | 8-entry GDT laid out for `SYSCALL`/`SYSRET` MSR arithmetic; 104-byte TSS with `rsp0` for the ring-3 → ring-0 stack switch on IRQs/exceptions |
+| syscall | `arch/amd64/syscall_entry.S`, `kern/syscall.c` | `SYSCALL` entry stub: stashes user RSP, switches to per-thread kernel stack via `syscall_kernel_rsp`, builds `struct syscall_frame`, calls the C dispatcher, `SYSRETQ` back; MSRs (EFER.SCE / STAR / LSTAR / FMASK) wired in `syscall_init` |
+| usermode | `arch/amd64/usermode.c`, `user_blob.S` | first ring-3 program: launcher thread maps a user code page + user stack page (`VM_PROT_USER`), copies an inline blob, `iretq`s to it.  The blob does `SYS_PRINT("hello ring 3\n")` then `SYS_EXIT` |
 | traps | `arch/amd64/idt.c`, `intr.c`, `isr.S` | 48-vector IDT, trap-frame dispatcher, autopsy print on exception |
 | irqs | `arch/amd64/pic.c`, `pit.c` | 8259 remap to 0x20/0x28, PIT @ 100 Hz with quantum tracking |
 | clock | `kern/tsc.c`, `clock.c` | rdtsc + PIT-anchored calibration, `uptime_ms`, busy-sleep |
@@ -165,11 +168,16 @@ Loosely Mach-shape rather than BSD-shape:
   (kernel ↔ worker-task) IPC — it's just two different `port_space`
   arguments.
 
-Deferred for now: out-of-line memory descriptors, real SMP,
-user/kernel mode split (next on the roadmap: ring-3 task, `syscall`/
-`sysret` plumbing, copy-in/out for `mach_msg`, ELF64 loader).  Each
-will land when a stress test or a userspace target surfaces a need
-for it.
+User-kernel split is in: a ring-3 task with SYSCALL/SYSRET is wired,
+the first user-mode program is an inline blob in the kernel image
+that prints via SYS_PRINT and exits via SYS_EXIT.
+
+Next on the roadmap: ELF64 loader so user-mode programs build
+separately and ship as `.elf` files; per-task PML4 for real
+isolation; copy-in/out + SMAP so syscalls can validate user
+pointers; `mach_msg` over the syscall boundary so userspace
+participates in the IPC story.  Deferred indefinitely: out-of-line
+memory descriptors, real SMP.
 
 ## License
 

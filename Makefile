@@ -61,6 +61,10 @@ OBJS	= \
 	$(OBJDIR)/intr.o	\
 	$(OBJDIR)/pit.o		\
 	$(OBJDIR)/pmap.o	\
+	$(OBJDIR)/syscall_entry.o \
+	$(OBJDIR)/syscall.o	\
+	$(OBJDIR)/usermode.o	\
+	$(OBJDIR)/user_blob.o	\
 	$(OBJDIR)/switch.o	\
 	$(OBJDIR)/kmain.o	\
 	$(OBJDIR)/kprintf.o	\

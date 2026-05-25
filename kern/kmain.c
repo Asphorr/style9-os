@@ -24,11 +24,13 @@
 #include "sched.h"
 #include "shell.h"
 #include "stress.h"
+#include "syscall.h"
 #include "task.h"
 #include "thread.h"
 #include "tty.h"
 #include "uart.h"
 #include "uart_drv.h"
+#include "usermode.h"
 
 #define	MULTIBOOT2_BOOTLOADER_MAGIC	0x36D76289U
 #define	MULTIBOOT1_BOOTLOADER_MAGIC	0x2BADB002U
@@ -88,6 +90,9 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 
 	kbd_drv_init();
 	uart_drv_init();
+
+	syscall_init();
+	usermode_run_first_blob();
 
 	shell_run();
 	/* NOTREACHED */
