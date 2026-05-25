@@ -20,8 +20,9 @@ Built from scratch — no upstream tree, no glue from another OS.
 | kmem | `kern/kmem.c` | power-of-two bucketed allocator, header-magic redzones |
 | ddb | `kern/ddb.c`, `panic.c`, `kprintf.c` | KASSERT, RBP-chain backtrace, in-kernel debugger |
 | spinlock | `kern/spinlock.c` | holder tracking, preempt-counter integration |
-| ports | `kern/port.c` | Mach `mach_msg_header_t` wire format, SEND / RECEIVE / SEND_ONCE rights, port descriptors carrying capabilities across spaces |
+| ports | `kern/port.c` | Mach `mach_msg_header_t` wire format, SEND / RECEIVE / SEND_ONCE rights, port descriptors carrying capabilities across spaces, blocking send on full queue |
 | port sets | `kern/port.c` | `port_set_allocate / insert / remove`, recv-on-many |
+| notif | `kern/port.c` | `MOVE_RECEIVE` rebinding, no-senders detection wakes recv with `MACH_E_DEAD` |
 | tasks | `kern/task.c` | resource container, owns one `port_space` |
 | threads | `kern/thread.c`, `arch/amd64/switch.S` | callee-saved context switch, kstack-backed |
 | sched | `kern/sched.c` | cooperative + preemptive round-robin, idle thread reaps zombies |
@@ -62,7 +63,7 @@ wrapper for QEMU launching is in `tools/runlog.ps1`.
 
 ## Stress tests
 
-The kernel runs a 9-test stress pass at boot, end-to-end exercising
+The kernel runs a 12-test stress pass at boot, end-to-end exercising
 every subsystem and checking conservation invariants:
 
 ```
@@ -83,25 +84,32 @@ stress portset 4x100    one port set, 4 member ports, 1 server thread
                         on the set; per-source attribution check
 stress intertask 200    two tasks (kernel + worker), each with its own
                         port_space, RPC via cross-space port descriptors
+stress moverecv 200     MOVE_RECEIVE in a descriptor: the receive right
+                        rebinds onto a new name, the old name keeps SEND
+stress nosenders 100    last sender drops while a receiver is parked in
+                        mach_msg_recv_block; receiver wakes with E_DEAD
+stress sendblock 2000   producer thread races to send into a 1024-slot
+                        queue while the consumer drains one at a time;
+                        producer blocks on full and resumes when freed
 ```
 
 Sample boot output:
 
 ```
-[5/9] stress thread 200
-stress_thread: 200 rounds (RPC over blocking recv)
-stress_thread: 3570 us, 402 context switches, 0 PIT ticks
-stress_thread: ports 0 -> 0, pmm 332 -> 332, cached 43 -> 43
-stress_thread: conserved 289 -> 289
-stress_thread: PASS
+[10/12] stress moverecv 200
+stress_moverecv: 200 rounds (transfer RECV right in flight)
+stress_moverecv: names 0 -> 0, conserved 293 -> 293
+stress_moverecv: PASS
 
-[6/9] stress preempt 4 workers, 1 s
-stress_preempt: 994378 us elapsed, ctx switches 20, preempts 20
-  worker  0 counter 51248085
-  worker  1 counter 46089340
-  worker  2 counter 49939747
-  worker  3 counter 51000083
-stress_preempt: PASS
+[11/12] stress nosenders 100
+stress_nosenders: 100 rounds (last sender drops, recv must wake with DEAD)
+stress_nosenders: names 0 -> 0, conserved 293 -> 293
+stress_nosenders: PASS
+
+[12/12] stress sendblock 2000
+stress_sendblock: 2000 rounds (producer blocks on full queue, slow consumer)
+stress_sendblock: names 0 -> 0, conserved 293 -> 293
+stress_sendblock: PASS
 ```
 
 ## Shell
@@ -146,9 +154,11 @@ Loosely Mach-shape rather than BSD-shape:
   (kernel ↔ worker-task) IPC — it's just two different `port_space`
   arguments.
 
-Deferred for now: send-once-notifications, `MOVE_RECEIVE`, out-of-line
-memory descriptors, real SMP, user/kernel mode split.  Each will land
-when a stress test surfaces a need for it.
+Deferred for now: out-of-line memory descriptors, real SMP,
+user/kernel mode split (next on the roadmap: ring-3 task, `syscall`/
+`sysret` plumbing, copy-in/out for `mach_msg`, ELF64 loader).  Each
+will land when a stress test or a userspace target surfaces a need
+for it.
 
 ## License
 

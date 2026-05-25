@@ -71,7 +71,7 @@ typedef uint32_t	mach_port_name_t;
  * Dispositions (what the kernel does with the right named in the slot).
  * Numbers match real Mach so the wire format is forward-compatible.
  */
-#define	MACH_MSG_TYPE_MOVE_RECEIVE	16	/* not yet supported          */
+#define	MACH_MSG_TYPE_MOVE_RECEIVE	16	/* sender transfers RECV      */
 #define	MACH_MSG_TYPE_MOVE_SEND		17	/* sender transfers SEND      */
 #define	MACH_MSG_TYPE_MOVE_SEND_ONCE	18	/* sender transfers SEND_ONCE */
 #define	MACH_MSG_TYPE_COPY_SEND		19	/* sender keeps SEND          */
@@ -174,6 +174,17 @@ int			 port_set_insert(struct port_space *,
 int			 port_set_remove(struct port_space *,
 			    mach_port_name_t set_name,
 			    mach_port_name_t port_name);
+
+/*
+ * Drop ONE specific right kind from a name without taking down the
+ * other rights held under the same name (and without destroying the
+ * port).  Returns MACH_E_NAME if `name` does not currently carry
+ * `right`.  Used by stress tests that need to model "last sender went
+ * away while receiver is still parked" without spawning extra spaces
+ * just to split rights across them.
+ */
+int			 port_mod_refs(struct port_space *,
+			    mach_port_name_t name, uint8_t right);
 
 /*
  * Bootstrap helper for inter-task IPC.

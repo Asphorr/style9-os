@@ -1797,3 +1797,538 @@ out:
 	kprintf("stress_intertask: PASS\n");
 	return (0);
 }
+
+/* ----------------------------------------------------------------------- *
+ *  stress_moverecv
+ *
+ *  Exercises MACH_MSG_TYPE_MOVE_RECEIVE: a port's receive right is
+ *  transferred through a message to a new name, and the original name
+ *  retains its surviving SEND right.
+ *
+ *  Single-space variant -- no worker task -- because the mechanism is
+ *  about the kernel correctly re-binding the RECV right between two
+ *  entries in the same name table, and we want a fast tight loop that
+ *  isolates that one operation.
+ *
+ *  Per round:
+ *    1. allocate pp = port_allocate(RECV | SEND).  pp owns RECV and SEND
+ *       in kernel_space.
+ *    2. send one tagged message to pp via the SEND right; it queues
+ *       on the port object.
+ *    3. send a complex message via `transport` carrying a port
+ *       descriptor { name = pp, disposition = MOVE_RECEIVE }.
+ *    4. recv from transport -> the descriptor in the received message
+ *       carries a fresh name new_name with RECV in kernel_space.
+ *    5. recv on pp must fail with MACH_E_RIGHT (RECV has moved off it).
+ *    6. recv on new_name must yield the tagged message queued in (2).
+ *    7. send to pp via surviving SEND, recv on new_name, confirm.
+ *    8. deallocate everything.
+ *
+ *  Sanity invariants: name-table baseline restored and kmem/pmm
+ *  conservation holds, just like the other stress tests.
+ * ----------------------------------------------------------------------- */
+struct stress_moverecv_msg {
+	struct mach_msg_header		hdr;
+	struct mach_msg_body		body;
+	struct mach_msg_port_descriptor	desc;
+};
+
+#define	STRESS_MOVERECV_TAG1	0xABCDABCDu
+#define	STRESS_MOVERECV_TAG2	0xFEEDFEEDu
+
+int
+stress_moverecv(unsigned int rounds)
+{
+	struct mach_msg_header		probe;
+	struct stress_moverecv_msg	rx, tx;
+	size_t				cached0, cached1, cons0, cons1;
+	size_t				inuse0, inuse1, pmm0, pmm1;
+	mach_port_name_t		new_name, pp, transport;
+	unsigned int			i;
+	int				rv;
+
+	if (rounds == 0)
+		rounds = 1;
+	if (rounds > 100000u)
+		rounds = 100000u;
+
+	kprintf("stress_moverecv: %u rounds (transfer RECV right in flight)\n",
+	    rounds);
+
+	inuse0  = port_space_inuse(kernel_space);
+	cached0 = kmem_cached_pages();
+	pmm0    = pmm_used_pages();
+	cons0   = pmm0 - cached0;
+
+	transport = port_allocate(kernel_space,
+	    MACH_PORT_RIGHT_RECEIVE | MACH_PORT_RIGHT_SEND);
+	if (transport == MACH_PORT_NULL) {
+		kprintf("stress_moverecv: transport allocate failed\n");
+		return (1);
+	}
+
+	for (i = 0; i < rounds; i++) {
+		pp = port_allocate(kernel_space,
+		    MACH_PORT_RIGHT_RECEIVE | MACH_PORT_RIGHT_SEND);
+		if (pp == MACH_PORT_NULL) {
+			kprintf("stress_moverecv: pp allocate fail @ %u\n", i);
+			rv = 2;
+			goto out;
+		}
+
+		/* (2) Queue a tagged message on pp via SEND. */
+		probe.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+		probe.msgh_size    = sizeof(probe);
+		probe.msgh_remote  = pp;
+		probe.msgh_local   = MACH_PORT_NULL;
+		probe.msgh_voucher = 0;
+		probe.msgh_id      = STRESS_MOVERECV_TAG1;
+		rv = mach_msg_send(kernel_space, &probe);
+		if (rv != MACH_MSG_OK) {
+			kprintf("stress_moverecv: tag1 send: %s\n",
+			    mach_msg_strerror(rv));
+			goto out;
+		}
+
+		/* (3) Transfer RECV via descriptor in a transport message. */
+		tx.hdr.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0)
+		    | MACH_MSGH_BITS_COMPLEX;
+		tx.hdr.msgh_size    = sizeof(tx);
+		tx.hdr.msgh_remote  = transport;
+		tx.hdr.msgh_local   = MACH_PORT_NULL;
+		tx.hdr.msgh_voucher = 0;
+		tx.hdr.msgh_id      = i;
+		tx.body.msgh_descriptor_count = 1;
+		tx.desc.name        = pp;
+		tx.desc.pad1        = 0;
+		tx.desc.disposition = MACH_MSG_TYPE_MOVE_RECEIVE;
+		tx.desc.type        = MACH_MSG_PORT_DESCRIPTOR;
+		tx.desc.pad2        = 0;
+		rv = mach_msg_send(kernel_space, &tx.hdr);
+		if (rv != MACH_MSG_OK) {
+			kprintf("stress_moverecv: MOVE_RECEIVE send: %s\n",
+			    mach_msg_strerror(rv));
+			goto out;
+		}
+
+		/* (4) Recv on transport, harvest new_name from descriptor. */
+		rv = mach_msg_recv(kernel_space, transport, &rx.hdr,
+		    sizeof(rx));
+		if (rv != MACH_MSG_OK) {
+			kprintf("stress_moverecv: transport recv: %s\n",
+			    mach_msg_strerror(rv));
+			goto out;
+		}
+		new_name = rx.desc.name;
+		if (new_name == MACH_PORT_NULL || new_name == pp) {
+			kprintf("stress_moverecv: bad new_name=%u (pp=%u)\n",
+			    new_name, pp);
+			rv = 3;
+			goto out;
+		}
+
+		/* (5) Old name must no longer carry RECV. */
+		rv = mach_msg_recv(kernel_space, pp, &probe, sizeof(probe));
+		if (rv != MACH_E_RIGHT) {
+			kprintf("stress_moverecv: pp still recv-able rv=%s\n",
+			    mach_msg_strerror(rv));
+			rv = 4;
+			goto out;
+		}
+
+		/* (6) Pre-queued message must arrive via new_name. */
+		rv = mach_msg_recv(kernel_space, new_name, &probe,
+		    sizeof(probe));
+		if (rv != MACH_MSG_OK ||
+		    probe.msgh_id != STRESS_MOVERECV_TAG1) {
+			kprintf("stress_moverecv: tag1 deliver fail "
+			    "(rv=%s id=0x%x)\n",
+			    mach_msg_strerror(rv), probe.msgh_id);
+			rv = 5;
+			goto out;
+		}
+
+		/* (7) Surviving SEND on pp still routes to the port. */
+		probe.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+		probe.msgh_size    = sizeof(probe);
+		probe.msgh_remote  = pp;
+		probe.msgh_local   = MACH_PORT_NULL;
+		probe.msgh_voucher = 0;
+		probe.msgh_id      = STRESS_MOVERECV_TAG2;
+		rv = mach_msg_send(kernel_space, &probe);
+		if (rv != MACH_MSG_OK) {
+			kprintf("stress_moverecv: tag2 send: %s\n",
+			    mach_msg_strerror(rv));
+			goto out;
+		}
+		rv = mach_msg_recv(kernel_space, new_name, &probe,
+		    sizeof(probe));
+		if (rv != MACH_MSG_OK ||
+		    probe.msgh_id != STRESS_MOVERECV_TAG2) {
+			kprintf("stress_moverecv: tag2 deliver fail "
+			    "(rv=%s id=0x%x)\n",
+			    mach_msg_strerror(rv), probe.msgh_id);
+			rv = 6;
+			goto out;
+		}
+
+		/* (8) Tear down this round's names. */
+		port_deallocate(kernel_space, pp);
+		port_deallocate(kernel_space, new_name);
+	}
+
+	rv = MACH_MSG_OK;
+
+out:
+	port_deallocate(kernel_space, transport);
+
+	inuse1  = port_space_inuse(kernel_space);
+	cached1 = kmem_cached_pages();
+	pmm1    = pmm_used_pages();
+	cons1   = pmm1 - cached1;
+
+	kprintf("stress_moverecv: names %zu -> %zu, conserved %zu -> %zu\n",
+	    inuse0, inuse1, cons0, cons1);
+
+	if (rv != MACH_MSG_OK) {
+		kprintf("stress_moverecv: FAIL rv=%d\n", rv);
+		return (rv);
+	}
+	if (inuse1 != inuse0) {
+		kprintf("stress_moverecv: FAIL name leak (delta=%lld)\n",
+		    (long long)((long long)inuse1 - (long long)inuse0));
+		return (70);
+	}
+	if (cons1 != cons0) {
+		kprintf("stress_moverecv: FAIL conservation broken "
+		    "(delta=%lld)\n",
+		    (long long)((long long)cons1 - (long long)cons0));
+		return (71);
+	}
+
+	kprintf("stress_moverecv: PASS\n");
+	return (0);
+}
+
+/* ----------------------------------------------------------------------- *
+ *  stress_nosenders
+ *
+ *  Verifies that when the last SEND right to a port disappears while a
+ *  thread is parked in mach_msg_recv_block on that port, the kernel
+ *  wakes the receiver with MACH_E_DEAD instead of leaving it stranded.
+ *
+ *  Per round:
+ *    1. allocate port with RECV | SEND.  One name, two rights.
+ *    2. spawn a worker thread that calls mach_msg_recv_block and
+ *       stashes the return code in a shared context.
+ *    3. yield a couple times so the worker reaches the parked state.
+ *    4. port_mod_refs(name, SEND) -- drops only the SEND right.  This
+ *       transitions the port to (send_count=0, send_once_count=0,
+ *       p_has_receive=true, queue empty, recv waiter present), which
+ *       is the no-senders trigger.
+ *    5. yield until the worker has exited (zombie); reap.
+ *    6. confirm the worker's recorded rv is MACH_E_DEAD.
+ *    7. deallocate the surviving RECV name.
+ * ----------------------------------------------------------------------- */
+struct stress_nosenders_ctx {
+	mach_port_name_t	snc_name;
+	volatile int		snc_done;	/* 0 until worker writes rv */
+	int			snc_rv;
+};
+
+static void
+stress_nosenders_worker(void *arg)
+{
+	struct stress_nosenders_ctx	*ctx = arg;
+	struct mach_msg_header		recv;
+	int				rv;
+
+	rv = mach_msg_recv_block(kernel_space, ctx->snc_name, &recv,
+	    sizeof(recv));
+	ctx->snc_rv = rv;
+	__atomic_store_n(&ctx->snc_done, 1, __ATOMIC_RELEASE);
+}
+
+int
+stress_nosenders(unsigned int rounds)
+{
+	struct stress_nosenders_ctx	 ctx;
+	struct thread			*worker;
+	size_t				 cached0, cached1, cons0, cons1;
+	size_t				 inuse0, inuse1, pmm0, pmm1;
+	mach_port_name_t		 name;
+	unsigned int			 i, spin;
+	int				 rv;
+
+	if (rounds == 0)
+		rounds = 1;
+	if (rounds > 1000u)
+		rounds = 1000u;
+
+	kprintf("stress_nosenders: %u rounds (last sender drops, recv "
+	    "must wake with DEAD)\n", rounds);
+
+	inuse0  = port_space_inuse(kernel_space);
+	cached0 = kmem_cached_pages();
+	pmm0    = pmm_used_pages();
+	cons0   = pmm0 - cached0;
+
+	for (i = 0; i < rounds; i++) {
+		name = port_allocate(kernel_space,
+		    MACH_PORT_RIGHT_RECEIVE | MACH_PORT_RIGHT_SEND);
+		if (name == MACH_PORT_NULL) {
+			kprintf("stress_nosenders: allocate fail @ %u\n", i);
+			rv = 1;
+			goto out;
+		}
+
+		ctx.snc_name = name;
+		ctx.snc_rv   = 0;
+		__atomic_store_n(&ctx.snc_done, 0, __ATOMIC_RELEASE);
+
+		worker = thread_create(kernel_task, stress_nosenders_worker,
+		    &ctx, "nosenders-w");
+		if (worker == NULL) {
+			kprintf("stress_nosenders: thread_create fail\n");
+			rv = 2;
+			goto out;
+		}
+		thread_start(worker);
+
+		/* Let the worker reach the parked state. */
+		for (spin = 0; spin < 4; spin++)
+			thread_yield();
+
+		/* Drop SEND only -> trigger no-senders detection. */
+		rv = port_mod_refs(kernel_space, name,
+		    MACH_PORT_RIGHT_SEND);
+		if (rv != MACH_MSG_OK) {
+			kprintf("stress_nosenders: mod_refs fail: %s\n",
+			    mach_msg_strerror(rv));
+			goto out;
+		}
+
+		/* Wait for worker to exit. */
+		for (spin = 0; spin < 256; spin++) {
+			if (__atomic_load_n(&ctx.snc_done,
+			    __ATOMIC_ACQUIRE) != 0)
+				break;
+			thread_yield();
+		}
+		if (__atomic_load_n(&ctx.snc_done, __ATOMIC_ACQUIRE) == 0) {
+			kprintf("stress_nosenders: worker never woke @ %u\n",
+			    i);
+			rv = 3;
+			goto out;
+		}
+
+		if (ctx.snc_rv != MACH_E_DEAD) {
+			kprintf("stress_nosenders: worker rv=%s, "
+			    "expected MACH_E_DEAD\n",
+			    mach_msg_strerror(ctx.snc_rv));
+			rv = 4;
+			goto out;
+		}
+
+		sched_reap_zombies();
+		port_deallocate(kernel_space, name);
+	}
+
+	rv = MACH_MSG_OK;
+
+out:
+	sched_reap_zombies();
+
+	inuse1  = port_space_inuse(kernel_space);
+	cached1 = kmem_cached_pages();
+	pmm1    = pmm_used_pages();
+	cons1   = pmm1 - cached1;
+
+	kprintf("stress_nosenders: names %zu -> %zu, conserved %zu -> %zu\n",
+	    inuse0, inuse1, cons0, cons1);
+
+	if (rv != MACH_MSG_OK) {
+		kprintf("stress_nosenders: FAIL rv=%d\n", rv);
+		return (rv);
+	}
+	if (inuse1 != inuse0) {
+		kprintf("stress_nosenders: FAIL name leak (delta=%lld)\n",
+		    (long long)((long long)inuse1 - (long long)inuse0));
+		return (80);
+	}
+	if (cons1 != cons0) {
+		kprintf("stress_nosenders: FAIL conservation broken "
+		    "(delta=%lld)\n",
+		    (long long)((long long)cons1 - (long long)cons0));
+		return (81);
+	}
+
+	kprintf("stress_nosenders: PASS\n");
+	return (0);
+}
+
+/* ----------------------------------------------------------------------- *
+ *  stress_sendblock
+ *
+ *  Producer thread sends `rounds` messages as fast as it can; the main
+ *  thread is the slow consumer, recv'ing one message per pass.  With
+ *  rounds > port qmax (currently 1024) the producer must block on a
+ *  full queue and resume each time the consumer takes a slot.
+ *
+ *  Net check: every sent message is delivered in order, the producer
+ *  exits cleanly, and the name table + memory budgets return to
+ *  baseline.
+ * ----------------------------------------------------------------------- */
+struct stress_sendblock_ctx {
+	mach_port_name_t	ssb_name;
+	unsigned int		ssb_rounds;
+	volatile int		ssb_done;
+	unsigned int		ssb_sent;
+	int			ssb_send_rv;
+};
+
+static void
+stress_sendblock_producer(void *arg)
+{
+	struct stress_sendblock_ctx	*ctx = arg;
+	struct mach_msg_header		 hdr;
+	unsigned int			 i;
+	int				 rv;
+
+	for (i = 0; i < ctx->ssb_rounds; i++) {
+		hdr.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+		hdr.msgh_size    = sizeof(hdr);
+		hdr.msgh_remote  = ctx->ssb_name;
+		hdr.msgh_local   = MACH_PORT_NULL;
+		hdr.msgh_voucher = 0;
+		hdr.msgh_id      = i;
+		rv = mach_msg_send(kernel_space, &hdr);
+		if (rv != MACH_MSG_OK) {
+			ctx->ssb_send_rv = rv;
+			break;
+		}
+	}
+	ctx->ssb_sent = i;
+	__atomic_store_n(&ctx->ssb_done, 1, __ATOMIC_RELEASE);
+}
+
+int
+stress_sendblock(unsigned int rounds)
+{
+	struct mach_msg_header		 hdr;
+	struct stress_sendblock_ctx	 ctx;
+	struct thread			*producer;
+	size_t				 cached0, cached1, cons0, cons1;
+	size_t				 inuse0, inuse1, pmm0, pmm1;
+	mach_port_name_t		 name;
+	unsigned int			 i, spin;
+	int				 rv;
+
+	if (rounds == 0)
+		rounds = 1;
+	if (rounds > 100000u)
+		rounds = 100000u;
+
+	kprintf("stress_sendblock: %u rounds (producer blocks on full "
+	    "queue, slow consumer)\n", rounds);
+
+	inuse0  = port_space_inuse(kernel_space);
+	cached0 = kmem_cached_pages();
+	pmm0    = pmm_used_pages();
+	cons0   = pmm0 - cached0;
+
+	name = port_allocate(kernel_space,
+	    MACH_PORT_RIGHT_RECEIVE | MACH_PORT_RIGHT_SEND);
+	if (name == MACH_PORT_NULL) {
+		kprintf("stress_sendblock: allocate fail\n");
+		return (1);
+	}
+
+	ctx.ssb_name     = name;
+	ctx.ssb_rounds   = rounds;
+	__atomic_store_n(&ctx.ssb_done, 0, __ATOMIC_RELEASE);
+	ctx.ssb_sent     = 0;
+	ctx.ssb_send_rv  = MACH_MSG_OK;
+
+	producer = thread_create(kernel_task, stress_sendblock_producer,
+	    &ctx, "sendblock-p");
+	if (producer == NULL) {
+		kprintf("stress_sendblock: thread_create fail\n");
+		rv = 2;
+		goto out;
+	}
+	thread_start(producer);
+
+	for (i = 0; i < rounds; i++) {
+		rv = mach_msg_recv_block(kernel_space, name, &hdr,
+		    sizeof(hdr));
+		if (rv != MACH_MSG_OK) {
+			kprintf("stress_sendblock: recv #%u: %s\n", i,
+			    mach_msg_strerror(rv));
+			goto out;
+		}
+		if (hdr.msgh_id != i) {
+			kprintf("stress_sendblock: order broken at #%u "
+			    "(got id=0x%x)\n", i, hdr.msgh_id);
+			rv = 3;
+			goto out;
+		}
+	}
+
+	for (spin = 0; spin < 256; spin++) {
+		if (__atomic_load_n(&ctx.ssb_done, __ATOMIC_ACQUIRE) != 0)
+			break;
+		thread_yield();
+	}
+	if (__atomic_load_n(&ctx.ssb_done, __ATOMIC_ACQUIRE) == 0) {
+		kprintf("stress_sendblock: producer never exited\n");
+		rv = 4;
+		goto out;
+	}
+
+	if (ctx.ssb_send_rv != MACH_MSG_OK) {
+		kprintf("stress_sendblock: producer send rv=%s\n",
+		    mach_msg_strerror(ctx.ssb_send_rv));
+		rv = ctx.ssb_send_rv;
+		goto out;
+	}
+	if (ctx.ssb_sent != rounds) {
+		kprintf("stress_sendblock: producer sent %u of %u\n",
+		    ctx.ssb_sent, rounds);
+		rv = 5;
+		goto out;
+	}
+
+	rv = MACH_MSG_OK;
+
+out:
+	sched_reap_zombies();
+	port_deallocate(kernel_space, name);
+
+	inuse1  = port_space_inuse(kernel_space);
+	cached1 = kmem_cached_pages();
+	pmm1    = pmm_used_pages();
+	cons1   = pmm1 - cached1;
+
+	kprintf("stress_sendblock: names %zu -> %zu, conserved %zu -> %zu\n",
+	    inuse0, inuse1, cons0, cons1);
+
+	if (rv != MACH_MSG_OK) {
+		kprintf("stress_sendblock: FAIL rv=%d\n", rv);
+		return (rv);
+	}
+	if (inuse1 != inuse0) {
+		kprintf("stress_sendblock: FAIL name leak (delta=%lld)\n",
+		    (long long)((long long)inuse1 - (long long)inuse0));
+		return (90);
+	}
+	if (cons1 != cons0) {
+		kprintf("stress_sendblock: FAIL conservation broken "
+		    "(delta=%lld)\n",
+		    (long long)((long long)cons1 - (long long)cons0));
+		return (91);
+	}
+
+	kprintf("stress_sendblock: PASS\n");
+	return (0);
+}

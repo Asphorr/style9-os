@@ -41,6 +41,8 @@ struct port {
 	struct port_msg	*p_qtail;		/* (p) FIFO tail             */
 	struct thread	*p_waiters_head;	/* (p) threads in recv_block */
 	struct thread	*p_waiters_tail;	/* (p)                       */
+	struct thread	*p_send_waiters_head;	/* (p) blocked on full queue */
+	struct thread	*p_send_waiters_tail;	/* (p)                       */
 	struct port_set	*p_set;			/* (p) set this port belongs */
 	struct port	*p_set_link;		/* (p) next in set members   */
 };
@@ -155,11 +157,17 @@ static int		 space_drop(struct port_space *,
 			    mach_port_name_t name);
 static int		 space_drop_one_right(struct port_space *,
 			    mach_port_name_t name, uint8_t right);
+static int		 space_unbind_no_deref(struct port_space *,
+			    mach_port_name_t name, uint8_t right);
+static int		 space_install_no_ref(struct port_space *,
+			    struct port *p, uint8_t rights,
+			    mach_port_name_t *name_out);
 
 static int		 msg_validate(const struct mach_msg_header *);
 static int		 msg_enqueue(struct port *, struct port_msg *,
 			    struct thread **waiter_out);
-static struct port_msg	*msg_dequeue(struct port *);
+static struct port_msg	*msg_dequeue(struct port *,
+			    struct thread **send_waiter_out);
 
 static void		 free_pending_descs(struct port_pending_desc *,
 			    size_t n);
@@ -212,6 +220,8 @@ port_create(void)
 	p->p_qtail       = NULL;
 	p->p_waiters_head = NULL;
 	p->p_waiters_tail = NULL;
+	p->p_send_waiters_head = NULL;
+	p->p_send_waiters_tail = NULL;
 	p->p_set          = NULL;
 	p->p_set_link     = NULL;
 	return (p);
@@ -227,6 +237,10 @@ port_free(struct port *p)
 	KASSERT(p->p_send_once_count == 0,
 	    "port_free: send_once_count != 0");
 	KASSERT(!p->p_has_receive, "port_free: receive right still held");
+	KASSERT(p->p_waiters_head == NULL,
+	    "port_free: recv waiters still parked");
+	KASSERT(p->p_send_waiters_head == NULL,
+	    "port_free: send waiters still parked");
 
 	/*
 	 * Drain any messages that were queued but never consumed; each
@@ -270,6 +284,7 @@ port_deref(struct port *p, uint8_t rights)
 	bool	last;
 	struct port_msg *drain_head = NULL;
 	struct thread	*wake_head = NULL;
+	struct thread	*send_wake_head = NULL;
 
 	spin_lock(&p->p_lock);
 
@@ -303,8 +318,33 @@ port_deref(struct port *p, uint8_t rights)
 		wake_head = p->p_waiters_head;
 		p->p_waiters_head = p->p_waiters_tail = NULL;
 
+		send_wake_head = p->p_send_waiters_head;
+		p->p_send_waiters_head = p->p_send_waiters_tail = NULL;
+
 		member_of = p->p_set;
 		p->p_set = NULL;
+	}
+
+	/*
+	 * No-senders detection.  If dropping a send-bearing right took
+	 * the per-port sender count to zero while the receive end is
+	 * still held and the queue is empty, any thread blocked in
+	 * recv on this port is stranded -- no future message can ever
+	 * arrive.  Mark the port dead and hand the waiters out for a
+	 * post-unlock wake so they can return MACH_E_DEAD.
+	 *
+	 * Set-waiters are not woken here: the set as a whole stays
+	 * alive as long as any other member still has senders, and
+	 * we have no cheap way to certify that condition here.
+	 */
+	if ((rights & (MACH_PORT_RIGHT_SEND |
+	    MACH_PORT_RIGHT_SEND_ONCE)) != 0 &&
+	    p->p_send_count == 0 && p->p_send_once_count == 0 &&
+	    p->p_has_receive && !p->p_dead &&
+	    p->p_qlen == 0 && p->p_waiters_head != NULL) {
+		p->p_dead = true;
+		wake_head = p->p_waiters_head;
+		p->p_waiters_head = p->p_waiters_tail = NULL;
 	}
 
 	last = (p->p_refs == 0);
@@ -323,6 +363,13 @@ port_deref(struct port *p, uint8_t rights)
 		wake_head->th_runq_link = NULL;
 		thread_wake(wake_head);
 		wake_head = next;
+	}
+
+	while (send_wake_head != NULL) {
+		struct thread *next = send_wake_head->th_runq_link;
+		send_wake_head->th_runq_link = NULL;
+		thread_wake(send_wake_head);
+		send_wake_head = next;
 	}
 
 	/*
@@ -740,6 +787,74 @@ space_drop_one_right(struct port_space *ps, mach_port_name_t name,
 	return (MACH_MSG_OK);
 }
 
+/*
+ * Remove a right from a name entry WITHOUT calling port_deref on the
+ * port -- the caller is transferring the right elsewhere (the canonical
+ * use is MOVE_RECEIVE, which moves the receive right into an in-flight
+ * message rather than destroying it).  If the entry's rights mask
+ * becomes empty the slot is freed.
+ *
+ * Conservation: the port object's p_has_receive / p_send_count /
+ * p_send_once_count are NOT touched here; the right lives on,
+ * temporarily owned by whatever the caller stuffed it into.
+ */
+static int
+space_unbind_no_deref(struct port_space *ps, mach_port_name_t name,
+    uint8_t right)
+{
+
+	if (name == MACH_PORT_NULL || name == MACH_PORT_DEAD)
+		return (MACH_E_INVAL);
+
+	spin_lock(&ps->ps_lock);
+	if (name >= ps->ps_capacity ||
+	    ps->ps_table[name].pe_port == NULL ||
+	    (ps->ps_table[name].pe_rights & right) == 0) {
+		spin_unlock(&ps->ps_lock);
+		return (MACH_E_NAME);
+	}
+	ps->ps_table[name].pe_rights =
+	    (uint8_t)(ps->ps_table[name].pe_rights & ~right);
+	if (ps->ps_table[name].pe_rights == 0) {
+		ps->ps_table[name].pe_port = NULL;
+		ps->ps_inuse--;
+		if (name < ps->ps_hint)
+			ps->ps_hint = name;
+	}
+	spin_unlock(&ps->ps_lock);
+	return (MACH_MSG_OK);
+}
+
+/*
+ * Install a port at a fresh name WITHOUT calling port_ref -- the caller
+ * is delivering a right that was already "checked out" of some other
+ * space (the MOVE_RECEIVE counterpart of space_unbind_no_deref).
+ */
+static int
+space_install_no_ref(struct port_space *ps, struct port *p, uint8_t rights,
+    mach_port_name_t *name_out)
+{
+	mach_port_name_t	n;
+	int			rv;
+
+	if (rights == 0 || p == NULL)
+		return (MACH_E_INVAL);
+
+	spin_lock(&ps->ps_lock);
+	rv = space_alloc_slot_locked(ps, &n);
+	if (rv != MACH_MSG_OK) {
+		spin_unlock(&ps->ps_lock);
+		return (rv);
+	}
+	ps->ps_table[n].pe_port   = p;
+	ps->ps_table[n].pe_set    = NULL;
+	ps->ps_table[n].pe_rights = rights;
+	spin_unlock(&ps->ps_lock);
+
+	*name_out = n;
+	return (MACH_MSG_OK);
+}
+
 /* ---- public space-level operations ------------------------------------ */
 
 mach_port_name_t
@@ -772,6 +887,13 @@ port_deallocate(struct port_space *ps, mach_port_name_t name)
 {
 
 	return (space_drop(ps, name));
+}
+
+int
+port_mod_refs(struct port_space *ps, mach_port_name_t name, uint8_t right)
+{
+
+	return (space_drop_one_right(ps, name, right));
 }
 
 /* ---- port_set public ops ----------------------------------------------- */
@@ -983,11 +1105,33 @@ msg_enqueue(struct port *p, struct port_msg *m, struct thread **waiter_out)
 	return (MACH_MSG_OK);
 }
 
+/*
+ * Pop one thread off the port's send-waiter FIFO, if any.  Caller
+ * holds p_lock; caller wakes the returned thread (if non-NULL) *after*
+ * dropping the lock (thread_wake takes sched_lock, and our lock order
+ * is port -> sched).
+ */
+static struct thread *
+port_extract_send_waiter_locked(struct port *p)
+{
+	struct thread	*w;
+
+	w = p->p_send_waiters_head;
+	if (w != NULL) {
+		p->p_send_waiters_head = w->th_runq_link;
+		if (p->p_send_waiters_head == NULL)
+			p->p_send_waiters_tail = NULL;
+		w->th_runq_link = NULL;
+	}
+	return (w);
+}
+
 static struct port_msg *
-msg_dequeue(struct port *p)
+msg_dequeue(struct port *p, struct thread **send_waiter_out)
 {
 	struct port_msg	*m;
 
+	*send_waiter_out = NULL;
 	spin_lock(&p->p_lock);
 	m = p->p_qhead;
 	if (m != NULL) {
@@ -995,6 +1139,7 @@ msg_dequeue(struct port *p)
 		if (p->p_qhead == NULL)
 			p->p_qtail = NULL;
 		p->p_qlen--;
+		*send_waiter_out = port_extract_send_waiter_locked(p);
 	}
 	spin_unlock(&p->p_lock);
 	return (m);
@@ -1038,6 +1183,32 @@ send_xlate_desc(struct port_space *from, mach_port_name_t name,
 	uint8_t		 rights;
 
 	switch (disposition) {
+	case MACH_MSG_TYPE_MOVE_RECEIVE:
+		p = space_lookup(from, name, MACH_PORT_RIGHT_RECEIVE,
+		    &rights);
+		if (p == NULL)
+			return (MACH_E_RIGHT);
+		/*
+		 * Refuse if the port is currently a set member or has
+		 * recv-blocked threads parked on it: moving the receive
+		 * right out would either silently detach the set member
+		 * or strand a thread on a right it no longer owns.  The
+		 * sender must withdraw from the set / unblock the
+		 * waiter first.
+		 */
+		spin_lock(&p->p_lock);
+		if (p->p_set != NULL || p->p_waiters_head != NULL) {
+			spin_unlock(&p->p_lock);
+			return (MACH_E_INVAL);
+		}
+		spin_unlock(&p->p_lock);
+		if (space_unbind_no_deref(from, name,
+		    MACH_PORT_RIGHT_RECEIVE) != MACH_MSG_OK)
+			return (MACH_E_NAME);
+		pd->pd_port = p;
+		pd->pd_disposition = MACH_PORT_RIGHT_RECEIVE;
+		return (MACH_MSG_OK);
+
 	case MACH_MSG_TYPE_MAKE_SEND:
 		p = space_lookup(from, name, MACH_PORT_RIGHT_RECEIVE,
 		    &rights);
@@ -1234,7 +1405,7 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *msg)
 		    sizeof(struct port_pending_desc));
 		if (bigger == NULL) {
 			port_deref(local_pd.pd_port,
-			    MACH_PORT_RIGHT_SEND);
+			    local_pd.pd_disposition);
 			rv = MACH_E_NOMEM;
 			goto fail;
 		}
@@ -1281,10 +1452,50 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *msg)
 	m->m_descs  = descs;
 
 	{
-		struct thread *waiter;
-		rv = msg_enqueue(dest, m, &waiter);
-		if (rv != MACH_MSG_OK)
-			goto fail;
+		struct thread	*waiter;
+		struct thread	*self;
+
+		/*
+		 * Enqueue with backpressure: if the destination queue is
+		 * full, park self on dest->p_send_waiters and wait for a
+		 * recv to free a slot, then retry.  Wakes propagate via
+		 * port_extract_send_waiter_locked in the recv paths.
+		 *
+		 * If the port dies while we are parked, port_deref's
+		 * RECV-drop path drains p_send_waiters and the retry
+		 * sees p_dead -> returns MACH_E_DEAD.
+		 */
+		for (;;) {
+			rv = msg_enqueue(dest, m, &waiter);
+			if (rv == MACH_MSG_OK)
+				break;
+			if (rv != MACH_E_NOSPACE)
+				goto fail;
+
+			spin_lock(&dest->p_lock);
+			if (dest->p_dead) {
+				spin_unlock(&dest->p_lock);
+				rv = MACH_E_DEAD;
+				goto fail;
+			}
+			if (dest->p_qlen < dest->p_qmax) {
+				spin_unlock(&dest->p_lock);
+				continue;
+			}
+			self = current_thread;
+			self->th_runq_link = NULL;
+			if (dest->p_send_waiters_tail == NULL) {
+				dest->p_send_waiters_head = self;
+				dest->p_send_waiters_tail = self;
+			} else {
+				dest->p_send_waiters_tail->th_runq_link =
+				    self;
+				dest->p_send_waiters_tail = self;
+			}
+			thread_block_release(THREAD_BLOCK_PORT, dest,
+			    &dest->p_lock);
+			/* Loop and retry. */
+		}
 		if (waiter != NULL)
 			thread_wake(waiter);
 	}
@@ -1357,7 +1568,18 @@ deliver_msg(struct port_space *to, struct port *p, struct port_msg *m,
 	for (i = 0; i < explicit_descs; i++) {
 		mach_port_name_t n;
 		uint8_t kind = m->m_descs[i].pd_disposition;
-		rv = space_install(to, m->m_descs[i].pd_port, kind, &n);
+		/*
+		 * RECEIVE descriptors carry the right itself rather than
+		 * a pending ref -- install without a fresh port_ref, and
+		 * skip the matching port_deref below.  See send_xlate_desc
+		 * MOVE_RECEIVE case for the symmetry.
+		 */
+		if (kind == MACH_PORT_RIGHT_RECEIVE)
+			rv = space_install_no_ref(to,
+			    m->m_descs[i].pd_port, kind, &n);
+		else
+			rv = space_install(to,
+			    m->m_descs[i].pd_port, kind, &n);
 		if (rv != MACH_MSG_OK) {
 			while (i > 0) {
 				i--;
@@ -1374,7 +1596,8 @@ deliver_msg(struct port_space *to, struct port *p, struct port_msg *m,
 			kfree(m);
 			return (rv);
 		}
-		port_deref(m->m_descs[i].pd_port, kind);
+		if (kind != MACH_PORT_RIGHT_RECEIVE)
+			port_deref(m->m_descs[i].pd_port, kind);
 		m->m_descs[i].pd_port = NULL;
 		pds[i].name = n;
 	}
@@ -1383,7 +1606,12 @@ deliver_msg(struct port_space *to, struct port *p, struct port_msg *m,
 		size_t li = m->m_ndescs - 1;
 		mach_port_name_t n;
 		uint8_t kind = m->m_descs[li].pd_disposition;
-		rv = space_install(to, m->m_descs[li].pd_port, kind, &n);
+		if (kind == MACH_PORT_RIGHT_RECEIVE)
+			rv = space_install_no_ref(to,
+			    m->m_descs[li].pd_port, kind, &n);
+		else
+			rv = space_install(to,
+			    m->m_descs[li].pd_port, kind, &n);
 		if (rv != MACH_MSG_OK) {
 			for (i = 0; i < explicit_descs; i++) {
 				if (pds[i].name != MACH_PORT_NULL)
@@ -1395,7 +1623,8 @@ deliver_msg(struct port_space *to, struct port *p, struct port_msg *m,
 			kfree(m);
 			return (rv);
 		}
-		port_deref(m->m_descs[li].pd_port, kind);
+		if (kind != MACH_PORT_RIGHT_RECEIVE)
+			port_deref(m->m_descs[li].pd_port, kind);
 		m->m_descs[li].pd_port = NULL;
 		hdr->msgh_local = n;
 	}
@@ -1418,7 +1647,9 @@ mach_msg_recv(struct port_space *to, mach_port_name_t recv_name,
 {
 	struct port	*p;
 	struct port_msg	*m;
+	struct thread	*send_waiter;
 	uint8_t		 dummy;
+	int		 rv;
 
 	if (buf == NULL || buf_size < sizeof(struct mach_msg_header))
 		return (MACH_E_INVAL);
@@ -1427,11 +1658,14 @@ mach_msg_recv(struct port_space *to, mach_port_name_t recv_name,
 	if (p == NULL)
 		return (MACH_E_RIGHT);
 
-	m = msg_dequeue(p);
+	m = msg_dequeue(p, &send_waiter);
 	if (m == NULL)
 		return (MACH_E_NOMSG);
 
-	return (deliver_msg(to, p, m, buf, buf_size));
+	rv = deliver_msg(to, p, m, buf, buf_size);
+	if (send_waiter != NULL)
+		thread_wake(send_waiter);
+	return (rv);
 }
 
 int
@@ -1460,6 +1694,9 @@ mach_msg_recv_block(struct port_space *to, mach_port_name_t recv_name,
 			return (MACH_E_RIGHT);
 
 		for (;;) {
+			struct thread *send_waiter;
+			int rv;
+
 			spin_lock(&p->p_lock);
 
 			if (p->p_dead) {
@@ -1473,9 +1710,13 @@ mach_msg_recv_block(struct port_space *to, mach_port_name_t recv_name,
 				if (p->p_qhead == NULL)
 					p->p_qtail = NULL;
 				p->p_qlen--;
+				send_waiter =
+				    port_extract_send_waiter_locked(p);
 				spin_unlock(&p->p_lock);
-				return (deliver_msg(to, p, m,
-				    buf, buf_size));
+				rv = deliver_msg(to, p, m, buf, buf_size);
+				if (send_waiter != NULL)
+					thread_wake(send_waiter);
+				return (rv);
 			}
 
 			self = current_thread;
@@ -1505,6 +1746,9 @@ mach_msg_recv_block(struct port_space *to, mach_port_name_t recv_name,
 		/* Scan members for the first non-empty queue. */
 		for (p = set->ps_members_head; p != NULL;
 		    p = p->p_set_link) {
+			struct thread *send_waiter;
+			int rv;
+
 			spin_lock(&p->p_lock);
 			if (p->p_qhead != NULL) {
 				m = p->p_qhead;
@@ -1512,10 +1756,14 @@ mach_msg_recv_block(struct port_space *to, mach_port_name_t recv_name,
 				if (p->p_qhead == NULL)
 					p->p_qtail = NULL;
 				p->p_qlen--;
+				send_waiter =
+				    port_extract_send_waiter_locked(p);
 				spin_unlock(&p->p_lock);
 				spin_unlock(&set->ps_lock);
-				return (deliver_msg(to, p, m,
-				    buf, buf_size));
+				rv = deliver_msg(to, p, m, buf, buf_size);
+				if (send_waiter != NULL)
+					thread_wake(send_waiter);
+				return (rv);
 			}
 			spin_unlock(&p->p_lock);
 		}
