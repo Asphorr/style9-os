@@ -36,6 +36,15 @@
 void	kbd_init(void);
 int	kbd_getc(void);
 
+/*
+ * Blocking IRQ-driven read.  If the buffer is empty the calling thread
+ * is parked until the keyboard IRQ pushes a character and signals a
+ * deferred wake.  Single-consumer only: at most one thread may be
+ * parked in kbd_getc_block at any moment (the keyboard driver thread,
+ * in this kernel).
+ */
+int	kbd_getc_block(void);
+
 int	kbd_poll_getc(void);
 int	kbd_poll_getc_block(void);
 

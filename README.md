@@ -26,6 +26,7 @@ Built from scratch — no upstream tree, no glue from another OS.
 | tasks | `kern/task.c` | resource container, owns one `port_space` |
 | threads | `kern/thread.c`, `arch/amd64/switch.S` | callee-saved context switch, kstack-backed |
 | sched | `kern/sched.c` | cooperative + preemptive round-robin, idle thread reaps zombies |
+| kbd drv | `kern/kbd_drv.c` | first real consumer of Mach IPC: bridges the IRQ-fed scancode ring to `kbd_input_port`; the shell recv's keys via `mach_msg_recv_block` instead of polling |
 | shell | `kern/shell.c`, `cmds.c` | line buffer + argv split + dispatch table, ~15 commands |
 | drivers | `dev/*.c` | 16550 UART, VGA, PS/2 keyboard, QEMU debugcon |
 
@@ -145,6 +146,14 @@ Loosely Mach-shape rather than BSD-shape:
 - Ports + messages are the universal IPC primitive; there are no
   separate pipe / socket / fd abstractions.  Even kernel-internal RPC
   uses `mach_msg_send` against `kernel_space`.
+- The keyboard is the first device wired this way: the IRQ pushes
+  scancodes into a ring (unchanged), a kernel `kbd-drv` thread parks
+  on the ring via `kbd_getc_block` and forwards each byte as a
+  `mach_msg` to `kbd_input_port`, and the shell reads keys via
+  `mach_msg_recv_block`.  IRQ-context wake hands the parked driver
+  thread off through a lock-free deferred-wake list drained at
+  `preempt_enable` / `intr_dispatch` tail, so the IRQ never touches
+  `sched_lock` directly.
 - The wire format matches real Mach (`mach_msg_header_t`, 24 bytes;
   `mach_msg_port_descriptor`, 8 bytes; `MACH_MSGH_BITS_COMPLEX`), so
   any future userspace ABI is forward-compatible.

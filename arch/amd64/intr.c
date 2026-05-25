@@ -86,20 +86,24 @@ intr_dispatch(struct trapframe *tf)
 		pic_eoi(irq);
 
 		/*
-		 * Preempt point.  If the IRQ handler set need_resched
-		 * (PIT does this when the quantum expires) and we are
-		 * not inside any critical section, yield here.  When
-		 * we hit a critical section instead, the deferred
-		 * schedule fires at the unlock that drops the count
-		 * back to zero.
+		 * Preempt point.  Two pieces of deferred work may have
+		 * been queued by the IRQ handler that just ran: any
+		 * wake requests posted via sched_post_irq_wake, and a
+		 * possible need_resched from PIT.  Service both only
+		 * when preempt is enabled (no caller held a spinlock
+		 * across the IRQ -- otherwise the deferred work fires
+		 * at the next spin_unlock that drops the count to
+		 * zero).
 		 */
-		if (preempt_is_enabled() &&
-		    __atomic_load_n(&preempt_need_resched,
-		        __ATOMIC_RELAXED)) {
-			__atomic_store_n(&preempt_need_resched, 0,
-			    __ATOMIC_RELAXED);
-			sched_count_preempt();
-			thread_yield();
+		if (preempt_is_enabled()) {
+			sched_drain_irq_wakes();
+			if (__atomic_load_n(&preempt_need_resched,
+			    __ATOMIC_RELAXED)) {
+				__atomic_store_n(&preempt_need_resched,
+				    0, __ATOMIC_RELAXED);
+				sched_count_preempt();
+				thread_yield();
+			}
 		}
 		return;
 	}

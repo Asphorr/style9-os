@@ -9,8 +9,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "kbd.h"
+#include "kbd_drv.h"
 #include "kprintf.h"
+#include "port.h"
 #include "shell.h"
 #include "tty.h"
 
@@ -26,7 +27,11 @@ static int	streq(const char *a, const char *b);
 void
 shell_run(void)
 {
-	int	c;
+	struct mach_msg_header	hdr;
+	char			*argv[SHELL_ARGC_MAX];
+	int			 argc;
+	int			 c;
+	int			 rv;
 
 	shell_len = 0;
 
@@ -34,47 +39,55 @@ shell_run(void)
 	tty_puts("\nstyle9-os shell.  type 'help' for commands.\n");
 	prompt();
 
+	/*
+	 * Input arrives as one mach_msg per character, sent by the
+	 * kbd driver thread.  msgh_id carries the byte; we ignore
+	 * msgh_bits / voucher.  Blocking recv parks the shell until
+	 * a key is pushed, so no busy-loop is needed.
+	 */
 	for (;;) {
-		__asm__ __volatile__ ("hlt");
+		rv = mach_msg_recv_block(kernel_space, kbd_input_port,
+		    &hdr, sizeof(hdr));
+		if (rv != MACH_MSG_OK)
+			continue;
 
-		while ((c = kbd_getc()) >= 0) {
-			if (c == '\n') {
-				tty_putc('\n');
-				shell_line[shell_len] = '\0';
+		c = (int)(unsigned char)hdr.msgh_id;
 
-				char *argv[SHELL_ARGC_MAX];
-				int argc = split_argv(shell_line, argv,
-				    SHELL_ARGC_MAX);
-				if (argc > 0)
-					(void)dispatch(argc, argv);
+		if (c == '\n') {
+			tty_putc('\n');
+			shell_line[shell_len] = '\0';
 
-				shell_len = 0;
-				prompt();
-				continue;
-			}
+			argc = split_argv(shell_line, argv,
+			    SHELL_ARGC_MAX);
+			if (argc > 0)
+				(void)dispatch(argc, argv);
 
-			if (c == '\b') {
-				if (shell_len > 0) {
-					shell_len--;
-					tty_putc('\b');
-				}
-				continue;
-			}
-
-			/*
-			 * Ignore characters that would overflow the
-			 * buffer rather than truncating mid-line; the
-			 * caller can backspace and retry.
-			 */
-			if (shell_len + 1 >= SHELL_LINE_MAX)
-				continue;
-
-			if ((unsigned char)c < 0x20 && c != '\t')
-				continue;
-
-			shell_line[shell_len++] = (char)c;
-			tty_putc((char)c);
+			shell_len = 0;
+			prompt();
+			continue;
 		}
+
+		if (c == '\b') {
+			if (shell_len > 0) {
+				shell_len--;
+				tty_putc('\b');
+			}
+			continue;
+		}
+
+		/*
+		 * Ignore characters that would overflow the buffer
+		 * rather than truncating mid-line; the caller can
+		 * backspace and retry.
+		 */
+		if (shell_len + 1 >= SHELL_LINE_MAX)
+			continue;
+
+		if ((unsigned char)c < 0x20 && c != '\t')
+			continue;
+
+		shell_line[shell_len++] = (char)c;
+		tty_putc((char)c);
 	}
 }
 

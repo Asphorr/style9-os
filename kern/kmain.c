@@ -12,6 +12,7 @@
 #include "idt.h"
 #include "intr.h"
 #include "kbd.h"
+#include "kbd_drv.h"
 #include "kmem.h"
 #include "kprintf.h"
 #include "memmap.h"
@@ -83,6 +84,8 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 
 	kmain_memory_smoke();
 	kmain_run_tests();
+
+	kbd_drv_init();
 
 	shell_run();
 	/* NOTREACHED */

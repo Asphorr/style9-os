@@ -61,6 +61,14 @@ volatile unsigned int	 preempt_quantum_used;	/* (a) */
  */
 static volatile int	preempt_count;		/* (a) */
 
+/*
+ * Lock-free LIFO of threads queued for thread_wake by an interrupt
+ * handler.  Chained through th_runq_link, which is otherwise unused
+ * while the thread is BLOCKED.  Pushed atomically from any context;
+ * drained in the safe windows of preempt_enable / intr_dispatch.
+ */
+static struct thread	*irq_wake_head;		/* (a) */
+
 static void	idle_loop(void *) __attribute__((noreturn));
 static struct thread *pick_next_locked(struct thread *self);
 static void	enqueue_locked(struct thread *th);
@@ -282,6 +290,35 @@ thread_wake(struct thread *th)
 }
 
 void
+sched_post_irq_wake(struct thread *th)
+{
+	struct thread	*old;
+
+	if (th == NULL)
+		return;
+
+	old = __atomic_load_n(&irq_wake_head, __ATOMIC_RELAXED);
+	do {
+		th->th_runq_link = old;
+	} while (!__atomic_compare_exchange_n(&irq_wake_head, &old, th,
+	    false, __ATOMIC_RELEASE, __ATOMIC_RELAXED));
+}
+
+void
+sched_drain_irq_wakes(void)
+{
+	struct thread	*list, *next;
+
+	list = __atomic_exchange_n(&irq_wake_head, NULL, __ATOMIC_ACQUIRE);
+	while (list != NULL) {
+		next = list->th_runq_link;
+		list->th_runq_link = NULL;
+		thread_wake(list);
+		list = next;
+	}
+}
+
+void
 sched_handoff_zombie(struct thread *self)
 {
 	struct thread	*next;
@@ -451,17 +488,24 @@ preempt_enable(void)
 		return;
 
 	/*
-	 * Just dropped to zero.  If PIT raised need_resched while
-	 * any critical section was active, the schedule was deferred
-	 * to this exact point.  thread_yield clears both the flag and
-	 * the quantum so this cannot re-trigger immediately.
+	 * Just dropped to zero.  Two pieces of deferred work may have
+	 * accumulated while a critical section was held: IRQ-context
+	 * wake requests queued on the lock-free list, and a PIT
+	 * need_resched.  Drain the wakes first (so any newly readied
+	 * thread participates in the immediate yield), then honour
+	 * the resched.
 	 *
-	 * The preempts counter is bumped via a plain atomic (rather
-	 * than spin_lock+sched_lock) so this entire path involves no
-	 * further spin_unlock -- otherwise the unlock would re-enter
+	 * The preempts counter itself is bumped via a plain atomic
+	 * rather than spin_lock+sched_lock so this path involves no
+	 * further spin_unlock -- otherwise that unlock would re-enter
 	 * preempt_enable, see need_resched still set, and recurse
-	 * indefinitely.
+	 * indefinitely.  thread_wake inside the drain does take
+	 * sched_lock and re-enters via spin_unlock; bounded recursion
+	 * since the second pass finds an empty wake list and a
+	 * cleared need_resched (thread_yield clears it).
 	 */
+	sched_drain_irq_wakes();
+
 	if (__atomic_load_n(&preempt_need_resched, __ATOMIC_RELAXED)) {
 		sched_count_preempt();
 		thread_yield();

@@ -64,6 +64,26 @@ void		thread_block_release(int reason, void *target,
 void		thread_wake(struct thread *);
 
 /*
+ * IRQ-safe deferred wake.
+ *
+ * `sched_post_irq_wake` is callable from interrupt context: it appends
+ * `th` to a lock-free atomic list and returns at once, without touching
+ * sched_lock.  It is the primitive a hardware driver uses to signal a
+ * thread blocked on kbd / serial / etc. from the IRQ that delivered the
+ * event.
+ *
+ * `sched_drain_irq_wakes` pops the list and runs thread_wake on every
+ * entry.  It is called from two safe spots in normal kernel context:
+ * the tail of intr_dispatch (right before the preempt point) and the
+ * tail of preempt_enable (just after the count drops to zero).  Both
+ * are guaranteed to be running with no spinlock held, so taking
+ * sched_lock from inside thread_wake cannot recurse onto a lock the
+ * interrupted thread was holding.
+ */
+void		sched_post_irq_wake(struct thread *);
+void		sched_drain_irq_wakes(void);
+
+/*
  * sched_handoff_zombie: called from thread_exit().  Adds the thread
  * to the zombie list (idle thread reaps them) and switches away.
  * Never returns.

@@ -12,6 +12,8 @@
 #include "io.h"
 #include "kbd.h"
 #include "pic.h"
+#include "sched.h"
+#include "thread.h"
 
 #define	KBD_DATA_PORT	0x60
 #define	KBD_STATUS_PORT	0x64
@@ -74,6 +76,26 @@ static volatile uint32_t	kbd_buf_tail;
 static char			kbd_buf[KBD_BUF_SIZE];
 
 static volatile uint8_t		kbd_shift;	/* either Shift key down */
+
+/*
+ * Single-consumer block-on-read support.
+ *
+ *	kbd_waiter	The one thread currently parked in kbd_getc_block,
+ *			or NULL.  Set by the consumer immediately before it
+ *			rechecks the ring and blocks; cleared by the IRQ
+ *			when it pushes a byte and harvests the waiter.  The
+ *			exchange is atomic so a producer push that races
+ *			with the consumer's set always observes one side
+ *			or the other -- never both.
+ *
+ *	kbd_wake_pending Set by the IRQ when it consumed a waiter slot.
+ *			The consumer checks this flag after registering and
+ *			rechecking the ring; if set, it skips the block and
+ *			loops back instead, so a wake delivered between the
+ *			recheck and the block is not lost.
+ */
+static struct thread *volatile	kbd_waiter;
+static volatile int		kbd_wake_pending;
 
 static void	kbd_irq(struct trapframe *);
 static void	kbd_buf_push(char);
@@ -170,7 +192,8 @@ kbd_decode_scancode(uint8_t sc)
 static void
 kbd_buf_push(char ch)
 {
-	uint32_t	next;
+	struct thread	*w;
+	uint32_t	 next;
 
 	next = kbd_buf_head + 1;
 	if (next - kbd_buf_tail > KBD_BUF_SIZE)
@@ -178,4 +201,69 @@ kbd_buf_push(char ch)
 
 	kbd_buf[kbd_buf_head & KBD_BUF_MASK] = ch;
 	kbd_buf_head = next;
+
+	/*
+	 * Harvest any parked consumer and signal it.  The exchange
+	 * makes the take-the-slot operation atomic against a consumer
+	 * that's installing itself concurrently; sched_post_irq_wake
+	 * defers the actual thread_wake to the next safe point (so
+	 * we don't take sched_lock from IRQ context).  The
+	 * wake_pending flag covers the narrow race where the
+	 * consumer is between recheck-and-block and would otherwise
+	 * miss the signal.
+	 */
+	w = __atomic_exchange_n(&kbd_waiter, NULL, __ATOMIC_ACQUIRE);
+	if (w != NULL) {
+		__atomic_store_n(&kbd_wake_pending, 1, __ATOMIC_RELEASE);
+		sched_post_irq_wake(w);
+	}
+}
+
+int
+kbd_getc_block(void)
+{
+	struct thread	*self;
+	int		 c;
+
+	self = current_thread;
+
+	for (;;) {
+		c = kbd_getc();
+		if (c >= 0)
+			return (c);
+
+		/*
+		 * Empty: register, clear the pending flag, then recheck
+		 * the ring under the now-installed waiter slot.  Order
+		 * matters -- the IRQ-side store sequence is push, then
+		 * exchange waiter, then set pending; we mirror it in
+		 * reverse: clear pending, install waiter, recheck.
+		 */
+		__atomic_store_n(&kbd_wake_pending, 0, __ATOMIC_RELAXED);
+		__atomic_store_n(&kbd_waiter, self, __ATOMIC_RELEASE);
+
+		c = kbd_getc();
+		if (c >= 0) {
+			__atomic_store_n(&kbd_waiter, NULL,
+			    __ATOMIC_RELAXED);
+			return (c);
+		}
+
+		/*
+		 * A wake delivered between the recheck above and the
+		 * block below would set wake_pending; if so, skip the
+		 * block and loop.  Otherwise it is safe to park -- a
+		 * later IRQ will sched_post_irq_wake us once the buffer
+		 * has data.
+		 */
+		if (__atomic_load_n(&kbd_wake_pending,
+		    __ATOMIC_ACQUIRE) != 0) {
+			__atomic_store_n(&kbd_waiter, NULL,
+			    __ATOMIC_RELAXED);
+			continue;
+		}
+
+		thread_block(THREAD_BLOCK_SLEEP, (void *)&kbd_buf_head);
+		/* Woken; loop and retry the ring. */
+	}
 }
