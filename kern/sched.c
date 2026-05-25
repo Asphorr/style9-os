@@ -1,0 +1,476 @@
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Copyright (c) 2026 The Hobby OS Project
+ * All rights reserved.
+ */
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "kmem.h"
+#include "kprintf.h"
+#include "panic.h"
+#include "sched.h"
+#include "spinlock.h"
+#include "task.h"
+#include "thread.h"
+
+/*
+ * Scheduler locking discipline.
+ *
+ * sched_lock is held across every context switch.  The OUTgoing
+ * thread acquires it (in thread_yield / thread_block / handoff_zombie)
+ * and the INcoming thread is responsible for releasing it -- either
+ * by falling through to the post-switch unlock at the bottom of the
+ * same function (for resumed threads), or by calling spin_unlock in
+ * thread_trampoline (for brand-new threads).
+ *
+ * This guarantees that the transition out of RUNNING and the moment
+ * we leave our own stack are atomic with respect to thread_wake: a
+ * waker spinning on sched_lock cannot observe us as both not-RUNNING
+ * (so eligible to be woken) and still executing past our save point.
+ *
+ * Cooperative only -- the PIT IRQ touches no scheduler state.
+ */
+
+static struct spinlock	sched_lock = SPINLOCK_INIT("sched");
+
+static struct thread	*runq_head;	/* (s) READY list, FIFO            */
+static struct thread	*runq_tail;	/* (s)                              */
+static size_t		 runq_len;	/* (s)                              */
+
+static struct thread	*zombie_head;	/* (s) waiting for idle to reap    */
+static struct thread	*idle_thread;	/* (c)                              */
+static uint64_t		 ctx_switches;	/* (s) printable counter            */
+static uint64_t		 preempts;	/* (s) IRQ-driven yields            */
+
+volatile int		 preempt_need_resched;	/* (a) */
+volatile unsigned int	 preempt_quantum_used;	/* (a) */
+
+/*
+ * Preempt-disable nesting count.  Global, not per-thread: when
+ * sched_lock is held across a context switch the unlock happens in a
+ * different thread, so per-thread accounting underflows.  What the
+ * counter conceptually represents is "is the kernel currently inside
+ * any critical section" -- which is exactly the kernel-wide invariant
+ * we want the PIT to consult.
+ *
+ * Per-CPU when we go SMP; until then a single int is fine.
+ */
+static volatile int	preempt_count;		/* (a) */
+
+static void	idle_loop(void *) __attribute__((noreturn));
+static struct thread *pick_next_locked(struct thread *self);
+static void	enqueue_locked(struct thread *th);
+
+/*
+ * sched_lock unlock helper invoked by the trampoline that starts every
+ * brand-new thread.  Lives here so trampoline doesn't need to know
+ * the lock's name.
+ */
+void	sched_post_switch_unlock(void);
+
+void
+sched_init(void)
+{
+
+	runq_head    = runq_tail = NULL;
+	runq_len     = 0;
+	zombie_head  = NULL;
+	ctx_switches = 0;
+	preempts     = 0;
+	preempt_need_resched = 0;
+	preempt_quantum_used = 0;
+
+	idle_thread = thread_create(kernel_task, idle_loop, NULL, "idle");
+	if (idle_thread == NULL)
+		panic("sched_init: idle thread creation failed");
+
+	/*
+	 * Idle is never on the runqueue -- pick_next_locked falls
+	 * through to it whenever there's nothing else.  Mark it READY
+	 * so the first dispatch's state-transition KASSERTs pass.
+	 */
+	spin_lock(&idle_thread->th_lock);
+	idle_thread->th_state = THREAD_READY;
+	spin_unlock(&idle_thread->th_lock);
+
+	kprintf("sched: cooperative round-robin, idle id=%llu\n",
+	    (unsigned long long)idle_thread->th_id);
+}
+
+void
+sched_enqueue(struct thread *th)
+{
+
+	if (th == NULL)
+		return;
+	if (th == idle_thread)
+		return;	/* idle dispatched only by pick_next_locked */
+
+	spin_lock(&sched_lock);
+
+	spin_lock(&th->th_lock);
+	/*
+	 * Allow enqueue from INIT (first run), READY (wake racing
+	 * with another wake -- harmless), or BLOCKED (transitioning).
+	 * Anything else is the caller's bug.
+	 */
+	th->th_state = THREAD_READY;
+	spin_unlock(&th->th_lock);
+
+	enqueue_locked(th);
+	spin_unlock(&sched_lock);
+}
+
+static void
+enqueue_locked(struct thread *th)
+{
+
+	th->th_runq_link = NULL;
+	if (runq_tail == NULL) {
+		runq_head = th;
+		runq_tail = th;
+	} else {
+		runq_tail->th_runq_link = th;
+		runq_tail = th;
+	}
+	runq_len++;
+}
+
+static struct thread *
+pick_next_locked(struct thread *self)
+{
+	struct thread	*next;
+
+	next = runq_head;
+	if (next != NULL) {
+		runq_head = next->th_runq_link;
+		if (runq_head == NULL)
+			runq_tail = NULL;
+		next->th_runq_link = NULL;
+		runq_len--;
+		return (next);
+	}
+
+	if (self != idle_thread)
+		return (idle_thread);
+
+	/* idle is yielding with nothing else to run -- stay on idle. */
+	return (NULL);
+}
+
+void
+thread_yield(void)
+{
+	struct thread	*self, *next;
+
+	self = current_thread;
+	KASSERT(self != NULL, "thread_yield: no current");
+
+	spin_lock(&sched_lock);
+
+	/*
+	 * Whether or not we actually switch, the act of calling
+	 * thread_yield discharges any pending resched request and
+	 * earns the caller a fresh quantum.
+	 */
+	__atomic_store_n(&preempt_need_resched, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&preempt_quantum_used, 0, __ATOMIC_RELAXED);
+
+	next = pick_next_locked(self);
+	if (next == NULL || next == self) {
+		spin_unlock(&sched_lock);
+		return;
+	}
+
+	if (self != idle_thread) {
+		spin_lock(&self->th_lock);
+		self->th_state = THREAD_READY;
+		spin_unlock(&self->th_lock);
+		enqueue_locked(self);
+	}
+
+	spin_lock(&next->th_lock);
+	next->th_state = THREAD_RUNNING;
+	spin_unlock(&next->th_lock);
+
+	current_thread = next;
+	ctx_switches++;
+
+	thread_switch_asm(&self->th_rsp_save, next->th_rsp_save);
+
+	/* Resumed: release the lock the OTHER thread acquired before switching. */
+	spin_unlock(&sched_lock);
+}
+
+void
+thread_block(int reason, void *target)
+{
+
+	thread_block_release(reason, target, NULL);
+}
+
+void
+thread_block_release(int reason, void *target, struct spinlock *external)
+{
+	struct thread	*self, *next;
+
+	self = current_thread;
+	KASSERT(self != NULL, "thread_block_release: no current");
+	KASSERT(self != idle_thread,
+	    "thread_block_release: idle cannot block");
+
+	spin_lock(&sched_lock);
+
+	spin_lock(&self->th_lock);
+	self->th_state        = THREAD_BLOCKED;
+	self->th_block_reason = reason;
+	self->th_block_target = target;
+	spin_unlock(&self->th_lock);
+
+	/*
+	 * Drop the caller's lock with sched_lock held.  Any thread_wake
+	 * fired now must first acquire sched_lock; by that time we have
+	 * already committed to BLOCKED so the wake observes a real
+	 * BLOCKED -> READY transition rather than losing the signal.
+	 */
+	if (external != NULL)
+		spin_unlock(external);
+
+	next = pick_next_locked(self);
+	KASSERT(next != NULL,
+	    "thread_block_release: pick_next returned NULL "
+	    "(idle missing)");
+
+	spin_lock(&next->th_lock);
+	next->th_state = THREAD_RUNNING;
+	spin_unlock(&next->th_lock);
+
+	current_thread = next;
+	ctx_switches++;
+
+	thread_switch_asm(&self->th_rsp_save, next->th_rsp_save);
+
+	/* Woken by thread_wake; release sched_lock and return. */
+	spin_unlock(&sched_lock);
+}
+
+void
+thread_wake(struct thread *th)
+{
+
+	if (th == NULL)
+		return;
+
+	spin_lock(&sched_lock);
+	spin_lock(&th->th_lock);
+	if (th->th_state != THREAD_BLOCKED) {
+		spin_unlock(&th->th_lock);
+		spin_unlock(&sched_lock);
+		return;
+	}
+	th->th_state        = THREAD_READY;
+	th->th_block_reason = THREAD_NOT_BLOCKED;
+	th->th_block_target = NULL;
+	spin_unlock(&th->th_lock);
+
+	enqueue_locked(th);
+	spin_unlock(&sched_lock);
+}
+
+void
+sched_handoff_zombie(struct thread *self)
+{
+	struct thread	*next;
+
+	spin_lock(&sched_lock);
+
+	self->th_zombie_next = zombie_head;
+	zombie_head = self;
+
+	next = pick_next_locked(self);
+	KASSERT(next != NULL,
+	    "sched_handoff_zombie: no runnable thread");
+
+	spin_lock(&next->th_lock);
+	next->th_state = THREAD_RUNNING;
+	spin_unlock(&next->th_lock);
+
+	current_thread = next;
+	ctx_switches++;
+
+	thread_switch_asm(&self->th_rsp_save, next->th_rsp_save);
+
+	/* NOTREACHED -- self is zombie. */
+	panic("sched_handoff_zombie: returned from switch");
+}
+
+void
+sched_post_switch_unlock(void)
+{
+
+	spin_unlock(&sched_lock);
+}
+
+void
+sched_reap_zombies(void)
+{
+	struct thread	*z, *next;
+
+	spin_lock(&sched_lock);
+	z = zombie_head;
+	zombie_head = NULL;
+	spin_unlock(&sched_lock);
+
+	while (z != NULL) {
+		struct task *t = z->th_task;
+		next = z->th_zombie_next;
+
+		if (z->th_kstack_owned && z->th_kstack_base != NULL)
+			kfree(z->th_kstack_base);
+
+		task_detach_thread(t, z);
+		kfree(z);
+		z = next;
+	}
+}
+
+/*
+ * Idle thread body.  On every spin: reap any zombies, then either
+ * yield (if there is real work waiting) or sti/hlt until the next
+ * interrupt nudges the system.  cli on the way out so the next iter
+ * of the loop reaps zombies without an IRQ landing on a half-set-up
+ * iteration.
+ */
+static void
+idle_loop(void *arg)
+{
+
+	(void)arg;
+	for (;;) {
+		sched_reap_zombies();
+
+		spin_lock(&sched_lock);
+		if (runq_head != NULL) {
+			spin_unlock(&sched_lock);
+			thread_yield();
+			continue;
+		}
+		spin_unlock(&sched_lock);
+
+		__asm__ __volatile__ ("sti; hlt; cli");
+	}
+}
+
+/* ---- introspection --------------------------------------------------- */
+
+void
+sched_print(void)
+{
+	struct thread	*cur;
+
+	spin_lock(&sched_lock);
+	kprintf("sched: %zu in runq, %llu context switches\n",
+	    runq_len, (unsigned long long)ctx_switches);
+	for (cur = runq_head; cur != NULL; cur = cur->th_runq_link) {
+		spin_unlock(&sched_lock);
+		thread_print(cur);
+		spin_lock(&sched_lock);
+	}
+	if (current_thread != NULL) {
+		spin_unlock(&sched_lock);
+		kprintf("current: ");
+		thread_print(current_thread);
+		spin_lock(&sched_lock);
+	}
+	spin_unlock(&sched_lock);
+}
+
+size_t
+sched_runq_len(void)
+{
+	size_t	n;
+
+	spin_lock(&sched_lock);
+	n = runq_len;
+	spin_unlock(&sched_lock);
+	return (n);
+}
+
+uint64_t
+sched_context_switches(void)
+{
+	uint64_t	v;
+
+	spin_lock(&sched_lock);
+	v = ctx_switches;
+	spin_unlock(&sched_lock);
+	return (v);
+}
+
+uint64_t
+sched_preempts(void)
+{
+
+	return (__atomic_load_n(&preempts, __ATOMIC_RELAXED));
+}
+
+void
+sched_count_preempt(void)
+{
+
+	__atomic_fetch_add(&preempts, 1, __ATOMIC_RELAXED);
+}
+
+/*
+ * Bump the kernel-wide preempt counter.  Every spin_lock calls this
+ * before the acquire spin; every spin_unlock matches it.  The counter
+ * tracks how many active critical sections the kernel is currently
+ * inside, summed across all threads; the PIT looks at it (not at any
+ * per-thread state) when deciding whether to honour need_resched.
+ */
+void
+preempt_disable(void)
+{
+
+	__atomic_fetch_add(&preempt_count, 1, __ATOMIC_SEQ_CST);
+}
+
+void
+preempt_enable(void)
+{
+	int	n;
+
+	n = __atomic_sub_fetch(&preempt_count, 1, __ATOMIC_SEQ_CST);
+	KASSERT(n >= 0, "preempt_enable: count underflow");
+
+	if (n != 0)
+		return;
+
+	/*
+	 * Just dropped to zero.  If PIT raised need_resched while
+	 * any critical section was active, the schedule was deferred
+	 * to this exact point.  thread_yield clears both the flag and
+	 * the quantum so this cannot re-trigger immediately.
+	 *
+	 * The preempts counter is bumped via a plain atomic (rather
+	 * than spin_lock+sched_lock) so this entire path involves no
+	 * further spin_unlock -- otherwise the unlock would re-enter
+	 * preempt_enable, see need_resched still set, and recurse
+	 * indefinitely.
+	 */
+	if (__atomic_load_n(&preempt_need_resched, __ATOMIC_RELAXED)) {
+		sched_count_preempt();
+		thread_yield();
+	}
+}
+
+bool
+preempt_is_enabled(void)
+{
+
+	return (__atomic_load_n(&preempt_count, __ATOMIC_RELAXED) == 0);
+}

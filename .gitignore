@@ -1,0 +1,13 @@
+# Build artefacts -- regenerated from source on every `make`.
+obj/
+kernel.elf
+*.o
+*.d
+
+# Live boot capture from runlog.ps1.
+live.log
+
+# Editor scratch.
+*.swp
+*.swo
+*~
