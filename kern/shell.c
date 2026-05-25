@@ -11,9 +11,11 @@
 
 #include "kbd_drv.h"
 #include "kprintf.h"
+#include "panic.h"
 #include "port.h"
 #include "shell.h"
 #include "tty.h"
+#include "uart_drv.h"
 
 static char	shell_line[SHELL_LINE_MAX];
 static size_t	shell_len;
@@ -27,7 +29,8 @@ static int	streq(const char *a, const char *b);
 void
 shell_run(void)
 {
-	struct mach_msg_header	hdr;
+	struct mach_msg_header	 hdr;
+	mach_port_name_t	 input_set;
 	char			*argv[SHELL_ARGC_MAX];
 	int			 argc;
 	int			 c;
@@ -35,18 +38,36 @@ shell_run(void)
 
 	shell_len = 0;
 
+	/*
+	 * Fan-in: both the keyboard and the serial console drive the
+	 * same shell.  Allocate a port set and add each input port as
+	 * a member; the recv_block on the set delivers whichever
+	 * member has the next message.  No extra threads needed -- the
+	 * existing kbd-drv and uart-drv threads each send into their
+	 * own port and the set surfaces both streams as one.
+	 */
+	input_set = port_set_allocate(kernel_space);
+	if (input_set == MACH_PORT_NULL)
+		panic("shell_run: port_set_allocate failed");
+	if (port_set_insert(kernel_space, input_set,
+	    kbd_input_port) != MACH_MSG_OK)
+		panic("shell_run: port_set_insert(kbd) failed");
+	if (port_set_insert(kernel_space, input_set,
+	    uart_input_port) != MACH_MSG_OK)
+		panic("shell_run: port_set_insert(uart) failed");
+
 	tty_set_attr(TTY_ATTR(TTY_WHITE, TTY_BLACK));
 	tty_puts("\nstyle9-os shell.  type 'help' for commands.\n");
 	prompt();
 
 	/*
-	 * Input arrives as one mach_msg per character, sent by the
-	 * kbd driver thread.  msgh_id carries the byte; we ignore
-	 * msgh_bits / voucher.  Blocking recv parks the shell until
-	 * a key is pushed, so no busy-loop is needed.
+	 * Input arrives as one mach_msg per character, sent by either
+	 * driver thread.  msgh_id carries the byte; we ignore
+	 * msgh_bits / voucher.  Blocking recv on the set parks the
+	 * shell until any member port has data.
 	 */
 	for (;;) {
-		rv = mach_msg_recv_block(kernel_space, kbd_input_port,
+		rv = mach_msg_recv_block(kernel_space, input_set,
 		    &hdr, sizeof(hdr));
 		if (rv != MACH_MSG_OK)
 			continue;

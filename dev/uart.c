@@ -8,7 +8,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "intr.h"
 #include "io.h"
+#include "pic.h"
+#include "sched.h"
+#include "thread.h"
 #include "uart.h"
 
 /*
@@ -40,11 +44,34 @@
 #define	MCR_RTS			0x02
 #define	MCR_OUT2		0x08	/* OUT2 gates IRQ delivery; harmless */
 
+#define	LSR_DATA_READY		0x01
 #define	LSR_THR_EMPTY		0x20
+
+#define	IER_ERBFI		0x01	/* enable received-data-available IRQ */
+
+#define	COM1_IRQ		4
+
+/*
+ * RX ring buffer.  Single-producer (COM1 IRQ) / single-consumer
+ * (uart_getc_block, called by the uart_drv thread).  Same locking
+ * discipline as the keyboard ring in dev/kbd.c: head/tail are 32-bit
+ * naturally atomic on amd64, writes from the IRQ run with IF=0.
+ */
+#define	UART_BUF_SIZE		256
+#define	UART_BUF_MASK		(UART_BUF_SIZE - 1)
 
 static uint16_t	uart_base = UART_COM1_BASE;
 
+static volatile uint32_t	uart_buf_head;
+static volatile uint32_t	uart_buf_tail;
+static char			uart_buf[UART_BUF_SIZE];
+
+static struct thread *volatile	uart_waiter;
+static volatile int		uart_wake_pending;
+
 static void	uart_send_raw(char);
+static void	uart_irq(struct trapframe *);
+static void	uart_buf_push(char);
 
 void
 uart_init(void)
@@ -106,4 +133,97 @@ uart_send_raw(char ch)
 	while ((inb(COM_LSR(uart_base)) & LSR_THR_EMPTY) == 0)
 		;
 	outb(COM_DR(uart_base), (uint8_t)ch);
+}
+
+void
+uart_enable_rx(void)
+{
+
+	irq_install(COM1_IRQ, uart_irq);
+	pic_unmask(COM1_IRQ);
+	outb(COM_IER(uart_base), IER_ERBFI);
+}
+
+int
+uart_getc_block(void)
+{
+	struct thread	*self;
+	char		 c;
+
+	self = current_thread;
+
+	for (;;) {
+		if (uart_buf_head != uart_buf_tail) {
+			c = uart_buf[uart_buf_tail & UART_BUF_MASK];
+			uart_buf_tail++;
+			return ((unsigned char)c);
+		}
+
+		__atomic_store_n(&uart_wake_pending, 0, __ATOMIC_RELAXED);
+		__atomic_store_n(&uart_waiter, self, __ATOMIC_RELEASE);
+
+		if (uart_buf_head != uart_buf_tail) {
+			__atomic_store_n(&uart_waiter, NULL,
+			    __ATOMIC_RELAXED);
+			c = uart_buf[uart_buf_tail & UART_BUF_MASK];
+			uart_buf_tail++;
+			return ((unsigned char)c);
+		}
+
+		if (__atomic_load_n(&uart_wake_pending,
+		    __ATOMIC_ACQUIRE) != 0) {
+			__atomic_store_n(&uart_waiter, NULL,
+			    __ATOMIC_RELAXED);
+			continue;
+		}
+
+		thread_block(THREAD_BLOCK_SLEEP, (void *)&uart_buf_head);
+	}
+}
+
+/*
+ * COM1 IRQ handler.  Drains every byte currently in the receiver
+ * (the 16550 fires one IRQ per FIFO-trigger-threshold but the line
+ * may have several bytes queued), pushes into the ring, then hands
+ * the parked consumer over via sched_post_irq_wake.
+ */
+static void
+uart_irq(struct trapframe *tf)
+{
+	uint8_t	b;
+
+	(void)tf;
+
+	while ((inb(COM_LSR(uart_base)) & LSR_DATA_READY) != 0) {
+		b = inb(COM_DR(uart_base));
+		/*
+		 * Convert CR (the terminal "Enter" byte on most TTY
+		 * line disciplines) to LF so the shell's line-mode
+		 * '\n' check matches without us replicating cooked-tty
+		 * logic here.
+		 */
+		if (b == '\r')
+			b = '\n';
+		uart_buf_push((char)b);
+	}
+}
+
+static void
+uart_buf_push(char ch)
+{
+	struct thread	*w;
+	uint32_t	 next;
+
+	next = uart_buf_head + 1;
+	if (next - uart_buf_tail > UART_BUF_SIZE)
+		return;
+
+	uart_buf[uart_buf_head & UART_BUF_MASK] = ch;
+	uart_buf_head = next;
+
+	w = __atomic_exchange_n(&uart_waiter, NULL, __ATOMIC_ACQUIRE);
+	if (w != NULL) {
+		__atomic_store_n(&uart_wake_pending, 1, __ATOMIC_RELEASE);
+		sched_post_irq_wake(w);
+	}
 }

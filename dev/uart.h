@@ -32,4 +32,18 @@ void	uart_putc(char);
 void	uart_puts(const char *);
 void	uart_write(const char *, size_t);
 
+/*
+ * Enable IRQ-driven receive on COM1.  Must be called *after* the IDT
+ * is up and interrupts are globally enabled -- the IRQ trampoline
+ * routes through irq_install / pic_unmask just like every other line.
+ */
+void	uart_enable_rx(void);
+
+/*
+ * Blocking IRQ-driven read.  Symmetric to kbd_getc_block: if the RX
+ * ring is empty, the caller parks via thread_block and is woken when
+ * the COM1 IRQ pushes a byte.  Single-consumer only.
+ */
+int	uart_getc_block(void);
+
 #endif /* !_DEV_UART_H_ */

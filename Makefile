@@ -83,7 +83,8 @@ OBJS	= \
 	$(OBJDIR)/dbgcon.o	\
 	$(OBJDIR)/uart.o	\
 	$(OBJDIR)/kbd.o		\
-	$(OBJDIR)/kbd_drv.o
+	$(OBJDIR)/kbd_drv.o	\
+	$(OBJDIR)/uart_drv.o
 
 all: kernel.elf
 
