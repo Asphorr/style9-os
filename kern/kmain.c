@@ -92,7 +92,13 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	uart_drv_init();
 
 	syscall_init();
-	usermode_run_first_blob();
+	/*
+	 * Just spawn hello.elf for now: the inline blob and the ELF
+	 * both map at the same USER_CODE_VA/USER_STACK_VA, and with
+	 * one shared PML4 a preempted blob would resume onto the
+	 * ELF's freshly-overwritten pages.  Per-task PML4 lifts
+	 * this; until then, one user thread at a time.
+	 */
 	usermode_run_hello_elf();
 
 	shell_run();
