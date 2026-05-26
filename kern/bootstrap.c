@@ -95,6 +95,27 @@ bootstrap_name_copy(char *dst, const char *src)
 		dst[i] = '\0';
 }
 
+size_t
+bootstrap_snapshot(char (*out_names)[BOOTSTRAP_NAME_MAX],
+    mach_port_name_t *out_knames, size_t max)
+{
+	size_t	i, n;
+
+	if (out_names == NULL || out_knames == NULL || max == 0)
+		return (0);
+
+	spin_lock(&registry_lock);
+	n = registry_count < max ? registry_count : max;
+	for (i = 0; i < n; i++) {
+		size_t j;
+		for (j = 0; j < BOOTSTRAP_NAME_MAX; j++)
+			out_names[i][j] = registry[i].bs_name[j];
+		out_knames[i] = registry[i].bs_kname;
+	}
+	spin_unlock(&registry_lock);
+	return (n);
+}
+
 int
 bootstrap_register(const char *name, mach_port_name_t kernel_name)
 {

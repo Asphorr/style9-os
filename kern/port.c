@@ -1404,6 +1404,11 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *msg)
 			    (struct task *)dest->p_special_arg, msg, from));
 		case PORT_SPECIAL_BOOTSTRAP:
 			return (bootstrap_dispatch(msg, from));
+		case PORT_SPECIAL_SERVICE: {
+			port_service_fn fn;
+			fn = (port_service_fn)(uintptr_t)dest->p_special_arg;
+			return (fn(msg, from));
+		}
 		default:
 			return (MACH_E_INVAL);
 		}
@@ -2184,6 +2189,22 @@ port_create_kernel_owned(uint8_t special_kind, void *special_arg)
 	p->p_special_arg = special_arg;
 	port_ref(p, MACH_PORT_RIGHT_RECEIVE);
 	return (p);
+}
+
+/*
+ * Install a SEND right for `p` in kernel_space at the next-free name
+ * and return that name in *name_out.  Used by services_init to wire
+ * each kernel-side service port into kernel_space so bootstrap can
+ * hand it out via COPY_SEND descriptors at lookup time.
+ */
+int
+port_install_send_in_kernel(struct port *p, mach_port_name_t *name_out)
+{
+
+	if (p == NULL || name_out == NULL)
+		return (MACH_E_INVAL);
+	return (space_install(kernel_space, p, MACH_PORT_RIGHT_SEND,
+	    name_out));
 }
 
 /*

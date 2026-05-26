@@ -139,10 +139,25 @@ _Static_assert(sizeof(struct mach_msg_port_descriptor) == 8,
  *	NONE		regular Mach port -- normal send/recv semantics
  *	TASK_SELF	p_special_arg is (struct task *), the target task
  *	BOOTSTRAP	the single global service registry; arg is unused
+ *	SERVICE		p_special_arg is a (port_service_fn) -- generic
+ *			kernel-side service hook, used by clock/stats/tasks
  */
 #define	PORT_SPECIAL_NONE		0
 #define	PORT_SPECIAL_TASK_SELF		1
 #define	PORT_SPECIAL_BOOTSTRAP		2
+#define	PORT_SPECIAL_SERVICE		3
+
+struct port_space;	/* fwd decl for the typedef below */
+
+/*
+ * Signature of a PORT_SPECIAL_SERVICE dispatcher.  Stashed by the port
+ * creator in p_special_arg; called from mach_msg_send's intercept with
+ * the incoming request header + the caller's port_space.  Implementations
+ * synthesize a reply and send it to req->msgh_local; the return value
+ * propagates back to the original sender as the mach_msg_send result.
+ */
+typedef int (*port_service_fn)(const struct mach_msg_header *req,
+		struct port_space *from);
 
 /*
  * Every task's port_space carries a SEND right to its own task_self

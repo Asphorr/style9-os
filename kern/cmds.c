@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "bootstrap.h"
 #include "clock.h"
 #include "kmem.h"
 #include "kprintf.h"
@@ -18,6 +19,7 @@
 #include "pmm.h"
 #include "port.h"
 #include "sched.h"
+#include "services.h"
 #include "shell.h"
 #include "stress.h"
 #include "task.h"
@@ -39,6 +41,7 @@ static int	cmd_sched(int, char **);
 static int	cmd_yield(int, char **);
 static int	cmd_stress(int, char **);
 static int	cmd_crash(int, char **);
+static int	cmd_mach(int, char **);
 
 static int	streq(const char *, const char *);
 static int	parse_uint(const char *s, unsigned int *out);
@@ -63,6 +66,8 @@ const struct shell_cmd	shell_cmds[] = {
 	{ "sched",  "scheduler state + ctx switches",         cmd_sched  },
 	{ "yield",  "yield to next thread (then return)",     cmd_yield  },
 	{ "stress", "stress <mem|boundary|timer|port|thread|preempt>", cmd_stress },
+	{ "mach",   "mach <ls|clock|stats|tasks> (bootstrap-served RPCs)",
+		cmd_mach   },
 	{ "crash",  "crash <dfree|wild|assert|unmapped|nonc>", cmd_crash  },
 	{ "panic",  "deliberate panic (tests panic path)",    cmd_panic  },
 };
@@ -583,4 +588,207 @@ parse_uint(const char *s, unsigned int *out)
 	}
 	*out = v;
 	return (0);
+}
+
+/* ---- `mach' command: bootstrap + service RPC demo --------------------- */
+
+/*
+ * Resolve a service name via the bootstrap port and return a SEND name
+ * for it in kernel_space.  The caller must port_deallocate when done.
+ * Returns MACH_PORT_NULL on failure.
+ */
+static mach_port_name_t
+mach_lookup(const char *svc_name)
+{
+	struct {
+		struct mach_msg_header			hdr;
+		struct bootstrap_lookup_request		body;
+	} req;
+	struct {
+		struct mach_msg_header			hdr;
+		struct mach_msg_body			body;
+		struct mach_msg_port_descriptor		pd;
+	} reply;
+	size_t	i;
+	int	rv;
+
+	for (i = 0; i < BOOTSTRAP_NAME_MAX; i++)
+		req.body.blr_name[i] = 0;
+	for (i = 0; svc_name[i] != '\0' && i < BOOTSTRAP_NAME_MAX - 1; i++)
+		req.body.blr_name[i] = svc_name[i];
+
+	req.hdr.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	req.hdr.msgh_size    = sizeof(req);
+	req.hdr.msgh_remote  = MACH_PORT_BOOTSTRAP;
+	req.hdr.msgh_local   = MACH_PORT_NULL;
+	req.hdr.msgh_voucher = 0;
+	req.hdr.msgh_id      = BOOTSTRAP_OP_LOOKUP;
+
+	rv = mach_msg_rpc(kernel_space, &req.hdr, &reply.hdr,
+	    sizeof(reply), 1000);
+	if (rv != MACH_MSG_OK)
+		return (MACH_PORT_NULL);
+	if (reply.hdr.msgh_id == BOOTSTRAP_REPLY_NOT_FOUND ||
+	    !(reply.hdr.msgh_bits & MACH_MSGH_BITS_COMPLEX))
+		return (MACH_PORT_NULL);
+	return (reply.pd.name);
+}
+
+static int
+mach_ls(void)
+{
+	char			names[BOOTSTRAP_MAX_SERVICES][BOOTSTRAP_NAME_MAX];
+	mach_port_name_t	knames[BOOTSTRAP_MAX_SERVICES];
+	size_t			n, i;
+
+	n = bootstrap_snapshot(names, knames, BOOTSTRAP_MAX_SERVICES);
+	kprintf("bootstrap services: %zu registered\n", n);
+	for (i = 0; i < n; i++)
+		kprintf("  %-16s -> kernel name %u\n", names[i],
+		    (unsigned)knames[i]);
+	return (0);
+}
+
+static int
+mach_call_clock(void)
+{
+	struct mach_msg_header		req;
+	struct {
+		struct mach_msg_header		hdr;
+		struct svc_clock_reply		body;
+	} reply;
+	mach_port_name_t		svc;
+	int				rv;
+
+	svc = mach_lookup(SVC_CLOCK_NAME);
+	if (svc == MACH_PORT_NULL) {
+		kprintf("mach: clock lookup failed\n");
+		return (1);
+	}
+
+	req.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	req.msgh_size    = sizeof(req);
+	req.msgh_remote  = svc;
+	req.msgh_local   = MACH_PORT_NULL;
+	req.msgh_voucher = 0;
+	req.msgh_id      = CLOCK_OP_GET;
+
+	rv = mach_msg_rpc(kernel_space, &req, &reply.hdr, sizeof(reply),
+	    1000);
+	(void)port_deallocate(kernel_space, svc);
+	if (rv != MACH_MSG_OK) {
+		kprintf("mach clock: rpc rv=%s\n", mach_msg_strerror(rv));
+		return (1);
+	}
+
+	kprintf("clock: uptime %llu ms / %llu us, ticks=%llu\n",
+	    (unsigned long long)reply.body.cr_uptime_ms,
+	    (unsigned long long)reply.body.cr_uptime_us,
+	    (unsigned long long)reply.body.cr_ticks);
+	return (0);
+}
+
+static int
+mach_call_stats(void)
+{
+	struct mach_msg_header		req;
+	struct {
+		struct mach_msg_header		hdr;
+		struct svc_stats_reply		body;
+	} reply;
+	mach_port_name_t		svc;
+	int				rv;
+
+	svc = mach_lookup(SVC_STATS_NAME);
+	if (svc == MACH_PORT_NULL) {
+		kprintf("mach: stats lookup failed\n");
+		return (1);
+	}
+
+	req.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	req.msgh_size    = sizeof(req);
+	req.msgh_remote  = svc;
+	req.msgh_local   = MACH_PORT_NULL;
+	req.msgh_voucher = 0;
+	req.msgh_id      = STATS_OP_GET;
+
+	rv = mach_msg_rpc(kernel_space, &req, &reply.hdr, sizeof(reply),
+	    1000);
+	(void)port_deallocate(kernel_space, svc);
+	if (rv != MACH_MSG_OK) {
+		kprintf("mach stats: rpc rv=%s\n", mach_msg_strerror(rv));
+		return (1);
+	}
+
+	kprintf("stats: pmm_used=%llu kmem_cached=%llu kernel_inuse=%llu\n",
+	    (unsigned long long)reply.body.sr_pmm_used_pages,
+	    (unsigned long long)reply.body.sr_kmem_cached_pages,
+	    (unsigned long long)reply.body.sr_kernel_inuse);
+	kprintf("       tasks=%llu threads=%llu ctx_switches=%llu\n",
+	    (unsigned long long)reply.body.sr_task_count,
+	    (unsigned long long)reply.body.sr_thread_count,
+	    (unsigned long long)reply.body.sr_ctx_switches);
+	return (0);
+}
+
+static int
+mach_call_tasks(void)
+{
+	struct mach_msg_header		req;
+	struct {
+		struct mach_msg_header		hdr;
+		struct svc_tasks_reply		body;
+	} reply;
+	mach_port_name_t		svc;
+	uint32_t			i;
+	int				rv;
+
+	svc = mach_lookup(SVC_TASKS_NAME);
+	if (svc == MACH_PORT_NULL) {
+		kprintf("mach: tasks lookup failed\n");
+		return (1);
+	}
+
+	req.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	req.msgh_size    = sizeof(req);
+	req.msgh_remote  = svc;
+	req.msgh_local   = MACH_PORT_NULL;
+	req.msgh_voucher = 0;
+	req.msgh_id      = TASKS_OP_LIST;
+
+	rv = mach_msg_rpc(kernel_space, &req, &reply.hdr, sizeof(reply),
+	    1000);
+	(void)port_deallocate(kernel_space, svc);
+	if (rv != MACH_MSG_OK) {
+		kprintf("mach tasks: rpc rv=%s\n", mach_msg_strerror(rv));
+		return (1);
+	}
+
+	kprintf("tasks via Mach: %u live\n",
+	    (unsigned)reply.body.tr_count);
+	for (i = 0; i < reply.body.tr_count && i < SVC_TASKS_MAX; i++) {
+		kprintf("  id=%llu  threads=%u  name='%s'\n",
+		    (unsigned long long)reply.body.tr_entries[i].te_task_id,
+		    (unsigned)reply.body.tr_entries[i].te_nthreads,
+		    reply.body.tr_entries[i].te_name);
+	}
+	return (0);
+}
+
+static int
+cmd_mach(int argc, char *argv[])
+{
+
+	if (argc < 2 || streq(argv[1], "ls"))
+		return (mach_ls());
+	if (streq(argv[1], "clock"))
+		return (mach_call_clock());
+	if (streq(argv[1], "stats"))
+		return (mach_call_stats());
+	if (streq(argv[1], "tasks"))
+		return (mach_call_tasks());
+
+	kprintf("mach: unknown subcommand '%s'\n", argv[1]);
+	kprintf("mach: usage: mach [ls|clock|stats|tasks]\n");
+	return (1);
 }

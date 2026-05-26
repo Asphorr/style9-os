@@ -9,6 +9,7 @@
 
 #include "bootstrap.h"
 #include "clock.h"
+#include "services.h"
 #include "gdt.h"
 #include "idt.h"
 #include "intr.h"
@@ -103,6 +104,15 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	if (bootstrap_register("kernel_task",
 	    MACH_PORT_TASK_SELF) != MACH_MSG_OK)
 		panic("kmain: bootstrap_register(kernel_task)");
+
+	/*
+	 * Bring up the kernel-side Mach services (clock, stats, tasks).
+	 * Each is a PORT_SPECIAL_SERVICE port with a synchronous
+	 * dispatcher, registered under its string name in the bootstrap
+	 * port so any task -- kernel or future ring-3 -- finds them via
+	 * the standard bootstrap_lookup path.
+	 */
+	services_init();
 
 	syscall_init();
 	/*

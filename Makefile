@@ -77,6 +77,7 @@ OBJS	= \
 	$(OBJDIR)/kmem.o	\
 	$(OBJDIR)/port.o	\
 	$(OBJDIR)/bootstrap.o	\
+	$(OBJDIR)/services.o	\
 	$(OBJDIR)/task.o	\
 	$(OBJDIR)/thread.o	\
 	$(OBJDIR)/sched.o	\

@@ -65,6 +65,15 @@ void			 task_print(struct task *);
 void			 task_list_print(void);
 
 /*
+ * Snapshot live-task pointers into the caller's `out` array (max
+ * entries).  No refs are bumped -- the snapshot is best-effort and
+ * intended for short-lived, kernel-side use (e.g. the `tasks` service
+ * dispatcher building its reply payload).  Returns the number of
+ * pointers written.
+ */
+size_t			 task_snapshot(struct task **out, size_t max);
+
+/*
  * Synchronous dispatcher invoked by mach_msg_send when the destination
  * port is tagged PORT_SPECIAL_TASK_SELF.  Reads `req->msgh_id` to pick
  * an op (see TASK_OP_* in port.h), assembles a reply message, and

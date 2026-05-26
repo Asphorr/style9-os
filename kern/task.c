@@ -357,3 +357,21 @@ task_list_print(void)
 	}
 	spin_unlock(&tasks_lock);
 }
+
+size_t
+task_snapshot(struct task **out, size_t max)
+{
+	size_t	i, n;
+
+	if (out == NULL || max == 0)
+		return (0);
+
+	n = 0;
+	spin_lock(&tasks_lock);
+	for (i = 0; i < TASK_LIST_MAX && n < max; i++) {
+		if (task_list[i] != NULL)
+			out[n++] = task_list[i];
+	}
+	spin_unlock(&tasks_lock);
+	return (n);
+}

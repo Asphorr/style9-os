@@ -81,4 +81,13 @@ struct port	*bootstrap_get_port(void);
 int		bootstrap_dispatch(const struct mach_msg_header *req,
 		    struct port_space *from);
 
+/*
+ * Snapshot the current registry.  Copies up to `max` (name, kernel_name)
+ * entries into the caller's `out_names` / `out_knames` arrays and
+ * returns how many were filled.  Used by the shell's `mach` command;
+ * order is registration order.
+ */
+size_t		bootstrap_snapshot(char (*out_names)[BOOTSTRAP_NAME_MAX],
+		    mach_port_name_t *out_knames, size_t max);
+
 #endif /* !_SYS_BOOTSTRAP_H_ */
