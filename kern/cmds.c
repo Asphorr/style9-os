@@ -11,6 +11,7 @@
 
 #include "bootstrap.h"
 #include "clock.h"
+#include "dev_subsystem.h"
 #include "klog.h"
 #include "kmem.h"
 #include "kprintf.h"
@@ -46,6 +47,7 @@ static int	cmd_crash(int, char **);
 static int	cmd_mach(int, char **);
 static int	cmd_vmmap(int, char **);
 static int	cmd_log(int, char **);
+static int	cmd_dev(int, char **);
 
 static int	streq(const char *, const char *);
 static int	parse_uint(const char *s, unsigned int *out);
@@ -74,6 +76,7 @@ const struct shell_cmd	shell_cmds[] = {
 		cmd_mach   },
 	{ "vmmap",  "kernel_task vm_map entries",             cmd_vmmap  },
 	{ "log",    "log <tail|debug|info|warn|error> [text]", cmd_log   },
+	{ "dev",    "dev <ls|info NAME|write uart TEXT>",     cmd_dev    },
 	{ "crash",  "crash <dfree|wild|assert|unmapped|nonc>", cmd_crash  },
 	{ "panic",  "deliberate panic (tests panic path)",    cmd_panic  },
 };
@@ -952,5 +955,163 @@ cmd_log(int argc, char *argv[])
 		return (log_write_via_mach(KLOG_LEVEL_ERROR, buf));
 
 	kprintf("log: unknown level '%s'\n", argv[1]);
+	return (1);
+}
+
+/* ---- dev control-port consumer ----------------------------------------- */
+
+/*
+ * Look up dev/<name> in the bootstrap port and return the resulting
+ * SEND right's name in kernel_space.  Caller port_deallocate's it when
+ * done.  Counterpart of mach_lookup() above, with the "dev/" prefix
+ * applied so cmd_dev callers can use bare device names.
+ */
+static mach_port_name_t
+dev_lookup(const char *short_name)
+{
+	char	full[BOOTSTRAP_NAME_MAX];
+	size_t	i, j;
+
+	for (i = 0; i < DEV_PREFIX_LEN; i++)
+		full[i] = DEV_PREFIX[i];
+	for (j = 0; short_name[j] != '\0' && i < BOOTSTRAP_NAME_MAX - 1; j++)
+		full[i++] = short_name[j];
+	full[i] = '\0';
+	return (mach_lookup(full));
+}
+
+static int
+dev_call_info(const char *name)
+{
+	struct mach_msg_header		req;
+	struct {
+		struct mach_msg_header	hdr;
+		struct dev_info_reply	body;
+	} reply;
+	const char		*kind_name;
+	mach_port_name_t	 svc;
+	int			 rv;
+
+	svc = dev_lookup(name);
+	if (svc == MACH_PORT_NULL) {
+		kprintf("dev info: '%s' not registered\n", name);
+		return (1);
+	}
+
+	req.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	req.msgh_size    = sizeof(req);
+	req.msgh_remote  = svc;
+	req.msgh_local   = MACH_PORT_NULL;
+	req.msgh_voucher = 0;
+	req.msgh_id      = DEV_OP_INFO;
+
+	rv = mach_msg_rpc(kernel_space, &req, &reply.hdr, sizeof(reply), 1000);
+	(void)port_deallocate(kernel_space, svc);
+	if (rv != MACH_MSG_OK) {
+		kprintf("dev info: rpc rv=%s\n", mach_msg_strerror(rv));
+		return (1);
+	}
+
+	switch (reply.body.dir_kind) {
+	case DEV_KIND_STREAM_RX: kind_name = "stream-rx"; break;
+	case DEV_KIND_STREAM_TX: kind_name = "stream-tx"; break;
+	case DEV_KIND_CHAR:      kind_name = "char";      break;
+	case DEV_KIND_BLOCK:     kind_name = "block";     break;
+	default:                 kind_name = "?";         break;
+	}
+	kprintf("  name=%-12s kind=%-10s flags=%c%c%c\n",
+	    reply.body.dir_name, kind_name,
+	    (reply.body.dir_flags & DEV_F_READABLE) ? 'r' : '-',
+	    (reply.body.dir_flags & DEV_F_WRITABLE) ? 'w' : '-',
+	    (reply.body.dir_flags & DEV_F_STREAM)   ? 's' : '-');
+	return (0);
+}
+
+static int
+dev_ls(void)
+{
+	char	names[8][DEV_NAME_MAX];
+	size_t	n, i;
+
+	n = dev_list_names(names, 8);
+	if (n == 0) {
+		kprintf("dev: no devices registered\n");
+		return (0);
+	}
+	kprintf("dev: %zu device(s)\n", n);
+	for (i = 0; i < n; i++)
+		(void)dev_call_info(names[i]);
+	return (0);
+}
+
+static int
+dev_write(const char *name, const char *text)
+{
+	struct {
+		struct mach_msg_header		hdr;
+		struct dev_write_request	body;
+	} req;
+	struct {
+		struct mach_msg_header		hdr;
+		struct dev_write_reply		body;
+	} reply;
+	mach_port_name_t	svc;
+	size_t			i, len;
+	int			rv;
+
+	svc = dev_lookup(name);
+	if (svc == MACH_PORT_NULL) {
+		kprintf("dev write: '%s' not registered\n", name);
+		return (1);
+	}
+
+	req.body.dwr_pad = 0;
+	for (i = 0; i < DEV_WRITE_MAX; i++)
+		req.body.dwr_data[i] = 0;
+	for (len = 0; text[len] != '\0' && len < DEV_WRITE_MAX - 1; len++)
+		req.body.dwr_data[len] = (uint8_t)text[len];
+	req.body.dwr_data[len++] = '\n';
+	req.body.dwr_len = (uint32_t)len;
+
+	req.hdr.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	req.hdr.msgh_size    = sizeof(req);
+	req.hdr.msgh_remote  = svc;
+	req.hdr.msgh_local   = MACH_PORT_NULL;
+	req.hdr.msgh_voucher = 0;
+	req.hdr.msgh_id      = DEV_OP_WRITE;
+
+	rv = mach_msg_rpc(kernel_space, &req.hdr, &reply.hdr, sizeof(reply),
+	    1000);
+	(void)port_deallocate(kernel_space, svc);
+	if (rv != MACH_MSG_OK) {
+		kprintf("dev write: rpc rv=%s\n", mach_msg_strerror(rv));
+		return (1);
+	}
+	kprintf("dev write %s: %u bytes\n", name,
+	    (unsigned)reply.body.dwr_written);
+	return (0);
+}
+
+static int
+cmd_dev(int argc, char *argv[])
+{
+
+	if (argc < 2 || streq(argv[1], "ls"))
+		return (dev_ls());
+	if (streq(argv[1], "info")) {
+		if (argc < 3) {
+			kprintf("dev info: usage: dev info NAME\n");
+			return (1);
+		}
+		return (dev_call_info(argv[2]));
+	}
+	if (streq(argv[1], "write")) {
+		if (argc < 4) {
+			kprintf("dev write: usage: dev write NAME TEXT\n");
+			return (1);
+		}
+		return (dev_write(argv[2], argv[3]));
+	}
+	kprintf("dev: unknown subcommand '%s'\n", argv[1]);
 	return (1);
 }

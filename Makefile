@@ -94,6 +94,7 @@ OBJS	= \
 	$(OBJDIR)/kbd.o		\
 	$(OBJDIR)/kbd_drv.o	\
 	$(OBJDIR)/uart_drv.o	\
+	$(OBJDIR)/dev_subsystem.o \
 	$(OBJDIR)/elf.o		\
 	$(OBJDIR)/hello_elf.o	\
 	$(OBJDIR)/ksym.o
