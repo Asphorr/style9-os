@@ -93,6 +93,7 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 
 	syscall_init();
 	usermode_run_first_blob();
+	usermode_run_hello_elf();
 
 	shell_run();
 	/* NOTREACHED */

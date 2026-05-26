@@ -168,6 +168,11 @@ _start:
 	movl	$0xC0000080, %ecx		/* IA32_EFER */
 	rdmsr
 	orl	$0x100, %eax			/* EFER.LME */
+	orl	$0x800, %eax			/* EFER.NXE -- bit 63 of a   */
+						/* PTE is the NX bit; without */
+						/* NXE the CPU treats it as a */
+						/* reserved bit and any walk  */
+						/* lands in a reserved-bit #PF*/
 	wrmsr
 
 	movl	%cr0, %eax

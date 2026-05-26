@@ -8,6 +8,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "elf.h"
 #include "gdt.h"
 #include "kprintf.h"
 #include "panic.h"
@@ -22,7 +23,17 @@
 extern uint8_t	user_blob_start[];
 extern uint8_t	user_blob_end[];
 
+/*
+ * Symbols emitted by objcopy when it wraps obj/hello.elf into
+ * obj/hello_elf.o (rule in the top-level Makefile).  The wrapper
+ * creates `..._start`, `..._end`, and `..._size` from the file path,
+ * so the names follow the obj/ prefix.
+ */
+extern uint8_t	_binary_hello_elf_start[];
+extern uint8_t	_binary_hello_elf_end[];
+
 static void	usermode_launcher(void *) __attribute__((noreturn));
+static void	usermode_elf_launcher(void *) __attribute__((noreturn));
 
 void
 usermode_run_first_blob(void)
@@ -34,6 +45,67 @@ usermode_run_first_blob(void)
 	if (th == NULL)
 		panic("usermode_run_first_blob: thread_create failed");
 	thread_start(th);
+}
+
+void
+usermode_run_hello_elf(void)
+{
+	struct thread	*th;
+
+	th = thread_create(kernel_task, usermode_elf_launcher, NULL,
+	    "user-elf");
+	if (th == NULL)
+		panic("usermode_run_hello_elf: thread_create failed");
+	thread_start(th);
+}
+
+/*
+ * Launcher for a ring-3 program shipped as an embedded ELF64.  Differs
+ * from usermode_launcher in that elf_load handles segment mapping and
+ * picks the entry RIP off e_entry; we only own the stack mapping.
+ */
+static void
+usermode_elf_launcher(void *arg)
+{
+	uint64_t	*kva;
+	uint64_t	 entry;
+	uint64_t	 stack_pa;
+	uint64_t	 ksp;
+	size_t		 i;
+	size_t		 image_size;
+	int		 rv;
+
+	(void)arg;
+
+	image_size = (size_t)(_binary_hello_elf_end -
+	    _binary_hello_elf_start);
+
+	rv = elf_load(_binary_hello_elf_start, image_size, &entry);
+	if (rv != ELF_E_OK)
+		panic("usermode_elf_launcher: elf_load rv=%d", rv);
+
+	stack_pa = pmm_alloc_page();
+	if (stack_pa == PA_INVALID)
+		panic("usermode_elf_launcher: stack alloc failed");
+	if (!pmap_kenter(USER_STACK_VA, stack_pa,
+	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_USER))
+		panic("usermode_elf_launcher: stack map failed");
+
+	kva = (uint64_t *)pmm_kva_from_pa(stack_pa);
+	for (i = 0; i < 512; i++)
+		kva[i] = 0;
+
+	ksp = (uint64_t)current_thread->th_kstack_base +
+	    current_thread->th_kstack_size;
+	tss_set_rsp0(ksp);
+	syscall_kernel_rsp = ksp;
+
+	kprintf("usermode: hello.elf entry=0x%llx (image=%zu bytes), "
+	    "stack=0x%llx\n",
+	    (unsigned long long)entry, image_size,
+	    (unsigned long long)USER_STACK_TOP);
+
+	usermode_enter(entry, USER_STACK_TOP);
 }
 
 /*

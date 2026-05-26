@@ -61,18 +61,35 @@ syscall_entry:
 	/* %rax holds the syscall's return value */
 
 	/*
-	 * Restore the bits SYSRETQ needs: %rcx <- user RIP,
-	 * %r11 <- user RFLAGS, %rsp <- user RSP.  Use %rdx as a
-	 * scratch for the RSP transfer; %rdx isn't preserved across
-	 * a syscall (caller-save).
+	 * Restore caller-save state.  The Linux x86_64 SYSCALL ABI
+	 * (which our libc-style user wrappers expect) says the
+	 * kernel preserves everything except %rax (return), %rcx
+	 * (saved RIP), and %r11 (saved RFLAGS).  GCC emits code for
+	 * the user side assuming exactly that, so we mirror it
+	 * here: arg registers come back as the user saw them on the
+	 * way in.
+	 *
+	 * Order: stash user RSP via syscall_user_rsp_scratch first
+	 * (we cannot park it in a register, since all the ones we
+	 * could use are either return-related or about to be
+	 * restored).
 	 */
-	movq	56(%rsp), %r11
-	movq	64(%rsp), %rcx
 	movq	72(%rsp), %rdx
+	movq	%rdx, syscall_user_rsp_scratch(%rip)
+
+	movq	56(%rsp), %r11			/* user RFLAGS */
+	movq	64(%rsp), %rcx			/* user RIP    */
+
+	movq	 0(%rsp), %rdi
+	movq	 8(%rsp), %rsi
+	movq	16(%rsp), %rdx
+	movq	24(%rsp), %r10
+	movq	32(%rsp), %r8
+	movq	40(%rsp), %r9
 
 	addq	$80, %rsp			/* tear down frame */
 
-	movq	%rdx, %rsp			/* back to user stack */
+	movq	syscall_user_rsp_scratch(%rip), %rsp
 
 	sysretq
 

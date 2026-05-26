@@ -14,6 +14,7 @@
 
 CC	= gcc
 LD	= ld
+OBJCOPY	= objcopy
 QEMU	= /mnt/c/Program\ Files/qemu/qemu-system-x86_64.exe
 
 # Directories that contain sources and their public headers.  Listed in
@@ -88,9 +89,38 @@ OBJS	= \
 	$(OBJDIR)/uart.o	\
 	$(OBJDIR)/kbd.o		\
 	$(OBJDIR)/kbd_drv.o	\
-	$(OBJDIR)/uart_drv.o
+	$(OBJDIR)/uart_drv.o	\
+	$(OBJDIR)/elf.o		\
+	$(OBJDIR)/hello_elf.o
 
 all: kernel.elf
+
+# ---- ring-3 user-mode programs ------------------------------------------
+# Built as standalone freestanding ELF64s and then wrapped into kernel-side
+# .o files via objcopy so the kernel image contains the bytes inline.  No
+# filesystem yet, so embedding the ELF directly is the simplest delivery.
+USER_DIR     = user
+USER_CFLAGS  = -m64 -std=c11 -ffreestanding -nostdlib			\
+	       -fno-pic -fno-pie -fno-stack-protector			\
+	       -fno-asynchronous-unwind-tables				\
+	       -mno-red-zone -mno-mmx -mno-sse -mno-sse2		\
+	       -O2 -Wall -Wextra
+USER_LDFLAGS = -m elf_x86_64 -nostdlib -T $(USER_DIR)/user.ld		\
+	       -z noexecstack -z max-page-size=0x1000 -static
+
+$(OBJDIR)/hello.user.o: $(USER_DIR)/hello.c | $(OBJDIR)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(OBJDIR)/hello.elf: $(OBJDIR)/hello.user.o $(USER_DIR)/user.ld
+	$(LD) $(USER_LDFLAGS) -o $@ $(OBJDIR)/hello.user.o
+
+# Wrap the user ELF as a kernel-linkable object so the kernel sees
+# _binary_obj_hello_elf_start / _end symbols.  --rename-section parks
+# the bytes in .rodata so they are read-only at runtime.
+$(OBJDIR)/hello_elf.o: $(OBJDIR)/hello.elf
+	cd $(OBJDIR) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386	\
+	    --rename-section .data=.rodata.hello_elf			\
+	    hello.elf hello_elf.o
 
 kernel.elf: $(OBJS) $(ARCH)/linker.ld
 	$(LD) $(LDFLAGS) -o $@ $(OBJS)

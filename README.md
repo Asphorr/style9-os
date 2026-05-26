@@ -14,6 +14,7 @@ Built from scratch — no upstream tree, no glue from another OS.
 | gdt | `arch/amd64/gdt.c` | 8-entry GDT laid out for `SYSCALL`/`SYSRET` MSR arithmetic; 104-byte TSS with `rsp0` for the ring-3 → ring-0 stack switch on IRQs/exceptions |
 | syscall | `arch/amd64/syscall_entry.S`, `kern/syscall.c` | `SYSCALL` entry stub: stashes user RSP, switches to per-thread kernel stack via `syscall_kernel_rsp`, builds `struct syscall_frame`, calls the C dispatcher, `SYSRETQ` back; MSRs (EFER.SCE / STAR / LSTAR / FMASK) wired in `syscall_init` |
 | usermode | `arch/amd64/usermode.c`, `user_blob.S` | first ring-3 program: launcher thread maps a user code page + user stack page (`VM_PROT_USER`), copies an inline blob, `iretq`s to it.  The blob does `SYS_PRINT("hello ring 3\n")` then `SYS_EXIT` |
+| elf loader | `kern/elf.c` | static ELF64 parser.  Walks PT_LOAD program headers, allocates 4 KiB user pages and maps them U=1 with R/W/X taken from p_flags, copies file data via the kernel-VA alias of the freshly-allocated frame.  Used to load `hello.elf` (built from `user/hello.c`, embedded in the kernel image via objcopy) |
 | traps | `arch/amd64/idt.c`, `intr.c`, `isr.S` | 48-vector IDT, trap-frame dispatcher, autopsy print on exception |
 | irqs | `arch/amd64/pic.c`, `pit.c` | 8259 remap to 0x20/0x28, PIT @ 100 Hz with quantum tracking |
 | clock | `kern/tsc.c`, `clock.c` | rdtsc + PIT-anchored calibration, `uptime_ms`, busy-sleep |
@@ -168,16 +169,31 @@ Loosely Mach-shape rather than BSD-shape:
   (kernel ↔ worker-task) IPC — it's just two different `port_space`
   arguments.
 
-User-kernel split is in: a ring-3 task with SYSCALL/SYSRET is wired,
-the first user-mode program is an inline blob in the kernel image
-that prints via SYS_PRINT and exits via SYS_EXIT.
+User-kernel split is in.  Ring-3 tasks now come from two paths:
+the inline kernel blob (kept as the smallest possible self-test) and
+ELF64 programs built from `user/*.c` and embedded into the kernel
+image via `objcopy --rename-section .data=.rodata.hello_elf`.  The
+kernel ELF loader walks PT_LOAD segments, maps each at the requested
+VA with U=1, and `iretq`s to `e_entry`.
 
-Next on the roadmap: ELF64 loader so user-mode programs build
-separately and ship as `.elf` files; per-task PML4 for real
-isolation; copy-in/out + SMAP so syscalls can validate user
-pointers; `mach_msg` over the syscall boundary so userspace
-participates in the IPC story.  Deferred indefinitely: out-of-line
-memory descriptors, real SMP.
+Boot tail showing both programs run:
+
+```
+usermode: entering ring 3 (rip=0x40000000 rsp=0x40010000, blob=54 bytes)
+hello ring 3
+[user thread exited, code=0]
+usermode: hello.elf entry=0x40000000 (image=8864 bytes), stack=0x40010000
+hello from hello.elf (loaded by kernel ELF parser, ring 3)
+  -- second syscall round-trip
+[user thread exited, code=0]
+```
+
+Next on the roadmap: per-task PML4 for real isolation (today one
+shared PML4 with U=1 leaves); copy-in/out + SMAP so syscalls can
+validate user pointers; `mach_msg` over the syscall boundary so
+userspace participates in the IPC story; a filesystem so ELFs can
+live on disk instead of being embedded.  Deferred indefinitely:
+out-of-line memory descriptors, real SMP.
 
 ## License
 

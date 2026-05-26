@@ -26,10 +26,17 @@
  */
 
 #define	USER_CODE_VA	0x40000000ULL	/* just past the 1 GiB boot map */
-#define	USER_STACK_VA	0x40001000ULL	/* one page above code          */
+#define	USER_STACK_VA	0x4000F000ULL	/* high in the first user page run */
 #define	USER_STACK_TOP	(USER_STACK_VA + 0x1000ULL)
 
 void	usermode_run_first_blob(void);
+
+/*
+ * usermode_run_hello_elf: load the kernel-embedded hello.elf
+ * (linked in via objcopy as _binary_obj_hello_elf_start ... _end) and
+ * iretq to its e_entry on a fresh user stack.
+ */
+void	usermode_run_hello_elf(void);
 
 /*
  * usermode_enter: never returns to its caller.  Pushes a synthetic
