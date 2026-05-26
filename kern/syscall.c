@@ -5,12 +5,15 @@
  * All rights reserved.
  */
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #include "kprintf.h"
+#include "port.h"
 #include "sched.h"
 #include "syscall.h"
+#include "task.h"
 #include "thread.h"
 #include "tty.h"
 
@@ -29,6 +32,13 @@ extern void	syscall_entry(void);
 static long	sys_print(const char *buf, size_t len);
 static long	sys_exit(int code) __attribute__((noreturn));
 static long	sys_yield(void);
+static long	sys_port_alloc(uint8_t rights);
+static long	sys_port_dealloc(mach_port_name_t name);
+static long	sys_msg_send(const struct mach_msg_header *umsg);
+static long	sys_msg_recv(mach_port_name_t name,
+		    struct mach_msg_header *ubuf, size_t ubuf_size);
+
+static bool	user_range_ok(uint64_t addr, size_t len);
 
 static inline uint64_t
 rdmsr(uint32_t msr)
@@ -99,6 +109,17 @@ syscall_dispatch(struct syscall_frame *f)
 		/* NOTREACHED */
 	case SYS_YIELD:
 		return (sys_yield());
+	case SYS_PORT_ALLOC:
+		return (sys_port_alloc((uint8_t)f->sf_arg0));
+	case SYS_PORT_DEALLOC:
+		return (sys_port_dealloc((mach_port_name_t)f->sf_arg0));
+	case SYS_MSG_SEND:
+		return (sys_msg_send(
+		    (const struct mach_msg_header *)f->sf_arg0));
+	case SYS_MSG_RECV:
+		return (sys_msg_recv((mach_port_name_t)f->sf_arg0,
+		    (struct mach_msg_header *)f->sf_arg1,
+		    (size_t)f->sf_arg2));
 	default:
 		return (SYS_E_NOSYS);
 	}
@@ -139,4 +160,85 @@ sys_yield(void)
 
 	thread_yield();
 	return (0);
+}
+
+/*
+ * User pointer range check.
+ *
+ * Today every ring-3 task shares the kernel's PML4 with U=1 leaves
+ * placed at [0x40000000, 0x80000000) -- the slot just past the boot
+ * identity map.  Until per-task pmaps + a real vm_map exist, the
+ * coarse "is the whole [addr, addr+len) inside that window?" check is
+ * enough to catch a userspace pointer that points back into kernel
+ * memory.  When SMAP comes online we'll also bracket the deref with
+ * stac/clac.
+ */
+#define	USER_VA_LO	0x40000000ULL
+#define	USER_VA_HI	0x80000000ULL
+
+static bool
+user_range_ok(uint64_t addr, size_t len)
+{
+
+	if (len == 0)
+		return (true);
+	if (addr < USER_VA_LO || addr >= USER_VA_HI)
+		return (false);
+	if (addr + len < addr)
+		return (false);
+	if (addr + len > USER_VA_HI)
+		return (false);
+	return (true);
+}
+
+static long
+sys_port_alloc(uint8_t rights)
+{
+	mach_port_name_t	n;
+
+	n = port_allocate(kernel_task->t_port_space, rights);
+	if (n == MACH_PORT_NULL)
+		return (SYS_E_INVAL);
+	return ((long)n);
+}
+
+static long
+sys_port_dealloc(mach_port_name_t name)
+{
+
+	return ((long)port_deallocate(kernel_task->t_port_space, name));
+}
+
+/*
+ * sys_msg_send / sys_msg_recv.
+ *
+ * The user supplies a pointer to a Mach header.  We honour the user's
+ * msgh_size (header + body bytes) but copy in / out via the kernel's
+ * direct view of the shared address space -- no kmalloc round-trip
+ * yet.  Once per-task pmaps exist this becomes the canonical place
+ * for a real copy-in.
+ */
+static long
+sys_msg_send(const struct mach_msg_header *umsg)
+{
+
+	if (!user_range_ok((uint64_t)(uintptr_t)umsg,
+	    sizeof(struct mach_msg_header)))
+		return (SYS_E_FAULT);
+	if (!user_range_ok((uint64_t)(uintptr_t)umsg, umsg->msgh_size))
+		return (SYS_E_FAULT);
+
+	return ((long)mach_msg_send(kernel_task->t_port_space, umsg));
+}
+
+static long
+sys_msg_recv(mach_port_name_t name, struct mach_msg_header *ubuf,
+    size_t ubuf_size)
+{
+
+	if (!user_range_ok((uint64_t)(uintptr_t)ubuf, ubuf_size))
+		return (SYS_E_FAULT);
+
+	return ((long)mach_msg_recv_block(kernel_task->t_port_space,
+	    name, ubuf, ubuf_size));
 }

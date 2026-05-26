@@ -25,9 +25,13 @@
  * own block without renumbering existing ones.
  */
 
-#define	SYS_PRINT	0	/* (const char *buf, size_t len) -> bytes written */
-#define	SYS_EXIT	1	/* (int code) -> NORETURN                          */
-#define	SYS_YIELD	2	/* ()         -> 0                                 */
+#define	SYS_PRINT		0	/* (const char *buf, size_t len) -> bytes  */
+#define	SYS_EXIT		1	/* (int code) -> NORETURN                  */
+#define	SYS_YIELD		2	/* ()         -> 0                         */
+#define	SYS_PORT_ALLOC		3	/* (uint8_t right_mask)         -> name    */
+#define	SYS_PORT_DEALLOC	4	/* (mach_port_name_t name)      -> 0/err   */
+#define	SYS_MSG_SEND		5	/* (struct mach_msg_header *)   -> 0/err   */
+#define	SYS_MSG_RECV		6	/* (name, buf, buf_size)        -> 0/err   */
 
 #define	SYS_E_NOSYS	(-1)
 #define	SYS_E_FAULT	(-2)

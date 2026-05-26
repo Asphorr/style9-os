@@ -4,20 +4,52 @@
  * Copyright (c) 2026 The Hobby OS Project
  * All rights reserved.
  *
- * First standalone ring-3 program for style9-os.  Built as a static
- * freestanding ELF64 by user/Makefile (or the top-level Makefile's
- * user-mode rules), linked at VA USER_LOAD_BASE (0x40000000) just
- * past the kernel's 1 GiB identity map.  No libc, just inline
- * syscalls.
+ * Ring-3 demo for style9-os.
+ *
+ *	1. Print a hello banner via SYS_PRINT.
+ *	2. Allocate a Mach port (RECEIVE | SEND) via SYS_PORT_ALLOC.
+ *	3. Send a self-message carrying a tagged msgh_id via SYS_MSG_SEND.
+ *	4. Receive it via SYS_MSG_RECV (blocking recv on the same port).
+ *	5. Print confirmation that the round-trip succeeded.
+ *	6. SYS_PORT_DEALLOC + SYS_EXIT.
+ *
+ * This exercises the full IPC plumbing across the user/kernel boundary:
+ * port_alloc + mach_msg_send + mach_msg_recv_block, all from ring 3.
  */
 
-typedef unsigned long	size_t;
-typedef long		ssize_t;
+typedef unsigned long		size_t;
+typedef long			ssize_t;
+typedef unsigned int		uint32_t;
+typedef unsigned char		uint8_t;
 
 /* Must agree with kern/syscall.h. */
-#define	SYS_PRINT	0
-#define	SYS_EXIT	1
-#define	SYS_YIELD	2
+#define	SYS_PRINT		0
+#define	SYS_EXIT		1
+#define	SYS_YIELD		2
+#define	SYS_PORT_ALLOC		3
+#define	SYS_PORT_DEALLOC	4
+#define	SYS_MSG_SEND		5
+#define	SYS_MSG_RECV		6
+
+/* Must agree with kern/port.h. */
+#define	MACH_PORT_NULL			((uint32_t)0)
+#define	MACH_PORT_RIGHT_RECEIVE		0x01u
+#define	MACH_PORT_RIGHT_SEND		0x02u
+
+#define	MACH_MSG_TYPE_COPY_SEND		19
+#define	MACH_MSGH_BITS(remote, local)	\
+	(((uint32_t)(remote) & 0xFFu) | (((uint32_t)(local) & 0xFFu) << 8))
+
+struct mach_msg_header {
+	uint32_t	msgh_bits;
+	uint32_t	msgh_size;
+	uint32_t	msgh_remote;
+	uint32_t	msgh_local;
+	uint32_t	msgh_voucher;
+	uint32_t	msgh_id;
+};
+
+/* ---- syscall wrappers ------------------------------------------------- */
 
 static long
 syscall1(long nr, long a0)
@@ -44,6 +76,20 @@ syscall2(long nr, long a0, long a1)
 }
 
 static long
+syscall3(long nr, long a0, long a1, long a2)
+{
+	long	ret;
+
+	__asm__ __volatile__ ("syscall"
+	    : "=a"(ret)
+	    : "0"(nr), "D"(a0), "S"(a1), "d"(a2)
+	    : "rcx", "r11", "memory");
+	return (ret);
+}
+
+/* ---- libc-shaped helpers --------------------------------------------- */
+
+static long
 write1(const char *s, size_t n)
 {
 
@@ -61,17 +107,89 @@ strlen(const char *s)
 	return (n);
 }
 
-static const char	banner[] =
-    "hello from hello.elf (loaded by kernel ELF parser, ring 3)\n";
-static const char	follow[] = "  -- second syscall round-trip\n";
+static void
+puts1(const char *s)
+{
+
+	(void)write1(s, strlen(s));
+}
+
+/* Tiny hex printer: writes 4 bytes of an msgh_id as "0xXXXXXXXX\n". */
+static void
+print_id(const char *prefix, uint32_t id)
+{
+	char		buf[32];
+	const char	hex[] = "0123456789ABCDEF";
+	size_t		i;
+	size_t		p;
+
+	p = 0;
+	while (prefix[p] != '\0') {
+		buf[p] = prefix[p];
+		p++;
+	}
+	buf[p++] = '0';
+	buf[p++] = 'x';
+	for (i = 0; i < 8; i++) {
+		buf[p++] = hex[(id >> ((7 - i) * 4)) & 0xFu];
+	}
+	buf[p++] = '\n';
+	(void)write1(buf, p);
+}
+
+/* ---- demo ------------------------------------------------------------ */
+
+#define	DEMO_TAG	0xCAFEBABEu
 
 __attribute__((noreturn))
 void
 _start(void)
 {
+	struct mach_msg_header	tx;
+	struct mach_msg_header	rx;
+	long			name_or_err;
+	long			rv;
+	uint32_t		name;
 
-	write1(banner, sizeof(banner) - 1);
-	write1(follow, strlen(follow));
+	puts1("hello from hello.elf (loaded by kernel ELF parser, ring 3)\n");
+
+	name_or_err = syscall1(SYS_PORT_ALLOC,
+	    MACH_PORT_RIGHT_RECEIVE | MACH_PORT_RIGHT_SEND);
+	if (name_or_err <= 0) {
+		puts1("  port_alloc failed\n");
+		syscall1(SYS_EXIT, 1);
+	}
+	name = (uint32_t)name_or_err;
+	print_id("  allocated port = ", name);
+
+	tx.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	tx.msgh_size    = sizeof(tx);
+	tx.msgh_remote  = name;
+	tx.msgh_local   = MACH_PORT_NULL;
+	tx.msgh_voucher = 0;
+	tx.msgh_id      = DEMO_TAG;
+
+	rv = syscall1(SYS_MSG_SEND, (long)&tx);
+	if (rv != 0) {
+		puts1("  msg_send failed\n");
+		syscall1(SYS_EXIT, 2);
+	}
+	puts1("  self-send queued\n");
+
+	rv = syscall3(SYS_MSG_RECV, (long)name, (long)&rx, (long)sizeof(rx));
+	if (rv != 0) {
+		puts1("  msg_recv failed\n");
+		syscall1(SYS_EXIT, 3);
+	}
+	print_id("  recv'd msgh_id = ", rx.msgh_id);
+
+	if (rx.msgh_id != DEMO_TAG) {
+		puts1("  TAG MISMATCH -- IPC corrupted\n");
+		syscall1(SYS_EXIT, 4);
+	}
+	puts1("  mach_msg round-trip via SYSCALL: OK\n");
+
+	(void)syscall1(SYS_PORT_DEALLOC, (long)name);
 
 	syscall1(SYS_EXIT, 0);
 	for (;;)

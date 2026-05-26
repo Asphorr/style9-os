@@ -12,7 +12,8 @@ Built from scratch — no upstream tree, no glue from another OS.
 |---|---|---|
 | boot | `arch/amd64/boot.S`, `linker.ld` | MB2 header + PVH ELF note, 32→64 mode transition, identity-map low 1 GiB with 2 MiB huge pages |
 | gdt | `arch/amd64/gdt.c` | 8-entry GDT laid out for `SYSCALL`/`SYSRET` MSR arithmetic; 104-byte TSS with `rsp0` for the ring-3 → ring-0 stack switch on IRQs/exceptions |
-| syscall | `arch/amd64/syscall_entry.S`, `kern/syscall.c` | `SYSCALL` entry stub: stashes user RSP, switches to per-thread kernel stack via `syscall_kernel_rsp`, builds `struct syscall_frame`, calls the C dispatcher, `SYSRETQ` back; MSRs (EFER.SCE / STAR / LSTAR / FMASK) wired in `syscall_init` |
+| syscall | `arch/amd64/syscall_entry.S`, `kern/syscall.c` | `SYSCALL` entry stub: stashes user RSP, switches to per-thread kernel stack via `syscall_kernel_rsp`, builds `struct syscall_frame`, calls the C dispatcher, `SYSRETQ` back; MSRs (EFER.SCE / STAR / LSTAR / FMASK) wired in `syscall_init`.  Caller-save registers are restored from the frame on the way out so user code matches the Linux x86_64 ABI |
+| syscalls list | `kern/syscall.c` | `SYS_PRINT`, `SYS_EXIT`, `SYS_YIELD`, `SYS_PORT_ALLOC`, `SYS_PORT_DEALLOC`, `SYS_MSG_SEND`, `SYS_MSG_RECV` -- the last four expose the full Mach IPC surface to ring 3 |
 | usermode | `arch/amd64/usermode.c`, `user_blob.S` | first ring-3 program: launcher thread maps a user code page + user stack page (`VM_PROT_USER`), copies an inline blob, `iretq`s to it.  The blob does `SYS_PRINT("hello ring 3\n")` then `SYS_EXIT` |
 | elf loader | `kern/elf.c` | static ELF64 parser.  Walks PT_LOAD program headers, allocates 4 KiB user pages and maps them U=1 with R/W/X taken from p_flags, copies file data via the kernel-VA alias of the freshly-allocated frame.  Used to load `hello.elf` (built from `user/hello.c`, embedded in the kernel image via objcopy) |
 | traps | `arch/amd64/idt.c`, `intr.c`, `isr.S` | 48-vector IDT, trap-frame dispatcher, autopsy print on exception |
@@ -176,24 +177,31 @@ image via `objcopy --rename-section .data=.rodata.hello_elf`.  The
 kernel ELF loader walks PT_LOAD segments, maps each at the requested
 VA with U=1, and `iretq`s to `e_entry`.
 
-Boot tail showing both programs run:
+Mach IPC is now reachable from ring 3.  `hello.elf` allocates a
+port via `SYS_PORT_ALLOC`, sends a tagged self-message via
+`SYS_MSG_SEND`, blocks on `SYS_MSG_RECV`, and confirms the tag
+round-trips byte-for-byte:
 
 ```
-usermode: entering ring 3 (rip=0x40000000 rsp=0x40010000, blob=54 bytes)
-hello ring 3
-[user thread exited, code=0]
-usermode: hello.elf entry=0x40000000 (image=8864 bytes), stack=0x40010000
+usermode: hello.elf entry=0x400000a0 (image=9008 bytes), stack=0x40010000
 hello from hello.elf (loaded by kernel ELF parser, ring 3)
-  -- second syscall round-trip
+  allocated port = 0x00000004
+  self-send queued
+  recv'd msgh_id = 0xCAFEBABE
+  mach_msg round-trip via SYSCALL: OK
 [user thread exited, code=0]
 ```
+
+The same kernel-side `mach_msg_send` / `mach_msg_recv_block` that
+the 12 stress tests exercise is what userspace calls -- the syscall
+layer just range-checks the user pointer and forwards.
 
 Next on the roadmap: per-task PML4 for real isolation (today one
-shared PML4 with U=1 leaves); copy-in/out + SMAP so syscalls can
-validate user pointers; `mach_msg` over the syscall boundary so
-userspace participates in the IPC story; a filesystem so ELFs can
-live on disk instead of being embedded.  Deferred indefinitely:
-out-of-line memory descriptors, real SMP.
+shared PML4 with U=1 leaves); SMAP so user-pointer derefs are
+bracketed by stac/clac; a userspace shell that recv's keys via the
+existing `kbd_input_port`/`uart_input_port` port set; a filesystem
+so ELFs can live on disk instead of being embedded.  Deferred
+indefinitely: out-of-line memory descriptors, real SMP.
 
 ## License
 
