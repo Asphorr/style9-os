@@ -102,7 +102,10 @@ OBJS	= \
 	$(OBJDIR)/ata_drv.o	\
 	$(OBJDIR)/dev_subsystem.o \
 	$(OBJDIR)/elf.o		\
+	$(OBJDIR)/progreg.o	\
 	$(OBJDIR)/hello_elf.o	\
+	$(OBJDIR)/clock_elf.o	\
+	$(OBJDIR)/tasks_elf.o	\
 	$(OBJDIR)/ksym.o
 
 all: kernel.elf
@@ -111,28 +114,63 @@ all: kernel.elf
 # Built as standalone freestanding ELF64s and then wrapped into kernel-side
 # .o files via objcopy so the kernel image contains the bytes inline.  No
 # filesystem yet, so embedding the ELF directly is the simplest delivery.
+#
+# Every user program links against libstyle9 (lib/style9*.{c,h} + crt0.S).
+# crt0 provides _start, calls main(argc=0, argv=NULL), then exit(rv).
 USER_DIR     = user
+LIB_DIR      = lib
 USER_CFLAGS  = -m64 -std=c11 -ffreestanding -nostdlib			\
 	       -fno-pic -fno-pie -fno-stack-protector			\
 	       -fno-asynchronous-unwind-tables				\
 	       -mno-red-zone -mno-mmx -mno-sse -mno-sse2		\
-	       -O2 -Wall -Wextra
+	       -O2 -Wall -Wextra					\
+	       -I$(LIB_DIR)
+USER_ASFLAGS = -m64 -fno-pic -fno-pie -I$(LIB_DIR)
 USER_LDFLAGS = -m elf_x86_64 -nostdlib -T $(USER_DIR)/user.ld		\
 	       -z noexecstack -z max-page-size=0x1000 -static
 
-$(OBJDIR)/hello.user.o: $(USER_DIR)/hello.c | $(OBJDIR)
+# libstyle9 objects.  crt0 MUST come first on the link line so its
+# _start lands at the .text._start section the linker script anchors
+# at e_entry; the LD script orders sections via *(.text._start) first,
+# but listing crt0 ahead of the rest is the canonical libc pattern
+# and avoids surprises if the script ever changes.
+LIB_OBJS = \
+	$(OBJDIR)/crt0.o	\
+	$(OBJDIR)/style9_sys.o	\
+	$(OBJDIR)/style9_str.o	\
+	$(OBJDIR)/style9_mem.o	\
+	$(OBJDIR)/style9_io.o	\
+	$(OBJDIR)/style9_mach.o
+
+$(OBJDIR)/crt0.o: $(LIB_DIR)/crt0.S | $(OBJDIR)
+	$(CC) $(USER_ASFLAGS) -c $< -o $@
+
+$(OBJDIR)/style9_%.o: $(LIB_DIR)/style9_%.c | $(OBJDIR)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(OBJDIR)/hello.elf: $(OBJDIR)/hello.user.o $(USER_DIR)/user.ld
-	$(LD) $(USER_LDFLAGS) -o $@ $(OBJDIR)/hello.user.o
+# List the user programs in the registry.  Each must have a matching
+# user/<name>.c file; everything else is wired up via the pattern rules
+# below.  To add one, drop user/<name>.c on disk, append the name here,
+# and register the matching _binary_<name>_elf_start/_end pair in
+# kern/progreg.c.
+USER_PROGRAMS = hello clock tasks
 
-# Wrap the user ELF as a kernel-linkable object so the kernel sees
-# _binary_obj_hello_elf_start / _end symbols.  --rename-section parks
-# the bytes in .rodata so they are read-only at runtime.
-$(OBJDIR)/hello_elf.o: $(OBJDIR)/hello.elf
+$(OBJDIR)/%.user.o: $(USER_DIR)/%.c | $(OBJDIR)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(OBJDIR)/%.elf: $(OBJDIR)/%.user.o $(LIB_OBJS) $(USER_DIR)/user.ld
+	$(LD) $(USER_LDFLAGS) -o $@ $(LIB_OBJS) $(OBJDIR)/$*.user.o
+
+# Wrap each user ELF as a kernel-linkable object so the kernel sees
+# _binary_<name>_elf_start / _end symbols.  --rename-section parks the
+# bytes in .rodata so they are read-only at runtime.  cd $(OBJDIR) so
+# objcopy doesn't bake the obj/ prefix into the symbol names.
+$(OBJDIR)/%_elf.o: $(OBJDIR)/%.elf
 	cd $(OBJDIR) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386	\
-	    --rename-section .data=.rodata.hello_elf			\
-	    hello.elf hello_elf.o
+	    --rename-section .data=.rodata.$*_elf			\
+	    $*.elf $*_elf.o
+
+USER_ELFS = $(foreach p,$(USER_PROGRAMS),$(OBJDIR)/$(p).elf)
 
 #
 # Two-pass link to embed a kernel-symbol table in .ksymtab.

@@ -4,230 +4,35 @@
  * Copyright (c) 2026 The Hobby OS Project
  * All rights reserved.
  *
- * Ring-3 demo for style9-os.
+ * Ring-3 demo for style9-os, now linked against libstyle9.
  *
- *	1. Print a hello banner via SYS_PRINT.
- *	2. Allocate a Mach port (RECEIVE | SEND) via SYS_PORT_ALLOC.
- *	3. Send a self-message carrying a tagged msgh_id via SYS_MSG_SEND.
- *	4. Receive it via SYS_MSG_RECV (blocking recv on the same port).
- *	5. Print confirmation that the round-trip succeeded.
- *	6. Probe the new timeout path: SYS_MSG_RECV_TIMED on an empty port
- *	   with a 50 ms deadline, expect an error return (E_TIMEOUT).
- *	7. Issue a TASK_OP_GET_INFO RPC to MACH_PORT_TASK_SELF, print the
- *	   task id and name the kernel returns.
- *	8. Bootstrap-lookup the service registered as "kernel_task", then
- *	   send TASK_OP_GET_INFO to the SEND right the kernel just handed
- *	   us in the lookup reply, verifying the looked-up name still
- *	   triggers the synchronous task_self dispatcher.
- *	9. SYS_PORT_DEALLOC + SYS_EXIT.
- *
- * This exercises the full IPC plumbing across the user/kernel boundary:
- * port_alloc + mach_msg_send + mach_msg_recv_block + mach_msg_recv_timed
- * + mach_msg_rpc, all from ring 3.
+ * Steps (each demos one layer of the user/kernel IPC plumbing):
+ *	1. printf banner via SYS_PRINT
+ *	2. mach_port_allocate + self-send + recv round-trip
+ *	3. mach_msg_recv_timed on an empty port (expect E_TIMEOUT)
+ *	4. task_self GET_INFO RPC (sync dispatcher in the kernel)
+ *	5. bootstrap_lookup("kernel_task") + GET_INFO chained call
  */
 
-typedef unsigned long		size_t;
-typedef long			ssize_t;
-typedef unsigned int		uint32_t;
-typedef unsigned char		uint8_t;
-
-/* Must agree with kern/syscall.h. */
-#define	SYS_PRINT		0
-#define	SYS_EXIT		1
-#define	SYS_YIELD		2
-#define	SYS_PORT_ALLOC		3
-#define	SYS_PORT_DEALLOC	4
-#define	SYS_MSG_SEND		5
-#define	SYS_MSG_RECV		6
-#define	SYS_MSG_RECV_TIMED	7
-#define	SYS_MSG_RPC		8
-
-/* MACH_E_TIMEOUT from kern/port.h -- recv_timed returns this on deadline. */
-#define	MACH_E_TIMEOUT		9
-
-/* Well-known names + op codes for the task_self / bootstrap ports
- * (kern/port.h + kern/bootstrap.h). */
-#define	MACH_PORT_TASK_SELF		((uint32_t)1)
-#define	MACH_PORT_BOOTSTRAP		((uint32_t)2)
-#define	TASK_OP_GET_INFO		1
-#define	BOOTSTRAP_OP_LOOKUP		1
-#define	BOOTSTRAP_REPLY_NOT_FOUND	0xFFFFFFFFu
-#define	BOOTSTRAP_NAME_MAX		32
-#define	MACH_MSGH_BITS_COMPLEX		0x80000000u
-#define	MACH_MSG_PORT_DESCRIPTOR	0
-
-/* Mirror of struct task_info_reply -- 48 bytes following the header. */
-struct task_info_reply {
-	unsigned long long	tir_task_id;
-	uint32_t		tir_nthreads;
-	uint32_t		tir_pad;
-	char			tir_name[32];
-};
-
-struct bootstrap_lookup_request {
-	char	blr_name[BOOTSTRAP_NAME_MAX];
-};
-
-struct mach_msg_body {
-	uint32_t	msgh_descriptor_count;
-};
-
-struct mach_msg_port_descriptor {
-	uint32_t	name;
-	uint8_t		pad1;
-	uint8_t		disposition;
-	uint8_t		type;
-	uint8_t		pad2;
-};
-
-/* Must agree with kern/port.h. */
-#define	MACH_PORT_NULL			((uint32_t)0)
-#define	MACH_PORT_RIGHT_RECEIVE		0x01u
-#define	MACH_PORT_RIGHT_SEND		0x02u
-
-#define	MACH_MSG_TYPE_COPY_SEND		19
-#define	MACH_MSGH_BITS(remote, local)	\
-	(((uint32_t)(remote) & 0xFFu) | (((uint32_t)(local) & 0xFFu) << 8))
-
-struct mach_msg_header {
-	uint32_t	msgh_bits;
-	uint32_t	msgh_size;
-	uint32_t	msgh_remote;
-	uint32_t	msgh_local;
-	uint32_t	msgh_voucher;
-	uint32_t	msgh_id;
-};
-
-/* ---- syscall wrappers ------------------------------------------------- */
-
-static long
-syscall1(long nr, long a0)
-{
-	long	ret;
-
-	__asm__ __volatile__ ("syscall"
-	    : "=a"(ret)
-	    : "0"(nr), "D"(a0)
-	    : "rcx", "r11", "memory");
-	return (ret);
-}
-
-static long
-syscall2(long nr, long a0, long a1)
-{
-	long	ret;
-
-	__asm__ __volatile__ ("syscall"
-	    : "=a"(ret)
-	    : "0"(nr), "D"(a0), "S"(a1)
-	    : "rcx", "r11", "memory");
-	return (ret);
-}
-
-static long
-syscall3(long nr, long a0, long a1, long a2)
-{
-	long	ret;
-
-	__asm__ __volatile__ ("syscall"
-	    : "=a"(ret)
-	    : "0"(nr), "D"(a0), "S"(a1), "d"(a2)
-	    : "rcx", "r11", "memory");
-	return (ret);
-}
-
-static long
-syscall4(long nr, long a0, long a1, long a2, long a3)
-{
-	register long	r10 __asm__("r10") = a3;
-	long		ret;
-
-	__asm__ __volatile__ ("syscall"
-	    : "=a"(ret)
-	    : "0"(nr), "D"(a0), "S"(a1), "d"(a2), "r"(r10)
-	    : "rcx", "r11", "memory");
-	return (ret);
-}
-
-/* ---- libc-shaped helpers --------------------------------------------- */
-
-static long
-write1(const char *s, size_t n)
-{
-
-	return (syscall2(SYS_PRINT, (long)s, (long)n));
-}
-
-static size_t
-strlen(const char *s)
-{
-	size_t	n;
-
-	n = 0;
-	while (s[n] != '\0')
-		n++;
-	return (n);
-}
-
-static void
-puts1(const char *s)
-{
-
-	(void)write1(s, strlen(s));
-}
-
-/*
- * Tiny hex printer: writes prefix + "0xXXXXXXXX\n".  Sized for the
- * longest prefix any current caller uses ("  bootstrap_lookup(...)")
- * plus the trailing hex+newline; if you grow a caller's prefix past
- * this, grow `buf` too -- there is no length check.
- */
-static void
-print_id(const char *prefix, uint32_t id)
-{
-	char		buf[128];
-	const char	hex[] = "0123456789ABCDEF";
-	size_t		i;
-	size_t		p;
-
-	p = 0;
-	while (prefix[p] != '\0' && p < sizeof(buf) - 11) {
-		buf[p] = prefix[p];
-		p++;
-	}
-	buf[p++] = '0';
-	buf[p++] = 'x';
-	for (i = 0; i < 8; i++) {
-		buf[p++] = hex[(id >> ((7 - i) * 4)) & 0xFu];
-	}
-	buf[p++] = '\n';
-	(void)write1(buf, p);
-}
-
-/* ---- demo ------------------------------------------------------------ */
+#include "style9.h"
 
 #define	DEMO_TAG	0xCAFEBABEu
 
-__attribute__((noreturn))
-void
-_start(void)
+static int
+demo_round_trip(void)
 {
 	struct mach_msg_header	tx;
 	struct mach_msg_header	rx;
-	long			name_or_err;
-	long			rv;
-	uint32_t		name;
+	mach_port_name_t	name;
+	int			rv;
 
-	puts1("hello from hello.elf (loaded by kernel ELF parser, ring 3)\n");
-
-	name_or_err = syscall1(SYS_PORT_ALLOC,
-	    MACH_PORT_RIGHT_RECEIVE | MACH_PORT_RIGHT_SEND);
-	if (name_or_err <= 0) {
-		puts1("  port_alloc failed\n");
-		syscall1(SYS_EXIT, 1);
+	name = mach_port_allocate(MACH_PORT_RIGHT_RECEIVE |
+	    MACH_PORT_RIGHT_SEND);
+	if (name == MACH_PORT_NULL) {
+		printf("  port_allocate failed\n");
+		return (1);
 	}
-	name = (uint32_t)name_or_err;
-	print_id("  allocated port = ", name);
+	printf("  allocated port = 0x%x\n", (uint32_t)name);
 
 	tx.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
 	tx.msgh_size    = sizeof(tx);
@@ -236,166 +41,128 @@ _start(void)
 	tx.msgh_voucher = 0;
 	tx.msgh_id      = DEMO_TAG;
 
-	rv = syscall1(SYS_MSG_SEND, (long)&tx);
-	if (rv != 0) {
-		puts1("  msg_send failed\n");
-		syscall1(SYS_EXIT, 2);
+	rv = mach_msg_send(&tx);
+	if (rv != MACH_MSG_OK) {
+		printf("  msg_send failed (rv=%d)\n", rv);
+		(void)mach_port_deallocate(name);
+		return (2);
 	}
-	puts1("  self-send queued\n");
+	printf("  self-send queued\n");
 
-	rv = syscall3(SYS_MSG_RECV, (long)name, (long)&rx, (long)sizeof(rx));
-	if (rv != 0) {
-		puts1("  msg_recv failed\n");
-		syscall1(SYS_EXIT, 3);
+	rv = mach_msg_recv(name, &rx, sizeof(rx));
+	if (rv != MACH_MSG_OK) {
+		printf("  msg_recv failed (rv=%d)\n", rv);
+		(void)mach_port_deallocate(name);
+		return (3);
 	}
-	print_id("  recv'd msgh_id = ", rx.msgh_id);
-
 	if (rx.msgh_id != DEMO_TAG) {
-		puts1("  TAG MISMATCH -- IPC corrupted\n");
-		syscall1(SYS_EXIT, 4);
+		printf("  TAG MISMATCH: got 0x%x expected 0x%x\n",
+		    rx.msgh_id, DEMO_TAG);
+		(void)mach_port_deallocate(name);
+		return (4);
 	}
-	puts1("  mach_msg round-trip via SYSCALL: OK\n");
+	printf("  mach_msg round-trip via SYSCALL: OK\n");
 
-	/*
-	 * Step 6: timeout probe.  Empty port (we just drained it above),
-	 * 50 ms deadline -- recv_timed must return a non-zero error (the
-	 * kernel surfaces MACH_E_TIMEOUT).  We don't insist on the exact
-	 * code from ring 3, only that the call returns rather than parks
-	 * forever; the kernel-side stress_rpc test asserts the precise
-	 * error code.
-	 */
-	rv = syscall4(SYS_MSG_RECV_TIMED, (long)name, (long)&rx,
-	    (long)sizeof(rx), 50);
-	if (rv == 0) {
-		puts1("  recv_timed unexpectedly returned a message\n");
-		syscall1(SYS_EXIT, 5);
+	/* Empty-port timeout probe. */
+	rv = mach_msg_recv_timed(name, &rx, sizeof(rx), 50);
+	if (rv == MACH_MSG_OK) {
+		printf("  recv_timed unexpectedly returned a message\n");
+		(void)mach_port_deallocate(name);
+		return (5);
 	}
-	if (rv != MACH_E_TIMEOUT) {
-		print_id("  recv_timed odd rv = ", (uint32_t)rv);
-	} else {
-		puts1("  recv_timed returned E_TIMEOUT after 50 ms: OK\n");
+	if (rv != MACH_E_TIMEOUT)
+		printf("  recv_timed odd rv = %d\n", rv);
+	else
+		printf("  recv_timed returned E_TIMEOUT after 50 ms: OK\n");
+
+	(void)mach_port_deallocate(name);
+	return (0);
+}
+
+static int
+demo_task_self(void)
+{
+	struct mach_msg_header	tx;
+	struct {
+		struct mach_msg_header	hdr;
+		struct task_info_reply	body;
+	} reply;
+	int	rv;
+
+	tx.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	tx.msgh_size    = sizeof(tx);
+	tx.msgh_remote  = MACH_PORT_TASK_SELF;
+	tx.msgh_local   = MACH_PORT_NULL;
+	tx.msgh_voucher = 0;
+	tx.msgh_id      = TASK_OP_GET_INFO;
+
+	rv = mach_msg_rpc(&tx, &reply.hdr, sizeof(reply), 1000);
+	if (rv != MACH_MSG_OK) {
+		printf("  task_self GET_INFO rpc failed (rv=%d)\n", rv);
+		return (6);
 	}
+	printf("  task_self GET_INFO ok: name='%s' tir_task_id=%llu\n",
+	    reply.body.tir_name,
+	    (unsigned long long)reply.body.tir_task_id);
+	return (0);
+}
 
-	/*
-	 * Step 7: task_self RPC.  msgh_id = TASK_OP_GET_INFO, the kernel
-	 * synchronously fills a 48-byte task_info_reply right after the
-	 * mach header in our recv buffer.  Reuses `rx` for the reply.
-	 */
-	{
-		struct task_info_reply	*info;
-		struct {
-			struct mach_msg_header	hdr;
-			struct task_info_reply	body;
-		} reply_pkt;
-		size_t			 i;
+static int
+demo_bootstrap_chain(void)
+{
+	struct mach_msg_header	tx;
+	struct {
+		struct mach_msg_header	hdr;
+		struct task_info_reply	body;
+	} info_reply;
+	mach_port_name_t	svc;
+	int			rv;
 
-		tx.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
-		tx.msgh_size    = sizeof(tx);
-		tx.msgh_remote  = MACH_PORT_TASK_SELF;
-		tx.msgh_local   = MACH_PORT_NULL;	/* rpc fills in */
-		tx.msgh_voucher = 0;
-		tx.msgh_id      = TASK_OP_GET_INFO;
-
-		rv = syscall4(SYS_MSG_RPC, (long)&tx, (long)&reply_pkt,
-		    (long)sizeof(reply_pkt), (long)1000);
-		if (rv != 0) {
-			puts1("  task_self GET_INFO rpc failed\n");
-			print_id("    rv = ", (uint32_t)rv);
-			syscall1(SYS_EXIT, 6);
-		}
-
-		info = &reply_pkt.body;
-		puts1("  task_self GET_INFO ok: task name='");
-		for (i = 0; i < sizeof(info->tir_name) &&
-		    info->tir_name[i] != '\0'; i++) {
-			char ch = info->tir_name[i];
-			(void)write1(&ch, 1);
-		}
-		print_id("' tir_task_id = ", (uint32_t)info->tir_task_id);
+	svc = bootstrap_lookup("kernel_task");
+	if (svc == MACH_PORT_NULL) {
+		printf("  bootstrap_lookup('kernel_task') failed\n");
+		return (7);
 	}
+	printf("  bootstrap_lookup('kernel_task') -> name=0x%x\n",
+	    (uint32_t)svc);
 
-	/*
-	 * Step 8: bootstrap_lookup("kernel_task") -> RPC GET_INFO on the
-	 * returned name.  Demonstrates two-step "find by name, then call"
-	 * with two distinct synchronous dispatchers chained.
-	 */
-	{
-		struct {
-			struct mach_msg_header			hdr;
-			struct bootstrap_lookup_request		body;
-		} lookup_req;
-		struct {
-			struct mach_msg_header			hdr;
-			struct mach_msg_body			body;
-			struct mach_msg_port_descriptor		pd;
-		} lookup_reply;
-		struct {
-			struct mach_msg_header			hdr;
-			struct task_info_reply			body;
-		} info_reply;
-		const char	*svc = "kernel_task";
-		size_t		 i;
-		uint32_t	 svc_name_local;
+	tx.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	tx.msgh_size    = sizeof(tx);
+	tx.msgh_remote  = svc;
+	tx.msgh_local   = MACH_PORT_NULL;
+	tx.msgh_voucher = 0;
+	tx.msgh_id      = TASK_OP_GET_INFO;
 
-		for (i = 0; i < BOOTSTRAP_NAME_MAX; i++)
-			lookup_req.body.blr_name[i] = 0;
-		for (i = 0; svc[i] != '\0' && i < BOOTSTRAP_NAME_MAX - 1; i++)
-			lookup_req.body.blr_name[i] = svc[i];
-
-		lookup_req.hdr.msgh_bits    =
-		    MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
-		lookup_req.hdr.msgh_size    = sizeof(lookup_req);
-		lookup_req.hdr.msgh_remote  = MACH_PORT_BOOTSTRAP;
-		lookup_req.hdr.msgh_local   = MACH_PORT_NULL;
-		lookup_req.hdr.msgh_voucher = 0;
-		lookup_req.hdr.msgh_id      = BOOTSTRAP_OP_LOOKUP;
-
-		rv = syscall4(SYS_MSG_RPC, (long)&lookup_req,
-		    (long)&lookup_reply, (long)sizeof(lookup_reply),
-		    (long)1000);
-		if (rv != 0) {
-			puts1("  bootstrap_lookup rpc failed\n");
-			print_id("    rv = ", (uint32_t)rv);
-			syscall1(SYS_EXIT, 7);
-		}
-		if (lookup_reply.hdr.msgh_id == BOOTSTRAP_REPLY_NOT_FOUND ||
-		    !(lookup_reply.hdr.msgh_bits & MACH_MSGH_BITS_COMPLEX)) {
-			puts1("  bootstrap_lookup: service not found\n");
-			syscall1(SYS_EXIT, 8);
-		}
-		svc_name_local = lookup_reply.pd.name;
-		print_id("  bootstrap_lookup('kernel_task') -> name = ",
-		    svc_name_local);
-
-		tx.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
-		tx.msgh_size    = sizeof(tx);
-		tx.msgh_remote  = svc_name_local;
-		tx.msgh_local   = MACH_PORT_NULL;
-		tx.msgh_voucher = 0;
-		tx.msgh_id      = TASK_OP_GET_INFO;
-
-		rv = syscall4(SYS_MSG_RPC, (long)&tx, (long)&info_reply,
-		    (long)sizeof(info_reply), (long)1000);
-		if (rv != 0) {
-			puts1("  GET_INFO via bootstrap-resolved name failed\n");
-			print_id("    rv = ", (uint32_t)rv);
-			syscall1(SYS_EXIT, 9);
-		}
-		puts1("  GET_INFO via bootstrap-resolved name: ok, ");
-		print_id("tir_task_id = ",
-		    (uint32_t)info_reply.body.tir_task_id);
-
-		/*
-		 * The SEND right the lookup gave us is now in our space
-		 * under svc_name_local; deallocate so the conservation
-		 * check at boot remains clean.
-		 */
-		(void)syscall1(SYS_PORT_DEALLOC, (long)svc_name_local);
+	rv = mach_msg_rpc(&tx, &info_reply.hdr, sizeof(info_reply), 1000);
+	(void)mach_port_deallocate(svc);
+	if (rv != MACH_MSG_OK) {
+		printf("  GET_INFO via bootstrap name failed (rv=%d)\n", rv);
+		return (8);
 	}
+	printf("  GET_INFO via bootstrap name: ok, tir_task_id=%llu\n",
+	    (unsigned long long)info_reply.body.tir_task_id);
+	return (0);
+}
 
-	(void)syscall1(SYS_PORT_DEALLOC, (long)name);
+int
+main(void)
+{
+	int	rv;
 
-	syscall1(SYS_EXIT, 0);
-	for (;;)
-		;
+	printf("hello from hello.elf (libstyle9, ring 3)\n");
+
+	rv = demo_round_trip();
+	if (rv != 0)
+		return (rv);
+
+	rv = demo_task_self();
+	if (rv != 0)
+		return (rv);
+
+	rv = demo_bootstrap_chain();
+	if (rv != 0)
+		return (rv);
+
+	printf("hello.elf: all demos passed\n");
+	return (0);
 }
