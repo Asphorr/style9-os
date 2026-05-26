@@ -7,6 +7,7 @@
 
 #include <stdint.h>
 
+#include "bootstrap.h"
 #include "clock.h"
 #include "gdt.h"
 #include "idt.h"
@@ -90,6 +91,18 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 
 	kbd_drv_init();
 	uart_drv_init();
+
+	/*
+	 * Register a demo service under the bootstrap port so ring-3
+	 * code has something to look up.  MACH_PORT_TASK_SELF=1 in
+	 * kernel_space resolves to kernel_task's task_self port; we
+	 * publish it as "kernel_task" so a lookup returns a fresh SEND
+	 * right under a new name in the caller's space, which then
+	 * routes through the synchronous task_self dispatcher when used.
+	 */
+	if (bootstrap_register("kernel_task",
+	    MACH_PORT_TASK_SELF) != MACH_MSG_OK)
+		panic("kmain: bootstrap_register(kernel_task)");
 
 	syscall_init();
 	/*
@@ -224,6 +237,7 @@ kmain_memory(uint32_t mb_magic, uint32_t mb_info)
 	pmap_bootstrap();
 	kmem_init();
 	port_subsystem_init();
+	bootstrap_init();
 	task_subsystem_init();
 	thread_subsystem_init();
 	sched_init();

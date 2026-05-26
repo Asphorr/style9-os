@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "bootstrap.h"
 #include "clock.h"
 #include "kmem.h"
 #include "kprintf.h"
@@ -1401,6 +1402,8 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *msg)
 		case PORT_SPECIAL_TASK_SELF:
 			return (task_self_dispatch(
 			    (struct task *)dest->p_special_arg, msg, from));
+		case PORT_SPECIAL_BOOTSTRAP:
+			return (bootstrap_dispatch(msg, from));
 		default:
 			return (MACH_E_INVAL);
 		}
@@ -2160,6 +2163,59 @@ port_release_task_self(struct task *t)
 		return;
 	t->t_self_port = NULL;
 	port_deref(p, MACH_PORT_RIGHT_RECEIVE);
+}
+
+/*
+ * Mint a port object the kernel itself owns (RECEIVE held, no name in
+ * any port_space) with a p_special tag pre-set.  Used to mint the
+ * singleton bootstrap port; future kernel-implemented Mach objects
+ * (host_self etc.) can use the same factory.
+ */
+struct port *
+port_create_kernel_owned(uint8_t special_kind, void *special_arg)
+{
+	struct port	*p;
+
+	p = port_create();
+	if (p == NULL)
+		return (NULL);
+
+	p->p_special     = special_kind;
+	p->p_special_arg = special_arg;
+	port_ref(p, MACH_PORT_RIGHT_RECEIVE);
+	return (p);
+}
+
+/*
+ * Install a SEND right to the global bootstrap port at name
+ * MACH_PORT_BOOTSTRAP in t->t_port_space.  Mirrors
+ * port_install_task_self in shape; differs in that the underlying
+ * port object is singleton-shared rather than per-task.
+ */
+int
+port_install_bootstrap(struct task *t)
+{
+	struct port		*p;
+	mach_port_name_t	 name;
+	int			 rv;
+
+	if (t == NULL || t->t_port_space == NULL)
+		return (MACH_E_INVAL);
+
+	p = bootstrap_get_port();
+	if (p == NULL)
+		return (MACH_E_DEAD);	/* bootstrap_init has not run */
+
+	rv = space_install(t->t_port_space, p, MACH_PORT_RIGHT_SEND, &name);
+	if (rv != MACH_MSG_OK)
+		return (rv);
+
+	if (name != MACH_PORT_BOOTSTRAP) {
+		panic("port_install_bootstrap: name %u, expected %u "
+		    "(was MACH_PORT_TASK_SELF installed first?)",
+		    (unsigned)name, (unsigned)MACH_PORT_BOOTSTRAP);
+	}
+	return (MACH_MSG_OK);
 }
 
 /* ---- diagnostics ----------------------------------------------------- */

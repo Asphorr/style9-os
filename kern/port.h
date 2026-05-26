@@ -138,16 +138,20 @@ _Static_assert(sizeof(struct mach_msg_port_descriptor) == 8,
  * Tag values:
  *	NONE		regular Mach port -- normal send/recv semantics
  *	TASK_SELF	p_special_arg is (struct task *), the target task
+ *	BOOTSTRAP	the single global service registry; arg is unused
  */
 #define	PORT_SPECIAL_NONE		0
 #define	PORT_SPECIAL_TASK_SELF		1
+#define	PORT_SPECIAL_BOOTSTRAP		2
 
 /*
  * Every task's port_space carries a SEND right to its own task_self
- * port at this well-known name.  Set up by task_create so the slot is
- * already populated by the time the first thread runs.
+ * port at this well-known name (set up by task_create) plus a SEND
+ * right to the global bootstrap port at the next slot.  Both are
+ * already populated by the time the task's first thread runs.
  */
 #define	MACH_PORT_TASK_SELF		((mach_port_name_t)1)
+#define	MACH_PORT_BOOTSTRAP		((mach_port_name_t)2)
 
 /*
  * Op codes used as msgh_id on messages sent to MACH_PORT_TASK_SELF.
@@ -342,6 +346,20 @@ int			 port_install_task_self(struct task *);
  * ref so the port can finally reach zero refs and be reclaimed.
  */
 void			 port_release_task_self(struct task *);
+
+/*
+ * Install a SEND right to the global bootstrap port (see kern/bootstrap.c)
+ * at MACH_PORT_BOOTSTRAP in t->t_port_space.  The bootstrap port itself
+ * must already exist (bootstrap_init) when this is called.  Idempotent
+ * across the call -- if the well-known slot is already populated for
+ * this task, no-op return MACH_MSG_OK.
+ *
+ * Slot ABI: this MUST land at name MACH_PORT_BOOTSTRAP (=2).  Since the
+ * function is invoked from task_create right after port_install_task_self
+ * (which always lands at name 1), the next-free slot is name 2, which
+ * matches.  port_install_bootstrap panics otherwise.
+ */
+int			 port_install_bootstrap(struct task *);
 
 /*
  * Introspection / debugging.

@@ -15,7 +15,11 @@
  *	   with a 50 ms deadline, expect an error return (E_TIMEOUT).
  *	7. Issue a TASK_OP_GET_INFO RPC to MACH_PORT_TASK_SELF, print the
  *	   task id and name the kernel returns.
- *	8. SYS_PORT_DEALLOC + SYS_EXIT.
+ *	8. Bootstrap-lookup the service registered as "kernel_task", then
+ *	   send TASK_OP_GET_INFO to the SEND right the kernel just handed
+ *	   us in the lookup reply, verifying the looked-up name still
+ *	   triggers the synchronous task_self dispatcher.
+ *	9. SYS_PORT_DEALLOC + SYS_EXIT.
  *
  * This exercises the full IPC plumbing across the user/kernel boundary:
  * port_alloc + mach_msg_send + mach_msg_recv_block + mach_msg_recv_timed
@@ -41,9 +45,16 @@ typedef unsigned char		uint8_t;
 /* MACH_E_TIMEOUT from kern/port.h -- recv_timed returns this on deadline. */
 #define	MACH_E_TIMEOUT		9
 
-/* Well-known name + op codes for the task_self port (kern/port.h). */
-#define	MACH_PORT_TASK_SELF	((uint32_t)1)
-#define	TASK_OP_GET_INFO	1
+/* Well-known names + op codes for the task_self / bootstrap ports
+ * (kern/port.h + kern/bootstrap.h). */
+#define	MACH_PORT_TASK_SELF		((uint32_t)1)
+#define	MACH_PORT_BOOTSTRAP		((uint32_t)2)
+#define	TASK_OP_GET_INFO		1
+#define	BOOTSTRAP_OP_LOOKUP		1
+#define	BOOTSTRAP_REPLY_NOT_FOUND	0xFFFFFFFFu
+#define	BOOTSTRAP_NAME_MAX		32
+#define	MACH_MSGH_BITS_COMPLEX		0x80000000u
+#define	MACH_MSG_PORT_DESCRIPTOR	0
 
 /* Mirror of struct task_info_reply -- 48 bytes following the header. */
 struct task_info_reply {
@@ -51,6 +62,22 @@ struct task_info_reply {
 	uint32_t		tir_nthreads;
 	uint32_t		tir_pad;
 	char			tir_name[32];
+};
+
+struct bootstrap_lookup_request {
+	char	blr_name[BOOTSTRAP_NAME_MAX];
+};
+
+struct mach_msg_body {
+	uint32_t	msgh_descriptor_count;
+};
+
+struct mach_msg_port_descriptor {
+	uint32_t	name;
+	uint8_t		pad1;
+	uint8_t		disposition;
+	uint8_t		type;
+	uint8_t		pad2;
 };
 
 /* Must agree with kern/port.h. */
@@ -149,17 +176,22 @@ puts1(const char *s)
 	(void)write1(s, strlen(s));
 }
 
-/* Tiny hex printer: writes 4 bytes of an msgh_id as "0xXXXXXXXX\n". */
+/*
+ * Tiny hex printer: writes prefix + "0xXXXXXXXX\n".  Sized for the
+ * longest prefix any current caller uses ("  bootstrap_lookup(...)")
+ * plus the trailing hex+newline; if you grow a caller's prefix past
+ * this, grow `buf` too -- there is no length check.
+ */
 static void
 print_id(const char *prefix, uint32_t id)
 {
-	char		buf[32];
+	char		buf[128];
 	const char	hex[] = "0123456789ABCDEF";
 	size_t		i;
 	size_t		p;
 
 	p = 0;
-	while (prefix[p] != '\0') {
+	while (prefix[p] != '\0' && p < sizeof(buf) - 11) {
 		buf[p] = prefix[p];
 		p++;
 	}
@@ -280,6 +312,85 @@ _start(void)
 			(void)write1(&ch, 1);
 		}
 		print_id("' tir_task_id = ", (uint32_t)info->tir_task_id);
+	}
+
+	/*
+	 * Step 8: bootstrap_lookup("kernel_task") -> RPC GET_INFO on the
+	 * returned name.  Demonstrates two-step "find by name, then call"
+	 * with two distinct synchronous dispatchers chained.
+	 */
+	{
+		struct {
+			struct mach_msg_header			hdr;
+			struct bootstrap_lookup_request		body;
+		} lookup_req;
+		struct {
+			struct mach_msg_header			hdr;
+			struct mach_msg_body			body;
+			struct mach_msg_port_descriptor		pd;
+		} lookup_reply;
+		struct {
+			struct mach_msg_header			hdr;
+			struct task_info_reply			body;
+		} info_reply;
+		const char	*svc = "kernel_task";
+		size_t		 i;
+		uint32_t	 svc_name_local;
+
+		for (i = 0; i < BOOTSTRAP_NAME_MAX; i++)
+			lookup_req.body.blr_name[i] = 0;
+		for (i = 0; svc[i] != '\0' && i < BOOTSTRAP_NAME_MAX - 1; i++)
+			lookup_req.body.blr_name[i] = svc[i];
+
+		lookup_req.hdr.msgh_bits    =
+		    MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+		lookup_req.hdr.msgh_size    = sizeof(lookup_req);
+		lookup_req.hdr.msgh_remote  = MACH_PORT_BOOTSTRAP;
+		lookup_req.hdr.msgh_local   = MACH_PORT_NULL;
+		lookup_req.hdr.msgh_voucher = 0;
+		lookup_req.hdr.msgh_id      = BOOTSTRAP_OP_LOOKUP;
+
+		rv = syscall4(SYS_MSG_RPC, (long)&lookup_req,
+		    (long)&lookup_reply, (long)sizeof(lookup_reply),
+		    (long)1000);
+		if (rv != 0) {
+			puts1("  bootstrap_lookup rpc failed\n");
+			print_id("    rv = ", (uint32_t)rv);
+			syscall1(SYS_EXIT, 7);
+		}
+		if (lookup_reply.hdr.msgh_id == BOOTSTRAP_REPLY_NOT_FOUND ||
+		    !(lookup_reply.hdr.msgh_bits & MACH_MSGH_BITS_COMPLEX)) {
+			puts1("  bootstrap_lookup: service not found\n");
+			syscall1(SYS_EXIT, 8);
+		}
+		svc_name_local = lookup_reply.pd.name;
+		print_id("  bootstrap_lookup('kernel_task') -> name = ",
+		    svc_name_local);
+
+		tx.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+		tx.msgh_size    = sizeof(tx);
+		tx.msgh_remote  = svc_name_local;
+		tx.msgh_local   = MACH_PORT_NULL;
+		tx.msgh_voucher = 0;
+		tx.msgh_id      = TASK_OP_GET_INFO;
+
+		rv = syscall4(SYS_MSG_RPC, (long)&tx, (long)&info_reply,
+		    (long)sizeof(info_reply), (long)1000);
+		if (rv != 0) {
+			puts1("  GET_INFO via bootstrap-resolved name failed\n");
+			print_id("    rv = ", (uint32_t)rv);
+			syscall1(SYS_EXIT, 9);
+		}
+		puts1("  GET_INFO via bootstrap-resolved name: ok, ");
+		print_id("tir_task_id = ",
+		    (uint32_t)info_reply.body.tir_task_id);
+
+		/*
+		 * The SEND right the lookup gave us is now in our space
+		 * under svc_name_local; deallocate so the conservation
+		 * check at boot remains clean.
+		 */
+		(void)syscall1(SYS_PORT_DEALLOC, (long)svc_name_local);
 	}
 
 	(void)syscall1(SYS_PORT_DEALLOC, (long)name);

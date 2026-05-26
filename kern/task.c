@@ -63,6 +63,8 @@ task_subsystem_init(void)
 	kernel_task->t_port_space = kernel_space;
 	if (port_install_task_self(kernel_task) != MACH_MSG_OK)
 		panic("task_subsystem_init: install task_self in kernel_space");
+	if (port_install_bootstrap(kernel_task) != MACH_MSG_OK)
+		panic("task_subsystem_init: install bootstrap in kernel_space");
 
 	kprintf("task: kernel_task id=%llu name=%s, %u initial tasks\n",
 	    (unsigned long long)kernel_task->t_id,
@@ -97,6 +99,19 @@ task_create(const char *name)
 	}
 
 	if (port_install_task_self(t) != MACH_MSG_OK) {
+		port_space_destroy(t->t_port_space);
+		kfree(t);
+		return (NULL);
+	}
+
+	/*
+	 * Install the SEND right to the global bootstrap port at the
+	 * second slot (MACH_PORT_BOOTSTRAP).  bootstrap_init must have
+	 * run before any task_create call -- kmain wires this in the
+	 * order port_subsystem_init -> bootstrap_init -> task_subsystem_init.
+	 */
+	if (port_install_bootstrap(t) != MACH_MSG_OK) {
+		port_release_task_self(t);
 		port_space_destroy(t->t_port_space);
 		kfree(t);
 		return (NULL);
