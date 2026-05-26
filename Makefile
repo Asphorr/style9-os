@@ -19,9 +19,11 @@ QEMU	= /mnt/c/Program\ Files/qemu/qemu-system-x86_64.exe
 
 # Directories that contain sources and their public headers.  Listed in
 # include-search order: arch first so e.g. machine/io.h-style headers
-# would shadow generic, then kern, then dev.
+# would shadow generic, then kern, then dev, then test.  test/ is the
+# boot-time stress harness; lives next to kern/ on the include path so
+# its bodies can pull in any kernel header without indirection.
 ARCH	= arch/amd64
-SRCDIRS	= $(ARCH) kern dev
+SRCDIRS	= $(ARCH) kern dev test
 
 OBJDIR	= obj
 
@@ -51,7 +53,7 @@ LDFLAGS	= -m elf_x86_64 -T $(ARCH)/linker.ld			\
 
 # VPATH lets the pattern rules below find sources without the recipe
 # spelling out the source directory explicitly.
-VPATH	= $(ARCH):kern:dev
+VPATH	= $(ARCH):kern:dev:test
 
 OBJS	= \
 	$(OBJDIR)/boot.o	\
