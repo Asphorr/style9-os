@@ -13,6 +13,7 @@
 #include "kprintf.h"
 #include "panic.h"
 #include "port.h"
+#include "port_internal.h"
 #include "spinlock.h"
 #include "task.h"
 
@@ -162,6 +163,28 @@ bootstrap_lookup_locked(const char *name)
  * via msgh_local.  On a hit the reply is COMPLEX with a single
  * port_descriptor carrying COPY_SEND to the service; on a miss the
  * reply is a bare 24-byte header tagged with BOOTSTRAP_REPLY_NOT_FOUND.
+ *
+ * Cross-space mechanics for the success path:
+ *
+ *	The registered service port is named in kernel_space, but the
+ *	caller (the original sender of the lookup) lives in some other
+ *	port_space.  If we asked mach_msg_send to translate the reply's
+ *	port_descriptor against the caller's space, the lookup of
+ *	svc_name would fail (or worse, "succeed" against a coincidentally
+ *	co-numbered name).  Instead we send the reply FROM kernel_space:
+ *
+ *	  1. resolve the caller's reply port via the caller's space,
+ *	  2. install a fresh SEND for it in kernel_space (so kernel_space
+ *	     has a name we can use as msgh_remote),
+ *	  3. build the reply with msgh_remote = that kernel name and
+ *	     MOVE_SEND disposition, so the send consumes our temporary
+ *	     install -- no kernel_space leak even after delivery,
+ *	  4. pd.name is svc_name, which already lives in kernel_space,
+ *	     and send_xlate_desc resolves it correctly.
+ *
+ *	The receive side is unchanged: deliver_msg sees a port_descriptor
+ *	carrying SEND, installs a fresh name in the caller's space, and
+ *	patches pd.name accordingly.
  */
 int
 bootstrap_dispatch(const struct mach_msg_header *req,
@@ -175,9 +198,13 @@ bootstrap_dispatch(const struct mach_msg_header *req,
 	struct mach_msg_header				reply_fail;
 	const struct bootstrap_lookup_request		*rq;
 	const uint8_t					*src;
+	struct port		*reply_port;
 	char			 name_buf[BOOTSTRAP_NAME_MAX];
+	mach_port_name_t	 kernel_reply_name;
 	mach_port_name_t	 svc_name;
+	uint8_t			 dummy;
 	size_t			 i;
+	int			 rv;
 
 	if (req == NULL || from == NULL)
 		return (MACH_E_INVAL);
@@ -217,11 +244,27 @@ bootstrap_dispatch(const struct mach_msg_header *req,
 		return (mach_msg_send(from, &reply_fail));
 	}
 
+	/*
+	 * Cross-space reply: install caller's reply port into kernel_space
+	 * so we can address it from there alongside svc_name.  Look it up
+	 * in the caller's space (where the lookup request named it via
+	 * msgh_local), then install a fresh SEND in kernel_space.
+	 */
+	reply_port = space_lookup(from, req->msgh_local,
+	    MACH_PORT_RIGHT_SEND, &dummy);
+	if (reply_port == NULL)
+		return (MACH_E_RIGHT);
+
+	rv = space_install(kernel_space, reply_port, MACH_PORT_RIGHT_SEND,
+	    &kernel_reply_name);
+	if (rv != MACH_MSG_OK)
+		return (rv);
+
 	reply_ok.hdr.msgh_bits    =
-	    MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) |
+	    MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND, 0) |
 	    MACH_MSGH_BITS_COMPLEX;
 	reply_ok.hdr.msgh_size    = sizeof(reply_ok);
-	reply_ok.hdr.msgh_remote  = req->msgh_local;
+	reply_ok.hdr.msgh_remote  = kernel_reply_name;
 	reply_ok.hdr.msgh_local   = MACH_PORT_NULL;
 	reply_ok.hdr.msgh_voucher = 0;
 	reply_ok.hdr.msgh_id      = req->msgh_id;
@@ -234,5 +277,16 @@ bootstrap_dispatch(const struct mach_msg_header *req,
 	reply_ok.pd.type        = MACH_MSG_PORT_DESCRIPTOR;
 	reply_ok.pd.pad2        = 0;
 
-	return (mach_msg_send(from, &reply_ok.hdr));
+	rv = mach_msg_send(kernel_space, &reply_ok.hdr);
+
+	/*
+	 * On send failure roll back the kernel_space install we did
+	 * above; the MOVE_SEND clause inside mach_msg_send only fires on
+	 * the success path.  space_drop_one_right port_derefs the SEND
+	 * for us so refs balance with the space_install above.
+	 */
+	if (rv != MACH_MSG_OK)
+		(void)space_drop_one_right(kernel_space, kernel_reply_name,
+		    MACH_PORT_RIGHT_SEND);
+	return (rv);
 }
