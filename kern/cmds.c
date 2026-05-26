@@ -11,6 +11,7 @@
 
 #include "bootstrap.h"
 #include "clock.h"
+#include "klog.h"
 #include "kmem.h"
 #include "kprintf.h"
 #include "memmap.h"
@@ -44,6 +45,7 @@ static int	cmd_stress(int, char **);
 static int	cmd_crash(int, char **);
 static int	cmd_mach(int, char **);
 static int	cmd_vmmap(int, char **);
+static int	cmd_log(int, char **);
 
 static int	streq(const char *, const char *);
 static int	parse_uint(const char *s, unsigned int *out);
@@ -71,6 +73,7 @@ const struct shell_cmd	shell_cmds[] = {
 	{ "mach",   "mach <ls|clock|stats|tasks> (bootstrap-served RPCs)",
 		cmd_mach   },
 	{ "vmmap",  "kernel_task vm_map entries",             cmd_vmmap  },
+	{ "log",    "log <tail|debug|info|warn|error> [text]", cmd_log   },
 	{ "crash",  "crash <dfree|wild|assert|unmapped|nonc>", cmd_crash  },
 	{ "panic",  "deliberate panic (tests panic path)",    cmd_panic  },
 };
@@ -809,4 +812,145 @@ cmd_vmmap(int argc, char *argv[])
 	}
 	vm_map_print(kernel_task->t_map);
 	return (0);
+}
+
+/* ---- `log' command -- klog tail + RPC writes -------------------------- */
+
+static void
+log_concat_args(char *dst, size_t cap, int argc, char *argv[])
+{
+	int	i;
+	size_t	o;
+
+	o = 0;
+	for (i = 2; i < argc && o + 1 < cap; i++) {
+		const char *s = argv[i];
+		if (i > 2 && o + 1 < cap)
+			dst[o++] = ' ';
+		while (*s != '\0' && o + 1 < cap)
+			dst[o++] = *s++;
+	}
+	dst[o] = '\0';
+}
+
+static int
+log_tail(void)
+{
+	struct mach_msg_header		req;
+	struct {
+		struct mach_msg_header		hdr;
+		struct klog_tail_reply		body;
+	} reply;
+	mach_port_name_t		svc;
+	uint32_t			i;
+	int				rv;
+
+	svc = mach_lookup(SVC_KLOG_NAME);
+	if (svc == MACH_PORT_NULL) {
+		kprintf("log: klog lookup failed\n");
+		return (1);
+	}
+
+	req.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	req.msgh_size    = sizeof(req);
+	req.msgh_remote  = svc;
+	req.msgh_local   = MACH_PORT_NULL;
+	req.msgh_voucher = 0;
+	req.msgh_id      = KLOG_OP_TAIL;
+
+	rv = mach_msg_rpc(kernel_space, &req, &reply.hdr, sizeof(reply),
+	    1000);
+	(void)port_deallocate(kernel_space, svc);
+	if (rv != MACH_MSG_OK) {
+		kprintf("log tail: rpc rv=%s\n", mach_msg_strerror(rv));
+		return (1);
+	}
+
+	kprintf("klog tail: %u entries\n", (unsigned)reply.body.ktr_count);
+	for (i = 0; i < reply.body.ktr_count; i++) {
+		const struct klog_entry *e = &reply.body.ktr_entries[i];
+		kprintf("  [%llu %s %s] %s\n",
+		    (unsigned long long)e->ke_uptime_ms,
+		    klog_level_name(e->ke_level),
+		    e->ke_src,
+		    e->ke_text);
+	}
+	return (0);
+}
+
+static int
+log_write_via_mach(uint8_t level, const char *text)
+{
+	struct {
+		struct mach_msg_header		hdr;
+		struct klog_write_request	body;
+	} req;
+	struct mach_msg_header		reply;
+	mach_port_name_t		svc;
+	size_t				i;
+	int				rv;
+
+	svc = mach_lookup(SVC_KLOG_NAME);
+	if (svc == MACH_PORT_NULL) {
+		kprintf("log: klog lookup failed\n");
+		return (1);
+	}
+
+	req.body.kwr_level = level;
+	for (i = 0; i < sizeof(req.body.kwr_pad); i++)
+		req.body.kwr_pad[i] = 0;
+	for (i = 0; i < KLOG_SRC_MAX; i++)
+		req.body.kwr_src[i] = 0;
+	req.body.kwr_src[0] = 's';
+	req.body.kwr_src[1] = 'h';
+	for (i = 0; i < KLOG_LINE_MAX; i++)
+		req.body.kwr_text[i] = 0;
+	for (i = 0; text[i] != '\0' && i < KLOG_LINE_MAX - 1; i++)
+		req.body.kwr_text[i] = text[i];
+
+	req.hdr.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	req.hdr.msgh_size    = sizeof(req);
+	req.hdr.msgh_remote  = svc;
+	req.hdr.msgh_local   = MACH_PORT_NULL;
+	req.hdr.msgh_voucher = 0;
+	req.hdr.msgh_id      = KLOG_OP_WRITE;
+
+	rv = mach_msg_rpc(kernel_space, &req.hdr, &reply, sizeof(reply),
+	    1000);
+	(void)port_deallocate(kernel_space, svc);
+	if (rv != MACH_MSG_OK) {
+		kprintf("log write: rpc rv=%s\n", mach_msg_strerror(rv));
+		return (1);
+	}
+	return (0);
+}
+
+static int
+cmd_log(int argc, char *argv[])
+{
+	char	buf[KLOG_LINE_MAX];
+
+	if (argc < 2) {
+		return (log_tail());
+	}
+	if (streq(argv[1], "tail"))
+		return (log_tail());
+
+	if (argc < 3) {
+		kprintf("log: usage: log <tail|debug|info|warn|error> [text]\n");
+		return (1);
+	}
+	log_concat_args(buf, sizeof(buf), argc, argv);
+
+	if (streq(argv[1], "debug"))
+		return (log_write_via_mach(KLOG_LEVEL_DEBUG, buf));
+	if (streq(argv[1], "info"))
+		return (log_write_via_mach(KLOG_LEVEL_INFO,  buf));
+	if (streq(argv[1], "warn"))
+		return (log_write_via_mach(KLOG_LEVEL_WARN,  buf));
+	if (streq(argv[1], "error"))
+		return (log_write_via_mach(KLOG_LEVEL_ERROR, buf));
+
+	kprintf("log: unknown level '%s'\n", argv[1]);
+	return (1);
 }

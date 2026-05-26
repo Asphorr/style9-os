@@ -9,6 +9,7 @@
 
 #include "bootstrap.h"
 #include "clock.h"
+#include "klog.h"
 #include "services.h"
 #include "vm.h"
 #include "gdt.h"
@@ -114,6 +115,21 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	 * the standard bootstrap_lookup path.
 	 */
 	services_init();
+
+	/*
+	 * Bring up the structured kernel log on the same machinery.
+	 * Writes here mirror to tty, which already pipes through to
+	 * COM1 + debugcon, so every klog line lands on three sinks at
+	 * once -- visible on the VGA console, captured by
+	 * `qemu -serial file:...`, and dumped by `qemu -debugcon stdio`.
+	 */
+	klog_service_init();
+
+	/* A couple of boot-time markers, mostly so `log tail` after
+	   the shell comes up has something to show. */
+	klog(KLOG_LEVEL_INFO,  "boot", "stress pass complete");
+	klog(KLOG_LEVEL_INFO,  "boot", "drivers + services up");
+	klog(KLOG_LEVEL_DEBUG, "boot", "entering shell");
 
 	syscall_init();
 	/*
