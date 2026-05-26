@@ -127,9 +127,52 @@ _Static_assert(sizeof(struct mach_msg_port_descriptor) == 8,
 #define	MACH_TIMEOUT_NONE	((uint64_t)0)
 #define	MACH_TIMEOUT_FOREVER	((uint64_t)~0ull)
 
+/*
+ * "Special" ports are kernel-implemented Mach objects.  A message sent
+ * to a port whose p_special tag is non-zero is dispatched synchronously
+ * in the send path -- there is no server thread, no queueing, and the
+ * dispatcher itself is responsible for any reply via msgh_local.  This
+ * is the same pattern real Mach uses for mach_task_self / mach_host_self
+ * etc., where the kernel object behind the SEND is the kernel itself.
+ *
+ * Tag values:
+ *	NONE		regular Mach port -- normal send/recv semantics
+ *	TASK_SELF	p_special_arg is (struct task *), the target task
+ */
+#define	PORT_SPECIAL_NONE		0
+#define	PORT_SPECIAL_TASK_SELF		1
+
+/*
+ * Every task's port_space carries a SEND right to its own task_self
+ * port at this well-known name.  Set up by task_create so the slot is
+ * already populated by the time the first thread runs.
+ */
+#define	MACH_PORT_TASK_SELF		((mach_port_name_t)1)
+
+/*
+ * Op codes used as msgh_id on messages sent to MACH_PORT_TASK_SELF.
+ * Reply layouts are pinned by _Static_assert in this header.
+ */
+#define	TASK_OP_GET_INFO		1
+
+/*
+ * Reply payload for TASK_OP_GET_INFO.  Sits right after the
+ * mach_msg_header in the reply message.
+ */
+struct task_info_reply {
+	uint64_t	tir_task_id;
+	uint32_t	tir_nthreads;
+	uint32_t	tir_pad;
+	char		tir_name[32];
+};
+
+_Static_assert(sizeof(struct task_info_reply) == 48,
+    "task_info_reply must be 48 bytes (wire format)");
+
 /* Opaque kernel objects. */
 struct port;
 struct port_space;
+struct task;
 
 /* The kernel's own port name space. */
 extern struct port_space	*kernel_space;
@@ -278,6 +321,27 @@ int			 mach_msg_rpc(struct port_space *space,
 			    struct mach_msg_header *reply_buf,
 			    size_t reply_buf_size,
 			    uint64_t timeout_ms);
+
+/*
+ * Allocate the task_self port for `t`, install a SEND right at
+ * MACH_PORT_TASK_SELF in t->t_port_space, and tag the port as
+ * PORT_SPECIAL_TASK_SELF so subsequent sends to that name dispatch
+ * synchronously to task_self_dispatch.  Idempotent across the kernel
+ * bootstrap: call exactly once per task, after t->t_port_space is in
+ * its final identity (see task_subsystem_init for the bootstrap order).
+ *
+ * Returns MACH_MSG_OK on success.  On failure the partial state is
+ * cleaned up (no port leak); caller can retry.
+ */
+int			 port_install_task_self(struct task *);
+
+/*
+ * Release the kernel-side RECEIVE right on the task_self port -- the
+ * counterpart to port_install_task_self.  Called from the task
+ * destruction path after the per-task port_space has dropped its SEND
+ * ref so the port can finally reach zero refs and be reclaimed.
+ */
+void			 port_release_task_self(struct task *);
 
 /*
  * Introspection / debugging.

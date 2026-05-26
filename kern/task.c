@@ -45,12 +45,24 @@ task_subsystem_init(void)
 		panic("task_subsystem_init: kernel_task allocation failed");
 
 	/*
-	 * kernel_task uses the pre-existing kernel_space rather than a
-	 * fresh one -- otherwise the ports already allocated during
-	 * port_subsystem_init would belong to nobody.
+	 * kernel_task is the unique exception that uses the pre-existing
+	 * kernel_space rather than the fresh one task_create made.  Two
+	 * fix-ups follow:
+	 *	1. Release the install task_create did into the throwaway
+	 *	   space (port_release_task_self drops the kernel-side
+	 *	   RECEIVE ref) so the port can be reaped along with that
+	 *	   space when we destroy it.
+	 *	2. Repoint t_port_space at kernel_space and re-run the
+	 *	   install there.  Because kernel_space is currently empty
+	 *	   (no allocations happen between port_subsystem_init and
+	 *	   here), the SEND right lands at name 1 -- the well-known
+	 *	   MACH_PORT_TASK_SELF slot.
 	 */
+	port_release_task_self(kernel_task);
 	port_space_destroy(kernel_task->t_port_space);
 	kernel_task->t_port_space = kernel_space;
+	if (port_install_task_self(kernel_task) != MACH_MSG_OK)
+		panic("task_subsystem_init: install task_self in kernel_space");
 
 	kprintf("task: kernel_task id=%llu name=%s, %u initial tasks\n",
 	    (unsigned long long)kernel_task->t_id,
@@ -72,13 +84,20 @@ task_create(const char *name)
 	t->t_id = next_task_id++;
 	spin_unlock(&tasks_lock);
 
-	t->t_name      = name != NULL ? name : "(anon)";
-	t->t_threads   = NULL;
-	t->t_nthreads  = 0;
-	t->t_refs      = 1;
+	t->t_name       = name != NULL ? name : "(anon)";
+	t->t_threads    = NULL;
+	t->t_nthreads   = 0;
+	t->t_refs       = 1;
+	t->t_self_port  = NULL;
 
 	t->t_port_space = port_space_new();
 	if (t->t_port_space == NULL) {
+		kfree(t);
+		return (NULL);
+	}
+
+	if (port_install_task_self(t) != MACH_MSG_OK) {
+		port_space_destroy(t->t_port_space);
 		kfree(t);
 		return (NULL);
 	}
@@ -172,8 +191,22 @@ task_deref(struct task *t)
 	task__chain_remove(t);
 	spin_unlock(&tasks_lock);
 
-	if (t->t_port_space != NULL && t != kernel_task)
+	/*
+	 * Order: drop the per-space SEND on task_self BEFORE releasing
+	 * the kernel-side RECEIVE.  port_space_destroy walks every entry
+	 * (incl. our well-known name 1) and port_dereps each one, so by
+	 * the time the call returns there are no remaining SEND refs;
+	 * port_release_task_self then drops the last RECEIVE and the port
+	 * reaches zero refs and is reclaimed inside that deref.
+	 *
+	 * kernel_task is the bootstrap exception -- it shares
+	 * kernel_space, which lives for the duration of the kernel.
+	 * Its task_self port stays alive too; never get here in practice.
+	 */
+	if (t != kernel_task) {
 		port_space_destroy(t->t_port_space);
+		port_release_task_self(t);
+	}
 	kfree(t);
 }
 
@@ -229,6 +262,67 @@ task_print(struct task *t)
 		    cur->th_name,
 		    thread_state_name(cur->th_state));
 	spin_unlock(&t->t_lock);
+}
+
+/*
+ * Synchronous dispatcher for messages addressed to a task's task_self
+ * port.  Invoked from inside mach_msg_send (port.c) for every send
+ * whose destination's p_special tag is PORT_SPECIAL_TASK_SELF, so the
+ * reply path executes in the caller's context -- there is no server
+ * thread, no queueing on the request side, just a direct lookup + an
+ * inline send of the reply via the caller's reply port (msgh_local).
+ *
+ * The reply uses COPY_SEND on msgh_local because mach_msg_rpc
+ * allocates that reply port with RECEIVE+SEND in the caller's space;
+ * the SEND right we lean on here was already there before the request
+ * crossed into the kernel.
+ */
+int
+task_self_dispatch(struct task *target, const struct mach_msg_header *req,
+    struct port_space *from)
+{
+	uint8_t		bytes[sizeof(struct mach_msg_header) +
+			    sizeof(struct task_info_reply)];
+	struct mach_msg_header	*rhdr;
+	struct task_info_reply	*body;
+	size_t			 i;
+
+	if (target == NULL || req == NULL || from == NULL)
+		return (MACH_E_INVAL);
+	if (req->msgh_local == MACH_PORT_NULL)
+		return (MACH_E_INVAL);
+
+	rhdr = (struct mach_msg_header *)bytes;
+	body = (struct task_info_reply *)(bytes +
+	    sizeof(struct mach_msg_header));
+
+	switch (req->msgh_id) {
+	case TASK_OP_GET_INFO:
+		spin_lock(&target->t_lock);
+		body->tir_task_id  = target->t_id;
+		body->tir_nthreads = target->t_nthreads;
+		spin_unlock(&target->t_lock);
+		body->tir_pad = 0;
+		for (i = 0; i < sizeof(body->tir_name); i++)
+			body->tir_name[i] = 0;
+		if (target->t_name != NULL) {
+			for (i = 0; i < sizeof(body->tir_name) - 1 &&
+			    target->t_name[i] != '\0'; i++)
+				body->tir_name[i] = target->t_name[i];
+		}
+
+		rhdr->msgh_bits    =
+		    MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+		rhdr->msgh_size    = sizeof(bytes);
+		rhdr->msgh_remote  = req->msgh_local;
+		rhdr->msgh_local   = MACH_PORT_NULL;
+		rhdr->msgh_voucher = 0;
+		rhdr->msgh_id      = req->msgh_id;
+		return (mach_msg_send(from, rhdr));
+
+	default:
+		return (MACH_E_INVAL);
+	}
 }
 
 void

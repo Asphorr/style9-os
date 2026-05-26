@@ -16,7 +16,18 @@
 #include "port.h"
 #include "sched.h"
 #include "spinlock.h"
+#include "task.h"
 #include "thread.h"
+
+/*
+ * Synchronous dispatcher for task_self messages.  Lives in task.c
+ * because it inspects struct task internals; declared here so the
+ * intercept in mach_msg_send can call it without including task.h's
+ * internals in port.c.
+ */
+extern int	task_self_dispatch(struct task *target,
+		    const struct mach_msg_header *req,
+		    struct port_space *from);
 
 /* ---- private types ----------------------------------------------------- */
 
@@ -46,6 +57,8 @@ struct port {
 	struct thread	*p_send_waiters_tail;	/* (p)                       */
 	struct port_set	*p_set;			/* (p) set this port belongs */
 	struct port	*p_set_link;		/* (p) next in set members   */
+	uint8_t		 p_special;		/* (c) PORT_SPECIAL_* tag    */
+	void		*p_special_arg;		/* (c) per-tag context ptr   */
 };
 
 /*
@@ -225,6 +238,8 @@ port_create(void)
 	p->p_send_waiters_tail = NULL;
 	p->p_set          = NULL;
 	p->p_set_link     = NULL;
+	p->p_special      = PORT_SPECIAL_NONE;
+	p->p_special_arg  = NULL;
 	return (p);
 }
 
@@ -1370,6 +1385,28 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *msg)
 		return (MACH_E_RIGHT);
 
 	/*
+	 * Special-port intercept.  When the destination is a kernel
+	 * object (task_self_port etc.) we never queue: the dispatcher
+	 * synthesises any reply directly and returns.  Honour MOVE_*
+	 * by dropping the sender's right first so the dispatcher
+	 * cannot observe a stale name in the sender's space.
+	 */
+	if (dest->p_special != PORT_SPECIAL_NONE) {
+		if (remote_disp == MACH_MSG_TYPE_MOVE_SEND ||
+		    remote_disp == MACH_MSG_TYPE_MOVE_SEND_ONCE) {
+			(void)space_drop_one_right(from,
+			    msg->msgh_remote, remote_right);
+		}
+		switch (dest->p_special) {
+		case PORT_SPECIAL_TASK_SELF:
+			return (task_self_dispatch(
+			    (struct task *)dest->p_special_arg, msg, from));
+		default:
+			return (MACH_E_INVAL);
+		}
+	}
+
+	/*
 	 * Take an extra ref on dest of the same kind as the sender's
 	 * right.  Released after enqueue regardless of MOVE/COPY.
 	 */
@@ -2056,6 +2093,76 @@ port_space_print(struct port_space *ps)
 	}
 	spin_unlock(&ps->ps_lock);
 }
+
+/* ---- special-port plumbing ------------------------------------------- */
+
+int
+port_install_task_self(struct task *t)
+{
+	struct port		*p;
+	mach_port_name_t	 name;
+	int			 rv;
+
+	if (t == NULL || t->t_port_space == NULL)
+		return (MACH_E_INVAL);
+	if (t->t_self_port != NULL)
+		return (MACH_MSG_OK);		/* already installed */
+
+	p = port_create();
+	if (p == NULL)
+		return (MACH_E_NOMEM);
+
+	/*
+	 * Tag the port before any visibility: once SEND lands in the
+	 * task's space a sender could resolve it through space_lookup
+	 * and reach mach_msg_send, which gates its intercept on
+	 * p_special.  Setting the tag first means there is no window in
+	 * which a regular queue path could fire against a port that is
+	 * really meant for synchronous dispatch.
+	 */
+	p->p_special     = PORT_SPECIAL_TASK_SELF;
+	p->p_special_arg = (void *)t;
+
+	port_ref(p, MACH_PORT_RIGHT_RECEIVE);
+
+	rv = space_install(t->t_port_space, p, MACH_PORT_RIGHT_SEND, &name);
+	if (rv != MACH_MSG_OK) {
+		port_deref(p, MACH_PORT_RIGHT_RECEIVE);
+		return (rv);
+	}
+
+	/*
+	 * The well-known name is by construction the first slot allocated
+	 * in a fresh port_space (ps_hint starts at 1).  Anything else
+	 * means a caller put something else into the space first, which
+	 * would break the ABI everyone else relies on -- panic instead of
+	 * letting a wrong name leak out.
+	 */
+	if (name != MACH_PORT_TASK_SELF) {
+		panic("port_install_task_self: name %u, expected %u "
+		    "(was the port_space pre-populated?)",
+		    (unsigned)name, (unsigned)MACH_PORT_TASK_SELF);
+	}
+
+	t->t_self_port = p;
+	return (MACH_MSG_OK);
+}
+
+void
+port_release_task_self(struct task *t)
+{
+	struct port	*p;
+
+	if (t == NULL)
+		return;
+	p = t->t_self_port;
+	if (p == NULL)
+		return;
+	t->t_self_port = NULL;
+	port_deref(p, MACH_PORT_RIGHT_RECEIVE);
+}
+
+/* ---- diagnostics ----------------------------------------------------- */
 
 const char *
 mach_msg_strerror(int code)

@@ -13,11 +13,13 @@
  *	5. Print confirmation that the round-trip succeeded.
  *	6. Probe the new timeout path: SYS_MSG_RECV_TIMED on an empty port
  *	   with a 50 ms deadline, expect an error return (E_TIMEOUT).
- *	7. SYS_PORT_DEALLOC + SYS_EXIT.
+ *	7. Issue a TASK_OP_GET_INFO RPC to MACH_PORT_TASK_SELF, print the
+ *	   task id and name the kernel returns.
+ *	8. SYS_PORT_DEALLOC + SYS_EXIT.
  *
  * This exercises the full IPC plumbing across the user/kernel boundary:
- * port_alloc + mach_msg_send + mach_msg_recv_block + mach_msg_recv_timed,
- * all from ring 3.
+ * port_alloc + mach_msg_send + mach_msg_recv_block + mach_msg_recv_timed
+ * + mach_msg_rpc, all from ring 3.
  */
 
 typedef unsigned long		size_t;
@@ -38,6 +40,18 @@ typedef unsigned char		uint8_t;
 
 /* MACH_E_TIMEOUT from kern/port.h -- recv_timed returns this on deadline. */
 #define	MACH_E_TIMEOUT		9
+
+/* Well-known name + op codes for the task_self port (kern/port.h). */
+#define	MACH_PORT_TASK_SELF	((uint32_t)1)
+#define	TASK_OP_GET_INFO	1
+
+/* Mirror of struct task_info_reply -- 48 bytes following the header. */
+struct task_info_reply {
+	unsigned long long	tir_task_id;
+	uint32_t		tir_nthreads;
+	uint32_t		tir_pad;
+	char			tir_name[32];
+};
 
 /* Must agree with kern/port.h. */
 #define	MACH_PORT_NULL			((uint32_t)0)
@@ -228,6 +242,44 @@ _start(void)
 		print_id("  recv_timed odd rv = ", (uint32_t)rv);
 	} else {
 		puts1("  recv_timed returned E_TIMEOUT after 50 ms: OK\n");
+	}
+
+	/*
+	 * Step 7: task_self RPC.  msgh_id = TASK_OP_GET_INFO, the kernel
+	 * synchronously fills a 48-byte task_info_reply right after the
+	 * mach header in our recv buffer.  Reuses `rx` for the reply.
+	 */
+	{
+		struct task_info_reply	*info;
+		struct {
+			struct mach_msg_header	hdr;
+			struct task_info_reply	body;
+		} reply_pkt;
+		size_t			 i;
+
+		tx.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+		tx.msgh_size    = sizeof(tx);
+		tx.msgh_remote  = MACH_PORT_TASK_SELF;
+		tx.msgh_local   = MACH_PORT_NULL;	/* rpc fills in */
+		tx.msgh_voucher = 0;
+		tx.msgh_id      = TASK_OP_GET_INFO;
+
+		rv = syscall4(SYS_MSG_RPC, (long)&tx, (long)&reply_pkt,
+		    (long)sizeof(reply_pkt), (long)1000);
+		if (rv != 0) {
+			puts1("  task_self GET_INFO rpc failed\n");
+			print_id("    rv = ", (uint32_t)rv);
+			syscall1(SYS_EXIT, 6);
+		}
+
+		info = &reply_pkt.body;
+		puts1("  task_self GET_INFO ok: task name='");
+		for (i = 0; i < sizeof(info->tir_name) &&
+		    info->tir_name[i] != '\0'; i++) {
+			char ch = info->tir_name[i];
+			(void)write1(&ch, 1);
+		}
+		print_id("' tir_task_id = ", (uint32_t)info->tir_task_id);
 	}
 
 	(void)syscall1(SYS_PORT_DEALLOC, (long)name);

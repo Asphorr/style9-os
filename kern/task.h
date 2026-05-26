@@ -30,6 +30,8 @@
  * what distinguishes them.
  */
 
+struct mach_msg_header;
+struct port;
 struct port_space;
 struct thread;
 
@@ -38,6 +40,7 @@ struct task {
 	uint64_t		 t_id;		/* (c) printable id        */
 	const char		*t_name;	/* (c) for ps-style listing */
 	struct port_space	*t_port_space;	/* (c) name table          */
+	struct port		*t_self_port;	/* (c) kernel-RECEIVE port  */
 	struct thread		*t_threads;	/* (t) head of thread list */
 	uint32_t		 t_nthreads;	/* (t) count                */
 	uint32_t		 t_refs;	/* (t) lifetime refs        */
@@ -60,5 +63,16 @@ void			 task_detach_thread(struct task *, struct thread *);
 
 void			 task_print(struct task *);
 void			 task_list_print(void);
+
+/*
+ * Synchronous dispatcher invoked by mach_msg_send when the destination
+ * port is tagged PORT_SPECIAL_TASK_SELF.  Reads `req->msgh_id` to pick
+ * an op (see TASK_OP_* in port.h), assembles a reply message, and
+ * sends it back to `req->msgh_local` using the COPY_SEND right the
+ * caller's space holds on that name.  Returns MACH_MSG_OK on success.
+ */
+int			 task_self_dispatch(struct task *target,
+			    const struct mach_msg_header *req,
+			    struct port_space *from);
 
 #endif /* !_SYS_TASK_H_ */
