@@ -16,6 +16,7 @@
 #include "spinlock.h"
 #include "task.h"
 #include "thread.h"
+#include "vm.h"
 
 /*
  * Lock-key:
@@ -91,6 +92,7 @@ task_create(const char *name)
 	t->t_nthreads   = 0;
 	t->t_refs       = 1;
 	t->t_self_port  = NULL;
+	t->t_map        = NULL;
 
 	t->t_port_space = port_space_new();
 	if (t->t_port_space == NULL) {
@@ -98,7 +100,26 @@ task_create(const char *name)
 		return (NULL);
 	}
 
+	/*
+	 * Per-task VM map.  Currently bookkeeping-only: hardware
+	 * mappings still go through pmap_kenter and the boot-time
+	 * shared PML4.  The map records what user-VA ranges this task
+	 * has staked out so the next commit (per-task PML4) can drive
+	 * page-table installs from it rather than from ad-hoc calls.
+	 *
+	 * Window is the standard user-VA slot every task gets today.
+	 * A future per-task heap / mmap pool can slice further out of
+	 * the same constants.
+	 */
+	t->t_map = vm_map_create(VM_USER_VA_LO, VM_USER_VA_HI);
+	if (t->t_map == NULL) {
+		port_space_destroy(t->t_port_space);
+		kfree(t);
+		return (NULL);
+	}
+
 	if (port_install_task_self(t) != MACH_MSG_OK) {
+		vm_map_destroy(t->t_map);
 		port_space_destroy(t->t_port_space);
 		kfree(t);
 		return (NULL);
@@ -112,6 +133,7 @@ task_create(const char *name)
 	 */
 	if (port_install_bootstrap(t) != MACH_MSG_OK) {
 		port_release_task_self(t);
+		vm_map_destroy(t->t_map);
 		port_space_destroy(t->t_port_space);
 		kfree(t);
 		return (NULL);
@@ -221,6 +243,7 @@ task_deref(struct task *t)
 	if (t != kernel_task) {
 		port_space_destroy(t->t_port_space);
 		port_release_task_self(t);
+		vm_map_destroy(t->t_map);
 	}
 	kfree(t);
 }

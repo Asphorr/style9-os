@@ -10,6 +10,7 @@
 #include "bootstrap.h"
 #include "clock.h"
 #include "services.h"
+#include "vm.h"
 #include "gdt.h"
 #include "idt.h"
 #include "intr.h"
@@ -246,6 +247,7 @@ kmain_memory(uint32_t mb_magic, uint32_t mb_info)
 	pmm_init();
 	pmap_bootstrap();
 	kmem_init();
+	vm_init();
 	port_subsystem_init();
 	bootstrap_init();
 	task_subsystem_init();

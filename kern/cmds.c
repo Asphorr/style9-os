@@ -25,6 +25,7 @@
 #include "task.h"
 #include "thread.h"
 #include "tty.h"
+#include "vm.h"
 
 static int	cmd_help(int, char **);
 static int	cmd_mem(int, char **);
@@ -42,6 +43,7 @@ static int	cmd_yield(int, char **);
 static int	cmd_stress(int, char **);
 static int	cmd_crash(int, char **);
 static int	cmd_mach(int, char **);
+static int	cmd_vmmap(int, char **);
 
 static int	streq(const char *, const char *);
 static int	parse_uint(const char *s, unsigned int *out);
@@ -68,6 +70,7 @@ const struct shell_cmd	shell_cmds[] = {
 	{ "stress", "stress <mem|boundary|timer|port|thread|preempt>", cmd_stress },
 	{ "mach",   "mach <ls|clock|stats|tasks> (bootstrap-served RPCs)",
 		cmd_mach   },
+	{ "vmmap",  "kernel_task vm_map entries",             cmd_vmmap  },
 	{ "crash",  "crash <dfree|wild|assert|unmapped|nonc>", cmd_crash  },
 	{ "panic",  "deliberate panic (tests panic path)",    cmd_panic  },
 };
@@ -791,4 +794,19 @@ cmd_mach(int argc, char *argv[])
 	kprintf("mach: unknown subcommand '%s'\n", argv[1]);
 	kprintf("mach: usage: mach [ls|clock|stats|tasks]\n");
 	return (1);
+}
+
+static int
+cmd_vmmap(int argc, char *argv[])
+{
+
+	(void)argc;
+	(void)argv;
+
+	if (kernel_task == NULL || kernel_task->t_map == NULL) {
+		kprintf("vmmap: kernel_task->t_map is NULL\n");
+		return (1);
+	}
+	vm_map_print(kernel_task->t_map);
+	return (0);
 }

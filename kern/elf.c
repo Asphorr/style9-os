@@ -13,6 +13,8 @@
 #include "kprintf.h"
 #include "pmap.h"
 #include "pmm.h"
+#include "task.h"
+#include "vm.h"
 
 static int	load_segment(const uint8_t *image, size_t image_size,
 		    const struct elf64_phdr *ph);
@@ -121,6 +123,18 @@ load_segment(const uint8_t *image, size_t image_size,
 		if (!pmap_kenter(va, pa, prot))
 			return (ELF_E_MAP);
 	}
+
+	/*
+	 * Record the whole segment as one entry in the task's vm_map.
+	 * Bookkeeping only -- pmap stays authoritative for the MMU
+	 * until per-task PML4 lands.  vme_prot carries pmap-style bits
+	 * (R/W/X plus USER); vme_flags only tracks backing semantics
+	 * (ANON, future COW), since "user accessibility" is already in
+	 * the prot byte and a second flag would just drift.
+	 */
+	if (!vm_map_enter(kernel_task->t_map, va_start, va_end - va_start,
+	    (uint8_t)prot, VME_F_ANON))
+		return (ELF_E_MAP);
 
 	src_off   = ph->p_offset;
 	remaining = ph->p_filesz;

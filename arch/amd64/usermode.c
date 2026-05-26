@@ -19,6 +19,7 @@
 #include "task.h"
 #include "thread.h"
 #include "usermode.h"
+#include "vm.h"
 
 extern uint8_t	user_blob_start[];
 extern uint8_t	user_blob_end[];
@@ -91,6 +92,16 @@ usermode_elf_launcher(void *arg)
 	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_USER))
 		panic("usermode_elf_launcher: stack map failed");
 
+	/*
+	 * Mirror the hardware install in the task's vm_map.  Bookkeeping
+	 * only this commit (pmap is the authoritative source for the MMU),
+	 * but the entry is what the next commit will drive page-table
+	 * installs from once each task gets its own PML4.
+	 */
+	if (!vm_map_enter(kernel_task->t_map, USER_STACK_VA, 0x1000,
+	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_USER, VME_F_ANON))
+		panic("usermode_elf_launcher: vm_map_enter stack");
+
 	kva = (uint64_t *)pmm_kva_from_pa(stack_pa);
 	for (i = 0; i < 512; i++)
 		kva[i] = 0;
@@ -104,6 +115,9 @@ usermode_elf_launcher(void *arg)
 	    "stack=0x%llx\n",
 	    (unsigned long long)entry, image_size,
 	    (unsigned long long)USER_STACK_TOP);
+
+	/* TEMPORARY: dump the kernel_task vm_map post-load for verification */
+	vm_map_print(kernel_task->t_map);
 
 	usermode_enter(entry, USER_STACK_TOP);
 }
@@ -142,6 +156,13 @@ usermode_launcher(void *arg)
 	if (!pmap_kenter(USER_STACK_VA, stack_pa,
 	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_USER))
 		panic("usermode_launcher: stack map failed");
+
+	if (!vm_map_enter(kernel_task->t_map, USER_CODE_VA, 0x1000,
+	    VM_PROT_READ | VM_PROT_EXEC | VM_PROT_USER, VME_F_ANON))
+		panic("usermode_launcher: vm_map_enter code");
+	if (!vm_map_enter(kernel_task->t_map, USER_STACK_VA, 0x1000,
+	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_USER, VME_F_ANON))
+		panic("usermode_launcher: vm_map_enter stack");
 
 	/*
 	 * Copy the blob into the user code page.  We touch it via the

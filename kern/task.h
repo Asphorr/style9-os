@@ -34,6 +34,7 @@ struct mach_msg_header;
 struct port;
 struct port_space;
 struct thread;
+struct vm_map;
 
 struct task {
 	struct spinlock		 t_lock;
@@ -41,6 +42,7 @@ struct task {
 	const char		*t_name;	/* (c) for ps-style listing */
 	struct port_space	*t_port_space;	/* (c) name table          */
 	struct port		*t_self_port;	/* (c) kernel-RECEIVE port  */
+	struct vm_map		*t_map;		/* (c) per-task vm map      */
 	struct thread		*t_threads;	/* (t) head of thread list */
 	uint32_t		 t_nthreads;	/* (t) count                */
 	uint32_t		 t_refs;	/* (t) lifetime refs        */
