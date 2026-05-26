@@ -31,6 +31,7 @@
  */
 
 struct mach_msg_header;
+struct pmap;
 struct port;
 struct port_space;
 struct thread;
@@ -43,6 +44,7 @@ struct task {
 	struct port_space	*t_port_space;	/* (c) name table          */
 	struct port		*t_self_port;	/* (c) kernel-RECEIVE port  */
 	struct vm_map		*t_map;		/* (c) per-task vm map      */
+	struct pmap		*t_pmap;	/* (c) per-task page-table  */
 	struct thread		*t_threads;	/* (t) head of thread list */
 	uint32_t		 t_nthreads;	/* (t) count                */
 	uint32_t		 t_refs;	/* (t) lifetime refs        */

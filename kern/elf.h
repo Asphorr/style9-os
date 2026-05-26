@@ -20,11 +20,13 @@
  *	e_entry naming the start address.
  *
  * elf_load() parses an image already resident in kernel memory, drops
- * the PT_LOAD segments into the live page-table at their requested VAs
- * (all U=1, with R/W/X mirroring p_flags), and returns the entry RIP.
- *
- * Single-task only for now; per-task pmaps land alongside SMP.
+ * the PT_LOAD segments into the target task's address space at their
+ * requested VAs (all U=1, with R/W/X mirroring p_flags), and returns
+ * the entry RIP.  Each segment is recorded in task->t_map alongside
+ * the hardware install into task->t_pmap.
  */
+
+struct task;
 
 #define	ELF_MAG0		0x7Fu
 #define	ELF_MAG1		'E'
@@ -83,6 +85,7 @@ _Static_assert(sizeof(struct elf64_phdr) == 56, "phdr must be 56 bytes");
 #define	ELF_E_MAP		(-7)
 #define	ELF_E_BADSEG		(-8)
 
-int	elf_load(const void *image, size_t image_size, uint64_t *entry_out);
+int	elf_load(struct task *target, const void *image, size_t image_size,
+	    uint64_t *entry_out);
 
 #endif /* !_SYS_ELF_H_ */

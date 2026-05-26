@@ -13,6 +13,7 @@
 #include "kmem.h"
 #include "kprintf.h"
 #include "panic.h"
+#include "pmap.h"
 #include "sched.h"
 #include "spinlock.h"
 #include "task.h"
@@ -83,6 +84,38 @@ static struct thread	*timed_head;		/* (timed_lock)            */
 static void	idle_loop(void *) __attribute__((noreturn));
 static struct thread *pick_next_locked(struct thread *self);
 static void	enqueue_locked(struct thread *th);
+static void	switch_pmap_if_needed(struct thread *self, struct thread *next);
+
+/*
+ * If the incoming thread belongs to a different task than the outgoing,
+ * load the new task's CR3.  Same-task switches (e.g. between kernel
+ * threads, or between two threads of the same user task) skip the
+ * reload; that saves the full TLB flush x86 does on every CR3 write.
+ *
+ * kernel_task threads (including idle) share kernel_pmap, so kernel-
+ * to-kernel switches never reload either.  Called from C BEFORE
+ * thread_switch_asm because the asm swap leaves us on the incoming
+ * thread's stack; either order works in practice (both pmaps share
+ * the boot identity map covering all kmalloc'd kstacks), but doing it
+ * here keeps "active pmap == executing thread's task pmap" true at
+ * every observable point.
+ */
+static void
+switch_pmap_if_needed(struct thread *self, struct thread *next)
+{
+	struct pmap	*old_pm;
+	struct pmap	*new_pm;
+
+	if (self == NULL || next == NULL)
+		return;
+	if (self->th_task == next->th_task)
+		return;
+	old_pm = self->th_task != NULL ? self->th_task->t_pmap : NULL;
+	new_pm = next->th_task != NULL ? next->th_task->t_pmap : NULL;
+	if (new_pm == NULL || new_pm == old_pm)
+		return;
+	pmap_activate(new_pm);
+}
 
 /*
  * sched_lock unlock helper invoked by the trampoline that starts every
@@ -219,6 +252,7 @@ thread_yield(void)
 	current_thread = next;
 	ctx_switches++;
 
+	switch_pmap_if_needed(self, next);
 	thread_switch_asm(&self->th_rsp_save, next->th_rsp_save);
 
 	/* Resumed: release the lock the OTHER thread acquired before switching. */
@@ -271,6 +305,7 @@ thread_block_release(int reason, void *target, struct spinlock *external)
 	current_thread = next;
 	ctx_switches++;
 
+	switch_pmap_if_needed(self, next);
 	thread_switch_asm(&self->th_rsp_save, next->th_rsp_save);
 
 	/* Woken by thread_wake; release sched_lock and return. */
@@ -429,6 +464,7 @@ sched_handoff_zombie(struct thread *self)
 	current_thread = next;
 	ctx_switches++;
 
+	switch_pmap_if_needed(self, next);
 	thread_switch_asm(&self->th_rsp_save, next->th_rsp_save);
 
 	/* NOTREACHED -- self is zombie. */

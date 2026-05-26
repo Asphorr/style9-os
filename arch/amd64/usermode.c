@@ -39,10 +39,13 @@ static void	usermode_elf_launcher(void *) __attribute__((noreturn));
 void
 usermode_run_first_blob(void)
 {
+	struct task	*ut;
 	struct thread	*th;
 
-	th = thread_create(kernel_task, usermode_launcher, NULL,
-	    "user-blob");
+	ut = task_create("user-blob");
+	if (ut == NULL)
+		panic("usermode_run_first_blob: task_create failed");
+	th = thread_create(ut, usermode_launcher, NULL, "user-blob");
 	if (th == NULL)
 		panic("usermode_run_first_blob: thread_create failed");
 	thread_start(th);
@@ -51,10 +54,13 @@ usermode_run_first_blob(void)
 void
 usermode_run_hello_elf(void)
 {
+	struct task	*ut;
 	struct thread	*th;
 
-	th = thread_create(kernel_task, usermode_elf_launcher, NULL,
-	    "user-elf");
+	ut = task_create("hello");
+	if (ut == NULL)
+		panic("usermode_run_hello_elf: task_create failed");
+	th = thread_create(ut, usermode_elf_launcher, NULL, "user-elf");
 	if (th == NULL)
 		panic("usermode_run_hello_elf: thread_create failed");
 	thread_start(th);
@@ -64,10 +70,16 @@ usermode_run_hello_elf(void)
  * Launcher for a ring-3 program shipped as an embedded ELF64.  Differs
  * from usermode_launcher in that elf_load handles segment mapping and
  * picks the entry RIP off e_entry; we only own the stack mapping.
+ *
+ * Runs as a kernel thread attached to the freshly-created user task, so
+ * by the time we get here the scheduler has already loaded our task's
+ * CR3 -- elf_load's pmap_enter calls land in (and TLB-flush) the live
+ * page table.
  */
 static void
 usermode_elf_launcher(void *arg)
 {
+	struct task	*ut;
 	uint64_t	*kva;
 	uint64_t	 entry;
 	uint64_t	 stack_pa;
@@ -78,27 +90,21 @@ usermode_elf_launcher(void *arg)
 
 	(void)arg;
 
+	ut         = current_thread->th_task;
 	image_size = (size_t)(_binary_hello_elf_end -
 	    _binary_hello_elf_start);
 
-	rv = elf_load(_binary_hello_elf_start, image_size, &entry);
+	rv = elf_load(ut, _binary_hello_elf_start, image_size, &entry);
 	if (rv != ELF_E_OK)
 		panic("usermode_elf_launcher: elf_load rv=%d", rv);
 
 	stack_pa = pmm_alloc_page();
 	if (stack_pa == PA_INVALID)
 		panic("usermode_elf_launcher: stack alloc failed");
-	if (!pmap_kenter(USER_STACK_VA, stack_pa,
+	if (!pmap_enter(ut->t_pmap, USER_STACK_VA, stack_pa,
 	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_USER))
 		panic("usermode_elf_launcher: stack map failed");
-
-	/*
-	 * Mirror the hardware install in the task's vm_map.  Bookkeeping
-	 * only this commit (pmap is the authoritative source for the MMU),
-	 * but the entry is what the next commit will drive page-table
-	 * installs from once each task gets its own PML4.
-	 */
-	if (!vm_map_enter(kernel_task->t_map, USER_STACK_VA, 0x1000,
+	if (!vm_map_enter(ut->t_map, USER_STACK_VA, 0x1000,
 	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_USER, VME_F_ANON))
 		panic("usermode_elf_launcher: vm_map_enter stack");
 
@@ -112,12 +118,9 @@ usermode_elf_launcher(void *arg)
 	syscall_kernel_rsp = ksp;
 
 	kprintf("usermode: hello.elf entry=0x%llx (image=%zu bytes), "
-	    "stack=0x%llx\n",
+	    "stack=0x%llx, task=%s\n",
 	    (unsigned long long)entry, image_size,
-	    (unsigned long long)USER_STACK_TOP);
-
-	/* TEMPORARY: dump the kernel_task vm_map post-load for verification */
-	vm_map_print(kernel_task->t_map);
+	    (unsigned long long)USER_STACK_TOP, ut->t_name);
 
 	usermode_enter(entry, USER_STACK_TOP);
 }
@@ -135,6 +138,7 @@ usermode_elf_launcher(void *arg)
 static void
 usermode_launcher(void *arg)
 {
+	struct task	*ut;
 	uint64_t	*kva;
 	uint64_t	 code_pa;
 	uint64_t	 stack_pa;
@@ -145,22 +149,24 @@ usermode_launcher(void *arg)
 
 	(void)arg;
 
+	ut = current_thread->th_task;
+
 	code_pa  = pmm_alloc_page();
 	stack_pa = pmm_alloc_page();
 	if (code_pa == PA_INVALID || stack_pa == PA_INVALID)
 		panic("usermode_launcher: pmm out of pages");
 
-	if (!pmap_kenter(USER_CODE_VA, code_pa,
+	if (!pmap_enter(ut->t_pmap, USER_CODE_VA, code_pa,
 	    VM_PROT_READ | VM_PROT_EXEC | VM_PROT_USER))
 		panic("usermode_launcher: code map failed");
-	if (!pmap_kenter(USER_STACK_VA, stack_pa,
+	if (!pmap_enter(ut->t_pmap, USER_STACK_VA, stack_pa,
 	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_USER))
 		panic("usermode_launcher: stack map failed");
 
-	if (!vm_map_enter(kernel_task->t_map, USER_CODE_VA, 0x1000,
+	if (!vm_map_enter(ut->t_map, USER_CODE_VA, 0x1000,
 	    VM_PROT_READ | VM_PROT_EXEC | VM_PROT_USER, VME_F_ANON))
 		panic("usermode_launcher: vm_map_enter code");
-	if (!vm_map_enter(kernel_task->t_map, USER_STACK_VA, 0x1000,
+	if (!vm_map_enter(ut->t_map, USER_STACK_VA, 0x1000,
 	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_USER, VME_F_ANON))
 		panic("usermode_launcher: vm_map_enter stack");
 
@@ -206,10 +212,10 @@ usermode_launcher(void *arg)
 	}
 
 	kprintf("usermode: entering ring 3 (rip=0x%llx rsp=0x%llx, "
-	    "blob=%zu bytes)\n",
+	    "blob=%zu bytes, task=%s)\n",
 	    (unsigned long long)USER_CODE_VA,
 	    (unsigned long long)USER_STACK_TOP,
-	    blob_len);
+	    blob_len, ut->t_name);
 
 	usermode_enter(USER_CODE_VA, USER_STACK_TOP);
 }

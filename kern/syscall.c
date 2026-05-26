@@ -181,13 +181,12 @@ sys_yield(void)
 /*
  * User pointer range check.
  *
- * Today every ring-3 task shares the kernel's PML4 with U=1 leaves
- * placed at [0x40000000, 0x80000000) -- the slot just past the boot
- * identity map.  Until per-task pmaps + a real vm_map exist, the
- * coarse "is the whole [addr, addr+len) inside that window?" check is
- * enough to catch a userspace pointer that points back into kernel
- * memory.  When SMAP comes online we'll also bracket the deref with
- * stac/clac.
+ * Every task gets its own pmap; ring-3 leaves live at [0x40000000,
+ * 0x80000000) by convention.  This check rejects pointers outside that
+ * window (in particular anything aiming back into kernel-VA below the
+ * 1 GiB identity map).  When SMAP comes online we'll also bracket the
+ * deref with stac/clac so a missed range check fails closed rather
+ * than just being a policy violation.
  */
 #define	USER_VA_LO	0x40000000ULL
 #define	USER_VA_HI	0x80000000ULL
@@ -212,7 +211,7 @@ sys_port_alloc(uint8_t rights)
 {
 	mach_port_name_t	n;
 
-	n = port_allocate(kernel_task->t_port_space, rights);
+	n = port_allocate(current_thread->th_task->t_port_space, rights);
 	if (n == MACH_PORT_NULL)
 		return (SYS_E_INVAL);
 	return ((long)n);
@@ -222,17 +221,19 @@ static long
 sys_port_dealloc(mach_port_name_t name)
 {
 
-	return ((long)port_deallocate(kernel_task->t_port_space, name));
+	return ((long)port_deallocate(current_thread->th_task->t_port_space,
+	    name));
 }
 
 /*
  * sys_msg_send / sys_msg_recv.
  *
  * The user supplies a pointer to a Mach header.  We honour the user's
- * msgh_size (header + body bytes) but copy in / out via the kernel's
- * direct view of the shared address space -- no kmalloc round-trip
- * yet.  Once per-task pmaps exist this becomes the canonical place
- * for a real copy-in.
+ * msgh_size (header + body bytes) and read the bytes directly from the
+ * caller's address space: each ring-3 task runs under its own pmap, so
+ * `umsg` is a valid VA only while this thread is current (which it is
+ * for the lifetime of the syscall).  No kmalloc round-trip yet -- the
+ * mach_msg_send path makes its own copy into the queued message.
  */
 static long
 sys_msg_send(const struct mach_msg_header *umsg)
@@ -244,7 +245,8 @@ sys_msg_send(const struct mach_msg_header *umsg)
 	if (!user_range_ok((uint64_t)(uintptr_t)umsg, umsg->msgh_size))
 		return (SYS_E_FAULT);
 
-	return ((long)mach_msg_send(kernel_task->t_port_space, umsg));
+	return ((long)mach_msg_send(current_thread->th_task->t_port_space,
+	    umsg));
 }
 
 static long
@@ -255,7 +257,8 @@ sys_msg_recv(mach_port_name_t name, struct mach_msg_header *ubuf,
 	if (!user_range_ok((uint64_t)(uintptr_t)ubuf, ubuf_size))
 		return (SYS_E_FAULT);
 
-	return ((long)mach_msg_recv_block(kernel_task->t_port_space,
+	return ((long)mach_msg_recv_block(
+	    current_thread->th_task->t_port_space,
 	    name, ubuf, ubuf_size));
 }
 
@@ -267,7 +270,8 @@ sys_msg_recv_timed(mach_port_name_t name, struct mach_msg_header *ubuf,
 	if (!user_range_ok((uint64_t)(uintptr_t)ubuf, ubuf_size))
 		return (SYS_E_FAULT);
 
-	return ((long)mach_msg_recv_timed(kernel_task->t_port_space,
+	return ((long)mach_msg_recv_timed(
+	    current_thread->th_task->t_port_space,
 	    name, ubuf, ubuf_size, timeout_ms));
 }
 
@@ -291,6 +295,6 @@ sys_msg_rpc(struct mach_msg_header *ureq, struct mach_msg_header *ureply,
 	if (!user_range_ok((uint64_t)(uintptr_t)ureply, ureply_size))
 		return (SYS_E_FAULT);
 
-	return ((long)mach_msg_rpc(kernel_task->t_port_space, ureq,
+	return ((long)mach_msg_rpc(current_thread->th_task->t_port_space, ureq,
 	    ureply, ureply_size, timeout_ms));
 }

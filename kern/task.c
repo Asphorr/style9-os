@@ -12,6 +12,7 @@
 #include "kmem.h"
 #include "kprintf.h"
 #include "panic.h"
+#include "pmap.h"
 #include "port.h"
 #include "spinlock.h"
 #include "task.h"
@@ -67,6 +68,16 @@ task_subsystem_init(void)
 	if (port_install_bootstrap(kernel_task) != MACH_MSG_OK)
 		panic("task_subsystem_init: install bootstrap in kernel_space");
 
+	/*
+	 * The kernel runs on the page-table tree boot.S installed and
+	 * pmap_bootstrap wrapped as kernel_pmap.  task_create allocated a
+	 * fresh per-task pmap for kernel_task; drop it and point at the
+	 * authoritative kernel pmap instead so context switches between
+	 * kernel threads never reload CR3.
+	 */
+	pmap_destroy(kernel_task->t_pmap);
+	kernel_task->t_pmap = kernel_pmap;
+
 	kprintf("task: kernel_task id=%llu name=%s, %u initial tasks\n",
 	    (unsigned long long)kernel_task->t_id,
 	    kernel_task->t_name, 1);
@@ -93,6 +104,7 @@ task_create(const char *name)
 	t->t_refs       = 1;
 	t->t_self_port  = NULL;
 	t->t_map        = NULL;
+	t->t_pmap       = NULL;
 
 	t->t_port_space = port_space_new();
 	if (t->t_port_space == NULL) {
@@ -101,15 +113,11 @@ task_create(const char *name)
 	}
 
 	/*
-	 * Per-task VM map.  Currently bookkeeping-only: hardware
-	 * mappings still go through pmap_kenter and the boot-time
-	 * shared PML4.  The map records what user-VA ranges this task
-	 * has staked out so the next commit (per-task PML4) can drive
-	 * page-table installs from it rather than from ad-hoc calls.
-	 *
-	 * Window is the standard user-VA slot every task gets today.
-	 * A future per-task heap / mmap pool can slice further out of
-	 * the same constants.
+	 * Per-task VM map records the user-VA ranges this task has staked
+	 * out; per-task pmap is the hardware page-table tree those entries
+	 * land in.  The map is paired with the pmap from creation forward
+	 * -- callers that vm_map_enter a range are also expected to
+	 * pmap_enter the underlying frame in the same task->t_pmap.
 	 */
 	t->t_map = vm_map_create(VM_USER_VA_LO, VM_USER_VA_HI);
 	if (t->t_map == NULL) {
@@ -118,7 +126,16 @@ task_create(const char *name)
 		return (NULL);
 	}
 
+	t->t_pmap = pmap_create();
+	if (t->t_pmap == NULL) {
+		vm_map_destroy(t->t_map);
+		port_space_destroy(t->t_port_space);
+		kfree(t);
+		return (NULL);
+	}
+
 	if (port_install_task_self(t) != MACH_MSG_OK) {
+		pmap_destroy(t->t_pmap);
 		vm_map_destroy(t->t_map);
 		port_space_destroy(t->t_port_space);
 		kfree(t);
@@ -133,6 +150,7 @@ task_create(const char *name)
 	 */
 	if (port_install_bootstrap(t) != MACH_MSG_OK) {
 		port_release_task_self(t);
+		pmap_destroy(t->t_pmap);
 		vm_map_destroy(t->t_map);
 		port_space_destroy(t->t_port_space);
 		kfree(t);
@@ -243,6 +261,7 @@ task_deref(struct task *t)
 	if (t != kernel_task) {
 		port_space_destroy(t->t_port_space);
 		port_release_task_self(t);
+		pmap_destroy(t->t_pmap);
 		vm_map_destroy(t->t_map);
 	}
 	kfree(t);

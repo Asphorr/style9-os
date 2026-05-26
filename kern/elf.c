@@ -16,11 +16,12 @@
 #include "task.h"
 #include "vm.h"
 
-static int	load_segment(const uint8_t *image, size_t image_size,
-		    const struct elf64_phdr *ph);
+static int	load_segment(struct task *target, const uint8_t *image,
+		    size_t image_size, const struct elf64_phdr *ph);
 
 int
-elf_load(const void *image, size_t image_size, uint64_t *entry_out)
+elf_load(struct task *target, const void *image, size_t image_size,
+    uint64_t *entry_out)
 {
 	const struct elf64_ehdr		*eh;
 	const struct elf64_phdr		*ph;
@@ -28,7 +29,7 @@ elf_load(const void *image, size_t image_size, uint64_t *entry_out)
 	uint16_t			 i;
 	int				 rv;
 
-	if (image == NULL || entry_out == NULL)
+	if (target == NULL || image == NULL || entry_out == NULL)
 		return (ELF_E_TRUNCATED);
 	if (image_size < sizeof(*eh))
 		return (ELF_E_TRUNCATED);
@@ -59,7 +60,7 @@ elf_load(const void *image, size_t image_size, uint64_t *entry_out)
 		if (ph->p_type != PT_LOAD)
 			continue;
 
-		rv = load_segment(bytes, image_size, ph);
+		rv = load_segment(target, bytes, image_size, ph);
 		if (rv != ELF_E_OK)
 			return (rv);
 	}
@@ -69,7 +70,7 @@ elf_load(const void *image, size_t image_size, uint64_t *entry_out)
 }
 
 /*
- * Bring one PT_LOAD into the live address space:
+ * Bring one PT_LOAD into the target task's address space:
  *	- round [p_vaddr, p_vaddr+p_memsz) out to whole pages,
  *	- allocate + map each page U=1 with R / W / X from p_flags,
  *	- zero the freshly-allocated frame (covers BSS),
@@ -79,7 +80,7 @@ elf_load(const void *image, size_t image_size, uint64_t *entry_out)
  *	  through the boot identity map, the user leaf stays RO).
  */
 static int
-load_segment(const uint8_t *image, size_t image_size,
+load_segment(struct task *target, const uint8_t *image, size_t image_size,
     const struct elf64_phdr *ph)
 {
 	uint64_t	va, va_start, va_end;
@@ -87,7 +88,6 @@ load_segment(const uint8_t *image, size_t image_size,
 	uint64_t	src_off;
 	uint64_t	remaining;
 	uint64_t	cur_va;
-	uint64_t	page_va;
 	uint64_t	page_off;
 	uint64_t	chunk;
 	uint8_t		*kva;
@@ -120,19 +120,18 @@ load_segment(const uint8_t *image, size_t image_size,
 		for (i = 0; i < PAGE_SIZE; i++)
 			kva[i] = 0;
 
-		if (!pmap_kenter(va, pa, prot))
+		if (!pmap_enter(target->t_pmap, va, pa, prot))
 			return (ELF_E_MAP);
 	}
 
 	/*
 	 * Record the whole segment as one entry in the task's vm_map.
-	 * Bookkeeping only -- pmap stays authoritative for the MMU
-	 * until per-task PML4 lands.  vme_prot carries pmap-style bits
-	 * (R/W/X plus USER); vme_flags only tracks backing semantics
-	 * (ANON, future COW), since "user accessibility" is already in
-	 * the prot byte and a second flag would just drift.
+	 * vme_prot carries pmap-style bits (R/W/X plus USER); vme_flags
+	 * only tracks backing semantics (ANON, future COW), since "user
+	 * accessibility" is already in the prot byte and a second flag
+	 * would just drift.
 	 */
-	if (!vm_map_enter(kernel_task->t_map, va_start, va_end - va_start,
+	if (!vm_map_enter(target->t_map, va_start, va_end - va_start,
 	    (uint8_t)prot, VME_F_ANON))
 		return (ELF_E_MAP);
 
@@ -141,13 +140,12 @@ load_segment(const uint8_t *image, size_t image_size,
 	cur_va    = ph->p_vaddr;
 
 	while (remaining > 0) {
-		page_va  = cur_va & ~(uint64_t)PAGE_MASK;
 		page_off = cur_va & PAGE_MASK;
 		chunk    = PAGE_SIZE - page_off;
 		if (chunk > remaining)
 			chunk = remaining;
 
-		pa = pmap_kextract(cur_va);
+		pa = pmap_extract(target->t_pmap, cur_va & ~(uint64_t)PAGE_MASK);
 		if (pa == PA_INVALID)
 			return (ELF_E_MAP);
 		kva = (uint8_t *)pmm_kva_from_pa(pa & ~(uint64_t)PAGE_MASK);
@@ -155,7 +153,6 @@ load_segment(const uint8_t *image, size_t image_size,
 		for (i = 0; i < chunk; i++)
 			kva[page_off + i] = image[src_off + i];
 
-		(void)page_va;
 		src_off   += chunk;
 		cur_va    += chunk;
 		remaining -= chunk;
