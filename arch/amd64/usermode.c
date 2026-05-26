@@ -103,6 +103,23 @@ arch_spawn_user(const char *name, const uint8_t *image, size_t image_size)
 		return (SYS_E_NOSYS);
 	}
 	thread_start(th);
+
+	/*
+	 * Drop the creator's ref now that the task is anchored by its
+	 * thread.  task_create returns t_refs=1; thread_create's
+	 * task_attach_thread bumps it to 2.  Without this release, the
+	 * final task_detach_thread on the exiting user thread would only
+	 * take refs 2 -> 1, never to 0, and the dead task would linger in
+	 * task_list forever -- SYS_TASK_ALIVE would keep reporting it
+	 * alive and the userspace shell's wait_child yield-spin would
+	 * never terminate.
+	 *
+	 * Safe to drop here because the thread is already enqueued: the
+	 * scheduler holds a stable view of the task via th_task whether
+	 * or not the thread has run yet, and task_deref only frees the
+	 * task when t_refs hits zero AND t_nthreads == 0 (KASSERT'd).
+	 */
+	task_deref(ut);
 	return ((long)ut->t_id);
 }
 

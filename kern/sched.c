@@ -10,12 +10,14 @@
 #include <stdint.h>
 
 #include "clock.h"
+#include "gdt.h"
 #include "kmem.h"
 #include "kprintf.h"
 #include "panic.h"
 #include "pmap.h"
 #include "sched.h"
 #include "spinlock.h"
+#include "syscall.h"
 #include "task.h"
 #include "thread.h"
 
@@ -85,6 +87,7 @@ static void	idle_loop(void *) __attribute__((noreturn));
 static struct thread *pick_next_locked(struct thread *self);
 static void	enqueue_locked(struct thread *th);
 static void	switch_pmap_if_needed(struct thread *self, struct thread *next);
+static void	switch_user_kstack(struct thread *next);
 
 /*
  * If the incoming thread belongs to a different task than the outgoing,
@@ -115,6 +118,39 @@ switch_pmap_if_needed(struct thread *self, struct thread *next)
 	if (new_pm == NULL || new_pm == old_pm)
 		return;
 	pmap_activate(new_pm);
+}
+
+/*
+ * Re-arm the ring-transition kstack pointers for the incoming thread.
+ *
+ * Both tss.rsp0 (used by IRQ-from-ring-3 entry) and syscall_kernel_rsp
+ * (used by the SYSCALL stub) are read by hardware at the next ring-3
+ * -> ring-0 transition, so they must always point at the CURRENT
+ * thread's own kstack -- otherwise a syscall taken from sh.elf after
+ * we just dispatched away from clock.elf would land on clock's freed
+ * kstack, scribble the syscall_frame onto recycled memory, and SYSRET
+ * to a garbage RIP.
+ *
+ * usermode_elf_launcher sets these once when a new user task starts,
+ * but the value is global -- without this re-arm on every context
+ * switch the MSRs are stale the moment the scheduler picks a
+ * different user thread.
+ *
+ * Threads without a kstack of their own (only the synthesised boot
+ * thread) are skipped; they don't return to ring 3, so the MSRs are
+ * never read from their context.
+ */
+static void
+switch_user_kstack(struct thread *next)
+{
+	uint64_t	ksp;
+
+	if (next == NULL || next->th_kstack_base == NULL)
+		return;
+	ksp = (uint64_t)(uintptr_t)next->th_kstack_base +
+	    next->th_kstack_size;
+	tss_set_rsp0(ksp);
+	syscall_kernel_rsp = ksp;
 }
 
 /*
@@ -253,6 +289,7 @@ thread_yield(void)
 	ctx_switches++;
 
 	switch_pmap_if_needed(self, next);
+	switch_user_kstack(next);
 	thread_switch_asm(&self->th_rsp_save, next->th_rsp_save);
 
 	/* Resumed: release the lock the OTHER thread acquired before switching. */
@@ -306,6 +343,7 @@ thread_block_release(int reason, void *target, struct spinlock *external)
 	ctx_switches++;
 
 	switch_pmap_if_needed(self, next);
+	switch_user_kstack(next);
 	thread_switch_asm(&self->th_rsp_save, next->th_rsp_save);
 
 	/* Woken by thread_wake; release sched_lock and return. */
@@ -465,6 +503,7 @@ sched_handoff_zombie(struct thread *self)
 	ctx_switches++;
 
 	switch_pmap_if_needed(self, next);
+	switch_user_kstack(next);
 	thread_switch_asm(&self->th_rsp_save, next->th_rsp_save);
 
 	/* NOTREACHED -- self is zombie. */
