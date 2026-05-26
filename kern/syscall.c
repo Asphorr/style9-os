@@ -37,6 +37,12 @@ static long	sys_port_dealloc(mach_port_name_t name);
 static long	sys_msg_send(const struct mach_msg_header *umsg);
 static long	sys_msg_recv(mach_port_name_t name,
 		    struct mach_msg_header *ubuf, size_t ubuf_size);
+static long	sys_msg_recv_timed(mach_port_name_t name,
+		    struct mach_msg_header *ubuf, size_t ubuf_size,
+		    uint64_t timeout_ms);
+static long	sys_msg_rpc(struct mach_msg_header *ureq,
+		    struct mach_msg_header *ureply, size_t ureply_size,
+		    uint64_t timeout_ms);
 
 static bool	user_range_ok(uint64_t addr, size_t len);
 
@@ -120,6 +126,16 @@ syscall_dispatch(struct syscall_frame *f)
 		return (sys_msg_recv((mach_port_name_t)f->sf_arg0,
 		    (struct mach_msg_header *)f->sf_arg1,
 		    (size_t)f->sf_arg2));
+	case SYS_MSG_RECV_TIMED:
+		return (sys_msg_recv_timed((mach_port_name_t)f->sf_arg0,
+		    (struct mach_msg_header *)f->sf_arg1,
+		    (size_t)f->sf_arg2,
+		    (uint64_t)f->sf_arg3));
+	case SYS_MSG_RPC:
+		return (sys_msg_rpc((struct mach_msg_header *)f->sf_arg0,
+		    (struct mach_msg_header *)f->sf_arg1,
+		    (size_t)f->sf_arg2,
+		    (uint64_t)f->sf_arg3));
 	default:
 		return (SYS_E_NOSYS);
 	}
@@ -241,4 +257,40 @@ sys_msg_recv(mach_port_name_t name, struct mach_msg_header *ubuf,
 
 	return ((long)mach_msg_recv_block(kernel_task->t_port_space,
 	    name, ubuf, ubuf_size));
+}
+
+static long
+sys_msg_recv_timed(mach_port_name_t name, struct mach_msg_header *ubuf,
+    size_t ubuf_size, uint64_t timeout_ms)
+{
+
+	if (!user_range_ok((uint64_t)(uintptr_t)ubuf, ubuf_size))
+		return (SYS_E_FAULT);
+
+	return ((long)mach_msg_recv_timed(kernel_task->t_port_space,
+	    name, ubuf, ubuf_size, timeout_ms));
+}
+
+/*
+ * SYS_MSG_RPC.  The user supplies a fully-populated request header and
+ * a reply buffer; the kernel allocates the reply port internally,
+ * splices it into req->msgh_local, sends, waits with timeout, and
+ * tears the reply port down.  msgh_local in the user's request is
+ * overwritten in place -- this is the standard Mach RPC convention.
+ */
+static long
+sys_msg_rpc(struct mach_msg_header *ureq, struct mach_msg_header *ureply,
+    size_t ureply_size, uint64_t timeout_ms)
+{
+
+	if (!user_range_ok((uint64_t)(uintptr_t)ureq,
+	    sizeof(struct mach_msg_header)))
+		return (SYS_E_FAULT);
+	if (!user_range_ok((uint64_t)(uintptr_t)ureq, ureq->msgh_size))
+		return (SYS_E_FAULT);
+	if (!user_range_ok((uint64_t)(uintptr_t)ureply, ureply_size))
+		return (SYS_E_FAULT);
+
+	return ((long)mach_msg_rpc(kernel_task->t_port_space, ureq,
+	    ureply, ureply_size, timeout_ms));
 }

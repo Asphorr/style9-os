@@ -117,6 +117,15 @@ _Static_assert(sizeof(struct mach_msg_port_descriptor) == 8,
 #define	MACH_E_NOMSG		6	/* recv on empty queue             */
 #define	MACH_E_TOOSMALL		7	/* caller's recv buf too small     */
 #define	MACH_E_NOMEM		8	/* kmalloc failed                  */
+#define	MACH_E_TIMEOUT		9	/* mach_msg_recv_timed deadline    */
+
+/*
+ * Special timeout values for mach_msg_recv_timed.
+ *	NONE	 -- non-blocking poll; returns MACH_E_NOMSG if empty
+ *	FOREVER	 -- behaviour identical to mach_msg_recv_block
+ */
+#define	MACH_TIMEOUT_NONE	((uint64_t)0)
+#define	MACH_TIMEOUT_FOREVER	((uint64_t)~0ull)
 
 /* Opaque kernel objects. */
 struct port;
@@ -234,6 +243,41 @@ int			 mach_msg_recv(struct port_space *to,
 int			 mach_msg_recv_block(struct port_space *to,
 			    mach_port_name_t recv_name,
 			    struct mach_msg_header *buf, size_t buf_size);
+
+/*
+ * mach_msg_recv_timed: like recv_block but bounds the wait by
+ * `timeout_ms` measured in milliseconds against clock_uptime_ms().
+ *	MACH_TIMEOUT_NONE	non-blocking poll
+ *	MACH_TIMEOUT_FOREVER	wait indefinitely (== recv_block)
+ *	any other value		return MACH_E_TIMEOUT when deadline elapses
+ *
+ * On timeout the caller's buf is untouched; on success it carries the
+ * dequeued message exactly as for recv_block.
+ */
+int			 mach_msg_recv_timed(struct port_space *to,
+			    mach_port_name_t recv_name,
+			    struct mach_msg_header *buf, size_t buf_size,
+			    uint64_t timeout_ms);
+
+/*
+ * mach_msg_rpc: send `req` to its destination, then wait for a single
+ * reply on a freshly-allocated reply port.  The reply port is created
+ * inside `space`, encoded into `req->msgh_local` with disposition
+ * MAKE_SEND so the server receives a SEND right to talk back through,
+ * and torn down before return regardless of outcome.
+ *
+ * `reply_buf` (capacity `reply_buf_size`) receives the reply message.
+ * `timeout_ms` bounds the wait the same way mach_msg_recv_timed does.
+ *
+ * On any failure (send error, recv error, timeout) the reply port is
+ * deallocated before this function returns, so the caller never has to
+ * clean it up on the error path.
+ */
+int			 mach_msg_rpc(struct port_space *space,
+			    struct mach_msg_header *req,
+			    struct mach_msg_header *reply_buf,
+			    size_t reply_buf_size,
+			    uint64_t timeout_ms);
 
 /*
  * Introspection / debugging.

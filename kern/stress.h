@@ -46,5 +46,6 @@ int	stress_intertask(unsigned int rounds);
 int	stress_moverecv(unsigned int rounds);
 int	stress_nosenders(unsigned int rounds);
 int	stress_sendblock(unsigned int rounds);
+int	stress_rpc(unsigned int rounds);
 
 #endif /* !_SYS_STRESS_H_ */

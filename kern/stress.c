@@ -2332,3 +2332,243 @@ out:
 	kprintf("stress_sendblock: PASS\n");
 	return (0);
 }
+
+/* ---- stress_rpc -------------------------------------------------------- */
+
+/*
+ * Exercises mach_msg_rpc end-to-end and verifies mach_msg_recv_timed
+ * surfaces MACH_E_TIMEOUT when no message arrives within the deadline.
+ *
+ * Topology: a single server thread holds RECEIVE on `srv_port` and
+ * loops recv -> reply.  The main thread issues mach_msg_rpc N times.
+ * mach_msg_rpc internally allocates a fresh reply port per call, encodes
+ * it into msgh_local with MAKE_SEND, sends, recvs the reply on it, and
+ * deallocates.  The server consumes the reply right via MOVE_SEND so
+ * its name slot is reclaimed each round.
+ *
+ * After the RPC loop a 50 ms recv_timed on a fresh, empty port checks
+ * the new PIT-driven sched_check_timeouts path: the call must return
+ * MACH_E_TIMEOUT within a loose wall-clock window (allows slack for
+ * PIT-scan latency under interleaved stress passes).
+ */
+
+#define	STRESS_RPC_SHUTDOWN_ID	0xDEAD0000u
+
+struct stress_rpc_ctx {
+	mach_port_name_t	src_port;
+	volatile int		src_done;
+	int			src_rv;
+};
+
+static void
+stress_rpc_server(void *arg)
+{
+	struct stress_rpc_ctx	*ctx;
+	struct mach_msg_header	 req;
+	struct mach_msg_header	 reply;
+	int			 rv;
+
+	ctx = (struct stress_rpc_ctx *)arg;
+
+	for (;;) {
+		rv = mach_msg_recv_block(kernel_space, ctx->src_port, &req,
+		    sizeof(req));
+		if (rv != MACH_MSG_OK) {
+			ctx->src_rv = rv;
+			break;
+		}
+		if (req.msgh_id == STRESS_RPC_SHUTDOWN_ID)
+			break;
+
+		reply.msgh_bits    = MACH_MSGH_BITS(
+		    MACH_MSG_TYPE_MOVE_SEND, 0);
+		reply.msgh_size    = sizeof(reply);
+		reply.msgh_remote  = req.msgh_local;
+		reply.msgh_local   = MACH_PORT_NULL;
+		reply.msgh_voucher = 0;
+		reply.msgh_id      = req.msgh_id;
+
+		rv = mach_msg_send(kernel_space, &reply);
+		if (rv != MACH_MSG_OK) {
+			ctx->src_rv = rv;
+			break;
+		}
+	}
+	__atomic_store_n(&ctx->src_done, 1, __ATOMIC_RELEASE);
+	thread_exit();
+}
+
+int
+stress_rpc(unsigned int rounds)
+{
+	struct stress_rpc_ctx	 ctx;
+	struct mach_msg_header	 req;
+	struct mach_msg_header	 reply;
+	struct thread		*server;
+	size_t			 inuse0, inuse1;
+	size_t			 cached0, cached1;
+	size_t			 pmm0, pmm1;
+	size_t			 cons0, cons1;
+	uint64_t		 t0, t1, dt;
+	mach_port_name_t	 srv;
+	mach_port_name_t	 empty;
+	unsigned int		 i;
+	unsigned int		 spin;
+	int			 rv;
+
+	if (rounds == 0)
+		rounds = 1;
+	if (rounds > 10000u)
+		rounds = 10000u;
+
+	kprintf("stress_rpc: %u rounds + 1 timeout probe\n", rounds);
+
+	inuse0  = port_space_inuse(kernel_space);
+	cached0 = kmem_cached_pages();
+	pmm0    = pmm_used_pages();
+	cons0   = pmm0 - cached0;
+
+	srv = port_allocate(kernel_space,
+	    MACH_PORT_RIGHT_RECEIVE | MACH_PORT_RIGHT_SEND);
+	if (srv == MACH_PORT_NULL) {
+		kprintf("stress_rpc: srv allocate fail\n");
+		return (1);
+	}
+
+	ctx.src_port = srv;
+	__atomic_store_n(&ctx.src_done, 0, __ATOMIC_RELEASE);
+	ctx.src_rv = MACH_MSG_OK;
+
+	server = thread_create(kernel_task, stress_rpc_server, &ctx,
+	    "rpc-srv");
+	if (server == NULL) {
+		kprintf("stress_rpc: thread_create fail\n");
+		rv = 2;
+		goto out;
+	}
+	thread_start(server);
+
+	for (i = 0; i < rounds; i++) {
+		req.msgh_bits    = MACH_MSGH_BITS(
+		    MACH_MSG_TYPE_COPY_SEND, 0);
+		req.msgh_size    = sizeof(req);
+		req.msgh_remote  = srv;
+		req.msgh_local   = MACH_PORT_NULL;	/* rpc fills in     */
+		req.msgh_voucher = 0;
+		req.msgh_id      = 0xCAFE0000u | i;
+
+		rv = mach_msg_rpc(kernel_space, &req, &reply, sizeof(reply),
+		    MACH_TIMEOUT_FOREVER);
+		if (rv != MACH_MSG_OK) {
+			kprintf("stress_rpc: rpc #%u: %s\n", i,
+			    mach_msg_strerror(rv));
+			goto out;
+		}
+		if (reply.msgh_id != (0xCAFE0000u | i)) {
+			kprintf("stress_rpc: reply id mismatch at #%u "
+			    "(got 0x%x)\n", i, reply.msgh_id);
+			rv = 3;
+			goto out;
+		}
+	}
+
+	/* Shutdown sentinel; server loops out and signals src_done. */
+	req.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	req.msgh_size    = sizeof(req);
+	req.msgh_remote  = srv;
+	req.msgh_local   = MACH_PORT_NULL;
+	req.msgh_voucher = 0;
+	req.msgh_id      = STRESS_RPC_SHUTDOWN_ID;
+	rv = mach_msg_send(kernel_space, &req);
+	if (rv != MACH_MSG_OK) {
+		kprintf("stress_rpc: shutdown send: %s\n",
+		    mach_msg_strerror(rv));
+		goto out;
+	}
+
+	for (spin = 0; spin < 1024; spin++) {
+		if (__atomic_load_n(&ctx.src_done, __ATOMIC_ACQUIRE) != 0)
+			break;
+		thread_yield();
+	}
+	if (__atomic_load_n(&ctx.src_done, __ATOMIC_ACQUIRE) == 0) {
+		kprintf("stress_rpc: server never exited\n");
+		rv = 4;
+		goto out;
+	}
+	if (ctx.src_rv != MACH_MSG_OK) {
+		kprintf("stress_rpc: server rv=%s\n",
+		    mach_msg_strerror(ctx.src_rv));
+		rv = ctx.src_rv;
+		goto out;
+	}
+	sched_reap_zombies();
+
+	/*
+	 * Timeout probe.  Fresh empty port, 50 ms deadline.  The PIT scan
+	 * runs at 100 Hz so the realised wait can drift by up to a tick;
+	 * 50..500 ms is a loose-enough envelope to ride out the boot-time
+	 * stress pass scheduling jitter without false alarms.
+	 */
+	empty = port_allocate(kernel_space,
+	    MACH_PORT_RIGHT_RECEIVE | MACH_PORT_RIGHT_SEND);
+	if (empty == MACH_PORT_NULL) {
+		kprintf("stress_rpc: empty allocate fail\n");
+		rv = 5;
+		goto out;
+	}
+	t0 = clock_uptime_ms();
+	rv = mach_msg_recv_timed(kernel_space, empty, &reply, sizeof(reply),
+	    50);
+	t1 = clock_uptime_ms();
+	dt = t1 - t0;
+	port_deallocate(kernel_space, empty);
+
+	if (rv != MACH_E_TIMEOUT) {
+		kprintf("stress_rpc: timeout probe rv=%s (expected E_TIMEOUT)\n",
+		    mach_msg_strerror(rv));
+		rv = 6;
+		goto out;
+	}
+	if (dt < 50u || dt > 500u) {
+		kprintf("stress_rpc: timeout slept %llu ms "
+		    "(want >=50, allow up to 500)\n",
+		    (unsigned long long)dt);
+		rv = 7;
+		goto out;
+	}
+	kprintf("stress_rpc: timeout probe slept %llu ms\n",
+	    (unsigned long long)dt);
+
+	rv = MACH_MSG_OK;
+
+out:
+	sched_reap_zombies();
+	port_deallocate(kernel_space, srv);
+
+	inuse1  = port_space_inuse(kernel_space);
+	cached1 = kmem_cached_pages();
+	pmm1    = pmm_used_pages();
+	cons1   = pmm1 - cached1;
+
+	kprintf("stress_rpc: names %zu -> %zu, conserved %zu -> %zu\n",
+	    inuse0, inuse1, cons0, cons1);
+
+	if (rv != MACH_MSG_OK) {
+		kprintf("stress_rpc: FAIL rv=%d\n", rv);
+		return (rv);
+	}
+	if (inuse1 != inuse0) {
+		kprintf("stress_rpc: FAIL name leak (delta=%lld)\n",
+		    (long long)((long long)inuse1 - (long long)inuse0));
+		return (90);
+	}
+	if (cons1 != cons0) {
+		kprintf("stress_rpc: FAIL conservation broken (delta=%lld)\n",
+		    (long long)((long long)cons1 - (long long)cons0));
+		return (91);
+	}
+
+	kprintf("stress_rpc: PASS\n");
+	return (0);
+}

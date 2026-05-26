@@ -11,10 +11,13 @@
  *	3. Send a self-message carrying a tagged msgh_id via SYS_MSG_SEND.
  *	4. Receive it via SYS_MSG_RECV (blocking recv on the same port).
  *	5. Print confirmation that the round-trip succeeded.
- *	6. SYS_PORT_DEALLOC + SYS_EXIT.
+ *	6. Probe the new timeout path: SYS_MSG_RECV_TIMED on an empty port
+ *	   with a 50 ms deadline, expect an error return (E_TIMEOUT).
+ *	7. SYS_PORT_DEALLOC + SYS_EXIT.
  *
  * This exercises the full IPC plumbing across the user/kernel boundary:
- * port_alloc + mach_msg_send + mach_msg_recv_block, all from ring 3.
+ * port_alloc + mach_msg_send + mach_msg_recv_block + mach_msg_recv_timed,
+ * all from ring 3.
  */
 
 typedef unsigned long		size_t;
@@ -30,6 +33,11 @@ typedef unsigned char		uint8_t;
 #define	SYS_PORT_DEALLOC	4
 #define	SYS_MSG_SEND		5
 #define	SYS_MSG_RECV		6
+#define	SYS_MSG_RECV_TIMED	7
+#define	SYS_MSG_RPC		8
+
+/* MACH_E_TIMEOUT from kern/port.h -- recv_timed returns this on deadline. */
+#define	MACH_E_TIMEOUT		9
 
 /* Must agree with kern/port.h. */
 #define	MACH_PORT_NULL			((uint32_t)0)
@@ -83,6 +91,19 @@ syscall3(long nr, long a0, long a1, long a2)
 	__asm__ __volatile__ ("syscall"
 	    : "=a"(ret)
 	    : "0"(nr), "D"(a0), "S"(a1), "d"(a2)
+	    : "rcx", "r11", "memory");
+	return (ret);
+}
+
+static long
+syscall4(long nr, long a0, long a1, long a2, long a3)
+{
+	register long	r10 __asm__("r10") = a3;
+	long		ret;
+
+	__asm__ __volatile__ ("syscall"
+	    : "=a"(ret)
+	    : "0"(nr), "D"(a0), "S"(a1), "d"(a2), "r"(r10)
 	    : "rcx", "r11", "memory");
 	return (ret);
 }
@@ -188,6 +209,26 @@ _start(void)
 		syscall1(SYS_EXIT, 4);
 	}
 	puts1("  mach_msg round-trip via SYSCALL: OK\n");
+
+	/*
+	 * Step 6: timeout probe.  Empty port (we just drained it above),
+	 * 50 ms deadline -- recv_timed must return a non-zero error (the
+	 * kernel surfaces MACH_E_TIMEOUT).  We don't insist on the exact
+	 * code from ring 3, only that the call returns rather than parks
+	 * forever; the kernel-side stress_rpc test asserts the precise
+	 * error code.
+	 */
+	rv = syscall4(SYS_MSG_RECV_TIMED, (long)name, (long)&rx,
+	    (long)sizeof(rx), 50);
+	if (rv == 0) {
+		puts1("  recv_timed unexpectedly returned a message\n");
+		syscall1(SYS_EXIT, 5);
+	}
+	if (rv != MACH_E_TIMEOUT) {
+		print_id("  recv_timed odd rv = ", (uint32_t)rv);
+	} else {
+		puts1("  recv_timed returned E_TIMEOUT after 50 ms: OK\n");
+	}
 
 	(void)syscall1(SYS_PORT_DEALLOC, (long)name);
 

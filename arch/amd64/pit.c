@@ -102,4 +102,13 @@ pit_isr(struct trapframe *tf)
 	if (q >= PREEMPT_QUANTUM_TICKS)
 		__atomic_store_n(&preempt_need_resched, 1,
 		    __ATOMIC_RELAXED);
+
+	/*
+	 * Deadline-driven wakes (sched_check_timeouts) do NOT belong
+	 * here -- spin_trylock inside that routine drops preempt_count
+	 * via spin_unlock, and a preempt_count transition to zero from
+	 * inside the ISR would yield BEFORE pic_eoi runs, leaving the
+	 * 8259 holding the IRQ and starving future PIT ticks.  The
+	 * check runs from intr_dispatch's tail instead, after pic_eoi.
+	 */
 }

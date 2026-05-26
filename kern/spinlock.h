@@ -45,6 +45,15 @@ void	spin_lock(struct spinlock *);
 void	spin_unlock(struct spinlock *);
 bool	spin_held(const struct spinlock *);
 
+/*
+ * Non-blocking acquire.  Returns true on success (lock now held), false
+ * if the lock is busy.  Caller must spin_unlock on success; on failure
+ * it leaves preempt counts and lock state untouched.  Useful from IRQ
+ * context where a normal spin would deadlock against a non-IRQ holder
+ * on the same CPU.
+ */
+bool	spin_trylock(struct spinlock *);
+
 #define	SPINLOCK_ASSERT_HELD(sl)					\
 	KASSERT(spin_held(sl),						\
 	    "spinlock not held where expected")

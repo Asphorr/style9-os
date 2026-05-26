@@ -84,6 +84,22 @@ void		sched_post_irq_wake(struct thread *);
 void		sched_drain_irq_wakes(void);
 
 /*
+ * Timed-block plumbing.  A thread that wants to be woken either by a
+ * pending event OR by a deadline records its deadline in
+ * th_wake_deadline_ms (absolute clock_uptime_ms()) and then calls
+ * sched_add_timed_waiter before parking via thread_block_release.  On
+ * wake the thread must call sched_remove_timed_waiter (idempotent) to
+ * detach itself, then inspect th_timed_out to discriminate "event
+ * arrived" from "deadline expired".
+ *
+ * sched_check_timeouts is the PIT-IRQ tail that scans the list and
+ * posts IRQ wakes for expired entries.
+ */
+void		sched_add_timed_waiter(struct thread *);
+void		sched_remove_timed_waiter(struct thread *);
+void		sched_check_timeouts(void);
+
+/*
  * sched_handoff_zombie: called from thread_exit().  Adds the thread
  * to the zombie list (idle thread reaps them) and switches away.
  * Never returns.

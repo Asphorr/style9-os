@@ -93,3 +93,21 @@ spin_held(const struct spinlock *sl)
 
 	return (sl->sl_state == 1 && sl->sl_holder_cpu == cpu_id());
 }
+
+bool
+spin_trylock(struct spinlock *sl)
+{
+	uintptr_t	ra;
+
+	ra = (uintptr_t)__builtin_return_address(0);
+
+	preempt_disable();
+	if (__atomic_exchange_n(&sl->sl_state, 1u, __ATOMIC_ACQUIRE) != 0) {
+		preempt_enable();
+		return (false);
+	}
+
+	sl->sl_holder_rip = ra;
+	sl->sl_holder_cpu = cpu_id();
+	return (true);
+}

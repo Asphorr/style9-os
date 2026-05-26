@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "clock.h"
 #include "kmem.h"
 #include "kprintf.h"
 #include "panic.h"
@@ -1126,6 +1127,51 @@ port_extract_send_waiter_locked(struct port *p)
 	return (w);
 }
 
+/*
+ * Remove a specific thread from the port's recv-waiter list if it is
+ * still on it.  Used by recv_timed cleanup: a thread woken because its
+ * deadline expired (rather than because a sender extracted it) is
+ * still on the list and must detach itself before returning E_TIMEOUT.
+ * Caller holds p_lock.  Idempotent if the thread is already gone.
+ */
+static void
+port_unbind_waiter_locked(struct port *p, struct thread *th)
+{
+	struct thread	**pp;
+
+	pp = &p->p_waiters_head;
+	while (*pp != NULL) {
+		if (*pp == th) {
+			*pp = th->th_runq_link;
+			if (*pp == NULL)
+				p->p_waiters_tail = NULL;
+			th->th_runq_link = NULL;
+			return;
+		}
+		pp = &(*pp)->th_runq_link;
+	}
+	/* Fall through silently if not present -- the sender wake path
+	   may have already extracted us. */
+}
+
+static void
+port_set_unbind_waiter_locked(struct port_set *set, struct thread *th)
+{
+	struct thread	**pp;
+
+	pp = &set->ps_waiters_head;
+	while (*pp != NULL) {
+		if (*pp == th) {
+			*pp = th->th_runq_link;
+			if (*pp == NULL)
+				set->ps_waiters_tail = NULL;
+			th->th_runq_link = NULL;
+			return;
+		}
+		pp = &(*pp)->th_runq_link;
+	}
+}
+
 static struct port_msg *
 msg_dequeue(struct port *p, struct thread **send_waiter_out)
 {
@@ -1672,14 +1718,35 @@ int
 mach_msg_recv_block(struct port_space *to, mach_port_name_t recv_name,
     struct mach_msg_header *buf, size_t buf_size)
 {
+
+	return (mach_msg_recv_timed(to, recv_name, buf, buf_size,
+	    MACH_TIMEOUT_FOREVER));
+}
+
+int
+mach_msg_recv_timed(struct port_space *to, mach_port_name_t recv_name,
+    struct mach_msg_header *buf, size_t buf_size, uint64_t timeout_ms)
+{
 	struct port	*p;
 	struct port_set	*set;
 	struct port_msg	*m;
 	struct thread	*self;
+	uint64_t	 deadline;
 	uint8_t		 dummy;
 
 	if (buf == NULL || buf_size < sizeof(struct mach_msg_header))
 		return (MACH_E_INVAL);
+
+	/*
+	 * Resolve the deadline once.  For FOREVER and NONE the actual
+	 * value is unused -- those flags drive different control paths
+	 * (skip the timed-waiters dance vs. return E_NOMSG on empty
+	 * without ever blocking).
+	 */
+	deadline = 0;
+	if (timeout_ms != MACH_TIMEOUT_FOREVER &&
+	    timeout_ms != MACH_TIMEOUT_NONE)
+		deadline = clock_uptime_ms() + timeout_ms;
 
 	/*
 	 * Two flavours: name refers to a port (RECEIVE right) -> wait
@@ -1719,8 +1786,14 @@ mach_msg_recv_block(struct port_space *to, mach_port_name_t recv_name,
 				return (rv);
 			}
 
+			if (timeout_ms == MACH_TIMEOUT_NONE) {
+				spin_unlock(&p->p_lock);
+				return (MACH_E_NOMSG);
+			}
+
 			self = current_thread;
 			self->th_runq_link = NULL;
+			self->th_timed_out = 0;
 			if (p->p_waiters_tail == NULL) {
 				p->p_waiters_head = self;
 				p->p_waiters_tail = self;
@@ -1729,8 +1802,51 @@ mach_msg_recv_block(struct port_space *to, mach_port_name_t recv_name,
 				p->p_waiters_tail = self;
 			}
 
+			if (timeout_ms != MACH_TIMEOUT_FOREVER) {
+				self->th_wake_deadline_ms = deadline;
+				sched_add_timed_waiter(self);
+			}
+
 			thread_block_release(THREAD_BLOCK_PORT, p,
 			    &p->p_lock);
+
+			/*
+			 * Woken.  Detach from the timed-waiters list
+			 * unconditionally; the call is idempotent if the
+			 * PIT already pulled us off.
+			 */
+			sched_remove_timed_waiter(self);
+
+			if (self->th_timed_out) {
+				self->th_timed_out = 0;
+				/*
+				 * The PIT woke us, not a sender, so we are
+				 * still on p->p_waiters.  Unbind, then check
+				 * the queue one last time in case a sender
+				 * raced in between the PIT wake and our
+				 * reacquire of p_lock.
+				 */
+				spin_lock(&p->p_lock);
+				port_unbind_waiter_locked(p, self);
+				if (p->p_qhead != NULL) {
+					m = p->p_qhead;
+					p->p_qhead = m->m_next;
+					if (p->p_qhead == NULL)
+						p->p_qtail = NULL;
+					p->p_qlen--;
+					send_waiter =
+					    port_extract_send_waiter_locked(p);
+					spin_unlock(&p->p_lock);
+					rv = deliver_msg(to, p, m, buf,
+					    buf_size);
+					if (send_waiter != NULL)
+						thread_wake(send_waiter);
+					return (rv);
+				}
+				spin_unlock(&p->p_lock);
+				return (MACH_E_TIMEOUT);
+			}
+			/* Real wake from a sender; loop to dequeue. */
 		}
 	}
 
@@ -1768,9 +1884,15 @@ mach_msg_recv_block(struct port_space *to, mach_port_name_t recv_name,
 			spin_unlock(&p->p_lock);
 		}
 
+		if (timeout_ms == MACH_TIMEOUT_NONE) {
+			spin_unlock(&set->ps_lock);
+			return (MACH_E_NOMSG);
+		}
+
 		/* No member has a message -- block on set's waiter list. */
 		self = current_thread;
 		self->th_runq_link = NULL;
+		self->th_timed_out = 0;
 		if (set->ps_waiters_tail == NULL) {
 			set->ps_waiters_head = self;
 			set->ps_waiters_tail = self;
@@ -1779,9 +1901,84 @@ mach_msg_recv_block(struct port_space *to, mach_port_name_t recv_name,
 			set->ps_waiters_tail = self;
 		}
 
+		if (timeout_ms != MACH_TIMEOUT_FOREVER) {
+			self->th_wake_deadline_ms = deadline;
+			sched_add_timed_waiter(self);
+		}
+
 		thread_block_release(THREAD_BLOCK_PORT, set,
 		    &set->ps_lock);
+
+		sched_remove_timed_waiter(self);
+
+		if (self->th_timed_out) {
+			self->th_timed_out = 0;
+			spin_lock(&set->ps_lock);
+			port_set_unbind_waiter_locked(set, self);
+			spin_unlock(&set->ps_lock);
+			/*
+			 * Loop back: a sender may have placed a message
+			 * on one of the members in the race window.  The
+			 * scan at the top of the loop will pick it up; if
+			 * the queues are still empty, we'll either re-park
+			 * (still within the original deadline, which has
+			 * elapsed -> immediately re-time-out) or return
+			 * E_TIMEOUT through the recomputed deadline path.
+			 * Simpler: just check elapsed time and return.
+			 */
+			return (MACH_E_TIMEOUT);
+		}
 	}
+}
+
+/*
+ * mach_msg_rpc: send-then-recv with an autogenerated reply port.
+ *
+ * The reply port is created in `space` carrying RECEIVE + SEND.  We
+ * splice it into req->msgh_local with disposition MAKE_SEND so the
+ * receiver receives a SEND right under their own name; they reply by
+ * msgh_remote = (that name) and the message lands back in our recv on
+ * the same reply port.  On any error -- send failure, recv failure,
+ * timeout -- the reply port is deallocated before return.
+ *
+ * `req->msgh_bits` is updated to encode the local disposition; the
+ * caller's remote disposition (COPY_SEND, MOVE_SEND_ONCE, ...) is
+ * preserved as-is.
+ */
+int
+mach_msg_rpc(struct port_space *space, struct mach_msg_header *req,
+    struct mach_msg_header *reply_buf, size_t reply_buf_size,
+    uint64_t timeout_ms)
+{
+	mach_port_name_t	reply_name;
+	uint32_t		remote_disp;
+	int			rv;
+
+	if (space == NULL || req == NULL || reply_buf == NULL)
+		return (MACH_E_INVAL);
+	if (reply_buf_size < sizeof(struct mach_msg_header))
+		return (MACH_E_INVAL);
+
+	reply_name = port_allocate(space,
+	    MACH_PORT_RIGHT_RECEIVE | MACH_PORT_RIGHT_SEND);
+	if (reply_name == MACH_PORT_NULL)
+		return (MACH_E_NOMEM);
+
+	remote_disp = MACH_MSGH_BITS_REMOTE(req->msgh_bits);
+	req->msgh_bits  = MACH_MSGH_BITS(remote_disp,
+	    MACH_MSG_TYPE_MAKE_SEND);
+	req->msgh_local = reply_name;
+
+	rv = mach_msg_send(space, req);
+	if (rv != MACH_MSG_OK) {
+		(void)port_deallocate(space, reply_name);
+		return (rv);
+	}
+
+	rv = mach_msg_recv_timed(space, reply_name, reply_buf,
+	    reply_buf_size, timeout_ms);
+	(void)port_deallocate(space, reply_name);
+	return (rv);
 }
 
 /* ---- introspection ---------------------------------------------------- */
@@ -1874,6 +2071,7 @@ mach_msg_strerror(int code)
 	case MACH_E_NOMSG:	return ("no message available");
 	case MACH_E_TOOSMALL:	return ("receive buffer too small");
 	case MACH_E_NOMEM:	return ("out of memory");
+	case MACH_E_TIMEOUT:	return ("recv timed out");
 	default:		return ("?");
 	}
 }

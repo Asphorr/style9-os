@@ -123,41 +123,44 @@ kmain_run_tests(void)
 	tty_puts("\n--- boot-time stress pass ---\n");
 	tty_set_attr(TTY_ATTR(TTY_LIGHT_GRAY, TTY_BLACK));
 
-	tty_puts("\n[1/12] stress mem 10000\n");
+	tty_puts("\n[1/13] stress mem 10000\n");
 	rv_mem = stress_mem(10000);
 
-	tty_puts("\n[2/12] stress mem boundary\n");
+	tty_puts("\n[2/13] stress mem boundary\n");
 	rv_boundary = stress_mem_boundary();
 
-	tty_puts("\n[3/12] stress timer 2s\n");
+	tty_puts("\n[3/13] stress timer 2s\n");
 	rv_timer = stress_timer(2);
 
-	tty_puts("\n[4/12] stress port 1000\n");
+	tty_puts("\n[4/13] stress port 1000\n");
 	int rv_port = stress_port(1000);
 
-	tty_puts("\n[5/12] stress thread 200\n");
+	tty_puts("\n[5/13] stress thread 200\n");
 	int rv_thread = stress_thread(200);
 
-	tty_puts("\n[6/12] stress preempt 4 workers, 1 s\n");
+	tty_puts("\n[6/13] stress preempt 4 workers, 1 s\n");
 	int rv_preempt = stress_preempt(4, 1000);
 
-	tty_puts("\n[7/12] stress sendonce 500\n");
+	tty_puts("\n[7/13] stress sendonce 500\n");
 	int rv_sendonce = stress_sendonce(500);
 
-	tty_puts("\n[8/12] stress portset 4 members x 100\n");
+	tty_puts("\n[8/13] stress portset 4 members x 100\n");
 	int rv_portset = stress_portset(4, 100);
 
-	tty_puts("\n[9/12] stress intertask 200 (parent <-> worker task)\n");
+	tty_puts("\n[9/13] stress intertask 200 (parent <-> worker task)\n");
 	int rv_intertask = stress_intertask(200);
 
-	tty_puts("\n[10/12] stress moverecv 200\n");
+	tty_puts("\n[10/13] stress moverecv 200\n");
 	int rv_moverecv = stress_moverecv(200);
 
-	tty_puts("\n[11/12] stress nosenders 100\n");
+	tty_puts("\n[11/13] stress nosenders 100\n");
 	int rv_nosenders = stress_nosenders(100);
 
-	tty_puts("\n[12/12] stress sendblock 2000\n");
+	tty_puts("\n[12/13] stress sendblock 2000\n");
 	int rv_sendblock = stress_sendblock(2000);
+
+	tty_puts("\n[13/13] stress rpc 200\n");
+	int rv_rpc = stress_rpc(200);
 
 	tty_set_attr(TTY_ATTR(TTY_YELLOW, TTY_BLACK));
 	tty_puts("\n--- stress pass summary ---\n");
@@ -186,6 +189,8 @@ kmain_run_tests(void)
 	    rv_nosenders == 0 ? "PASS" : "FAIL", rv_nosenders);
 	kprintf("  stress sendblock 2000: %s (rv=%d)\n",
 	    rv_sendblock == 0 ? "PASS" : "FAIL", rv_sendblock);
+	kprintf("  stress rpc 200       : %s (rv=%d)\n",
+	    rv_rpc == 0 ? "PASS" : "FAIL", rv_rpc);
 }
 
 /*

@@ -32,6 +32,8 @@
 #define	SYS_PORT_DEALLOC	4	/* (mach_port_name_t name)      -> 0/err   */
 #define	SYS_MSG_SEND		5	/* (struct mach_msg_header *)   -> 0/err   */
 #define	SYS_MSG_RECV		6	/* (name, buf, buf_size)        -> 0/err   */
+#define	SYS_MSG_RECV_TIMED	7	/* (name, buf, buf_size, ms)    -> 0/err   */
+#define	SYS_MSG_RPC		8	/* (req, replybuf, repsize, ms) -> 0/err   */
 
 #define	SYS_E_NOSYS	(-1)
 #define	SYS_E_FAULT	(-2)

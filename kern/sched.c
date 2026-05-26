@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "clock.h"
 #include "kmem.h"
 #include "kprintf.h"
 #include "panic.h"
@@ -68,6 +69,16 @@ static volatile int	preempt_count;		/* (a) */
  * drained in the safe windows of preempt_enable / intr_dispatch.
  */
 static struct thread	*irq_wake_head;		/* (a) */
+
+/*
+ * Timed-waiters list: threads parked in mach_msg_recv_timed with a
+ * non-FOREVER deadline.  Threaded through th_timed_link.  Maintained
+ * under timed_lock from non-IRQ context; sched_check_timeouts runs
+ * from the PIT IRQ and uses spin_trylock so a contended tick is just
+ * skipped (deadline accuracy bound is one PIT period, ~10 ms).
+ */
+static struct spinlock	timed_lock = SPINLOCK_INIT("sched-timed");
+static struct thread	*timed_head;		/* (timed_lock)            */
 
 static void	idle_loop(void *) __attribute__((noreturn));
 static struct thread *pick_next_locked(struct thread *self);
@@ -316,6 +327,85 @@ sched_drain_irq_wakes(void)
 		thread_wake(list);
 		list = next;
 	}
+}
+
+/*
+ * Add `th` to the list of timed waiters.  Caller has already filled in
+ * th_wake_deadline_ms; this function inserts into a small list at the
+ * head so insert is O(1).  Removal scans linearly; with only a handful
+ * of timed waiters at a time (typically one or two RPC clients) the
+ * extra cost is negligible compared to alternatives like a sorted
+ * insert that pessimises the common case.
+ */
+void
+sched_add_timed_waiter(struct thread *th)
+{
+
+	if (th == NULL || th->th_wake_deadline_ms == 0)
+		return;
+
+	spin_lock(&timed_lock);
+	th->th_timed_out  = 0;
+	th->th_timed_link = timed_head;
+	timed_head        = th;
+	spin_unlock(&timed_lock);
+}
+
+void
+sched_remove_timed_waiter(struct thread *th)
+{
+	struct thread	**pp;
+
+	if (th == NULL)
+		return;
+
+	spin_lock(&timed_lock);
+	pp = &timed_head;
+	while (*pp != NULL) {
+		if (*pp == th) {
+			*pp = th->th_timed_link;
+			th->th_timed_link        = NULL;
+			th->th_wake_deadline_ms  = 0;
+			break;
+		}
+		pp = &(*pp)->th_timed_link;
+	}
+	spin_unlock(&timed_lock);
+}
+
+/*
+ * Walk the timed-waiters list and post an IRQ wake for any thread
+ * whose deadline has elapsed.  Called from the PIT IRQ tail; uses
+ * spin_trylock so a non-IRQ holder of timed_lock never deadlocks us
+ * (we'll catch the deadline on the next tick at the cost of <= one
+ * PIT period of latency).
+ */
+void
+sched_check_timeouts(void)
+{
+	struct thread	**pp;
+	struct thread	 *th;
+	uint64_t	  now;
+
+	if (!spin_trylock(&timed_lock))
+		return;
+
+	now = clock_uptime_ms();
+	pp  = &timed_head;
+	while (*pp != NULL) {
+		th = *pp;
+		if (th->th_wake_deadline_ms != 0 &&
+		    th->th_wake_deadline_ms <= now) {
+			*pp                      = th->th_timed_link;
+			th->th_timed_link        = NULL;
+			th->th_wake_deadline_ms  = 0;
+			th->th_timed_out         = 1;
+			sched_post_irq_wake(th);
+		} else {
+			pp = &(*pp)->th_timed_link;
+		}
+	}
+	spin_unlock(&timed_lock);
 }
 
 void

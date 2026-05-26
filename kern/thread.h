@@ -76,6 +76,20 @@ struct thread {
 	struct thread		*th_runq_link;		/* runqueue / waitq */
 	struct thread		*th_task_link;		/* task->t_threads  */
 	struct thread		*th_zombie_next;	/* reaper list      */
+
+	/*
+	 * Timeout plumbing for mach_msg_recv_timed.  th_wake_deadline_ms
+	 * holds the absolute clock_uptime_ms() value at which this thread
+	 * wants to be woken; sched_check_timeouts (called from the PIT
+	 * IRQ) walks the global timed_waiters list and posts an IRQ wake
+	 * when the deadline has passed.  th_timed_out is the resulting
+	 * signal back to the recv loop: "you woke because your timer
+	 * expired, not because a message arrived".  th_timed_link threads
+	 * the timed_waiters list itself.
+	 */
+	uint64_t		 th_wake_deadline_ms;
+	volatile int		 th_timed_out;
+	struct thread		*th_timed_link;
 };
 
 extern struct thread		*current_thread;	/* per-CPU later    */

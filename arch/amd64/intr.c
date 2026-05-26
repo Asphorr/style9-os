@@ -111,6 +111,18 @@ intr_dispatch(struct trapframe *tf)
 		pic_eoi(irq);
 
 		/*
+		 * Wake any thread whose mach_msg_recv_timed deadline has
+		 * elapsed.  Runs here (not in pit_isr) because the
+		 * spin_unlock inside sched_check_timeouts can drop
+		 * preempt_count to zero with need_resched still set,
+		 * which would yield -- doing that BEFORE pic_eoi leaves
+		 * the 8259 holding the IRQ and blocks subsequent PIT
+		 * ticks (the busy-sleep path observed this as an outright
+		 * boot hang at stress_preempt).
+		 */
+		sched_check_timeouts();
+
+		/*
 		 * Preempt point.  Two pieces of deferred work may have
 		 * been queued by the IRQ handler that just ran: any
 		 * wake requests posted via sched_post_irq_wake, and a
