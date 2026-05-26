@@ -7,6 +7,10 @@ kernel.elf
 # Live boot capture from runlog.ps1.
 live.log
 
+# Serial log written by tools/run.ps1 (mirror of COM1 from the kernel
+# tty); the assistant tails this file instead of asking for screenshots.
+serial.log
+
 # Screendumps and other ad-hoc debug artefacts.
 *.png
 *.ppm
