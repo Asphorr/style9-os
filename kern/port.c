@@ -60,6 +60,29 @@ struct port {
 	struct port	*p_set_link;		/* (p) next in set members   */
 	uint8_t		 p_special;		/* (c) PORT_SPECIAL_* tag    */
 	void		*p_special_arg;		/* (c) per-tag context ptr   */
+
+	/*
+	 * Inline-reply stash.  Armed by mach_msg_rpc before issuing the
+	 * request: while p_stash_buf != NULL, a mach_msg_send targeting
+	 * this port writes the message bytes DIRECTLY into the stash buf
+	 * and returns OK without ever allocating a port_msg or touching
+	 * the FIFO.  The caller (still mid-rpc) picks the reply up by
+	 * reading p_stash_rv after the send returns.
+	 *
+	 * Fast-path eligibility (taken under p_lock):
+	 *	p_stash_buf != NULL && p_stash_rv == MACH_E_NOMSG (pending)
+	 *	&& msgh_size <= p_stash_size
+	 *	&& message has no descriptors (no MACH_MSGH_BITS_COMPLEX
+	 *	   and msgh_local == 0)
+	 *
+	 * The bare-message restriction keeps the fast path branch-free of
+	 * descriptor translation; complex replies fall back to the FIFO.
+	 * Our kernel-side service dispatchers (clock / stats / tasks /
+	 * klog / task_self) all reply bare today, so this catches them.
+	 */
+	struct mach_msg_header *p_stash_buf;	/* (p) caller's reply buf  */
+	size_t		 p_stash_size;		/* (p) capacity in bytes   */
+	int		 p_stash_rv;		/* (p) NOMSG/OK/error      */
 };
 
 /*
@@ -241,6 +264,9 @@ port_create(void)
 	p->p_set_link     = NULL;
 	p->p_special      = PORT_SPECIAL_NONE;
 	p->p_special_arg  = NULL;
+	p->p_stash_buf    = NULL;
+	p->p_stash_size   = 0;
+	p->p_stash_rv     = MACH_E_NOMSG;
 	return (p);
 }
 
@@ -1386,6 +1412,59 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *msg)
 		return (MACH_E_RIGHT);
 
 	/*
+	 * Inline-reply fast path.  If the destination has an armed stash
+	 * AND the message is bare (no descriptors, no implicit reply
+	 * port), write the bytes straight into the stash buffer and set
+	 * p_stash_rv = OK.  This is the synchronous-RPC rendezvous: the
+	 * armed thread is mid-mach_msg_rpc inside the same call stack,
+	 * not parked, so no wake is needed -- it reads p_stash_rv after
+	 * its mach_msg_send returns.  Zero kmalloc, zero enqueue.
+	 *
+	 * MOVE_* dispositions still drop the sender's right so the
+	 * post-send sender's space is identical to the slow-path case.
+	 */
+	if (!complex && !has_local) {
+		size_t	want_size;
+
+		want_size = msg->msgh_size;
+		spin_lock(&dest->p_lock);
+		if (dest->p_stash_buf != NULL &&
+		    dest->p_stash_rv == MACH_E_NOMSG &&
+		    !dest->p_dead &&
+		    want_size <= dest->p_stash_size) {
+			uint8_t			*dst;
+			const uint8_t		*src;
+			struct mach_msg_header	*sh;
+
+			dst = (uint8_t *)dest->p_stash_buf;
+			src = (const uint8_t *)msg;
+			for (i = 0; i < want_size; i++)
+				dst[i] = src[i];
+			/*
+			 * Sender filled msgh_local with their own name; the
+			 * stash receiver has no use for it (the reply port
+			 * name belongs to the receiver's space, but the
+			 * sender's view doesn't translate).  Zero it so the
+			 * receiver doesn't accidentally space_drop a name it
+			 * never owned.
+			 */
+			sh = (struct mach_msg_header *)dst;
+			sh->msgh_local = MACH_PORT_NULL;
+
+			dest->p_stash_rv = MACH_MSG_OK;
+			spin_unlock(&dest->p_lock);
+
+			if (remote_disp == MACH_MSG_TYPE_MOVE_SEND ||
+			    remote_disp == MACH_MSG_TYPE_MOVE_SEND_ONCE) {
+				(void)space_drop_one_right(from,
+				    msg->msgh_remote, remote_right);
+			}
+			return (MACH_MSG_OK);
+		}
+		spin_unlock(&dest->p_lock);
+	}
+
+	/*
 	 * Special-port intercept.  When the destination is a kernel
 	 * object (task_self_port etc.) we never queue: the dispatcher
 	 * synthesises any reply directly and returns.  Honour MOVE_*
@@ -1989,6 +2068,24 @@ mach_msg_recv_timed(struct port_space *to, mach_port_name_t recv_name,
  * `req->msgh_bits` is updated to encode the local disposition; the
  * caller's remote disposition (COPY_SEND, MOVE_SEND_ONCE, ...) is
  * preserved as-is.
+ *
+ * Inline-reply optimisation:
+ *
+ *	Before issuing the send, we arm the reply port's "stash": pointer
+ *	to the caller's reply_buf and its size, with rv=NOMSG.  If the
+ *	send's downstream dispatcher (PORT_SPECIAL_*) runs synchronously
+ *	in this thread and replies via mach_msg_send to the reply port,
+ *	the send-side fast path writes the bytes straight into reply_buf
+ *	and sets the stash rv to OK.  No port_msg ever allocated.  We
+ *	then disarm and check the rv -- if filled, return without ever
+ *	calling mach_msg_recv_timed.
+ *
+ *	Async senders (a parked server thread that will reply later) take
+ *	the slow path: the send-side fast path test fails (stash is still
+ *	armed when the dispatcher returns, but the dispatcher itself
+ *	enqueues -- no, dispatcher only fast-paths the bare reply case;
+ *	queued sends still queue).  So disarm before recv, then recv runs
+ *	normally against the FIFO.
  */
 int
 mach_msg_rpc(struct port_space *space, struct mach_msg_header *req,
@@ -1996,7 +2093,10 @@ mach_msg_rpc(struct port_space *space, struct mach_msg_header *req,
     uint64_t timeout_ms)
 {
 	mach_port_name_t	reply_name;
+	struct port		*reply_port;
 	uint32_t		remote_disp;
+	uint8_t			dummy_rights;
+	int			stash_rv;
 	int			rv;
 
 	if (space == NULL || req == NULL || reply_buf == NULL)
@@ -2009,15 +2109,54 @@ mach_msg_rpc(struct port_space *space, struct mach_msg_header *req,
 	if (reply_name == MACH_PORT_NULL)
 		return (MACH_E_NOMEM);
 
+	reply_port = space_lookup(space, reply_name,
+	    MACH_PORT_RIGHT_RECEIVE, &dummy_rights);
+	if (reply_port == NULL) {
+		/* Should not happen -- we just allocated it. */
+		(void)port_deallocate(space, reply_name);
+		return (MACH_E_INVAL);
+	}
+
+	/*
+	 * Arm the stash.  mach_msg_send's fast path will overwrite
+	 * p_stash_rv to MACH_MSG_OK on synchronous bare-reply delivery;
+	 * if the dispatcher chose to enqueue (or replied with a complex
+	 * message), p_stash_rv stays NOMSG and we fall through to recv.
+	 */
+	spin_lock(&reply_port->p_lock);
+	reply_port->p_stash_buf  = reply_buf;
+	reply_port->p_stash_size = reply_buf_size;
+	reply_port->p_stash_rv   = MACH_E_NOMSG;
+	spin_unlock(&reply_port->p_lock);
+
 	remote_disp = MACH_MSGH_BITS_REMOTE(req->msgh_bits);
 	req->msgh_bits  = MACH_MSGH_BITS(remote_disp,
 	    MACH_MSG_TYPE_MAKE_SEND);
 	req->msgh_local = reply_name;
 
 	rv = mach_msg_send(space, req);
+
+	/*
+	 * Disarm regardless of how the send went; if the fast path fired
+	 * stash_rv is MACH_MSG_OK and the reply bytes are already in
+	 * reply_buf.
+	 */
+	spin_lock(&reply_port->p_lock);
+	stash_rv = reply_port->p_stash_rv;
+	reply_port->p_stash_buf  = NULL;
+	reply_port->p_stash_size = 0;
+	reply_port->p_stash_rv   = MACH_E_NOMSG;
+	spin_unlock(&reply_port->p_lock);
+
 	if (rv != MACH_MSG_OK) {
 		(void)port_deallocate(space, reply_name);
 		return (rv);
+	}
+
+	if (stash_rv == MACH_MSG_OK) {
+		/* Fast-path delivery already wrote into reply_buf. */
+		(void)port_deallocate(space, reply_name);
+		return (MACH_MSG_OK);
 	}
 
 	rv = mach_msg_recv_timed(space, reply_name, reply_buf,
