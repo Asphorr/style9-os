@@ -8,6 +8,7 @@
 #ifndef _MACHINE_USERMODE_H_
 #define	_MACHINE_USERMODE_H_
 
+#include <stddef.h>
 #include <stdint.h>
 
 /*
@@ -32,11 +33,15 @@
 void	usermode_run_first_blob(void);
 
 /*
- * usermode_run_hello_elf: load the kernel-embedded hello.elf
- * (linked in via objcopy as _binary_obj_hello_elf_start ... _end) and
- * iretq to its e_entry on a fresh user stack.
+ * arch_spawn_user: create a task, load the named ELF blob into it via
+ * the program registry's image pointer, and start a user thread that
+ * iretq's into ring 3 on e_entry.  Wired up by progreg_spawn() in
+ * kern/progreg.c; ring-3 callers reach it via SYS_SPAWN.
+ *
+ * Returns the new task's t_id on success, negative SYS_E_* on failure.
  */
-void	usermode_run_hello_elf(void);
+long	arch_spawn_user(const char *name, const uint8_t *image,
+	    size_t image_size);
 
 /*
  * usermode_enter: never returns to its caller.  Pushes a synthetic

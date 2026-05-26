@@ -34,6 +34,7 @@
 #define	SYS_MSG_RECV		6	/* (name, buf, buf_size)        -> 0/err   */
 #define	SYS_MSG_RECV_TIMED	7	/* (name, buf, buf_size, ms)    -> 0/err   */
 #define	SYS_MSG_RPC		8	/* (req, replybuf, repsize, ms) -> 0/err   */
+#define	SYS_SPAWN		9	/* (const char *name)           -> task_id */
 
 #define	SYS_E_NOSYS	(-1)
 #define	SYS_E_FAULT	(-2)

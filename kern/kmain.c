@@ -11,6 +11,7 @@
 #include "bootstrap.h"
 #include "clock.h"
 #include "klog.h"
+#include "progreg.h"
 #include "services.h"
 #include "vm.h"
 #include "gdt.h"
@@ -134,14 +135,10 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	klog(KLOG_LEVEL_DEBUG, "boot", "entering shell");
 
 	syscall_init();
-	/*
-	 * Just spawn hello.elf for now: the inline blob and the ELF
-	 * both map at the same USER_CODE_VA/USER_STACK_VA, and with
-	 * one shared PML4 a preempted blob would resume onto the
-	 * ELF's freshly-overwritten pages.  Per-task PML4 lifts
-	 * this; until then, one user thread at a time.
-	 */
-	usermode_run_hello_elf();
+
+	progreg_init();
+	if (progreg_spawn("hello") < 0)
+		panic("kmain: spawn(hello) failed");
 
 	shell_run();
 	/* NOTREACHED */

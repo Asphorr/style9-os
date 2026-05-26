@@ -20,6 +20,7 @@
 #include "pmap.h"
 #include "pmm.h"
 #include "port.h"
+#include "progreg.h"
 #include "sched.h"
 #include "services.h"
 #include "shell.h"
@@ -49,6 +50,7 @@ static int	cmd_vmmap(int, char **);
 static int	cmd_log(int, char **);
 static int	cmd_dev(int, char **);
 static int	cmd_disk(int, char **);
+static int	cmd_spawn(int, char **);
 
 static int	streq(const char *, const char *);
 static int	parse_uint(const char *s, unsigned int *out);
@@ -80,6 +82,7 @@ const struct shell_cmd	shell_cmds[] = {
 	{ "dev",    "dev <ls|info NAME|write uart TEXT>",     cmd_dev    },
 	{ "disk",   "disk <ls|info NAME|read NAME LBA|write NAME LBA TEXT|sync NAME>",
 		cmd_disk   },
+	{ "spawn",  "spawn <ls|NAME> -- run a user program",  cmd_spawn  },
 	{ "crash",  "crash <dfree|wild|assert|unmapped|nonc>", cmd_crash  },
 	{ "panic",  "deliberate panic (tests panic path)",    cmd_panic  },
 };
@@ -1411,4 +1414,31 @@ cmd_disk(int argc, char *argv[])
 	}
 	kprintf("disk: unknown subcommand '%s'\n", argv[1]);
 	return (1);
+}
+
+/* ---- spawn: launch a registered user program ----------------------- */
+
+static int
+cmd_spawn(int argc, char *argv[])
+{
+	struct progreg_entry	snap[PROGREG_MAX];
+	size_t			n, i;
+	long			rv;
+
+	if (argc < 2 || streq(argv[1], "ls")) {
+		n = progreg_snapshot(snap, PROGREG_MAX);
+		kprintf("registered programs (%zu):\n", n);
+		for (i = 0; i < n; i++)
+			kprintf("  %-12s  %zu bytes\n",
+			    snap[i].pr_name, snap[i].pr_size);
+		return (0);
+	}
+
+	rv = progreg_spawn(argv[1]);
+	if (rv < 0) {
+		kprintf("spawn: '%s' failed (rv=%ld)\n", argv[1], rv);
+		return (1);
+	}
+	kprintf("spawn: '%s' running as task id=%ld\n", argv[1], rv);
+	return (0);
 }

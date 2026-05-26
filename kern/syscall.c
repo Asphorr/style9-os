@@ -11,6 +11,7 @@
 
 #include "kprintf.h"
 #include "port.h"
+#include "progreg.h"
 #include "sched.h"
 #include "syscall.h"
 #include "task.h"
@@ -43,6 +44,7 @@ static long	sys_msg_recv_timed(mach_port_name_t name,
 static long	sys_msg_rpc(struct mach_msg_header *ureq,
 		    struct mach_msg_header *ureply, size_t ureply_size,
 		    uint64_t timeout_ms);
+static long	sys_spawn(const char *uname);
 
 static bool	user_range_ok(uint64_t addr, size_t len);
 
@@ -136,6 +138,8 @@ syscall_dispatch(struct syscall_frame *f)
 		    (struct mach_msg_header *)f->sf_arg1,
 		    (size_t)f->sf_arg2,
 		    (uint64_t)f->sf_arg3));
+	case SYS_SPAWN:
+		return (sys_spawn((const char *)f->sf_arg0));
 	default:
 		return (SYS_E_NOSYS);
 	}
@@ -297,4 +301,44 @@ sys_msg_rpc(struct mach_msg_header *ureq, struct mach_msg_header *ureply,
 
 	return ((long)mach_msg_rpc(current_thread->th_task->t_port_space, ureq,
 	    ureply, ureply_size, timeout_ms));
+}
+
+/*
+ * sys_spawn: launch the named program in a fresh task.  Copies the
+ * caller's name string into a small kernel-side buffer (bounded by
+ * PROGREG_NAME_MAX), validates each byte lies inside the user-VA
+ * window the kernel can dereference, then hands the lookup to
+ * progreg_spawn.  Returns the new task's id on success or a negative
+ * SYS_E_* code.
+ *
+ * No copy-in via copyin() yet -- we still rely on per-task PML4 being
+ * loaded for the calling thread, then read the byte through its U=1
+ * leaves directly.  Once SMAP/copyin land this becomes the textbook
+ * copyin_str.
+ */
+static long
+sys_spawn(const char *uname)
+{
+	char	kname[PROGREG_NAME_MAX];
+	size_t	i;
+	long	uaddr;
+
+	if (uname == NULL)
+		return (SYS_E_FAULT);
+
+	uaddr = (long)(uintptr_t)uname;
+	if (!user_range_ok((uint64_t)uaddr, 1))
+		return (SYS_E_FAULT);
+
+	for (i = 0; i < PROGREG_NAME_MAX; i++) {
+		if (!user_range_ok((uint64_t)(uaddr + (long)i), 1))
+			return (SYS_E_FAULT);
+		kname[i] = uname[i];
+		if (uname[i] == '\0')
+			break;
+	}
+	if (i == PROGREG_NAME_MAX)
+		return (SYS_E_INVAL);
+
+	return (progreg_spawn(kname));
 }

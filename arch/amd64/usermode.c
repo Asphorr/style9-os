@@ -10,6 +10,7 @@
 
 #include "elf.h"
 #include "gdt.h"
+#include "kmem.h"
 #include "kprintf.h"
 #include "panic.h"
 #include "pmap.h"
@@ -25,15 +26,24 @@ extern uint8_t	user_blob_start[];
 extern uint8_t	user_blob_end[];
 
 /*
- * Symbols emitted by objcopy when it wraps obj/hello.elf into
- * obj/hello_elf.o (rule in the top-level Makefile).  The wrapper
- * creates `..._start`, `..._end`, and `..._size` from the file path,
- * so the names follow the obj/ prefix.
+ * Boot-time blob path: the very first ring-3 program (a hand-written
+ * scrap of asm in arch/amd64/user_blob.S) for early SYS_PRINT/EXIT
+ * smoke testing.  Kept around because it is still a viable "no libc"
+ * minimal ring-3 entry point.
  */
-extern uint8_t	_binary_hello_elf_start[];
-extern uint8_t	_binary_hello_elf_end[];
-
 static void	usermode_launcher(void *) __attribute__((noreturn));
+
+/*
+ * Carries a spawn intent across the thread boundary.  Allocated by
+ * arch_spawn_user, freed by the launcher just before it iretq's so
+ * leaks don't accumulate if the program loops forever in ring 3.
+ */
+struct user_spawn_arg {
+	const char	*sa_name;
+	const uint8_t	*sa_image;
+	size_t		 sa_image_size;
+};
+
 static void	usermode_elf_launcher(void *) __attribute__((noreturn));
 
 void
@@ -51,19 +61,49 @@ usermode_run_first_blob(void)
 	thread_start(th);
 }
 
-void
-usermode_run_hello_elf(void)
+/*
+ * Generic user-program spawn entry.  Called from progreg_spawn (which
+ * looked up the embedded ELF blob in the program registry).  Builds a
+ * fresh task, allocates a small descriptor on the kernel heap to hand
+ * the image pointer + name across to the launcher thread, then
+ * thread_starts it.  Returns the new task's id, or a negative
+ * SYS_E_* on allocation failure.
+ *
+ * The descriptor is heap-allocated rather than stack so it survives
+ * after arch_spawn_user returns; the launcher takes ownership and
+ * kfrees it during setup.
+ */
+long
+arch_spawn_user(const char *name, const uint8_t *image, size_t image_size)
 {
-	struct task	*ut;
-	struct thread	*th;
+	struct user_spawn_arg	*sa;
+	struct task		*ut;
+	struct thread		*th;
 
-	ut = task_create("hello");
-	if (ut == NULL)
-		panic("usermode_run_hello_elf: task_create failed");
-	th = thread_create(ut, usermode_elf_launcher, NULL, "user-elf");
-	if (th == NULL)
-		panic("usermode_run_hello_elf: thread_create failed");
+	if (name == NULL || image == NULL || image_size == 0)
+		return (SYS_E_INVAL);
+
+	sa = (struct user_spawn_arg *)kmalloc(sizeof(*sa));
+	if (sa == NULL)
+		return (SYS_E_NOSYS);	/* OOM; closest in our small set */
+	sa->sa_name       = name;
+	sa->sa_image      = image;
+	sa->sa_image_size = image_size;
+
+	ut = task_create(name);
+	if (ut == NULL) {
+		kfree(sa);
+		return (SYS_E_NOSYS);
+	}
+
+	th = thread_create(ut, usermode_elf_launcher, sa, "user-elf");
+	if (th == NULL) {
+		task_deref(ut);
+		kfree(sa);
+		return (SYS_E_NOSYS);
+	}
 	thread_start(th);
+	return ((long)ut->t_id);
 }
 
 /*
@@ -79,24 +119,22 @@ usermode_run_hello_elf(void)
 static void
 usermode_elf_launcher(void *arg)
 {
-	struct task	*ut;
-	uint64_t	*kva;
-	uint64_t	 entry;
-	uint64_t	 stack_pa;
-	uint64_t	 ksp;
-	size_t		 i;
-	size_t		 image_size;
-	int		 rv;
+	struct user_spawn_arg	*sa;
+	struct task		*ut;
+	uint64_t		*kva;
+	uint64_t		 entry;
+	uint64_t		 stack_pa;
+	uint64_t		 ksp;
+	size_t			 i;
+	int			 rv;
 
-	(void)arg;
+	sa = (struct user_spawn_arg *)arg;
+	ut = current_thread->th_task;
 
-	ut         = current_thread->th_task;
-	image_size = (size_t)(_binary_hello_elf_end -
-	    _binary_hello_elf_start);
-
-	rv = elf_load(ut, _binary_hello_elf_start, image_size, &entry);
+	rv = elf_load(ut, sa->sa_image, sa->sa_image_size, &entry);
 	if (rv != ELF_E_OK)
-		panic("usermode_elf_launcher: elf_load rv=%d", rv);
+		panic("usermode_elf_launcher: elf_load %s rv=%d",
+		    sa->sa_name, rv);
 
 	stack_pa = pmm_alloc_page();
 	if (stack_pa == PA_INVALID)
@@ -117,11 +155,12 @@ usermode_elf_launcher(void *arg)
 	tss_set_rsp0(ksp);
 	syscall_kernel_rsp = ksp;
 
-	kprintf("usermode: hello.elf entry=0x%llx (image=%zu bytes), "
-	    "stack=0x%llx, task=%s\n",
-	    (unsigned long long)entry, image_size,
-	    (unsigned long long)USER_STACK_TOP, ut->t_name);
+	kprintf("usermode: spawn '%s' entry=0x%llx (image=%zu bytes), "
+	    "stack=0x%llx\n",
+	    sa->sa_name, (unsigned long long)entry, sa->sa_image_size,
+	    (unsigned long long)USER_STACK_TOP);
 
+	kfree(sa);
 	usermode_enter(entry, USER_STACK_TOP);
 }
 
