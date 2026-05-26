@@ -57,6 +57,7 @@ typedef long long		int64_t;
 #define	SYS_MSG_RECV_TIMED	7
 #define	SYS_MSG_RPC		8
 #define	SYS_SPAWN		9	/* phase 1b */
+#define	SYS_TASK_ALIVE		10	/* phase 2  */
 
 #define	SYS_E_NOSYS		(-1)
 #define	SYS_E_FAULT		(-2)
@@ -78,6 +79,20 @@ long	syscall4(long nr, long a0, long a1, long a2, long a3);
 
 void	exit(int code) __attribute__((noreturn));
 long	yield(void);
+
+/*
+ * Spawn the named program (looks up in the kernel's progreg).  Returns
+ * the new task's id on success, or a negative SYS_E_* code.  Fire-and-
+ * forget: combine with task_alive() to wait for the child.
+ */
+long	spawn(const char *name);
+
+/*
+ * task_alive: 1 if a task with this id is still running, 0 otherwise.
+ * yield-spin around this to wait for a spawned child without baking in
+ * a real notification path.
+ */
+int	task_alive(uint64_t task_id);
 
 /* ---- I/O ----------------------------------------------------------- */
 
@@ -209,6 +224,67 @@ int		mach_msg_rpc(struct mach_msg_header *req,
  * mach_port_deallocate() the returned name when done.
  */
 mach_port_name_t bootstrap_lookup(const char *service);
+
+/* ---- dev/NAME generic-driver protocol (mirrors dev/dev_proto.h) --- */
+
+#define	DEV_OP_INFO		1
+#define	DEV_OP_OPEN_STREAM	2
+#define	DEV_OP_WRITE		3
+
+#define	DEV_KIND_NONE		0
+#define	DEV_KIND_STREAM_RX	1
+#define	DEV_KIND_STREAM_TX	2
+#define	DEV_KIND_CHAR		3
+#define	DEV_KIND_BLOCK		4
+
+#define	DEV_F_READABLE		0x01u
+#define	DEV_F_WRITABLE		0x02u
+#define	DEV_F_STREAM		0x04u
+
+#define	DEV_NAME_MAX		16
+#define	DEV_WRITE_MAX		256
+
+struct dev_info_reply {
+	char		dir_name[DEV_NAME_MAX];
+	uint32_t	dir_kind;
+	uint32_t	dir_flags;
+};
+
+struct dev_write_request {
+	uint32_t	dwr_len;
+	uint32_t	dwr_pad;
+	uint8_t		dwr_data[DEV_WRITE_MAX];
+};
+
+struct dev_write_reply {
+	int32_t		dwr_rv;
+	uint32_t	dwr_written;
+};
+
+/*
+ * dev_open_stream: bootstrap_lookup("dev/<name>") + RPC DEV_OP_OPEN_STREAM
+ * + extract the port_descriptor + deallocate the control port.  Returns
+ * the SEND right naming the driver's stream port, or MACH_PORT_NULL on
+ * any failure.  Caller mach_msg_recv()s on the returned name to pull
+ * bytes from the driver.  Caller must mach_port_deallocate() when done.
+ */
+mach_port_name_t dev_open_stream(const char *short_name);
+
+/*
+ * dev_info: query the named driver for its kind + capability flags.
+ * Returns MACH_MSG_OK on success and fills *out; any negative MACH_E_*
+ * otherwise.  Lightweight probe before opening a stream.
+ */
+int		 dev_info(const char *short_name, struct dev_info_reply *out);
+
+/*
+ * dev_write: send DEV_OP_WRITE to the driver named "dev/<short_name>".
+ * Up to DEV_WRITE_MAX bytes; returns the number of bytes the driver
+ * acknowledged, or a negative MACH_E_*.  Used by future TX consumers
+ * (e.g. a network logger speaking dev/uart).
+ */
+ssize_t		 dev_write(const char *short_name,
+		    const void *buf, size_t len);
 
 /* ---- kernel-side services (mirrors mach/services.h) --------------- */
 

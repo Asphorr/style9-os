@@ -105,3 +105,17 @@ yield(void)
 
 	return (syscall0(SYS_YIELD));
 }
+
+long
+spawn(const char *name)
+{
+
+	return (syscall1(SYS_SPAWN, (long)name));
+}
+
+int
+task_alive(uint64_t task_id)
+{
+
+	return ((int)syscall1(SYS_TASK_ALIVE, (long)task_id));
+}

@@ -29,6 +29,9 @@ extern uint8_t	_binary_clock_elf_end[];
 extern uint8_t	_binary_tasks_elf_start[];
 extern uint8_t	_binary_tasks_elf_end[];
 
+extern uint8_t	_binary_sh_elf_start[];
+extern uint8_t	_binary_sh_elf_end[];
+
 /*
  * Bridge into the arch-specific user-thread spawn path.  Lives in
  * arch/amd64/usermode.c; declared here so progreg_spawn doesn't have
@@ -72,6 +75,8 @@ progreg_init(void)
 	    _binary_clock_elf_start, _binary_clock_elf_end);
 	register_one("tasks",
 	    _binary_tasks_elf_start, _binary_tasks_elf_end);
+	register_one("sh",
+	    _binary_sh_elf_start, _binary_sh_elf_end);
 
 	kprintf("progreg: %zu programs registered\n", nentries);
 }

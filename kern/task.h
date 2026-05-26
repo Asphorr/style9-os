@@ -78,6 +78,16 @@ void			 task_list_print(void);
 size_t			 task_snapshot(struct task **out, size_t max);
 
 /*
+ * Best-effort liveness probe by task id.  Returns true if a task with
+ * that id is in the global task_list under tasks_lock at the moment of
+ * the call.  No ref is bumped -- the result is stale the instant
+ * tasks_lock is released, so callers must treat this as a hint, not a
+ * handle.  Powers the SYS_TASK_ALIVE syscall: the shell yield-spins
+ * until a spawned child drops off the live list.
+ */
+bool			 task_is_alive(uint64_t id);
+
+/*
  * Synchronous dispatcher invoked by mach_msg_send when the destination
  * port is tagged PORT_SPECIAL_TASK_SELF.  Reads `req->msgh_id` to pick
  * an op (see TASK_OP_* in port.h), assembles a reply message, and

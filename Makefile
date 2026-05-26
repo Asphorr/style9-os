@@ -106,6 +106,7 @@ OBJS	= \
 	$(OBJDIR)/hello_elf.o	\
 	$(OBJDIR)/clock_elf.o	\
 	$(OBJDIR)/tasks_elf.o	\
+	$(OBJDIR)/sh_elf.o	\
 	$(OBJDIR)/ksym.o
 
 all: kernel.elf
@@ -140,7 +141,8 @@ LIB_OBJS = \
 	$(OBJDIR)/style9_str.o	\
 	$(OBJDIR)/style9_mem.o	\
 	$(OBJDIR)/style9_io.o	\
-	$(OBJDIR)/style9_mach.o
+	$(OBJDIR)/style9_mach.o	\
+	$(OBJDIR)/style9_dev.o
 
 $(OBJDIR)/crt0.o: $(LIB_DIR)/crt0.S | $(OBJDIR)
 	$(CC) $(USER_ASFLAGS) -c $< -o $@
@@ -153,7 +155,7 @@ $(OBJDIR)/style9_%.o: $(LIB_DIR)/style9_%.c | $(OBJDIR)
 # below.  To add one, drop user/<name>.c on disk, append the name here,
 # and register the matching _binary_<name>_elf_start/_end pair in
 # kern/progreg.c.
-USER_PROGRAMS = hello clock tasks
+USER_PROGRAMS = hello clock tasks sh
 
 $(OBJDIR)/%.user.o: $(USER_DIR)/%.c | $(OBJDIR)
 	$(CC) $(USER_CFLAGS) -c $< -o $@

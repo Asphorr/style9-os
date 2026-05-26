@@ -45,6 +45,7 @@ static long	sys_msg_rpc(struct mach_msg_header *ureq,
 		    struct mach_msg_header *ureply, size_t ureply_size,
 		    uint64_t timeout_ms);
 static long	sys_spawn(const char *uname);
+static long	sys_task_alive(uint64_t task_id);
 
 static bool	user_range_ok(uint64_t addr, size_t len);
 
@@ -140,6 +141,8 @@ syscall_dispatch(struct syscall_frame *f)
 		    (uint64_t)f->sf_arg3));
 	case SYS_SPAWN:
 		return (sys_spawn((const char *)f->sf_arg0));
+	case SYS_TASK_ALIVE:
+		return (sys_task_alive((uint64_t)f->sf_arg0));
 	default:
 		return (SYS_E_NOSYS);
 	}
@@ -341,4 +344,18 @@ sys_spawn(const char *uname)
 		return (SYS_E_INVAL);
 
 	return (progreg_spawn(kname));
+}
+
+/*
+ * sys_task_alive: 1 if a task with this id is still on the live list,
+ * 0 if not.  Cheap polling primitive that lets the userspace shell
+ * yield-spin until a spawned child has terminated; a real blocking
+ * exit-notify port (Mach death notification) is a phase-3 conversation.
+ * No fault paths -- the id is a scalar, no user-VA touched.
+ */
+static long
+sys_task_alive(uint64_t task_id)
+{
+
+	return (task_is_alive(task_id) ? 1 : 0);
 }

@@ -417,3 +417,28 @@ task_snapshot(struct task **out, size_t max)
 	spin_unlock(&tasks_lock);
 	return (n);
 }
+
+/*
+ * task_is_alive: best-effort, lock-only liveness check.  No ref bump --
+ * the answer is stale once tasks_lock is dropped, so the shell must
+ * yield-spin (and re-probe) until it stays 'false'.  Cheap enough for
+ * that purpose: a single scan of TASK_LIST_MAX (64) slots under one
+ * spinlock acquisition.
+ */
+bool
+task_is_alive(uint64_t id)
+{
+	bool	alive;
+	size_t	i;
+
+	alive = false;
+	spin_lock(&tasks_lock);
+	for (i = 0; i < TASK_LIST_MAX; i++) {
+		if (task_list[i] != NULL && task_list[i]->t_id == id) {
+			alive = true;
+			break;
+		}
+	}
+	spin_unlock(&tasks_lock);
+	return (alive);
+}

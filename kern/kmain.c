@@ -137,10 +137,50 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	syscall_init();
 
 	progreg_init();
-	if (progreg_spawn("hello") < 0)
-		panic("kmain: spawn(hello) failed");
 
-	shell_run();
+	/*
+	 * Phase 2: ring-3 shell takes over as the user-facing surface.
+	 *
+	 * sh.elf calls dev_open_stream("kbd"), which MOVE_RECEIVEs the
+	 * single RECV right on kbd_input_port out of kernel_space and into
+	 * sh.elf's port_space.  After that the in-kernel kern/shell.c can
+	 * no longer recv on kbd_input_port, so we must NOT call shell_run()
+	 * here -- it would either panic (port_set_insert on a port we no
+	 * longer own) or steal characters in a race with sh.elf.  The file
+	 * stays in the tree as a fallback / reference; phase 3 deletes it
+	 * once the userspace surface has full parity (disk + dev listing
+	 * subcommands).
+	 *
+	 * If sh.elf ever fails to spawn we drop straight into the legacy
+	 * kernel shell so the system stays interactive.
+	 */
+	if (progreg_spawn("sh") < 0) {
+		kprintf("kmain: spawn(sh) failed -- falling back to kernel shell\n");
+		shell_run();
+		/* NOTREACHED */
+	}
+
+	/*
+	 * sh.elf is now the interactive surface.  This thread (the boot
+	 * thread / kernel_task's id=1) has done its job; exit so it falls
+	 * off the runq cleanly.
+	 *
+	 * Why not yield-spin: a yield-loop keeps the boot thread perpetually
+	 * READY, and pick_next_locked only returns idle_thread when the
+	 * runq is empty.  idle_loop is the only caller of
+	 * sched_reap_zombies, so a boot thread that lingers on the runq
+	 * starves the reaper -- exited user tasks stay in task_list, the
+	 * shell's yield-spin on SYS_TASK_ALIVE never sees them go away,
+	 * and the prompt never comes back after a child returns.
+	 *
+	 * thread_exit() turns this thread into a zombie and hands the CPU
+	 * to whatever pick_next finds next; idle is now reachable and
+	 * reaps both this boot thread and any later user-task zombies.
+	 * kernel_task's t_refs stay high because kbd_drv_thread,
+	 * uart_drv_thread, idle_thread, and the service threads are all
+	 * still attached to it, so the task itself is unaffected.
+	 */
+	thread_exit();
 	/* NOTREACHED */
 }
 
