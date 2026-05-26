@@ -46,4 +46,49 @@ io_wait(void)
 	outb(0x80, 0);
 }
 
+/*
+ * 16-bit port I/O.  Used by drivers that transfer data words from a
+ * device register (ATA PIO data port being the canonical example).
+ * Block helpers below run a `rep insw / rep outsw` so a whole sector
+ * (256 16-bit words) moves with one instruction.
+ */
+static inline void
+outw(uint16_t port, uint16_t val)
+{
+
+	__asm__ __volatile__ ("outw %0, %1"
+	    :
+	    : "a"(val), "Nd"(port));
+}
+
+static inline uint16_t
+inw(uint16_t port)
+{
+	uint16_t	val;
+
+	__asm__ __volatile__ ("inw %1, %0"
+	    : "=a"(val)
+	    : "Nd"(port));
+	return (val);
+}
+
+static inline void
+insw(uint16_t port, void *buf, uint32_t count)
+{
+
+	__asm__ __volatile__ ("rep insw"
+	    : "+D"(buf), "+c"(count)
+	    : "d"(port)
+	    : "memory");
+}
+
+static inline void
+outsw(uint16_t port, const void *buf, uint32_t count)
+{
+
+	__asm__ __volatile__ ("rep outsw"
+	    : "+S"(buf), "+c"(count)
+	    : "d"(port));
+}
+
 #endif /* !_MACHINE_IO_H_ */

@@ -7,6 +7,7 @@
 
 #include <stdint.h>
 
+#include "ata_drv.h"
 #include "bootstrap.h"
 #include "clock.h"
 #include "klog.h"
@@ -94,6 +95,7 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 
 	kbd_drv_init();
 	uart_drv_init();
+	ata_drv_init();
 
 	/*
 	 * Register a demo service under the bootstrap port so ring-3

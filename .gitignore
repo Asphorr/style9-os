@@ -16,3 +16,7 @@ live.log
 *.swp
 *.swo
 *~
+
+# Disk images used for ATA driver smoke tests.
+disk.img
+*.img

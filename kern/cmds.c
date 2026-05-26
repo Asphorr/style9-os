@@ -48,6 +48,7 @@ static int	cmd_mach(int, char **);
 static int	cmd_vmmap(int, char **);
 static int	cmd_log(int, char **);
 static int	cmd_dev(int, char **);
+static int	cmd_disk(int, char **);
 
 static int	streq(const char *, const char *);
 static int	parse_uint(const char *s, unsigned int *out);
@@ -77,6 +78,8 @@ const struct shell_cmd	shell_cmds[] = {
 	{ "vmmap",  "kernel_task vm_map entries",             cmd_vmmap  },
 	{ "log",    "log <tail|debug|info|warn|error> [text]", cmd_log   },
 	{ "dev",    "dev <ls|info NAME|write uart TEXT>",     cmd_dev    },
+	{ "disk",   "disk <ls|info NAME|read NAME LBA|write NAME LBA TEXT|sync NAME>",
+		cmd_disk   },
 	{ "crash",  "crash <dfree|wild|assert|unmapped|nonc>", cmd_crash  },
 	{ "panic",  "deliberate panic (tests panic path)",    cmd_panic  },
 };
@@ -1113,5 +1116,299 @@ cmd_dev(int argc, char *argv[])
 		return (dev_write(argv[2], argv[3]));
 	}
 	kprintf("dev: unknown subcommand '%s'\n", argv[1]);
+	return (1);
+}
+
+/* ---- disk: BLOCK-device consumer using dev/disk* control ports ---- */
+
+static int
+disk_call_geom(const char *name)
+{
+	struct mach_msg_header		req;
+	struct {
+		struct mach_msg_header	hdr;
+		struct dev_geom_reply	body;
+	} reply;
+	mach_port_name_t	svc;
+	int			rv;
+
+	svc = dev_lookup(name);
+	if (svc == MACH_PORT_NULL) {
+		kprintf("disk: '%s' not registered\n", name);
+		return (1);
+	}
+
+	req.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	req.msgh_size    = sizeof(req);
+	req.msgh_remote  = svc;
+	req.msgh_local   = MACH_PORT_NULL;
+	req.msgh_voucher = 0;
+	req.msgh_id      = DEV_OP_GEOM;
+
+	rv = mach_msg_rpc(kernel_space, &req, &reply.hdr, sizeof(reply), 2000);
+	(void)port_deallocate(kernel_space, svc);
+	if (rv != MACH_MSG_OK) {
+		kprintf("disk geom: rpc rv=%s\n", mach_msg_strerror(rv));
+		return (1);
+	}
+	if (reply.body.dgr_rv != MACH_MSG_OK) {
+		kprintf("disk geom: drive rv=%d\n", reply.body.dgr_rv);
+		return (1);
+	}
+	{
+		uint64_t bytes;
+		bytes = reply.body.dgr_total_sectors *
+		    (uint64_t)reply.body.dgr_sector_bytes;
+		kprintf("  %-8s  sector=%u total=%llu sectors (%llu MiB)  "
+		    "ext=%s\n  model=%s\n",
+		    name,
+		    (unsigned)reply.body.dgr_sector_bytes,
+		    (unsigned long long)reply.body.dgr_total_sectors,
+		    (unsigned long long)(bytes >> 20),
+		    (reply.body.dgr_flags & 1) ? "yes" : "no",
+		    reply.body.dgr_model);
+	}
+	return (0);
+}
+
+static int
+disk_ls(void)
+{
+	char	names[8][DEV_NAME_MAX];
+	size_t	n, i, shown;
+
+	n = dev_list_names(names, 8);
+	shown = 0;
+	for (i = 0; i < n; i++) {
+		/* Only show dev/disk* entries. */
+		if (names[i][0] != 'd' || names[i][1] != 'i' ||
+		    names[i][2] != 's' || names[i][3] != 'k')
+			continue;
+		if (shown == 0)
+			kprintf("disks:\n");
+		(void)disk_call_geom(names[i]);
+		shown++;
+	}
+	if (shown == 0)
+		kprintf("disk: no block devices registered\n");
+	return (0);
+}
+
+static int
+parse_u64(const char *s, uint64_t *out)
+{
+	uint64_t	v;
+	size_t		i;
+
+	if (s == NULL || s[0] == '\0')
+		return (-1);
+	v = 0;
+	for (i = 0; s[i] != '\0'; i++) {
+		if (s[i] < '0' || s[i] > '9')
+			return (-1);
+		v = v * 10 + (uint64_t)(s[i] - '0');
+	}
+	*out = v;
+	return (0);
+}
+
+static void
+hexdump_sector(const uint8_t *data, size_t nbytes, uint64_t lba)
+{
+	size_t	i, j;
+
+	for (i = 0; i < nbytes; i += 16) {
+		kprintf("  %08llx  ",
+		    (unsigned long long)(lba * 512 + i));
+		for (j = 0; j < 16 && i + j < nbytes; j++)
+			kprintf("%02x ", (unsigned)data[i + j]);
+		kprintf(" ");
+		for (j = 0; j < 16 && i + j < nbytes; j++) {
+			uint8_t c = data[i + j];
+			kprintf("%c", (c >= 32 && c < 127) ? c : '.');
+		}
+		kprintf("\n");
+	}
+}
+
+static int
+disk_read(const char *name, uint64_t lba)
+{
+	struct {
+		struct mach_msg_header		hdr;
+		struct dev_block_io_req		body;
+	} req;
+	struct {
+		struct mach_msg_header		hdr;
+		struct dev_block_read_reply	body;
+	} reply;
+	mach_port_name_t	svc;
+	int			rv;
+
+	svc = dev_lookup(name);
+	if (svc == MACH_PORT_NULL) {
+		kprintf("disk read: '%s' not registered\n", name);
+		return (1);
+	}
+
+	req.body.dbr_lba   = lba;
+	req.body.dbr_count = 1;
+	req.body.dbr_pad   = 0;
+
+	req.hdr.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	req.hdr.msgh_size    = sizeof(req);
+	req.hdr.msgh_remote  = svc;
+	req.hdr.msgh_local   = MACH_PORT_NULL;
+	req.hdr.msgh_voucher = 0;
+	req.hdr.msgh_id      = DEV_OP_READ_BLOCK;
+
+	rv = mach_msg_rpc(kernel_space, &req.hdr, &reply.hdr,
+	    sizeof(reply), 5000);
+	(void)port_deallocate(kernel_space, svc);
+	if (rv != MACH_MSG_OK) {
+		kprintf("disk read: rpc rv=%s\n", mach_msg_strerror(rv));
+		return (1);
+	}
+	if (reply.body.dbr_rv != MACH_MSG_OK) {
+		kprintf("disk read: drive rv=%d\n", reply.body.dbr_rv);
+		return (1);
+	}
+
+	kprintf("disk read %s lba=%llu (%u sector):\n", name,
+	    (unsigned long long)lba, (unsigned)reply.body.dbr_count);
+	hexdump_sector(reply.body.dbr_data,
+	    (size_t)reply.body.dbr_count * 512, lba);
+	return (0);
+}
+
+static int
+disk_write(const char *name, uint64_t lba, const char *text)
+{
+	struct {
+		struct mach_msg_header		hdr;
+		struct dev_block_write_req	body;
+	} req;
+	struct {
+		struct mach_msg_header		hdr;
+		struct dev_block_io_reply	body;
+	} reply;
+	mach_port_name_t	svc;
+	size_t			i, tlen;
+	int			rv;
+
+	svc = dev_lookup(name);
+	if (svc == MACH_PORT_NULL) {
+		kprintf("disk write: '%s' not registered\n", name);
+		return (1);
+	}
+
+	req.body.dbw_lba   = lba;
+	req.body.dbw_count = 1;
+	req.body.dbw_pad   = 0;
+	for (i = 0; i < DEV_BLOCK_MAX_BYTES; i++)
+		req.body.dbw_data[i] = 0;
+	for (tlen = 0; text[tlen] != '\0' && tlen < 511; tlen++)
+		req.body.dbw_data[tlen] = (uint8_t)text[tlen];
+	req.body.dbw_data[tlen] = '\n';
+
+	req.hdr.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	req.hdr.msgh_size    = sizeof(req);
+	req.hdr.msgh_remote  = svc;
+	req.hdr.msgh_local   = MACH_PORT_NULL;
+	req.hdr.msgh_voucher = 0;
+	req.hdr.msgh_id      = DEV_OP_WRITE_BLOCK;
+
+	rv = mach_msg_rpc(kernel_space, &req.hdr, &reply.hdr,
+	    sizeof(reply), 5000);
+	(void)port_deallocate(kernel_space, svc);
+	if (rv != MACH_MSG_OK) {
+		kprintf("disk write: rpc rv=%s\n", mach_msg_strerror(rv));
+		return (1);
+	}
+	if (reply.body.dbr_rv != MACH_MSG_OK) {
+		kprintf("disk write: drive rv=%d\n", reply.body.dbr_rv);
+		return (1);
+	}
+	kprintf("disk write %s lba=%llu: %u sector(s) committed\n",
+	    name, (unsigned long long)lba,
+	    (unsigned)reply.body.dbr_sectors);
+	return (0);
+}
+
+static int
+disk_sync(const char *name)
+{
+	struct mach_msg_header		req;
+	struct {
+		struct mach_msg_header		hdr;
+		struct dev_block_io_reply	body;
+	} reply;
+	mach_port_name_t	svc;
+	int			rv;
+
+	svc = dev_lookup(name);
+	if (svc == MACH_PORT_NULL) {
+		kprintf("disk sync: '%s' not registered\n", name);
+		return (1);
+	}
+
+	req.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	req.msgh_size    = sizeof(req);
+	req.msgh_remote  = svc;
+	req.msgh_local   = MACH_PORT_NULL;
+	req.msgh_voucher = 0;
+	req.msgh_id      = DEV_OP_SYNC;
+
+	rv = mach_msg_rpc(kernel_space, &req, &reply.hdr, sizeof(reply), 5000);
+	(void)port_deallocate(kernel_space, svc);
+	if (rv != MACH_MSG_OK) {
+		kprintf("disk sync: rpc rv=%s\n", mach_msg_strerror(rv));
+		return (1);
+	}
+	if (reply.body.dbr_rv != MACH_MSG_OK) {
+		kprintf("disk sync: drive rv=%d\n", reply.body.dbr_rv);
+		return (1);
+	}
+	kprintf("disk sync %s: cache flushed\n", name);
+	return (0);
+}
+
+static int
+cmd_disk(int argc, char *argv[])
+{
+	uint64_t	lba;
+
+	if (argc < 2 || streq(argv[1], "ls"))
+		return (disk_ls());
+
+	if (streq(argv[1], "info")) {
+		if (argc < 3) {
+			kprintf("disk info: usage: disk info NAME\n");
+			return (1);
+		}
+		return (disk_call_geom(argv[2]));
+	}
+	if (streq(argv[1], "read")) {
+		if (argc < 4 || parse_u64(argv[3], &lba) != 0) {
+			kprintf("disk read: usage: disk read NAME LBA\n");
+			return (1);
+		}
+		return (disk_read(argv[2], lba));
+	}
+	if (streq(argv[1], "write")) {
+		if (argc < 5 || parse_u64(argv[3], &lba) != 0) {
+			kprintf("disk write: usage: disk write NAME LBA TEXT\n");
+			return (1);
+		}
+		return (disk_write(argv[2], lba, argv[4]));
+	}
+	if (streq(argv[1], "sync")) {
+		if (argc < 3) {
+			kprintf("disk sync: usage: disk sync NAME\n");
+			return (1);
+		}
+		return (disk_sync(argv[2]));
+	}
+	kprintf("disk: unknown subcommand '%s'\n", argv[1]);
 	return (1);
 }
