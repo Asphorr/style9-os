@@ -46,6 +46,19 @@ SECTIONS
 		*(.data*)
 	} : data
 
+	/*
+	 * Kernel symbol table.  Populated by a post-link rebuild
+	 * (tools/gen_ksyms.sh + Makefile two-pass), kept after .data
+	 * and before .bss so its growth between passes shifts only
+	 * the BSS image -- function and rodata addresses extracted
+	 * in pass 1 stay correct in pass 2.
+	 */
+	.ksymtab ALIGN(4K) : {
+		__ksymtab_start = .;
+		KEEP(*(.ksymtab))
+		__ksymtab_end = .;
+	} : data
+
 	.bss ALIGN(4K) : {
 		__bss_start = .;
 		*(COMMON)

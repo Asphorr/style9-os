@@ -12,6 +12,7 @@
 
 #include "ddb.h"
 #include "kprintf.h"
+#include "ksym.h"
 #include "panic.h"
 #include "tty.h"
 
@@ -100,8 +101,9 @@ backtrace_print(uintptr_t rbp, int max_frames)
 		if (ret_addr == 0)
 			break;
 
-		kprintf("  #%-2d  rip=0x%016lx  rbp=0x%016lx\n",
-		    i, ret_addr, (uint64_t)frame);
+		kprintf("  #%-2d  rip=", i);
+		ksym_print(ret_addr);
+		kprintf("  rbp=0x%016lx\n", (uint64_t)frame);
 
 		frame = (uint64_t *)frame[0];
 	}

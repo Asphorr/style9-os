@@ -12,6 +12,7 @@
 #include "ddb.h"
 #include "intr.h"
 #include "kprintf.h"
+#include "ksym.h"
 #include "panic.h"
 #include "pic.h"
 #include "sched.h"
@@ -163,9 +164,10 @@ intr_panic(const struct trapframe *tf)
 		pf_print_err((uint64_t)tf->tf_err);
 	}
 
-	kprintf("rip=0x%016lx  cs=0x%04lx  rflags=0x%016lx\n",
-	    (unsigned long)tf->tf_rip, (unsigned long)tf->tf_cs,
-	    (unsigned long)tf->tf_rflags);
+	kprintf("rip=");
+	ksym_print((uint64_t)tf->tf_rip);
+	kprintf("\n     cs=0x%04lx  rflags=0x%016lx\n",
+	    (unsigned long)tf->tf_cs, (unsigned long)tf->tf_rflags);
 	kprintf("rsp=0x%016lx  ss=0x%04lx\n",
 	    (unsigned long)tf->tf_rsp, (unsigned long)tf->tf_ss);
 	kprintf("rax=0x%016lx  rbx=0x%016lx\n",

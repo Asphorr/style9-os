@@ -91,7 +91,8 @@ OBJS	= \
 	$(OBJDIR)/kbd_drv.o	\
 	$(OBJDIR)/uart_drv.o	\
 	$(OBJDIR)/elf.o		\
-	$(OBJDIR)/hello_elf.o
+	$(OBJDIR)/hello_elf.o	\
+	$(OBJDIR)/ksym.o
 
 all: kernel.elf
 
@@ -122,8 +123,42 @@ $(OBJDIR)/hello_elf.o: $(OBJDIR)/hello.elf
 	    --rename-section .data=.rodata.hello_elf			\
 	    hello.elf hello_elf.o
 
-kernel.elf: $(OBJS) $(ARCH)/linker.ld
-	$(LD) $(LDFLAGS) -o $@ $(OBJS)
+#
+# Two-pass link to embed a kernel-symbol table in .ksymtab.
+#
+# Pass 1: link with a tiny stub ksyms object so the kernel ELF has all
+# real addresses resolved.  tools/gen_ksyms.sh then reads `nm -n` on
+# that pass-1 image and emits ksyms_real.S, an assembly blob holding
+# (addr, name_ptr) tuples + a string pool, all anchored under
+# __ksymtab_start / __ksymtab_end.
+#
+# Pass 2: re-link with ksyms_real.o.  The linker script places
+# .ksymtab between .data and .bss, so growth of the symbol section
+# between pass 1 and pass 2 only shifts .bss -- text/rodata/data
+# addresses stay put, and the addresses gen_ksyms.sh baked in remain
+# correct in the final binary.
+#
+KSYMS_STUB_S  = $(OBJDIR)/ksyms_stub.S
+KSYMS_REAL_S  = $(OBJDIR)/ksyms_real.S
+KSYMS_STAGE1  = $(OBJDIR)/kernel.stage1
+
+$(KSYMS_STUB_S): | $(OBJDIR)
+	@printf '.section .ksymtab,"a",@progbits\n.global __ksymtab_start\n.global __ksymtab_end\n__ksymtab_start:\n.quad 0\n.quad 0\n__ksymtab_end:\n' > $@
+
+$(OBJDIR)/ksyms_stub.o: $(KSYMS_STUB_S)
+	$(CC) $(ASFLAGS) -c $< -o $@
+
+$(KSYMS_STAGE1): $(OBJS) $(OBJDIR)/ksyms_stub.o $(ARCH)/linker.ld
+	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(OBJDIR)/ksyms_stub.o
+
+$(KSYMS_REAL_S): $(KSYMS_STAGE1) tools/gen_ksyms.sh
+	tools/gen_ksyms.sh $(KSYMS_STAGE1) > $@
+
+$(OBJDIR)/ksyms_real.o: $(KSYMS_REAL_S)
+	$(CC) $(ASFLAGS) -c $< -o $@
+
+kernel.elf: $(OBJS) $(OBJDIR)/ksyms_real.o $(ARCH)/linker.ld
+	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(OBJDIR)/ksyms_real.o
 
 $(OBJDIR)/%.o: %.c | $(OBJDIR)
 	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
