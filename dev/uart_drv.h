@@ -11,7 +11,7 @@
 #include "port.h"
 
 /*
- * Serial-console RX driver.  Mirrors kern/kbd_drv: at boot,
+ * Serial-console RX driver.  Mirrors dev/kbd_drv: at boot,
  * uart_drv_init() allocates `uart_input_port` in kernel_space with
  * RECEIVE | SEND, enables the COM1 receive IRQ, and spawns a
  * `uart-drv` kernel thread that bridges uart_getc_block to

@@ -31,8 +31,8 @@ Built from scratch — no upstream tree, no glue from another OS.
 | tasks | `kern/task.c` | resource container, owns one `port_space` |
 | threads | `kern/thread.c`, `arch/amd64/switch.S` | callee-saved context switch, kstack-backed |
 | sched | `kern/sched.c` | cooperative + preemptive round-robin, idle thread reaps zombies |
-| kbd drv | `kern/kbd_drv.c` | bridges the PS/2 IRQ ring to `kbd_input_port` |
-| uart drv | `kern/uart_drv.c` | enables COM1 RX IRQ, bridges to `uart_input_port` (same wire format as the keyboard, single character per message) |
+| kbd drv | `dev/kbd_drv.c` | bridges the PS/2 IRQ ring to `kbd_input_port` |
+| uart drv | `dev/uart_drv.c` | enables COM1 RX IRQ, bridges to `uart_input_port` (same wire format as the keyboard, single character per message) |
 | shell | `kern/shell.c`, `cmds.c` | recv's on a port set that has both `kbd_input_port` and `uart_input_port` as members -- either input source drives the same line editor |
 | drivers | `dev/*.c` | 16550 UART (TX polled, RX IRQ-driven), VGA, PS/2 keyboard, QEMU debugcon |
 
