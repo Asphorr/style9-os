@@ -28,8 +28,10 @@
  *	%p	pointer (== %#x of (uintptr_t))
  *	%%	literal '%'
  *
- * Width/precision flags are not honoured beyond a leading '0' on hex
- * to zero-pad to the natural width of the cast.  Long modifier `l` is
+ * Flags supported:
+ *	'0'	zero-pad numeric conversions
+ *	'-'	left-align (default is right-align) for %s and numbers
+ * Width is honoured for %d/%i/%u/%x/%X/%s.  Long modifier `l` is
  * accepted (%ld / %lu / %lx) and read as long; `ll` is also accepted
  * for long long.  No floats -- we have no FPU saved on syscall yet.
  */
@@ -87,12 +89,28 @@ sb_putc(struct sbuf *sb, char c)
 }
 
 static void
-sb_puts(struct sbuf *sb, const char *s)
+sb_puts(struct sbuf *sb, const char *s, unsigned width, int left_align)
 {
+	size_t	len;
 	size_t	i;
 
-	for (i = 0; s[i] != '\0'; i++)
+	for (len = 0; s[len] != '\0'; len++)
+		continue;
+
+	if (!left_align) {
+		while ((unsigned)len < width) {
+			sb_putc(sb, ' ');
+			width--;
+		}
+	}
+	for (i = 0; i < len; i++)
 		sb_putc(sb, s[i]);
+	if (left_align) {
+		while ((unsigned)len < width) {
+			sb_putc(sb, ' ');
+			width--;
+		}
+	}
 }
 
 /*
@@ -161,6 +179,7 @@ printf(const char *fmt, ...)
 	int		longs;
 	unsigned	width;
 	int		zero_pad;
+	int		left_align;
 	size_t		i;
 
 	sb.sb_buf     = buf;
@@ -185,10 +204,13 @@ printf(const char *fmt, ...)
 		 * the right thing for the conversion letter at least.
 		 */
 		zero_pad = 0;
+		left_align = 0;
 		while (fmt[i] == '0' || fmt[i] == '-' ||
 		    fmt[i] == '+' || fmt[i] == ' ' || fmt[i] == '#') {
 			if (fmt[i] == '0')
 				zero_pad = 1;
+			else if (fmt[i] == '-')
+				left_align = 1;
 			i++;
 		}
 
@@ -221,7 +243,8 @@ printf(const char *fmt, ...)
 				break;
 			case 's':
 				s = va_arg(ap, const char *);
-				sb_puts(&sb, s != NULL ? s : "(null)");
+				sb_puts(&sb, s != NULL ? s : "(null)",
+				    width, left_align);
 				break;
 			case 'd':
 			case 'i':

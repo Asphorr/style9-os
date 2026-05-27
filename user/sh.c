@@ -80,22 +80,22 @@ static int	last_status;
 
 /* ---- ANSI escape constants --------------------------------------- */
 
+/*
+ * Restrained palette: white-bold for emphasis, gray for body,
+ * dark-gray for the chrome rules, light-red for the rare error.
+ * The 'green prompt + yellow keywords' style from v1 is gone --
+ * the aesthetic here is closer to a modern Terminal.app prompt
+ * than to a hobby-OS splash.
+ */
 #define	ESC_RESET	"\x1b[0m"
-#define	ESC_REVERSE	"\x1b[7m"
-#define	ESC_BOLD	"\x1b[1m"
-#define	ESC_FG_RED	"\x1b[1;31m"
-#define	ESC_FG_GREEN	"\x1b[1;32m"
-#define	ESC_FG_YELLOW	"\x1b[1;33m"
-#define	ESC_FG_BLUE	"\x1b[1;34m"
-#define	ESC_FG_MAGENTA	"\x1b[1;35m"
-#define	ESC_FG_CYAN	"\x1b[1;36m"
-#define	ESC_FG_WHITE	"\x1b[1;37m"
-#define	ESC_FG_GRAY	"\x1b[0;37m"
+#define	ESC_FG_RED	"\x1b[0;91m"	/* light red, not bold */
+#define	ESC_FG_WHITE	"\x1b[1;37m"	/* bold white -- headers, prompt */
+#define	ESC_FG_GRAY	"\x1b[0;37m"	/* default body colour          */
+#define	ESC_FG_DGRAY	"\x1b[1;30m"	/* dark gray -- rules, chrome   */
 #define	ESC_CLR_SCR	"\x1b[2J\x1b[H"
 #define	ESC_SAVE_CUR	"\x1b[s"
 #define	ESC_REST_CUR	"\x1b[u"
 #define	ESC_HOME	"\x1b[1;1H"
-#define	ESC_EOL_CLR	"\x1b[K"
 
 /* ---- single-byte read from the kbd stream port ------------------- */
 
@@ -185,31 +185,43 @@ fetch_stats(struct svc_stats_reply *out)
 /* ---- TUI surface ------------------------------------------------- */
 
 /*
- * paint_status_bar: lift the cursor to (1,1), emit a reverse-video
- * one-line dashboard, then put the cursor back where the caller had
- * it.  Inherits the SGR attribute through the trailing ESC_EOL_CLR so
- * the bar's reverse-video background runs the full 80 columns even
- * though we only wrote a partial line of glyph text.
+ * paint_hr: emit a full-width horizontal rule at the cursor's current
+ * row.  Uses CP437 0xC4 single-line glyph (─); the VGA text-mode font
+ * has it natively at that codepoint, and our tty state machine passes
+ * non-ESC bytes straight through.  Built as a single 80-byte buffer +
+ * trailing newline so it's one write() not eighty putchar()s.
+ */
+static void
+paint_hr(void)
+{
+	char	line[81];
+	int	i;
+
+	line[0]  = ' ';
+	for (i = 1; i < 79; i++)
+		line[i] = (char)0xc4;
+	line[79] = ' ';
+	line[80] = '\n';
+	(void)write(line, 81);
+}
+
+/*
+ * paint_status_bar: lift the cursor to (1,1) and paint a two-row
+ * header -- app-name + right-aligned uptime on row 0, a thin horizontal
+ * rule on row 1.  No reverse-video bar; the chrome here is meant to
+ * read as quiet typography rather than a 1990s curses banner.
  *
- * Three live data fields: total ram + KiB used, live task count,
- * uptime in HH:MM:SS.  If a service query fails the values just show
- * as zero -- preferable to suppressing the bar entirely.
+ * Both rows are repainted on every prompt so they survive scrolling:
+ * since QEMU's VGA scroll moves rows up and row 0 drops off the top,
+ * the next paint sees an empty top row to overwrite cleanly.
  */
 static void
 paint_status_bar(void)
 {
 	struct svc_clock_reply	ck;
-	struct svc_stats_reply	st;
-	uint64_t		used_kib;
-	uint64_t		total_kib;
 	uint64_t		s, m, h;
 
 	(void)fetch_clock(&ck);
-	(void)fetch_stats(&st);
-
-	used_kib  = st.sr_pmm_used_pages * 4ull;
-	total_kib = st.sr_pmm_total_pages * 4ull;
-
 	s = ck.cr_uptime_ms / 1000ull;
 	h = s / 3600ull;
 	s = s - h * 3600ull;
@@ -218,32 +230,42 @@ paint_status_bar(void)
 
 	puts(ESC_SAVE_CUR);
 	puts(ESC_HOME);
-	puts(ESC_REVERSE);
-	printf(" style9-os(9)     ram %llu/%lluK     tasks %llu     uptime "
-	    "%02llu:%02llu:%02llu",
-	    (unsigned long long)used_kib,
-	    (unsigned long long)total_kib,
-	    (unsigned long long)st.sr_task_count,
-	    (unsigned long long)h,
-	    (unsigned long long)m,
-	    (unsigned long long)s);
-	puts(ESC_EOL_CLR);
+	puts(ESC_FG_GRAY);
+	/*
+	 * 80 columns total: 1sp + "style9-os(9)" (12) + 57sp + uptime
+	 * (8) + 1sp + nl + 1.  "%58s" right-aligns the 8-char uptime to
+	 * column 79, leaving column 80 as a trailing space.
+	 */
+	{
+		char	tbuf[16];
+		tbuf[0] = (char)('0' + ((unsigned)(h / 10) % 10));
+		tbuf[1] = (char)('0' + ((unsigned)h % 10));
+		tbuf[2] = ':';
+		tbuf[3] = (char)('0' + ((unsigned)(m / 10) % 10));
+		tbuf[4] = (char)('0' + ((unsigned)m % 10));
+		tbuf[5] = ':';
+		tbuf[6] = (char)('0' + ((unsigned)(s / 10) % 10));
+		tbuf[7] = (char)('0' + ((unsigned)s % 10));
+		tbuf[8] = '\0';
+		printf(" style9-os(9)%66s \n", tbuf);
+	}
+	puts(ESC_FG_DGRAY);
+	paint_hr();
 	puts(ESC_RESET);
 	puts(ESC_REST_CUR);
 }
 
 /*
- * paint_splash: the manpage-style welcome.  Drawn once at startup;
- * scrolls off naturally as the user works.  Layout is a 5-line ASCII
- * '9' glyph on the left and NAME / SYSTEM / SEE ALSO blocks aligned
- * to the right, mirroring a real BSD manual page.
+ * paint_splash: a quiet manpage-style welcome.  No ASCII '9' glyph;
+ * the section-9 reference lives in the title and in 'SEE ALSO' --
+ * the typography itself is the logo.  Lots of vertical whitespace
+ * so the eye can rest between sections; left margin two columns,
+ * label gutter at column three, content gutter at column eighteen.
  *
  * Colour usage:
- *	cyan-bold	the '9' glyph and the manpage title bar
  *	white-bold	section headers (NAME, SYSTEM, SEE ALSO)
- *	gray		key labels (kernel, ram, ...)
- *	white-bold	values (so they pop against the gray)
- *	gray		the trailing hint line
+ *	gray		body text + value columns
+ *	dark gray	horizontal rules
  */
 static void
 paint_splash(void)
@@ -256,46 +278,30 @@ paint_splash(void)
 	used_kib  = st.sr_pmm_used_pages * 4ull;
 	total_kib = st.sr_pmm_total_pages * 4ull;
 
-	puts("\n");
-	puts(ESC_FG_CYAN);
-	puts("     ___\n");
-	puts("    / _ \\      ");
-	puts(ESC_FG_WHITE);
-	puts("STYLE9-OS(9)");
-	puts(ESC_FG_GRAY);
-	puts("                          style9-os Manual\n");
-	puts(ESC_FG_CYAN);
-	puts("   | (_) |\n");
-	puts("    \\__, |    ");
-	puts(ESC_FG_WHITE);
-	puts("NAME\n");
-	puts(ESC_FG_CYAN);
-	puts("      /_/");
-	puts(ESC_FG_GRAY);
-	puts("        style9-os -- BSD-flavoured x86_64 microkernel\n");
+	/* Two blank rows after the status header for breathing room. */
+	puts("\n\n");
+
+	puts(ESC_FG_WHITE); puts("  NAME           ");
+	puts(ESC_FG_GRAY);  puts("style9-os -- BSD-flavoured x86_64 "
+	    "microkernel\n");
 	puts("\n");
 
-	puts("               ");
-	puts(ESC_FG_WHITE);
-	puts("SYSTEM\n");
-	puts(ESC_FG_GRAY);
-	puts("                  arch    : x86_64\n");
-	printf("                  ram     : %llu / %llu KiB\n",
+	puts(ESC_FG_WHITE); puts("  SYSTEM         ");
+	puts(ESC_FG_GRAY);  puts("arch     x86_64\n");
+	printf("                 ram      %llu / %llu KiB\n",
 	    (unsigned long long)used_kib,
 	    (unsigned long long)total_kib);
-	printf("                  tasks   : %llu live\n",
+	printf("                 tasks    %llu live\n",
 	    (unsigned long long)st.sr_task_count);
-	puts("                  shell   : sh.elf  (libstyle9, ring 3)\n");
+	puts("                 shell    sh.elf\n");
 	puts("\n");
 
-	puts("               ");
-	puts(ESC_FG_WHITE);
-	puts("SEE ALSO\n");
-	puts(ESC_FG_GRAY);
-	puts("                  style(9), help(1)\n");
+	puts(ESC_FG_WHITE); puts("  SEE ALSO       ");
+	puts(ESC_FG_GRAY);  puts("style(9), help(1)\n");
 	puts("\n");
 
-	puts("  type `help' to see available commands.\n");
+	puts(ESC_FG_DGRAY);
+	paint_hr();
 	puts(ESC_RESET);
 	puts("\n");
 }
@@ -318,26 +324,25 @@ echo_backspace(void)
 }
 
 /*
- * prompt: repaint the persistent status bar, then emit the colour-
- * coded prompt at the cursor's current row.  '[ok]' / '[err N]' lights
- * green/red respectively; the '$' is always bright green so it stands
- * out as the input anchor.
+ * prompt: repaint the persistent status bar, then emit the prompt at
+ * the cursor's current row.  On success the prompt is a plain bold-
+ * white '$ '; on failure we prepend a subdued 'err N ' in light-red
+ * (no brackets, no shouting) and then the same plain '$ '.  Closer to
+ * how a modern shell surfaces $? than to a permanent status indicator.
  */
 static void
 prompt(void)
 {
 
 	paint_status_bar();
+	puts("\n");
 
-	if (last_status == 0) {
-		puts(ESC_FG_GREEN);
-		puts("[ok]");
-	} else {
+	if (last_status != 0) {
 		puts(ESC_FG_RED);
-		printf("[err %d]", last_status);
+		printf("err %d  ", last_status);
 	}
-	puts(ESC_FG_GREEN);
-	puts(" $ ");
+	puts(ESC_FG_WHITE);
+	puts("$ ");
 	puts(ESC_RESET);
 }
 
@@ -376,41 +381,34 @@ split_argv(char *line, char *argv[], int max)
 /* ---- builtins ----------------------------------------------------- */
 
 /*
- * Coloured builtin/program listing.  Mirrors a manpage SYNOPSIS block:
- * section header in bold-white, command names in yellow, descriptions
- * in gray.  Spawnables get the same treatment so the visual rhythm
- * stays consistent regardless of whether the user reads down the
- * builtins or the spawnables.
+ * builtin_help: terse "two-column form" -- command on the left, one-
+ * line description on the right.  No section headers; spawnables get
+ * one inline row separated by two spaces, the way a tab-completion
+ * preview reads.  Bold-white commands, gray descriptions.
  */
 static void
 builtin_help(void)
 {
-	const char	*p;
-	size_t		 i;
+	size_t	i;
 
-	puts(ESC_FG_WHITE);
-	puts("style9-os shell -- builtins:\n");
-	puts(ESC_RESET);
-
-	puts(ESC_FG_YELLOW); puts("  help        ");
-	puts(ESC_FG_GRAY);   puts("show this list\n");
-	puts(ESC_FG_YELLOW); puts("  echo ARGS   ");
-	puts(ESC_FG_GRAY);   puts("print arguments\n");
-	puts(ESC_FG_YELLOW); puts("  clear       ");
-	puts(ESC_FG_GRAY);   puts("clear screen and repaint the splash\n");
-	puts(ESC_FG_YELLOW); puts("  about       ");
-	puts(ESC_FG_GRAY);   puts("print version banner\n");
+	puts(ESC_FG_WHITE); puts("  help     ");
+	puts(ESC_FG_GRAY);  puts("show this list\n");
+	puts(ESC_FG_WHITE); puts("  echo     ");
+	puts(ESC_FG_GRAY);  puts("print arguments\n");
+	puts(ESC_FG_WHITE); puts("  clear    ");
+	puts(ESC_FG_GRAY);  puts("clear screen and repaint the splash\n");
+	puts(ESC_FG_WHITE); puts("  about    ");
+	puts(ESC_FG_GRAY);  puts("version banner + live counters\n");
 
 	puts("\n");
-	puts(ESC_FG_WHITE);
-	puts("spawnable programs:\n");
-	puts(ESC_FG_YELLOW);
+	puts(ESC_FG_WHITE); puts("  spawn    ");
+	puts(ESC_FG_GRAY);
 	for (i = 0; known_progs[i] != NULL; i++) {
-		p = known_progs[i];
-		puts("  ");
-		puts(p);
-		puts("\n");
+		if (i > 0)
+			puts("    ");
+		puts(known_progs[i]);
 	}
+	puts("\n");
 	puts(ESC_RESET);
 }
 
@@ -446,26 +444,26 @@ builtin_about(void)
 {
 	struct svc_clock_reply	ck;
 	struct svc_stats_reply	st;
-	uint64_t		s;
+	uint64_t		s, m, h;
 
 	(void)fetch_clock(&ck);
 	(void)fetch_stats(&st);
 	s = ck.cr_uptime_ms / 1000ull;
+	h = s / 3600ull;
+	s = s - h * 3600ull;
+	m = s / 60ull;
+	s = s - m * 60ull;
 
-	puts(ESC_FG_WHITE);
-	puts("style9-os");
 	puts(ESC_FG_GRAY);
-	puts(" -- a BSD-flavoured x86_64 microkernel.\n");
-	puts("  written end-to-end in the style(9) BSD KNF convention, "
-	    "hence the name.\n");
+	puts("  style9-os -- a BSD-flavoured x86_64 microkernel.\n");
+	puts("  written end-to-end in the style(9) BSD KNF convention,\n");
+	puts("  hence the name.\n");
 	puts("\n");
-	puts(ESC_FG_WHITE); puts("  sh.elf");
-	puts(ESC_FG_GRAY);
-	puts(" -- libstyle9 ring-3 shell, phase 2.\n");
-	printf("  uptime %llu.%03llu s, %llu task(s), %llu thread(s), "
-	    "%llu ctx switches.\n",
+	printf("  uptime %llu:%02llu:%02llu   |   %llu tasks, %llu threads   |"
+	    "   %llu ctx switches\n",
+	    (unsigned long long)h,
+	    (unsigned long long)m,
 	    (unsigned long long)s,
-	    (unsigned long long)(ck.cr_uptime_ms % 1000ull),
 	    (unsigned long long)st.sr_task_count,
 	    (unsigned long long)st.sr_thread_count,
 	    (unsigned long long)st.sr_ctx_switches);
@@ -534,7 +532,9 @@ dispatch(int argc, char *argv[])
 	 */
 	rv = spawn(argv[0]);
 	if (rv <= 0) {
-		puts(ESC_FG_RED);
+		puts(ESC_FG_GRAY);
+		puts("  ");
+		puts(ESC_FG_WHITE);
 		puts(argv[0]);
 		puts(ESC_FG_GRAY);
 		puts(": not found\n");
