@@ -11,9 +11,17 @@
 
 #include "ddb.h"
 #include "kbd.h"
+#include "kmem.h"
 #include "kprintf.h"
+#include "memmap.h"
 #include "panic.h"
+#include "pmm.h"
+#include "port.h"
+#include "sched.h"
+#include "task.h"
+#include "thread.h"
 #include "tty.h"
+#include "vm.h"
 
 #define	DDB_LINEMAX	96
 
@@ -23,8 +31,13 @@ static void	ddb_dispatch(const char *line, uint64_t entry_rbp,
 static void	ddb_help(void);
 static void	ddb_regs(const struct trapframe *tf);
 static void	ddb_examine(const char *args);
+static void	ddb_ps(void);
+static void	ddb_show(const char *args);
+static void	ddb_show_task(uint64_t id);
+static void	ddb_show_thread(uint64_t id);
 static const char *skip_ws(const char *s);
 static int	parse_hex(const char *s, uint64_t *out);
+static int	parse_uint(const char *s, uint64_t *out);
 
 void
 ddb_enter(uint64_t entry_rbp, const struct trapframe *tf)
@@ -108,6 +121,19 @@ ddb_dispatch(const char *line, uint64_t entry_rbp, const struct trapframe *tf)
 		backtrace_print((uintptr_t)entry_rbp, 16);
 		return;
 	}
+	if (line[0] == 'p' && (line[1] == '\0' || line[1] == 's' ||
+	    line[1] == ' ' || line[1] == '\t')) {
+		ddb_ps();
+		return;
+	}
+	if (line[0] == 's' && (line[1] == ' ' || line[1] == '\t' ||
+	    (line[1] == 'h' && line[2] == 'o' && line[3] == 'w'))) {
+		const char *args = line + 1;
+		if (line[1] == 'h')
+			args = line + 4;	/* skip "how" */
+		ddb_show(args);
+		return;
+	}
 	if (line[0] == 'x') {
 		ddb_examine(line + 1);
 		return;
@@ -134,6 +160,13 @@ ddb_help(void)
 	    "  r                 print trap-context registers\n"
 	    "  bt                print backtrace from panic entry frame\n"
 	    "  x <addr> [<n>]    hex-dump n bytes (default 64) from addr\n"
+	    "  ps                list every task with its threads\n"
+	    "  s task <id>       show one task's full state\n"
+	    "  s thread <id>     show one thread's full state\n"
+	    "  s sched           runqueue + context-switch counter\n"
+	    "  s ports           every kernel port_space entry\n"
+	    "  s vm              kernel_task's vm_map\n"
+	    "  s mem             memmap + pmm + kmem summary\n"
 	    "  q                 halt the CPU\n");
 	tty_set_attr(TTY_ATTR(TTY_WHITE, TTY_BLACK));
 }
@@ -219,6 +252,133 @@ ddb_examine(const char *args)
 	tty_putc('\n');
 }
 
+/* ---- introspection commands -------------------------------------- */
+
+/*
+ * Walk every live task, then every thread attached to it.  No locks --
+ * DDB runs with interrupts disabled and we accept the small chance of
+ * a torn read for inspection convenience.  Same trade-off the existing
+ * task_list_print / sched_print make.
+ */
+static void
+ddb_ps(void)
+{
+	struct task		*tasks[16];
+	struct thread		*th;
+	size_t			 n;
+	size_t			 i;
+
+	tty_set_attr(TTY_ATTR(TTY_LIGHT_CYAN, TTY_BLACK));
+	tty_puts("all live tasks + threads:\n");
+	tty_set_attr(TTY_ATTR(TTY_LIGHT_GRAY, TTY_BLACK));
+
+	n = task_snapshot(tasks, sizeof(tasks) / sizeof(tasks[0]));
+	for (i = 0; i < n; i++) {
+		task_print(tasks[i]);
+		for (th = tasks[i]->t_threads; th != NULL;
+		    th = th->th_task_link) {
+			kprintf("    ");
+			thread_print(th);
+		}
+	}
+}
+
+static void
+ddb_show(const char *args)
+{
+	uint64_t	id;
+
+	args = skip_ws(args);
+	if (*args == '\0') {
+		kprintf("ddb: usage: s {task|thread|sched|ports|vm|mem} ...\n");
+		return;
+	}
+
+	if (args[0] == 't' && args[1] == 'a' && args[2] == 's' &&
+	    args[3] == 'k') {
+		args = skip_ws(args + 4);
+		if (parse_uint(args, &id) <= 0) {
+			kprintf("ddb: usage: s task <id>\n");
+			return;
+		}
+		ddb_show_task(id);
+		return;
+	}
+	if (args[0] == 't' && args[1] == 'h') {
+		/* "thread" -- skip "thread" or just match prefix */
+		args = skip_ws(args + 6);
+		if (parse_uint(args, &id) <= 0) {
+			kprintf("ddb: usage: s thread <id>\n");
+			return;
+		}
+		ddb_show_thread(id);
+		return;
+	}
+	if (args[0] == 's' && args[1] == 'c') {		/* sched */
+		sched_print();
+		return;
+	}
+	if (args[0] == 'p' && args[1] == 'o') {		/* ports */
+		port_space_print(kernel_space);
+		return;
+	}
+	if (args[0] == 'v' && args[1] == 'm') {		/* vm */
+		vm_map_print(kernel_task->t_map);
+		return;
+	}
+	if (args[0] == 'm' && args[1] == 'e') {		/* mem */
+		memmap_print();
+		pmm_stats();
+		kmem_stats();
+		return;
+	}
+
+	kprintf("ddb: unknown 'show' target: %s\n", args);
+}
+
+static void
+ddb_show_task(uint64_t id)
+{
+	struct task	*tasks[16];
+	size_t		 n;
+	size_t		 i;
+
+	n = task_snapshot(tasks, sizeof(tasks) / sizeof(tasks[0]));
+	for (i = 0; i < n; i++) {
+		if (tasks[i]->t_id == id) {
+			task_print(tasks[i]);
+			return;
+		}
+	}
+	kprintf("ddb: no task with id=%llu\n", (unsigned long long)id);
+}
+
+/*
+ * Threads are stored per-task, not in a global list, so walk every
+ * task and then every thread attached to it.  No ref bumps -- DDB
+ * holds the kernel still.
+ */
+static void
+ddb_show_thread(uint64_t id)
+{
+	struct task	*tasks[16];
+	struct thread	*th;
+	size_t		 n;
+	size_t		 i;
+
+	n = task_snapshot(tasks, sizeof(tasks) / sizeof(tasks[0]));
+	for (i = 0; i < n; i++) {
+		for (th = tasks[i]->t_threads; th != NULL;
+		    th = th->th_task_link) {
+			if (th->th_id == id) {
+				thread_print(th);
+				return;
+			}
+		}
+	}
+	kprintf("ddb: no thread with id=%llu\n", (unsigned long long)id);
+}
+
 static const char *
 skip_ws(const char *s)
 {
@@ -226,6 +386,38 @@ skip_ws(const char *s)
 	while (*s == ' ' || *s == '\t')
 		s++;
 	return (s);
+}
+
+/*
+ * Parse an unsigned integer in either base.  "0x"/"0X" prefix goes
+ * hex; anything else (incl. plain "12") is decimal.  Returns the
+ * number of input characters consumed, or 0 on failure (no digits).
+ */
+static int
+parse_uint(const char *s, uint64_t *out)
+{
+	uint64_t	v;
+	int		consumed, digits;
+
+	if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+		return (parse_hex(s, out));
+
+	v = 0;
+	consumed = 0;
+	digits = 0;
+	for (;;) {
+		char	c = s[consumed];
+
+		if (c < '0' || c > '9')
+			break;
+		v = v * 10u + (uint64_t)(c - '0');
+		consumed++;
+		digits++;
+	}
+	if (digits == 0)
+		return (0);
+	*out = v;
+	return (consumed);
 }
 
 /*
