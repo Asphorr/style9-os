@@ -14,6 +14,7 @@
 #include "panic.h"
 #include "sched.h"
 #include "spinlock.h"
+#include "witness.h"
 
 /*
  * Single-CPU placeholder; once an SMP boot exists this becomes the
@@ -77,6 +78,8 @@ spin_lock(struct spinlock *sl)
 
 	sl->sl_holder_rip = ra;
 	sl->sl_holder_cpu = cpu_id();
+
+	witness_acquired(sl, ra);
 }
 
 void
@@ -86,6 +89,8 @@ spin_unlock(struct spinlock *sl)
 	KASSERT(sl->sl_state == 1, "spin_unlock of unheld lock");
 	KASSERT(sl->sl_holder_cpu == cpu_id(),
 	    "spin_unlock by non-owner CPU");
+
+	witness_released(sl);
 
 	sl->sl_holder_rip = 0;
 	sl->sl_holder_cpu = -1;
@@ -123,5 +128,7 @@ spin_trylock(struct spinlock *sl)
 
 	sl->sl_holder_rip = ra;
 	sl->sl_holder_cpu = cpu_id();
+
+	witness_acquired(sl, ra);
 	return (true);
 }

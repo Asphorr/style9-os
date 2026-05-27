@@ -75,6 +75,7 @@ OBJS	= \
 	$(OBJDIR)/panic.o	\
 	$(OBJDIR)/ddb.o		\
 	$(OBJDIR)/spinlock.o	\
+	$(OBJDIR)/witness.o	\
 	$(OBJDIR)/memmap.o	\
 	$(OBJDIR)/pmm.o		\
 	$(OBJDIR)/kmem.o	\

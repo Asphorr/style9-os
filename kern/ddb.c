@@ -22,6 +22,7 @@
 #include "thread.h"
 #include "tty.h"
 #include "vm.h"
+#include "witness.h"
 
 #define	DDB_LINEMAX	96
 
@@ -167,6 +168,7 @@ ddb_help(void)
 	    "  s ports           every kernel port_space entry\n"
 	    "  s vm              kernel_task's vm_map\n"
 	    "  s mem             memmap + pmm + kmem summary\n"
+	    "  s locks           held locks for current thread (WITNESS)\n"
 	    "  q                 halt the CPU\n");
 	tty_set_attr(TTY_ATTR(TTY_WHITE, TTY_BLACK));
 }
@@ -330,6 +332,10 @@ ddb_show(const char *args)
 		memmap_print();
 		pmm_stats();
 		kmem_stats();
+		return;
+	}
+	if (args[0] == 'l' && args[1] == 'o') {		/* locks */
+		witness_dump_held(current_thread);
 		return;
 	}
 

@@ -67,6 +67,7 @@ thread_subsystem_init(void)
 	boot->th_wake_deadline_ms = 0;
 	boot->th_timed_out       = 0;
 	boot->th_timed_link      = NULL;
+	boot->th_held_count      = 0;
 
 	current_thread = boot;
 	task_attach_thread(kernel_task, boot);
@@ -135,6 +136,7 @@ thread_create(struct task *t, void (*entry)(void *), void *arg,
 	th->th_wake_deadline_ms  = 0;
 	th->th_timed_out         = 0;
 	th->th_timed_link        = NULL;
+	th->th_held_count        = 0;
 
 	/*
 	 * Fake-call frame at the high end of the kstack.  switch.S

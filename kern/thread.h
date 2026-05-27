@@ -90,6 +90,20 @@ struct thread {
 	uint64_t		 th_wake_deadline_ms;
 	volatile int		 th_timed_out;
 	struct thread		*th_timed_link;
+
+	/*
+	 * WITNESS-lite per-thread held-locks stack.  Each entry records
+	 * the lock's class name (identity-compared, not strcmp) and the
+	 * RIP that acquired it.  Pushed by spin_lock, popped by
+	 * spin_unlock.  Used both for lock-order cycle detection and for
+	 * `s locks` in ddb / panic dumps.
+	 */
+#define	THREAD_HELD_LOCKS_MAX	8
+	struct witness_held {
+		const char	*wh_name;
+		uintptr_t	 wh_ra;
+	}			 th_held[THREAD_HELD_LOCKS_MAX];
+	uint8_t			 th_held_count;
 };
 
 extern struct thread		*current_thread;	/* per-CPU later    */
