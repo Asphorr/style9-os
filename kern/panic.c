@@ -35,6 +35,7 @@ panic(const char *fmt, ...)
 {
 	va_list		ap;
 	uintptr_t	rbp;
+	void		*caller;
 
 	/*
 	 * Disable interrupts unconditionally; we are about to render and
@@ -49,6 +50,8 @@ panic(const char *fmt, ...)
 	}
 	panic_in_progress = true;
 
+	caller = __builtin_return_address(0);
+
 	tty_set_attr(TTY_ATTR(TTY_LIGHT_RED, TTY_BLACK));
 	tty_puts("\n*** kernel panic: ");
 
@@ -58,6 +61,11 @@ panic(const char *fmt, ...)
 
 	tty_puts("\n");
 
+	tty_set_attr(TTY_ATTR(TTY_LIGHT_GRAY, TTY_BLACK));
+	kprintf("called from ");
+	ksym_print((uint64_t)(uintptr_t)caller);
+	kprintf("\n");
+
 	__asm__ __volatile__ ("movq %%rbp, %0" : "=r"(rbp));
 	backtrace_print(rbp, 16);
 
@@ -65,14 +73,16 @@ panic(const char *fmt, ...)
 	/* NOTREACHED -- ddb_enter is __dead. */
 }
 
+/*
+ * KASSERT failure path.  file:line + the failed expression are baked
+ * into the panic message; the "called from" line in panic() points
+ * inside kassert_fail itself, but file:line is sufficient to find the
+ * assertion site and the backtrace shows the calling chain.
+ */
 void
 kassert_fail(const char *cond, const char *file, int line, const char *msg)
 {
 
-	/*
-	 * Re-route through panic so all hard stops share the same dump
-	 * format and the same backtrace walker.
-	 */
 	panic("KASSERT(%s) at %s:%d: %s", cond, file, line, msg);
 }
 

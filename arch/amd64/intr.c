@@ -236,8 +236,9 @@ user_fault_die(const struct trapframe *tf)
 		pf_print_err((uint64_t)tf->tf_err);
 	}
 
-	kprintf("  rip=0x%lx  rsp=0x%lx  rbp=0x%lx\n",
-	    (unsigned long)tf->tf_rip,
+	kprintf("  rip=");
+	ksym_print((uint64_t)tf->tf_rip);
+	kprintf("\n  rsp=0x%lx  rbp=0x%lx\n",
 	    (unsigned long)tf->tf_rsp,
 	    (unsigned long)tf->tf_rbp);
 	kprintf("  rax=0x%lx  rdi=0x%lx  rsi=0x%lx  rdx=0x%lx\n",

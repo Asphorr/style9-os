@@ -9,6 +9,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "kprintf.h"
+#include "ksym.h"
 #include "panic.h"
 #include "sched.h"
 #include "spinlock.h"
@@ -51,11 +53,23 @@ spin_lock(struct spinlock *sl)
 	preempt_disable();
 
 	if (sl->sl_state != 0 && sl->sl_holder_cpu == cpu_id()) {
-		panic("spin_lock(%s): recursive acquire from "
-		    "rip=0x%016lx (prior holder rip=0x%016lx)",
-		    sl->sl_name != NULL ? sl->sl_name : "?",
-		    (unsigned long)ra,
-		    (unsigned long)sl->sl_holder_rip);
+		/*
+		 * Spell out both sites with ksym_print BEFORE calling panic,
+		 * because panic's %lx formatter has no hook for symbol
+		 * resolution.  Doing it here means the recursive-acquire
+		 * report names the offending function on both sides:
+		 *	"attempted from sched_drain_irq_wakes+0x42, prior
+		 *	 holder thread_wake+0x10".
+		 */
+		kprintf("\n*** spin_lock(%s): recursive acquire\n",
+		    sl->sl_name != NULL ? sl->sl_name : "?");
+		kprintf("  attempted from ");
+		ksym_print((uint64_t)ra);
+		kprintf("\n  prior holder  ");
+		ksym_print((uint64_t)sl->sl_holder_rip);
+		kprintf("\n");
+		panic("spin_lock(%s): recursive acquire",
+		    sl->sl_name != NULL ? sl->sl_name : "?");
 	}
 
 	while (__atomic_exchange_n(&sl->sl_state, 1u, __ATOMIC_ACQUIRE) != 0)
