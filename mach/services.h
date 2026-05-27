@@ -51,10 +51,11 @@ struct svc_stats_reply {
 	uint64_t	sr_task_count;
 	uint64_t	sr_thread_count;
 	uint64_t	sr_ctx_switches;
+	uint64_t	sr_pmm_total_pages;
 };
 
-_Static_assert(sizeof(struct svc_stats_reply) == 48,
-    "svc_stats_reply must be 48 bytes (wire format)");
+_Static_assert(sizeof(struct svc_stats_reply) == 56,
+    "svc_stats_reply must be 56 bytes (wire format)");
 
 /* ---- "tasks" service ---- */
 #define	SVC_TASKS_NAME		"tasks"

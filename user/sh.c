@@ -25,15 +25,24 @@
  * Built-ins:
  *	help		list builtins + known spawnable programs
  *	echo ARGS...	print arguments separated by spaces
- *	clear		ANSI clear-screen
- *	about		single-line banner
+ *	clear		ANSI clear-screen + repaint splash
+ *	about		multi-line banner + system info
  *
  * Anything else gets handed straight to SYS_SPAWN; the kernel's
  * progreg either resolves it (returns task_id) or returns SYS_E_INVAL.
  *
+ * TUI surface
+ * ---
+ * Row 0 is a persistent reverse-video status bar (style9-os(9) + live
+ * task count + ram + uptime), repainted on every prompt.  The shell
+ * opens with a man-page-style splash -- big ASCII '9' + NAME / SYSTEM
+ * / SEE ALSO blocks -- which scrolls off naturally as the user works.
+ * The prompt itself is colour-coded: bright green '$' on success,
+ * '[err N]' in red when the last spawn failed.
+ *
  * Wait-for-child is a yield-spin against SYS_TASK_ALIVE.  Cheap and
  * adequate for a cooperative scheduler; a real exit-notification port
- * is a phase-3 conversation.
+ * (and proper $? carry-through) is a phase-3 conversation.
  */
 
 #define	SH_LINE_MAX	256
@@ -53,9 +62,42 @@ static const char *known_progs[] = {
 	NULL,
 };
 
-/* ---- single-byte read from the kbd stream port ------------------- */
+/*
+ * Cached service ports.  Looked up once at startup; the splash and
+ * the per-prompt status bar both pull from them.  MACH_PORT_NULL if
+ * the lookup failed -- the bar then displays "?" in place of the data.
+ */
+static mach_port_name_t	g_kbd_stream;
+static mach_port_name_t	g_clock_port;
+static mach_port_name_t	g_stats_port;
 
-static mach_port_name_t	g_kbd_stream;	/* SEND right naming dev/kbd's RX */
+/*
+ * Last-command return status.  spawn() returns task_id > 0 on success
+ * or a negative SYS_E_* on failure; the prompt paints '[err N]' when
+ * non-zero.  Builtins always succeed.
+ */
+static int	last_status;
+
+/* ---- ANSI escape constants --------------------------------------- */
+
+#define	ESC_RESET	"\x1b[0m"
+#define	ESC_REVERSE	"\x1b[7m"
+#define	ESC_BOLD	"\x1b[1m"
+#define	ESC_FG_RED	"\x1b[1;31m"
+#define	ESC_FG_GREEN	"\x1b[1;32m"
+#define	ESC_FG_YELLOW	"\x1b[1;33m"
+#define	ESC_FG_BLUE	"\x1b[1;34m"
+#define	ESC_FG_MAGENTA	"\x1b[1;35m"
+#define	ESC_FG_CYAN	"\x1b[1;36m"
+#define	ESC_FG_WHITE	"\x1b[1;37m"
+#define	ESC_FG_GRAY	"\x1b[0;37m"
+#define	ESC_CLR_SCR	"\x1b[2J\x1b[H"
+#define	ESC_SAVE_CUR	"\x1b[s"
+#define	ESC_REST_CUR	"\x1b[u"
+#define	ESC_HOME	"\x1b[1;1H"
+#define	ESC_EOL_CLR	"\x1b[K"
+
+/* ---- single-byte read from the kbd stream port ------------------- */
 
 /*
  * read_byte: park in mach_msg_recv on the kbd stream port and return
@@ -76,6 +118,188 @@ read_byte(void)
 	return ((int)(unsigned char)hdr.msgh_id);
 }
 
+/* ---- service-query helpers --------------------------------------- */
+
+/*
+ * fetch_clock / fetch_stats: one RPC each into the cached service
+ * port.  Return 0 on success and -1 on any failure; on failure the
+ * reply struct is zeroed so the caller can render "?" without an
+ * explicit branch on every field.
+ */
+static int
+fetch_clock(struct svc_clock_reply *out)
+{
+	struct mach_msg_header	req;
+	struct {
+		struct mach_msg_header	hdr;
+		struct svc_clock_reply	body;
+	} reply;
+	int			rv;
+
+	memset(out, 0, sizeof(*out));
+	if (g_clock_port == MACH_PORT_NULL)
+		return (-1);
+
+	req.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	req.msgh_size    = sizeof(req);
+	req.msgh_remote  = g_clock_port;
+	req.msgh_local   = MACH_PORT_NULL;
+	req.msgh_voucher = 0;
+	req.msgh_id      = CLOCK_OP_GET;
+
+	rv = mach_msg_rpc(&req, &reply.hdr, sizeof(reply), 1000);
+	if (rv != MACH_MSG_OK)
+		return (-1);
+	*out = reply.body;
+	return (0);
+}
+
+static int
+fetch_stats(struct svc_stats_reply *out)
+{
+	struct mach_msg_header	req;
+	struct {
+		struct mach_msg_header	hdr;
+		struct svc_stats_reply	body;
+	} reply;
+	int			rv;
+
+	memset(out, 0, sizeof(*out));
+	if (g_stats_port == MACH_PORT_NULL)
+		return (-1);
+
+	req.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	req.msgh_size    = sizeof(req);
+	req.msgh_remote  = g_stats_port;
+	req.msgh_local   = MACH_PORT_NULL;
+	req.msgh_voucher = 0;
+	req.msgh_id      = STATS_OP_GET;
+
+	rv = mach_msg_rpc(&req, &reply.hdr, sizeof(reply), 1000);
+	if (rv != MACH_MSG_OK)
+		return (-1);
+	*out = reply.body;
+	return (0);
+}
+
+/* ---- TUI surface ------------------------------------------------- */
+
+/*
+ * paint_status_bar: lift the cursor to (1,1), emit a reverse-video
+ * one-line dashboard, then put the cursor back where the caller had
+ * it.  Inherits the SGR attribute through the trailing ESC_EOL_CLR so
+ * the bar's reverse-video background runs the full 80 columns even
+ * though we only wrote a partial line of glyph text.
+ *
+ * Three live data fields: total ram + KiB used, live task count,
+ * uptime in HH:MM:SS.  If a service query fails the values just show
+ * as zero -- preferable to suppressing the bar entirely.
+ */
+static void
+paint_status_bar(void)
+{
+	struct svc_clock_reply	ck;
+	struct svc_stats_reply	st;
+	uint64_t		used_kib;
+	uint64_t		total_kib;
+	uint64_t		s, m, h;
+
+	(void)fetch_clock(&ck);
+	(void)fetch_stats(&st);
+
+	used_kib  = st.sr_pmm_used_pages * 4ull;
+	total_kib = st.sr_pmm_total_pages * 4ull;
+
+	s = ck.cr_uptime_ms / 1000ull;
+	h = s / 3600ull;
+	s = s - h * 3600ull;
+	m = s / 60ull;
+	s = s - m * 60ull;
+
+	puts(ESC_SAVE_CUR);
+	puts(ESC_HOME);
+	puts(ESC_REVERSE);
+	printf(" style9-os(9)     ram %llu/%lluK     tasks %llu     uptime "
+	    "%02llu:%02llu:%02llu",
+	    (unsigned long long)used_kib,
+	    (unsigned long long)total_kib,
+	    (unsigned long long)st.sr_task_count,
+	    (unsigned long long)h,
+	    (unsigned long long)m,
+	    (unsigned long long)s);
+	puts(ESC_EOL_CLR);
+	puts(ESC_RESET);
+	puts(ESC_REST_CUR);
+}
+
+/*
+ * paint_splash: the manpage-style welcome.  Drawn once at startup;
+ * scrolls off naturally as the user works.  Layout is a 5-line ASCII
+ * '9' glyph on the left and NAME / SYSTEM / SEE ALSO blocks aligned
+ * to the right, mirroring a real BSD manual page.
+ *
+ * Colour usage:
+ *	cyan-bold	the '9' glyph and the manpage title bar
+ *	white-bold	section headers (NAME, SYSTEM, SEE ALSO)
+ *	gray		key labels (kernel, ram, ...)
+ *	white-bold	values (so they pop against the gray)
+ *	gray		the trailing hint line
+ */
+static void
+paint_splash(void)
+{
+	struct svc_stats_reply	st;
+	uint64_t		used_kib;
+	uint64_t		total_kib;
+
+	(void)fetch_stats(&st);
+	used_kib  = st.sr_pmm_used_pages * 4ull;
+	total_kib = st.sr_pmm_total_pages * 4ull;
+
+	puts("\n");
+	puts(ESC_FG_CYAN);
+	puts("     ___\n");
+	puts("    / _ \\      ");
+	puts(ESC_FG_WHITE);
+	puts("STYLE9-OS(9)");
+	puts(ESC_FG_GRAY);
+	puts("                          style9-os Manual\n");
+	puts(ESC_FG_CYAN);
+	puts("   | (_) |\n");
+	puts("    \\__, |    ");
+	puts(ESC_FG_WHITE);
+	puts("NAME\n");
+	puts(ESC_FG_CYAN);
+	puts("      /_/");
+	puts(ESC_FG_GRAY);
+	puts("        style9-os -- BSD-flavoured x86_64 microkernel\n");
+	puts("\n");
+
+	puts("               ");
+	puts(ESC_FG_WHITE);
+	puts("SYSTEM\n");
+	puts(ESC_FG_GRAY);
+	puts("                  arch    : x86_64\n");
+	printf("                  ram     : %llu / %llu KiB\n",
+	    (unsigned long long)used_kib,
+	    (unsigned long long)total_kib);
+	printf("                  tasks   : %llu live\n",
+	    (unsigned long long)st.sr_task_count);
+	puts("                  shell   : sh.elf  (libstyle9, ring 3)\n");
+	puts("\n");
+
+	puts("               ");
+	puts(ESC_FG_WHITE);
+	puts("SEE ALSO\n");
+	puts(ESC_FG_GRAY);
+	puts("                  style(9), help(1)\n");
+	puts("\n");
+
+	puts("  type `help' to see available commands.\n");
+	puts(ESC_RESET);
+	puts("\n");
+}
+
 /* ---- echo helpers ------------------------------------------------- */
 
 static void
@@ -90,14 +314,31 @@ echo_backspace(void)
 {
 
 	/* \b moves cursor left, ' ' wipes the glyph, \b moves left again. */
-	(void)write("\b \b", 3);
+	puts("\b \b");
 }
 
+/*
+ * prompt: repaint the persistent status bar, then emit the colour-
+ * coded prompt at the cursor's current row.  '[ok]' / '[err N]' lights
+ * green/red respectively; the '$' is always bright green so it stands
+ * out as the input anchor.
+ */
 static void
 prompt(void)
 {
 
-	puts("$ ");
+	paint_status_bar();
+
+	if (last_status == 0) {
+		puts(ESC_FG_GREEN);
+		puts("[ok]");
+	} else {
+		puts(ESC_FG_RED);
+		printf("[err %d]", last_status);
+	}
+	puts(ESC_FG_GREEN);
+	puts(" $ ");
+	puts(ESC_RESET);
 }
 
 /* ---- argv tokenizer (in-place) ----------------------------------- */
@@ -134,24 +375,43 @@ split_argv(char *line, char *argv[], int max)
 
 /* ---- builtins ----------------------------------------------------- */
 
+/*
+ * Coloured builtin/program listing.  Mirrors a manpage SYNOPSIS block:
+ * section header in bold-white, command names in yellow, descriptions
+ * in gray.  Spawnables get the same treatment so the visual rhythm
+ * stays consistent regardless of whether the user reads down the
+ * builtins or the spawnables.
+ */
 static void
 builtin_help(void)
 {
 	const char	*p;
 	size_t		 i;
 
+	puts(ESC_FG_WHITE);
 	puts("style9-os shell -- builtins:\n");
-	puts("  help        show this list\n");
-	puts("  echo ARGS   print arguments\n");
-	puts("  clear       clear the screen\n");
-	puts("  about       print version banner\n");
-	puts("\nspawnable programs:\n");
+	puts(ESC_RESET);
+
+	puts(ESC_FG_YELLOW); puts("  help        ");
+	puts(ESC_FG_GRAY);   puts("show this list\n");
+	puts(ESC_FG_YELLOW); puts("  echo ARGS   ");
+	puts(ESC_FG_GRAY);   puts("print arguments\n");
+	puts(ESC_FG_YELLOW); puts("  clear       ");
+	puts(ESC_FG_GRAY);   puts("clear screen and repaint the splash\n");
+	puts(ESC_FG_YELLOW); puts("  about       ");
+	puts(ESC_FG_GRAY);   puts("print version banner\n");
+
+	puts("\n");
+	puts(ESC_FG_WHITE);
+	puts("spawnable programs:\n");
+	puts(ESC_FG_YELLOW);
 	for (i = 0; known_progs[i] != NULL; i++) {
 		p = known_progs[i];
 		puts("  ");
 		puts(p);
-		putchar('\n');
+		puts("\n");
 	}
+	puts(ESC_RESET);
 }
 
 static void
@@ -167,20 +427,49 @@ builtin_echo(int argc, char *argv[])
 	putchar('\n');
 }
 
+/*
+ * builtin_clear: erase the screen and redraw the splash so the freshly
+ * cleared screen still has the welcome banner visible.  The status
+ * bar repaint happens at the next prompt() call, so we don't need to
+ * touch it here.
+ */
 static void
 builtin_clear(void)
 {
 
-	/* ANSI ESC [ H == cursor home, ESC [ 2 J == erase screen. */
-	(void)write("\x1b[H\x1b[2J", 7);
+	puts(ESC_CLR_SCR);
+	paint_splash();
 }
 
 static void
 builtin_about(void)
 {
+	struct svc_clock_reply	ck;
+	struct svc_stats_reply	st;
+	uint64_t		s;
 
-	puts("style9-os: BSD-style microkernel, x86_64\n");
-	puts("  sh.elf (ring 3, libstyle9, phase 2)\n");
+	(void)fetch_clock(&ck);
+	(void)fetch_stats(&st);
+	s = ck.cr_uptime_ms / 1000ull;
+
+	puts(ESC_FG_WHITE);
+	puts("style9-os");
+	puts(ESC_FG_GRAY);
+	puts(" -- a BSD-flavoured x86_64 microkernel.\n");
+	puts("  written end-to-end in the style(9) BSD KNF convention, "
+	    "hence the name.\n");
+	puts("\n");
+	puts(ESC_FG_WHITE); puts("  sh.elf");
+	puts(ESC_FG_GRAY);
+	puts(" -- libstyle9 ring-3 shell, phase 2.\n");
+	printf("  uptime %llu.%03llu s, %llu task(s), %llu thread(s), "
+	    "%llu ctx switches.\n",
+	    (unsigned long long)s,
+	    (unsigned long long)(ck.cr_uptime_ms % 1000ull),
+	    (unsigned long long)st.sr_task_count,
+	    (unsigned long long)st.sr_thread_count,
+	    (unsigned long long)st.sr_ctx_switches);
+	puts(ESC_RESET);
 }
 
 /* ---- spawn + yield-spin wait ------------------------------------- */
@@ -208,29 +497,34 @@ streq(const char *a, const char *b)
 	}
 }
 
-static void
+/*
+ * dispatch: route the argv to a builtin or hand to SYS_SPAWN.  Returns
+ * the status to propagate into last_status: 0 for builtin / successful
+ * spawn, the negative SYS_E_* code if spawn returned an error.
+ */
+static int
 dispatch(int argc, char *argv[])
 {
 	long	rv;
 
 	if (argc <= 0)
-		return;
+		return (0);
 
 	if (streq(argv[0], "help")) {
 		builtin_help();
-		return;
+		return (0);
 	}
 	if (streq(argv[0], "echo")) {
 		builtin_echo(argc, argv);
-		return;
+		return (0);
 	}
 	if (streq(argv[0], "clear")) {
 		builtin_clear();
-		return;
+		return (0);
 	}
 	if (streq(argv[0], "about")) {
 		builtin_about();
-		return;
+		return (0);
 	}
 
 	/*
@@ -240,11 +534,15 @@ dispatch(int argc, char *argv[])
 	 */
 	rv = spawn(argv[0]);
 	if (rv <= 0) {
+		puts(ESC_FG_RED);
 		puts(argv[0]);
+		puts(ESC_FG_GRAY);
 		puts(": not found\n");
-		return;
+		puts(ESC_RESET);
+		return ((int)rv);
 	}
 	wait_child(rv);
+	return (0);
 }
 
 /* ---- line editor ------------------------------------------------- */
@@ -264,7 +562,9 @@ repl(void)
 	for (;;) {
 		c = read_byte();
 		if (c < 0) {
+			puts(ESC_FG_RED);
 			puts("sh: read failed, exiting\n");
+			puts(ESC_RESET);
 			return;
 		}
 
@@ -273,7 +573,7 @@ repl(void)
 			line[len] = '\0';
 			argc = split_argv(line, argv, SH_ARGC_MAX);
 			if (argc > 0)
-				dispatch(argc, argv);
+				last_status = dispatch(argc, argv);
 			len = 0;
 			prompt();
 			continue;
@@ -303,17 +603,22 @@ int
 main(void)
 {
 
-	puts("style9-os: sh.elf up (libstyle9, ring 3)\n");
-
 	g_kbd_stream = dev_open_stream("kbd");
 	if (g_kbd_stream == MACH_PORT_NULL) {
 		puts("sh: dev_open_stream('kbd') failed\n");
 		return (1);
 	}
-	puts("sh: dev/kbd opened.  type 'help' for commands.\n");
+	g_clock_port = bootstrap_lookup(SVC_CLOCK_NAME);
+	g_stats_port = bootstrap_lookup(SVC_STATS_NAME);
 
+	puts(ESC_CLR_SCR);
+	paint_splash();
 	repl();
 
 	(void)mach_port_deallocate(g_kbd_stream);
+	if (g_clock_port != MACH_PORT_NULL)
+		(void)mach_port_deallocate(g_clock_port);
+	if (g_stats_port != MACH_PORT_NULL)
+		(void)mach_port_deallocate(g_stats_port);
 	return (0);
 }

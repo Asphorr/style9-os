@@ -115,6 +115,7 @@ svc_stats_dispatch(const struct mach_msg_header *req, struct port_space *from)
 	r.sr_task_count        = ntasks;
 	r.sr_thread_count      = threads;
 	r.sr_ctx_switches      = sched_context_switches();
+	r.sr_pmm_total_pages   = pmm_total_pages();
 	return (svc_reply_inline(req, from, &r, sizeof(r)));
 }
 
