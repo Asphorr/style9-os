@@ -78,6 +78,18 @@ static char			kbd_buf[KBD_BUF_SIZE];
 static volatile uint8_t		kbd_shift;	/* either Shift key down */
 
 /*
+ * Extended-scancode latch.  Scancode set 1 prefixes the cursor keys,
+ * page navigation, and a handful of others with 0xE0 to disambiguate
+ * them from numpad equivalents.  The IRQ handler consumes the 0xE0
+ * byte, sets this flag, and treats the next byte as an extended press
+ * (or release with bit 7 set, ignored).  The extended press is then
+ * translated to its ANSI/VT100 escape sequence and pushed byte-by-byte
+ * into the ring so a userspace pager sees the same multi-byte stream
+ * it would get from a real serial terminal.
+ */
+static volatile uint8_t		kbd_extended;
+
+/*
  * Single-consumer block-on-read support.
  *
  *	kbd_waiter	The one thread currently parked in kbd_getc_block,
@@ -122,14 +134,60 @@ kbd_getc(void)
 	return ((unsigned char)c);
 }
 
+/*
+ * Translate an extended (post-0xE0) press scancode to an ANSI/VT100
+ * escape sequence and push the bytes into the ring one at a time.
+ * Releases (high bit set) and unmapped scancodes are silently dropped.
+ */
+static void
+kbd_emit_extended(uint8_t sc)
+{
+	const char	*p;
+	const char	*seq;
+
+	if ((sc & 0x80) != 0)
+		return;	/* release -- ignored */
+
+	seq = NULL;
+	switch (sc) {
+	case 0x48: seq = "\x1b[A";  break;	/* Up arrow             */
+	case 0x50: seq = "\x1b[B";  break;	/* Down arrow           */
+	case 0x4D: seq = "\x1b[C";  break;	/* Right arrow          */
+	case 0x4B: seq = "\x1b[D";  break;	/* Left arrow           */
+	case 0x49: seq = "\x1b[5~"; break;	/* Page Up              */
+	case 0x51: seq = "\x1b[6~"; break;	/* Page Down            */
+	case 0x47: seq = "\x1b[H";  break;	/* Home                 */
+	case 0x4F: seq = "\x1b[F";  break;	/* End                  */
+	case 0x53: seq = "\x1b[3~"; break;	/* Delete               */
+	case 0x52: seq = "\x1b[2~"; break;	/* Insert               */
+	}
+	if (seq == NULL)
+		return;
+	for (p = seq; *p != '\0'; p++)
+		kbd_buf_push(*p);
+}
+
 static void
 kbd_irq(struct trapframe *tf)
 {
+	uint8_t	sc;
 	int	c;
 
 	(void)tf;
 
-	c = kbd_decode_scancode(inb(KBD_DATA_PORT));
+	sc = inb(KBD_DATA_PORT);
+
+	if (sc == 0xE0) {
+		kbd_extended = 1;
+		return;
+	}
+	if (kbd_extended) {
+		kbd_extended = 0;
+		kbd_emit_extended(sc);
+		return;
+	}
+
+	c = kbd_decode_scancode(sc);
 	if (c >= 0)
 		kbd_buf_push((char)c);
 }
