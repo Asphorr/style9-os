@@ -146,6 +146,10 @@ typedef uint32_t		mach_port_name_t;
 #define	MACH_MSG_TYPE_MAKE_SEND_ONCE	21
 
 #define	MACH_MSG_PORT_DESCRIPTOR	0
+#define	MACH_MSG_OOL_DESCRIPTOR		1
+#define	MACH_MSG_VIRTUAL_COPY		0
+#define	MACH_MSG_PHYSICAL_COPY		1
+#define	MACH_MSG_OOL_MAX_BYTES		(1u << 20)	/* 1 MiB             */
 #define	MACH_MSGH_BITS_COMPLEX		0x80000000u
 #define	MACH_MSGH_BITS(remote, local)	\
 	(((uint32_t)(remote) & 0xFFu) | (((uint32_t)(local) & 0xFFu) << 8))
@@ -178,12 +182,28 @@ struct mach_msg_body {
 };
 
 struct mach_msg_port_descriptor {
-	mach_port_name_t	name;
-	uint8_t			pad1;
+	uint8_t			type;		/* == MACH_MSG_PORT_DESCRIPTOR */
 	uint8_t			disposition;
-	uint8_t			type;
+	uint8_t			pad1;
 	uint8_t			pad2;
+	mach_port_name_t	name;
 };
+
+/*
+ * Packed to keep alignment at 4 instead of the 8 the uint64_t address
+ * field would force; otherwise a 4-byte gap appears between body and
+ * an OOL descriptor in a wire struct, which the kernel walker would
+ * read as a bogus port descriptor.  See mach/port.h for the full
+ * rationale.
+ */
+struct mach_msg_ool_descriptor {
+	uint8_t			type;		/* == MACH_MSG_OOL_DESCRIPTOR */
+	uint8_t			copy;		/* MACH_MSG_PHYSICAL_COPY     */
+	uint8_t			deallocate;	/* reserved, set 0            */
+	uint8_t			pad;
+	uint32_t		size;		/* bytes to ferry              */
+	uint64_t		address;	/* sender VA / receiver VA     */
+} __attribute__((packed));
 
 /* Op codes the kernel exposes today on its well-known ports. */
 #define	TASK_OP_GET_INFO		1

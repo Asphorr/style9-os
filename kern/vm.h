@@ -128,4 +128,17 @@ struct vm_map_entry	*vm_map_lookup(struct vm_map *, uint64_t va);
 
 void			 vm_map_print(struct vm_map *);
 
+struct pmap;
+
+/*
+ * Walk every VME_F_ANON entry in `map`, pmap_extract each 4 KiB page
+ * out of `pm`, drop the mapping, and pmm_free_page the frame.  Called
+ * from task teardown after the per-task threads have stopped running
+ * (so there are no concurrent vm_map mutators) and before pmap_destroy
+ * tears down the page tables themselves.  No-op on the map's entries
+ * past the walk -- vm_map_destroy still has to free vme storage.
+ */
+void			 vm_map_release_anon(struct vm_map *,
+			    struct pmap *pm);
+
 #endif /* !_SYS_VM_H_ */

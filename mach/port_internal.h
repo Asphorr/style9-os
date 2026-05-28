@@ -70,9 +70,24 @@ struct port_set {
 	struct thread	*ps_waiters_tail;	/* (p)                       */
 };
 
+/*
+ * Per-descriptor kernel state while a message is in flight.  Tagged
+ * union: pd_type selects which fields are live.
+ *
+ *	MACH_MSG_PORT_DESCRIPTOR	pd_port + pd_disposition carry the
+ *					kernel ref taken at send time.
+ *	MACH_MSG_OOL_DESCRIPTOR		pd_ool_buf + pd_ool_size carry the
+ *					staging copy of the sender's bytes,
+ *					kfree'd in cleanup paths.
+ */
 struct port_pending_desc {
-	struct port	*pd_port;
-	uint8_t		 pd_disposition;
+	uint8_t		 pd_type;
+	uint8_t		 pd_disposition;	/* PORT */
+	uint8_t		 pd_ool_copy;		/* OOL: MACH_MSG_PHYSICAL_COPY */
+	uint8_t		 pd_pad;
+	uint32_t	 pd_ool_size;		/* OOL: bytes in pd_ool_buf  */
+	struct port	*pd_port;		/* PORT                       */
+	void		*pd_ool_buf;		/* OOL: kmalloc'd staging buf */
 };
 
 struct port_msg {

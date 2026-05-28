@@ -30,13 +30,28 @@
  *	   { msgh_bits, msgh_size, msgh_remote, msgh_local, voucher, id }
  *   if MACH_MSGH_BITS_COMPLEX:
  *     4-byte body { ndescs }
- *     ndescs * 8-byte port_descriptor { name, disposition, type, pad }
- *   followed by inline payload up to msgh_size bytes total.
+ *     descriptor area -- ndescs entries, each one of:
+ *	   8-byte  port_descriptor  { type=0, disposition, name }
+ *	   16-byte ool_descriptor   { type=1, copy, size, address }
+ *     followed by inline payload up to msgh_size bytes total.
  *
- * Capability passing: every port descriptor in a message moves or
- * copies one right from the sender's space into the receiver's space.
- * The kernel does the name -> port -> name translation on send and
- * recv respectively; messages in flight hold port refs directly.
+ * Descriptor area is variable-stride.  The first byte of every
+ * descriptor is the `type` tag; the parser reads it, dispatches by
+ * size (8 or 16), and advances.  Type-first layout keeps mixed port
+ * + OOL messages well-defined without a separate types[] table.
+ *
+ * Capability passing: every port descriptor moves or copies one right
+ * from the sender's space into the receiver's space.  The kernel
+ * does the name -> port -> name translation on send and recv
+ * respectively; messages in flight hold port refs directly.
+ *
+ * Bulk-data passing: every OOL descriptor names a sender VA range.
+ * The kernel copies the bytes into a kmalloc'd staging buffer on
+ * send; on recv it allocates fresh frames in the receiver, copies
+ * the bytes in, installs them into the receiver's pmap, records the
+ * landing in the receiver's vm_map, and patches the descriptor's
+ * `address` field to the new receiver VA.  No VM-shared semantics
+ * yet -- v1 OOL is physical copy only.
  *
  * No blocking yet (no scheduler).  port_send is non-blocking and
  * returns -E_NOSPACE if the destination queue is full; port_recv
@@ -78,8 +93,31 @@ typedef uint32_t	mach_port_name_t;
 #define	MACH_MSG_TYPE_MAKE_SEND		20	/* sender holds RECV -> SEND  */
 #define	MACH_MSG_TYPE_MAKE_SEND_ONCE	21	/* sender holds RECV -> SO    */
 
-/* Descriptor type tag (only port descriptors supported). */
+/*
+ * Descriptor type tags.  The first byte of every descriptor in the
+ * message body is one of these.  Sizes (used by the parser to advance
+ * to the next descriptor):
+ *	PORT_DESCRIPTOR	 8 bytes
+ *	OOL_DESCRIPTOR	16 bytes
+ */
 #define	MACH_MSG_PORT_DESCRIPTOR	0
+#define	MACH_MSG_OOL_DESCRIPTOR		1
+
+/*
+ * Copy semantics for OOL descriptors.  Real Mach also defines
+ * VIRTUAL_COPY (zero) which uses VM remapping / COW; v1 only
+ * implements PHYSICAL_COPY (memcpy into fresh frames).  A virtual
+ * copy descriptor sent today is upgraded to a physical copy.
+ */
+#define	MACH_MSG_VIRTUAL_COPY		0
+#define	MACH_MSG_PHYSICAL_COPY		1
+
+/*
+ * Upper bound on a single OOL descriptor's size (bytes).  Lets the
+ * kernel cap a misbehaving sender before kmalloc starts shovelling
+ * megabytes for an attacker.  Raise as needed; one page is the floor.
+ */
+#define	MACH_MSG_OOL_MAX_BYTES		(1u << 20)	/* 1 MiB           */
 
 struct mach_msg_header {
 	uint32_t		msgh_bits;
@@ -94,18 +132,50 @@ struct mach_msg_body {
 	uint32_t		msgh_descriptor_count;
 };
 
+/*
+ * Port-right descriptor.  Eight bytes; type-tag at byte 0 so the
+ * variable-stride descriptor walker can dispatch generically.  Field
+ * names match the v1 layout so all existing senders compile without
+ * change -- only the in-memory layout differs.
+ */
 struct mach_msg_port_descriptor {
-	mach_port_name_t	name;
-	uint8_t			pad1;
+	uint8_t			type;		/* == MACH_MSG_PORT_DESCRIPTOR */
 	uint8_t			disposition;
-	uint8_t			type;
+	uint8_t			pad1;
 	uint8_t			pad2;
+	mach_port_name_t	name;
 };
+
+/*
+ * Bulk-memory descriptor.  Sixteen bytes; type-tag at byte 0.  On
+ * send `address` is a sender VA; on recv the same field is rewritten
+ * to a freshly-mapped receiver VA pointing at the copied bytes.
+ * `deallocate` is reserved for the eventual "unmap sender's pages
+ * after send" semantics; ignored in v1.
+ *
+ * Packed because the natural alignment of uint64_t forces the whole
+ * struct to align(8), which then inserts a 4-byte gap between the
+ * 4-byte mach_msg_body and the first OOL descriptor in a containing
+ * struct.  Those zero bytes look exactly like a bogus port descriptor
+ * to the kernel's variable-stride walker (byte 0 = 0 = PORT type),
+ * so the send rejects with E_INVAL.  Packed removes the alignment
+ * requirement; x86_64 absorbs the uint64_t misaligned read.
+ */
+struct mach_msg_ool_descriptor {
+	uint8_t			type;		/* == MACH_MSG_OOL_DESCRIPTOR */
+	uint8_t			copy;		/* MACH_MSG_PHYSICAL_COPY     */
+	uint8_t			deallocate;	/* reserved, set 0            */
+	uint8_t			pad;
+	uint32_t		size;		/* bytes to ferry              */
+	uint64_t		address;	/* sender VA / receiver VA     */
+} __attribute__((packed));
 
 _Static_assert(sizeof(struct mach_msg_header) == 24,
     "mach_msg_header must be 24 bytes");
 _Static_assert(sizeof(struct mach_msg_port_descriptor) == 8,
-    "mach_msg_port_descriptor must be 8 bytes");
+    "mach_msg_port_descriptor must be 8 bytes (wire format)");
+_Static_assert(sizeof(struct mach_msg_ool_descriptor) == 16,
+    "mach_msg_ool_descriptor must be 16 bytes (wire format)");
 
 /* Error returns from mach_msg_send / mach_msg_recv (negative). */
 #define	MACH_MSG_OK		0

@@ -12,6 +12,8 @@
 #include "kmem.h"
 #include "kprintf.h"
 #include "panic.h"
+#include "pmap.h"
+#include "pmm.h"
 #include "spinlock.h"
 #include "vm.h"
 
@@ -83,6 +85,35 @@ vm_map_destroy(struct vm_map *map)
 		e = next;
 	}
 	kfree(map);
+}
+
+void
+vm_map_release_anon(struct vm_map *map, struct pmap *pm)
+{
+	struct vm_map_entry	*e;
+	uint64_t		 va;
+	uint64_t		 pa;
+
+	if (map == NULL || pm == NULL)
+		return;
+
+	/*
+	 * Same single-thread invariant as vm_map_destroy -- this is the
+	 * tail of task teardown, no mutators are racing us.  Anonymous
+	 * entries own their backing frames (no sharing in v1), so each
+	 * present leaf can be unmapped + freed unconditionally.
+	 */
+	for (e = map->vm_head; e != NULL; e = e->vme_next) {
+		if ((e->vme_flags & VME_F_ANON) == 0)
+			continue;
+		for (va = e->vme_start; va < e->vme_end; va += VM_PAGE_SIZE) {
+			pa = pmap_extract(pm, va);
+			if (pa == PA_INVALID)
+				continue;
+			(void)pmap_remove(pm, va);
+			pmm_free_page(pa);
+		}
+	}
 }
 
 /*

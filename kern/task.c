@@ -261,6 +261,15 @@ task_deref(struct task *t)
 	if (t != kernel_task) {
 		port_space_destroy(t->t_port_space);
 		port_release_task_self(t);
+		/*
+		 * Reclaim the anonymous backing frames the task's user VA
+		 * ever pulled in (image load pages, OOL recv installs, ...)
+		 * before pmap_destroy frees the page-table tree itself.
+		 * pmap_destroy only walks intermediate levels; without the
+		 * vm_map_release_anon pass each task drag along its
+		 * lifetime's worth of leaf frames forever.
+		 */
+		vm_map_release_anon(t->t_map, t->t_pmap);
 		pmap_destroy(t->t_pmap);
 		vm_map_destroy(t->t_map);
 	}

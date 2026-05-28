@@ -2572,3 +2572,311 @@ out:
 	kprintf("stress_rpc: PASS\n");
 	return (0);
 }
+
+/* ---- stress_ool -------------------------------------------------------- */
+
+/*
+ * Out-of-line memory descriptors.  Parent (kernel_task) ships kmalloc'd
+ * buffers of varying sizes through an OOL descriptor; worker task recv
+ * receives the bytes mapped into its own VM at a fresh USER VA, walks
+ * them via a direct dereference (worker's pmap is current in the server
+ * thread), checksums, and replies with the checksum.
+ *
+ *   sizes covered    : 1, 32, 256, 4095, 4096, 8192, 16384, 65535 bytes
+ *   per-size rounds  : `rounds`, deterministic seed per round
+ *   pattern          : byte i = (i + round_id) ^ 0xA5
+ *   verdict          : FAIL if any worker checksum disagrees with parent's
+ *
+ * Conservation footnote: each successful OOL recv installs new frames in
+ * the worker's pmap that v1 has no vm_deallocate for.  Those frames are
+ * reclaimed at the end of the test when worker_task is destroyed (last
+ * thread exits + task_deref drops the pmap + vm_map).  So we record the
+ * baseline pmm count BEFORE worker creation and check AFTER destruction.
+ */
+
+#define	STRESS_OOL_SENTINEL	0x070000FEu
+
+struct stress_ool_msg {
+	struct mach_msg_header		hdr;
+	struct mach_msg_body		body;
+	struct mach_msg_ool_descriptor	ool;
+	struct mach_msg_port_descriptor	reply_pd;
+};
+
+struct stress_ool_ctx {
+	mach_port_name_t	soc_service;	/* in worker_space */
+	unsigned int		soc_rv;
+};
+
+static uint32_t
+stress_ool_checksum(const uint8_t *buf, uint32_t size)
+{
+	uint32_t	h, i;
+
+	h = 0x811C9DC5u;	/* FNV-1a seed */
+	for (i = 0; i < size; i++) {
+		h ^= (uint32_t)buf[i];
+		h *= 0x01000193u;
+	}
+	return (h);
+}
+
+static void
+stress_ool_server(void *arg)
+{
+	struct stress_ool_ctx	*ctx;
+	struct stress_ool_msg	 recv;
+	struct mach_msg_header	 reply;
+	struct port_space	*self_space;
+	const uint8_t		*payload;
+	uint32_t		 sum;
+	int			 rv;
+
+	ctx        = (struct stress_ool_ctx *)arg;
+	self_space = current_thread->th_task->t_port_space;
+
+	for (;;) {
+		rv = mach_msg_recv_block(self_space, ctx->soc_service,
+		    &recv.hdr, sizeof(recv));
+		if (rv != MACH_MSG_OK) {
+			ctx->soc_rv = (unsigned int)rv;
+			return;
+		}
+
+		if (recv.hdr.msgh_id == STRESS_OOL_SENTINEL) {
+			ctx->soc_rv = 0;
+			return;
+		}
+
+		/*
+		 * Direct dereference: the worker's pmap is current and
+		 * recv_install_ool installed the bytes at recv.ool.address
+		 * with VM_PROT_USER | R/W.  CPL=0 can read U=1 pages, so
+		 * no copyin needed.
+		 */
+		if (recv.ool.size == 0) {
+			sum = 0u;
+		} else if (recv.ool.address == 0) {
+			sum = 0xDEADBEEFu;	/* sender promised bytes, recv lost them */
+		} else {
+			payload = (const uint8_t *)(uintptr_t)recv.ool.address;
+			sum     = stress_ool_checksum(payload, recv.ool.size);
+		}
+
+		reply.msgh_bits    = MACH_MSGH_BITS(
+		    MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+		reply.msgh_size    = sizeof(reply);
+		reply.msgh_remote  = recv.reply_pd.name;
+		reply.msgh_local   = MACH_PORT_NULL;
+		reply.msgh_voucher = 0;
+		reply.msgh_id      = sum;
+		(void)mach_msg_send(self_space, &reply);
+	}
+}
+
+int
+stress_ool(unsigned int rounds)
+{
+	static const uint32_t	sizes[] = {
+		1u, 32u, 256u, 4095u, 4096u, 8192u, 16384u, 65535u,
+	};
+	const unsigned int	n_sizes = sizeof(sizes) / sizeof(sizes[0]);
+
+	struct stress_ool_ctx	 ctx;
+	struct stress_ool_msg	 req;
+	struct mach_msg_header	 sentinel, reply;
+	struct task		*worker;
+	struct thread		*server;
+	uint8_t			*kbuf;
+	mach_port_name_t	 service_kernel, service_worker;
+	mach_port_name_t	 reply_port;
+	size_t			 cached0, cached1, pmm0, pmm1, cons0, cons1;
+	size_t			 inuse_k0, inuse_k1;
+	uint32_t		 expected;
+	uint32_t		 max_size;
+	uint32_t		 size;
+	uint32_t		 j;
+	unsigned int		 i, k;
+	int			 rv;
+
+	if (rounds == 0)
+		rounds = 1;
+	if (rounds > 1000u)
+		rounds = 1000u;
+
+	max_size = 0;
+	for (i = 0; i < n_sizes; i++) {
+		if (sizes[i] > max_size)
+			max_size = sizes[i];
+	}
+
+	kprintf("stress_ool: %u rounds x %u sizes, max payload %u bytes\n",
+	    rounds, n_sizes, (unsigned)max_size);
+
+	cached0  = kmem_cached_pages();
+	pmm0     = pmm_used_pages();
+	cons0    = pmm0 - cached0;
+	inuse_k0 = port_space_inuse(kernel_space);
+
+	worker = task_create("ool_worker");
+	if (worker == NULL) {
+		kprintf("stress_ool: task_create failed\n");
+		return (1);
+	}
+
+	service_worker = port_allocate(worker->t_port_space,
+	    MACH_PORT_RIGHT_RECEIVE | MACH_PORT_RIGHT_SEND);
+	rv = port_space_inject_send(worker->t_port_space, service_worker,
+	    kernel_space, &service_kernel);
+	if (service_worker == MACH_PORT_NULL || rv != MACH_MSG_OK) {
+		kprintf("stress_ool: service bootstrap failed\n");
+		return (2);
+	}
+
+	ctx.soc_service = service_worker;
+	ctx.soc_rv      = 0xFFFFFFFFu;
+
+	server = thread_create(worker, stress_ool_server, &ctx, "ool-srv");
+	if (server == NULL) {
+		kprintf("stress_ool: thread_create failed\n");
+		return (3);
+	}
+	thread_start(server);
+
+	kbuf = (uint8_t *)kmalloc(max_size);
+	if (kbuf == NULL) {
+		kprintf("stress_ool: kmalloc %u failed\n", (unsigned)max_size);
+		rv = 4;
+		goto stop_server;
+	}
+
+	rv = 0;
+	for (i = 0; i < rounds && rv == 0; i++) {
+		for (k = 0; k < n_sizes && rv == 0; k++) {
+			size = sizes[k];
+			for (j = 0; j < size; j++)
+				kbuf[j] = (uint8_t)((j + i + k) ^ 0xA5u);
+			expected = stress_ool_checksum(kbuf, size);
+
+			reply_port = port_allocate(kernel_space,
+			    MACH_PORT_RIGHT_RECEIVE |
+			    MACH_PORT_RIGHT_SEND_ONCE);
+			if (reply_port == MACH_PORT_NULL) {
+				kprintf("stress_ool: reply allocate fail "
+				    "i=%u k=%u\n", i, k);
+				rv = 5;
+				break;
+			}
+
+			req.hdr.msgh_bits    =
+			    MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0)
+			    | MACH_MSGH_BITS_COMPLEX;
+			req.hdr.msgh_size    = sizeof(req);
+			req.hdr.msgh_remote  = service_kernel;
+			req.hdr.msgh_local   = MACH_PORT_NULL;
+			req.hdr.msgh_voucher = 0;
+			req.hdr.msgh_id      = 1u + (uint32_t)i * n_sizes + k;
+
+			req.body.msgh_descriptor_count = 2;
+
+			req.ool.type       = MACH_MSG_OOL_DESCRIPTOR;
+			req.ool.copy       = MACH_MSG_PHYSICAL_COPY;
+			req.ool.deallocate = 0;
+			req.ool.pad        = 0;
+			req.ool.size       = size;
+			req.ool.address    = (uint64_t)(uintptr_t)kbuf;
+
+			req.reply_pd.type        = MACH_MSG_PORT_DESCRIPTOR;
+			req.reply_pd.disposition =
+			    MACH_MSG_TYPE_MAKE_SEND_ONCE;
+			req.reply_pd.pad1        = 0;
+			req.reply_pd.pad2        = 0;
+			req.reply_pd.name        = reply_port;
+
+			rv = mach_msg_send(kernel_space, &req.hdr);
+			if (rv != MACH_MSG_OK) {
+				kprintf("stress_ool: send i=%u k=%u sz=%u: %s\n",
+				    i, k, (unsigned)size,
+				    mach_msg_strerror(rv));
+				(void)port_deallocate(kernel_space, reply_port);
+				break;
+			}
+
+			rv = mach_msg_recv_block(kernel_space, reply_port,
+			    &reply, sizeof(reply));
+			(void)port_deallocate(kernel_space, reply_port);
+			if (rv != MACH_MSG_OK) {
+				kprintf("stress_ool: reply recv i=%u k=%u: %s\n",
+				    i, k, mach_msg_strerror(rv));
+				break;
+			}
+			if (reply.msgh_id != expected) {
+				kprintf("stress_ool: checksum mismatch i=%u "
+				    "k=%u sz=%u got=0x%x want=0x%x\n",
+				    i, k, (unsigned)size,
+				    (unsigned)reply.msgh_id,
+				    (unsigned)expected);
+				rv = 6;
+				break;
+			}
+		}
+	}
+
+	kfree(kbuf);
+
+stop_server:
+	/* Send sentinel to terminate the server. */
+	sentinel.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	sentinel.msgh_size    = sizeof(sentinel);
+	sentinel.msgh_remote  = service_kernel;
+	sentinel.msgh_local   = MACH_PORT_NULL;
+	sentinel.msgh_voucher = 0;
+	sentinel.msgh_id      = STRESS_OOL_SENTINEL;
+	(void)mach_msg_send(kernel_space, &sentinel);
+
+	/* Wait until the server thread exits.  Coarse: yield until ctx
+	   gets its terminal value (server sets soc_rv before return). */
+	for (i = 0; i < 1000u && ctx.soc_rv == 0xFFFFFFFFu; i++)
+		thread_yield();
+
+	(void)port_deallocate(kernel_space, service_kernel);
+
+	sched_reap_zombies();
+
+	/*
+	 * Drop the worker task.  The server thread already exited and was
+	 * reaped above; this last ref deref destroys the per-task pmap and
+	 * vm_map, reclaiming every frame the OOL recv path installed.
+	 */
+	task_deref(worker);
+
+	cached1  = kmem_cached_pages();
+	pmm1     = pmm_used_pages();
+	cons1    = pmm1 - cached1;
+	inuse_k1 = port_space_inuse(kernel_space);
+
+	kprintf("stress_ool: kernel inuse %zu -> %zu, conserved %zu -> %zu\n",
+	    inuse_k0, inuse_k1, cons0, cons1);
+
+	if (rv != 0) {
+		kprintf("stress_ool: FAIL rv=%d\n", rv);
+		return (rv);
+	}
+	if (ctx.soc_rv != 0) {
+		kprintf("stress_ool: FAIL server rv=%u\n", ctx.soc_rv);
+		return (7);
+	}
+	if (inuse_k1 != inuse_k0) {
+		kprintf("stress_ool: FAIL kernel name leak (delta=%lld)\n",
+		    (long long)((long long)inuse_k1 - (long long)inuse_k0));
+		return (8);
+	}
+	if (cons1 != cons0) {
+		kprintf("stress_ool: FAIL conservation broken (delta=%lld)\n",
+		    (long long)((long long)cons1 - (long long)cons0));
+		return (9);
+	}
+
+	kprintf("stress_ool: PASS\n");
+	return (0);
+}

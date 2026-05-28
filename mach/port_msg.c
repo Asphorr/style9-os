@@ -14,12 +14,15 @@
 #include "kmem.h"
 #include "kprintf.h"
 #include "panic.h"
+#include "pmap.h"
+#include "pmm.h"
 #include "port.h"
 #include "port_internal.h"
 #include "sched.h"
 #include "spinlock.h"
 #include "task.h"
 #include "thread.h"
+#include "vm.h"
 
 /*
  * Message-passing layer for the Mach IPC subsystem.
@@ -226,9 +229,13 @@ free_pending_descs(struct port_pending_desc *descs, size_t n)
 		return;
 
 	for (i = 0; i < n; i++) {
-		if (descs[i].pd_port != NULL) {
+		if (descs[i].pd_type == MACH_MSG_PORT_DESCRIPTOR &&
+		    descs[i].pd_port != NULL) {
 			port_deref(descs[i].pd_port,
 			    descs[i].pd_disposition);
+		} else if (descs[i].pd_type == MACH_MSG_OOL_DESCRIPTOR &&
+		    descs[i].pd_ool_buf != NULL) {
+			kfree(descs[i].pd_ool_buf);
 		}
 	}
 	kfree(descs);
@@ -253,6 +260,10 @@ send_xlate_desc(struct port_space *from, mach_port_name_t name,
 {
 	struct port	*p;
 	uint8_t		 rights;
+
+	pd->pd_type     = MACH_MSG_PORT_DESCRIPTOR;
+	pd->pd_ool_buf  = NULL;
+	pd->pd_ool_size = 0;
 
 	switch (disposition) {
 	case MACH_MSG_TYPE_MOVE_RECEIVE:
@@ -344,6 +355,256 @@ send_xlate_desc(struct port_space *from, mach_port_name_t name,
 	default:
 		return (MACH_E_INVAL);
 	}
+}
+
+/* ---- OOL helpers --------------------------------------------------- */
+
+/*
+ * desc_step: one iteration of the variable-stride descriptor walker.
+ * Reads the type tag at buf[off] and returns the descriptor's stride
+ * (8 for port, 16 for OOL); writes the tag to *type_out.  Returns 0
+ * if the type is unknown or the full descriptor would run past `cap`,
+ * signalling MACH_E_INVAL to the caller without touching the buffer.
+ */
+static size_t
+desc_step(const uint8_t *buf, size_t off, size_t cap, uint8_t *type_out)
+{
+	uint8_t	t;
+	size_t	stride;
+
+	if (off >= cap)
+		return (0);
+	t = buf[off];
+	if (t == MACH_MSG_PORT_DESCRIPTOR)
+		stride = sizeof(struct mach_msg_port_descriptor);
+	else if (t == MACH_MSG_OOL_DESCRIPTOR)
+		stride = sizeof(struct mach_msg_ool_descriptor);
+	else
+		return (0);
+	if (off + stride > cap)
+		return (0);
+	*type_out = t;
+	return (stride);
+}
+
+/*
+ * send_capture_ool: on send, validate the OOL descriptor's sender VA
+ * range, kmalloc a staging buffer the size of the payload, and copy
+ * the bytes in.  The sender's pmap is current (sender is the calling
+ * task), so reading from the user VA is a direct dereference.
+ *
+ * v1 normalises everything to MACH_MSG_PHYSICAL_COPY -- virtual-copy
+ * descriptors get upgraded to physical at capture time so the recv
+ * path only sees one shape.  Per-descriptor `deallocate` is recorded
+ * but not honoured: real-Mach unmap-after-send is a follow-up.
+ *
+ * On success the pd carries an owned kmalloc'd buffer that the
+ * receive path (or any cleanup path) is responsible for freeing.
+ */
+static int
+send_capture_ool(struct port_space *from,
+    const struct mach_msg_ool_descriptor *od,
+    struct port_pending_desc *pd)
+{
+	struct task	*sender;
+	uint8_t		*staging;
+	uint32_t	 size;
+	uint64_t	 addr;
+	uint32_t	 i;
+
+	(void)from;	/* sender == current task; from isn't needed */
+
+	pd->pd_type     = MACH_MSG_OOL_DESCRIPTOR;
+	pd->pd_port     = NULL;
+	pd->pd_ool_buf  = NULL;
+	pd->pd_ool_size = 0;
+	pd->pd_ool_copy = MACH_MSG_PHYSICAL_COPY;
+
+	size = od->size;
+	addr = od->address;
+
+	if (size == 0) {
+		/* Zero-byte OOL: legal, just an empty buffer.  Receiver
+		   will see address=0, size=0; no VM install needed. */
+		return (MACH_MSG_OK);
+	}
+	if (size > MACH_MSG_OOL_MAX_BYTES)
+		return (MACH_E_INVAL);
+	if (od->copy != MACH_MSG_PHYSICAL_COPY &&
+	    od->copy != MACH_MSG_VIRTUAL_COPY)
+		return (MACH_E_INVAL);
+
+	/*
+	 * Validate the sender's address range is plausibly inside the
+	 * task's user VA window.  This is a coarse check -- a perfect
+	 * one would walk t_map for full coverage, but the subsequent
+	 * memcpy will already fault on any unmapped page within the
+	 * window, so we just guard the obvious wraparound + out-of-
+	 * window cases here.
+	 *
+	 * kernel_task is exempt: its t_map covers the user VA window but
+	 * kernel-side senders ship blobs out of kmalloc'd kernel addresses,
+	 * which legitimately sit outside that window.  The kernel is also
+	 * trusted not to point at unmapped memory; the subsequent memcpy
+	 * triple-faults if it ever does, which is a louder bug than the
+	 * silent userspace EINVAL we want for ring-3 senders.
+	 */
+	sender = current_thread != NULL ? current_thread->th_task : NULL;
+	if (sender != NULL && sender != kernel_task && sender->t_map != NULL) {
+		uint64_t end = addr + size;
+		if (end < addr)
+			return (MACH_E_INVAL);	/* wraparound */
+		if (addr < sender->t_map->vm_lo ||
+		    end > sender->t_map->vm_hi)
+			return (MACH_E_INVAL);
+	}
+
+	staging = (uint8_t *)kmalloc((size_t)size);
+	if (staging == NULL)
+		return (MACH_E_NOMEM);
+
+	/* Sender's pmap is current; direct byte-by-byte copy. */
+	{
+		const uint8_t *src = (const uint8_t *)(uintptr_t)addr;
+		for (i = 0; i < size; i++)
+			staging[i] = src[i];
+	}
+
+	pd->pd_ool_buf  = staging;
+	pd->pd_ool_size = size;
+	return (MACH_MSG_OK);
+}
+
+/*
+ * recv_rollback_ool: on recv-path failure, tear down a partially-
+ * installed OOL range in the receiver: walk the per-page mappings,
+ * remove from pmap, free the underlying frames, and drop the vm_map
+ * entry that recorded the range.
+ *
+ * `installed_pages` is the page count actually installed before the
+ * failure; the caller passes whatever it got through before erroring
+ * so we don't unmap-then-free pages that were never inserted.
+ */
+static void
+recv_rollback_ool(struct task *to, uint64_t landing_va,
+    size_t installed_pages, size_t total_aligned)
+{
+	size_t	i;
+
+	for (i = 0; i < installed_pages; i++) {
+		uint64_t	va = landing_va + (uint64_t)i * PAGE_SIZE;
+		uint64_t	pa;
+
+		pa = pmap_extract(to->t_pmap, va);
+		(void)pmap_remove(to->t_pmap, va);
+		if (pa != PA_INVALID)
+			pmm_free_page(pa);
+	}
+	if (total_aligned > 0)
+		(void)vm_map_remove(to->t_map, landing_va, total_aligned);
+}
+
+/*
+ * recv_install_ool: on recv, take the captured staging buffer for an
+ * OOL descriptor and materialise it in the receiver's address space.
+ *
+ *	1. find_space picks a fresh VA in the receiver's vm_map
+ *	2. for each page: pmm_alloc a frame, copy the matching slice
+ *	   of staging into it, pmap_enter at the landing VA
+ *	3. vm_map_enter records the new range so it survives across
+ *	   subsequent vm_map walks (and so a future vm_deallocate can
+ *	   find + tear it down)
+ *	4. patch the receiver-visible OOL descriptor: address is now
+ *	   the new VA, type/size remain as the sender sent them
+ *	5. free the staging buffer -- the receiver owns the data now
+ *
+ * Rolls back via recv_rollback_ool on any per-step failure so a
+ * partial install can never leak frames or a vm_map entry.
+ */
+static int
+recv_install_ool(struct port_space *to_space,
+    struct port_pending_desc *pd,
+    struct mach_msg_ool_descriptor *od_in_buf)
+{
+	struct task	*to;
+	uint64_t	 landing_va = 0;
+	uint64_t	 aligned;
+	size_t		 npages, i;
+	uint32_t	 size;
+	uint8_t		*staging;
+
+	(void)to_space;
+	to   = current_thread != NULL ? current_thread->th_task : NULL;
+	size = pd->pd_ool_size;
+
+	/* Always normalise these on the recv-side descriptor. */
+	od_in_buf->type       = MACH_MSG_OOL_DESCRIPTOR;
+	od_in_buf->copy       = MACH_MSG_PHYSICAL_COPY;
+	od_in_buf->deallocate = 0;
+	od_in_buf->pad        = 0;
+	od_in_buf->size       = size;
+	od_in_buf->address    = 0;
+
+	if (size == 0)
+		return (MACH_MSG_OK);
+
+	if (to == NULL || to->t_map == NULL || to->t_pmap == NULL)
+		return (MACH_E_INVAL);
+
+	staging = (uint8_t *)pd->pd_ool_buf;
+	if (staging == NULL)
+		return (MACH_E_INVAL);
+
+	aligned = ((uint64_t)size + PAGE_SIZE - 1u) & ~(uint64_t)PAGE_MASK;
+	npages  = (size_t)(aligned >> PAGE_SHIFT);
+
+	if (!vm_map_find_space(to->t_map, aligned, &landing_va))
+		return (MACH_E_NOMEM);
+
+	for (i = 0; i < npages; i++) {
+		uint64_t	 va = landing_va + (uint64_t)i * PAGE_SIZE;
+		uint64_t	 pa;
+		uint8_t		*kva;
+		size_t		 chunk, offset;
+		size_t		 j;
+
+		pa = pmm_alloc_page();
+		if (pa == PA_INVALID) {
+			recv_rollback_ool(to, landing_va, i, 0);
+			return (MACH_E_NOMEM);
+		}
+
+		kva    = (uint8_t *)pmm_kva_from_pa(pa);
+		offset = i * PAGE_SIZE;
+		chunk  = PAGE_SIZE;
+		if (offset + chunk > (size_t)size)
+			chunk = (size_t)size - offset;
+		for (j = 0; j < chunk; j++)
+			kva[j] = staging[offset + j];
+		for (j = chunk; j < PAGE_SIZE; j++)
+			kva[j] = 0;
+
+		if (!pmap_enter(to->t_pmap, va, pa,
+		    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_USER)) {
+			pmm_free_page(pa);
+			recv_rollback_ool(to, landing_va, i, 0);
+			return (MACH_E_NOMEM);
+		}
+	}
+
+	if (!vm_map_enter(to->t_map, landing_va, aligned,
+	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_USER, VME_F_ANON)) {
+		recv_rollback_ool(to, landing_va, npages, 0);
+		return (MACH_E_NOMEM);
+	}
+
+	od_in_buf->address = landing_va;
+
+	/* Receiver owns the pages now; staging is no longer needed. */
+	kfree(pd->pd_ool_buf);
+	pd->pd_ool_buf  = NULL;
+	pd->pd_ool_size = 0;
+	return (MACH_MSG_OK);
 }
 
 int
@@ -514,6 +775,9 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *msg)
 
 	if (complex) {
 		const struct mach_msg_body *body;
+		size_t			 walk_off;
+		size_t			 walk_i;
+
 		if (msg->msgh_size < hdrs_off +
 		    sizeof(struct mach_msg_body)) {
 			rv = MACH_E_INVAL;
@@ -523,11 +787,22 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *msg)
 		    (m->m_buf + hdrs_off);
 		ndescs = body->msgh_descriptor_count;
 		if (ndescs > 0) {
-			if (msg->msgh_size < hdrs_off +
-			    sizeof(struct mach_msg_body) +
-			    ndescs * sizeof(struct mach_msg_port_descriptor)) {
-				rv = MACH_E_INVAL;
-				goto fail;
+			/*
+			 * Variable-stride walk: confirm every descriptor's
+			 * type tag is known and the full descriptor fits
+			 * within msgh_size before we commit to processing.
+			 */
+			walk_off = hdrs_off + sizeof(struct mach_msg_body);
+			for (walk_i = 0; walk_i < ndescs; walk_i++) {
+				uint8_t	t;
+				size_t	stride;
+				stride = desc_step(m->m_buf, walk_off,
+				    msg->msgh_size, &t);
+				if (stride == 0) {
+					rv = MACH_E_INVAL;
+					goto fail;
+				}
+				walk_off += stride;
 			}
 			descs = (struct port_pending_desc *)kcalloc(
 			    ndescs, sizeof(struct port_pending_desc));
@@ -581,24 +856,39 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *msg)
 
 	/* Body descriptors -- the explicit ones the user packaged. */
 	if (complex) {
-		struct mach_msg_port_descriptor *pds;
-		size_t explicit_descs;
+		size_t	off;
+		size_t	explicit_descs;
 
-		pds = (struct mach_msg_port_descriptor *)
-		    (m->m_buf + hdrs_off + sizeof(struct mach_msg_body));
+		off = hdrs_off + sizeof(struct mach_msg_body);
 		explicit_descs = has_local ? ndescs - 1 : ndescs;
 
 		for (i = 0; i < explicit_descs; i++) {
-			if (pds[i].type != MACH_MSG_PORT_DESCRIPTOR) {
+			uint8_t	t = m->m_buf[off];
+
+			if (t == MACH_MSG_PORT_DESCRIPTOR) {
+				struct mach_msg_port_descriptor *pd =
+				    (struct mach_msg_port_descriptor *)
+				    (m->m_buf + off);
+				rv = send_xlate_desc(from, pd->name,
+				    pd->disposition, &descs[i]);
+				if (rv != MACH_MSG_OK)
+					goto fail;
+				pd->name = MACH_PORT_NULL;
+				off += sizeof(struct mach_msg_port_descriptor);
+			} else if (t == MACH_MSG_OOL_DESCRIPTOR) {
+				struct mach_msg_ool_descriptor *od =
+				    (struct mach_msg_ool_descriptor *)
+				    (m->m_buf + off);
+				rv = send_capture_ool(from, od, &descs[i]);
+				if (rv != MACH_MSG_OK)
+					goto fail;
+				od->address = 0;
+				off += sizeof(struct mach_msg_ool_descriptor);
+			} else {
+				/* Should have been caught by the walk. */
 				rv = MACH_E_INVAL;
 				goto fail;
 			}
-			rv = send_xlate_desc(from, pds[i].name,
-			    pds[i].disposition, &descs[i]);
-			if (rv != MACH_MSG_OK)
-				goto fail;
-			/* Erase sender's name; recv will fill it in. */
-			pds[i].name = MACH_PORT_NULL;
 		}
 	}
 
@@ -663,15 +953,8 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *msg)
 	return (MACH_MSG_OK);
 
 fail:
-	if (descs != NULL) {
-		/* Roll back per-descriptor refs of whatever kind they are. */
-		for (i = 0; i < ndescs; i++) {
-			if (descs[i].pd_port != NULL)
-				port_deref(descs[i].pd_port,
-				    descs[i].pd_disposition);
-		}
-		kfree(descs);
-	}
+	/* Releases port refs AND frees OOL staging buffers as appropriate. */
+	free_pending_descs(descs, ndescs);
 	if (m != NULL)
 		kfree(m);
 	if (dest != NULL)
@@ -681,13 +964,85 @@ fail:
 
 /* ---- mach_msg_recv --------------------------------------------------- */
 
+/*
+ * recv_rollback_installed: undo the first `up_to` descriptors of an
+ * in-flight delivery -- caller has already noticed an error on
+ * descriptor `up_to` and needs to back out everything that succeeded
+ * up to (but not including) it.
+ *
+ * For each previously-installed descriptor:
+ *	PORT	  -- pds[k].name was just rewritten to a receiver-space
+ *		     name; drop that right back out of the receiver.
+ *	OOL	  -- od[k].address was just rewritten to a receiver VA;
+ *		     unmap the range, free the frames, drop the vm_map
+ *		     entry.
+ *
+ * After undoing the install side, walk the remaining descs[] to
+ * release ports we never delivered + free OOL staging that's still
+ * sitting in pd_ool_buf.
+ */
+static void
+recv_rollback_installed(struct port_space *to, struct port_msg *m,
+    size_t up_to)
+{
+	size_t	off;
+	size_t	i;
+
+	off = sizeof(struct mach_msg_header) + sizeof(struct mach_msg_body);
+	for (i = 0; i < up_to; i++) {
+		uint8_t	t = m->m_descs[i].pd_type;
+
+		if (t == MACH_MSG_PORT_DESCRIPTOR) {
+			struct mach_msg_port_descriptor *pd =
+			    (struct mach_msg_port_descriptor *)
+			    (m->m_buf + off);
+			if (pd->name != MACH_PORT_NULL) {
+				(void)space_drop_one_right(to, pd->name,
+				    m->m_descs[i].pd_disposition);
+				pd->name = MACH_PORT_NULL;
+			}
+			off += sizeof(struct mach_msg_port_descriptor);
+		} else if (t == MACH_MSG_OOL_DESCRIPTOR) {
+			struct mach_msg_ool_descriptor *od =
+			    (struct mach_msg_ool_descriptor *)
+			    (m->m_buf + off);
+			if (od->address != 0 &&
+			    current_thread != NULL &&
+			    current_thread->th_task != NULL) {
+				uint64_t aligned;
+				size_t   npages;
+
+				aligned = ((uint64_t)od->size + PAGE_SIZE - 1u)
+				    & ~(uint64_t)PAGE_MASK;
+				npages  = (size_t)(aligned >> PAGE_SHIFT);
+				recv_rollback_ool(current_thread->th_task,
+				    od->address, npages, aligned);
+				od->address = 0;
+			}
+			off += sizeof(struct mach_msg_ool_descriptor);
+		}
+	}
+
+	/* The descs[] entries past `up_to` never installed; free them. */
+	for (i = up_to; i < m->m_ndescs; i++) {
+		if (m->m_descs[i].pd_type == MACH_MSG_PORT_DESCRIPTOR &&
+		    m->m_descs[i].pd_port != NULL) {
+			port_deref(m->m_descs[i].pd_port,
+			    m->m_descs[i].pd_disposition);
+		} else if (m->m_descs[i].pd_type == MACH_MSG_OOL_DESCRIPTOR &&
+		    m->m_descs[i].pd_ool_buf != NULL) {
+			kfree(m->m_descs[i].pd_ool_buf);
+		}
+	}
+}
+
 static int
 deliver_msg(struct port_space *to, struct port *p, struct port_msg *m,
     struct mach_msg_header *buf, size_t buf_size)
 {
 	struct mach_msg_header	*hdr;
-	struct mach_msg_port_descriptor *pds = NULL;
 	size_t			 hdrs_off, explicit_descs;
+	size_t			 off;
 	size_t			 i;
 	int			 rv;
 	bool			 has_local;
@@ -712,49 +1067,67 @@ deliver_msg(struct port_space *to, struct port *p, struct port_msg *m,
 		struct mach_msg_body *body =
 		    (struct mach_msg_body *)(m->m_buf + hdrs_off);
 		explicit_descs = body->msgh_descriptor_count;
-		pds = (struct mach_msg_port_descriptor *)
-		    (m->m_buf + hdrs_off +
-		     sizeof(struct mach_msg_body));
 	} else {
 		explicit_descs = 0;
 	}
 
+	off = hdrs_off + sizeof(struct mach_msg_body);
 	for (i = 0; i < explicit_descs; i++) {
-		mach_port_name_t n;
-		uint8_t kind = m->m_descs[i].pd_disposition;
-		/*
-		 * RECEIVE descriptors carry the right itself rather than
-		 * a pending ref -- install without a fresh port_ref, and
-		 * skip the matching port_deref below.  See send_xlate_desc
-		 * MOVE_RECEIVE case for the symmetry.
-		 */
-		if (kind == MACH_PORT_RIGHT_RECEIVE)
-			rv = space_install_no_ref(to,
-			    m->m_descs[i].pd_port, kind, &n);
-		else
-			rv = space_install(to,
-			    m->m_descs[i].pd_port, kind, &n);
-		if (rv != MACH_MSG_OK) {
-			while (i > 0) {
-				i--;
-				(void)space_drop_one_right(to, pds[i].name,
-				    m->m_descs[i].pd_disposition);
-				pds[i].name = MACH_PORT_NULL;
+		uint8_t	t = m->m_descs[i].pd_type;
+
+		if (t == MACH_MSG_PORT_DESCRIPTOR) {
+			struct mach_msg_port_descriptor *pd =
+			    (struct mach_msg_port_descriptor *)
+			    (m->m_buf + off);
+			mach_port_name_t	n;
+			uint8_t			kind;
+
+			kind = m->m_descs[i].pd_disposition;
+			/*
+			 * RECEIVE descriptors carry the right itself rather
+			 * than a pending ref -- install without a fresh
+			 * port_ref, and skip the matching port_deref below.
+			 * See send_xlate_desc MOVE_RECEIVE for the symmetry.
+			 */
+			if (kind == MACH_PORT_RIGHT_RECEIVE)
+				rv = space_install_no_ref(to,
+				    m->m_descs[i].pd_port, kind, &n);
+			else
+				rv = space_install(to,
+				    m->m_descs[i].pd_port, kind, &n);
+			if (rv != MACH_MSG_OK) {
+				recv_rollback_installed(to, m, i);
+				if (m->m_descs != NULL)
+					kfree(m->m_descs);
+				kfree(m);
+				return (rv);
 			}
-			for (i = 0; i < m->m_ndescs; i++) {
-				if (m->m_descs[i].pd_port != NULL)
-					port_deref(m->m_descs[i].pd_port,
-					    m->m_descs[i].pd_disposition);
+			if (kind != MACH_PORT_RIGHT_RECEIVE)
+				port_deref(m->m_descs[i].pd_port, kind);
+			m->m_descs[i].pd_port = NULL;
+			pd->name = n;
+			off += sizeof(struct mach_msg_port_descriptor);
+		} else if (t == MACH_MSG_OOL_DESCRIPTOR) {
+			struct mach_msg_ool_descriptor *od =
+			    (struct mach_msg_ool_descriptor *)
+			    (m->m_buf + off);
+			rv = recv_install_ool(to, &m->m_descs[i], od);
+			if (rv != MACH_MSG_OK) {
+				recv_rollback_installed(to, m, i);
+				if (m->m_descs != NULL)
+					kfree(m->m_descs);
+				kfree(m);
+				return (rv);
 			}
+			off += sizeof(struct mach_msg_ool_descriptor);
+		} else {
+			/* Should have been caught on send. */
+			recv_rollback_installed(to, m, i);
 			if (m->m_descs != NULL)
 				kfree(m->m_descs);
 			kfree(m);
-			return (rv);
+			return (MACH_E_INVAL);
 		}
-		if (kind != MACH_PORT_RIGHT_RECEIVE)
-			port_deref(m->m_descs[i].pd_port, kind);
-		m->m_descs[i].pd_port = NULL;
-		pds[i].name = n;
 	}
 
 	if (has_local) {
@@ -768,12 +1141,7 @@ deliver_msg(struct port_space *to, struct port *p, struct port_msg *m,
 			rv = space_install(to,
 			    m->m_descs[li].pd_port, kind, &n);
 		if (rv != MACH_MSG_OK) {
-			for (i = 0; i < explicit_descs; i++) {
-				if (pds[i].name != MACH_PORT_NULL)
-					(void)space_drop_one_right(to,
-					    pds[i].name,
-					    m->m_descs[i].pd_disposition);
-			}
+			recv_rollback_installed(to, m, explicit_descs);
 			port_deref(m->m_descs[li].pd_port, kind);
 			if (m->m_descs != NULL)
 				kfree(m->m_descs);
@@ -1117,8 +1485,16 @@ mach_msg_rpc(struct port_space *space, struct mach_msg_header *req,
 	spin_unlock(&reply_port->p_lock);
 
 	remote_disp = MACH_MSGH_BITS_REMOTE(req->msgh_bits);
+	/*
+	 * Splice MAKE_SEND into the local disposition slot but preserve
+	 * the COMPLEX flag if the caller set it -- otherwise an RPC that
+	 * carries body descriptors loses its descriptor area to a fresh
+	 * MACH_MSGH_BITS() recompute that only encodes the disposition
+	 * bytes.
+	 */
 	req->msgh_bits  = MACH_MSGH_BITS(remote_disp,
-	    MACH_MSG_TYPE_MAKE_SEND);
+	    MACH_MSG_TYPE_MAKE_SEND) |
+	    (req->msgh_bits & MACH_MSGH_BITS_COMPLEX);
 	req->msgh_local = reply_name;
 
 	rv = mach_msg_send(space, req);
