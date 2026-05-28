@@ -129,6 +129,7 @@ OBJS	= \
 	$(OBJDIR)/machotest_macho.o \
 	$(OBJDIR)/machotest_fat_macho.o \
 	$(OBJDIR)/darwinhello_macho.o \
+	$(OBJDIR)/darwinmsg_macho.o \
 	$(OBJDIR)/ksym.o
 
 all: kernel.elf
@@ -256,6 +257,19 @@ $(OBJDIR)/darwinhello.elf: $(OBJDIR)/darwinhello.o $(USER_DIR)/user.ld
 	$(LD) $(USER_LDFLAGS) -o $@ $(OBJDIR)/darwinhello.o
 
 $(OBJDIR)/darwinhello.macho: $(OBJDIR)/darwinhello.elf $(ELF2MACHO)
+	$(ELF2MACHO) macos $< $@
+
+# darwinmsg (S3): a freestanding Darwin program that does a real mach_msg()
+# round-trip.  Freestanding C this time (no libstyle9, no crt0): -fno-builtin
+# keeps the compiler from lowering its struct stores into a memcpy/memset call
+# the no-libc link could not resolve.  Same macos wrapping as darwinhello.
+$(OBJDIR)/darwinmsg.o: $(USER_DIR)/darwinmsg.c | $(OBJDIR)
+	$(CC) $(USER_CFLAGS) -fno-builtin -c $< -o $@
+
+$(OBJDIR)/darwinmsg.elf: $(OBJDIR)/darwinmsg.o $(USER_DIR)/user.ld
+	$(LD) $(USER_LDFLAGS) -o $@ $(OBJDIR)/darwinmsg.o
+
+$(OBJDIR)/darwinmsg.macho: $(OBJDIR)/darwinmsg.elf $(ELF2MACHO)
 	$(ELF2MACHO) macos $< $@
 
 # Wrap a .macho into a kernel-linkable object exposing

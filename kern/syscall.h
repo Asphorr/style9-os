@@ -11,6 +11,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "port.h"	/* mach_port_name_t, struct mach_msg_header */
+
 /*
  * Kernel syscall ABI.
  *
@@ -90,6 +92,18 @@ long	syscall_dispatch(struct syscall_frame *);
  * personality's write(2) (kern/darwin.c).
  */
 long	syscall_console_write(const char *buf, size_t len);
+
+/*
+ * Mach message send/recv core: user-range-check + SMAP bracket + the
+ * matching mach_msg_* call.  Back SYS_MSG_SEND / SYS_MSG_RECV[_TIMED] and
+ * the Darwin personality's mach_msg trap (kern/darwin.c).  Return MACH_MSG_OK
+ * (0) / a positive MACH_E_*, or SYS_E_FAULT for a bad user pointer.
+ */
+long	syscall_msg_send(const struct mach_msg_header *umsg);
+long	syscall_msg_recv(mach_port_name_t name, struct mach_msg_header *ubuf,
+	    size_t ubuf_size);
+long	syscall_msg_recv_timed(mach_port_name_t name,
+	    struct mach_msg_header *ubuf, size_t ubuf_size, uint64_t timeout_ms);
 
 /*
  * Per-thread bookkeeping the scheduler keeps in sync with the entry

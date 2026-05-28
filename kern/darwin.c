@@ -43,6 +43,8 @@
 
 static long	darwin_unix(struct syscall_frame *f, uint32_t nr);
 static long	darwin_mach(struct syscall_frame *f, uint32_t trap);
+static long	darwin_mach_msg(struct syscall_frame *f);
+static long	darwin_mach_msg_err(long rv, bool sending);
 
 /* Success: carry clear, `val` in %rax. */
 static long
@@ -151,9 +153,89 @@ darwin_mach(struct syscall_frame *f, uint32_t trap)
 		    (unsigned)n);
 		return (darwin_ok(f, (long)n));	/* MACH_PORT_NULL on failure */
 	}
+	case DARWIN_MACH_mach_msg_trap:
+		return (darwin_mach_msg(f));
 	default:
 		/* Port-returning traps signal failure with a null name. */
 		kprintf("darwin: unhandled mach trap %u\n", (unsigned)trap);
 		return (darwin_ok(f, (long)MACH_PORT_NULL));
 	}
+}
+
+/*
+ * Map a style9 mach_msg result -- MACH_MSG_OK / a positive MACH_E_*, or the
+ * negative SYS_E_FAULT a user-range check returns -- onto the Darwin
+ * mach_msg_return_t the caller reads.  `sending` selects the SEND_* vs RCV_*
+ * code family.
+ */
+static long
+darwin_mach_msg_err(long rv, bool sending)
+{
+
+	switch (rv) {
+	case MACH_E_NAME:
+	case MACH_E_RIGHT:
+	case MACH_E_DEAD:
+		return (sending ? DARWIN_MACH_SEND_INVALID_DEST :
+		    DARWIN_MACH_RCV_INVALID_NAME);
+	case MACH_E_TOOSMALL:
+		return (DARWIN_MACH_RCV_TOO_LARGE);
+	case MACH_E_TIMEOUT:
+		return (sending ? DARWIN_MACH_SEND_TIMED_OUT :
+		    DARWIN_MACH_RCV_TIMED_OUT);
+	default:
+		return (sending ? DARWIN_MACH_SEND_INVALID_DATA :
+		    DARWIN_MACH_RCV_INVALID_DATA);
+	}
+}
+
+/*
+ * mach_msg_trap (Mach class 1, trap 31): the classic combined send/receive.
+ * Darwin's mach_msg(3) packs its arguments into the syscall registers in the
+ * usual order; we read msg/option/rcv_size/rcv_name/timeout.  The 7th arg
+ * (notify) is unsupported -- a classic mach_msg passes MACH_PORT_NULL there.
+ * send_size (arg2) is implicit: the kernel honours msg->msgh_size.  A combined
+ * SEND|RCV sends then receives into the same buffer, exactly as mach_msg(3)
+ * does; the shared syscall_msg_* helpers do the user-range check + SMAP
+ * bracket + drive the kernel's existing message path.  Returns a
+ * mach_msg_return_t in %rax with carry clear (Mach convention).
+ */
+static long
+darwin_mach_msg(struct syscall_frame *f)
+{
+	struct mach_msg_header	*msg;
+	uint64_t		 timeout;
+	uint32_t		 option;
+	uint32_t		 rcv_size;
+	mach_port_name_t	 rcv_name;
+	long			 rv;
+
+	msg      = (struct mach_msg_header *)f->sf_arg0;
+	option   = (uint32_t)f->sf_arg1;
+	rcv_size = (uint32_t)f->sf_arg3;
+	rcv_name = (mach_port_name_t)f->sf_arg4;
+	timeout  = f->sf_arg5;
+
+	if (option & DARWIN_MACH_SEND_MSG) {
+		rv = syscall_msg_send(msg);
+		if (rv != MACH_MSG_OK) {
+			kprintf("darwin: MACH mach_msg send -> rv=%ld\n", rv);
+			return (darwin_ok(f, darwin_mach_msg_err(rv, true)));
+		}
+	}
+	if (option & DARWIN_MACH_RCV_MSG) {
+		if (option & DARWIN_MACH_RCV_TIMEOUT)
+			rv = syscall_msg_recv_timed(rcv_name, msg, rcv_size,
+			    timeout);
+		else
+			rv = syscall_msg_recv(rcv_name, msg, rcv_size);
+		if (rv != MACH_MSG_OK) {
+			kprintf("darwin: MACH mach_msg recv -> rv=%ld\n", rv);
+			return (darwin_ok(f, darwin_mach_msg_err(rv, false)));
+		}
+	}
+
+	kprintf("darwin: MACH mach_msg(option=0x%x) -> KERN_SUCCESS\n",
+	    (unsigned)option);
+	return (darwin_ok(f, DARWIN_MACH_MSG_SUCCESS));
 }

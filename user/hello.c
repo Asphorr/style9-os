@@ -1599,8 +1599,10 @@ demo_macho_spawn(void)
  * unimplemented call to prove the carry/errno convention).  It ships as a
  * Mach-O carrying an LC_BUILD_VERSION naming PLATFORM_MACOS, so the loader
  * tags its task TASK_PERSONALITY_DARWIN and syscall_dispatch routes it
- * through darwin_dispatch.  Its banner + the kernel's per-call trace appear
- * in the boot transcript; we bounded-yield until it retires.
+ * through darwin_dispatch.  Then darwinmsg (S3) does a real mach_msg()
+ * round-trip on its own port through the same personality.  Each program's
+ * banner + the kernel's per-call trace appear in the boot transcript; we
+ * bounded-yield until each retires.
  */
 static int
 demo_darwin_spawn(void)
@@ -1618,6 +1620,15 @@ demo_darwin_spawn(void)
 	for (i = 0; i < 64 && task_alive((uint64_t)child_id); i++)
 		(void)yield();
 	printf("  darwinhello (Darwin ABI) retired after %d yields\n", i);
+
+	child_id = spawn("darwinmsg");
+	if (child_id < 0) {
+		printf("  spawn('darwinmsg') failed (rv=%ld)\n", child_id);
+		return (89);
+	}
+	for (i = 0; i < 64 && task_alive((uint64_t)child_id); i++)
+		(void)yield();
+	printf("  darwinmsg (Darwin mach_msg) retired after %d yields\n", i);
 	return (0);
 }
 

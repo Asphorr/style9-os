@@ -100,6 +100,9 @@ extern uint8_t	_binary_machotest_fat_macho_end[];
 extern uint8_t	_binary_darwinhello_macho_start[];
 extern uint8_t	_binary_darwinhello_macho_end[];
 
+extern uint8_t	_binary_darwinmsg_macho_start[];
+extern uint8_t	_binary_darwinmsg_macho_end[];
+
 /*
  * Bridge into the arch-specific user-thread spawn path.  Lives in
  * arch/amd64/usermode.c; declared here so progreg_spawn doesn't have
@@ -190,6 +193,8 @@ progreg_init(void)
 	    _binary_machotest_fat_macho_start, _binary_machotest_fat_macho_end);
 	register_one("darwinhello",
 	    _binary_darwinhello_macho_start, _binary_darwinhello_macho_end);
+	register_one("darwinmsg",
+	    _binary_darwinmsg_macho_start, _binary_darwinmsg_macho_end);
 
 	kprintf("progreg: %zu programs registered\n", nentries);
 }

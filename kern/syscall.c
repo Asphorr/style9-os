@@ -407,17 +407,19 @@ sys_port_dealloc(mach_port_name_t name)
 }
 
 /*
- * sys_msg_send / sys_msg_recv.
+ * Mach message send/recv.  The user supplies a pointer to a Mach header;
+ * we honour the user's msgh_size and read the bytes directly from the
+ * caller's address space (its pmap is current for the syscall's lifetime).
+ * No kmalloc round-trip on send -- the mach_msg_send path makes its own
+ * copy into the queued message.
  *
- * The user supplies a pointer to a Mach header.  We honour the user's
- * msgh_size (header + body bytes) and read the bytes directly from the
- * caller's address space: each ring-3 task runs under its own pmap, so
- * `umsg` is a valid VA only while this thread is current (which it is
- * for the lifetime of the syscall).  No kmalloc round-trip yet -- the
- * mach_msg_send path makes its own copy into the queued message.
+ * The range-check + SMAP-bracket + mach_msg_* core lives in the non-static
+ * syscall_msg_* helpers so the Darwin personality's mach_msg trap
+ * (kern/darwin.c) reuses the exact same path; the sys_msg_* wrappers are
+ * just the style9 syscall-table entry points.
  */
-static long
-sys_msg_send(const struct mach_msg_header *umsg)
+long
+syscall_msg_send(const struct mach_msg_header *umsg)
 {
 	uint32_t	msgh_size;
 
@@ -444,7 +446,14 @@ sys_msg_send(const struct mach_msg_header *umsg)
 }
 
 static long
-sys_msg_recv(mach_port_name_t name, struct mach_msg_header *ubuf,
+sys_msg_send(const struct mach_msg_header *umsg)
+{
+
+	return (syscall_msg_send(umsg));
+}
+
+long
+syscall_msg_recv(mach_port_name_t name, struct mach_msg_header *ubuf,
     size_t ubuf_size)
 {
 
@@ -457,7 +466,15 @@ sys_msg_recv(mach_port_name_t name, struct mach_msg_header *ubuf,
 }
 
 static long
-sys_msg_recv_timed(mach_port_name_t name, struct mach_msg_header *ubuf,
+sys_msg_recv(mach_port_name_t name, struct mach_msg_header *ubuf,
+    size_t ubuf_size)
+{
+
+	return (syscall_msg_recv(name, ubuf, ubuf_size));
+}
+
+long
+syscall_msg_recv_timed(mach_port_name_t name, struct mach_msg_header *ubuf,
     size_t ubuf_size, uint64_t timeout_ms)
 {
 
@@ -467,6 +484,14 @@ sys_msg_recv_timed(mach_port_name_t name, struct mach_msg_header *ubuf,
 	return ((long)mach_msg_recv_timed(
 	    current_thread->th_task->t_port_space,
 	    name, ubuf, ubuf_size, timeout_ms));
+}
+
+static long
+sys_msg_recv_timed(mach_port_name_t name, struct mach_msg_header *ubuf,
+    size_t ubuf_size, uint64_t timeout_ms)
+{
+
+	return (syscall_msg_recv_timed(name, ubuf, ubuf_size, timeout_ms));
 }
 
 /*

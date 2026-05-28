@@ -25,7 +25,8 @@
  *
  * We honour a deliberately small subset, enough to prove the personality
  * end to end and translate each call onto the style9 primitive that already
- * implements it.  Full mach_msg marshalling / MIG / libSystem are S3/S4.
+ * implements it.  The mach_msg trap (S3) routes onto the kernel's existing
+ * message path; MIG stub generation and a real libSystem stay userspace/S4.
  */
 
 #define	DARWIN_SYSCALL_CLASS_SHIFT	24
@@ -59,6 +60,7 @@
 #define	DARWIN_MACH_mach_reply_port	26
 #define	DARWIN_MACH_thread_self_trap	27
 #define	DARWIN_MACH_task_self_trap	28
+#define	DARWIN_MACH_mach_msg_trap	31	/* classic combined mach_msg() */
 
 /*
  * BSD errno values (Darwin <sys/errno.h>) for the failures we can produce.
@@ -71,6 +73,26 @@
 #define	DARWIN_EFAULT	14
 #define	DARWIN_EINVAL	22
 #define	DARWIN_ENOSYS	78
+
+/*
+ * mach_msg option flags + the mach_msg_return_t values darwin_dispatch
+ * produces (Darwin <mach/message.h>).  mach_msg_trap returns one of these in
+ * %rax with NO carry convention -- it is a Mach trap (class 1), so even a
+ * receive timeout comes back as a code in %rax with carry clear.
+ */
+#define	DARWIN_MACH_SEND_MSG		0x00000001u
+#define	DARWIN_MACH_RCV_MSG		0x00000002u
+#define	DARWIN_MACH_SEND_TIMEOUT	0x00000010u
+#define	DARWIN_MACH_RCV_TIMEOUT		0x00000100u
+
+#define	DARWIN_MACH_MSG_SUCCESS		0x00000000
+#define	DARWIN_MACH_SEND_INVALID_DATA	0x10000002
+#define	DARWIN_MACH_SEND_INVALID_DEST	0x10000003
+#define	DARWIN_MACH_SEND_TIMED_OUT	0x10000004
+#define	DARWIN_MACH_RCV_INVALID_NAME	0x10004002
+#define	DARWIN_MACH_RCV_TIMED_OUT	0x10004003
+#define	DARWIN_MACH_RCV_TOO_LARGE	0x10004004
+#define	DARWIN_MACH_RCV_INVALID_DATA	0x10004005
 
 struct syscall_frame;
 

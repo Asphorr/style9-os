@@ -24,7 +24,7 @@ Built from scratch — no upstream tree, no glue from another OS.
 | usermode | `arch/amd64/usermode.c` | per-task PML4 staged at task creation; the launcher sniffs the image's 4-byte magic and routes ELF to `elf_load` or Mach-O to `macho_load` (shared `(task, image, size, &entry)` contract, shared argv/stack/port-injection path); `iretq` lands at the entry RIP with a fresh user stack |
 | elf loader | `kern/elf.c` | static ELF64 parser.  Walks PT_LOAD program headers, allocates 4 KiB user pages and maps them via the task's pmap with R/W/X taken from p_flags, copies file data via `pmm_kva_from_pa` of the freshly-allocated frame |
 | macho loader | `kern/macho.c`, `tools/elf2macho.c` | XNU binary compat, S1: thin x86-64 Mach-O + fat/universal slice picker, mapping each `LC_SEGMENT_64` the way the ELF loader maps PT_LOAD and resolving the entry from `LC_UNIXTHREAD`/`LC_MAIN`.  The build host has no Darwin cross-toolchain, so the host tool `elf2macho` rewraps a style9 ELF into a spec-shaped Mach-O; `-Ikern` shares the wire structs so loader and converter never drift |
-| darwin abi | `kern/darwin.c` | XNU binary compat, S2: a per-task syscall personality.  A Mach-O carrying an `LC_BUILD_VERSION` for macOS is tagged `TASK_PERSONALITY_DARWIN`, and `syscall_dispatch` routes it to `darwin_dispatch`, which decodes Apple's class-encoded `%rax` (class 2 = BSD `write`/`getpid`/`exit`, class 1 = Mach `task_self_trap`/`mach_reply_port`) and honours the carry-flag errno convention.  The native style9 syscall table is left untouched |
+| darwin abi | `kern/darwin.c` | XNU binary compat, S2/S3: a per-task syscall personality.  A Mach-O carrying an `LC_BUILD_VERSION` for macOS is tagged `TASK_PERSONALITY_DARWIN`, and `syscall_dispatch` routes it to `darwin_dispatch`, which decodes Apple's class-encoded `%rax` -- class 2 = BSD `write`/`getpid`/`exit` with the carry-flag errno convention; class 1 = Mach `task_self_trap`/`mach_reply_port`/`mach_msg` traps -- and translates each onto the style9 primitive.  The `mach_msg` trap drives the kernel's existing message queue, so a Darwin task does real IPC; the native style9 syscall table is left untouched |
 | progreg | `kern/progreg.c` | "program registry" -- two dozen user programs embedded in the kernel image via objcopy, delivered as ELF or (for the Mach-O loader + Darwin demos) Mach-O containers.  `progreg_spawn(name)` creates a task and loads the matching image into it; `SYS_SPAWN` is the userspace door |
 | traps | `arch/amd64/idt.c`, `intr.c`, `isr.S` | 48-vector IDT, trap-frame dispatcher, symbolicated autopsy on exception |
 | irqs | `arch/amd64/pic.c`, `pit.c` | 8259 remap to 0x20/0x28, PIT @ 100 Hz with quantum tracking |
@@ -216,8 +216,12 @@ That is staged as a four-rung ladder:
   convention — the same bytes a macOS x86-64 binary's libSystem stubs
   emit.  The freestanding `user/darwinhello` stub exercises it end to end,
   and the native style9 syscall path is left untouched.
-- **S3 — binary-exact Mach IPC (ahead).**  A wire-exact `mach_msg` /
-  `mach_msg2` trap surface plus MIG, so a Darwin binary can do real IPC.
+- **S3 — Mach IPC trap (landed).**  The `mach_msg` trap (class 1, trap 31)
+  drives Darwin messages through the kernel's existing queue; the
+  `mach_msg_header_t` is byte-exact, so a Darwin task's own header round-
+  trips unchanged.  The freestanding `user/darwinmsg` stub does a real
+  send+receive on its own port.  MIG stub *generation* stays a userspace
+  concern, and `mach_msg2`/overwrite plus the 7th (`notify`) arg are deferred.
 - **S4 — libSystem + dyld (ahead).**  A minimal `libSystem` shim and
   dynamic linker — the point where unmodified Apple binaries run, and
   where standing up a Darwin cross-toolchain finally becomes worth it.
@@ -316,11 +320,11 @@ The same kernel-side `mach_msg_send` / `mach_msg_recv_timed` that the
 just range-checks the user pointer and forwards.
 
 Next on the roadmap: the XNU binary-compatibility ladder above continues
-with S3 (binary-exact `mach_msg` + Mach traps + MIG) and S4 (a minimal
-libSystem + dyld).  Also open: a filesystem on `dev/disk0` so programs can
-live on disk instead of being embedded; virtual-copy (COW) OOL semantics;
-real SMP.  (SMAP user-pointer bracketing and the `vm_allocate` syscall,
-once on this list, have since landed.)
+with S4 -- a minimal libSystem + dyld, where unmodified Apple binaries run.
+Also open: a filesystem on `dev/disk0` so programs can live on disk instead
+of being embedded; virtual-copy (COW) OOL semantics; real SMP.  (SMAP
+user-pointer bracketing, the `vm_allocate` syscall, and the S1-S3 rungs of
+the XNU ladder, once on this list, have since landed.)
 
 ## License
 

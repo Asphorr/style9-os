@@ -248,7 +248,14 @@ typedef uint32_t	mach_port_name_t;
  */
 #define	MACH_MSG_OOL_MAX_BYTES		(1u << 20)	/* 1 MiB           */
 
-/* WIRE FORMAT.  ABI-stable. */
+/*
+ * WIRE FORMAT.  ABI-stable -- and byte-exact with Darwin's mach_msg_header_t:
+ * the field order and offsets match Apple's header field-for-field
+ *	msgh_bits @0  msgh_size @4  msgh_remote(_port) @8  msgh_local(_port) @12
+ *	msgh_voucher(_port) @16  msgh_id @20  (24 bytes total, asserted below).
+ * That is what lets a TASK_PERSONALITY_DARWIN binary's own mach_msg_header_t
+ * round-trip through this kernel's mach_msg path unchanged (S3, kern/darwin.c).
+ */
 struct mach_msg_header {
 	uint32_t		msgh_bits;
 	uint32_t		msgh_size;	/* total bytes incl header */
