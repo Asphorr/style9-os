@@ -1544,6 +1544,53 @@ demo_spawn_argv(void)
 	return (0);
 }
 
+/*
+ * demo_macho_spawn: exercise the Mach-O container loader (kern/macho.c).
+ * machotest is an ordinary style9 program delivered as a Mach-O instead
+ * of an ELF; the spawn launcher sniffs the image magic and routes it to
+ * macho_load.  We spawn the thin x86-64 slice WITH a command line -- which
+ * also confirms the SysV initial-stack frame reaches main(argc, argv)
+ * regardless of container format -- then the single-slice fat/universal
+ * archive, which drives macho_load's slice picker.  Both programs print a
+ * banner the boot transcript captures; we bounded-yield between them so
+ * the two outputs do not interleave.
+ */
+static int
+demo_macho_spawn(void)
+{
+	char			*child_argv[3];
+	mach_port_name_t	 taskport;
+	long			 child_id;
+	int			 i;
+
+	printf("\nMach-O loader demo (kern/macho.c):\n");
+
+	child_argv[0] = "machotest";
+	child_argv[1] = "thin";
+	child_argv[2] = "slice";
+	taskport = MACH_PORT_NULL;
+	child_id = spawn_args("machotest", 3, child_argv, &taskport);
+	if (child_id < 0) {
+		printf("  spawn_args('machotest') failed (rv=%ld)\n", child_id);
+		return (86);
+	}
+	for (i = 0; i < 64 && task_alive((uint64_t)child_id); i++)
+		(void)yield();
+	if (taskport != MACH_PORT_NULL)
+		(void)mach_port_deallocate(taskport);
+	printf("  thin Mach-O retired after %d yields\n", i);
+
+	child_id = spawn("machotest_fat");
+	if (child_id < 0) {
+		printf("  spawn('machotest_fat') failed (rv=%ld)\n", child_id);
+		return (87);
+	}
+	for (i = 0; i < 64 && task_alive((uint64_t)child_id); i++)
+		(void)yield();
+	printf("  fat Mach-O (x86_64 slice) retired after %d yields\n", i);
+	return (0);
+}
+
 static int
 demo_bootstrap_publish(void)
 {
@@ -1784,6 +1831,10 @@ main(void)
 		return (rv);
 
 	rv = demo_spawn_argv();
+	if (rv != 0)
+		return (rv);
+
+	rv = demo_macho_spawn();
 	if (rv != 0)
 		return (rv);
 

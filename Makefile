@@ -105,6 +105,7 @@ OBJS	= \
 	$(OBJDIR)/ata_drv.o	\
 	$(OBJDIR)/dev_subsystem.o \
 	$(OBJDIR)/elf.o		\
+	$(OBJDIR)/macho.o	\
 	$(OBJDIR)/progreg.o	\
 	$(OBJDIR)/hello_elf.o	\
 	$(OBJDIR)/clock_elf.o	\
@@ -124,6 +125,8 @@ OBJS	= \
 	$(OBJDIR)/heartbeatd_elf.o \
 	$(OBJDIR)/argecho_elf.o \
 	$(OBJDIR)/crasher_elf.o \
+	$(OBJDIR)/machotest_macho.o \
+	$(OBJDIR)/machotest_fat_macho.o \
 	$(OBJDIR)/ksym.o
 
 all: kernel.elf
@@ -198,6 +201,52 @@ $(OBJDIR)/%_elf.o: $(OBJDIR)/%.elf
 
 USER_ELFS = $(foreach p,$(USER_PROGRAMS),$(OBJDIR)/$(p).elf)
 
+# ---- ring-3 programs delivered as Mach-O (S1: container loader) ----------
+# Apple ships ring-3 binaries as Mach-O.  To exercise the kernel's Mach-O
+# loader (kern/macho.c) we take an ordinary style9 user ELF and rewrap it
+# as a Mach-O with the host tool tools/elf2macho -- this build host has no
+# Darwin cross toolchain, and a converter yields a deterministic, spec-shaped
+# container without one.  The program ABI inside is unchanged (libstyle9
+# crt0 + SYS_* numbers); only the container format differs, which is exactly
+# what S1 sets out to prove.  Matching Apple's syscall/Mach-trap ABI is a
+# separate, later step.
+#
+# Each name is built from user/<name>.c via the generic %.user.o + %.elf
+# rules (the .macho targets pull the .elf in), then converted to BOTH a thin
+# x86-64 Mach-O and a one-slice fat/universal archive, and objcopy-wrapped
+# into _binary_<name>_macho.o / _binary_<name>_fat_macho.o for progreg.c.
+MACHO_PROGRAMS = machotest
+
+# Host build of the converter: a plain hosted compile (NOT the freestanding
+# kernel flags).  -Ikern lets it share the exact wire structs in kern/macho.h
+# and kern/elf.h, so the converter and the kernel can never drift apart.
+# -U_FORTIFY_SOURCE disables glibc's _FORTIFY_SOURCE memcpy checking, whose
+# object-size analysis throws a false positive on our calloc'd-buffer +
+# computed-offset writes at -O2; runtime hardening is irrelevant for a
+# deterministic build tool, and plain -Warray-bounds stays on for real bugs.
+HOST_CC     = $(CC)
+HOST_CFLAGS = -O2 -Wall -Wextra -std=c11 -Ikern -U_FORTIFY_SOURCE
+ELF2MACHO   = $(OBJDIR)/elf2macho
+
+$(ELF2MACHO): tools/elf2macho.c kern/macho.h kern/elf.h | $(OBJDIR)
+	$(HOST_CC) $(HOST_CFLAGS) -o $@ tools/elf2macho.c
+
+# machotest ships as two containers from one ELF: a thin slice and a
+# single-arch fat/universal archive, so the loader's thin path AND its
+# fat slice-picker both get boot-exercised.
+$(OBJDIR)/machotest.macho: $(OBJDIR)/machotest.elf $(ELF2MACHO)
+	$(ELF2MACHO) $< $@
+
+$(OBJDIR)/machotest_fat.macho: $(OBJDIR)/machotest.elf $(ELF2MACHO)
+	$(ELF2MACHO) fat $< $@
+
+# Wrap a .macho into a kernel-linkable object exposing
+# _binary_<name>_macho_start / _end.  Mirror of the %_elf.o rule.
+$(OBJDIR)/%_macho.o: $(OBJDIR)/%.macho
+	cd $(OBJDIR) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386	\
+	    --rename-section .data=.rodata.$*_macho			\
+	    $*.macho $*_macho.o
+
 # ---- man pages -----------------------------------------------------------
 # Render each docs/man/<name>.9 mdoc source to plain ASCII via mandoc, then
 # embed the bytes in the kernel image via objcopy.  `col -b` strips the
@@ -269,6 +318,7 @@ $(OBJDIR)/%.o: %.S | $(OBJDIR)
 -include $(OBJS:.o=.d)
 -include $(LIB_OBJS:.o=.d)
 -include $(addsuffix .d,$(addprefix $(OBJDIR)/,$(USER_PROGRAMS:=.user)))
+-include $(addsuffix .d,$(addprefix $(OBJDIR)/,$(MACHO_PROGRAMS:=.user)))
 
 $(OBJDIR):
 	mkdir -p $(OBJDIR)

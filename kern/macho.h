@@ -1,0 +1,169 @@
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Copyright (c) 2026 The Hobby OS Project
+ * All rights reserved.
+ */
+
+#ifndef _SYS_MACHO_H_
+#define	_SYS_MACHO_H_
+
+#include <stddef.h>
+#include <stdint.h>
+
+/*
+ * Minimal Mach-O (thin x86-64, plus fat/universal slice picking) loader
+ * for ring-3 programs -- the sibling of the ELF loader in elf.h.
+ *
+ * Apple ships every ring-3 binary as Mach-O; teaching the kernel to map
+ * the container is the first rung of XNU binary compatibility (S1: the
+ * container only).  The ABI INSIDE the container is unchanged here --
+ * the program still uses libstyle9's crt0 and the style9 SYS_* numbers,
+ * so a Mach-O loaded by macho_load runs through the exact same launcher,
+ * stack frame, and syscall path as an ELF.  Matching Apple's syscall
+ * ABI + Mach trap layout is a later, separate step.
+ *
+ * macho_load() parses an image already resident in kernel memory.  When
+ * the image is a fat/universal archive it selects the CPU_TYPE_X86_64
+ * slice and recurses on it; the thin path then drops every
+ * LC_SEGMENT_64 into the target task's address space at its requested VA
+ * (R/W/X from initprot, all U=1) and returns the entry RIP read from
+ * LC_UNIXTHREAD or LC_MAIN.  Each segment is recorded in task->t_map
+ * alongside the hardware install into task->t_pmap -- identical bookkeeping
+ * to elf_load(), so the launcher treats the two formats interchangeably.
+ *
+ * The layouts below are imposed by the Mach-O file format (mach-o/loader.h
+ * and mach-o/fat.h in Apple's headers); reordering fields desynchronises
+ * the parser from what a Mach-O linker -- or our tools/elf2macho host
+ * converter -- writes.  Fat headers are stored BIG-ENDIAN on disk; the
+ * parser byte-swaps them (everything else is little-endian native).
+ */
+
+struct task;
+
+/* Container magics (native byte order as read from a little-endian host). */
+#define	MACHO_MAGIC_64		0xFEEDFACFu	/* 64-bit thin, native      */
+#define	MACHO_CIGAM_64		0xCFFAEDFEu	/* 64-bit thin, byte-swapped */
+#define	MACHO_FAT_MAGIC		0xCAFEBABEu	/* fat header, big-endian    */
+#define	MACHO_FAT_CIGAM		0xBEBAFECAu	/* fat header as read LE     */
+
+/* CPU types (the 0x01000000 bit is CPU_ARCH_ABI64). */
+#define	MACHO_CPU_TYPE_X86_64	0x01000007
+
+/* mach_header_64.filetype */
+#define	MACHO_MH_EXECUTE	0x2
+
+/* load_command.cmd values we honour (LC_REQ_DYLD rides bit 31 of LC_MAIN). */
+#define	MACHO_LC_REQ_DYLD	0x80000000u
+#define	MACHO_LC_SEGMENT_64	0x19
+#define	MACHO_LC_UNIXTHREAD	0x5
+#define	MACHO_LC_MAIN		(0x28u | MACHO_LC_REQ_DYLD)
+
+/* LC_UNIXTHREAD flavor + register count for x86-64. */
+#define	MACHO_x86_THREAD_STATE64	4
+#define	MACHO_x86_THREAD_STATE64_COUNT	42	/* 21 uint64 = 42 uint32 */
+
+/* segment_command_64 initprot/maxprot bits (vm_prot_t on disk). */
+#define	MACHO_VM_PROT_READ	0x1
+#define	MACHO_VM_PROT_WRITE	0x2
+#define	MACHO_VM_PROT_EXECUTE	0x4
+
+/* WIRE FORMAT.  Mach-O-imposed (mach_header_64). */
+struct mach_header_64 {
+	uint32_t	magic;
+	uint32_t	cputype;
+	uint32_t	cpusubtype;
+	uint32_t	filetype;
+	uint32_t	ncmds;
+	uint32_t	sizeofcmds;
+	uint32_t	flags;
+	uint32_t	reserved;
+};
+
+/* WIRE FORMAT.  Common prefix of every load command. */
+struct mach_load_command {
+	uint32_t	cmd;
+	uint32_t	cmdsize;
+};
+
+/* WIRE FORMAT.  LC_SEGMENT_64 (section headers, if any, follow inline). */
+struct mach_segment_command_64 {
+	uint32_t	cmd;
+	uint32_t	cmdsize;
+	char		segname[16];
+	uint64_t	vmaddr;
+	uint64_t	vmsize;
+	uint64_t	fileoff;
+	uint64_t	filesize;
+	int32_t		maxprot;
+	int32_t		initprot;
+	uint32_t	nsects;
+	uint32_t	flags;
+};
+
+/*
+ * WIRE FORMAT.  LC_UNIXTHREAD header; the flavor-specific register block
+ * (struct mach_x86_thread_state64 for flavor x86_THREAD_STATE64) follows.
+ */
+struct mach_thread_command {
+	uint32_t	cmd;
+	uint32_t	cmdsize;
+	uint32_t	flavor;
+	uint32_t	count;
+};
+
+/* WIRE FORMAT.  x86_THREAD_STATE64 register block (21 * 8 = 168 bytes). */
+struct mach_x86_thread_state64 {
+	uint64_t	rax, rbx, rcx, rdx;
+	uint64_t	rdi, rsi, rbp, rsp;
+	uint64_t	r8, r9, r10, r11;
+	uint64_t	r12, r13, r14, r15;
+	uint64_t	rip, rflags;
+	uint64_t	cs, fs, gs;
+};
+
+/* WIRE FORMAT.  LC_MAIN (entryoff is a file offset into the image). */
+struct mach_entry_point_command {
+	uint32_t	cmd;
+	uint32_t	cmdsize;
+	uint64_t	entryoff;
+	uint64_t	stacksize;
+};
+
+/* WIRE FORMAT.  fat/universal header + per-arch entry (BIG-ENDIAN on disk). */
+struct mach_fat_header {
+	uint32_t	magic;
+	uint32_t	nfat_arch;
+};
+
+struct mach_fat_arch {
+	uint32_t	cputype;
+	uint32_t	cpusubtype;
+	uint32_t	offset;
+	uint32_t	size;
+	uint32_t	align;
+};
+
+_Static_assert(sizeof(struct mach_header_64) == 32, "mach_header_64 must be 32 bytes");
+_Static_assert(sizeof(struct mach_load_command) == 8, "load_command must be 8 bytes");
+_Static_assert(sizeof(struct mach_segment_command_64) == 72, "segment_command_64 must be 72 bytes");
+_Static_assert(sizeof(struct mach_thread_command) == 16, "thread_command must be 16 bytes");
+_Static_assert(sizeof(struct mach_x86_thread_state64) == 168, "x86_thread_state64 must be 168 bytes");
+_Static_assert(sizeof(struct mach_entry_point_command) == 24, "entry_point_command must be 24 bytes");
+_Static_assert(sizeof(struct mach_fat_header) == 8, "fat_header must be 8 bytes");
+_Static_assert(sizeof(struct mach_fat_arch) == 20, "fat_arch must be 20 bytes");
+
+#define	MACHO_E_OK		0
+#define	MACHO_E_TRUNCATED	(-1)
+#define	MACHO_E_BADMAG		(-2)
+#define	MACHO_E_BADCPU		(-3)	/* wrong cputype / no x86-64 slice */
+#define	MACHO_E_BADTYPE		(-4)	/* not MH_EXECUTE                  */
+#define	MACHO_E_NOMEM		(-5)
+#define	MACHO_E_MAP		(-6)
+#define	MACHO_E_BADCMD		(-7)	/* malformed load command          */
+#define	MACHO_E_NOENTRY		(-8)	/* no LC_UNIXTHREAD / LC_MAIN       */
+
+int	macho_load(struct task *target, const void *image, size_t image_size,
+	    uint64_t *entry_out);
+
+#endif /* !_SYS_MACHO_H_ */

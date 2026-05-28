@@ -12,6 +12,7 @@
 #include "gdt.h"
 #include "kmem.h"
 #include "kprintf.h"
+#include "macho.h"
 #include "panic.h"
 #include "pmap.h"
 #include "pmm.h"
@@ -294,13 +295,19 @@ build_user_arg_stack(uint64_t kva_base, int argc, char *const *argv)
 }
 
 /*
- * Launcher for a ring-3 program shipped as an embedded ELF64.  Differs
- * from usermode_launcher in that elf_load handles segment mapping and
- * picks the entry RIP off e_entry; we only own the stack mapping.
+ * Launcher for a ring-3 program shipped as an embedded image.  Differs
+ * from usermode_launcher in that the format loader handles segment
+ * mapping and picks the entry RIP off the image header; we only own the
+ * stack mapping.  The image is format-sniffed on its first four bytes:
+ * an ELF magic routes to elf_load, a Mach-O (thin MH_MAGIC_64 or a
+ * fat/universal archive) routes to macho_load.  Both loaders share the
+ * (task, image, size, &entry) contract, so everything downstream of the
+ * sniff -- stack frame, port injection, ring-3 transition -- is identical
+ * regardless of container format.
  *
  * Runs as a kernel thread attached to the freshly-created user task, so
  * by the time we get here the scheduler has already loaded our task's
- * CR3 -- elf_load's pmap_enter calls land in (and TLB-flush) the live
+ * CR3 -- the loader's pmap_enter calls land in (and TLB-flush) the live
  * page table.
  */
 static void
@@ -314,15 +321,26 @@ usermode_elf_launcher(void *arg)
 	uint64_t		 ksp;
 	uint64_t		 user_rsp;
 	size_t			 i;
+	uint32_t		 magic;
 	int			 rv;
 
 	sa = (struct user_spawn_arg *)arg;
 	ut = current_thread->th_task;
 
-	rv = elf_load(ut, sa->sa_image, sa->sa_image_size, &entry);
-	if (rv != ELF_E_OK)
-		panic("usermode_elf_launcher: elf_load %s rv=%d",
-		    sa->sa_name, rv);
+	magic = sa->sa_image_size >= sizeof(uint32_t) ?
+	    *(const uint32_t *)sa->sa_image : 0;
+	if (magic == MACHO_MAGIC_64 || magic == MACHO_FAT_MAGIC ||
+	    magic == MACHO_FAT_CIGAM) {
+		rv = macho_load(ut, sa->sa_image, sa->sa_image_size, &entry);
+		if (rv != MACHO_E_OK)
+			panic("usermode_elf_launcher: macho_load %s rv=%d",
+			    sa->sa_name, rv);
+	} else {
+		rv = elf_load(ut, sa->sa_image, sa->sa_image_size, &entry);
+		if (rv != ELF_E_OK)
+			panic("usermode_elf_launcher: elf_load %s rv=%d",
+			    sa->sa_name, rv);
+	}
 
 	stack_pa = pmm_alloc_page();
 	if (stack_pa == PA_INVALID)

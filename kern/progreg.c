@@ -78,6 +78,20 @@ extern uint8_t	_binary_crasher_elf_start[];
 extern uint8_t	_binary_crasher_elf_end[];
 
 /*
+ * Mach-O-delivered programs.  Same source-and-libc as any other ring-3
+ * binary, but the embedded blob is a Mach-O container (tools/elf2macho
+ * rewraps the ELF) rather than an ELF -- the spawn launcher sniffs the
+ * image magic and routes these to macho_load instead of elf_load.  Two
+ * containers from the one program exercise both loader paths: a thin
+ * x86-64 image and a single-slice fat/universal archive.
+ */
+extern uint8_t	_binary_machotest_macho_start[];
+extern uint8_t	_binary_machotest_macho_end[];
+
+extern uint8_t	_binary_machotest_fat_macho_start[];
+extern uint8_t	_binary_machotest_fat_macho_end[];
+
+/*
  * Bridge into the arch-specific user-thread spawn path.  Lives in
  * arch/amd64/usermode.c; declared here so progreg_spawn doesn't have
  * to pull in machine headers.  Returns the new task's t_id or a
@@ -161,6 +175,10 @@ progreg_init(void)
 	    _binary_argecho_elf_start, _binary_argecho_elf_end);
 	register_one("crasher",
 	    _binary_crasher_elf_start, _binary_crasher_elf_end);
+	register_one("machotest",
+	    _binary_machotest_macho_start, _binary_machotest_macho_end);
+	register_one("machotest_fat",
+	    _binary_machotest_fat_macho_start, _binary_machotest_fat_macho_end);
 
 	kprintf("progreg: %zu programs registered\n", nentries);
 }
