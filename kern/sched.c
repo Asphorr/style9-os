@@ -15,6 +15,7 @@
 #include "kprintf.h"
 #include "panic.h"
 #include "pmap.h"
+#include "queue.h"
 #include "sched.h"
 #include "spinlock.h"
 #include "syscall.h"
@@ -45,7 +46,8 @@ static struct thread	*runq_head;	/* (s) READY list, FIFO            */
 static struct thread	*runq_tail;	/* (s)                              */
 static size_t		 runq_len;	/* (s)                              */
 
-static struct thread	*zombie_head;	/* (s) waiting for idle to reap    */
+SLIST_HEAD(zombie_list, thread);
+static struct zombie_list zombie_head;	/* (s) waiting for idle to reap    */
 static struct thread	*idle_thread;	/* (c)                              */
 static uint64_t		 ctx_switches;	/* (s) printable counter            */
 static uint64_t		 preempts;	/* (s) IRQ-driven yields            */
@@ -166,7 +168,7 @@ sched_init(void)
 
 	runq_head    = runq_tail = NULL;
 	runq_len     = 0;
-	zombie_head  = NULL;
+	SLIST_INIT(&zombie_head);
 	ctx_switches = 0;
 	preempts     = 0;
 	preempt_need_resched = 0;
@@ -488,8 +490,7 @@ sched_handoff_zombie(struct thread *self)
 
 	spin_lock(&sched_lock);
 
-	self->th_zombie_next = zombie_head;
-	zombie_head = self;
+	SLIST_INSERT_HEAD(&zombie_head, self, th_zombie_link);
 
 	next = pick_next_locked(self);
 	KASSERT(next != NULL,
@@ -520,23 +521,25 @@ sched_post_switch_unlock(void)
 void
 sched_reap_zombies(void)
 {
-	struct thread	*z, *next;
+	struct zombie_list	 drain;
+	struct thread		*next;
+	struct task		*t;
+	struct thread		*z;
+
+	SLIST_INIT(&drain);
 
 	spin_lock(&sched_lock);
-	z = zombie_head;
-	zombie_head = NULL;
+	SLIST_SWAP(&drain, &zombie_head, thread);
 	spin_unlock(&sched_lock);
 
-	while (z != NULL) {
-		struct task *t = z->th_task;
-		next = z->th_zombie_next;
+	SLIST_FOREACH_SAFE(z, &drain, th_zombie_link, next) {
+		t = z->th_task;
 
 		if (z->th_kstack_owned && z->th_kstack_base != NULL)
 			kfree(z->th_kstack_base);
 
 		task_detach_thread(t, z);
 		kfree(z);
-		z = next;
 	}
 }
 

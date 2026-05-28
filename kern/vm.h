@@ -20,34 +20,35 @@
  * it carries.  Sits one layer above the machine-dependent pmap, which
  * stays authoritative for the actual hardware page tables.
  *
- * This commit is bookkeeping only -- vm_map_enter records a mapping
- * the caller has already installed via pmap_kenter, and
- * vm_map_destroy frees the entries without itself touching pmap.  The
- * next commit (per-task PML4) makes vm_map load-bearing: pmap_kenter
- * gets driven from the map at fault time / task-switch time, and the
- * map becomes the source of truth.
+ * vm_map is the per-task source of truth for live virtual ranges.
+ * vm_map_enter records a mapping the caller has already installed via
+ * pmap_kenter (kernel master) or pmap_enter (per-task pmap); the OOL
+ * recv path uses vm_map_find_space to place a fresh range without
+ * stomping the receiver's existing mappings; vm_map_release_anon walks
+ * VME_F_ANON entries at task teardown to drop the backing frames
+ * before pmap_destroy frees the page-table tree itself.
  *
  * Design notes:
  *
  *	- Entries form a singly-linked list, head-sorted by vme_start,
  *	  with no overlaps.  Lookup is O(N) but N is tiny for the
- *	  workloads we care about (a few code/stack/heap entries per
- *	  task); a future BST swap-in is a local change.
+ *	  workloads here (a few code/stack/heap entries per task); a
+ *	  future BST swap-in is a local change.
  *
  *	- Adjacency (entry A's vme_end == entry B's vme_start) is
  *	  permitted; they just stay separate entries.  Coalescing is a
  *	  follow-up nicety.
  *
- *	- vme_object is a placeholder for the upcoming vm_object commit;
- *	  today it is always NULL and vme_flags tells the consumer where
- *	  the pages actually came from (anonymous frames pmm allocated,
- *	  or an objcopy-embedded blob for ELF .text/.rodata).
+ *	- vme_object is a placeholder for future vm_object support;
+ *	  it is currently always NULL and vme_flags tells the consumer
+ *	  where the pages actually came from (anonymous frames pmm
+ *	  allocated, or an objcopy-embedded blob for ELF .text/.rodata).
  *
  *	- Protections reuse the existing VM_PROT_* bits from
  *	  arch/amd64/pmap.h so call sites do not have to translate.
  */
 
-struct vm_object;	/* vm.c commit 2 will define this */
+struct vm_object;	/* defined when vm_object support lands */
 struct task;
 
 #define	VME_F_ANON		0x01	/* anonymous (pmm) backing       */
@@ -57,7 +58,7 @@ struct vm_map_entry {
 	uint64_t		 vme_start;	/* (m) inclusive       */
 	uint64_t		 vme_end;	/* (m) exclusive       */
 	uint64_t		 vme_offset;	/* (m) into vme_object */
-	struct vm_object	*vme_object;	/* (m) NULL today      */
+	struct vm_object	*vme_object;	/* (m) NULL until vm_object lands */
 	uint8_t			 vme_prot;	/* (c) VM_PROT_*       */
 	uint8_t			 vme_flags;	/* (c) VME_F_*         */
 	uint16_t		 vme_pad;
@@ -95,7 +96,8 @@ void			 vm_map_destroy(struct vm_map *);
  * Record a mapping in `map`.  Fails (returns false) if [va, va+size)
  * overlaps an existing entry or escapes [vm_lo, vm_hi).  Does NOT
  * touch pmap -- the caller is responsible for the hardware install
- * (today via pmap_kenter; future per-task PML4 will plumb this).
+ * (pmap_kenter into the kernel master pmap, or pmap_enter into the
+ * task's per-task pmap).
  */
 bool			 vm_map_enter(struct vm_map *,
 			    uint64_t va, uint64_t size,

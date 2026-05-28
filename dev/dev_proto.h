@@ -21,11 +21,14 @@
  * an output driver implements INFO + WRITE, a block device would
  * implement INFO + READ + WRITE + IOCTL.  INFO is always supported.
  *
- * Wire shapes are pinned by _Static_assert so kernel-side dispatchers
- * and future ring-3 consumers agree on the layout.  All replies COPY_SEND
- * back through req->msgh_local; the inline-reply fast path applies to
- * bare replies (INFO, WRITE) and skips the kmalloc / enqueue / wake of
- * the queue path entirely.
+ * Wire structs below are ABI-stable: existing fields keep their offsets,
+ * new fields append, and the size is pinned by _Static_assert.  Reordering
+ * an existing field breaks any consumer compiled against an older layout.
+ * Each struct is preceded by a WIRE FORMAT banner for grep-ability.
+ *
+ * All replies COPY_SEND back through req->msgh_local; the inline-reply
+ * fast path applies to bare replies (INFO, WRITE) and skips the kmalloc
+ * + enqueue + wake of the queue path entirely.
  */
 
 #define	DEV_OP_INFO		1	/* request: header.  reply: dev_info_reply  */
@@ -42,7 +45,7 @@
  * Sector size is fixed at 512 for the protocol.  Drives reporting
  * something else are rejected at probe time -- the wire shape would
  * have to change to accommodate them, and 512 is universal on the
- * hardware we target.
+ * supported hardware.
  */
 #define	DEV_OP_GEOM		4	/* request: header.  reply: dev_geom_reply  */
 #define	DEV_OP_READ_BLOCK	5	/* request: dev_block_io_req.  reply: dev_block_read_reply */
@@ -85,6 +88,7 @@
  * Reply for DEV_OP_INFO.  Sits right after the mach_msg_header in the
  * reply message.  24 bytes; the fast path treats this as a bare reply.
  */
+/* WIRE FORMAT.  ABI-stable. */
 struct dev_info_reply {
 	char		dir_name[DEV_NAME_MAX];	/* NUL-terminated         */
 	uint32_t	dir_kind;		/* DEV_KIND_*             */
@@ -99,6 +103,7 @@ _Static_assert(sizeof(struct dev_info_reply) == DEV_NAME_MAX + 8,
  * dwr_data; the driver writes those out and returns dwr_written in the
  * reply (may be less than dwr_len if a short write occurred).
  */
+/* WIRE FORMAT.  ABI-stable. */
 struct dev_write_request {
 	uint32_t	dwr_len;
 	uint32_t	dwr_pad;
@@ -108,6 +113,7 @@ struct dev_write_request {
 _Static_assert(sizeof(struct dev_write_request) == 8 + DEV_WRITE_MAX,
     "dev_write_request must be 264 bytes (wire format)");
 
+/* WIRE FORMAT.  ABI-stable. */
 struct dev_write_reply {
 	int32_t		dwr_rv;		/* MACH_MSG_OK or MACH_E_*     */
 	uint32_t	dwr_written;	/* bytes actually consumed     */
@@ -123,6 +129,7 @@ _Static_assert(sizeof(struct dev_write_reply) == 8,
  * (NUL-padded).  dgr_total_sectors is in dgr_sector_bytes units; a
  * 1 GiB QEMU disk reports total=0x200000, bytes=512.
  */
+/* WIRE FORMAT.  ABI-stable. */
 struct dev_geom_reply {
 	int32_t		dgr_rv;
 	uint32_t	dgr_sector_bytes;
@@ -140,6 +147,7 @@ _Static_assert(sizeof(struct dev_geom_reply) == 64,
  * at LBA `dbr_lba`.  Caller's reply buffer must hold a dev_block_read_reply
  * (header + status + count * 512 bytes).
  */
+/* WIRE FORMAT.  ABI-stable. */
 struct dev_block_io_req {
 	uint64_t	dbr_lba;
 	uint32_t	dbr_count;	/* sectors; 1..DEV_BLOCK_MAX_SECTORS */
@@ -156,6 +164,7 @@ _Static_assert(sizeof(struct dev_block_io_req) == 16,
  * the full DEV_BLOCK_MAX_BYTES so the buffer size is fixed and the
  * receiver doesn't need to special-case partial messages.
  */
+/* WIRE FORMAT.  ABI-stable. */
 struct dev_block_read_reply {
 	int32_t		dbr_rv;
 	uint32_t	dbr_count;
@@ -169,6 +178,7 @@ _Static_assert(sizeof(struct dev_block_read_reply) == 8 + DEV_BLOCK_MAX_BYTES,
  * Request for DEV_OP_WRITE_BLOCK.  Carries the (lba, count) tuple plus
  * the inline data payload.  Symmetric to the read reply.
  */
+/* WIRE FORMAT.  ABI-stable. */
 struct dev_block_write_req {
 	uint64_t	dbw_lba;
 	uint32_t	dbw_count;	/* sectors */
@@ -183,6 +193,7 @@ _Static_assert(sizeof(struct dev_block_write_req) == 16 + DEV_BLOCK_MAX_BYTES,
  * Reply for DEV_OP_WRITE_BLOCK and DEV_OP_SYNC.  Same shape as
  * dev_write_reply but field names track the block semantics.
  */
+/* WIRE FORMAT.  ABI-stable. */
 struct dev_block_io_reply {
 	int32_t		dbr_rv;
 	uint32_t	dbr_sectors;	/* sectors actually transferred */

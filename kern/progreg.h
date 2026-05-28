@@ -14,11 +14,11 @@
 /*
  * Program registry.
  *
- * Today the kernel ships every ring-3 program embedded in its own
- * image (objcopy wraps each user ELF into a .rodata blob; see the
- * "_elf.o" rule in the Makefile).  progreg is the small table that
- * names those blobs so SYS_SPAWN can resolve a string name to an
- * (image, size) pair and hand them to the ELF loader.
+ * The kernel currently ships every ring-3 program embedded in its
+ * own image (objcopy wraps each user ELF into a .rodata blob; see
+ * the "_elf.o" rule in the Makefile).  progreg is the small table
+ * that names those blobs so SYS_SPAWN can resolve a string name to
+ * an (image, size) pair and hand them to the ELF loader.
  *
  * When a filesystem lands, progreg shrinks to a back-compat shim
  * pointing at /sbin/NAME via vnode lookups; the user-facing

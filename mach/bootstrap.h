@@ -43,6 +43,10 @@
  *
  * The client distinguishes success vs failure by the COMPLEX bit on
  * the reply's msgh_bits.
+ *
+ * Wire structs below are ABI-stable: existing fields keep their offsets,
+ * new fields append, and the size is pinned by _Static_assert.  Reordering
+ * an existing field breaks any consumer compiled against an older layout.
  */
 
 #define	BOOTSTRAP_NAME_MAX		32
@@ -52,6 +56,7 @@
 
 #define	BOOTSTRAP_REPLY_NOT_FOUND	0xFFFFFFFFu
 
+/* WIRE FORMAT.  ABI-stable. */
 struct bootstrap_lookup_request {
 	char	blr_name[BOOTSTRAP_NAME_MAX];
 };

@@ -15,14 +15,13 @@
 struct thread;
 
 /*
- * Cooperative round-robin scheduler.
- *
- * No preemption yet -- threads yield explicitly via thread_yield or
- * implicitly via thread_block (e.g. mach_msg_recv_block on an empty
- * port).  The PIT IRQ keeps bumping the tick counter but does NOT
- * call into the scheduler; that would require an "ask for resched on
- * return-to-thread" flag and the IRQ trampoline to honour it.  Easy
- * to add later without changing the API below.
+ * Round-robin scheduler with PIT-driven preemption.  Threads also
+ * yield explicitly via thread_yield, or implicitly via thread_block
+ * (e.g. mach_msg_recv_block on an empty port).  The PIT IRQ debits
+ * the current thread's PREEMPT_QUANTUM_TICKS slice and sets
+ * preempt_need_resched on expiry; the reschedule fires either inline
+ * at the end of intr_dispatch, or deferred until the next
+ * preempt_enable that drops the count to zero.
  *
  * Lock order: anywhere that takes sched_lock, take it last.
  */

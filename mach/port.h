@@ -23,8 +23,15 @@
  * exist there is just one global namespace (kernel_space).
  *
  * The header wire format is taken verbatim from Mach (the same layout
- * userspace will eventually see), so kernel-internal message passing
- * already uses the future syscall ABI.
+ * userspace receives through SYS_MSG_*), so kernel-internal message
+ * passing already uses the ring-3 syscall ABI.
+ *
+ * Wire structs below are ABI-stable: existing fields keep their offsets,
+ * new fields append, and the size is pinned by _Static_assert.  Reordering
+ * an existing field is forbidden -- any consumer compiled against an
+ * older layout (lib/style9_mach.o, future ring-3 mig stubs) silently
+ * misparses the field it thought it was reading.  Marked with WIRE FORMAT
+ * banners individually for grep-ability.
  *
  *   bits  24-byte mach_msg_header_t
  *	   { msgh_bits, msgh_size, msgh_remote, msgh_local, voucher, id }
@@ -106,8 +113,8 @@ typedef uint32_t	mach_port_name_t;
 /*
  * Copy semantics for OOL descriptors.  Real Mach also defines
  * VIRTUAL_COPY (zero) which uses VM remapping / COW; v1 only
- * implements PHYSICAL_COPY (memcpy into fresh frames).  A virtual
- * copy descriptor sent today is upgraded to a physical copy.
+ * implements PHYSICAL_COPY (memcpy into fresh frames).  A virtual-
+ * copy descriptor is upgraded to a physical copy at send time.
  */
 #define	MACH_MSG_VIRTUAL_COPY		0
 #define	MACH_MSG_PHYSICAL_COPY		1
@@ -119,6 +126,7 @@ typedef uint32_t	mach_port_name_t;
  */
 #define	MACH_MSG_OOL_MAX_BYTES		(1u << 20)	/* 1 MiB           */
 
+/* WIRE FORMAT.  ABI-stable. */
 struct mach_msg_header {
 	uint32_t		msgh_bits;
 	uint32_t		msgh_size;	/* total bytes incl header */
@@ -128,6 +136,7 @@ struct mach_msg_header {
 	uint32_t		msgh_id;	/* caller's protocol id     */
 };
 
+/* WIRE FORMAT.  ABI-stable. */
 struct mach_msg_body {
 	uint32_t		msgh_descriptor_count;
 };
@@ -138,6 +147,7 @@ struct mach_msg_body {
  * names match the v1 layout so all existing senders compile without
  * change -- only the in-memory layout differs.
  */
+/* WIRE FORMAT.  ABI-stable. */
 struct mach_msg_port_descriptor {
 	uint8_t			type;		/* == MACH_MSG_PORT_DESCRIPTOR */
 	uint8_t			disposition;
@@ -161,6 +171,7 @@ struct mach_msg_port_descriptor {
  * so the send rejects with E_INVAL.  Packed removes the alignment
  * requirement; x86_64 absorbs the uint64_t misaligned read.
  */
+/* WIRE FORMAT.  ABI-stable. */
 struct mach_msg_ool_descriptor {
 	uint8_t			type;		/* == MACH_MSG_OOL_DESCRIPTOR */
 	uint8_t			copy;		/* MACH_MSG_PHYSICAL_COPY     */
@@ -248,6 +259,7 @@ typedef int (*port_service_fn)(const struct mach_msg_header *req,
  * Reply payload for TASK_OP_GET_INFO.  Sits right after the
  * mach_msg_header in the reply message.
  */
+/* WIRE FORMAT.  ABI-stable. */
 struct task_info_reply {
 	uint64_t	tir_task_id;
 	uint32_t	tir_nthreads;
@@ -334,8 +346,9 @@ int			 port_mod_refs(struct port_space *,
  * reference, and installs it as a new name in `dst`.  This is the
  * primitive that lets a parent task hand a child task a way to talk
  * back to it: in real Mach the equivalent happens implicitly via
- * task ports + bootstrap server; we expose it directly so a parent
- * creating a child can wire up communication before the child runs.
+ * task ports + bootstrap server; the primitive is exposed directly
+ * so a parent creating a child can wire up communication before the
+ * child runs.
  *
  * Returns MACH_MSG_OK on success and writes the new name to
  * `dst_name_out`.  No effect on `src_name` (it keeps its SEND right).
@@ -352,6 +365,17 @@ int			 port_space_inject_send(struct port_space *src,
  * copy in the queued message.
  */
 int			 mach_msg_send(struct port_space *from,
+			    const struct mach_msg_header *msg);
+
+/*
+ * Like mach_msg_send, but flags the current thread as a trusted kernel
+ * sender for the duration of the call.  send_capture_ool then skips its
+ * user-VA range validation, permitting kernel rodata addresses in OOL
+ * descriptors.  Reserved for kernel-internal services that ship
+ * kernel-resident bytes back to a userspace caller (the "man" service
+ * is the canonical example).  Untrusted callers MUST use mach_msg_send.
+ */
+int			 mach_msg_send_trusted(struct port_space *from,
 			    const struct mach_msg_header *msg);
 
 /*

@@ -24,6 +24,9 @@
  * requested VAs (all U=1, with R/W/X mirroring p_flags), and returns
  * the entry RIP.  Each segment is recorded in task->t_map alongside
  * the hardware install into task->t_pmap.
+ *
+ * Layout below is imposed by the ELF64 specification; reordering fields
+ * desynchronises the parser from what the linker writes.
  */
 
 struct task;
@@ -44,6 +47,7 @@ struct task;
 #define	PF_W			(1u << 1)
 #define	PF_R			(1u << 2)
 
+/* WIRE FORMAT.  ELF64-imposed. */
 struct elf64_ehdr {
 	uint8_t		e_ident[16];
 	uint16_t	e_type;
@@ -61,6 +65,7 @@ struct elf64_ehdr {
 	uint16_t	e_shstrndx;
 };
 
+/* WIRE FORMAT.  ELF64-imposed. */
 struct elf64_phdr {
 	uint32_t	p_type;
 	uint32_t	p_flags;

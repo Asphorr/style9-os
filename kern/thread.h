@@ -12,6 +12,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "queue.h"
 #include "spinlock.h"
 
 struct task;
@@ -75,7 +76,17 @@ struct thread {
 
 	struct thread		*th_runq_link;		/* runqueue / waitq */
 	struct thread		*th_task_link;		/* task->t_threads  */
-	struct thread		*th_zombie_next;	/* reaper list      */
+	SLIST_ENTRY(thread)	 th_zombie_link;	/* zombie SLIST     */
+
+	/*
+	 * Trusted-send flag.  Toggled by mach_msg_send_trusted around a
+	 * send call that originates from kernel code shipping kernel-rodata
+	 * bytes through an OOL descriptor (e.g. the "man" service replying
+	 * with a man page).  When set, send_capture_ool skips its user-VA
+	 * range validation on the assumption the kernel knows what address
+	 * it is dereferencing.  Must NEVER be exposed to userspace.
+	 */
+	bool			 th_trusted_send;
 
 	/*
 	 * Timeout plumbing for mach_msg_recv_timed.  th_wake_deadline_ms

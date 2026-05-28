@@ -14,8 +14,8 @@
  * Time Stamp Counter: a free-running 64-bit cycle counter that has
  * existed on every x86 since the original Pentium.  Cheap to read
  * (rdtsc, 25-ish cycles), monotonic across CPL changes, but its
- * frequency is implementation-defined -- we calibrate against the PIT
- * once at boot and treat the result as constant thereafter.
+ * frequency is implementation-defined -- tsc_calibrate runs against
+ * the PIT once at boot and treats the result as constant thereafter.
  *
  * Calibration must run AFTER pit_init and AFTER sti, because it
  * advances the comparator by counting IRQ-driven PIT ticks.  Spinning

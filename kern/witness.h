@@ -17,13 +17,13 @@
  *
  *	Each spinlock has a "class" identified by its name pointer
  *	(spin_init's `name` arg, expected to be a static string -- two
- *	locks with the same literal address share a class).  Every time
- *	spin_lock is called, we record the edge "<every currently-held
- *	class> -> <new class>" in a global N x N bitmap.  If we are
- *	about to acquire C while holding H, and the bitmap already has
- *	the edge C -> H (i.e. somewhere earlier the kernel grabbed H
- *	while holding C), we are about to close a deadlock cycle --
- *	panic with the held stack so the offending pair is visible.
+ *	locks with the same literal address share a class).  Every
+ *	spin_lock records the edge "<every currently-held class> ->
+ *	<new class>" in a global N x N bitmap.  An acquire of C while
+ *	holding H, with the bitmap already carrying the edge C -> H
+ *	(i.e. some earlier acquire took H while holding C), closes a
+ *	deadlock cycle and panics with the held stack so the offending
+ *	pair is visible.
  *
  *	Nested same-class acquires (e.g. walking two different `struct
  *	thread`s, each with its own th_lock named "thread") are
@@ -34,12 +34,12 @@
  *
  * IRQ safety: every state mutation happens with IRQs disabled.  An
  * IRQ handler that itself takes a spinlock would otherwise race the
- * outer acquire's witness update.  The window is microscopic and we
- * are single-CPU, so spinlock + cli/sti is sufficient.
+ * outer acquire's witness update.  The window is microscopic and the
+ * kernel is single-CPU, so spinlock + cli/sti suffices.
  *
- * Disabled-by-default knob is intentional: turn it off in production
- * builds by removing the spin_lock hook calls.  We compile it in
- * unconditionally for now (the hobby kernel is its own debug build).
+ * Disabled-by-default knob is intentional: production builds can turn
+ * it off by removing the spin_lock hook calls.  The hobby kernel
+ * compiles it in unconditionally (the kernel is its own debug build).
  */
 
 struct spinlock;

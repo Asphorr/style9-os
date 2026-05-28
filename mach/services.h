@@ -23,14 +23,17 @@
  *
  * Boot-time wiring in services_init.
  *
- * Wire formats below are pinned by _Static_assert so a future ring-3
- * libc / sysctl shim can build against them without further coupling.
+ * Wire structs below are ABI-stable: existing fields keep their offsets,
+ * new fields append, and the size is pinned by _Static_assert.  Reordering
+ * an existing field breaks any consumer compiled against an older layout.
+ * Each is preceded by a WIRE FORMAT banner for grep-ability.
  */
 
 /* ---- "clock" service ---- */
 #define	SVC_CLOCK_NAME		"clock"
 #define	CLOCK_OP_GET		1
 
+/* WIRE FORMAT.  ABI-stable. */
 struct svc_clock_reply {
 	uint64_t	cr_uptime_ms;
 	uint64_t	cr_uptime_us;
@@ -44,6 +47,7 @@ _Static_assert(sizeof(struct svc_clock_reply) == 24,
 #define	SVC_STATS_NAME		"stats"
 #define	STATS_OP_GET		1
 
+/* WIRE FORMAT.  ABI-stable. */
 struct svc_stats_reply {
 	uint64_t	sr_pmm_used_pages;
 	uint64_t	sr_kmem_cached_pages;
@@ -64,6 +68,7 @@ _Static_assert(sizeof(struct svc_stats_reply) == 56,
 #define	SVC_TASKS_MAX		16
 #define	SVC_TASKS_NAME_MAX	24
 
+/* WIRE FORMAT.  ABI-stable. */
 struct svc_tasks_entry {
 	uint64_t	te_task_id;
 	uint32_t	te_nthreads;
@@ -74,6 +79,7 @@ struct svc_tasks_entry {
 _Static_assert(sizeof(struct svc_tasks_entry) == 40,
     "svc_tasks_entry must be 40 bytes (wire format)");
 
+/* WIRE FORMAT.  ABI-stable. */
 struct svc_tasks_reply {
 	uint32_t		tr_count;
 	uint32_t		tr_pad;
@@ -83,6 +89,35 @@ struct svc_tasks_reply {
 _Static_assert(sizeof(struct svc_tasks_reply) ==
     8 + SVC_TASKS_MAX * sizeof(struct svc_tasks_entry),
     "svc_tasks_reply layout pinned");
+
+/* ---- "man" service ---- */
+/*
+ * Manual-page registry.  Holds a small static table of embedded
+ * mdoc-rendered text blobs (built from docs/man/*.9 via the Makefile
+ * mandoc pipeline).  Op MAN_OP_GET takes the page name in the inline
+ * body and ships the rendered text back as a single OOL descriptor.
+ *
+ * Wire format (request):
+ *	mach_msg_header	(msgh_id = MAN_OP_GET, msgh_size = header + body)
+ *	body bytes	NUL-terminated short name (e.g. "port"), <= 32 chars
+ *
+ * Wire format (reply, success):
+ *	mach_msg_header	(MACH_MSGH_BITS_COMPLEX)
+ *	mach_msg_body	(descriptor_count = 1)
+ *	mach_msg_ool_descriptor	(PHYSICAL_COPY, points at receiver VA)
+ *
+ * Wire format (reply, not found):
+ *	mach_msg_header	(no COMPLEX bit, msgh_id = MAN_NOT_FOUND)
+ *
+ * Pages are auto-rendered at build time via `mandoc -Tutf8 | col -b`
+ * (no backspace overstrike) and embedded as ld -b binary blobs.
+ * Adding a new page = drop docs/man/<name>.9 on disk and register it
+ * by name in mach/services.c.
+ */
+#define	SVC_MAN_NAME		"man"
+#define	MAN_OP_GET		1
+#define	MAN_NOT_FOUND		0xFFFFFFFFu
+#define	MAN_NAME_MAX		32
 
 /* ---- "echool" service ---- */
 /*

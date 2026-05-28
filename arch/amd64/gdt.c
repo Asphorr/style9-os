@@ -40,10 +40,12 @@ struct gdt_ptr {
 static struct gdt_ptr	gdtr;
 
 /*
- * 64-bit TSS.  Only RSP0 is meaningful today (used by the CPU when an
- * interrupt or exception promotes us from ring 3 to ring 0).  The IST
- * fields stay zero; when we want per-IRQ stacks they slot in here.
+ * 64-bit TSS.  Only RSP0 is consumed (the CPU loads it when an interrupt
+ * or exception promotes from ring 3 to ring 0); IST stays zero until
+ * per-IRQ stacks are introduced.  Layout below is imposed by Intel SDM
+ * Vol 3 -- reordering desynchronises the CPU's hardware load.
  */
+/* WIRE FORMAT.  Intel SDM Vol 3 imposed. */
 struct tss {
 	uint32_t	reserved0;
 	uint64_t	rsp0;

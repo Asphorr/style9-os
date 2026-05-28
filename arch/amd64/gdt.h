@@ -25,9 +25,9 @@
  *
  * STAR is therefore programmed with [47:32]=0x08 and [63:48]=0x18.
  *
- * The TSS exists so a #PF/#GP/IRQ delivered while we are in ring 3
- * lands on the per-task RSP0 the scheduler installs there, rather
- * than continuing on the user stack.
+ * The TSS exists so a #PF/#GP/IRQ delivered while a thread is in
+ * ring 3 lands on the per-task RSP0 the scheduler installs there,
+ * rather than continuing on the user stack.
  */
 
 #define	GDT_NULL		0x00

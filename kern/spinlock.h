@@ -21,9 +21,9 @@
  *
  * The holder fields are purely diagnostic; spin_lock records the call
  * site so that a hang or a SPINLOCK_ASSERT_HELD failure can pinpoint
- * which routine last touched it.  Single-CPU today, but the structure
- * is set up so adding a per-CPU id and a WITNESS-style lock-order
- * checker later is additive rather than disruptive.
+ * which routine last touched it.  Single-CPU.  The struct is shaped
+ * so a per-CPU id is additive; the WITNESS-style lock-order check
+ * itself has already landed in kern/witness.h.
  *
  * Static initialiser:  static struct spinlock x = SPINLOCK_INIT("x");
  * Dynamic init:        spin_init(&lock, "name");

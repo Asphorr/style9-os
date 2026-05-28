@@ -16,11 +16,15 @@
  *
  * On entry from the loader %ebx points at a hvm_start_info structure
  * placed somewhere below 4 GiB.  All embedded pointers are physical
- * and also below 4 GiB; we read them via the identity map.
+ * and also below 4 GiB; the identity map serves the reads.
+ *
+ * Layout is imposed by the Xen PVH boot ABI; reordering fields
+ * desynchronises the parser from what the loader writes.
  */
 
 #define	PVH_START_MAGIC		0x336EC578U	/* HVM_START_MAGIC_VALUE */
 
+/* WIRE FORMAT.  Xen PVH-imposed. */
 struct pvh_start_info {
 	uint32_t	psi_magic;
 	uint32_t	psi_version;
@@ -34,6 +38,7 @@ struct pvh_start_info {
 	uint32_t	psi_reserved;
 } __attribute__((packed));
 
+/* WIRE FORMAT.  Xen PVH-imposed. */
 struct pvh_memmap_entry {
 	uint64_t	pme_base;
 	uint64_t	pme_length;

@@ -26,8 +26,10 @@
  *	KLOG_OP_WRITE  -- append a line (payload = klog_write_request)
  *	KLOG_OP_TAIL   -- read the last entries (reply = klog_tail_reply)
  *
- * The wire formats below are pinned by _Static_assert so layouts stay
- * stable across the kernel/userland boundary.
+ * Wire structs below are ABI-stable: existing fields keep their offsets,
+ * new fields append, and the size is pinned by _Static_assert.  Reordering
+ * an existing field breaks any consumer compiled against an older layout.
+ * Each is preceded by a WIRE FORMAT banner for grep-ability.
  */
 
 #define	KLOG_LEVEL_DEBUG	1
@@ -40,6 +42,7 @@
 #define	KLOG_RING_ENTRIES	128	/* ~16 KiB of ring             */
 #define	KLOG_TAIL_BATCH		16	/* max entries per TAIL reply  */
 
+/* WIRE FORMAT.  ABI-stable. */
 struct klog_entry {
 	uint64_t	ke_uptime_ms;
 	uint32_t	ke_seq;
@@ -59,6 +62,7 @@ _Static_assert(sizeof(struct klog_entry) == 8 + 4 + 1 + 3 +
 #define	KLOG_OP_WRITE		1
 #define	KLOG_OP_TAIL		2
 
+/* WIRE FORMAT.  ABI-stable. */
 struct klog_write_request {
 	uint8_t		kwr_level;
 	uint8_t		kwr_pad[7];
@@ -70,6 +74,7 @@ _Static_assert(sizeof(struct klog_write_request) ==
     8 + KLOG_SRC_MAX + KLOG_LINE_MAX,
     "klog_write_request layout pinned");
 
+/* WIRE FORMAT.  ABI-stable. */
 struct klog_tail_reply {
 	uint32_t		ktr_count;
 	uint32_t		ktr_pad;

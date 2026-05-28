@@ -168,6 +168,22 @@ typedef uint32_t		mach_port_name_t;
 #define	MACH_TIMEOUT_NONE		((uint64_t)0)
 #define	MACH_TIMEOUT_FOREVER		((uint64_t)~0ull)
 
+/*
+ * Wire structs below mirror the kernel-side declarations in mach/port.h,
+ * mach/bootstrap.h, dev/dev_proto.h, and mach/services.h.  They MUST stay
+ * byte-identical: a field offset that disagrees between this header and
+ * the kernel declaration silently misparses the on-wire layout, because
+ * the compiled lib/style9_*.o objects read the field at THIS file's
+ * offset.  The 2026-05-28 OOL bring-up bug was exactly this drift -- a
+ * descriptor field reordered kernel-side, lib/style9_mach.o left stale
+ * by missing Makefile dep tracking, userspace reading the wrong byte.
+ *
+ * Edit kernel-side first, edit here second, verify _Static_assert sizes
+ * match across the boundary.  Each struct is preceded by a WIRE FORMAT
+ * banner for grep-ability.
+ */
+
+/* WIRE FORMAT.  Mirrors mach/port.h. */
 struct mach_msg_header {
 	uint32_t		msgh_bits;
 	uint32_t		msgh_size;
@@ -177,10 +193,12 @@ struct mach_msg_header {
 	uint32_t		msgh_id;
 };
 
+/* WIRE FORMAT.  Mirrors mach/port.h. */
 struct mach_msg_body {
 	uint32_t		msgh_descriptor_count;
 };
 
+/* WIRE FORMAT.  Mirrors mach/port.h. */
 struct mach_msg_port_descriptor {
 	uint8_t			type;		/* == MACH_MSG_PORT_DESCRIPTOR */
 	uint8_t			disposition;
@@ -196,6 +214,7 @@ struct mach_msg_port_descriptor {
  * read as a bogus port descriptor.  See mach/port.h for the full
  * rationale.
  */
+/* WIRE FORMAT.  Mirrors mach/port.h. */
 struct mach_msg_ool_descriptor {
 	uint8_t			type;		/* == MACH_MSG_OOL_DESCRIPTOR */
 	uint8_t			copy;		/* MACH_MSG_PHYSICAL_COPY     */
@@ -205,12 +224,13 @@ struct mach_msg_ool_descriptor {
 	uint64_t		address;	/* sender VA / receiver VA     */
 } __attribute__((packed));
 
-/* Op codes the kernel exposes today on its well-known ports. */
+/* Op codes the kernel exposes on its well-known ports. */
 #define	TASK_OP_GET_INFO		1
 #define	BOOTSTRAP_OP_LOOKUP		1
 #define	BOOTSTRAP_REPLY_NOT_FOUND	0xFFFFFFFFu
 #define	BOOTSTRAP_NAME_MAX		32
 
+/* WIRE FORMAT.  Mirrors mach/port.h. */
 struct task_info_reply {
 	uint64_t	tir_task_id;
 	uint32_t	tir_nthreads;
@@ -218,6 +238,7 @@ struct task_info_reply {
 	char		tir_name[32];
 };
 
+/* WIRE FORMAT.  Mirrors mach/bootstrap.h. */
 struct bootstrap_lookup_request {
 	char	blr_name[BOOTSTRAP_NAME_MAX];
 };
@@ -239,8 +260,8 @@ int		mach_msg_rpc(struct mach_msg_header *req,
 /*
  * One-shot bootstrap lookup helper.  Builds the request, RPCs it to
  * MACH_PORT_BOOTSTRAP, returns the SEND name the kernel handed back
- * in our space.  Returns MACH_PORT_NULL if the service is not
- * registered (or any error occurred).  The caller must
+ * in the caller's space.  Returns MACH_PORT_NULL if the service is
+ * not registered (or any error occurred).  The caller must
  * mach_port_deallocate() the returned name when done.
  */
 mach_port_name_t bootstrap_lookup(const char *service);
@@ -264,18 +285,21 @@ mach_port_name_t bootstrap_lookup(const char *service);
 #define	DEV_NAME_MAX		16
 #define	DEV_WRITE_MAX		256
 
+/* WIRE FORMAT.  Mirrors dev/dev_proto.h. */
 struct dev_info_reply {
 	char		dir_name[DEV_NAME_MAX];
 	uint32_t	dir_kind;
 	uint32_t	dir_flags;
 };
 
+/* WIRE FORMAT.  Mirrors dev/dev_proto.h. */
 struct dev_write_request {
 	uint32_t	dwr_len;
 	uint32_t	dwr_pad;
 	uint8_t		dwr_data[DEV_WRITE_MAX];
 };
 
+/* WIRE FORMAT.  Mirrors dev/dev_proto.h. */
 struct dev_write_reply {
 	int32_t		dwr_rv;
 	uint32_t	dwr_written;
@@ -311,6 +335,7 @@ ssize_t		 dev_write(const char *short_name,
 #define	SVC_CLOCK_NAME		"clock"
 #define	CLOCK_OP_GET		1
 
+/* WIRE FORMAT.  Mirrors mach/services.h. */
 struct svc_clock_reply {
 	uint64_t	cr_uptime_ms;
 	uint64_t	cr_uptime_us;
@@ -320,6 +345,7 @@ struct svc_clock_reply {
 #define	SVC_STATS_NAME		"stats"
 #define	STATS_OP_GET		1
 
+/* WIRE FORMAT.  Mirrors mach/services.h. */
 struct svc_stats_reply {
 	uint64_t	sr_pmm_used_pages;
 	uint64_t	sr_kmem_cached_pages;
@@ -335,6 +361,7 @@ struct svc_stats_reply {
 #define	SVC_TASKS_MAX		16
 #define	SVC_TASKS_NAME_MAX	24
 
+/* WIRE FORMAT.  Mirrors mach/services.h. */
 struct svc_tasks_entry {
 	uint64_t	te_task_id;
 	uint32_t	te_nthreads;
@@ -342,6 +369,7 @@ struct svc_tasks_entry {
 	char		te_name[SVC_TASKS_NAME_MAX];
 };
 
+/* WIRE FORMAT.  Mirrors mach/services.h. */
 struct svc_tasks_reply {
 	uint32_t		tr_count;
 	uint32_t		tr_pad;
@@ -350,5 +378,23 @@ struct svc_tasks_reply {
 
 #define	SVC_ECHOOL_NAME		"echool"
 #define	ECHOOL_OP_CHECKSUM	1
+
+#define	SVC_MAN_NAME		"man"
+#define	MAN_OP_GET		1
+#define	MAN_NOT_FOUND		0xFFFFFFFFu
+#define	MAN_NAME_MAX		32
+
+/*
+ * man_fetch: ask the kernel "man" service for the rendered text of the
+ * named page (e.g. "port" for port.9).  On success returns MACH_MSG_OK
+ * and writes the buffer address + length to *out_text and *out_len; the
+ * buffer is an OOL-installed range in the caller's vm_map, owned by the
+ * caller's task and freed at task exit (no munmap exists yet).
+ *
+ * Returns MACH_E_NAME if no such page is registered, or any MACH_E_*
+ * propagated from the underlying RPC.
+ */
+int		 man_fetch(const char *name, const char **out_text,
+		    size_t *out_len);
 
 #endif /* !_STYLE9_H_ */

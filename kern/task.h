@@ -17,10 +17,10 @@
 /*
  * Mach-style task: the resource container.
  *
- * A task owns an address space (later -- everything shares the kernel
- * address space for now), a port name space, and the set of threads
- * scheduled within it.  A thread always belongs to exactly one task,
- * but a task may have zero, one, or many threads.
+ * A task owns a per-task address space (t_pmap + t_map), a port name
+ * space, and the set of threads scheduled within it.  A thread always
+ * belongs to exactly one task, but a task may have zero, one, or many
+ * threads.
  *
  * The split between task and thread is deliberate: unlike UNIX where
  * fork() conflates resource container and execution unit, here you

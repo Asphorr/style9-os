@@ -14,9 +14,9 @@
  * Intel 8253 / 8254 Programmable Interval Timer.
  *
  * Channel 0 is wired to IRQ0 on the master 8259 (vector 32 after the
- * project's pic_init remap).  We programme it in rate-generator mode
- * with the divisor that produces the requested hz, then install a
- * handler that simply increments a monotonic tick counter.  Read with
+ * project's pic_init remap).  pit_init programmes it in rate-generator
+ * mode with the divisor that produces the requested hz, then installs
+ * a handler that increments a monotonic tick counter.  Read with
  * pit_ticks().
  *
  *	PIT_INPUT_HZ	the canonical 1.193182 MHz input clock; divisor

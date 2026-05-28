@@ -16,13 +16,13 @@
  * shell_run reads characters from the keyboard ring buffer, builds a
  * line in a fixed-size buffer, and on '\n' splits the line into argv
  * tokens and dispatches through the command table in cmds.c.  The
- * buffer is static (kmem-free hot path) so we can stress-test the
- * memory subsystem from inside the shell without the parser itself
+ * buffer is static (kmem-free hot path) so the memory subsystem can
+ * be stress-tested from inside the shell without the parser itself
  * being a confounder.
  *
  * The command table is shell_cmds[] / shell_ncmds in cmds.c.  Each
  * command returns an int -- 0 == success, non-zero printed as "error
- * N" but otherwise unused for now.
+ * N" but otherwise unused.
  */
 
 #define	SHELL_LINE_MAX	256

@@ -24,7 +24,7 @@
  * The shell (or any other consumer holding the RECEIVE right) reads
  * keys with mach_msg_recv_block(kernel_space, kbd_input_port, ...).
  * Multiple consumers are possible in principle but only one can hold
- * RECEIVE at a time; for now the shell is the sole reader.
+ * RECEIVE at a time; the shell is the sole reader.
  *
  * The msg id space:
  *	1..0xFF		one ASCII byte in the low octet

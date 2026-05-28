@@ -67,10 +67,10 @@ long	syscall_dispatch(struct syscall_frame *);
 
 /*
  * Per-thread bookkeeping the scheduler keeps in sync with the entry
- * stub: each time we are about to run a ring-3 thread, sched stores
- * that thread's kernel-stack top into `syscall_kernel_rsp` so the
- * stub knows where to switch on the next syscall.  Also stamped into
- * the TSS (for IRQ/exception ring-transition).
+ * stub: each time a ring-3 thread is about to run, sched stores that
+ * thread's kernel-stack top into `syscall_kernel_rsp` so the stub
+ * knows where to switch on the next syscall.  Also stamped into the
+ * TSS (for IRQ/exception ring-transition).
  */
 extern uint64_t	syscall_kernel_rsp;
 
