@@ -148,8 +148,13 @@ LIB_OBJS = \
 $(OBJDIR)/crt0.o: $(LIB_DIR)/crt0.S | $(OBJDIR)
 	$(CC) $(USER_ASFLAGS) -c $< -o $@
 
+# -MMD generates a .d sidecar so edits to lib/style9.h trigger user-
+# library rebuilds; without it the lib/*.o land in obj/ with no header
+# dependency, and changing a struct layout in style9.h leaves the kernel
+# rebuilt but the user libs stale -- yielding mismatched wire format on
+# every IPC the kernel and ring-3 exchange.
 $(OBJDIR)/style9_%.o: $(LIB_DIR)/style9_%.c | $(OBJDIR)
-	$(CC) $(USER_CFLAGS) -c $< -o $@
+	$(CC) $(USER_CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 # List the user programs in the registry.  Each must have a matching
 # user/<name>.c file; everything else is wired up via the pattern rules
@@ -159,7 +164,7 @@ $(OBJDIR)/style9_%.o: $(LIB_DIR)/style9_%.c | $(OBJDIR)
 USER_PROGRAMS = hello clock tasks sh
 
 $(OBJDIR)/%.user.o: $(USER_DIR)/%.c | $(OBJDIR)
-	$(CC) $(USER_CFLAGS) -c $< -o $@
+	$(CC) $(USER_CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(OBJDIR)/%.elf: $(OBJDIR)/%.user.o $(LIB_OBJS) $(USER_DIR)/user.ld
 	$(LD) $(USER_LDFLAGS) -o $@ $(LIB_OBJS) $(OBJDIR)/$*.user.o
@@ -219,8 +224,12 @@ $(OBJDIR)/%.o: %.S | $(OBJDIR)
 	$(CC) $(ASFLAGS) $(DEPFLAGS) -c $< -o $@
 
 # Pull in the auto-generated .d files.  The leading '-' so a missing
-# file (first build, or post-clean) is silent rather than fatal.
+# file (first build, or post-clean) is silent rather than fatal.  Cover
+# kernel objects, libstyle9 objects, and per-program .user.o objects so
+# header edits trigger the matching rebuilds everywhere.
 -include $(OBJS:.o=.d)
+-include $(LIB_OBJS:.o=.d)
+-include $(addsuffix .d,$(addprefix $(OBJDIR)/,$(USER_PROGRAMS:=.user)))
 
 $(OBJDIR):
 	mkdir -p $(OBJDIR)
