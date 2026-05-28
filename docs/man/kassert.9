@@ -1,0 +1,229 @@
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 The Hobby OS Project
+.\" All rights reserved.
+.\"
+.Dd May 28, 2026
+.Dt KASSERT 9
+.Os style9-os
+.
+.Sh NAME
+.Nm KASSERT ,
+.Nm panic ,
+.Nm kassert_fail ,
+.Nm panic_in_progress
+.Nd kernel invariant and unrecoverable-fault primitives
+.
+.Sh SYNOPSIS
+.In panic.h
+.Pp
+.Fn KASSERT "expr" "const char *msg"
+.Ft void
+.Fn panic "const char *fmt" "..."
+.Ft void
+.Fn kassert_fail "const char *cond" "const char *file" "int line" "const char *msg"
+.Ft void
+.Fn backtrace_print "uintptr_t rbp" "int max_frames"
+.Pp
+.Ft "extern volatile bool"
+.Va panic_in_progress ;
+.
+.Sh DESCRIPTION
+.Nm style9-os
+ships three diagnostic primitives, ordered by severity:
+.Bl -tag -width "kassert_fail"
+.It Fn KASSERT cond msg
+Compile-time-inlined invariant check.
+If
+.Fa cond
+evaluates to zero the macro calls
+.Fn kassert_fail
+with the textual condition, the source file and line, and
+.Fa msg ;
+.Fn kassert_fail
+prints the location and message, walks the frame-pointer chain to
+emit a backtrace, and panics.
+.It Fn panic fmt ...
+Hard stop.
+Emits the formatted message, walks the frame-pointer chain via
+.Fn backtrace_print ,
+sets
+.Va panic_in_progress ,
+and halts.
+Marked
+.Sy noreturn .
+.It Fn backtrace_print rbp max_frames
+Walk up to
+.Fa max_frames
+stack frames starting from the supplied RBP.
+Each frame is symbolicated against
+.Va __ksymtab .
+The trap dispatcher passes the faulting context's RBP rather than the
+dispatcher's own so the trace starts where the user wants it to.
+.El
+.
+.Sh PHILOSOPHY
+.Nm style9-os
+follows the classic BSD bar: ship thousands of
+.Fn KASSERT
+calls.
+One missed invariant in production is worth more than every
+assertion's cycle cost.
+.Pp
+KASSERTs compile down to a CMP plus a conditional branch on the cold
+path; the cost in the hot path is one byte and one tested flag.
+The kernel is its own debug build -- KASSERT, WITNESS
+.Pq Xr witness 9 ,
+the kmem red zones, and the freelist poison ship in the same binary,
+without an
+.Sy DEBUG
+gate.
+.Pp
+When in doubt, write the KASSERT.
+.Em Wrong KASSERTs
+get fixed the first time the kernel boots; missing ones can sit silent
+for months and surface as inscrutable corruption.
+.
+.Sh WHEN TO USE EACH
+.Bl -tag -width "kprintf"
+.It Fn KASSERT cond msg
+Any invariant the code relies on but cannot enforce via types.
+Examples: this list is non-empty here; the holder field matches us; phys
+is page-aligned; queue head equals tail iff size is zero; the state
+machine is in the expected source state.
+.It Fn panic fmt
+Unrecoverable conditions that are not invariant violations: corrupt boot
+info, missing required hardware, exhausted resource that the kernel
+cannot fall back on
+.Pq e.g. PMM out of pages during early bring-up .
+.It Fn kprintf fmt
+.Pq Xr kprintf 9
+One-shot diagnostic prints from a working code path.
+Not for
+.Dq noisy normal :
+rate-limit at the source, or expose a counter that
+.Xr ddb 9
+can dump on demand.
+.El
+.Pp
+There is no
+.Fn kwarn ,
+.Fn printf_once ,
+or rate-limited logger.
+If a path is suspicious enough to log, it is suspicious enough to either
+KASSERT or to be reported via a one-shot bring-up banner.
+.
+.Sh PANIC PATH MODULES
+Modules that may run on the panic path
+.Pq Xr tty 9 , Xr dbgcon 9 , Xr uart 9
+consult
+.Va panic_in_progress
+and bypass any synchronisation that would otherwise self-deadlock
+against an outer caller already holding the relevant lock.
+Pattern:
+.Bd -literal -offset indent
+if (panic_in_progress) {
+	/* unlocked fast path -- just emit the byte */
+} else {
+	spin_lock(&tty_lock);
+	/* ... */
+	spin_unlock(&tty_lock);
+}
+.Ed
+.
+.Sh EXAMPLES
+Pre-condition check at the top of a function:
+.Bd -literal -offset indent
+void
+list_push(struct list *l, struct item *it)
+{
+	KASSERT(l != NULL, "null list");
+	KASSERT(it != NULL, "null item");
+	KASSERT(it->next == NULL, "item already linked");
+	it->next = l->head;
+	l->head = it;
+}
+.Ed
+.Pp
+State-machine transition guard:
+.Bd -literal -offset indent
+KASSERT(t->th_state == TH_RUNNING,
+    "transition out of RUNNING from wrong state");
+t->th_state = TH_BLOCKED;
+.Ed
+.Pp
+Unrecoverable resource exhaustion at boot:
+.Bd -literal -offset indent
+kernel_task = task_create("kernel");
+if (kernel_task == NULL)
+	panic("task_subsystem_init: kernel_task allocation failed");
+.Ed
+.
+.Sh ANTI-PATTERNS
+.Bl -tag -width "if (DEBUG)"
+.It Sy if (DEBUG) KASSERT(...)
+KASSERTs are unconditional in
+.Nm style9-os .
+Do not gate them.
+.It Sy KASSERT on user-supplied input
+KASSERT is for invariants the kernel maintains, not for things the
+caller could violate.
+A user pointer outside the user-VA window is checked with
+.Fn user_range_ok
+and returns
+.Dv SYS_E_FAULT ;
+it is not a KASSERT.
+.It Sy panic on recoverable failure
+.Fn kmalloc
+returning
+.Dv NULL
+on a runtime path is recoverable: return the appropriate per-subsystem
+error
+.Pq Dv MACH_E_NOMEM , Dv SYS_E_NOMEM .
+Panicking on every allocation failure makes the kernel fragile.
+.It Sy KASSERT on a slow predicate
+The KASSERT is on the hot path; the predicate must be O(1).
+.Dq Validate the entire vm_map for consistency
+is not a KASSERT, it is a
+.Xr ddb 9
+command.
+.El
+.
+.Sh OUTPUT FORMAT
+A
+.Fn KASSERT
+failure produces:
+.Bd -literal -offset indent
+KASSERT failed:
+  cond  cur->vme_end > cur->vme_start
+  file  kern/vm.c:218
+  msg   vm_map_entry has zero extent
+panic: assertion
+[ 0] panic+0x4a
+[ 1] kassert_fail+0x2c
+[ 2] vm_map_remove+0xb1
+[ 3] sys_vm_deallocate+0x55
+[ 4] syscall_dispatch+0x9e
+[ 5] syscall_entry+0x21
+.Ed
+.Pp
+.Fn panic
+produces the same trailing backtrace with the formatted panic message
+in place of the KASSERT block.
+.
+.Sh SEE ALSO
+.Xr ddb 9 ,
+.Xr kprintf 9 ,
+.Xr witness 9
+.
+.Sh HISTORY
+.Fn KASSERT
+and
+.Fn panic
+have been part of
+.Nm style9-os
+since the debug-infrastructure arc landed on May 27, 2026.
+.
+.Sh AUTHORS
+.An -nosplit
+.An The style9-os project .

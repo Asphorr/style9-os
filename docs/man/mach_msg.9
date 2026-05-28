@@ -1,0 +1,255 @@
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 The Hobby OS Project
+.\" All rights reserved.
+.\"
+.Dd May 28, 2026
+.Dt MACH_MSG 9
+.Os style9-os
+.
+.Sh NAME
+.Nm mach_msg_send ,
+.Nm mach_msg_recv ,
+.Nm mach_msg_recv_timed ,
+.Nm mach_msg_rpc
+.Nd transfer Mach messages between port spaces
+.
+.Sh SYNOPSIS
+.In style9.h
+.Pp
+.Ft int
+.Fn mach_msg_send "const struct mach_msg_header *msg"
+.Ft int
+.Fn mach_msg_recv "mach_port_name_t name" "struct mach_msg_header *buf" "size_t buf_size"
+.Ft int
+.Fn mach_msg_recv_timed "mach_port_name_t name" "struct mach_msg_header *buf" "size_t buf_size" "uint64_t timeout_ms"
+.Ft int
+.Fn mach_msg_rpc "struct mach_msg_header *req" "struct mach_msg_header *reply" "size_t reply_size" "uint64_t timeout_ms"
+.
+.Sh DESCRIPTION
+The
+.Nm mach_msg
+family ships messages between Mach
+.Em port spaces .
+Every task carries one port space; the well-known names
+.Dv MACH_PORT_TASK_SELF
+and
+.Dv MACH_PORT_BOOTSTRAP
+are populated at task creation.
+See
+.Xr port 9
+for the wire format and the underlying rights model.
+.Pp
+.Fn mach_msg_send
+copies the header and body addressed by
+.Fa msg
+into a kernel-side message, validates and translates every descriptor,
+and either queues the message at the destination port or hands it
+synchronously to the port's special-port dispatcher.
+.Pp
+.Fn mach_msg_recv
+blocks until a message is available at
+.Fa name
+.Pq a Dv RECEIVE Ns "-rights" name or a port-set name ,
+then copies header + body into
+.Fa buf .
+The receive translates every descriptor: port descriptors land at fresh
+names in the receiver's space; OOL descriptors land at fresh user-VA
+ranges installed in the receiver's
+.Em vm_map
+.Pq see Xr vm_allocate 9 .
+.Pp
+.Fn mach_msg_recv_timed
+is the same primitive bounded by
+.Fa timeout_ms
+milliseconds.
+A timeout of
+.Dv MACH_TIMEOUT_NONE
+.Pq zero
+makes the call a non-blocking poll;
+.Dv MACH_TIMEOUT_FOREVER
+makes it identical to
+.Fn mach_msg_recv .
+.Pp
+.Fn mach_msg_rpc
+is the convenience wrapper for request/reply round-trips: the kernel
+allocates a fresh reply port, splices it into
+.Fa req Ns 's
+.Va msgh_local
+.Pq preserving Dv MACH_MSGH_BITS_COMPLEX No so body descriptors survive ,
+sends, receives the reply into
+.Fa reply
+with a
+.Fa timeout_ms
+bound, and deallocates the reply port before returning.
+Special-port destinations
+.Pq task_self, bootstrap, kernel services
+short-circuit the queue and reply synchronously into the caller's
+reply buffer.
+.
+.Sh MESSAGE STRUCTURE
+The minimum send is a bare header:
+.Bd -literal -offset indent
+struct mach_msg_header {
+    uint32_t          msgh_bits;
+    uint32_t          msgh_size;
+    mach_port_name_t  msgh_remote;
+    mach_port_name_t  msgh_local;
+    uint32_t          msgh_voucher;
+    uint32_t          msgh_id;
+};
+.Ed
+.Pp
+.Va msgh_bits
+encodes the disposition of the remote (destination) and local
+.Pq reply
+names: the low byte holds the remote disposition, the next byte the
+local; the high bit is
+.Dv MACH_MSGH_BITS_COMPLEX
+and indicates a body follows.
+.Pp
+A complex message follows the header with a
+.Vt mach_msg_body
+.Pq one uint32_t descriptor count
+then a variable-stride descriptor area.
+Byte 0 of every descriptor is the type tag
+.Pq Dv MACH_MSG_PORT_DESCRIPTOR No or Dv MACH_MSG_OOL_DESCRIPTOR ;
+the walker dispatches on it and advances by the descriptor's size.
+.
+.Sh IMPLEMENTATION NOTES
+A send to a port tagged
+.Em special
+.Pq task_self, bootstrap, or any Dv PORT_SPECIAL_SERVICE No port
+does not queue: the kernel runs the per-tag dispatcher synchronously
+in the sender's thread context, and the reply is delivered to
+.Va msgh_local
+inline.
+.Fn mach_msg_rpc
+exploits this to avoid an enqueue + scheduler hop for the common
+case of
+.Dq ask a kernel service a question and get an answer .
+.Pp
+OOL descriptors carry bulk memory.
+On send, the kernel copies the sender's bytes into a kmalloc'd
+staging buffer; on recv, fresh frames are allocated and the staging
+bytes are materialised at a fresh receiver-side VA range.
+The
+.Em deallocate
+bit on the descriptor asks the kernel to
+.Fn vm_map_release
+the sender's source range after the copy
+.Pq see Xr vm_allocate 9 .
+.Pp
+Port descriptors carry capabilities.
+A
+.Dv MAKE_SEND
+disposition on a name the sender holds
+.Dv RECEIVE
+on creates a fresh
+.Dv SEND
+right in the receiver's space; a
+.Dv MOVE_RECEIVE
+transfers the
+.Dv RECEIVE
+right so the original sender keeps only a
+.Dv SEND
+back.
+The full disposition table lives in
+.Xr port 9 .
+.
+.Sh RETURN VALUES
+All four functions return
+.Dv MACH_MSG_OK
+on success, or a negative
+.Dv MACH_E_*
+code on failure.
+.
+.Sh EXAMPLES
+Lookup a service and call into it:
+.Bd -literal -offset indent
+mach_port_name_t svc = bootstrap_lookup("clock");
+if (svc == MACH_PORT_NULL)
+	return MACH_E_NAME;
+
+struct {
+	struct mach_msg_header	hdr;
+} req;
+struct {
+	struct mach_msg_header	hdr;
+	struct svc_clock_reply	body;
+} reply;
+
+req.hdr.msgh_bits	= MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+req.hdr.msgh_size	= sizeof(req);
+req.hdr.msgh_remote	= svc;
+req.hdr.msgh_local	= MACH_PORT_NULL;
+req.hdr.msgh_voucher	= 0;
+req.hdr.msgh_id		= CLOCK_OP_GET;
+
+int rv = mach_msg_rpc(&req.hdr, &reply.hdr, sizeof(reply), 1000);
+(void)mach_port_deallocate(svc);
+if (rv == MACH_MSG_OK)
+	printf("uptime %llu ms\\n", reply.body.cr_uptime_ms);
+.Ed
+.Pp
+Non-blocking poll for a notification:
+.Bd -literal -offset indent
+struct mach_msg_header note;
+int rv = mach_msg_recv_timed(notify_port, &note, sizeof(note), 0);
+if (rv == MACH_E_TIMEOUT)
+	/* no message right now */;
+.Ed
+.
+.Sh ERRORS
+.Bl -tag -width "MACH_E_TOOSMALL"
+.It Dv MACH_E_INVAL
+malformed header or body
+.Pq bad size, bad descriptor type, descriptor area larger than the message size .
+.It Dv MACH_E_NAME
+.Fa msgh_remote ,
+.Fa msgh_local ,
+or
+.Fa name
+does not exist in the caller's port space.
+.It Dv MACH_E_RIGHT
+the named name exists but does not carry the right the operation needs
+.Pq e.g. Dv RECEIVE No required, only Dv SEND No present .
+.It Dv MACH_E_DEAD
+the destination port has been destroyed.
+.It Dv MACH_E_NOSPACE
+the destination's queue is full and the send did not wait, or the
+caller's name table is full.
+.It Dv MACH_E_NOMSG
+.Fn mach_msg_recv
+called on an empty queue with no waiter slot available
+.Pq Fn mach_msg_recv_block No blocks instead .
+.It Dv MACH_E_TOOSMALL
+.Fa buf_size
+.Pq or Fa reply_size
+is smaller than the message the kernel wants to deliver.
+.It Dv MACH_E_NOMEM
+kmalloc failed during message copy-in.
+.It Dv MACH_E_TIMEOUT
+.Fn mach_msg_recv_timed
+or
+.Fn mach_msg_rpc
+expired before a message arrived.
+.El
+.
+.Sh SEE ALSO
+.Xr port 9 ,
+.Xr vm_allocate 9
+.
+.Sh HISTORY
+The
+.Nm mach_msg
+surface has been part of
+.Nm style9-os
+since the Mach IPC bring-up.
+OOL descriptors with the
+.Em deallocate
+bit landed on May 28, 2026.
+.
+.Sh AUTHORS
+.An -nosplit
+.An The style9-os project .

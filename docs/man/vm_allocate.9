@@ -1,0 +1,251 @@
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 The Hobby OS Project
+.\" All rights reserved.
+.\"
+.Dd May 28, 2026
+.Dt VM_ALLOCATE 9
+.Os style9-os
+.
+.Sh NAME
+.Nm vm_allocate ,
+.Nm vm_deallocate
+.Nd allocate and release anonymous user-VA ranges
+.
+.Sh SYNOPSIS
+.In style9.h
+.Pp
+.Ft void *
+.Fn vm_allocate "size_t bytes" "uint32_t prot"
+.Ft int
+.Fn vm_deallocate "void *va" "size_t bytes"
+.Pp
+Kernel-internal helper that backs both:
+.In vm.h
+.Ft bool
+.Fn vm_map_release "struct vm_map *map" "struct pmap *pm" "uint64_t va" "uint64_t size"
+.
+.Sh DESCRIPTION
+.Fn vm_allocate
+requests a fresh range of user virtual address space, backs every page
+with a newly allocated and zero-filled frame, installs the leaves into
+the caller's per-task page table, and records the resulting extent in
+the caller's
+.Em vm_map .
+The returned pointer is page-aligned; the range is mapped with the
+permission bits in
+.Fa prot
+plus
+.Dv VM_PROT_USER
+implicitly.
+.Pp
+.Fa bytes
+is rounded up to a multiple of 4 KiB before the search begins.
+.Fa prot
+is any bitwise-OR of
+.Dv VM_PROT_READ ,
+.Dv VM_PROT_WRITE ,
+and
+.Dv VM_PROT_EXEC ;
+bits outside that set are silently masked out.
+A
+.Fa prot
+of zero installs a present, read-only mapping
+.Po
+x86_64 has no
+.Dq absent-but-mapped
+bit; the most restrictive form is
+.Dq read-only, no-execute
+.Pc .
+.Pp
+.Fn vm_deallocate
+releases a range previously returned by
+.Fn vm_allocate :
+each present page is unmapped from the per-task pmap, the backing
+frame is returned to the page allocator, and the matching
+.Em vm_map_entry
+is removed.
+.Pp
+In v1 the
+.Pq Fa va , Fa bytes
+tuple must mirror a prior
+.Fn vm_allocate
+exactly --
+.Fa va
+must equal the entry's start and
+.Fa bytes
+must not exceed its extent.
+Partial deallocate and ranges that span more than one entry are
+rejected.
+.Pp
+.Fn vm_map_release
+is the kernel-internal primitive that both
+.Fn vm_deallocate
+and the OOL
+.Em deallocate
+flag in
+.Xr mach_msg 9
+call.
+The user-facing wrappers add their own argument validation
+.Pq page-rounding, sign checks
+on top.
+.
+.Sh INTERACTION WITH OOL DESCRIPTORS
+A sender that wants the kernel to release its source buffer after an
+OOL transfer sets
+.Va deallocate
+to
+.Dv 1
+on the
+.Vt mach_msg_ool_descriptor
+it ships.
+.Xr mach_msg 9
+calls
+.Fn vm_map_release
+on the sender's range post-copy, freeing the user from having to race
+the send with a follow-up
+.Fn vm_deallocate .
+The flag is best-effort: if the source range does not mirror a single
+.Fn vm_allocate Ns 'd
+anonymous entry, the kernel silently skips the release rather than
+returning an error from
+.Fn mach_msg_send .
+.
+.Sh IMPLEMENTATION NOTES
+The user-VA window is
+.Bq Dv VM_USER_VA_LO , Dv VM_USER_VA_HI
+.Pq currently 1 GiB at 0x40000000 -- 0x80000000 .
+.Em vm_map
+allocates from this window via a forward-linear scan starting from
+.Va vm_hint ;
+the hint is bumped on every successful
+.Fn vm_map_find_space
+to spread allocations linearly rather than cluster them at the low
+end.
+.Pp
+Frames come from the page allocator and are zeroed via the kernel
+physmap before the user-side mapping is installed.
+Once
+.Fn pmap_enter
+returns the page is observable from ring 3 as zero-filled.
+.Pp
+The strict
+.Dq mirror an allocate
+constraint on
+.Fn vm_deallocate
+exists because
+.Fn vm_map_remove
+in v1 only removes vm_map_entries that lie fully inside the request.
+A future change will split entries at the requested edges so partial
+deallocate
+.Pq matching POSIX munmap
+becomes well-defined; until then call sites stay symmetric.
+.
+.Sh RETURN VALUES
+.Fn vm_allocate
+returns a non-NULL pointer to the new range on success, or
+.Dv NULL
+on any failure.
+.Pp
+.Fn vm_deallocate
+returns 0 on success, or a negative
+.Dv SYS_E_*
+code on failure.
+.Pp
+.Fn vm_map_release
+returns
+.Dv true
+when the range matched and was released,
+.Dv false
+otherwise.
+.
+.Sh EXAMPLES
+Allocate, fill, ship via OOL with the deallocate flag set:
+.Bd -literal -offset indent
+struct {
+	struct mach_msg_header		hdr;
+	struct mach_msg_body		body;
+	struct mach_msg_ool_descriptor	ool;
+} req;
+char *buf;
+
+buf = vm_allocate(4096, VM_PROT_READ | VM_PROT_WRITE);
+if (buf == NULL)
+	return -1;
+memset(buf, 'A', 4096);
+
+req.hdr.msgh_bits	= MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) |
+    MACH_MSGH_BITS_COMPLEX;
+req.hdr.msgh_size	= sizeof(req);
+req.hdr.msgh_remote	= server_port;
+req.hdr.msgh_local	= MACH_PORT_NULL;
+req.hdr.msgh_voucher	= 0;
+req.hdr.msgh_id		= OP_INGEST;
+req.body.msgh_descriptor_count = 1;
+req.ool.type		= MACH_MSG_OOL_DESCRIPTOR;
+req.ool.copy		= MACH_MSG_PHYSICAL_COPY;
+req.ool.deallocate	= 1;
+req.ool.size		= 4096;
+req.ool.address		= (uint64_t)(uintptr_t)buf;
+
+(void)mach_msg_send(&req.hdr);
+/* buf is gone -- do NOT touch it again. */
+.Ed
+.Pp
+Plain allocate / release:
+.Bd -literal -offset indent
+void *p = vm_allocate(8192, VM_PROT_READ | VM_PROT_WRITE);
+if (p == NULL)
+	return -1;
+/* ... use *p ... */
+(void)vm_deallocate(p, 8192);
+.Ed
+.
+.Sh ERRORS
+.Fn vm_allocate
+returns
+.Dv NULL
+when:
+.Bl -tag -width "SYS_E_NOMEM"
+.It Dv SYS_E_INVAL
+.Fa bytes
+is zero.
+.It Dv SYS_E_NOMEM
+the
+.Em vm_map
+has no hole large enough, or the page allocator is out of frames.
+The kernel rolls back any pages mapped before the failure so a
+partial allocation never leaks.
+.El
+.Pp
+.Fn vm_deallocate
+returns:
+.Bl -tag -width "SYS_E_INVAL"
+.It Dv SYS_E_INVAL
+.Fa va
+is not page-aligned,
+.Fa bytes
+is zero, or
+.Pq Fa va , Fa bytes
+does not mirror a known anonymous
+.Em vm_map_entry .
+.El
+.
+.Sh SEE ALSO
+.Xr mach_msg 9 ,
+.Xr port 9
+.
+.Sh HISTORY
+.Fn vm_allocate
+and
+.Fn vm_deallocate
+landed in
+.Nm style9-os
+on May 28, 2026.
+The OOL
+.Em deallocate
+flag wiring landed alongside.
+.
+.Sh AUTHORS
+.An -nosplit
+.An The style9-os project .

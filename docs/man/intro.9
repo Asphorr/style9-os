@@ -1,0 +1,262 @@
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 The Hobby OS Project
+.\" All rights reserved.
+.\"
+.Dd May 28, 2026
+.Dt INTRO 9
+.Os style9-os
+.
+.Sh NAME
+.Nm intro
+.Nd introduction to style9-os, a BSD-flavoured x86_64 kernel with Mach IPC
+.
+.Sh DESCRIPTION
+.Nm style9-os
+is a hobby kernel for the long-mode x86_64.
+It boots via PVH
+.Pq QEMU Sy -kernel No on an ELF64
+or Multiboot 1/2, runs preemptive multitasking with Mach-style ports as
+the only inter-task primitive, and ships a small ring-3 surface built
+on top.
+.Pp
+The name is a play on
+.Sy style(9) ,
+the FreeBSD kernel style guide -- the project is an exercise in
+applying that style discipline to a from-scratch tree.
+.
+.Sh SUBSYSTEMS
+At a glance:
+.Bl -tag -width "userspace"
+.It Sy boot
+PVH note + Multiboot 2 header in
+.Pa arch/amd64/boot.S ;
+identity-maps the low 1 GiB with 2 MiB huge pages and trampolines into
+long mode.
+.It Sy traps
+48-vector IDT, trap-frame dispatcher, symbolicated panic on exception.
+.It Sy memory
+.Xr pmm 9
+.Pq bitmap page allocator ,
+.Xr kmem 9
+.Pq power-of-two slabs with 0xFE red zones + 0xDE freelist poison ,
+.Xr pmap 9
+.Pq per-task page tables ,
+.Xr vm_allocate 9
+.Pq user-VA ranges .
+.It Sy scheduling
+Cooperative + preemptive round-robin with PIT @ 100 Hz; idle thread
+reaps zombies; timed-waiter list backs
+.Fn mach_msg_recv_timed .
+.It Sy ipc
+Mach ports
+.Pq Xr port 9
+with SEND / RECEIVE / SEND_ONCE rights, port sets, OOL bulk-memory
+descriptors, and a synchronous-dispatcher fast path for kernel
+services
+.Pq Xr mach_msg 9 .
+.It Sy services
+.Em clock ,
+.Em stats ,
+.Em tasks ,
+.Em echool
+.Pq OOL exerciser ,
+.Em klog ,
+and
+.Em man
+.Pq this manual system .
+Each is a kernel-resident
+.Dv PORT_SPECIAL_SERVICE
+port registered with bootstrap.
+.It Sy drivers
+PS/2 keyboard, COM1 UART, ATA disk -- each bridges its IRQ to a Mach
+stream port via the
+.Em dev/<name>
+protocol.
+.It Sy userspace
+ring-3 programs are ELF64 binaries linked against
+.Em libstyle9 ,
+embedded in the kernel image via
+.Sy objcopy
+.Pq no on-disk filesystem yet ,
+and registered in
+.Pa kern/progreg.c .
+The shell
+.Pq Pa user/sh.c
+is the default landing UI.
+.It Sy diagnostics
+Symbolicated panic, in-kernel debugger
+.Pq Xr ddb 9 ,
+WITNESS lock-order verifier
+.Pq Xr witness 9 ,
+KASSERT and
+.Fn panic
+.Pq Xr kassert 9 ,
+14-test boot-time stress harness, on-host serial mirror.
+.El
+.
+.Sh STYLE
+Project-wide
+.Sy style(9) :
+.Bl -bullet
+.It
+.Sy SPDX-License-Identifier
+header on every file.
+.It
+Function names at column 0, prototypes separate from definitions, tab
+indentation, parenthesised returns:
+.Sy return (expr);
+.It
+Per-struct field prefixes:
+.Va p_
+for
+.Vt struct port ,
+.Va th_
+for
+.Vt struct thread ,
+.Va vme_
+for
+.Vt struct vm_map_entry ,
+and so on.
+.It
+Lock-key annotations on shared struct fields:
+.Sy (p)
+protected,
+.Sy (a)
+atomic,
+.Sy (c)
+const after init,
+.Sy (m)
+protected by the per-struct lock.
+.It
+.Sy _Static_assert
+on every wire-format struct so a layout drift fails the build, not the
+first boot.
+.It
+.Sy KASSERT
+on every invariant the code relies on but cannot encode in types.
+.It
+.Sy WIRE FORMAT.
+banner comment on every ABI-stable struct so a wire change is impossible
+to miss in review.
+.It
+Impersonal voice throughout: header comments describe what the surface
+does, not what the writer thinks.
+.El
+.Pp
+The full project-side bar-raising rules are recorded in commit
+.Pa 4dd5d44
+and the related memory entries.
+.
+.Sh BUILD AND RUN
+.Bd -literal -offset indent
+cd os
+make            # build kernel.elf
+make log        # boot headless, capture serial to obj/boot.log
+make run        # boot interactive in QEMU
+.Ed
+.Pp
+Or from the Windows host:
+.Bd -literal -offset indent
+\&.\\tools\\run.ps1
+.Ed
+.Pp
+The host script launches QEMU with an interactive window and mirrors
+COM1 to
+.Pa serial.log
+so a developer can drive the shell while another window tails the log.
+.Pp
+The kernel runs a 14-test stress pass at boot and then spawns
+.Em hello.elf
+as a ring-3 smoke test before handing off to
+.Em sh.elf .
+.
+.Sh DESIGN
+Loosely Mach-shape rather than BSD-shape:
+.Bl -bullet
+.It
+.Vt task
+and
+.Vt thread
+are separate from day one; there is no
+.Vt proc
+that conflates them.
+.It
+Mach
+.Em ports
+are the universal IPC primitive.
+There are no separate pipe, socket, or file descriptor abstractions
+on top.
+Even kernel-internal RPC uses
+.Fn mach_msg_send
+against
+.Va kernel_space .
+.It
+Both input devices ship bytes over Mach: each driver IRQ pushes into a
+ring, a per-driver kernel thread parks via
+.Fn sched_post_irq_wake ,
+and the shell receives on a port set whose members are
+.Em dev/kbd
+and
+.Em dev/uart .
+.It
+The wire format matches real Mach in shape -- 24-byte header, 8-byte
+port descriptor, 16-byte OOL descriptor, type-tag at byte 0 of every
+descriptor -- so a future userspace built against
+.Em mach.h
+on a different host would be one library shim away.
+.It
+Kernel-side services use a single
+.Dv PORT_SPECIAL_SERVICE
+hook in
+.Fn mach_msg_send :
+the dispatcher runs synchronously in the sender's thread context and
+the reply lands inline.
+Same pattern Mach uses for
+.Em task_port
+and
+.Em host_port .
+.El
+.
+.Sh GETTING STARTED
+After boot the shell prompts
+.Sy $ .
+Type
+.Sy help
+for the builtin list,
+.Sy about
+for live counters, or
+.Sy man <topic>
+to read this manual.
+Programs in the registry
+.Pq Em hello , clock , tasks
+are reachable by name.
+.Pp
+Reading next:
+.Bl -tag -width "vm_allocate(9)"
+.It Xr port 9
+the IPC primitive and its rights model.
+.It Xr mach_msg 9
+how to send, receive, and RPC.
+.It Xr vm_allocate 9
+how to obtain user-VA ranges and release them.
+.It Xr kassert 9
+the diagnostic philosophy and primitives.
+.El
+.
+.Sh SEE ALSO
+.Xr kassert 9 ,
+.Xr mach_msg 9 ,
+.Xr port 9 ,
+.Xr style 9
+.Pq the FreeBSD style guide this project is named after ,
+.Xr vm_allocate 9
+.
+.Sh HISTORY
+.Nm style9-os
+boots, runs Mach IPC end-to-end from ring 3, and serves its own manual
+since May 28, 2026.
+.
+.Sh AUTHORS
+.An -nosplit
+.An The style9-os project .
