@@ -367,6 +367,20 @@ vm_map_snapshot(struct vm_map *map, struct mach_vm_region_entry *out,
 	return (n);
 }
 
+size_t
+vm_map_region_count(struct vm_map *map)
+{
+	size_t	n;
+
+	if (map == NULL)
+		return (0);
+
+	spin_lock(&map->vm_lock);
+	n = map->vm_count;
+	spin_unlock(&map->vm_lock);
+	return (n);
+}
+
 static void
 vm_print_entry(const struct vm_map_entry *e)
 {

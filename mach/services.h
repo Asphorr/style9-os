@@ -72,12 +72,14 @@ _Static_assert(sizeof(struct svc_stats_reply) == 56,
 struct svc_tasks_entry {
 	uint64_t	te_task_id;
 	uint32_t	te_nthreads;
+	uint32_t	te_nports;	/* names in t_port_space        */
+	uint32_t	te_nvm_regions;	/* live entries in t_map        */
 	uint32_t	te_pad;
 	char		te_name[SVC_TASKS_NAME_MAX];
 };
 
-_Static_assert(sizeof(struct svc_tasks_entry) == 40,
-    "svc_tasks_entry must be 40 bytes (wire format)");
+_Static_assert(sizeof(struct svc_tasks_entry) == 48,
+    "svc_tasks_entry must be 48 bytes (wire format)");
 
 /* WIRE FORMAT.  ABI-stable. */
 struct svc_tasks_reply {
@@ -172,10 +174,15 @@ _Static_assert(sizeof(struct svc_tasks_reply) ==
 #define	LAUNCHCTL_OP_LIST	1
 #define	LAUNCHCTL_OP_LOAD	2
 #define	LAUNCHCTL_OP_UNLOAD	3
+#define	LAUNCHCTL_OP_STOP	4	/* kill task, keep entry (v2)    */
+#define	LAUNCHCTL_OP_START	5	/* respawn a stopped entry (v2)  */
 
 #define	LAUNCHD_MAX_SERVICES	8
 #define	LAUNCHD_NAME_MAX	24
 #define	LAUNCHD_PROGRAM_MAX	24
+
+/* LOAD-request flag bits (lr_flags). */
+#define	LAUNCHD_LOAD_FLAG_KEEPALIVE	0x1u	/* respawn on unexpected exit */
 
 /*
  * State machine.  LOAD always tries to spawn, so an entry never
@@ -187,15 +194,18 @@ _Static_assert(sizeof(struct svc_tasks_reply) ==
 #define	LAUNCHD_STATE_RUNNING	0
 #define	LAUNCHD_STATE_EXITED	1
 #define	LAUNCHD_STATE_FAILED	2
+#define	LAUNCHD_STATE_STOPPED	3	/* explicit STOP; no auto-restart */
 
 /* WIRE FORMAT.  ABI-stable.  LOAD request body. */
 struct svc_launchctl_load_req {
 	char		lr_name[LAUNCHD_NAME_MAX];
 	char		lr_program[LAUNCHD_PROGRAM_MAX];
+	uint32_t	lr_flags;	/* LAUNCHD_LOAD_FLAG_*           */
+	uint32_t	lr_pad;
 };
 
-_Static_assert(sizeof(struct svc_launchctl_load_req) == 48,
-    "svc_launchctl_load_req must be 48 bytes (wire format)");
+_Static_assert(sizeof(struct svc_launchctl_load_req) == 56,
+    "svc_launchctl_load_req must be 56 bytes (wire format)");
 
 /* WIRE FORMAT.  ABI-stable.  UNLOAD request body (label only). */
 struct svc_launchctl_byname_req {
@@ -210,10 +220,15 @@ struct svc_launchctl_status_reply {
 	int32_t		ls_status;	/* MACH_MSG_OK or MACH_E_*       */
 	uint32_t	ls_state;	/* LAUNCHD_STATE_* after the op  */
 	uint64_t	ls_task_id;	/* 0 if not running              */
+	uint32_t	ls_taskport;	/* mach_port_name_t: SEND on the */
+					/* child task-self port installed*/
+					/* in the caller's space on LOAD */
+					/* success; 0 otherwise          */
+	uint32_t	ls_pad;
 };
 
-_Static_assert(sizeof(struct svc_launchctl_status_reply) == 16,
-    "svc_launchctl_status_reply must be 16 bytes (wire format)");
+_Static_assert(sizeof(struct svc_launchctl_status_reply) == 24,
+    "svc_launchctl_status_reply must be 24 bytes (wire format)");
 
 /* WIRE FORMAT.  ABI-stable.  One row in a LIST reply. */
 struct svc_launchctl_entry {

@@ -11,6 +11,8 @@
 
 #include "kprintf.h"
 #include "panic.h"
+#include "port.h"
+#include "port_internal.h"
 #include "progreg.h"
 #include "syscall.h"
 
@@ -56,6 +58,18 @@ extern uint8_t	_binary_echod_elf_end[];
 extern uint8_t	_binary_launchctl_elf_start[];
 extern uint8_t	_binary_launchctl_elf_end[];
 
+extern uint8_t	_binary_loopchild_elf_start[];
+extern uint8_t	_binary_loopchild_elf_end[];
+
+extern uint8_t	_binary_selfkill_elf_start[];
+extern uint8_t	_binary_selfkill_elf_end[];
+
+extern uint8_t	_binary_top_elf_start[];
+extern uint8_t	_binary_top_elf_end[];
+
+extern uint8_t	_binary_heartbeatd_elf_start[];
+extern uint8_t	_binary_heartbeatd_elf_end[];
+
 /*
  * Bridge into the arch-specific user-thread spawn path.  Lives in
  * arch/amd64/usermode.c; declared here so progreg_spawn doesn't have
@@ -68,9 +82,12 @@ extern uint8_t	_binary_launchctl_elf_end[];
  * on any failure path.
  */
 struct port;
+struct port_space;
 extern long	arch_spawn_user(const char *name,
 		    const uint8_t *image, size_t image_size,
-		    struct port *inject_port);
+		    struct port *inject_port,
+		    struct port_space *caller_space,
+		    mach_port_name_t *out_taskport_name);
 
 /*
  * Lock key:
@@ -124,6 +141,14 @@ progreg_init(void)
 	    _binary_echod_elf_start, _binary_echod_elf_end);
 	register_one("launchctl",
 	    _binary_launchctl_elf_start, _binary_launchctl_elf_end);
+	register_one("loopchild",
+	    _binary_loopchild_elf_start, _binary_loopchild_elf_end);
+	register_one("selfkill",
+	    _binary_selfkill_elf_start, _binary_selfkill_elf_end);
+	register_one("top",
+	    _binary_top_elf_start, _binary_top_elf_end);
+	register_one("heartbeatd",
+	    _binary_heartbeatd_elf_start, _binary_heartbeatd_elf_end);
 
 	kprintf("progreg: %zu programs registered\n", nentries);
 }
@@ -175,8 +200,38 @@ progreg_spawn_with_port(const char *name, struct port *inject_port)
 	const struct progreg_entry	*e;
 
 	e = progreg_find(name);
+	if (e == NULL) {
+		if (inject_port != NULL)
+			port_deref(inject_port, MACH_PORT_RIGHT_SEND);
+		return (SYS_E_INVAL);
+	}
+	return (arch_spawn_user(e->pr_name, e->pr_image, e->pr_size,
+	    inject_port, NULL, NULL));
+}
+
+/*
+ * progreg_spawn_returning_taskport: spawn a registered program AND
+ * install a SEND right on the new task's task-self port in
+ * `caller_space`.  The resulting port name is written back through
+ * `out_taskport_name` -- caller can then use it as the argument to
+ * SYS_TASK_KILL or any other task-port-capability operation.
+ *
+ * Powers SYS_SPAWN_RETURNS_TASKPORT.  The shell uses this for every
+ * child it tracks: storing {task_id, taskport_name} per child gives
+ * sh.c the capability needed to terminate a foreground job on
+ * Ctrl-C, or to implement a `kill` builtin.
+ */
+long
+progreg_spawn_returning_taskport(const char *name,
+    struct port_space *caller_space, mach_port_name_t *out_taskport_name)
+{
+	const struct progreg_entry	*e;
+
+	if (caller_space == NULL || out_taskport_name == NULL)
+		return (SYS_E_INVAL);
+	e = progreg_find(name);
 	if (e == NULL)
 		return (SYS_E_INVAL);
 	return (arch_spawn_user(e->pr_name, e->pr_image, e->pr_size,
-	    inject_port));
+	    NULL, caller_space, out_taskport_name));
 }

@@ -504,6 +504,51 @@ port_release_task_self(struct task *t)
 }
 
 /*
+ * port_arm_dead_name_object: kernel-internal DEAD_NAME arming on port
+ * objects rather than names.  The userspace path
+ * (port_request_notification) resolves names in a space + checks the
+ * caller's rights; an in-kernel watcher (the launchd keep_alive worker)
+ * already holds port pointers, so it arms directly.
+ *
+ * Takes one SEND ref on `notify` for the registration; that ref is
+ * dropped automatically when the one-shot fires (port_deref's
+ * fire_dead_name path) or when `watched`'s RECEIVE is finally released
+ * without firing.  Replacing an existing registration drops the old
+ * notify ref.  Returns MACH_E_DEAD if `watched` is already dead (the
+ * event the caller wanted can no longer be observed).
+ *
+ * Lock-order: ref `notify` BEFORE taking watched->p_lock so the two
+ * per-port locks never nest.  The old-notify deref happens after the
+ * unlock for the same reason.
+ */
+int
+port_arm_dead_name_object(struct port *watched, struct port *notify,
+    uint32_t tag)
+{
+	struct port	*old;
+
+	if (watched == NULL || notify == NULL)
+		return (MACH_E_INVAL);
+
+	port_ref(notify, MACH_PORT_RIGHT_SEND);
+
+	spin_lock(&watched->p_lock);
+	if (watched->p_dead || !watched->p_has_receive) {
+		spin_unlock(&watched->p_lock);
+		port_deref(notify, MACH_PORT_RIGHT_SEND);
+		return (MACH_E_DEAD);
+	}
+	old = watched->p_notify_dead_name;
+	watched->p_notify_dead_name    = notify;
+	watched->p_notify_dead_name_id = tag;
+	spin_unlock(&watched->p_lock);
+
+	if (old != NULL)
+		port_deref(old, MACH_PORT_RIGHT_SEND);
+	return (MACH_MSG_OK);
+}
+
+/*
  * Mint a port object the kernel itself owns (RECEIVE held, no name in
  * any port_space) with a p_special tag pre-set.  Used to mint the
  * singleton bootstrap port; future kernel-implemented Mach objects

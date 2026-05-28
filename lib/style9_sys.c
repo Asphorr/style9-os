@@ -168,6 +168,21 @@ task_alive(uint64_t task_id)
 	return ((int)syscall1(SYS_TASK_ALIVE, (long)task_id));
 }
 
+int
+task_kill(mach_port_name_t target_port)
+{
+
+	return ((int)syscall1(SYS_TASK_KILL, (long)target_port));
+}
+
+long
+spawn_returns_taskport(const char *name, mach_port_name_t *out_taskport)
+{
+
+	return (syscall2(SYS_SPAWN_RETURNS_TASKPORT, (long)name,
+	    (long)out_taskport));
+}
+
 /* ---- vm ------------------------------------------------------------ */
 
 void *

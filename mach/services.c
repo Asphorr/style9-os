@@ -22,6 +22,7 @@
 #include "spinlock.h"
 #include "task.h"
 #include "thread.h"
+#include "vm.h"
 
 extern struct port_space	*kernel_space;
 extern struct port		*port_create_kernel_owned(uint8_t kind,
@@ -43,7 +44,7 @@ static int
 svc_reply_inline(const struct mach_msg_header *req, struct port_space *from,
     const void *body, size_t body_size)
 {
-	uint8_t		buf[sizeof(struct mach_msg_header) + 768];
+	uint8_t		buf[sizeof(struct mach_msg_header) + 1024];
 	struct mach_msg_header	*rhdr;
 	uint8_t		*dst;
 	const uint8_t	*src;
@@ -148,6 +149,19 @@ svc_tasks_dispatch(const struct mach_msg_header *req, struct port_space *from)
 		r.tr_entries[i].te_task_id  = t->t_id;
 		r.tr_entries[i].te_nthreads = t->t_nthreads;
 		spin_unlock(&t->t_lock);
+
+		/*
+		 * Per-resource counts read OUTSIDE t_lock: port_space_inuse
+		 * takes the space lock, vm_map_region_count takes vm_lock --
+		 * nesting either under t_lock would invert no existing order,
+		 * but keeping them separate keeps t_lock a short leaf.  A task
+		 * can't be reaped mid-handler (cooperative kernel, no yield
+		 * here), so the t_port_space / t_map pointers stay valid.
+		 */
+		r.tr_entries[i].te_nports     =
+		    (uint32_t)port_space_inuse(t->t_port_space);
+		r.tr_entries[i].te_nvm_regions =
+		    (uint32_t)vm_map_region_count(t->t_map);
 		r.tr_entries[i].te_pad = 0;
 
 		if (t->t_name != NULL) {

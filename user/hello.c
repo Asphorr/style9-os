@@ -1145,6 +1145,161 @@ demo_launchctl_spawn(void)
 }
 
 /*
+ * demo_selfkill_spawn: spawn the `selfkill` program which exercises
+ * SYS_TASK_KILL on its OWN task-self port (the trivial-capability
+ * case -- every task has SEND on MACH_PORT_TASK_SELF).  The
+ * syscall-exit kill check (detection point #5) should retire the
+ * child before its sysretq, so the BUG line in selfkill.c never
+ * appears in the boot transcript.
+ */
+static int
+demo_selfkill_spawn(void)
+{
+	long	child_id;
+	int	i;
+	int	alive;
+
+	printf("\nselfkill demo:\n");
+	child_id = spawn("selfkill");
+	if (child_id < 0) {
+		printf("  spawn('selfkill') failed (rv=%ld)\n", child_id);
+		return (76);
+	}
+	alive = 1;
+	for (i = 0; i < 128 && alive; i++) {
+		(void)yield();
+		alive = task_alive((uint64_t)child_id);
+	}
+	printf("  task_alive(%ld) after self-kill: %s (waited %d yields)\n",
+	    child_id, alive ? "yes (kill failed)" : "no (kill landed)", i);
+	return (0);
+}
+
+/*
+ * demo_parent_managed_kill: end-to-end test of the v3 capability
+ * path -- spawn_returns_taskport hands the parent BOTH task_id AND a
+ * SEND right on the child's task-self port in one syscall, so the
+ * parent never has to talk to bootstrap to acquire the kill
+ * capability.  Mirrors the sh.c child-table pattern: every spawn
+ * gives us the handle, so task_kill is one call away.
+ */
+static int
+demo_parent_managed_kill(void)
+{
+	mach_port_name_t	taskport;
+	long			child_id;
+	int			i;
+	int			alive;
+	int			rv;
+
+	printf("\nparent-managed kill demo (spawn_returns_taskport):\n");
+	taskport = MACH_PORT_NULL;
+	child_id = spawn_returns_taskport("loopchild", &taskport);
+	if (child_id < 0) {
+		printf("  spawn_returns_taskport('loopchild') failed (rv=%ld)\n",
+		    child_id);
+		return (80);
+	}
+	if (taskport == MACH_PORT_NULL) {
+		printf("  spawn returned task_id=%ld but no taskport\n",
+		    child_id);
+		return (81);
+	}
+	printf("  spawned task_id=%ld with taskport=0x%x in our space\n",
+	    child_id, (unsigned)taskport);
+
+	/*
+	 * Give loopchild a few yields to start running its compute
+	 * loop -- without that the kill races against bootstrap-register
+	 * setup and the child dies before reaching the loop body.  Not a
+	 * correctness issue but a cleaner narrative in the boot log.
+	 */
+	for (i = 0; i < 16; i++)
+		(void)yield();
+
+	rv = task_kill(taskport);
+	printf("  task_kill(taskport) -> %d\n", rv);
+
+	alive = 1;
+	for (i = 0; i < 64 && alive; i++) {
+		(void)yield();
+		alive = task_alive((uint64_t)child_id);
+	}
+	printf("  task_alive(%ld) after parent-managed kill: %s "
+	    "(waited %d yields)\n",
+	    child_id,
+	    alive ? "yes (capability path BROKEN)" : "no (capability path OK)",
+	    i);
+
+	(void)mach_port_deallocate(taskport);
+	return (0);
+}
+
+/*
+ * demo_compute_kill_spawn: end-to-end demo of detection point #4
+ * (IRQ-return-to-user).  loopchild publishes its own task-self port
+ * under bootstrap, then enters a syscall-free spin.  Parent looks the
+ * port up + calls task_kill; without the IRQ-return check the child
+ * would loop forever (no syscall boundary to catch the flag).  PIT
+ * IRQs hit roughly every 10 ms; the child should retire within a
+ * handful of parent yields.
+ */
+static int
+demo_compute_kill_spawn(void)
+{
+	mach_port_name_t	tport;
+	long			child_id;
+	int			i;
+	int			alive;
+	int			rv;
+
+	printf("\ncompute-loop kill demo:\n");
+	child_id = spawn("loopchild");
+	if (child_id < 0) {
+		printf("  spawn('loopchild') failed (rv=%ld)\n", child_id);
+		return (78);
+	}
+
+	/*
+	 * Wait for loopchild to register its task-self under bootstrap.
+	 * Polling on bootstrap_lookup is cheap (a single RPC); a handful
+	 * of yields lets the child reach the register-then-enter-loop
+	 * point.
+	 */
+	tport = MACH_PORT_NULL;
+	for (i = 0; i < 64 && tport == MACH_PORT_NULL; i++) {
+		(void)yield();
+		tport = bootstrap_lookup("loopchild.tport");
+	}
+	if (tport == MACH_PORT_NULL) {
+		printf("  loopchild.tport lookup failed after %d yields\n", i);
+		return (79);
+	}
+	printf("  loopchild.tport = 0x%x (after %d lookup yields)\n",
+	    (unsigned)tport, i);
+
+	rv = task_kill(tport);
+	printf("  task_kill(loopchild) -> %d\n", rv);
+
+	/*
+	 * loopchild has no syscall window the kill could fire on, so
+	 * termination is contingent on the IRQ-return detection point
+	 * triggering at the next PIT tick.  Bounded probe budget.
+	 */
+	alive = 1;
+	for (i = 0; i < 128 && alive; i++) {
+		(void)yield();
+		alive = task_alive((uint64_t)child_id);
+	}
+	printf("  task_alive(%ld) after task_kill: %s (waited %d yields)\n",
+	    child_id, alive ? "yes (IRQ-return MISSED)" : "no (IRQ-return OK)",
+	    i);
+
+	(void)mach_port_deallocate(tport);
+	return (0);
+}
+
+/*
  * demo_vmmap_spawn: spawn the `vmmap` tool and let it print.  Same
  * shape as demo_lsmp_spawn: bounded-yield wait so the child has time
  * to dump its table before the parent moves on.
@@ -1199,6 +1354,32 @@ demo_lsmp_spawn(void)
 	 * which is harmless.
 	 */
 	for (i = 0; i < 64; i++)
+		(void)yield();
+	return (0);
+}
+
+/*
+ * demo_top_spawn: spawn the `top` tool and let it run its samples.
+ * top RPCs the "tasks" service a few times with a yield gap between,
+ * printing the per-task thread/port/region columns the service grew
+ * for it.  We bounded-yield generously (160x) so all samples land in
+ * the boot log before main() moves on; top does no IPC with us, so as
+ * with lsmp/vmmap we cannot block on a port and just yield instead.
+ */
+static int
+demo_top_spawn(void)
+{
+	long	child_id;
+	int	i;
+
+	printf("\ntop demo:\n");
+	child_id = spawn("top");
+	if (child_id < 0) {
+		printf("  spawn('top') failed (rv=%ld)\n", child_id);
+		return (73);
+	}
+	(void)child_id;
+	for (i = 0; i < 160; i++)
 		(void)yield();
 	return (0);
 }
@@ -1419,6 +1600,22 @@ main(void)
 		return (rv);
 
 	rv = demo_launchctl_spawn();
+	if (rv != 0)
+		return (rv);
+
+	rv = demo_selfkill_spawn();
+	if (rv != 0)
+		return (rv);
+
+	rv = demo_compute_kill_spawn();
+	if (rv != 0)
+		return (rv);
+
+	rv = demo_parent_managed_kill();
+	if (rv != 0)
+		return (rv);
+
+	rv = demo_top_spawn();
 	if (rv != 0)
 		return (rv);
 

@@ -118,6 +118,10 @@ OBJS	= \
 	$(OBJDIR)/vmmap_elf.o \
 	$(OBJDIR)/echod_elf.o \
 	$(OBJDIR)/launchctl_elf.o \
+	$(OBJDIR)/loopchild_elf.o \
+	$(OBJDIR)/selfkill_elf.o \
+	$(OBJDIR)/top_elf.o \
+	$(OBJDIR)/heartbeatd_elf.o \
 	$(OBJDIR)/ksym.o
 
 all: kernel.elf
@@ -172,7 +176,7 @@ $(OBJDIR)/style9_%.o: $(LIB_DIR)/style9_%.c | $(OBJDIR)
 # below.  To add one, drop user/<name>.c on disk, append the name here,
 # and register the matching _binary_<name>_elf_start/_end pair in
 # kern/progreg.c.
-USER_PROGRAMS = hello clock tasks sh excchild excchild_ud excchild_thr excchild_resume lsmp vmmap echod launchctl
+USER_PROGRAMS = hello clock tasks sh excchild excchild_ud excchild_thr excchild_resume lsmp vmmap echod launchctl loopchild selfkill top heartbeatd
 
 $(OBJDIR)/%.user.o: $(USER_DIR)/%.c | $(OBJDIR)
 	$(CC) $(USER_CFLAGS) $(DEPFLAGS) -c $< -o $@

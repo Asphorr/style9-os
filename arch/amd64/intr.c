@@ -112,6 +112,37 @@ irq_install(unsigned int irq, irq_handler_t handler)
 }
 
 /*
+ * Async-kill detection point #4: IRQ-return-to-user.  Catches a kill
+ * issued against a task whose thread is doing a pure ring-3 compute
+ * loop -- one that never voluntarily enters the kernel via syscall or
+ * blocking IPC.  The timer IRQ (or any other hardware IRQ) brings the
+ * thread into the kernel; the trampoline runs intr_dispatch; this
+ * helper fires before the function returns and the asm iretq's back
+ * to ring 3, retiring the thread instead of resuming user code.
+ *
+ * Gated on (tf_cs & 3) == 3 so kernel-mode IRQ interrupts (e.g. PIT
+ * landing while the scheduler holds sched_lock) never call thread_exit.
+ * kernel_task is skipped explicitly even though t_killed cannot be set
+ * on it -- belt-and-braces, and makes the early-out cheaper than the
+ * atomic load.
+ */
+static inline void
+intr_check_async_kill_on_user_return(const struct trapframe *tf)
+{
+
+	if ((tf->tf_cs & 3) != 3)
+		return;
+	if (current_thread == NULL)
+		return;
+	if (current_thread->th_task == kernel_task)
+		return;
+	if (!task_kill_pending(current_thread->th_task))
+		return;
+	thread_exit();
+	/* NOTREACHED */
+}
+
+/*
  * C-side trap dispatcher, called from isr_common with %rsp pointing at
  * the populated trapframe.  Vectors below 32 are CPU exceptions and
  * abort the kernel; vectors 32-47 are hardware IRQs and route through
@@ -140,6 +171,7 @@ intr_dispatch(struct trapframe *tf)
 			 * user_fault_die calls thread_exit() which is
 			 * noreturn.
 			 */
+			intr_check_async_kill_on_user_return(tf);
 			return;
 		}
 		intr_panic(tf);
@@ -184,10 +216,12 @@ intr_dispatch(struct trapframe *tf)
 				thread_yield();
 			}
 		}
+		intr_check_async_kill_on_user_return(tf);
 		return;
 	}
 
 	/* Vector >= 48: spurious / not installed -- ignore quietly. */
+	intr_check_async_kill_on_user_return(tf);
 }
 
 static void

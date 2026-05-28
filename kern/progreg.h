@@ -69,4 +69,22 @@ long	progreg_spawn(const char *name);
 struct port;
 long	progreg_spawn_with_port(const char *name, struct port *inject_port);
 
+/*
+ * Variant that spawns the named program AND installs a SEND right on
+ * the new task's task-self port in `caller_space`, writing the
+ * resulting port name to `*out_taskport_name`.  Powers
+ * SYS_SPAWN_RETURNS_TASKPORT: the shell uses the returned name as the
+ * capability-handle argument to SYS_TASK_KILL when killing the child
+ * (Ctrl-C, `kill <task_id>` builtin).
+ *
+ * Both `caller_space` and `out_taskport_name` are required (non-NULL);
+ * pass NULL for both to get progreg_spawn-style behavior.  On any
+ * failure the port name is left untouched.
+ */
+struct port_space;
+#include "port.h"		/* mach_port_name_t */
+long	progreg_spawn_returning_taskport(const char *name,
+	    struct port_space *caller_space,
+	    mach_port_name_t *out_taskport_name);
+
 #endif /* !_SYS_PROGREG_H_ */

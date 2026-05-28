@@ -23,6 +23,7 @@
 #define	SC_RELEASE	0x80	/* bit set on key-release scancodes */
 #define	SC_LSHIFT	0x2A
 #define	SC_RSHIFT	0x36
+#define	SC_LCTRL	0x1D	/* RCtrl is 0xE0 0x1D, handled in extended */
 
 #define	KBD_BUF_SIZE	128	/* must be power of two */
 #define	KBD_BUF_MASK	(KBD_BUF_SIZE - 1)
@@ -76,6 +77,7 @@ static volatile uint32_t	kbd_buf_tail;
 static char			kbd_buf[KBD_BUF_SIZE];
 
 static volatile uint8_t		kbd_shift;	/* either Shift key down */
+static volatile uint8_t		kbd_ctrl;	/* either Ctrl key down  */
 
 /*
  * Extended-scancode latch.  Scancode set 1 prefixes the cursor keys,
@@ -138,12 +140,31 @@ kbd_getc(void)
  * Translate an extended (post-0xE0) press scancode to an ANSI/VT100
  * escape sequence and push the bytes into the ring one at a time.
  * Releases (high bit set) and unmapped scancodes are silently dropped.
+ *
+ * Special case: RCtrl shares scancode 0x1D with LCtrl but arrives in
+ * the extended set.  Track its press / release into the same
+ * kbd_ctrl flag the LCtrl path uses so either key produces the same
+ * terminal-control behavior.
  */
 static void
 kbd_emit_extended(uint8_t sc)
 {
 	const char	*p;
 	const char	*seq;
+
+	/*
+	 * RCtrl press / release.  Done before the "release filter" below
+	 * because the release form (0x9D) carries our state-clearing
+	 * signal.
+	 */
+	if (sc == SC_LCTRL) {
+		kbd_ctrl = 1;
+		return;
+	}
+	if (sc == (SC_LCTRL | SC_RELEASE)) {
+		kbd_ctrl = 0;
+		return;
+	}
 
 	if ((sc & 0x80) != 0)
 		return;	/* release -- ignored */
@@ -233,6 +254,8 @@ kbd_decode_scancode(uint8_t sc)
 		pressed = (uint8_t)(sc & 0x7F);
 		if (pressed == SC_LSHIFT || pressed == SC_RSHIFT)
 			kbd_shift = 0;
+		else if (pressed == SC_LCTRL)
+			kbd_ctrl = 0;
 		return (-1);
 	}
 
@@ -240,10 +263,30 @@ kbd_decode_scancode(uint8_t sc)
 		kbd_shift = 1;
 		return (-1);
 	}
+	if (sc == SC_LCTRL) {
+		kbd_ctrl = 1;
+		return (-1);
+	}
 
 	ch = (kbd_shift != 0) ? sc_table_shift[sc] : sc_table[sc];
 	if (ch == 0)
 		return (-1);
+
+	/*
+	 * Ctrl folding: when Ctrl is held, translate letter keys 'A'..'Z'
+	 * / 'a'..'z' to their corresponding ASCII control codes (0x01 ..
+	 * 0x1A).  Standard VT100 / xterm convention: Ctrl-C -> 0x03,
+	 * Ctrl-D -> 0x04, Ctrl-Z -> 0x1A, and so on.  Userspace sees a
+	 * single control byte in the kbd byte stream and acts on it
+	 * (e.g. sh.c's foreground-wait peeks for 0x03 to kill the
+	 * current child).  Non-letter keys pass through unchanged.
+	 */
+	if (kbd_ctrl != 0) {
+		if (ch >= 'a' && ch <= 'z')
+			ch = (char)(ch - 'a' + 1);
+		else if (ch >= 'A' && ch <= 'Z')
+			ch = (char)(ch - 'A' + 1);
+	}
 	return ((unsigned char)ch);
 }
 

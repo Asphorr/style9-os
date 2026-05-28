@@ -77,6 +77,9 @@ static long	sys_task_get_port_snapshot(uint64_t task_id,
 static long	sys_task_get_vm_regions(uint64_t task_id,
 		    struct mach_vm_region_entry *ubuf,
 		    size_t max_entries);
+static long	sys_task_kill(mach_port_name_t target_port_name);
+static long	sys_spawn_returns_taskport(const char *uname,
+		    mach_port_name_t *out_taskport_name);
 
 static bool	user_range_ok(uint64_t addr, size_t len);
 
@@ -136,8 +139,8 @@ syscall_init(void)
 	    (void *)(uintptr_t)&syscall_entry);
 }
 
-long
-syscall_dispatch(struct syscall_frame *f)
+static long
+syscall_dispatch_body(struct syscall_frame *f)
 {
 
 	switch (f->sf_nr) {
@@ -224,9 +227,56 @@ syscall_dispatch(struct syscall_frame *f)
 		    (uint64_t)f->sf_arg0,
 		    (struct mach_vm_region_entry *)f->sf_arg1,
 		    (size_t)f->sf_arg2));
+	case SYS_TASK_KILL:
+		return (sys_task_kill((mach_port_name_t)f->sf_arg0));
+	case SYS_SPAWN_RETURNS_TASKPORT:
+		return (sys_spawn_returns_taskport(
+		    (const char *)f->sf_arg0,
+		    (mach_port_name_t *)f->sf_arg1));
 	default:
 		return (SYS_E_NOSYS);
 	}
+}
+
+long
+syscall_dispatch(struct syscall_frame *f)
+{
+	long	rv;
+
+	/*
+	 * Async-kill detection point #1.  If task_request_terminate
+	 * fired while this thread was running in ring 3, t_killed is set
+	 * by the time we re-enter the kernel here.  Retire before
+	 * dispatching: the caller has been marked dead and any reply
+	 * we'd produce will never be observed (the user pages are about
+	 * to be torn down).  See kern/task.h's t_killed comment for the
+	 * full detection-site list.
+	 */
+	if (current_thread->th_task != kernel_task &&
+	    task_kill_pending(current_thread->th_task))
+		thread_exit();
+	/* NOTREACHED if killed */
+
+	rv = syscall_dispatch_body(f);
+
+	/*
+	 * Detection point #5: syscall-exit kill check.  Catches the
+	 * "syscall ITSELF caused the kill" case (e.g. SYS_TASK_KILL on
+	 * self, or a future signal-style syscall that posts a kill to
+	 * its own task).  The entry check (#1) would catch this on the
+	 * NEXT syscall, but a self-kill should retire immediately so
+	 * the user never gets a sysretq -- no half-step of returned user
+	 * code between issuing the kill and dying.  The IRQ-return
+	 * detection point (#4) and the thread_block_release pre-park /
+	 * post-wake points (#2, #3) cover the gaps if for some reason
+	 * we miss here, but this is the cleanest path.
+	 */
+	if (current_thread->th_task != kernel_task &&
+	    task_kill_pending(current_thread->th_task))
+		thread_exit();
+	/* NOTREACHED if killed */
+
+	return (rv);
 }
 
 /*
@@ -915,6 +965,136 @@ sys_task_get_vm_regions(uint64_t task_id,
 		ubuf[i] = kbuf[i];
 	smap_user_access_end();
 	return ((long)n);
+}
+
+/*
+ * sys_task_kill: capability-based async terminate.
+ *
+ * `target_port_name` is a port name in the caller's space.  The kernel
+ * resolves it, verifies the SEND right, checks that the port's special
+ * tag is PORT_SPECIAL_TASK_SELF (i.e., the named port IS a task's
+ * task-self port), extracts the linked struct task from p_special_arg,
+ * and fires task_request_terminate against that task's id.
+ *
+ * Caller can trivially kill itself by passing MACH_PORT_TASK_SELF (==1)
+ * -- every task has its own task-self port wired into slot 1 of its
+ * space at task_create time.  To kill *another* task, the caller must
+ * hold SEND on the target's task-self port; today the only ways to
+ * acquire that are (a) being handed it via OOL, (b) parent-inject via
+ * SYS_SPAWN_WITH_PORT.  So the v1 attack surface is small and
+ * Mach-shaped: you cannot kill what you do not have a port to.
+ *
+ * Refuses kernel_task explicitly (its task-self port is in
+ * kernel_space, which is not directly reachable from ring 3 anyway,
+ * but the check is cheap and documents intent).
+ *
+ * Returns MACH_MSG_OK on success, MACH_E_RIGHT if the SEND lookup
+ * fails, MACH_E_INVAL if the port is not a task-self port or names
+ * kernel_task.  Async semantics: the kill is queued; if the caller
+ * killed itself, the actual retire happens on this syscall's return
+ * (the dispatch-entry detection point catches it on the NEXT syscall,
+ * or this very return path runs through the IRQ-return check at the
+ * next PIT tick).  More commonly the caller is not the target, so the
+ * syscall returns normally and the target dies asynchronously.
+ */
+static long
+sys_task_kill(mach_port_name_t target_port_name)
+{
+	struct port	*p;
+	struct task	*target;
+	uint8_t		 dummy;
+	uint64_t	 target_id;
+
+	p = space_lookup(current_thread->th_task->t_port_space,
+	    target_port_name, MACH_PORT_RIGHT_SEND, &dummy);
+	if (p == NULL)
+		return ((long)MACH_E_RIGHT);
+
+	if (p->p_special != PORT_SPECIAL_TASK_SELF)
+		return ((long)MACH_E_INVAL);
+
+	target = (struct task *)p->p_special_arg;
+	if (target == NULL || target == kernel_task)
+		return ((long)MACH_E_INVAL);
+
+	target_id = target->t_id;
+	task_request_terminate(target_id);
+
+	/*
+	 * Caller may have just killed itself.  The detection sites take
+	 * care of it on the return path (syscall_dispatch's entry check
+	 * fires on the next syscall; thread_block_release's pre-park and
+	 * the IRQ-return check cover the in-between cases).  Don't try
+	 * to short-circuit here -- returning MACH_MSG_OK gives the user
+	 * code its sysret if the kill targeted a different task, and
+	 * does no harm if it was a self-kill (the thread retires before
+	 * any user-visible side effect).
+	 */
+	return ((long)MACH_MSG_OK);
+}
+
+/*
+ * sys_spawn_returns_taskport: spawn variant for callers that intend
+ * to manage the child (kill/signal it later).  Atomically returns
+ * BOTH the new task's id (positive return value) AND a port name in
+ * the caller's space holding SEND on the child's task-self port,
+ * written through `out_taskport_name`.
+ *
+ * The capability handed back is the exact argument SYS_TASK_KILL
+ * accepts: parent + future task-manager service use this to terminate
+ * a child without needing any other lookup or auth.  The Mach
+ * fingerprint is: "if you spawned it, you can kill it."
+ *
+ * Failures fan out into SYS_E_FAULT (bad pointers), SYS_E_INVAL (no
+ * such program), SYS_E_NOSYS (out-of-resources during the new task's
+ * setup).  On failure `*out_taskport_name` is untouched.
+ */
+static long
+sys_spawn_returns_taskport(const char *uname,
+    mach_port_name_t *out_taskport_name)
+{
+	char			 kname[PROGREG_NAME_MAX];
+	mach_port_name_t	 kname_out;
+	size_t			 i;
+	long			 uaddr;
+	long			 rv;
+
+	if (uname == NULL || out_taskport_name == NULL)
+		return (SYS_E_FAULT);
+
+	uaddr = (long)(uintptr_t)uname;
+	if (!user_range_ok((uint64_t)uaddr, 1))
+		return (SYS_E_FAULT);
+	if (!user_range_ok((uint64_t)(uintptr_t)out_taskport_name,
+	    sizeof(mach_port_name_t)))
+		return (SYS_E_FAULT);
+
+	smap_user_access_begin();
+	for (i = 0; i < PROGREG_NAME_MAX; i++) {
+		if (!user_range_ok((uint64_t)(uaddr + (long)i), 1)) {
+			smap_user_access_end();
+			return (SYS_E_FAULT);
+		}
+		kname[i] = uname[i];
+		if (uname[i] == '\0')
+			break;
+	}
+	smap_user_access_end();
+
+	if (i == PROGREG_NAME_MAX)
+		return (SYS_E_INVAL);
+
+	kname_out = MACH_PORT_NULL;
+	rv = progreg_spawn_returning_taskport(kname,
+	    current_thread->th_task->t_port_space, &kname_out);
+	if (rv < 0)
+		return (rv);
+
+	smap_user_access_begin();
+	*out_taskport_name = kname_out;
+	smap_user_access_end();
+
+	return (rv);
 }
 
 /*

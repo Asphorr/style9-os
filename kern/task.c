@@ -15,6 +15,7 @@
 #include "pmap.h"
 #include "port.h"
 #include "port_internal.h"
+#include "sched.h"
 #include "spinlock.h"
 #include "task.h"
 #include "thread.h"
@@ -113,6 +114,7 @@ task_create(const char *name)
 			t->t_exc_ports[exi] = NULL;
 	}
 	t->t_exc_flags = 0;
+	t->t_killed    = false;
 
 	t->t_port_space = port_space_new();
 	if (t->t_port_space == NULL) {
@@ -523,4 +525,114 @@ task_is_alive(uint64_t id)
 	}
 	spin_unlock(&tasks_lock);
 	return (alive);
+}
+
+/*
+ * task_self_port_for: take one SEND ref on `task_id`'s task-self port
+ * and hand the port object back, or NULL if the id is unknown / names
+ * kernel_task / has no self port.  The returned ref is the caller's to
+ * drop with port_deref(.., MACH_PORT_RIGHT_SEND).
+ *
+ * Powers the launchd LOAD reply: launchd hands the freshly spawned
+ * child's task-self SEND right to launchctl as an implicit-local port
+ * descriptor so launchctl can arm a DEAD_NAME notification on it --
+ * death-by-notification instead of the v1 task_alive yield-poll.
+ *
+ * Lock-order: tasks_lock -> p_lock (inside port_ref).  p_lock is a
+ * leaf and nothing takes tasks_lock while holding it, so no cycle.
+ * Taking the ref under tasks_lock guarantees the task cannot be
+ * chain-removed + freed between the match and the ref bump.
+ */
+struct port *
+task_self_port_for(uint64_t task_id)
+{
+	struct port	*p;
+	size_t		 i;
+
+	p = NULL;
+	spin_lock(&tasks_lock);
+	for (i = 0; i < TASK_LIST_MAX; i++) {
+		struct task	*t = task_list[i];
+
+		if (t != NULL && t->t_id == task_id) {
+			if (t != kernel_task && t->t_self_port != NULL) {
+				p = t->t_self_port;
+				port_ref(p, MACH_PORT_RIGHT_SEND);
+			}
+			break;
+		}
+	}
+	spin_unlock(&tasks_lock);
+	return (p);
+}
+
+/*
+ * task_request_terminate: async-kill on a live target.  Three phases:
+ *
+ *	1. Identify the target under tasks_lock + bump a ref so it
+ *	   cannot teardown out from under the wake walk.  Refuse the
+ *	   request if it names kernel_task; the kernel task hosts every
+ *	   kernel-side thread (idle, drivers, services) and is by
+ *	   construction not killable.
+ *
+ *	2. Atomic-store t_killed = true with RELEASE so the matching
+ *	   ACQUIRE in task_kill_pending (called from the detection sites
+ *	   in syscall_dispatch + thread_block_release) reads the freshly
+ *	   set flag.  Done while still holding tasks_lock so concurrent
+ *	   tasks_lock holders cannot observe the target before the flag
+ *	   is set.
+ *
+ *	3. Walk t_threads under t_lock and thread_wake each entry.
+ *	   thread_wake is a no-op for non-BLOCKED threads, so READY and
+ *	   RUNNING members are correctly ignored.  Threads that were
+ *	   already mid-park (acquired sched_lock but not yet committed
+ *	   to BLOCKED) observe t_killed under sched_lock in
+ *	   thread_block_release's pre-park check and retire without
+ *	   needing a wake -- this covers the race where the kill arrives
+ *	   between the would-be-parker reading "no message available"
+ *	   and committing to the BLOCKED state.
+ *
+ * Lock-order introduced: t_lock -> sched_lock -> th_lock (via the
+ * thread_wake fan-out under t_lock).  Nothing in the existing code
+ * acquires t_lock while holding sched_lock or th_lock, so the new
+ * edge does not close a cycle.
+ */
+void
+task_request_terminate(uint64_t task_id)
+{
+	struct task	*t;
+	struct thread	*th;
+	size_t		 i;
+
+	t = NULL;
+	spin_lock(&tasks_lock);
+	for (i = 0; i < TASK_LIST_MAX; i++) {
+		if (task_list[i] != NULL && task_list[i]->t_id == task_id) {
+			t = task_list[i];
+			break;
+		}
+	}
+	if (t == NULL || t == kernel_task) {
+		spin_unlock(&tasks_lock);
+		return;
+	}
+	__atomic_store_n(&t->t_killed, true, __ATOMIC_RELEASE);
+	task_ref(t);
+	spin_unlock(&tasks_lock);
+
+	spin_lock(&t->t_lock);
+	for (th = t->t_threads; th != NULL; th = th->th_task_link)
+		thread_wake(th);
+	spin_unlock(&t->t_lock);
+
+	task_deref(t);
+}
+
+bool
+task_kill_pending(struct task *t)
+{
+
+	if (t == NULL)
+		return (false);
+	return (__atomic_load_n(&t->t_killed, __ATOMIC_ACQUIRE));
 }

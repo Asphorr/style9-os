@@ -45,11 +45,24 @@ void	usermode_run_first_blob(void);
  * dropped on any failure path.  Used by SYS_SPAWN_WITH_PORT to hand
  * a private channel to a child task.
  *
+ * `caller_space` + `out_taskport_name` are the optional second pair:
+ * when both are non-NULL, a SEND right on the new task's task-self
+ * port is installed in `caller_space` and the resulting name is
+ * written back through the out-pointer.  Pass NULL/NULL for the
+ * SYS_SPAWN / SYS_SPAWN_WITH_PORT shapes; pass both for the
+ * SYS_SPAWN_RETURNS_TASKPORT shape (parent-managed children, used by
+ * the shell + task-manager-style services).
+ *
  * Returns the new task's t_id on success, negative SYS_E_* on failure.
  */
 struct port;
+struct port_space;
+
+#include "port.h"		/* mach_port_name_t */
 long	arch_spawn_user(const char *name, const uint8_t *image,
-	    size_t image_size, struct port *inject_port);
+	    size_t image_size, struct port *inject_port,
+	    struct port_space *caller_space,
+	    mach_port_name_t *out_taskport_name);
 
 /*
  * usermode_enter: never returns to its caller.  Pushes a synthetic

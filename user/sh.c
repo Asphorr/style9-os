@@ -78,6 +78,31 @@ static mach_port_name_t	g_stats_port;
  */
 static int	last_status;
 
+/*
+ * Child registry.  Every fg/bg job the shell spawns lands here as a
+ * (task_id, taskport_name) pair so the shell holds the capability
+ * needed to kill the child via SYS_TASK_KILL.  Entries are written
+ * once at spawn time and never explicitly evicted -- the kernel
+ * recycles task_ids and port names lazily; on the next collision the
+ * shell will simply overwrite the stale row.  16 slots is well in
+ * excess of any plausible in-flight job count for this kernel.
+ */
+#define	SH_CHILD_MAX	16
+struct sh_child {
+	uint64_t		c_task_id;
+	mach_port_name_t	c_taskport;
+};
+static struct sh_child	sh_children[SH_CHILD_MAX];
+
+/*
+ * Foreground job state, set by dispatch() right before wait_child(),
+ * cleared after the wait returns.  wait_child uses fg_taskport to
+ * deliver a kill when the user hits Ctrl-C.  Single-job-at-a-time
+ * model (no real job-control + & yet); the slot is enough.
+ */
+static long			fg_task_id;
+static mach_port_name_t		fg_taskport;
+
 /* ---- ANSI escape constants --------------------------------------- */
 
 /*
@@ -403,6 +428,8 @@ builtin_help(void)
 	puts(ESC_FG_GRAY);  puts("OOL Mach IPC round-trip via svc/echool\n");
 	puts(ESC_FG_WHITE); puts("  man      ");
 	puts(ESC_FG_GRAY);  puts("show a manual page (try: man port)\n");
+	puts(ESC_FG_WHITE); puts("  kill     ");
+	puts(ESC_FG_GRAY);  puts("kill <task_id> -- terminate a child of this shell\n");
 
 	puts("\n");
 	puts(ESC_FG_WHITE); puts("  spawn    ");
@@ -809,14 +836,82 @@ builtin_man(int argc, char *argv[])
 
 /* ---- spawn + yield-spin wait ------------------------------------- */
 
+/*
+ * Drop the (task_id, taskport) pair into the first empty slot, or
+ * overwrite slot 0 if every slot is full (lossy oldest-first; we
+ * don't have a real LRU and don't need one for this kernel).
+ */
 static void
-wait_child(long task_id)
+sh_child_remember(uint64_t task_id, mach_port_name_t taskport)
 {
+	size_t	i;
+
+	for (i = 0; i < SH_CHILD_MAX; i++) {
+		if (sh_children[i].c_task_id == 0) {
+			sh_children[i].c_task_id  = task_id;
+			sh_children[i].c_taskport = taskport;
+			return;
+		}
+	}
+	sh_children[0].c_task_id  = task_id;
+	sh_children[0].c_taskport = taskport;
+}
+
+/*
+ * Look up the saved taskport for a task_id.  Returns MACH_PORT_NULL
+ * if no matching entry -- the user typed `kill 999` on an unknown id,
+ * or the row aged out.
+ */
+static mach_port_name_t
+sh_child_lookup(uint64_t task_id)
+{
+	size_t	i;
+
+	for (i = 0; i < SH_CHILD_MAX; i++) {
+		if (sh_children[i].c_task_id == task_id)
+			return (sh_children[i].c_taskport);
+	}
+	return (MACH_PORT_NULL);
+}
+
+/*
+ * Foreground-wait with Ctrl-C handling.  Replaces the bare yield-spin
+ * with a kbd-stream peek every 50 ms: any byte that arrives during
+ * the wait is checked for ASCII 0x03 (Ctrl-C, courtesy of kbd.c's
+ * Ctrl-folding).  On 0x03 we issue SYS_TASK_KILL against the fg
+ * job's taskport and keep spinning until task_alive returns false --
+ * the kill is async, so the task may take a yield or two to actually
+ * retire (see detection-site model in kern/task.h).
+ *
+ * Non-^C bytes are discarded silently.  A real shell would re-route
+ * them into a type-ahead buffer the next prompt consumes; today the
+ * kbd ring is the buffer of record and the user just loses those
+ * bytes if they typed during a foreground job.  Cheap to fix later
+ * (drain the kbd into a local scratch + flush on prompt) and not
+ * worth the surface here.
+ */
+static void
+wait_child(long task_id, mach_port_name_t taskport)
+{
+	struct mach_msg_header	hdr;
+	int			rv;
+	int			c;
 
 	if (task_id <= 0)
 		return;
-	while (task_alive((uint64_t)task_id))
-		(void)yield();
+	while (task_alive((uint64_t)task_id)) {
+		rv = mach_msg_recv_timed(g_kbd_stream, &hdr, sizeof(hdr), 50);
+		if (rv != MACH_MSG_OK)
+			continue;
+		c = (int)(unsigned char)hdr.msgh_id;
+		if (c == 0x03 && taskport != MACH_PORT_NULL) {
+			puts(ESC_FG_RED);
+			puts("^C\n");
+			puts(ESC_RESET);
+			(void)task_kill(taskport);
+			/* loop again -- kernel retires the task asynchronously */
+		}
+	}
 }
 
 static int
@@ -833,6 +928,93 @@ streq(const char *a, const char *b)
 }
 
 /*
+ * atou64: tiny stdtoul.  Returns 0 on any junk (sh `kill 0` then
+ * gets the proper "task 0 not found" error from the registry lookup).
+ */
+static uint64_t
+atou64(const char *s)
+{
+	uint64_t	v;
+
+	v = 0;
+	if (s == NULL)
+		return (0);
+	while (*s >= '0' && *s <= '9') {
+		v = v * 10 + (uint64_t)(*s - '0');
+		s++;
+	}
+	return (v);
+}
+
+/*
+ * `kill <task_id>` builtin: look up the saved taskport for the named
+ * task_id + call SYS_TASK_KILL with it.  Capability-based, so
+ * `kill 1` (init) returns MACH_E_RIGHT cleanly (sh never had the
+ * taskport for kernel-side tasks).  Async: by the time `kill` returns
+ * the target may not have fully retired yet; user can probe with
+ * the `tasks` program if they care about the exact moment.
+ */
+static int
+builtin_kill(int argc, char *argv[])
+{
+	mach_port_name_t	taskport;
+	uint64_t		task_id;
+	int			rv;
+
+	if (argc < 2) {
+		puts("  usage: kill <task_id>\n");
+		return (0);
+	}
+	task_id  = atou64(argv[1]);
+	taskport = sh_child_lookup(task_id);
+	if (taskport == MACH_PORT_NULL) {
+		puts(ESC_FG_GRAY);
+		puts("  kill: no taskport on file for task_id=");
+		puts(argv[1]);
+		puts(" (sh only knows children it spawned)\n");
+		puts(ESC_RESET);
+		return (0);
+	}
+	rv = task_kill(taskport);
+	if (rv != MACH_MSG_OK) {
+		puts(ESC_FG_RED);
+		puts("  kill: SYS_TASK_KILL returned ");
+		puts(ESC_RESET);
+		/* tiny integer-to-string for one-digit MACH_E_* codes */
+		{
+			char	buf[16];
+			int	n;
+			int	v;
+			int	i;
+			v = rv < 0 ? -rv : rv;
+			n = 0;
+			if (rv < 0)
+				buf[n++] = '-';
+			if (v == 0)
+				buf[n++] = '0';
+			else {
+				int start = n;
+				while (v > 0) {
+					buf[n++] = (char)('0' + (v % 10));
+					v /= 10;
+				}
+				/* reverse the digits in place */
+				for (i = 0; i < (n - start) / 2; i++) {
+					char tmp = buf[start + i];
+					buf[start + i] = buf[n - 1 - i];
+					buf[n - 1 - i] = tmp;
+				}
+			}
+			buf[n] = '\0';
+			puts(buf);
+		}
+		puts("\n");
+		return (0);
+	}
+	return (0);
+}
+
+/*
  * dispatch: route the argv to a builtin or hand to SYS_SPAWN.  Returns
  * the status to propagate into last_status: 0 for builtin / successful
  * spawn, the negative SYS_E_* code if spawn returned an error.
@@ -840,7 +1022,8 @@ streq(const char *a, const char *b)
 static int
 dispatch(int argc, char *argv[])
 {
-	long	rv;
+	mach_port_name_t	taskport;
+	long			rv;
 
 	if (argc <= 0)
 		return (0);
@@ -869,13 +1052,19 @@ dispatch(int argc, char *argv[])
 		builtin_man(argc, argv);
 		return (0);
 	}
+	if (streq(argv[0], "kill"))
+		return (builtin_kill(argc, argv));
 
 	/*
-	 * Not a builtin -- hand to SYS_SPAWN.  argv[1..] are ignored for
-	 * now; the kernel's progreg_spawn takes only a name.  Real argv
-	 * delivery to the child waits on a stack-loader update.
+	 * Not a builtin -- hand to SYS_SPAWN_RETURNS_TASKPORT so we
+	 * also receive a SEND right on the child's task-self port and
+	 * can deliver Ctrl-C / kill builtins against it.  argv[1..]
+	 * are ignored for now; the kernel's progreg_spawn takes only a
+	 * name.  Real argv delivery to the child waits on a stack-
+	 * loader update.
 	 */
-	rv = spawn(argv[0]);
+	taskport = MACH_PORT_NULL;
+	rv = spawn_returns_taskport(argv[0], &taskport);
 	if (rv <= 0) {
 		puts(ESC_FG_GRAY);
 		puts("  ");
@@ -886,7 +1075,13 @@ dispatch(int argc, char *argv[])
 		puts(ESC_RESET);
 		return ((int)rv);
 	}
-	wait_child(rv);
+	sh_child_remember((uint64_t)rv, taskport);
+
+	fg_task_id  = rv;
+	fg_taskport = taskport;
+	wait_child(rv, taskport);
+	fg_task_id  = 0;
+	fg_taskport = MACH_PORT_NULL;
 	return (0);
 }
 
@@ -929,6 +1124,21 @@ repl(void)
 				len--;
 				echo_backspace();
 			}
+			continue;
+		}
+
+		/*
+		 * Ctrl-C at the prompt with no foreground job: abandon
+		 * the current line + reprint.  Standard interactive-shell
+		 * behavior; we never reach wait_child's ^C path in this
+		 * window since dispatch hasn't been called yet.
+		 */
+		if (c == 0x03) {
+			puts(ESC_FG_RED);
+			puts("^C\n");
+			puts(ESC_RESET);
+			len = 0;
+			prompt();
 			continue;
 		}
 

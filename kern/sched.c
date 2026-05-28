@@ -297,6 +297,20 @@ thread_yield(void)
 
 	/* Resumed: release the lock the OTHER thread acquired before switching. */
 	spin_unlock(&sched_lock);
+
+	/*
+	 * Drain any zombies that have accumulated.  Historically reap was
+	 * idle-only, on the theory that "nothing else to do" was the safest
+	 * point to free thread structs.  That works when at most one user
+	 * thread is yield-spinning (idle gets the empty-runq case + reaps),
+	 * but breaks down with two or more concurrent yield-spinners: their
+	 * FIFO round-robin keeps the runq non-empty forever, idle never
+	 * runs, and zombies (e.g. an async-killed task waiting to drop its
+	 * last ref) pile up indefinitely.  Reaping from every voluntary
+	 * yield closes that hole at a one-spinlock-trylock cost in the
+	 * common (zombie-list-empty) case.
+	 */
+	sched_reap_zombies();
 }
 
 void
@@ -317,6 +331,29 @@ thread_block_release(int reason, void *target, struct spinlock *external)
 	    "thread_block_release: idle cannot block");
 
 	spin_lock(&sched_lock);
+
+	/*
+	 * Pre-park kill check.  task_request_terminate sets t_killed
+	 * BEFORE taking sched_lock for the wake fan-out, so any thread
+	 * that acquires sched_lock to commit to BLOCKED after the kill
+	 * was issued observes the flag here.  Without this, a thread
+	 * mid-transition from RUNNING to BLOCKED could miss the wake
+	 * (thread_wake bails on non-BLOCKED) and stay parked indefinitely.
+	 *
+	 * Drop external before thread_exit -- the caller's lock has no
+	 * business surviving into sched_handoff_zombie's reacquisition
+	 * of sched_lock.  kernel_task threads cannot be killed so skip
+	 * the check for them entirely; t_killed is permanently false
+	 * there.
+	 */
+	if (self->th_task != kernel_task &&
+	    task_kill_pending(self->th_task)) {
+		spin_unlock(&sched_lock);
+		if (external != NULL)
+			spin_unlock(external);
+		thread_exit();
+		/* NOTREACHED */
+	}
 
 	spin_lock(&self->th_lock);
 	self->th_state        = THREAD_BLOCKED;
@@ -351,6 +388,17 @@ thread_block_release(int reason, void *target, struct spinlock *external)
 
 	/* Woken by thread_wake; release sched_lock and return. */
 	spin_unlock(&sched_lock);
+
+	/*
+	 * Post-wake kill check.  If task_request_terminate ran while we
+	 * were parked, the wake it fired broke us out of the BLOCKED
+	 * state and we resumed here; t_killed is set, so retire instead
+	 * of returning to the caller (whose RPC the user will never read).
+	 */
+	if (current_thread->th_task != kernel_task &&
+	    task_kill_pending(current_thread->th_task))
+		thread_exit();
+	/* NOTREACHED if killed */
 }
 
 void

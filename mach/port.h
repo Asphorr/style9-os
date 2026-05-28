@@ -624,6 +624,17 @@ int			 port_request_notification(struct port_space *space,
 			    mach_port_name_t *prev_out);
 
 /*
+ * port_arm_dead_name_object: object-level DEAD_NAME arming for in-kernel
+ * watchers that already hold port pointers (no name resolution / rights
+ * check).  Posts MACH_NOTIFY_DEAD_NAME carrying `tag` in nh_msgid onto
+ * `notify` when `watched`'s RECEIVE right is released.  Takes a SEND ref
+ * on `notify` released on fire (one-shot).  MACH_E_DEAD if `watched` is
+ * already dead.  Drives the launchd keep_alive worker.
+ */
+int			 port_arm_dead_name_object(struct port *watched,
+			    struct port *notify, uint32_t tag);
+
+/*
  * port_exception_post: kernel-side primitive used by the trap
  * dispatcher to deliver a MACH_EXC_FAULT message onto a task's
  * exception port.  Caller holds one SEND ref on `port` (typically

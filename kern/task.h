@@ -73,6 +73,34 @@ struct task {
 	 * argument to SYS_TASK_SET_EXC_PORTS.  (t) under t_lock.
 	 */
 	uint32_t		 t_exc_flags;
+
+	/*
+	 * Async-termination flag.  Set once by task_request_terminate
+	 * via __atomic_store(RELEASE); never cleared.  Five detection
+	 * points, every place a thread can transition from "still
+	 * running this task" to "about to commit to more work":
+	 *	1. syscall_dispatch ENTRY -- next syscall after a ring-3
+	 *	   compute window with t_killed already set.
+	 *	2. thread_block_release pre-park -- caught between wake-
+	 *	   eligibility (BLOCKED) and actually-blocked, otherwise
+	 *	   we'd park and never observe the wake.
+	 *	3. thread_block_release post-wake -- woken by the kill,
+	 *	   retire before returning into the caller's recv/RPC loop.
+	 *	4. intr_dispatch tail when iretq'ing to ring 3 -- catches
+	 *	   pure compute loops that never syscall.  PIT timer (or
+	 *	   any IRQ) brings the thread into the kernel; we retire
+	 *	   instead of resuming user code.
+	 *	5. syscall_dispatch EXIT -- catches "this syscall ITSELF
+	 *	   caused the kill" (SYS_TASK_KILL on self), so the user
+	 *	   never observes a sysretq on the kill-issuing call.
+	 *
+	 * kernel_task is never killable -- task_request_terminate
+	 * refuses task_id matching kernel_task and every check site
+	 * fast-paths past kernel-task threads before the atomic load.
+	 *
+	 * (a) atomic, set-once semantics; readers use ACQUIRE load.
+	 */
+	volatile bool		 t_killed;
 };
 
 extern struct task		*kernel_task;
@@ -111,6 +139,46 @@ size_t			 task_snapshot(struct task **out, size_t max);
  * until a spawned child drops off the live list.
  */
 bool			 task_is_alive(uint64_t id);
+
+/*
+ * Request asynchronous termination of the task identified by `task_id`.
+ * Sets t_killed via __atomic_store(RELEASE) and then best-effort wakes
+ * every thread on the target's t_threads list.  Any thread already in
+ * BLOCKED state observes the wake, returns through thread_block_release's
+ * post-wake check, and retires; any thread about to park observes
+ * t_killed under sched_lock in the pre-park check and retires
+ * immediately; threads running in ring 3 observe t_killed at the top
+ * of their next syscall_dispatch.
+ *
+ * Lock-order: tasks_lock -> t_lock -> sched_lock -> th_lock.  The
+ * tasks_lock dance owns task identification + the t_killed store; the
+ * t_lock walk + thread_wake fan-out introduces the new t_lock ->
+ * sched_lock edge but no existing path takes sched_lock then t_lock,
+ * so no cycle.
+ *
+ * Pure ring-3 compute loops that never syscall will NOT terminate
+ * under v1 -- the IRQ-return-to-user check is deferred for v2.
+ *
+ * task_id == kernel_task->t_id is silently refused; missing ids are
+ * silently no-ops (the caller probably races a natural exit).
+ */
+void			 task_request_terminate(uint64_t task_id);
+
+/*
+ * Non-blocking accessor for the t_killed flag.  ACQUIRE load.  NULL
+ * task pointer returns false.  Used at the syscall-dispatch entry +
+ * thread_block_release detection sites.
+ */
+bool			 task_kill_pending(struct task *t);
+
+/*
+ * task_self_port_for: take one SEND ref on `task_id`'s task-self port
+ * and return the port object (caller drops the ref via port_deref with
+ * MACH_PORT_RIGHT_SEND).  NULL if the id is unknown, names kernel_task,
+ * or has no self port.  Lets launchd hand a freshly spawned child's
+ * task-self SEND to launchctl for DEAD_NAME arming.
+ */
+struct port		*task_self_port_for(uint64_t task_id);
 
 /*
  * Synchronous dispatcher invoked by mach_msg_send when the destination

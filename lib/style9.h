@@ -72,6 +72,8 @@ typedef long long		int64_t;
 #define	SYS_THREAD_SET_EXC_PORTS 22
 #define	SYS_TASK_GET_PORT_SNAPSHOT 23
 #define	SYS_TASK_GET_VM_REGIONS	24
+#define	SYS_TASK_KILL		25
+#define	SYS_SPAWN_RETURNS_TASKPORT 26
 
 #define	SYS_E_NOSYS		(-1)
 #define	SYS_E_FAULT		(-2)
@@ -113,6 +115,8 @@ long	spawn(const char *name);
  * a real notification path.
  */
 int	task_alive(uint64_t task_id);
+
+/* task_kill: prototype lives below mach_port_name_t's typedef. */
 
 /* ---- I/O ----------------------------------------------------------- */
 
@@ -486,6 +490,32 @@ int		mach_port_request_notification(mach_port_name_t name,
 long	spawn_with_port(const char *name, mach_port_name_t source_name);
 
 /*
+ * task_kill: capability-based async terminate.  `target_port` is a
+ * port name in the caller's space that the kernel verifies is a
+ * task-self port (PORT_SPECIAL_TASK_SELF), holding SEND.  Self-kill is
+ * trivial: task_kill(MACH_PORT_TASK_SELF).  Killing another task
+ * requires having been handed its task-self port via OOL or parent
+ * inject.  Returns MACH_MSG_OK on accept, MACH_E_RIGHT on missing
+ * SEND, MACH_E_INVAL if the port is not a task-self port.  The
+ * actual termination is asynchronous (the syscall returns before the
+ * target retires); see [[project-task-async-kill-2026-05-28]] for the
+ * detection-site model.
+ */
+int	task_kill(mach_port_name_t target_port);
+
+/*
+ * spawn_returns_taskport: like spawn(), but also writes a port name
+ * carrying SEND on the new task's task-self port to `*out_taskport`.
+ * The pair `(returned task_id, *out_taskport)` is the capability
+ * needed by task_kill() to terminate the child later.  Shell uses
+ * this for every fg/bg job so Ctrl-C + `kill <id>` are wired to the
+ * child via the Mach-shaped path (no pid -> task lookup needed).
+ * Returns task_id on success, negative SYS_E_* on failure; on
+ * failure *out_taskport is untouched.
+ */
+long	spawn_returns_taskport(const char *name, mach_port_name_t *out_taskport);
+
+/*
  * task_set_exception_port: install (or replace) the calling task's
  * exception port for every type.  Equivalent to
  * task_set_exception_ports(EXC_MASK_ALL, notify_port).  Kept for
@@ -668,9 +698,14 @@ struct svc_stats_reply {
 struct svc_tasks_entry {
 	uint64_t	te_task_id;
 	uint32_t	te_nthreads;
+	uint32_t	te_nports;	/* names in t_port_space        */
+	uint32_t	te_nvm_regions;	/* live entries in t_map        */
 	uint32_t	te_pad;
 	char		te_name[SVC_TASKS_NAME_MAX];
 };
+
+_Static_assert(sizeof(struct svc_tasks_entry) == 48,
+    "svc_tasks_entry must be 48 bytes (wire format)");
 
 /* WIRE FORMAT.  Mirrors mach/services.h. */
 struct svc_tasks_reply {
@@ -678,6 +713,10 @@ struct svc_tasks_reply {
 	uint32_t		tr_pad;
 	struct svc_tasks_entry	tr_entries[SVC_TASKS_MAX];
 };
+
+_Static_assert(sizeof(struct svc_tasks_reply) ==
+    8 + SVC_TASKS_MAX * sizeof(struct svc_tasks_entry),
+    "svc_tasks_reply layout pinned");
 
 #define	SVC_ECHOOL_NAME		"echool"
 #define	ECHOOL_OP_CHECKSUM	1
@@ -691,20 +730,30 @@ struct svc_tasks_reply {
 #define	LAUNCHCTL_OP_LIST	1
 #define	LAUNCHCTL_OP_LOAD	2
 #define	LAUNCHCTL_OP_UNLOAD	3
+#define	LAUNCHCTL_OP_STOP	4
+#define	LAUNCHCTL_OP_START	5
 
 #define	LAUNCHD_MAX_SERVICES	8
 #define	LAUNCHD_NAME_MAX	24
 #define	LAUNCHD_PROGRAM_MAX	24
 
+#define	LAUNCHD_LOAD_FLAG_KEEPALIVE	0x1u
+
 #define	LAUNCHD_STATE_RUNNING	0
 #define	LAUNCHD_STATE_EXITED	1
 #define	LAUNCHD_STATE_FAILED	2
+#define	LAUNCHD_STATE_STOPPED	3
 
 /* WIRE FORMAT.  Mirrors mach/services.h. */
 struct svc_launchctl_load_req {
 	char		lr_name[LAUNCHD_NAME_MAX];
 	char		lr_program[LAUNCHD_PROGRAM_MAX];
+	uint32_t	lr_flags;
+	uint32_t	lr_pad;
 };
+
+_Static_assert(sizeof(struct svc_launchctl_load_req) == 56,
+    "svc_launchctl_load_req must be 56 bytes (wire format)");
 
 /* WIRE FORMAT.  Mirrors mach/services.h. */
 struct svc_launchctl_byname_req {
@@ -716,7 +765,13 @@ struct svc_launchctl_status_reply {
 	int32_t		ls_status;
 	uint32_t	ls_state;
 	uint64_t	ls_task_id;
+	uint32_t	ls_taskport;	/* SEND on child task-self port  */
+					/* in caller's space (LOAD ok)   */
+	uint32_t	ls_pad;
 };
+
+_Static_assert(sizeof(struct svc_launchctl_status_reply) == 24,
+    "svc_launchctl_status_reply must be 24 bytes (wire format)");
 
 /* WIRE FORMAT.  Mirrors mach/services.h. */
 struct svc_launchctl_entry {

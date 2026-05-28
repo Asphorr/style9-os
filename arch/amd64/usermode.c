@@ -83,11 +83,14 @@ usermode_run_first_blob(void)
  */
 long
 arch_spawn_user(const char *name, const uint8_t *image, size_t image_size,
-    struct port *inject_port)
+    struct port *inject_port, struct port_space *caller_space,
+    mach_port_name_t *out_taskport_name)
 {
 	struct user_spawn_arg	*sa;
 	struct task		*ut;
 	struct thread		*th;
+	mach_port_name_t	 taskport_name;
+	int			 rv;
 
 	if (name == NULL || image == NULL || image_size == 0) {
 		if (inject_port != NULL)
@@ -114,10 +117,49 @@ arch_spawn_user(const char *name, const uint8_t *image, size_t image_size,
 		return (SYS_E_NOSYS);
 	}
 
+	/*
+	 * Optional caller-space taskport install.  When `caller_space`
+	 * is non-NULL, the caller wants a SEND right on the new task's
+	 * task-self port installed in their space + the resulting name
+	 * written back.  Done BEFORE thread_create so a failure path
+	 * cleanly task_derefs the not-yet-running task -- t_refs is
+	 * still 1 (no thread attached), so deref to 0 frees it via
+	 * task__chain_remove.
+	 *
+	 * Powers SYS_SPAWN_RETURNS_TASKPORT: the shell + future
+	 * task-manager-style services use this to acquire the
+	 * capability needed by SYS_TASK_KILL on the child.
+	 */
+	if (caller_space != NULL && out_taskport_name != NULL) {
+		rv = space_install(caller_space, ut->t_self_port,
+		    MACH_PORT_RIGHT_SEND, &taskport_name);
+		if (rv != MACH_MSG_OK) {
+			if (inject_port != NULL)
+				port_deref(inject_port, MACH_PORT_RIGHT_SEND);
+			task_deref(ut);
+			kfree(sa);
+			return (SYS_E_NOSYS);
+		}
+		*out_taskport_name = taskport_name;
+	}
+
 	th = thread_create(ut, usermode_elf_launcher, sa, "user-elf");
 	if (th == NULL) {
 		if (inject_port != NULL)
 			port_deref(inject_port, MACH_PORT_RIGHT_SEND);
+		if (caller_space != NULL && out_taskport_name != NULL) {
+			/*
+			 * Roll back the taskport install on thread-create
+			 * failure: drop the SEND ref we installed in the
+			 * caller's space.  Otherwise the caller would
+			 * receive a name pointing at a port whose task is
+			 * about to be freed -- a UAF window the moment they
+			 * try to use it.
+			 */
+			(void)space_drop_one_right(caller_space,
+			    *out_taskport_name, MACH_PORT_RIGHT_SEND);
+			*out_taskport_name = MACH_PORT_NULL;
+		}
 		task_deref(ut);
 		kfree(sa);
 		return (SYS_E_NOSYS);

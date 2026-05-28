@@ -160,6 +160,13 @@ size_t			 vm_map_snapshot(struct vm_map *map,
 			    struct mach_vm_region_entry *out,
 			    size_t max_entries);
 
+/*
+ * O(1) live-region count for a map.  Reads vm_count under vm_lock so
+ * the value is internally consistent with the snapshot walk.  Drives
+ * the per-task region column in the "tasks" service / top(1).
+ */
+size_t			 vm_map_region_count(struct vm_map *map);
+
 struct pmap;
 
 /*
