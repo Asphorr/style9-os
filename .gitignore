@@ -24,3 +24,6 @@ serial.log
 # Disk images used for ATA driver smoke tests.
 disk.img
 *.img
+
+# Browser-render of mdoc man pages (regenerated via mandoc -Thtml).
+docs/man/*.html
