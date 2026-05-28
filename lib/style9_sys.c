@@ -113,9 +113,78 @@ spawn(const char *name)
 	return (syscall1(SYS_SPAWN, (long)name));
 }
 
+long
+spawn_with_port(const char *name, mach_port_name_t source_name)
+{
+
+	return (syscall2(SYS_SPAWN_WITH_PORT, (long)name, (long)source_name));
+}
+
+int
+task_set_exception_port(mach_port_name_t notify_port)
+{
+
+	return ((int)syscall1(SYS_TASK_SET_EXC_PORT, (long)notify_port));
+}
+
+int
+task_set_exception_ports(uint32_t types_mask, mach_port_name_t notify_port)
+{
+
+	return ((int)syscall2(SYS_TASK_SET_EXC_PORTS,
+	    (long)types_mask, (long)notify_port));
+}
+
+int
+thread_set_exception_ports(uint32_t types_mask, mach_port_name_t notify_port)
+{
+
+	return ((int)syscall2(SYS_THREAD_SET_EXC_PORTS,
+	    (long)types_mask, (long)notify_port));
+}
+
+long
+task_get_port_snapshot(uint64_t task_id,
+    struct mach_port_snapshot_entry *out, size_t max_entries)
+{
+
+	return (syscall3(SYS_TASK_GET_PORT_SNAPSHOT,
+	    (long)task_id, (long)out, (long)max_entries));
+}
+
+long
+task_get_vm_regions(uint64_t task_id,
+    struct mach_vm_region_entry *out, size_t max_entries)
+{
+
+	return (syscall3(SYS_TASK_GET_VM_REGIONS,
+	    (long)task_id, (long)out, (long)max_entries));
+}
+
 int
 task_alive(uint64_t task_id)
 {
 
 	return ((int)syscall1(SYS_TASK_ALIVE, (long)task_id));
+}
+
+/* ---- vm ------------------------------------------------------------ */
+
+void *
+vm_allocate(size_t bytes, uint32_t prot)
+{
+	long	rv;
+
+	rv = syscall2(SYS_VM_ALLOCATE, (long)bytes, (long)prot);
+	if (rv < 0)
+		return (NULL);
+	return ((void *)(uintptr_t)rv);
+}
+
+int
+vm_deallocate(void *va, size_t bytes)
+{
+
+	return ((int)syscall2(SYS_VM_DEALLOCATE,
+	    (long)(uintptr_t)va, (long)bytes));
 }

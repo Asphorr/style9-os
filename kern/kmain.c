@@ -29,6 +29,7 @@
 #include "port.h"
 #include "sched.h"
 #include "shell.h"
+#include "smap.h"
 #include "stress.h"
 #include "syscall.h"
 #include "task.h"
@@ -135,6 +136,8 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	klog(KLOG_LEVEL_DEBUG, "boot", "entering shell");
 
 	syscall_init();
+	smap_init();
+	(void)smap_enable_runtime();
 
 	progreg_init();
 

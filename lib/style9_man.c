@@ -79,3 +79,15 @@ man_fetch(const char *name, const char **out_text, size_t *out_len)
 	*out_len  = (size_t)reply.ool.size;
 	return (MACH_MSG_OK);
 }
+
+int
+man_release(const char *text, size_t len)
+{
+	size_t	aligned;
+
+	if (text == NULL || len == 0)
+		return (SYS_E_INVAL);
+
+	aligned = (len + 0xFFFu) & ~(size_t)0xFFFu;
+	return (vm_deallocate((void *)(uintptr_t)text, aligned));
+}

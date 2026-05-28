@@ -130,6 +130,36 @@ struct vm_map_entry	*vm_map_lookup(struct vm_map *, uint64_t va);
 
 void			 vm_map_print(struct vm_map *);
 
+/*
+ * Wire-format snapshot of one entry in a vm_map.  Returned in arrays
+ * by SYS_TASK_GET_VM_REGIONS.  Mirrors struct vm_map_entry's externally
+ * meaningful fields -- the head/list pointers + vm_object placeholder
+ * stay kernel-private.  ABI-stable; future revisions may append new
+ * trailing fields but never reorder.
+ */
+#define	MACH_VM_REGION_MAX		64
+
+/* WIRE FORMAT.  ABI-stable. */
+struct mach_vm_region_entry {
+	uint64_t	mvr_start;	/* inclusive base VA              */
+	uint64_t	mvr_end;	/* exclusive top VA               */
+	uint64_t	mvr_offset;	/* into vm_object (0 today)       */
+	uint8_t		mvr_prot;	/* VM_PROT_*                      */
+	uint8_t		mvr_flags;	/* VME_F_*                        */
+	uint8_t		mvr_pad[6];
+};
+
+/*
+ * Snapshot every live entry in `map` into `out`, up to `max_entries`.
+ * Best-effort: walks under vm_lock, copies field-by-field.  Returns
+ * the number of entries written.  Drives the userspace `vmmap` tool
+ * (Darwin's `vmmap(1)` analog -- shows a process's VM layout, again
+ * a question Linux has no equivalent to without /proc/pid/maps).
+ */
+size_t			 vm_map_snapshot(struct vm_map *map,
+			    struct mach_vm_region_entry *out,
+			    size_t max_entries);
+
 struct pmap;
 
 /*
@@ -142,5 +172,22 @@ struct pmap;
  */
 void			 vm_map_release_anon(struct vm_map *,
 			    struct pmap *pm);
+
+/*
+ * Tear down a single anonymous range previously installed by some
+ * combination of vm_map_find_space + per-page pmap_enter + vm_map_enter.
+ *
+ * Strict semantics in v1: (va, size) MUST mirror a single VME_F_ANON
+ * vm_map_entry whose extent covers the request.  Partial deallocate,
+ * ranges spanning multiple entries, or ranges naming a non-anonymous
+ * entry all return false with no side effect.  Used both by
+ * SYS_VM_DEALLOCATE and by send_capture_ool's deallocate-on-send hook.
+ *
+ * On success: each present pmap leaf is unmapped, the backing frame is
+ * pmm_free_page'd, the matching vm_map_entry is dropped, and true is
+ * returned.
+ */
+bool			 vm_map_release(struct vm_map *,
+			    struct pmap *pm, uint64_t va, uint64_t size);
 
 #endif /* !_SYS_VM_H_ */

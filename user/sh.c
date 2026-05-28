@@ -283,7 +283,7 @@ paint_splash(void)
 
 	puts(ESC_FG_WHITE); puts("  NAME           ");
 	puts(ESC_FG_GRAY);  puts("style9-os -- BSD-flavoured x86_64 "
-	    "microkernel\n");
+	    "kernel with Mach IPC\n");
 	puts("\n");
 
 	puts(ESC_FG_WHITE); puts("  SYSTEM         ");
@@ -544,7 +544,9 @@ builtin_about(void)
 	s = s - m * 60ull;
 
 	puts(ESC_FG_GRAY);
-	puts("  style9-os -- a BSD-flavoured x86_64 microkernel.\n");
+	puts("  style9-os -- a BSD-flavoured x86_64 kernel with Mach IPC.\n");
+	puts("  monolithic in the XNU sense: services and drivers live in\n");
+	puts("  ring 0, Mach msg is the inter-component messaging surface.\n");
 	puts("  written end-to-end in the style(9) BSD KNF convention,\n");
 	puts("  hence the name.\n");
 	puts("\n");
@@ -795,6 +797,14 @@ builtin_man(int argc, char *argv[])
 	title[i]   = '\0';
 
 	pager_show(text, len, title);
+
+	/*
+	 * Release the OOL-installed range so repeated `man` invocations do
+	 * not leak one anonymous mapping each.  man_release is best-effort
+	 * -- a failure (range no longer matches an entry) is harmless and
+	 * silently absorbed; the buffer stays around until task exit.
+	 */
+	(void)man_release(text, len);
 }
 
 /* ---- spawn + yield-spin wait ------------------------------------- */

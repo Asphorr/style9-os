@@ -35,6 +35,61 @@ mach_port_deallocate(mach_port_name_t name)
 }
 
 int
+mach_port_mod_refs(mach_port_name_t name, uint8_t right)
+{
+
+	return ((int)syscall2(SYS_PORT_MOD_REFS, (long)name, (long)right));
+}
+
+mach_port_name_t
+mach_port_set_allocate(void)
+{
+	long	rv;
+
+	rv = syscall0(SYS_PORT_SET_ALLOC);
+	if (rv <= 0)
+		return (MACH_PORT_NULL);
+	return ((mach_port_name_t)rv);
+}
+
+int
+mach_port_set_insert(mach_port_name_t set_name, mach_port_name_t port_name)
+{
+
+	return ((int)syscall2(SYS_PORT_SET_INSERT,
+	    (long)set_name, (long)port_name));
+}
+
+int
+mach_port_set_remove(mach_port_name_t set_name, mach_port_name_t port_name)
+{
+
+	return ((int)syscall2(SYS_PORT_SET_REMOVE,
+	    (long)set_name, (long)port_name));
+}
+
+mach_port_name_t
+mach_port_set_extract(mach_port_name_t port_name)
+{
+	long	rv;
+
+	rv = syscall1(SYS_PORT_SET_EXTRACT, (long)port_name);
+	if (rv <= 0)
+		return (MACH_PORT_NULL);
+	return ((mach_port_name_t)rv);
+}
+
+int
+mach_port_request_notification(mach_port_name_t name, uint32_t notify_type,
+    mach_port_name_t notify_port, uint32_t notify_msgid)
+{
+
+	return ((int)syscall4(SYS_PORT_REQUEST_NOTIFICATION,
+	    (long)name, (long)notify_type, (long)notify_port,
+	    (long)notify_msgid));
+}
+
+int
 mach_msg_send(const struct mach_msg_header *msg)
 {
 
@@ -110,4 +165,91 @@ bootstrap_lookup(const char *service)
 	if (!(reply.hdr.msgh_bits & MACH_MSGH_BITS_COMPLEX))
 		return (MACH_PORT_NULL);
 	return (reply.pd.name);
+}
+
+/*
+ * bootstrap_register_service: publish `port` under `service` in the
+ * registry.  Wraps the BOOTSTRAP_OP_REGISTER request -- COMPLEX
+ * message carrying one port_descriptor (COPY_SEND of `port`) plus the
+ * service name in the trailing inline payload -- and decodes the
+ * bsr_status word in the status reply.
+ */
+int
+bootstrap_register_service(const char *service, mach_port_name_t port)
+{
+	struct {
+		struct mach_msg_header			hdr;
+		struct mach_msg_body			body;
+		struct mach_msg_port_descriptor		pd;
+		struct bootstrap_lookup_request		name;
+	} req;
+	struct {
+		struct mach_msg_header			hdr;
+		struct bootstrap_status_reply		body;
+	} reply;
+	size_t	i;
+	int	rv;
+
+	for (i = 0; i < BOOTSTRAP_NAME_MAX; i++)
+		req.name.blr_name[i] = '\0';
+	for (i = 0; service[i] != '\0' && i < BOOTSTRAP_NAME_MAX - 1; i++)
+		req.name.blr_name[i] = service[i];
+
+	req.hdr.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) |
+	    MACH_MSGH_BITS_COMPLEX;
+	req.hdr.msgh_size    = sizeof(req);
+	req.hdr.msgh_remote  = MACH_PORT_BOOTSTRAP;
+	req.hdr.msgh_local   = MACH_PORT_NULL;
+	req.hdr.msgh_voucher = 0;
+	req.hdr.msgh_id      = BOOTSTRAP_OP_REGISTER;
+
+	req.body.msgh_descriptor_count = 1;
+
+	req.pd.type        = MACH_MSG_PORT_DESCRIPTOR;
+	req.pd.disposition = MACH_MSG_TYPE_COPY_SEND;
+	req.pd.pad1        = 0;
+	req.pd.pad2        = 0;
+	req.pd.name        = port;
+
+	rv = mach_msg_rpc(&req.hdr, &reply.hdr, sizeof(reply), 1000);
+	if (rv != MACH_MSG_OK)
+		return (rv);
+	return ((int)reply.body.bsr_status);
+}
+
+/*
+ * bootstrap_deregister_service: remove `service` from the registry.
+ * Plain (non-complex) request with the service name in the inline
+ * payload; decode status from the reply.
+ */
+int
+bootstrap_deregister_service(const char *service)
+{
+	struct {
+		struct mach_msg_header			hdr;
+		struct bootstrap_lookup_request		name;
+	} req;
+	struct {
+		struct mach_msg_header			hdr;
+		struct bootstrap_status_reply		body;
+	} reply;
+	size_t	i;
+	int	rv;
+
+	for (i = 0; i < BOOTSTRAP_NAME_MAX; i++)
+		req.name.blr_name[i] = '\0';
+	for (i = 0; service[i] != '\0' && i < BOOTSTRAP_NAME_MAX - 1; i++)
+		req.name.blr_name[i] = service[i];
+
+	req.hdr.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	req.hdr.msgh_size    = sizeof(req);
+	req.hdr.msgh_remote  = MACH_PORT_BOOTSTRAP;
+	req.hdr.msgh_local   = MACH_PORT_NULL;
+	req.hdr.msgh_voucher = 0;
+	req.hdr.msgh_id      = BOOTSTRAP_OP_DEREGISTER;
+
+	rv = mach_msg_rpc(&req.hdr, &reply.hdr, sizeof(reply), 1000);
+	if (rv != MACH_MSG_OK)
+		return (rv);
+	return ((int)reply.body.bsr_status);
 }

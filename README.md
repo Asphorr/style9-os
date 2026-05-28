@@ -154,7 +154,7 @@ After the boot pass + the `hello.elf` ring-3 smoke run, you land in
 sh.elf -- a ring-3 shell in an Apple/BSD-flavoured manpage TUI:
 
 ```
-  NAME           style9-os -- BSD-flavoured x86_64 microkernel
+  NAME           style9-os -- BSD-flavoured x86_64 kernel with Mach IPC
 
   SYSTEM         arch     x86_64
                  ram      1704 / 130944 KiB

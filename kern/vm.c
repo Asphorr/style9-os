@@ -116,6 +116,46 @@ vm_map_release_anon(struct vm_map *map, struct pmap *pm)
 	}
 }
 
+bool
+vm_map_release(struct vm_map *map, struct pmap *pm,
+    uint64_t va, uint64_t size)
+{
+	struct vm_map_entry	*entry;
+	uint64_t		 end;
+	uint64_t		 pa;
+	uint64_t		 v;
+
+	if (map == NULL || pm == NULL || size == 0)
+		return (false);
+	if ((va & VM_PAGE_MASK) != 0 || (size & VM_PAGE_MASK) != 0)
+		return (false);
+
+	end = va + size;
+	if (end < va)
+		return (false);
+	if (va < map->vm_lo || end > map->vm_hi)
+		return (false);
+
+	entry = vm_map_lookup(map, va);
+	if (entry == NULL)
+		return (false);
+	if (entry->vme_start != va || entry->vme_end < end)
+		return (false);
+	if ((entry->vme_flags & VME_F_ANON) == 0)
+		return (false);
+
+	for (v = va; v < end; v += VM_PAGE_SIZE) {
+		pa = pmap_extract(pm, v);
+		if (pa == PA_INVALID)
+			continue;
+		(void)pmap_remove(pm, v);
+		pmm_free_page(pa);
+	}
+
+	(void)vm_map_remove(map, va, size);
+	return (true);
+}
+
 /*
  * Caller holds vm_lock.  Returns true if [va, va+size) does not
  * overlap any existing entry, false otherwise.
@@ -296,6 +336,35 @@ vm_map_print(struct vm_map *map)
 	for (e = map->vm_head; e != NULL; e = e->vme_next)
 		vm_print_entry(e);
 	spin_unlock(&map->vm_lock);
+}
+
+size_t
+vm_map_snapshot(struct vm_map *map, struct mach_vm_region_entry *out,
+    size_t max_entries)
+{
+	struct vm_map_entry		*e;
+	struct mach_vm_region_entry	*o;
+	size_t				 i;
+	size_t				 n;
+
+	if (map == NULL || out == NULL || max_entries == 0)
+		return (0);
+
+	n = 0;
+	spin_lock(&map->vm_lock);
+	for (e = map->vm_head; e != NULL && n < max_entries; e = e->vme_next) {
+		o = &out[n];
+		o->mvr_start  = e->vme_start;
+		o->mvr_end    = e->vme_end;
+		o->mvr_offset = e->vme_offset;
+		o->mvr_prot   = e->vme_prot;
+		o->mvr_flags  = e->vme_flags;
+		for (i = 0; i < sizeof(o->mvr_pad); i++)
+			o->mvr_pad[i] = 0;
+		n++;
+	}
+	spin_unlock(&map->vm_lock);
+	return (n);
 }
 
 static void

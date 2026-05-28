@@ -12,6 +12,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "port.h"
 #include "queue.h"
 #include "spinlock.h"
 
@@ -115,6 +116,21 @@ struct thread {
 		uintptr_t	 wh_ra;
 	}			 th_held[THREAD_HELD_LOCKS_MAX];
 	uint8_t			 th_held_count;
+
+	/*
+	 * Per-thread exception ports.  Identical shape to the task-level
+	 * t_exc_ports array; user_fault_die checks this slot FIRST and
+	 * falls through to the task-level slot only when this entry is
+	 * NULL.  Thread-level wins because the canonical use is a
+	 * debugger attached to one particular thread, watching its
+	 * faults specifically while the rest of the task takes a
+	 * different (or no) handler.  All under th_lock.
+	 *
+	 * Refs balance the same way the task-level slots do: one SEND
+	 * ref per non-NULL slot, dropped on slot replace and on thread
+	 * reap (sched_reap_zombies before kfree).
+	 */
+	struct port		*th_exc_ports[EXC_TYPE_COUNT];
 };
 
 extern struct thread		*current_thread;	/* per-CPU later    */
@@ -129,6 +145,16 @@ void		thread_exit(void) __attribute__((noreturn));
 
 const char	*thread_state_name(enum thread_state);
 void		thread_print(struct thread *);
+
+/*
+ * Install `port` into every slot of `th->th_exc_ports` named by
+ * `types_mask`; semantics + ref discipline mirror
+ * task_set_exception_ports.  Passing port=NULL clears the named
+ * slots.  Returns MACH_MSG_OK on success, MACH_E_INVAL on a bad
+ * mask.  Caller typically passes current_thread.
+ */
+int		thread_set_exception_ports(struct thread *th,
+		    uint32_t types_mask, struct port *port);
 
 /* defined in switch.S */
 void		thread_switch_asm(uint64_t *old_rsp_save, uint64_t new_rsp);

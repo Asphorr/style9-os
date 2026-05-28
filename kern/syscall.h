@@ -36,10 +36,25 @@
 #define	SYS_MSG_RPC		8	/* (req, replybuf, repsize, ms) -> 0/err   */
 #define	SYS_SPAWN		9	/* (const char *name)           -> task_id */
 #define	SYS_TASK_ALIVE		10	/* (uint64_t task_id)           -> 0/1     */
+#define	SYS_VM_ALLOCATE		11	/* (size_t bytes, uint32_t prot) -> VA    */
+#define	SYS_VM_DEALLOCATE	12	/* (uint64_t va, size_t bytes)  -> 0/err  */
+#define	SYS_PORT_MOD_REFS	13	/* (name, right)                -> 0/err  */
+#define	SYS_PORT_SET_ALLOC	14	/* ()                           -> name   */
+#define	SYS_PORT_SET_INSERT	15	/* (set_name, port_name)        -> 0/err  */
+#define	SYS_PORT_SET_REMOVE	16	/* (set_name, port_name)        -> 0/err  */
+#define	SYS_PORT_REQUEST_NOTIFICATION 17 /* (name, type, notify, msgid) -> 0/err */
+#define	SYS_SPAWN_WITH_PORT	18	/* (const char *name, mach_port_name_t) -> task_id */
+#define	SYS_TASK_SET_EXC_PORT	19	/* (mach_port_name_t notify) -> 0/err */
+#define	SYS_PORT_SET_EXTRACT	20	/* (port_name) -> set_name or 0       */
+#define	SYS_TASK_SET_EXC_PORTS	21	/* (mask, notify) -> 0/err            */
+#define	SYS_THREAD_SET_EXC_PORTS 22	/* (mask, notify) -> 0/err            */
+#define	SYS_TASK_GET_PORT_SNAPSHOT 23	/* (task_id, buf, max_entries) -> count */
+#define	SYS_TASK_GET_VM_REGIONS	24	/* (task_id, buf, max_entries) -> count   */
 
 #define	SYS_E_NOSYS	(-1)
 #define	SYS_E_FAULT	(-2)
 #define	SYS_E_INVAL	(-3)
+#define	SYS_E_NOMEM	(-4)
 
 /*
  * On-stack frame the entry asm hands to syscall_dispatch.  Field order

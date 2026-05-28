@@ -57,6 +57,29 @@ struct port {
 	struct mach_msg_header *p_stash_buf;
 	size_t		 p_stash_size;
 	int		 p_stash_rv;
+
+	/*
+	 * Notification slots (one-shot per type).
+	 *
+	 *	NO_SENDERS	registered by the receiver of THIS port; fires
+	 *			when the last send-bearing right drops while
+	 *			RECEIVE is still held.
+	 *	DEAD_NAME	registered by a SEND holder of THIS port; fires
+	 *			when RECEIVE is dropped and the port goes dead
+	 *			(the watcher's SEND name in their own space
+	 *			becomes a dead name).
+	 *
+	 * The kernel holds a SEND ref on each notify port to keep it
+	 * alive until the notification fires or the source's RECV
+	 * drops (whichever first); both refs are released through
+	 * port_deref's notify-cleanup branches.  v1 is single-slot per
+	 * type: a second registration replaces the first.  All under
+	 * p_lock.
+	 */
+	struct port	*p_notify_no_senders;
+	struct port	*p_notify_dead_name;
+	uint32_t	 p_notify_no_senders_id;
+	uint32_t	 p_notify_dead_name_id;
 };
 
 struct port_set {
@@ -151,5 +174,15 @@ int		 space_drop_one_right(struct port_space *,
 		    mach_port_name_t name, uint8_t right);
 int		 space_unbind_no_deref(struct port_space *,
 		    mach_port_name_t name, uint8_t right);
+
+/*
+ * port_msg.c -- synthesise + enqueue a kernel-originated notification
+ * message on `notify_port`.  Caller passes in the opcode (msgh_id) and
+ * the user tag the receiver gets in nh_msgid.  Best-effort: dropped if
+ * the queue is full or the port is dead.  Caller still owns the SEND
+ * ref it held -- this routine does not deref.
+ */
+int		 port_notify_enqueue(struct port *notify_port,
+		    uint32_t notify_id, uint32_t user_tag);
 
 #endif /* !_MACH_PORT_INTERNAL_H_ */

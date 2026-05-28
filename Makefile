@@ -65,6 +65,7 @@ OBJS	= \
 	$(OBJDIR)/intr.o	\
 	$(OBJDIR)/pit.o		\
 	$(OBJDIR)/pmap.o	\
+	$(OBJDIR)/smap.o	\
 	$(OBJDIR)/syscall_entry.o \
 	$(OBJDIR)/syscall.o	\
 	$(OBJDIR)/usermode.o	\
@@ -84,6 +85,7 @@ OBJS	= \
 	$(OBJDIR)/port_msg.o	\
 	$(OBJDIR)/bootstrap.o	\
 	$(OBJDIR)/services.o	\
+	$(OBJDIR)/launchd.o	\
 	$(OBJDIR)/klog.o	\
 	$(OBJDIR)/vm.o		\
 	$(OBJDIR)/task.o	\
@@ -108,6 +110,14 @@ OBJS	= \
 	$(OBJDIR)/clock_elf.o	\
 	$(OBJDIR)/tasks_elf.o	\
 	$(OBJDIR)/sh_elf.o	\
+	$(OBJDIR)/excchild_elf.o \
+	$(OBJDIR)/excchild_ud_elf.o \
+	$(OBJDIR)/excchild_thr_elf.o \
+	$(OBJDIR)/excchild_resume_elf.o \
+	$(OBJDIR)/lsmp_elf.o \
+	$(OBJDIR)/vmmap_elf.o \
+	$(OBJDIR)/echod_elf.o \
+	$(OBJDIR)/launchctl_elf.o \
 	$(OBJDIR)/ksym.o
 
 all: kernel.elf
@@ -162,7 +172,7 @@ $(OBJDIR)/style9_%.o: $(LIB_DIR)/style9_%.c | $(OBJDIR)
 # below.  To add one, drop user/<name>.c on disk, append the name here,
 # and register the matching _binary_<name>_elf_start/_end pair in
 # kern/progreg.c.
-USER_PROGRAMS = hello clock tasks sh
+USER_PROGRAMS = hello clock tasks sh excchild excchild_ud excchild_thr excchild_resume lsmp vmmap echod launchctl
 
 $(OBJDIR)/%.user.o: $(USER_DIR)/%.c | $(OBJDIR)
 	$(CC) $(USER_CFLAGS) $(DEPFLAGS) -c $< -o $@

@@ -108,6 +108,10 @@ port_create(void)
 	p->p_stash_buf    = NULL;
 	p->p_stash_size   = 0;
 	p->p_stash_rv     = MACH_E_NOMSG;
+	p->p_notify_no_senders     = NULL;
+	p->p_notify_dead_name      = NULL;
+	p->p_notify_no_senders_id  = 0;
+	p->p_notify_dead_name_id   = 0;
 	return (p);
 }
 
@@ -169,6 +173,12 @@ port_deref(struct port *p, uint8_t rights)
 	struct port_msg *drain_head = NULL;
 	struct thread	*wake_head = NULL;
 	struct thread	*send_wake_head = NULL;
+	struct port	*notify_no_senders = NULL;
+	struct port	*notify_dead_name = NULL;
+	uint32_t	 notify_no_senders_id = 0;
+	uint32_t	 notify_dead_name_id = 0;
+	bool		 fire_no_senders = false;
+	bool		 fire_dead_name = false;
 
 	spin_lock(&p->p_lock);
 
@@ -207,32 +217,88 @@ port_deref(struct port *p, uint8_t rights)
 
 		member_of = p->p_set;
 		p->p_set = NULL;
+
+		/*
+		 * NO_SENDERS slot: receiver going away means the
+		 * no-senders event can no longer fire on this port.
+		 * Snapshot+clear so the post-unlock cleanup releases
+		 * our SEND ref on the notify target without firing.
+		 */
+		if (p->p_notify_no_senders != NULL) {
+			notify_no_senders = p->p_notify_no_senders;
+			p->p_notify_no_senders    = NULL;
+			p->p_notify_no_senders_id = 0;
+		}
+		/*
+		 * DEAD_NAME slot: receiver going away IS the trigger.
+		 * Snapshot + tag, mark for firing, release the SEND ref
+		 * post-unlock (after the notification is delivered).
+		 */
+		if (p->p_notify_dead_name != NULL) {
+			notify_dead_name    = p->p_notify_dead_name;
+			notify_dead_name_id = p->p_notify_dead_name_id;
+			p->p_notify_dead_name    = NULL;
+			p->p_notify_dead_name_id = 0;
+			fire_dead_name = true;
+		}
 	}
 
 	/*
 	 * No-senders detection.  If dropping a send-bearing right took
 	 * the per-port sender count to zero while the receive end is
-	 * still held and the queue is empty, any thread blocked in
-	 * recv on this port is stranded -- no future message can ever
-	 * arrive.  Mark the port dead and hand the waiters out for a
-	 * post-unlock wake so they can return MACH_E_DEAD.
+	 * still held, either:
+	 *	a notification was armed -- fire it (one-shot); the port
+	 *	  stays alive so the receiver may MAKE_SEND a fresh right
+	 *	  inside the notify handler if it chooses;
+	 *	no notification -- fall back to the v0 behaviour: mark
+	 *	  the port dead and wake any recv-blocked threads with
+	 *	  MACH_E_DEAD so they aren't stranded waiting for a
+	 *	  message that can never arrive.
 	 *
-	 * Set-waiters are not woken here: the set as a whole stays
-	 * alive as long as any other member still has senders, and
-	 * we have no cheap way to certify that condition here.
+	 * Set-waiters are not woken in the fallback path: the set as a
+	 * whole stays alive as long as any other member still has
+	 * senders, and we have no cheap way to certify that condition
+	 * here.
 	 */
 	if ((rights & (MACH_PORT_RIGHT_SEND |
 	    MACH_PORT_RIGHT_SEND_ONCE)) != 0 &&
 	    p->p_send_count == 0 && p->p_send_once_count == 0 &&
-	    p->p_has_receive && !p->p_dead &&
-	    p->p_qlen == 0 && p->p_waiters_head != NULL) {
-		p->p_dead = true;
-		wake_head = p->p_waiters_head;
-		p->p_waiters_head = p->p_waiters_tail = NULL;
+	    p->p_has_receive && !p->p_dead) {
+		if (p->p_notify_no_senders != NULL) {
+			notify_no_senders    = p->p_notify_no_senders;
+			notify_no_senders_id = p->p_notify_no_senders_id;
+			p->p_notify_no_senders    = NULL;
+			p->p_notify_no_senders_id = 0;
+			fire_no_senders = true;
+		} else if (p->p_qlen == 0 && p->p_waiters_head != NULL) {
+			p->p_dead = true;
+			wake_head = p->p_waiters_head;
+			p->p_waiters_head = p->p_waiters_tail = NULL;
+		}
 	}
 
 	last = (p->p_refs == 0);
 	spin_unlock(&p->p_lock);
+
+	if (fire_no_senders) {
+		(void)port_notify_enqueue(notify_no_senders,
+		    MACH_NOTIFY_NO_SENDERS, notify_no_senders_id);
+	}
+	if (notify_no_senders != NULL) {
+		/*
+		 * Release the kernel-held SEND ref on the notify port.
+		 * Covers both the firing path (one-shot consumes the
+		 * registration) and the RECV-drop cleanup path (source
+		 * died with a registration still armed).
+		 */
+		port_deref(notify_no_senders, MACH_PORT_RIGHT_SEND);
+	}
+	if (fire_dead_name) {
+		(void)port_notify_enqueue(notify_dead_name,
+		    MACH_NOTIFY_DEAD_NAME, notify_dead_name_id);
+	}
+	if (notify_dead_name != NULL)
+		port_deref(notify_dead_name, MACH_PORT_RIGHT_SEND);
 
 	while (drain_head != NULL) {
 		struct port_msg *next = drain_head->m_next;

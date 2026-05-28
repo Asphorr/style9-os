@@ -58,4 +58,15 @@ size_t	progreg_snapshot(struct progreg_entry *out, size_t max);
  */
 long	progreg_spawn(const char *name);
 
+/*
+ * Variant that also injects a SEND right into the child's port_space at
+ * MACH_PORT_PARENT (well-known name 3 = next-free slot after TASK_SELF
+ * and BOOTSTRAP).  The caller must have already taken one extra SEND
+ * ref on `inject_port` -- that ref is transferred into the child's
+ * port_space.  On any failure path the ref is dropped.  `inject_port`
+ * NULL means "behave identically to progreg_spawn".
+ */
+struct port;
+long	progreg_spawn_with_port(const char *name, struct port *inject_port);
+
 #endif /* !_SYS_PROGREG_H_ */

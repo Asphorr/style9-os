@@ -10,13 +10,18 @@
 #include <stdint.h>
 
 #include "kprintf.h"
+#include "pmap.h"
+#include "pmm.h"
 #include "port.h"
+#include "port_internal.h"
 #include "progreg.h"
 #include "sched.h"
+#include "smap.h"
 #include "syscall.h"
 #include "task.h"
 #include "thread.h"
 #include "tty.h"
+#include "vm.h"
 
 #define	MSR_EFER	0xC0000080u
 #define	MSR_STAR	0xC0000081u
@@ -46,6 +51,32 @@ static long	sys_msg_rpc(struct mach_msg_header *ureq,
 		    uint64_t timeout_ms);
 static long	sys_spawn(const char *uname);
 static long	sys_task_alive(uint64_t task_id);
+static long	sys_vm_allocate(uint64_t size, uint32_t prot);
+static long	sys_vm_deallocate(uint64_t va, uint64_t size);
+static long	sys_port_mod_refs(mach_port_name_t name, uint8_t right);
+static long	sys_port_set_alloc(void);
+static long	sys_port_set_insert(mach_port_name_t set_name,
+		    mach_port_name_t port_name);
+static long	sys_port_set_remove(mach_port_name_t set_name,
+		    mach_port_name_t port_name);
+static long	sys_port_request_notification(mach_port_name_t name,
+		    uint32_t notify_type,
+		    mach_port_name_t notify_port_name,
+		    uint32_t notify_msgid);
+static long	sys_spawn_with_port(const char *uname,
+		    mach_port_name_t source_name);
+static long	sys_task_set_exc_port(mach_port_name_t notify_port_name);
+static long	sys_port_set_extract(mach_port_name_t port_name);
+static long	sys_task_set_exc_ports(uint32_t types_mask,
+		    mach_port_name_t notify_port_name);
+static long	sys_thread_set_exc_ports(uint32_t types_mask,
+		    mach_port_name_t notify_port_name);
+static long	sys_task_get_port_snapshot(uint64_t task_id,
+		    struct mach_port_snapshot_entry *ubuf,
+		    size_t max_entries);
+static long	sys_task_get_vm_regions(uint64_t task_id,
+		    struct mach_vm_region_entry *ubuf,
+		    size_t max_entries);
 
 static bool	user_range_ok(uint64_t addr, size_t len);
 
@@ -143,6 +174,56 @@ syscall_dispatch(struct syscall_frame *f)
 		return (sys_spawn((const char *)f->sf_arg0));
 	case SYS_TASK_ALIVE:
 		return (sys_task_alive((uint64_t)f->sf_arg0));
+	case SYS_VM_ALLOCATE:
+		return (sys_vm_allocate((uint64_t)f->sf_arg0,
+		    (uint32_t)f->sf_arg1));
+	case SYS_VM_DEALLOCATE:
+		return (sys_vm_deallocate((uint64_t)f->sf_arg0,
+		    (uint64_t)f->sf_arg1));
+	case SYS_PORT_MOD_REFS:
+		return (sys_port_mod_refs((mach_port_name_t)f->sf_arg0,
+		    (uint8_t)f->sf_arg1));
+	case SYS_PORT_SET_ALLOC:
+		return (sys_port_set_alloc());
+	case SYS_PORT_SET_INSERT:
+		return (sys_port_set_insert((mach_port_name_t)f->sf_arg0,
+		    (mach_port_name_t)f->sf_arg1));
+	case SYS_PORT_SET_REMOVE:
+		return (sys_port_set_remove((mach_port_name_t)f->sf_arg0,
+		    (mach_port_name_t)f->sf_arg1));
+	case SYS_PORT_SET_EXTRACT:
+		return (sys_port_set_extract((mach_port_name_t)f->sf_arg0));
+	case SYS_TASK_SET_EXC_PORTS:
+		return (sys_task_set_exc_ports(
+		    (uint32_t)f->sf_arg0,
+		    (mach_port_name_t)f->sf_arg1));
+	case SYS_THREAD_SET_EXC_PORTS:
+		return (sys_thread_set_exc_ports(
+		    (uint32_t)f->sf_arg0,
+		    (mach_port_name_t)f->sf_arg1));
+	case SYS_PORT_REQUEST_NOTIFICATION:
+		return (sys_port_request_notification(
+		    (mach_port_name_t)f->sf_arg0,
+		    (uint32_t)f->sf_arg1,
+		    (mach_port_name_t)f->sf_arg2,
+		    (uint32_t)f->sf_arg3));
+	case SYS_SPAWN_WITH_PORT:
+		return (sys_spawn_with_port(
+		    (const char *)f->sf_arg0,
+		    (mach_port_name_t)f->sf_arg1));
+	case SYS_TASK_SET_EXC_PORT:
+		return (sys_task_set_exc_port(
+		    (mach_port_name_t)f->sf_arg0));
+	case SYS_TASK_GET_PORT_SNAPSHOT:
+		return (sys_task_get_port_snapshot(
+		    (uint64_t)f->sf_arg0,
+		    (struct mach_port_snapshot_entry *)f->sf_arg1,
+		    (size_t)f->sf_arg2));
+	case SYS_TASK_GET_VM_REGIONS:
+		return (sys_task_get_vm_regions(
+		    (uint64_t)f->sf_arg0,
+		    (struct mach_vm_region_entry *)f->sf_arg1,
+		    (size_t)f->sf_arg2));
 	default:
 		return (SYS_E_NOSYS);
 	}
@@ -157,13 +238,29 @@ syscall_dispatch(struct syscall_frame *f)
 static long
 sys_print(const char *buf, size_t len)
 {
+	char	scratch[4096];
 	size_t	i;
 
-	if (len > 4096u)
-		len = 4096u;
+	if (len > sizeof(scratch))
+		len = sizeof(scratch);
+	if (len == 0)
+		return (0);
+	if (!user_range_ok((uint64_t)(uintptr_t)buf, len))
+		return (SYS_E_FAULT);
+
+	/*
+	 * Copy out of the user buffer into a kernel scratch under SMAP
+	 * bracket, then push to tty without holding AC=1 across the
+	 * tty's locking + console output path.  4 KiB cap keeps the
+	 * scratch on the kernel stack.
+	 */
+	smap_user_access_begin();
+	for (i = 0; i < len; i++)
+		scratch[i] = buf[i];
+	smap_user_access_end();
 
 	for (i = 0; i < len; i++)
-		tty_putc(buf[i]);
+		tty_putc(scratch[i]);
 
 	return ((long)len);
 }
@@ -245,11 +342,24 @@ sys_port_dealloc(mach_port_name_t name)
 static long
 sys_msg_send(const struct mach_msg_header *umsg)
 {
+	uint32_t	msgh_size;
 
 	if (!user_range_ok((uint64_t)(uintptr_t)umsg,
 	    sizeof(struct mach_msg_header)))
 		return (SYS_E_FAULT);
-	if (!user_range_ok((uint64_t)(uintptr_t)umsg, umsg->msgh_size))
+
+	/*
+	 * Read msgh_size under one SMAP bracket and then bound the
+	 * whole [umsg, umsg+msgh_size) range against the user-VA
+	 * window before mach_msg_send's copyin reads the body.  This
+	 * keeps the previous "body fits in user VA" guarantee without
+	 * leaving an unbracketed deref on the SMAP-enabled path.
+	 */
+	smap_user_access_begin();
+	msgh_size = umsg->msgh_size;
+	smap_user_access_end();
+
+	if (!user_range_ok((uint64_t)(uintptr_t)umsg, msgh_size))
 		return (SYS_E_FAULT);
 
 	return ((long)mach_msg_send(current_thread->th_task->t_port_space,
@@ -293,11 +403,17 @@ static long
 sys_msg_rpc(struct mach_msg_header *ureq, struct mach_msg_header *ureply,
     size_t ureply_size, uint64_t timeout_ms)
 {
+	uint32_t	ureq_size;
 
 	if (!user_range_ok((uint64_t)(uintptr_t)ureq,
 	    sizeof(struct mach_msg_header)))
 		return (SYS_E_FAULT);
-	if (!user_range_ok((uint64_t)(uintptr_t)ureq, ureq->msgh_size))
+
+	smap_user_access_begin();
+	ureq_size = ureq->msgh_size;
+	smap_user_access_end();
+
+	if (!user_range_ok((uint64_t)(uintptr_t)ureq, ureq_size))
 		return (SYS_E_FAULT);
 	if (!user_range_ok((uint64_t)(uintptr_t)ureply, ureply_size))
 		return (SYS_E_FAULT);
@@ -333,13 +449,24 @@ sys_spawn(const char *uname)
 	if (!user_range_ok((uint64_t)uaddr, 1))
 		return (SYS_E_FAULT);
 
+	/*
+	 * Bracket the byte-by-byte copy of the user name string.  Walks
+	 * up to PROGREG_NAME_MAX bytes, stopping at the first NUL.  The
+	 * per-byte user_range_ok already covers the address; the bracket
+	 * lets the kernel actually read once CR4.SMAP is enabled.
+	 */
+	smap_user_access_begin();
 	for (i = 0; i < PROGREG_NAME_MAX; i++) {
-		if (!user_range_ok((uint64_t)(uaddr + (long)i), 1))
+		if (!user_range_ok((uint64_t)(uaddr + (long)i), 1)) {
+			smap_user_access_end();
 			return (SYS_E_FAULT);
+		}
 		kname[i] = uname[i];
 		if (uname[i] == '\0')
 			break;
 	}
+	smap_user_access_end();
+
 	if (i == PROGREG_NAME_MAX)
 		return (SYS_E_INVAL);
 
@@ -358,4 +485,466 @@ sys_task_alive(uint64_t task_id)
 {
 
 	return (task_is_alive(task_id) ? 1 : 0);
+}
+
+/*
+ * sys_vm_allocate: hand back a fresh user-VA range, populated with
+ * anonymous (zeroed) pages, mapped read/write (and execute if asked)
+ * with U=1.  `size` is rounded up to a multiple of 4 KiB; `prot`
+ * carries any of VM_PROT_READ / VM_PROT_WRITE / VM_PROT_EXEC --
+ * VM_PROT_USER is set unconditionally since vm_allocate is always
+ * user-facing.  Returns the chosen VA on success, negative SYS_E_*
+ * on failure.
+ *
+ * Failure paths unwind: pmm_alloc_page or pmap_enter failures, and a
+ * final vm_map_enter failure, roll back every page touched so far so
+ * a partial allocation never leaks frames.
+ */
+static long
+sys_vm_allocate(uint64_t size, uint32_t prot)
+{
+	struct task	*t;
+	uint8_t		*kva;
+	uint64_t	 pa;
+	uint64_t	 v;
+	uint64_t	 va;
+	size_t		 i;
+	size_t		 j;
+	size_t		 pages;
+	uint32_t	 pmap_flags;
+
+	if (size == 0)
+		return (SYS_E_INVAL);
+
+	size = (size + 0xFFFull) & ~0xFFFull;
+	if (size == 0)
+		return (SYS_E_NOMEM);
+
+	prot      &= (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXEC);
+	pmap_flags = prot | VM_PROT_USER;
+	pages      = (size_t)(size >> 12);
+
+	t = current_thread->th_task;
+
+	if (!vm_map_find_space(t->t_map, size, &va))
+		return (SYS_E_NOMEM);
+
+	for (i = 0; i < pages; i++) {
+		v  = va + (uint64_t)i * 0x1000ull;
+		pa = pmm_alloc_page();
+		if (pa == PA_INVALID)
+			goto unwind;
+		kva = (uint8_t *)pmm_kva_from_pa(pa);
+		for (j = 0; j < 0x1000u; j++)
+			kva[j] = 0;
+		if (!pmap_enter(t->t_pmap, v, pa, pmap_flags)) {
+			pmm_free_page(pa);
+			goto unwind;
+		}
+	}
+
+	if (!vm_map_enter(t->t_map, va, size,
+	    (uint8_t)pmap_flags, VME_F_ANON))
+		goto unwind;
+
+	return ((long)va);
+
+unwind:
+	for (j = 0; j < i; j++) {
+		v  = va + (uint64_t)j * 0x1000ull;
+		pa = pmap_extract(t->t_pmap, v);
+		(void)pmap_remove(t->t_pmap, v);
+		if (pa != PA_INVALID)
+			pmm_free_page(pa);
+	}
+	return (SYS_E_NOMEM);
+}
+
+/*
+ * sys_vm_deallocate: release a previously vm_allocate'd range.  v1
+ * requires the (va, size) pair to mirror the allocate exactly -- the
+ * range must start at a known anonymous vm_map_entry whose extent
+ * covers the request.  Partial deallocate and ranges crossing entry
+ * boundaries are rejected via vm_map_release returning false.  Returns
+ * 0 on success, negative SYS_E_* otherwise.
+ */
+static long
+sys_vm_deallocate(uint64_t va, uint64_t size)
+{
+	struct task	*t;
+
+	if (size == 0)
+		return (SYS_E_INVAL);
+	if ((va & 0xFFFull) != 0)
+		return (SYS_E_INVAL);
+
+	size = (size + 0xFFFull) & ~0xFFFull;
+	if (size == 0)
+		return (SYS_E_INVAL);
+
+	t = current_thread->th_task;
+	if (!vm_map_release(t->t_map, t->t_pmap, va, size))
+		return (SYS_E_INVAL);
+	return (0);
+}
+
+/*
+ * sys_port_mod_refs: drop ONE right kind from a name in the caller's
+ * port space.  Used by callers that need to split a name carrying both
+ * RECV and SEND (e.g. drop only SEND while keeping RECV to receive
+ * back) without tearing the whole slot down.  Returns a MACH_E_* on
+ * failure -- not a SYS_E_* -- so the user sees the Mach-layer reason.
+ */
+static long
+sys_port_mod_refs(mach_port_name_t name, uint8_t right)
+{
+
+	return ((long)port_mod_refs(current_thread->th_task->t_port_space,
+	    name, right));
+}
+
+/*
+ * sys_port_set_alloc: create a new port set in the caller's space and
+ * return its name.  A port set bundles multiple ports' receive queues
+ * behind one name so a single mach_msg_recv can serve any member.  The
+ * name carries MACH_PORT_RIGHT_PORT_SET; you cannot SEND to it.
+ */
+static long
+sys_port_set_alloc(void)
+{
+	mach_port_name_t	n;
+
+	n = port_set_allocate(current_thread->th_task->t_port_space);
+	if (n == MACH_PORT_NULL)
+		return (SYS_E_NOMEM);
+	return ((long)n);
+}
+
+static long
+sys_port_set_insert(mach_port_name_t set_name, mach_port_name_t port_name)
+{
+
+	return ((long)port_set_insert(current_thread->th_task->t_port_space,
+	    set_name, port_name));
+}
+
+static long
+sys_port_set_remove(mach_port_name_t set_name, mach_port_name_t port_name)
+{
+
+	return ((long)port_set_remove(current_thread->th_task->t_port_space,
+	    set_name, port_name));
+}
+
+/*
+ * sys_port_set_extract: returns the name of the port set `port_name`
+ * belongs to in the calling task's space, or 0 (MACH_PORT_NULL) when
+ * the port is not currently a member of any set.  Read-only; never
+ * mutates the space.  Failure modes (bad name, no RECV right) collapse
+ * to MACH_PORT_NULL -- same encoding as "not in a set" since the
+ * caller's expected reaction is identical in both cases.
+ */
+static long
+sys_port_set_extract(mach_port_name_t port_name)
+{
+
+	return ((long)port_set_extract(current_thread->th_task->t_port_space,
+	    port_name));
+}
+
+/*
+ * sys_port_request_notification: register a notify port to receive a
+ * MACH_NOTIFY_* message when the source port reaches the matching
+ * event.  v1 supports MACH_NOTIFY_NO_SENDERS only; the caller must hold
+ * RECEIVE on `name` and SEND on `notify_port_name`, both in the
+ * current task's port space.  The user-supplied `notify_msgid` is
+ * carried back unchanged in the notification's nh_msgid field so a
+ * service that watches many ports through one notify port can
+ * disambiguate the source.
+ */
+static long
+sys_port_request_notification(mach_port_name_t name, uint32_t notify_type,
+    mach_port_name_t notify_port_name, uint32_t notify_msgid)
+{
+	mach_port_name_t	prev;
+
+	return ((long)port_request_notification(
+	    current_thread->th_task->t_port_space,
+	    name, notify_type, notify_port_name, notify_msgid, &prev));
+}
+
+/*
+ * sys_spawn_with_port: variant of SYS_SPAWN that also hands the child
+ * a SEND right at the well-known MACH_PORT_PARENT slot.
+ *
+ * The caller passes the program name plus a name in their own
+ * port_space carrying SEND right.  This handler:
+ *	1. validates + copies in the program name (same as sys_spawn),
+ *	2. looks up source_name in the caller's space with SEND right,
+ *	3. takes a SEND ref so the port survives the spawn race,
+ *	4. hands the ref to progreg_spawn_with_port, which forwards it
+ *	   into arch_spawn_user's user_spawn_arg; the launcher transfers
+ *	   the ref into the child's port_space via space_install_no_ref
+ *	   so the install lands at name == MACH_PORT_PARENT (== 3).
+ *
+ * Returns the new task's id on success, or a negative SYS_E_* on
+ * failure (including MACH_E_RIGHT mapped to SYS_E_INVAL when the
+ * caller does not actually hold SEND on source_name).
+ */
+static long
+sys_spawn_with_port(const char *uname, mach_port_name_t source_name)
+{
+	struct port	*src;
+	char		 kname[PROGREG_NAME_MAX];
+	size_t		 i;
+	long		 uaddr;
+	uint8_t		 dummy;
+
+	if (uname == NULL)
+		return (SYS_E_FAULT);
+
+	uaddr = (long)(uintptr_t)uname;
+	if (!user_range_ok((uint64_t)uaddr, 1))
+		return (SYS_E_FAULT);
+
+	smap_user_access_begin();
+	for (i = 0; i < PROGREG_NAME_MAX; i++) {
+		if (!user_range_ok((uint64_t)(uaddr + (long)i), 1)) {
+			smap_user_access_end();
+			return (SYS_E_FAULT);
+		}
+		kname[i] = uname[i];
+		if (uname[i] == '\0')
+			break;
+	}
+	smap_user_access_end();
+
+	if (i == PROGREG_NAME_MAX)
+		return (SYS_E_INVAL);
+
+	/*
+	 * Look up the source name with SEND right.  Lookup does not
+	 * take a ref; bump it explicitly so the port survives the
+	 * window between this return and the launcher consuming it.
+	 */
+	src = space_lookup(current_thread->th_task->t_port_space,
+	    source_name, MACH_PORT_RIGHT_SEND, &dummy);
+	if (src == NULL)
+		return (SYS_E_INVAL);
+	port_ref(src, MACH_PORT_RIGHT_SEND);
+
+	/*
+	 * progreg_spawn_with_port owns the ref from here -- on success
+	 * the launcher transfers it into the child's name table, on
+	 * any failure path arch_spawn_user port_derefs it.  No further
+	 * cleanup needed in this handler.
+	 */
+	return (progreg_spawn_with_port(kname, src));
+}
+
+/*
+ * sys_task_set_exc_port: install (or replace) the current task's
+ * exception port.  Caller passes a name in their own space carrying
+ * SEND right; the kernel takes a SEND ref, swaps into t_exc_port, and
+ * releases any previous slot's ref.  v1 returns MACH_MSG_OK or a
+ * MACH_E_* without exposing the previous slot's name (matching the
+ * port_request_notification convention).
+ */
+static long
+sys_task_set_exc_port(mach_port_name_t notify_port_name)
+{
+
+	/*
+	 * A v1 back-compat: SYS_TASK_SET_EXC_PORT installs the same
+	 * notify port across every type slot, so a caller compiled
+	 * before A v2 still routes every fault to its single watcher.
+	 * SYS_TASK_SET_EXC_PORTS is the modern form (per-type masks).
+	 */
+	return (sys_task_set_exc_ports(EXC_MASK_ALL, notify_port_name));
+}
+
+/*
+ * sys_task_set_exc_ports: install (or clear) the calling task's
+ * exception ports for every type named in `types_mask` (one or more
+ * of EXC_MASK_*).  `notify_port_name == MACH_PORT_NULL` clears the
+ * named slots; otherwise the kernel takes popcount(types_mask) SEND
+ * refs on the resolved port and writes it into each named slot,
+ * replacing whatever was there (refs released via port_deref).
+ *
+ * Returns MACH_MSG_OK or a MACH_E_* on bad name / bad mask.
+ */
+static long
+sys_task_set_exc_ports(uint32_t arg, mach_port_name_t notify_port_name)
+{
+	struct task	*t;
+	struct port	*new_port;
+	uint32_t	 types_mask;
+	uint32_t	 flags;
+	uint8_t		 dummy;
+	int		 rv;
+
+	t = current_thread->th_task;
+
+	/*
+	 * Pack types in the low 16 bits, behavior flags in the high
+	 * 16: a single syscall covers both selection and policy.
+	 * Reject any bits outside EXC_MASK_ALL / EXC_FLAGS_VALID so
+	 * forward-incompatible callers fail fast rather than having
+	 * their stray bits silently reinterpreted by a future revision.
+	 */
+	types_mask = arg & EXC_MASK_ALL;
+	flags      = arg & ~EXC_MASK_ALL;
+	if ((flags & ~EXC_FLAGS_VALID) != 0)
+		return ((long)MACH_E_INVAL);
+
+	new_port = NULL;
+	if (notify_port_name != MACH_PORT_NULL) {
+		new_port = space_lookup(t->t_port_space, notify_port_name,
+		    MACH_PORT_RIGHT_SEND, &dummy);
+		if (new_port == NULL)
+			return ((long)MACH_E_RIGHT);
+	}
+
+	rv = task_set_exception_ports(t, types_mask, new_port);
+	if (rv != MACH_MSG_OK)
+		return ((long)rv);
+
+	/*
+	 * Flags are a task-wide property, applied to whichever slot
+	 * eventually fires.  Stash whenever the syscall changes any
+	 * slot bookkeeping (including the no-types empty-mask case
+	 * with flags-only).  Last writer wins.
+	 */
+	spin_lock(&t->t_lock);
+	t->t_exc_flags = flags;
+	spin_unlock(&t->t_lock);
+	return ((long)MACH_MSG_OK);
+}
+
+/*
+ * sys_task_get_port_snapshot: copy one wire-format
+ * mach_port_snapshot_entry per populated slot in the named task's
+ * port_space into the caller's array.  Drives the userspace `lsmp`
+ * tool ("list mach ports"): a debugger-style introspection surface
+ * that has no Linux equivalent because Linux has no Mach ports.
+ *
+ * v1 supports only task_id == 0 (snapshot self).  Cross-task
+ * introspection would need either a task_for_pid-style authorization
+ * primitive or a per-task ref-bumping lookup; deferred until a real
+ * consumer (e.g. an external debugger task) shows up.
+ *
+ * Returns the number of entries written on success, or a negative
+ * SYS_E_*.  `max_entries` is capped at MACH_PORT_SNAPSHOT_MAX so the
+ * kernel staging buffer stays on the syscall stack.
+ */
+static long
+sys_task_get_port_snapshot(uint64_t task_id,
+    struct mach_port_snapshot_entry *ubuf, size_t max_entries)
+{
+	struct mach_port_snapshot_entry	 kbuf[MACH_PORT_SNAPSHOT_MAX];
+	struct task			*t;
+	size_t				 bytes;
+	size_t				 i;
+	size_t				 n;
+
+	if (max_entries == 0)
+		return (0);
+	if (max_entries > MACH_PORT_SNAPSHOT_MAX)
+		max_entries = MACH_PORT_SNAPSHOT_MAX;
+
+	bytes = max_entries * sizeof(*ubuf);
+	if (!user_range_ok((uint64_t)(uintptr_t)ubuf, bytes))
+		return (SYS_E_FAULT);
+
+	if (task_id != 0)
+		return (SYS_E_INVAL);
+	t = current_thread->th_task;
+
+	n = port_space_snapshot(t->t_port_space, kbuf, max_entries);
+
+	/*
+	 * Copy out without holding any port_space lock: kbuf is a
+	 * private stack snapshot, so a faulting user_buf write only
+	 * tears down this syscall, never deadlocks ps_lock.
+	 */
+	smap_user_access_begin();
+	for (i = 0; i < n; i++)
+		ubuf[i] = kbuf[i];
+	smap_user_access_end();
+	return ((long)n);
+}
+
+/*
+ * sys_task_get_vm_regions: copy one wire-format mach_vm_region_entry
+ * per live entry in the named task's vm_map into the caller's array.
+ * Drives the userspace `vmmap` tool: dumps a process's VM layout the
+ * same way Darwin's vmmap(1) does, again a question Linux only
+ * answers via /proc parsing.
+ *
+ * v1 supports only task_id == 0 (self) for the same reason as the
+ * port-snapshot syscall; cross-task introspection needs an auth
+ * primitive that has not landed yet.
+ */
+static long
+sys_task_get_vm_regions(uint64_t task_id,
+    struct mach_vm_region_entry *ubuf, size_t max_entries)
+{
+	struct mach_vm_region_entry	 kbuf[MACH_VM_REGION_MAX];
+	struct task			*t;
+	size_t				 bytes;
+	size_t				 i;
+	size_t				 n;
+
+	if (max_entries == 0)
+		return (0);
+	if (max_entries > MACH_VM_REGION_MAX)
+		max_entries = MACH_VM_REGION_MAX;
+
+	bytes = max_entries * sizeof(*ubuf);
+	if (!user_range_ok((uint64_t)(uintptr_t)ubuf, bytes))
+		return (SYS_E_FAULT);
+
+	if (task_id != 0)
+		return (SYS_E_INVAL);
+	t = current_thread->th_task;
+
+	n = vm_map_snapshot(t->t_map, kbuf, max_entries);
+
+	smap_user_access_begin();
+	for (i = 0; i < n; i++)
+		ubuf[i] = kbuf[i];
+	smap_user_access_end();
+	return ((long)n);
+}
+
+/*
+ * sys_thread_set_exc_ports: per-thread variant of
+ * sys_task_set_exc_ports.  Operates on the calling thread (no API
+ * for setting another thread's slots today); the kernel takes ref
+ * accounting the same way as the task-level path.
+ *
+ * Returns MACH_MSG_OK or a MACH_E_*.
+ */
+static long
+sys_thread_set_exc_ports(uint32_t types_mask, mach_port_name_t notify_port_name)
+{
+	struct task	*t;
+	struct port	*new_port;
+	uint8_t		 dummy;
+
+	t = current_thread->th_task;
+
+	if ((types_mask & ~EXC_MASK_ALL) != 0)
+		return ((long)MACH_E_INVAL);
+
+	new_port = NULL;
+	if (notify_port_name != MACH_PORT_NULL) {
+		new_port = space_lookup(t->t_port_space, notify_port_name,
+		    MACH_PORT_RIGHT_SEND, &dummy);
+		if (new_port == NULL)
+			return ((long)MACH_E_RIGHT);
+	}
+
+	return ((long)thread_set_exception_ports(current_thread, types_mask,
+	    new_port));
 }

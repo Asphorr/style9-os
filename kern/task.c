@@ -14,6 +14,7 @@
 #include "panic.h"
 #include "pmap.h"
 #include "port.h"
+#include "port_internal.h"
 #include "spinlock.h"
 #include "task.h"
 #include "thread.h"
@@ -105,6 +106,13 @@ task_create(const char *name)
 	t->t_self_port  = NULL;
 	t->t_map        = NULL;
 	t->t_pmap       = NULL;
+	{
+		unsigned	exi;
+
+		for (exi = 0; exi < EXC_TYPE_COUNT; exi++)
+			t->t_exc_ports[exi] = NULL;
+	}
+	t->t_exc_flags = 0;
 
 	t->t_port_space = port_space_new();
 	if (t->t_port_space == NULL) {
@@ -258,6 +266,25 @@ task_deref(struct task *t)
 	 * kernel_space, which lives for the duration of the kernel.
 	 * Its task_self port stays alive too; never get here in practice.
 	 */
+	/*
+	 * Release the kernel-held SEND ref on the task's exception port,
+	 * if any.  Done BEFORE port_space_destroy so the deref happens
+	 * outside the space's bulk-deref walk; the exc_port lives in some
+	 * OTHER task's space (typically a parent's), so it's untouched
+	 * by our own space destruction.
+	 */
+	{
+		unsigned	exi;
+
+		for (exi = 0; exi < EXC_TYPE_COUNT; exi++) {
+			if (t->t_exc_ports[exi] != NULL) {
+				port_deref(t->t_exc_ports[exi],
+				    MACH_PORT_RIGHT_SEND);
+				t->t_exc_ports[exi] = NULL;
+			}
+		}
+	}
+
 	if (t != kernel_task) {
 		port_space_destroy(t->t_port_space);
 		port_release_task_self(t);
@@ -328,6 +355,52 @@ task_print(struct task *t)
 		    cur->th_name,
 		    thread_state_name(cur->th_state));
 	spin_unlock(&t->t_lock);
+}
+
+int
+task_set_exception_ports(struct task *t, uint32_t types_mask, struct port *port)
+{
+	struct port	*prev[EXC_TYPE_COUNT];
+	unsigned	 i;
+
+	if (t == NULL)
+		return (MACH_E_INVAL);
+	if ((types_mask & ~EXC_MASK_ALL) != 0)
+		return (MACH_E_INVAL);
+	if (types_mask == 0)
+		return (MACH_MSG_OK);
+
+	/*
+	 * Take popcount(types_mask) refs on the new port BEFORE the
+	 * swap so any interleaving user_fault_die that snapshots one
+	 * of the slots between unlock and the prev-drop reads a live
+	 * ref.  Ordering: take-new-refs -> swap -> drop-prev mirrors
+	 * SYS_TASK_SET_EXC_PORT's A v1 pattern for the same reason.
+	 */
+	if (port != NULL) {
+		for (i = 0; i < EXC_TYPE_COUNT; i++) {
+			if (types_mask & (1u << i))
+				port_ref(port, MACH_PORT_RIGHT_SEND);
+		}
+	}
+
+	for (i = 0; i < EXC_TYPE_COUNT; i++)
+		prev[i] = NULL;
+
+	spin_lock(&t->t_lock);
+	for (i = 0; i < EXC_TYPE_COUNT; i++) {
+		if ((types_mask & (1u << i)) == 0)
+			continue;
+		prev[i] = t->t_exc_ports[i];
+		t->t_exc_ports[i] = port;
+	}
+	spin_unlock(&t->t_lock);
+
+	for (i = 0; i < EXC_TYPE_COUNT; i++) {
+		if (prev[i] != NULL)
+			port_deref(prev[i], MACH_PORT_RIGHT_SEND);
+	}
+	return (MACH_MSG_OK);
 }
 
 /*

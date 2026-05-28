@@ -15,6 +15,7 @@
 #include "kprintf.h"
 #include "panic.h"
 #include "pmap.h"
+#include "port_internal.h"
 #include "queue.h"
 #include "sched.h"
 #include "spinlock.h"
@@ -533,7 +534,23 @@ sched_reap_zombies(void)
 	spin_unlock(&sched_lock);
 
 	SLIST_FOREACH_SAFE(z, &drain, th_zombie_link, next) {
+		unsigned	exi;
+
 		t = z->th_task;
+
+		/*
+		 * Release SEND refs the thread held on its per-thread
+		 * exception ports.  No t_lock needed: a zombie has no
+		 * other reachers (thread_exit already detached us from
+		 * the runqueue and any waitq).
+		 */
+		for (exi = 0; exi < EXC_TYPE_COUNT; exi++) {
+			if (z->th_exc_ports[exi] != NULL) {
+				port_deref(z->th_exc_ports[exi],
+				    MACH_PORT_RIGHT_SEND);
+				z->th_exc_ports[exi] = NULL;
+			}
+		}
 
 		if (z->th_kstack_owned && z->th_kstack_base != NULL)
 			kfree(z->th_kstack_base);

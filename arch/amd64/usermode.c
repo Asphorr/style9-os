@@ -15,6 +15,8 @@
 #include "panic.h"
 #include "pmap.h"
 #include "pmm.h"
+#include "port.h"
+#include "port_internal.h"
 #include "sched.h"
 #include "syscall.h"
 #include "task.h"
@@ -37,11 +39,17 @@ static void	usermode_launcher(void *) __attribute__((noreturn));
  * Carries a spawn intent across the thread boundary.  Allocated by
  * arch_spawn_user, freed by the launcher just before it iretq's so
  * leaks don't accumulate if the program loops forever in ring 3.
+ *
+ * sa_inject_port is optional: when non-NULL the launcher installs a
+ * SEND right on it into the child's port_space at MACH_PORT_PARENT.
+ * Caller has already taken one SEND ref on the port; the install
+ * transfers that ref into the child's name table (space_install_no_ref).
  */
 struct user_spawn_arg {
 	const char	*sa_name;
 	const uint8_t	*sa_image;
 	size_t		 sa_image_size;
+	struct port	*sa_inject_port;
 };
 
 static void	usermode_elf_launcher(void *) __attribute__((noreturn));
@@ -74,30 +82,42 @@ usermode_run_first_blob(void)
  * kfrees it during setup.
  */
 long
-arch_spawn_user(const char *name, const uint8_t *image, size_t image_size)
+arch_spawn_user(const char *name, const uint8_t *image, size_t image_size,
+    struct port *inject_port)
 {
 	struct user_spawn_arg	*sa;
 	struct task		*ut;
 	struct thread		*th;
 
-	if (name == NULL || image == NULL || image_size == 0)
+	if (name == NULL || image == NULL || image_size == 0) {
+		if (inject_port != NULL)
+			port_deref(inject_port, MACH_PORT_RIGHT_SEND);
 		return (SYS_E_INVAL);
+	}
 
 	sa = (struct user_spawn_arg *)kmalloc(sizeof(*sa));
-	if (sa == NULL)
+	if (sa == NULL) {
+		if (inject_port != NULL)
+			port_deref(inject_port, MACH_PORT_RIGHT_SEND);
 		return (SYS_E_NOSYS);	/* OOM; closest in our small set */
-	sa->sa_name       = name;
-	sa->sa_image      = image;
-	sa->sa_image_size = image_size;
+	}
+	sa->sa_name        = name;
+	sa->sa_image       = image;
+	sa->sa_image_size  = image_size;
+	sa->sa_inject_port = inject_port;
 
 	ut = task_create(name);
 	if (ut == NULL) {
+		if (inject_port != NULL)
+			port_deref(inject_port, MACH_PORT_RIGHT_SEND);
 		kfree(sa);
 		return (SYS_E_NOSYS);
 	}
 
 	th = thread_create(ut, usermode_elf_launcher, sa, "user-elf");
 	if (th == NULL) {
+		if (inject_port != NULL)
+			port_deref(inject_port, MACH_PORT_RIGHT_SEND);
 		task_deref(ut);
 		kfree(sa);
 		return (SYS_E_NOSYS);
@@ -172,10 +192,33 @@ usermode_elf_launcher(void *arg)
 	tss_set_rsp0(ksp);
 	syscall_kernel_rsp = ksp;
 
+	/*
+	 * Inject the parent's port into the child's port_space at the
+	 * well-known MACH_PORT_PARENT slot before transitioning to
+	 * ring 3.  Slots 1 (task_self) and 2 (bootstrap) were filled by
+	 * task_create, so the next-free slot is by construction
+	 * MACH_PORT_PARENT == 3; space_install_no_ref consumes the SEND
+	 * ref the parent already held, so no extra port_ref here.
+	 */
+	if (sa->sa_inject_port != NULL) {
+		mach_port_name_t	pname;
+		int			pr;
+
+		pr = space_install_no_ref(ut->t_port_space,
+		    sa->sa_inject_port, MACH_PORT_RIGHT_SEND, &pname);
+		if (pr != MACH_MSG_OK)
+			panic("usermode_elf_launcher: inject install rv=%d", pr);
+		if (pname != MACH_PORT_PARENT)
+			panic("usermode_elf_launcher: inject name %u, "
+			    "expected %u (parent port_space pre-populated?)",
+			    (unsigned)pname, (unsigned)MACH_PORT_PARENT);
+	}
+
 	kprintf("usermode: spawn '%s' entry=0x%llx (image=%zu bytes), "
-	    "stack=0x%llx\n",
+	    "stack=0x%llx%s\n",
 	    sa->sa_name, (unsigned long long)entry, sa->sa_image_size,
-	    (unsigned long long)USER_STACK_TOP);
+	    (unsigned long long)USER_STACK_TOP,
+	    sa->sa_inject_port != NULL ? ", parent port injected" : "");
 
 	kfree(sa);
 	usermode_enter(entry, USER_STACK_TOP);

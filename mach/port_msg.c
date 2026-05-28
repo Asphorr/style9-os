@@ -19,6 +19,7 @@
 #include "port.h"
 #include "port_internal.h"
 #include "sched.h"
+#include "smap.h"
 #include "spinlock.h"
 #include "task.h"
 #include "thread.h"
@@ -58,6 +59,19 @@ msg_validate(const struct mach_msg_header *h)
 	if (h->msgh_size < sizeof(*h))
 		return (MACH_E_INVAL);
 	if (h->msgh_size > MAX_MSG_BYTES)
+		return (MACH_E_INVAL);
+	/*
+	 * Forward-compat strictness: reject senders that scribble on
+	 * msgh_bits reserved bits or on msgh_voucher (reserved for the
+	 * unimplemented voucher capability).  A future revision will
+	 * extend MACH_MSGH_BITS_USED_MASK + define voucher semantics;
+	 * callers compiled against an older spec will fail fast with
+	 * MACH_E_INVAL the moment they cross the boundary, rather than
+	 * having their stray bits silently reinterpreted.
+	 */
+	if ((h->msgh_bits & ~MACH_MSGH_BITS_USED_MASK) != 0)
+		return (MACH_E_INVAL);
+	if (h->msgh_voucher != 0)
 		return (MACH_E_INVAL);
 	return (MACH_MSG_OK);
 }
@@ -241,6 +255,144 @@ free_pending_descs(struct port_pending_desc *descs, size_t n)
 	kfree(descs);
 }
 
+/* ---- notifications --------------------------------------------------- */
+
+/*
+ * Synthesise a notification message and enqueue it on `notify_port`.
+ * Called from port_deref's no-senders detection (and, eventually, the
+ * dead-name path) with a local SEND-ref already held on notify_port so
+ * the receiver does not race the firing against the destination's
+ * teardown.  Caller owns that ref -- this routine does not drop it.
+ *
+ * Best-effort: a dead notify port (receiver gone) or a full queue
+ * silently drops the notification.  v1 has no return-to-source backstop;
+ * a future revision can stash the notification on a kernel-side dead
+ * letter queue if real Mach semantics become important.
+ */
+int
+port_notify_enqueue(struct port *notify_port, uint32_t notify_id,
+    uint32_t user_tag)
+{
+	struct port_msg			*m;
+	struct mach_notify_header	*nh;
+	struct thread			*waiter = NULL;
+	int				 rv;
+
+	if (notify_port == NULL)
+		return (MACH_E_INVAL);
+
+	m = (struct port_msg *)kmalloc(sizeof(*m) +
+	    sizeof(struct mach_notify_header));
+	if (m == NULL)
+		return (MACH_E_NOMEM);
+
+	m->m_next   = NULL;
+	m->m_size   = sizeof(struct mach_notify_header);
+	m->m_ndescs = 0;
+	m->m_descs  = NULL;
+
+	nh = (struct mach_notify_header *)m->m_buf;
+	nh->hdr.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	nh->hdr.msgh_size    = sizeof(struct mach_notify_header);
+	nh->hdr.msgh_remote  = MACH_PORT_NULL;
+	nh->hdr.msgh_local   = MACH_PORT_NULL;
+	nh->hdr.msgh_voucher = 0;
+	nh->hdr.msgh_id      = notify_id;
+	nh->nh_msgid         = user_tag;
+	nh->nh_pad           = 0;
+
+	rv = msg_enqueue(notify_port, m, &waiter);
+	if (rv != MACH_MSG_OK) {
+		kfree(m);
+		return (rv);
+	}
+	if (waiter != NULL)
+		thread_wake(waiter);
+	return (MACH_MSG_OK);
+}
+
+int
+port_exception_post(struct port *port, uint32_t trapno, uint32_t err,
+    uint64_t rip, uint64_t rsp, uint64_t rflags, uint64_t cr2,
+    uint64_t task_id, struct port *reply_port)
+{
+	struct port_msg			*m;
+	struct port_pending_desc	*descs = NULL;
+	struct mach_exception_header	*eh;
+	struct thread			*waiter = NULL;
+	uint8_t				 local_disp = 0;
+	int				 rv;
+
+	if (port == NULL)
+		return (MACH_E_INVAL);
+
+	m = (struct port_msg *)kmalloc(sizeof(*m) +
+	    sizeof(struct mach_exception_header));
+	if (m == NULL)
+		return (MACH_E_NOMEM);
+
+	/*
+	 * When the watcher opted into the reply protocol the caller
+	 * hands us a kernel-owned reply port; attach it as an implicit
+	 * msgh_local descriptor with MAKE_SEND disposition so the
+	 * watcher's deliver_msg installs a SEND name in their space.
+	 * The receiver replies through that name; the kernel-side
+	 * recv on `reply_port` (from the caller) wakes on the verdict.
+	 *
+	 * Ref accounting: take one SEND ref here for the message
+	 * in-flight; deliver_msg drops it after installing the
+	 * receiver's name, so refs balance whether or not delivery
+	 * succeeds (the free_pending_descs failure path also drops
+	 * via port_deref).
+	 */
+	if (reply_port != NULL) {
+		descs = (struct port_pending_desc *)kcalloc(1,
+		    sizeof(struct port_pending_desc));
+		if (descs == NULL) {
+			kfree(m);
+			return (MACH_E_NOMEM);
+		}
+		descs[0].pd_type        = MACH_MSG_PORT_DESCRIPTOR;
+		descs[0].pd_disposition = MACH_PORT_RIGHT_SEND;
+		descs[0].pd_port        = reply_port;
+		descs[0].pd_ool_buf     = NULL;
+		descs[0].pd_ool_size    = 0;
+		port_ref(reply_port, MACH_PORT_RIGHT_SEND);
+		local_disp = MACH_MSG_TYPE_MAKE_SEND;
+	}
+
+	m->m_next   = NULL;
+	m->m_size   = sizeof(struct mach_exception_header);
+	m->m_ndescs = (reply_port != NULL) ? 1 : 0;
+	m->m_descs  = descs;
+
+	eh = (struct mach_exception_header *)m->m_buf;
+	eh->hdr.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND,
+	    local_disp);
+	eh->hdr.msgh_size    = sizeof(struct mach_exception_header);
+	eh->hdr.msgh_remote  = MACH_PORT_NULL;
+	eh->hdr.msgh_local   = MACH_PORT_NULL;
+	eh->hdr.msgh_voucher = 0;
+	eh->hdr.msgh_id      = MACH_EXC_FAULT;
+	eh->eh_trapno        = trapno;
+	eh->eh_err           = err;
+	eh->eh_rip           = rip;
+	eh->eh_rsp           = rsp;
+	eh->eh_rflags        = rflags;
+	eh->eh_cr2           = cr2;
+	eh->eh_task_id       = task_id;
+
+	rv = msg_enqueue(port, m, &waiter);
+	if (rv != MACH_MSG_OK) {
+		free_pending_descs(descs, m->m_ndescs);
+		kfree(m);
+		return (rv);
+	}
+	if (waiter != NULL)
+		thread_wake(waiter);
+	return (MACH_MSG_OK);
+}
+
 /* ---- mach_msg_send --------------------------------------------------- */
 
 /*
@@ -395,8 +547,17 @@ desc_step(const uint8_t *buf, size_t off, size_t cap, uint8_t *type_out)
  *
  * v1 normalises everything to MACH_MSG_PHYSICAL_COPY -- virtual-copy
  * descriptors get upgraded to physical at capture time so the recv
- * path only sees one shape.  Per-descriptor `deallocate` is recorded
- * but not honoured: real-Mach unmap-after-send is a follow-up.
+ * path only sees one shape.
+ *
+ * Per-descriptor `deallocate` IS honoured for ring-3 senders:
+ * post-copy, if the sender set deallocate=1 AND the source range
+ * mirrors a vm_allocate'd anonymous entry exactly, the kernel calls
+ * vm_map_release on the sender's range so the user does not have to
+ * race the send + manual vm_deallocate.  Non-matching ranges (stack,
+ * static data, partial slices of a larger allocation) leave the
+ * sender's VM untouched -- the flag is best-effort, not mandatory.
+ * Kernel and trusted-send senders skip the hook (their addresses
+ * are kernel-VA; nothing to vm_map_release).
  *
  * On success the pd carries an owned kmalloc'd buffer that the
  * receive path (or any cleanup path) is responsible for freeing.
@@ -471,16 +632,120 @@ send_capture_ool(struct port_space *from,
 	if (staging == NULL)
 		return (MACH_E_NOMEM);
 
-	/* Sender's pmap is current; direct byte-by-byte copy. */
+	/*
+	 * Sender's pmap is current; direct byte-by-byte copy.  Bracketed
+	 * for SMAP so the kernel can read the U=1 source page once
+	 * CR4.SMAP is enabled.
+	 */
 	{
 		const uint8_t *src = (const uint8_t *)(uintptr_t)addr;
+		smap_user_access_begin();
 		for (i = 0; i < size; i++)
 			staging[i] = src[i];
+		smap_user_access_end();
 	}
 
 	pd->pd_ool_buf  = staging;
 	pd->pd_ool_size = size;
+
+	/*
+	 * Honour the deallocate-on-send flag for ring-3 senders.  Skip
+	 * for kernel-internal senders (kernel_task / trusted-send) since
+	 * their `addr` is a kernel VA, not a managed user range.  Page-
+	 * round the size before the lookup so a sub-page OOL (e.g. 100
+	 * bytes out of a 4 KiB allocation) still matches the vm_map_entry
+	 * that vm_allocate created.  Best-effort: a non-matching range
+	 * silently leaves the sender's VM alone.
+	 */
+	if (od->deallocate != 0 && sender != NULL && sender != kernel_task &&
+	    !(current_thread != NULL && current_thread->th_trusted_send)) {
+		uint64_t aligned = ((uint64_t)size + 0xFFFull) & ~0xFFFull;
+		(void)vm_map_release(sender->t_map, sender->t_pmap,
+		    addr, aligned);
+	}
 	return (MACH_MSG_OK);
+}
+
+/*
+ * apply_ool_deallocate: post-dispatch dealloc hook for the special-
+ * port short-circuit path.
+ *
+ * The normal queue path runs through send_capture_ool, which honours
+ * deallocate-on-send inline because it has already copied the bytes
+ * into a kernel-side staging buffer.  Special-port destinations bypass
+ * send_capture_ool: the dispatcher reads OOL bytes straight out of
+ * the sender's pmap.  Releasing the source range BEFORE the dispatch
+ * would yank the bytes out from under the dispatcher; releasing it
+ * AFTER lets the dispatcher consume the bytes first.
+ *
+ * Caller (mach_msg_send's special-port branch) passes a kernel-VA
+ * `msg` -- the upfront copyin already mirrored the user message into
+ * m->m_buf, so this walk is pure kernel-VA bookkeeping.  Only the
+ * vm_map_release calls touch user state, and they take the user-VA
+ * `od->address` as data.
+ */
+static void
+apply_ool_deallocate(const struct mach_msg_header *msg,
+    struct port_space *from)
+{
+	const struct mach_msg_body	*body;
+	struct task			*sender;
+	const uint8_t			*p;
+	size_t				 off;
+	uint32_t			 i;
+	uint32_t			 ndescs;
+	uint8_t				 t;
+
+	(void)from;
+
+	if (current_thread == NULL)
+		return;
+	if (current_thread->th_trusted_send)
+		return;
+	sender = current_thread->th_task;
+	if (sender == NULL || sender == kernel_task)
+		return;
+	if (sender->t_map == NULL || sender->t_pmap == NULL)
+		return;
+
+	if ((msg->msgh_bits & MACH_MSGH_BITS_COMPLEX) == 0)
+		return;
+	if (msg->msgh_size < sizeof(struct mach_msg_header) +
+	    sizeof(struct mach_msg_body))
+		return;
+
+	body = (const struct mach_msg_body *)
+	    ((const uint8_t *)msg + sizeof(struct mach_msg_header));
+	ndescs = body->msgh_descriptor_count;
+	off    = sizeof(struct mach_msg_header) + sizeof(struct mach_msg_body);
+
+	for (i = 0; i < ndescs; i++) {
+		if (off >= msg->msgh_size)
+			break;
+		p = (const uint8_t *)msg + off;
+		t = *p;
+
+		if (t == MACH_MSG_PORT_DESCRIPTOR) {
+			off += sizeof(struct mach_msg_port_descriptor);
+		} else if (t == MACH_MSG_OOL_DESCRIPTOR) {
+			const struct mach_msg_ool_descriptor	*od;
+			uint64_t	 aligned;
+
+			if (off + sizeof(struct mach_msg_ool_descriptor) >
+			    msg->msgh_size)
+				break;
+			od = (const struct mach_msg_ool_descriptor *)p;
+			if (od->deallocate != 0 && od->size > 0) {
+				aligned = ((uint64_t)od->size + 0xFFFull) &
+				    ~0xFFFull;
+				(void)vm_map_release(sender->t_map,
+				    sender->t_pmap, od->address, aligned);
+			}
+			off += sizeof(struct mach_msg_ool_descriptor);
+		} else {
+			break;
+		}
+	}
 }
 
 /*
@@ -631,8 +896,10 @@ mach_msg_send_trusted(struct port_space *from,
 }
 
 int
-mach_msg_send(struct port_space *from, const struct mach_msg_header *msg)
+mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 {
+	struct mach_msg_header	 hdr_copy;
+	const struct mach_msg_header *msg;
 	int			 rv;
 	struct port		*dest = NULL;
 	struct port_msg		*m = NULL;
@@ -640,28 +907,56 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *msg)
 	size_t			 ndescs = 0;
 	size_t			 i, hdrs_off;
 	uint8_t			 remote_disp, local_disp;
+	uint8_t			 remote_right;
 	bool			 has_local;
 	bool			 complex;
-	const uint8_t		*src;
 	uint8_t			 dummy_rights;
 
-	rv = msg_validate(msg);
+	if (umsg == NULL)
+		return (MACH_E_INVAL);
+
+	/*
+	 * Single-pass copyin pattern: read the user header under one
+	 * SMAP bracket, validate the kernel-side copy, then allocate
+	 * the queue buffer m sized to fit the whole message and
+	 * copyin the entire body straight into m->m_buf.  After this
+	 * block, `msg` aliases m->m_buf (kernel VA) and every
+	 * subsequent header / body / descriptor read in this function
+	 * (and in the dispatchers / OOL walker we call out to) is a
+	 * plain kernel-VA dereference -- no further brackets needed.
+	 *
+	 * The destination buffer for the copyin is the queue buffer
+	 * itself, so the message bytes are copied exactly once.  The
+	 * special-port short-circuit pays for this kmalloc + kfree
+	 * even though it does not enqueue m; that cost is one heap
+	 * round-trip per dispatch, well below the wire-format walk
+	 * we are already doing.
+	 */
+	smap_user_access_begin();
+	hdr_copy = *umsg;
+	smap_user_access_end();
+
+	rv = msg_validate(&hdr_copy);
 	if (rv != MACH_MSG_OK)
 		return (rv);
 
-	remote_disp = MACH_MSGH_BITS_REMOTE(msg->msgh_bits);
-	local_disp  = MACH_MSGH_BITS_LOCAL(msg->msgh_bits);
-	complex     = (msg->msgh_bits & MACH_MSGH_BITS_COMPLEX) != 0;
-	has_local   = (msg->msgh_local != MACH_PORT_NULL) &&
+	/*
+	 * No body-bound check here: kernel-spawned worker tasks (stress
+	 * harness, future kernel servers) send with kernel-VA `umsg`
+	 * pointers even though sender != kernel_task, and a sender vs.
+	 * t_map check would wrongly reject them.  Ring-3 entry points
+	 * (sys_msg_send / sys_msg_rpc) bound umsg + msgh_size against
+	 * the user-VA window before reaching here, so the body copyin
+	 * below is safe for the syscall caller; kernel callers are
+	 * trusted not to point at unmapped memory.
+	 */
+
+	remote_disp = MACH_MSGH_BITS_REMOTE(hdr_copy.msgh_bits);
+	local_disp  = MACH_MSGH_BITS_LOCAL(hdr_copy.msgh_bits);
+	complex     = (hdr_copy.msgh_bits & MACH_MSGH_BITS_COMPLEX) != 0;
+	has_local   = (hdr_copy.msgh_local != MACH_PORT_NULL) &&
 	    (local_disp != 0);
 
-	/*
-	 * Pick the right kind the sender must hold for the remote.
-	 * COPY_SEND and MOVE_SEND want SEND; MOVE_SEND_ONCE wants
-	 * SEND_ONCE.  COPY_SEND_ONCE / MAKE_*_to-yourself are not
-	 * legal as remote dispositions.
-	 */
-	uint8_t remote_right;
 	switch (remote_disp) {
 	case MACH_MSG_TYPE_COPY_SEND:
 	case MACH_MSG_TYPE_MOVE_SEND:
@@ -674,10 +969,32 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *msg)
 		return (MACH_E_INVAL);
 	}
 
+	m = (struct port_msg *)kmalloc(sizeof(*m) + hdr_copy.msgh_size);
+	if (m == NULL)
+		return (MACH_E_NOMEM);
+	m->m_next   = NULL;
+	m->m_size   = hdr_copy.msgh_size;
+	m->m_ndescs = 0;
+	m->m_descs  = NULL;
+
+	smap_user_access_begin();
+	{
+		const uint8_t	*src;
+
+		src = (const uint8_t *)umsg;
+		for (i = 0; i < hdr_copy.msgh_size; i++)
+			m->m_buf[i] = src[i];
+	}
+	smap_user_access_end();
+
+	msg = (const struct mach_msg_header *)m->m_buf;
+
 	dest = space_lookup(from, msg->msgh_remote, remote_right,
 	    &dummy_rights);
-	if (dest == NULL)
+	if (dest == NULL) {
+		kfree(m);
 		return (MACH_E_RIGHT);
+	}
 
 	/*
 	 * Inline-reply fast path.  If the destination has an armed stash
@@ -704,8 +1021,17 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *msg)
 			const uint8_t		*src2;
 			struct mach_msg_header	*sh;
 
-			dst  = (uint8_t *)dest->p_stash_buf;
-			src2 = (const uint8_t *)msg;
+			dst  = (uint8_t *)dest->p_stash_buf;	/* user VA */
+			src2 = (const uint8_t *)msg;		/* kernel VA */
+			/*
+			 * dest->p_stash_buf was armed by mach_msg_rpc and
+			 * points into the receiver's caller-supplied user
+			 * buffer.  Single SMAP bracket on the copy + the
+			 * msgh_local zero so the inline-reply fast path
+			 * touches user memory the same way deliver_msg
+			 * does on the slow path.
+			 */
+			smap_user_access_begin();
 			for (i = 0; i < want_size; i++)
 				dst[i] = src2[i];
 			/*
@@ -718,6 +1044,7 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *msg)
 			 */
 			sh = (struct mach_msg_header *)dst;
 			sh->msgh_local = MACH_PORT_NULL;
+			smap_user_access_end();
 
 			dest->p_stash_rv = MACH_MSG_OK;
 			spin_unlock(&dest->p_lock);
@@ -727,6 +1054,7 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *msg)
 				(void)space_drop_one_right(from,
 				    msg->msgh_remote, remote_right);
 			}
+			kfree(m);
 			return (MACH_MSG_OK);
 		}
 		spin_unlock(&dest->p_lock);
@@ -740,6 +1068,8 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *msg)
 	 * cannot observe a stale name in the sender's space.
 	 */
 	if (dest->p_special != PORT_SPECIAL_NONE) {
+		int	special_rv;
+
 		if (remote_disp == MACH_MSG_TYPE_MOVE_SEND ||
 		    remote_disp == MACH_MSG_TYPE_MOVE_SEND_ONCE) {
 			(void)space_drop_one_right(from,
@@ -747,18 +1077,34 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *msg)
 		}
 		switch (dest->p_special) {
 		case PORT_SPECIAL_TASK_SELF:
-			return (task_self_dispatch(
-			    (struct task *)dest->p_special_arg, msg, from));
+			special_rv = task_self_dispatch(
+			    (struct task *)dest->p_special_arg, msg, from);
+			break;
 		case PORT_SPECIAL_BOOTSTRAP:
-			return (bootstrap_dispatch(msg, from));
+			special_rv = bootstrap_dispatch(msg, from);
+			break;
 		case PORT_SPECIAL_SERVICE: {
 			port_service_fn fn;
 			fn = (port_service_fn)(uintptr_t)dest->p_special_arg;
-			return (fn(msg, from));
+			special_rv = fn(msg, from);
+			break;
 		}
 		default:
-			return (MACH_E_INVAL);
+			special_rv = MACH_E_INVAL;
+			break;
 		}
+		/*
+		 * Dispatchers read msg (== m->m_buf) directly -- it is
+		 * kernel VA, so any further OOL-source touches happen
+		 * with the OOL descriptor's `address` already validated
+		 * in the kernel copy.  apply_ool_deallocate honours
+		 * deallocate-on-send for any OOL with the flag set; it
+		 * walks m->m_buf, so no SMAP brackets are needed there
+		 * either.
+		 */
+		apply_ool_deallocate(msg, from);
+		kfree(m);
+		return (special_rv);
 	}
 
 	/*
@@ -778,22 +1124,11 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *msg)
 		    remote_right);
 	}
 
-	/* Allocate the queued message buffer (kmalloc-zeroed). */
-	m = (struct port_msg *)kmalloc(sizeof(*m) + msg->msgh_size);
-	if (m == NULL) {
-		rv = MACH_E_NOMEM;
-		goto fail;
-	}
-	m->m_next   = NULL;
-	m->m_size   = msg->msgh_size;
-	m->m_ndescs = 0;
-	m->m_descs  = NULL;
-
-	/* Copy the raw message bytes verbatim. */
-	src = (const uint8_t *)msg;
-	for (i = 0; i < msg->msgh_size; i++)
-		m->m_buf[i] = src[i];
-
+	/*
+	 * m is already allocated and m->m_buf already populated from
+	 * the upfront copyin -- nothing to do here beyond setting the
+	 * hdrs offset that the descriptor walker uses.
+	 */
 	hdrs_off = sizeof(struct mach_msg_header);
 
 	if (complex) {
@@ -1177,10 +1512,19 @@ deliver_msg(struct port_space *to, struct port *p, struct port_msg *m,
 		hdr->msgh_local = n;
 	}
 
+	/*
+	 * Copyout the queued kernel-VA message into the caller's user
+	 * buffer.  Single SMAP bracket on the write side -- m->m_buf
+	 * has been built up entirely in the kernel (post-receive
+	 * descriptor translation lives in there), so this is the only
+	 * user touch on the deliver path.
+	 */
 	{
 		uint8_t *dst = (uint8_t *)buf;
+		smap_user_access_begin();
 		for (i = 0; i < m->m_size; i++)
 			dst[i] = m->m_buf[i];
+		smap_user_access_end();
 	}
 
 	if (m->m_descs != NULL)
@@ -1507,18 +1851,31 @@ mach_msg_rpc(struct port_space *space, struct mach_msg_header *req,
 	reply_port->p_stash_rv   = MACH_E_NOMSG;
 	spin_unlock(&reply_port->p_lock);
 
-	remote_disp = MACH_MSGH_BITS_REMOTE(req->msgh_bits);
 	/*
-	 * Splice MAKE_SEND into the local disposition slot but preserve
-	 * the COMPLEX flag if the caller set it -- otherwise an RPC that
-	 * carries body descriptors loses its descriptor area to a fresh
-	 * MACH_MSGH_BITS() recompute that only encodes the disposition
-	 * bytes.
+	 * Read the caller's bits, then patch msgh_bits / msgh_local in
+	 * place to splice in MAKE_SEND and the freshly-allocated reply
+	 * name.  Both touch the user's req struct, so they happen under
+	 * a SMAP bracket.  The COMPLEX flag is preserved so an RPC that
+	 * carries body descriptors does not lose its descriptor area to
+	 * a MACH_MSGH_BITS() recompute that would only encode the
+	 * disposition bytes.
 	 */
-	req->msgh_bits  = MACH_MSGH_BITS(remote_disp,
-	    MACH_MSG_TYPE_MAKE_SEND) |
-	    (req->msgh_bits & MACH_MSGH_BITS_COMPLEX);
-	req->msgh_local = reply_name;
+	{
+		uint32_t bits_local;
+
+		smap_user_access_begin();
+		bits_local = req->msgh_bits;
+		smap_user_access_end();
+
+		remote_disp = MACH_MSGH_BITS_REMOTE(bits_local);
+
+		smap_user_access_begin();
+		req->msgh_bits = MACH_MSGH_BITS(remote_disp,
+		    MACH_MSG_TYPE_MAKE_SEND) |
+		    (bits_local & MACH_MSGH_BITS_COMPLEX);
+		req->msgh_local = reply_name;
+		smap_user_access_end();
+	}
 
 	rv = mach_msg_send(space, req);
 

@@ -12,6 +12,7 @@
 #include "kmem.h"
 #include "kprintf.h"
 #include "panic.h"
+#include "port_internal.h"
 #include "sched.h"
 #include "spinlock.h"
 #include "task.h"
@@ -68,6 +69,12 @@ thread_subsystem_init(void)
 	boot->th_timed_out       = 0;
 	boot->th_timed_link      = NULL;
 	boot->th_held_count      = 0;
+	{
+		unsigned	exi;
+
+		for (exi = 0; exi < EXC_TYPE_COUNT; exi++)
+			boot->th_exc_ports[exi] = NULL;
+	}
 
 	current_thread = boot;
 	task_attach_thread(kernel_task, boot);
@@ -137,6 +144,12 @@ thread_create(struct task *t, void (*entry)(void *), void *arg,
 	th->th_timed_out         = 0;
 	th->th_timed_link        = NULL;
 	th->th_held_count        = 0;
+	{
+		unsigned	exi;
+
+		for (exi = 0; exi < EXC_TYPE_COUNT; exi++)
+			th->th_exc_ports[exi] = NULL;
+	}
 
 	/*
 	 * Fake-call frame at the high end of the kstack.  switch.S
@@ -196,6 +209,52 @@ thread_exit(void)
 	sched_handoff_zombie(me);
 	/* NOTREACHED */
 	panic("thread_exit: returned from sched_handoff_zombie");
+}
+
+int
+thread_set_exception_ports(struct thread *th, uint32_t types_mask,
+    struct port *port)
+{
+	struct port	*prev[EXC_TYPE_COUNT];
+	unsigned	 i;
+
+	if (th == NULL)
+		return (MACH_E_INVAL);
+	if ((types_mask & ~EXC_MASK_ALL) != 0)
+		return (MACH_E_INVAL);
+	if (types_mask == 0)
+		return (MACH_MSG_OK);
+
+	/*
+	 * Mirror task_set_exception_ports' ref ordering:
+	 * take popcount(types_mask) refs on the new port BEFORE the
+	 * swap so any concurrent user_fault_die snapshot reads a live
+	 * ref between the unlock and the prev-drop.
+	 */
+	if (port != NULL) {
+		for (i = 0; i < EXC_TYPE_COUNT; i++) {
+			if (types_mask & (1u << i))
+				port_ref(port, MACH_PORT_RIGHT_SEND);
+		}
+	}
+
+	for (i = 0; i < EXC_TYPE_COUNT; i++)
+		prev[i] = NULL;
+
+	spin_lock(&th->th_lock);
+	for (i = 0; i < EXC_TYPE_COUNT; i++) {
+		if ((types_mask & (1u << i)) == 0)
+			continue;
+		prev[i] = th->th_exc_ports[i];
+		th->th_exc_ports[i] = port;
+	}
+	spin_unlock(&th->th_lock);
+
+	for (i = 0; i < EXC_TYPE_COUNT; i++) {
+		if (prev[i] != NULL)
+			port_deref(prev[i], MACH_PORT_RIGHT_SEND);
+	}
+	return (MACH_MSG_OK);
 }
 
 const char *

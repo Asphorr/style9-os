@@ -38,10 +38,18 @@ void	usermode_run_first_blob(void);
  * iretq's into ring 3 on e_entry.  Wired up by progreg_spawn() in
  * kern/progreg.c; ring-3 callers reach it via SYS_SPAWN.
  *
+ * `inject_port` is optional: when non-NULL, the launcher installs a
+ * SEND right on the port into the child's port_space at name
+ * MACH_PORT_PARENT before transitioning to ring 3.  Caller must hold
+ * one SEND ref; the ref is transferred into the child on success and
+ * dropped on any failure path.  Used by SYS_SPAWN_WITH_PORT to hand
+ * a private channel to a child task.
+ *
  * Returns the new task's t_id on success, negative SYS_E_* on failure.
  */
+struct port;
 long	arch_spawn_user(const char *name, const uint8_t *image,
-	    size_t image_size);
+	    size_t image_size, struct port *inject_port);
 
 /*
  * usermode_enter: never returns to its caller.  Pushes a synthetic

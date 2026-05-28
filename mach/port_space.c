@@ -525,6 +525,52 @@ port_space_inject_send(struct port_space *src, mach_port_name_t src_name,
 	return (MACH_MSG_OK);
 }
 
+mach_port_name_t
+port_set_extract(struct port_space *ps, mach_port_name_t port_name)
+{
+	struct port_set		*set;
+	struct port		*p;
+	mach_port_name_t	 result;
+	uint8_t			 dummy;
+	size_t			 i;
+
+	if (ps == NULL)
+		return (MACH_PORT_NULL);
+
+	/*
+	 * Need RECEIVE to reach the port the same way port_set_insert /
+	 * port_set_remove do; SEND-only holders never see set membership
+	 * because the set bridges receive queues, not send rights.
+	 */
+	p = space_lookup(ps, port_name, MACH_PORT_RIGHT_RECEIVE, &dummy);
+	if (p == NULL)
+		return (MACH_PORT_NULL);
+
+	spin_lock(&p->p_lock);
+	set = p->p_set;
+	spin_unlock(&p->p_lock);
+	if (set == NULL)
+		return (MACH_PORT_NULL);
+
+	/*
+	 * Map the port_set pointer back to its name in this space.  The
+	 * set must have been installed somewhere in ps -- port_set_insert
+	 * looks up both port and set in the same space -- so a linear
+	 * scan finds it.  Stop at the first hit; sets occupy at most one
+	 * name per space.
+	 */
+	result = MACH_PORT_NULL;
+	spin_lock(&ps->ps_lock);
+	for (i = 1; i < ps->ps_capacity; i++) {
+		if (ps->ps_table[i].pe_set == set) {
+			result = (mach_port_name_t)i;
+			break;
+		}
+	}
+	spin_unlock(&ps->ps_lock);
+	return (result);
+}
+
 int
 port_set_remove(struct port_space *ps, mach_port_name_t set_name,
     mach_port_name_t port_name)
@@ -567,6 +613,102 @@ port_set_remove(struct port_space *ps, mach_port_name_t set_name,
 	return (MACH_MSG_OK);
 }
 
+int
+port_request_notification(struct port_space *space, mach_port_name_t name,
+    uint32_t notify_type, mach_port_name_t notify_port_name,
+    uint32_t notify_msgid, mach_port_name_t *prev_out)
+{
+	struct port	*source;
+	struct port	*notify_port;
+	struct port	*prev_target = NULL;
+	uint8_t		 required;
+	uint8_t		 dummy;
+
+	if (space == NULL || prev_out == NULL)
+		return (MACH_E_INVAL);
+
+	/*
+	 * Each notification type names a different precondition on the
+	 * source:
+	 *	NO_SENDERS -- caller is the RECEIVER, watching for "all my
+	 *		     senders went away" while still holding RECV.
+	 *	DEAD_NAME  -- caller is a SEND HOLDER, watching for "the
+	 *		     port behind my SEND name died" so the name
+	 *		     in their own space becomes a dead name.
+	 * Other types (SEND_ONCE notification, port-deleted, ...)
+	 * reserved for future revisions.
+	 */
+	switch (notify_type) {
+	case MACH_NOTIFY_NO_SENDERS:
+		required = MACH_PORT_RIGHT_RECEIVE;
+		break;
+	case MACH_NOTIFY_DEAD_NAME:
+		required = MACH_PORT_RIGHT_SEND;
+		break;
+	default:
+		return (MACH_E_INVAL);
+	}
+
+	/*
+	 * Lookup itself does not take a ref; we rely on the caller's
+	 * name table entry keeping the port alive for the duration of
+	 * this call.
+	 */
+	source = space_lookup(space, name, required, &dummy);
+	if (source == NULL)
+		return (MACH_E_RIGHT);
+
+	notify_port = space_lookup(space, notify_port_name,
+	    MACH_PORT_RIGHT_SEND, &dummy);
+	if (notify_port == NULL)
+		return (MACH_E_RIGHT);
+
+	/*
+	 * Disallow source == notify target.  For NO_SENDERS the kernel
+	 * SEND ref on the notify port would mask the user's own "all
+	 * senders gone" event; for DEAD_NAME firing the notification
+	 * onto the same dying port is a guaranteed dead letter.
+	 */
+	if (source == notify_port)
+		return (MACH_E_INVAL);
+
+	/*
+	 * Take a SEND ref for the slot.  Released by port_deref's
+	 * firing branch (one-shot) or the RECV-drop cleanup branch.
+	 * Done before swapping the field so an interleaving fire reads
+	 * a live ref.
+	 */
+	port_ref(notify_port, MACH_PORT_RIGHT_SEND);
+
+	spin_lock(&source->p_lock);
+	if (notify_type == MACH_NOTIFY_NO_SENDERS) {
+		prev_target                    = source->p_notify_no_senders;
+		source->p_notify_no_senders    = notify_port;
+		source->p_notify_no_senders_id = notify_msgid;
+	} else {
+		prev_target                    = source->p_notify_dead_name;
+		source->p_notify_dead_name     = notify_port;
+		source->p_notify_dead_name_id  = notify_msgid;
+	}
+	spin_unlock(&source->p_lock);
+
+	/*
+	 * The kernel held a SEND ref for the previous registration; drop
+	 * it now that the slot points elsewhere.
+	 */
+	if (prev_target != NULL)
+		port_deref(prev_target, MACH_PORT_RIGHT_SEND);
+
+	/*
+	 * v1 makes no attempt to resolve prev_target back to a name in
+	 * the caller's space (would require walking ps_table or
+	 * stashing the name alongside the pointer).  Tracking the
+	 * previous registration is the application's job.
+	 */
+	*prev_out = MACH_PORT_NULL;
+	return (MACH_MSG_OK);
+}
+
 /* ---- introspection -------------------------------------------------- */
 
 size_t
@@ -594,6 +736,72 @@ port_queue_len(struct port_space *ps, mach_port_name_t name)
 	v = p->p_qlen;
 	spin_unlock(&p->p_lock);
 	return (v);
+}
+
+size_t
+port_space_snapshot(struct port_space *ps,
+    struct mach_port_snapshot_entry *out, size_t max_entries)
+{
+	struct port			*p;
+	struct port_set			*set;
+	struct mach_port_snapshot_entry	*e;
+	size_t				 i, n;
+	uint8_t				 r;
+
+	if (ps == NULL || out == NULL || max_entries == 0)
+		return (0);
+
+	n = 0;
+	spin_lock(&ps->ps_lock);
+	for (i = 1; i < ps->ps_capacity && n < max_entries; i++) {
+		p   = ps->ps_table[i].pe_port;
+		set = ps->ps_table[i].pe_set;
+		r   = ps->ps_table[i].pe_rights;
+
+		if (p == NULL && set == NULL)
+			continue;
+
+		e = &out[n];
+		e->mpse_name             = (mach_port_name_t)i;
+		e->mpse_rights           = r;
+		e->mpse_special          = PORT_SPECIAL_NONE;
+		e->mpse_flags            = 0;
+		e->mpse_object_id        = 0;
+		e->mpse_qlen             = 0;
+		e->mpse_qmax             = 0;
+		e->mpse_refs             = 0;
+		e->mpse_send_count       = 0;
+		e->mpse_send_once_count  = 0;
+		e->mpse_member_count     = 0;
+
+		if (set != NULL) {
+			e->mpse_kind = (uint8_t)PORT_SNAPSHOT_KIND_SET;
+			spin_lock(&set->ps_lock);
+			e->mpse_object_id    = set->ps_id;
+			e->mpse_refs         = set->ps_refs;
+			e->mpse_member_count = (uint32_t)set->ps_member_count;
+			if (set->ps_dead)
+				e->mpse_flags |= PORT_SNAPSHOT_FLAG_DEAD;
+			spin_unlock(&set->ps_lock);
+		} else {
+			e->mpse_kind = (uint8_t)PORT_SNAPSHOT_KIND_PORT;
+			spin_lock(&p->p_lock);
+			e->mpse_object_id       = p->p_id;
+			e->mpse_special         = p->p_special;
+			e->mpse_qlen            = (uint32_t)p->p_qlen;
+			e->mpse_qmax            = (uint32_t)p->p_qmax;
+			e->mpse_refs            = p->p_refs;
+			e->mpse_send_count      = p->p_send_count;
+			e->mpse_send_once_count = p->p_send_once_count;
+			if (p->p_dead)
+				e->mpse_flags |= PORT_SNAPSHOT_FLAG_DEAD;
+			spin_unlock(&p->p_lock);
+		}
+
+		n++;
+	}
+	spin_unlock(&ps->ps_lock);
+	return (n);
 }
 
 void

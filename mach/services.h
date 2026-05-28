@@ -136,6 +136,108 @@ _Static_assert(sizeof(struct svc_tasks_reply) ==
 #define	SVC_ECHOOL_NAME		"echool"
 #define	ECHOOL_OP_CHECKSUM	1
 
+/* ---- "launchd" service ---- */
+/*
+ * Minimal launchd analog: a registry of managed services.  Each entry
+ * names a registered string (the "label" -- Apple calls it Label),
+ * the program to spawn (a name registered with progreg, e.g. "echod"),
+ * and tracks lifecycle state + task id.
+ *
+ * v1 ops:
+ *	LAUNCHCTL_OP_LIST	enumerate every loaded entry.  Re-validates
+ *				task liveness via task_is_alive at snapshot
+ *				time -- if a RUNNING entry's task is gone,
+ *				its row is updated to EXITED before being
+ *				written to the reply.
+ *	LAUNCHCTL_OP_LOAD	register a label+program pair, spawn the
+ *				program immediately, and record the task id.
+ *				State transitions: RUNNING on success, FAILED
+ *				if the spawn returned an error.  Duplicate
+ *				labels are rejected with MACH_E_INVAL.
+ *	LAUNCHCTL_OP_UNLOAD	drop the entry from the registry.  Real
+ *				kill not implemented yet (no SYS_TASK_KILL);
+ *				a still-running task continues until it
+ *				exits on its own.  Operation succeeds either
+ *				way; the entry is gone from launchd's table.
+ *
+ * Wire shapes are inline-only -- no OOL.  Total reply for LIST is
+ * 8 + LAUNCHD_MAX_SERVICES * sizeof(entry).
+ *
+ * Deferred to v2: STOP / START (need a kill primitive), restart-on-
+ * exit policies, .plist-equivalent manifest loading from disk, cross-
+ * task auth, persistent service catalog.
+ */
+#define	SVC_LAUNCHD_NAME	"launchd"
+
+#define	LAUNCHCTL_OP_LIST	1
+#define	LAUNCHCTL_OP_LOAD	2
+#define	LAUNCHCTL_OP_UNLOAD	3
+
+#define	LAUNCHD_MAX_SERVICES	8
+#define	LAUNCHD_NAME_MAX	24
+#define	LAUNCHD_PROGRAM_MAX	24
+
+/*
+ * State machine.  LOAD always tries to spawn, so an entry never
+ * lingers in a fresh "loaded but never started" state -- that maps
+ * directly to RUNNING-or-FAILED.  EXITED is the catch-all "task is
+ * gone now" reached either when LIST observes task_is_alive == false
+ * or (future) when a death notification fires.
+ */
+#define	LAUNCHD_STATE_RUNNING	0
+#define	LAUNCHD_STATE_EXITED	1
+#define	LAUNCHD_STATE_FAILED	2
+
+/* WIRE FORMAT.  ABI-stable.  LOAD request body. */
+struct svc_launchctl_load_req {
+	char		lr_name[LAUNCHD_NAME_MAX];
+	char		lr_program[LAUNCHD_PROGRAM_MAX];
+};
+
+_Static_assert(sizeof(struct svc_launchctl_load_req) == 48,
+    "svc_launchctl_load_req must be 48 bytes (wire format)");
+
+/* WIRE FORMAT.  ABI-stable.  UNLOAD request body (label only). */
+struct svc_launchctl_byname_req {
+	char		lr_name[LAUNCHD_NAME_MAX];
+};
+
+_Static_assert(sizeof(struct svc_launchctl_byname_req) == 24,
+    "svc_launchctl_byname_req must be 24 bytes (wire format)");
+
+/* WIRE FORMAT.  ABI-stable.  LOAD / UNLOAD reply body. */
+struct svc_launchctl_status_reply {
+	int32_t		ls_status;	/* MACH_MSG_OK or MACH_E_*       */
+	uint32_t	ls_state;	/* LAUNCHD_STATE_* after the op  */
+	uint64_t	ls_task_id;	/* 0 if not running              */
+};
+
+_Static_assert(sizeof(struct svc_launchctl_status_reply) == 16,
+    "svc_launchctl_status_reply must be 16 bytes (wire format)");
+
+/* WIRE FORMAT.  ABI-stable.  One row in a LIST reply. */
+struct svc_launchctl_entry {
+	char		le_name[LAUNCHD_NAME_MAX];
+	char		le_program[LAUNCHD_PROGRAM_MAX];
+	uint32_t	le_state;
+	uint32_t	le_pad;
+	uint64_t	le_task_id;
+};
+
+_Static_assert(sizeof(struct svc_launchctl_entry) == 64,
+    "svc_launchctl_entry must be 64 bytes (wire format)");
+
+/* WIRE FORMAT.  ABI-stable.  LIST reply body. */
+struct svc_launchctl_list_reply {
+	uint32_t			ll_count;
+	uint32_t			ll_pad;
+	struct svc_launchctl_entry	ll_entries[LAUNCHD_MAX_SERVICES];
+};
+
+_Static_assert(sizeof(struct svc_launchctl_list_reply) ==
+    8 + LAUNCHD_MAX_SERVICES * sizeof(struct svc_launchctl_entry),
+    "svc_launchctl_list_reply layout pinned");
+
 /* Bring up + register all four services.  Call after bootstrap_init
  * and task_subsystem_init (so kernel_task exists for thread/task ID
  * accounting). */

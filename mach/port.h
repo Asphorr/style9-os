@@ -90,6 +90,17 @@ typedef uint32_t	mach_port_name_t;
 	(((uint32_t)(remote) & 0xFFu) | (((uint32_t)(local) & 0xFFu) << 8))
 
 /*
+ * Bits the kernel currently consumes in msgh_bits: the two 8-bit
+ * disposition lanes (0..15) plus the COMPLEX flag (31).  Anything
+ * outside this mask is reserved for future revisions and MUST be
+ * zero on send.  mach_msg_send rejects nonzero reserved bits with
+ * MACH_E_INVAL so forward-incompatible callers fail loudly the
+ * moment they touch a bit that has not been spec'd yet.
+ */
+#define	MACH_MSGH_BITS_USED_MASK	\
+	((uint32_t)MACH_MSGH_BITS_COMPLEX | (uint32_t)0xFFFFu)
+
+/*
  * Dispositions (what the kernel does with the right named in the slot).
  * Numbers match real Mach so the wire format is forward-compatible.
  */
@@ -99,6 +110,117 @@ typedef uint32_t	mach_port_name_t;
 #define	MACH_MSG_TYPE_COPY_SEND		19	/* sender keeps SEND          */
 #define	MACH_MSG_TYPE_MAKE_SEND		20	/* sender holds RECV -> SEND  */
 #define	MACH_MSG_TYPE_MAKE_SEND_ONCE	21	/* sender holds RECV -> SO    */
+
+/*
+ * Notifications.
+ *
+ * A port's receiver may register a "notify port" for state-change
+ * events via mach_port_request_notification.  When the event fires the
+ * kernel synthesises a Mach message with msgh_id = MACH_NOTIFY_<EVENT>
+ * and posts it to the registered notify port.  Notifications are
+ * one-shot: firing consumes the registration; re-arming requires a
+ * fresh request.  Numbers match real Mach (MACH_NOTIFY_FIRST = 64).
+ *
+ *	MACH_NOTIFY_NO_SENDERS	last send-bearing right on the source
+ *				port has been dropped while the
+ *				receiver still holds RECEIVE.  Used by
+ *				services to detect "client has gone
+ *				away" without polling.  v1.
+ *
+ *	MACH_NOTIFY_DEAD_NAME	(v2, reserved) the port behind a name
+ *				in this space has died, so the name now
+ *				refers to MACH_PORT_DEAD.
+ */
+#define	MACH_NOTIFY_FIRST		64
+#define	MACH_NOTIFY_NO_SENDERS		(MACH_NOTIFY_FIRST + 6)
+#define	MACH_NOTIFY_DEAD_NAME		(MACH_NOTIFY_FIRST + 8)
+
+/*
+ * Exception messages.  When a ring-3 fault retires a thread the kernel
+ * posts a mach_exception_header onto the task's t_exc_port (set via
+ * SYS_TASK_SET_EXC_PORT) before the thread is finally killed.  The
+ * receiver -- typically a debugger or crash reporter in a separate
+ * task -- sees msgh_id = MACH_EXC_FAULT and reads thread state out of
+ * the body to decide what to do.  Number chosen above the notify
+ * range so opcodes never collide.
+ */
+#define	MACH_EXC_FAULT			100
+
+/*
+ * Exception type indices.  user_fault_die maps the x86 trap vector down
+ * to one of these and dispatches to the corresponding slot in the
+ * task's t_exc_ports[] array.  Numbered as small integers so they
+ * index the array directly; EXC_MASK_* bitmask form is what
+ * task_set_exception_ports / SYS_TASK_SET_EXC_PORTS use to address
+ * multiple slots in one call.
+ *
+ *	BAD_ACCESS       #PF, #GP, #SS, #NP and any other fault not
+ *	                 otherwise classified (the default bucket)
+ *	BAD_INSTRUCTION  #UD, #NM (illegal opcode / device-not-available)
+ *	ARITHMETIC       #DE, #MF, #XM (divide, x87, SSE)
+ *	BREAKPOINT       #BP (INT3) -- the debugger bucket
+ *
+ * Setting a port for a type that is never triggered by the current
+ * trapno mapping is legal; the slot simply never fires.  New trap
+ * vectors are added by extending the switch in exc_type_from_trapno.
+ */
+#define	EXC_TYPE_BAD_ACCESS		0u
+#define	EXC_TYPE_BAD_INSTRUCTION	1u
+#define	EXC_TYPE_ARITHMETIC		2u
+#define	EXC_TYPE_BREAKPOINT		3u
+#define	EXC_TYPE_COUNT			4u
+
+#define	EXC_MASK_BAD_ACCESS		(1u << EXC_TYPE_BAD_ACCESS)
+#define	EXC_MASK_BAD_INSTRUCTION	(1u << EXC_TYPE_BAD_INSTRUCTION)
+#define	EXC_MASK_ARITHMETIC		(1u << EXC_TYPE_ARITHMETIC)
+#define	EXC_MASK_BREAKPOINT		(1u << EXC_TYPE_BREAKPOINT)
+#define	EXC_MASK_ALL			((1u << EXC_TYPE_COUNT) - 1u)
+
+/*
+ * Exception-port behavior flags.  Packed into the high half of the
+ * mask argument to SYS_TASK_SET_EXC_PORTS so a single syscall covers
+ * both type selection (low bits) and per-task behavior (high bits).
+ *
+ *	EXC_FLAG_RESUMABLE   opt into the reply protocol.  When set,
+ *			    user_fault_die parks the faulting thread on
+ *			    a kernel-allocated reply port (named via
+ *			    msgh_local in the exception message), waits
+ *			    for the watcher to send a mach_exception_reply
+ *			    back, and applies the verdict: KILL retires
+ *			    the thread (A v1 default), RESUME advances
+ *			    tf->tf_rip by er_rip_advance and returns to
+ *			    user mode.  No reply within RESUMABLE_TIMEOUT_MS
+ *			    is treated as KILL.
+ *
+ *			    When clear (the default), the kernel retires
+ *			    the thread immediately after delivering the
+ *			    exception -- the A v1 post-and-forget pattern.
+ *
+ * Future flags append in the same 16-bit field; types stay in the low
+ * 16 bits.  EXC_FLAGS_VALID pins the consumed-flag set so callers
+ * setting unknown bits fail loudly with MACH_E_INVAL.
+ */
+#define	EXC_FLAG_RESUMABLE		0x00010000u
+#define	EXC_FLAGS_VALID			EXC_FLAG_RESUMABLE
+
+/*
+ * Exception reply opcode (msgh_id) + verdict codes that ride in the
+ * mach_exception_reply body.  RESUME advances RIP by er_rip_advance
+ * and returns to user mode; KILL retires the thread; STEP is reserved
+ * for v3 (single-instruction trap re-arming via RFLAGS.TF).
+ */
+#define	MACH_EXC_REPLY			101
+
+#define	EXC_VERDICT_KILL		0u
+#define	EXC_VERDICT_RESUME		1u
+#define	EXC_VERDICT_STEP		2u
+
+/*
+ * How long user_fault_die parks a resumable thread waiting for a
+ * verdict.  Bounded so a misbehaving / crashed watcher can't pin a
+ * faulting thread forever; on expiry the kernel falls back to KILL.
+ */
+#define	EXC_REPLY_TIMEOUT_MS		500u
 
 /*
  * Descriptor type tags.  The first byte of every descriptor in the
@@ -160,8 +282,13 @@ struct mach_msg_port_descriptor {
  * Bulk-memory descriptor.  Sixteen bytes; type-tag at byte 0.  On
  * send `address` is a sender VA; on recv the same field is rewritten
  * to a freshly-mapped receiver VA pointing at the copied bytes.
- * `deallocate` is reserved for the eventual "unmap sender's pages
- * after send" semantics; ignored in v1.
+ *
+ * `deallocate` is honoured: set 1 to ask the kernel to vm_map_release
+ * the sender's source range after the copy is captured.  Best-effort
+ * -- if the range does not mirror a single vm_allocate'd anonymous
+ * entry exactly, the flag is silently ignored.  Skipped for
+ * kernel-internal senders (kernel_task / trusted-send) since those
+ * addresses are kernel-VA, not user-managed.
  *
  * Packed because the natural alignment of uint64_t forces the whole
  * struct to align(8), which then inserts a 4-byte gap between the
@@ -175,7 +302,7 @@ struct mach_msg_port_descriptor {
 struct mach_msg_ool_descriptor {
 	uint8_t			type;		/* == MACH_MSG_OOL_DESCRIPTOR */
 	uint8_t			copy;		/* MACH_MSG_PHYSICAL_COPY     */
-	uint8_t			deallocate;	/* reserved, set 0            */
+	uint8_t			deallocate;	/* 1: vm_release source post-copy */
 	uint8_t			pad;
 	uint32_t		size;		/* bytes to ferry              */
 	uint64_t		address;	/* sender VA / receiver VA     */
@@ -187,6 +314,115 @@ _Static_assert(sizeof(struct mach_msg_port_descriptor) == 8,
     "mach_msg_port_descriptor must be 8 bytes (wire format)");
 _Static_assert(sizeof(struct mach_msg_ool_descriptor) == 16,
     "mach_msg_ool_descriptor must be 16 bytes (wire format)");
+
+/*
+ * Wire layout of a notification message posted by the kernel to a
+ * registered notify port.  msgh_id carries the MACH_NOTIFY_* opcode;
+ * nh_msgid carries the user-supplied tag handed to
+ * mach_port_request_notification so the receiver can disambiguate when
+ * multiple sources share one notify port.
+ */
+/* WIRE FORMAT.  ABI-stable. */
+struct mach_notify_header {
+	struct mach_msg_header	hdr;
+	uint32_t		nh_msgid;
+	uint32_t		nh_pad;
+};
+
+_Static_assert(sizeof(struct mach_notify_header) == 32,
+    "mach_notify_header must be 32 bytes (wire format)");
+
+/*
+ * Wire layout of an exception message posted by the kernel when a
+ * ring-3 thread retires on a fault.  msgh_id is MACH_EXC_FAULT.  All
+ * register fields are sampled from the trapframe at fault time; cr2
+ * is the faulting VA for #PF and 0 otherwise.  task_id lets a
+ * receiver distinguish which child crashed when serving many faults.
+ */
+/* WIRE FORMAT.  ABI-stable. */
+struct mach_exception_header {
+	struct mach_msg_header	hdr;
+	uint32_t		eh_trapno;	/* x86 vector              */
+	uint32_t		eh_err;		/* CPU-supplied error code */
+	uint64_t		eh_rip;
+	uint64_t		eh_rsp;
+	uint64_t		eh_rflags;
+	uint64_t		eh_cr2;		/* #PF faulting VA, else 0 */
+	uint64_t		eh_task_id;
+};
+
+_Static_assert(sizeof(struct mach_exception_header) == 72,
+    "mach_exception_header must be 72 bytes (wire format)");
+
+/*
+ * Wire layout of the verdict the watcher sends back when RESUMABLE
+ * was set.  msgh_id MUST be MACH_EXC_REPLY; the kernel parses the
+ * body and applies er_verdict -- unrecognised verdicts and any
+ * msgh_id mismatch are treated as KILL.  er_rip_advance is honored
+ * only for RESUME and carries the byte count to skip past the
+ * faulting instruction (2 for ud2, 1 for INT3, ...).
+ */
+/* WIRE FORMAT.  ABI-stable. */
+struct mach_exception_reply {
+	struct mach_msg_header	hdr;		/* msgh_id = MACH_EXC_REPLY */
+	uint32_t		er_verdict;	/* EXC_VERDICT_*            */
+	uint32_t		er_rip_advance;	/* bytes past faulting insn */
+};
+
+_Static_assert(sizeof(struct mach_exception_reply) == 32,
+    "mach_exception_reply must be 32 bytes (wire format)");
+
+/*
+ * Snapshot of one populated slot in a port_space.  Returned in
+ * arrays by SYS_TASK_GET_PORT_SNAPSHOT.  Wire layout is ABI-stable;
+ * future kernel revisions may append new fields but never reorder.
+ *
+ *	mpse_name		integer name in the snapshotted space.
+ *	mpse_kind		PORT_SNAPSHOT_KIND_* selector for which
+ *				per-object fields carry valid data:
+ *	  PORT			mpse_object_id is p_id, mpse_qlen/qmax/
+ *				refs/send_count/send_once_count populated,
+ *				mpse_member_count = 0.
+ *	  SET			mpse_object_id is ps_id, mpse_member_count
+ *				populated, queue + refs fields zeroed.
+ *	mpse_rights		MACH_PORT_RIGHT_* mask carried by this name
+ *				entry.
+ *	mpse_special		PORT_SPECIAL_* tag of the underlying port
+ *				(NONE for ordinary ports + every port_set).
+ *	mpse_flags		PORT_SNAPSHOT_FLAG_* -- bit 0 set when the
+ *				underlying port has gone dead.
+ */
+#define	PORT_SNAPSHOT_KIND_PORT		1u
+#define	PORT_SNAPSHOT_KIND_SET		2u
+
+#define	PORT_SNAPSHOT_FLAG_DEAD		0x01u
+
+/* WIRE FORMAT.  ABI-stable. */
+struct mach_port_snapshot_entry {
+	mach_port_name_t	mpse_name;
+	uint8_t			mpse_kind;
+	uint8_t			mpse_rights;
+	uint8_t			mpse_special;
+	uint8_t			mpse_flags;
+	uint64_t		mpse_object_id;
+	uint32_t		mpse_qlen;
+	uint32_t		mpse_qmax;
+	uint32_t		mpse_refs;
+	uint32_t		mpse_send_count;
+	uint32_t		mpse_send_once_count;
+	uint32_t		mpse_member_count;
+};
+
+_Static_assert(sizeof(struct mach_port_snapshot_entry) == 40,
+    "mach_port_snapshot_entry must be 40 bytes (wire format)");
+
+/*
+ * Cap on entries the kernel writes in one snapshot syscall.  Sized
+ * vs typical per-task usage (task_self + bootstrap + parent + a
+ * handful of alloc'd ports + per-type exception ports); keeps the
+ * kernel-side staging buffer on stack.
+ */
+#define	MACH_PORT_SNAPSHOT_MAX		64
 
 /* Error returns from mach_msg_send / mach_msg_recv (negative). */
 #define	MACH_MSG_OK		0
@@ -248,6 +484,16 @@ typedef int (*port_service_fn)(const struct mach_msg_header *req,
  */
 #define	MACH_PORT_TASK_SELF		((mach_port_name_t)1)
 #define	MACH_PORT_BOOTSTRAP		((mach_port_name_t)2)
+
+/*
+ * Well-known slot for a port the parent task injected at spawn time
+ * via SYS_SPAWN_WITH_PORT.  Tasks spawned without an injection have an
+ * empty slot here; the child program detects that by attempting a
+ * mach_msg_send and observing MACH_E_RIGHT.  The slot is by
+ * construction the next-free name after TASK_SELF and BOOTSTRAP, so
+ * arch_spawn_user's install KASSERTs the chosen name == 3.
+ */
+#define	MACH_PORT_PARENT		((mach_port_name_t)3)
 
 /*
  * Op codes used as msgh_id on messages sent to MACH_PORT_TASK_SELF.
@@ -329,6 +575,18 @@ int			 port_set_remove(struct port_space *,
 			    mach_port_name_t port_name);
 
 /*
+ * Read-only introspection: return the name of the port set `port_name`
+ * currently belongs to (in `space`), or MACH_PORT_NULL when the port
+ * is standalone.  Symmetric to insert/remove; useful for cleanup loops
+ * that need to find a port's set without tracking it externally.
+ *
+ * Assumes set membership stays within one port_space -- the kernel
+ * exposes no API to share a port_set across spaces today.
+ */
+mach_port_name_t	 port_set_extract(struct port_space *space,
+			    mach_port_name_t port_name);
+
+/*
  * Drop ONE specific right kind from a name without taking down the
  * other rights held under the same name (and without destroying the
  * port).  Returns MACH_E_NAME if `name` does not currently carry
@@ -338,6 +596,56 @@ int			 port_set_remove(struct port_space *,
  */
 int			 port_mod_refs(struct port_space *,
 			    mach_port_name_t name, uint8_t right);
+
+/*
+ * mach_port_request_notification: arrange for the kernel to post a
+ * notification message to `notify_port_name` when the source port at
+ * `name` reaches the event named by `notify_type` (one of MACH_NOTIFY_*).
+ *
+ * The caller must hold RECEIVE on `name` (only the receiver may register
+ * notifications) and SEND on `notify_port_name`.  `notify_msgid` is a
+ * user-chosen tag the kernel will copy verbatim into the notification
+ * message's nh_msgid field so callers serving many ports through one
+ * notify port can distinguish them.
+ *
+ * If a notification of this type was already registered on `name`, the
+ * previous notify-port name is returned via *prev_out so the caller can
+ * mach_port_deallocate it; MACH_PORT_NULL is written otherwise.  The
+ * kernel takes a SEND ref on the new notify port and drops it when the
+ * notification fires (one-shot) or when the source port's RECV right
+ * is finally released.
+ *
+ * v1 supports only MACH_NOTIFY_NO_SENDERS; other types return MACH_E_INVAL.
+ */
+int			 port_request_notification(struct port_space *space,
+			    mach_port_name_t name, uint32_t notify_type,
+			    mach_port_name_t notify_port_name,
+			    uint32_t notify_msgid,
+			    mach_port_name_t *prev_out);
+
+/*
+ * port_exception_post: kernel-side primitive used by the trap
+ * dispatcher to deliver a MACH_EXC_FAULT message onto a task's
+ * exception port.  Caller holds one SEND ref on `port` (typically
+ * already in task->t_exc_ports[..]); this routine does not deref.
+ * Individual fields rather than a trapframe pointer so mach/ stays
+ * free of arch/ dependencies.  Best-effort: a dead port or full
+ * queue silently drops.
+ *
+ * `reply_port` is optional: when non-NULL the message carries an
+ * implicit msgh_local descriptor minting a SEND right on `reply_port`
+ * into the watcher's space (msgh_bits LOCAL_disp = MAKE_SEND).  The
+ * watcher recvs the exception, reads msgh_local, and sends back a
+ * mach_exception_reply through that name -- the kernel parks the
+ * faulting thread on `reply_port`'s recv queue until the verdict
+ * arrives.  When NULL the message has no implicit local; the watcher
+ * is observer-only and the caller retires the thread directly.
+ */
+int			 port_exception_post(struct port *port,
+			    uint32_t trapno, uint32_t err,
+			    uint64_t rip, uint64_t rsp, uint64_t rflags,
+			    uint64_t cr2, uint64_t task_id,
+			    struct port *reply_port);
 
 /*
  * Bootstrap helper for inter-task IPC.
@@ -478,5 +786,24 @@ size_t			 port_space_inuse(struct port_space *);
 size_t			 port_queue_len(struct port_space *,
 			    mach_port_name_t);
 const char		*mach_msg_strerror(int code);
+
+/*
+ * Snapshot one entry per populated slot in `ps`.  Drives the userspace
+ * `lsmp` tool ("list mach ports", same shape as Darwin's debugger
+ * surface): the kernel walks the name table under ps->ps_lock, takes
+ * each non-empty entry's per-object lock briefly to copy out counters,
+ * and writes a wire-format mach_port_snapshot_entry per slot into the
+ * caller's array (up to `max_entries`).  Returns the number of entries
+ * actually written.  Name 0 is never populated by convention, so 0
+ * means the space is empty.
+ *
+ * Best-effort: counts may shift between adjacent entries since the
+ * outer lock is released after each populated row to bound contention.
+ * Sized so a typical task (task_self + bootstrap + parent + a handful
+ * of alloc'd ports + exception ports) fits within MACH_PORT_SNAPSHOT_MAX.
+ */
+size_t			 port_space_snapshot(struct port_space *ps,
+			    struct mach_port_snapshot_entry *out,
+			    size_t max_entries);
 
 #endif /* !_SYS_PORT_H_ */

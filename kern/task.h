@@ -12,6 +12,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "port.h"
 #include "spinlock.h"
 
 /*
@@ -48,6 +49,30 @@ struct task {
 	struct thread		*t_threads;	/* (t) head of thread list */
 	uint32_t		 t_nthreads;	/* (t) count                */
 	uint32_t		 t_refs;	/* (t) lifetime refs        */
+	/*
+	 * Per-type task-level exception ports.  user_fault_die maps the
+	 * x86 trap vector down to an EXC_TYPE_* index and posts
+	 * MACH_EXC_FAULT onto t_exc_ports[type] (NULL slots silently
+	 * drop).  Each slot is independent: the kernel holds one SEND
+	 * ref per non-NULL slot; refs balance on slot replace, on
+	 * mask-clear, and on task destruction.  Set via
+	 * SYS_TASK_SET_EXC_PORTS (mask form) or SYS_TASK_SET_EXC_PORT
+	 * (sets every slot from a single port, back-compat with A v1).
+	 * All under t_lock.
+	 */
+	struct port		*t_exc_ports[EXC_TYPE_COUNT];
+
+	/*
+	 * Behavior flags for the exception dispatch path.  Bitwise OR
+	 * of EXC_FLAG_* (today: only EXC_FLAG_RESUMABLE).  When
+	 * RESUMABLE is set, user_fault_die uses the reply protocol --
+	 * post the exception with an implicit reply port and park the
+	 * thread until a mach_exception_reply lands (or the timeout
+	 * expires, which falls back to KILL).  Clear by default; opted
+	 * into by passing flag bits in the high half of the mask
+	 * argument to SYS_TASK_SET_EXC_PORTS.  (t) under t_lock.
+	 */
+	uint32_t		 t_exc_flags;
 };
 
 extern struct task		*kernel_task;
@@ -97,5 +122,19 @@ bool			 task_is_alive(uint64_t id);
 int			 task_self_dispatch(struct task *target,
 			    const struct mach_msg_header *req,
 			    struct port_space *from);
+
+/*
+ * Install `port` into every slot of `t->t_exc_ports` named by
+ * `types_mask` (a bitwise OR of EXC_MASK_* values).  Existing
+ * occupants of those slots get port_deref'd; the kernel takes one
+ * fresh SEND ref per slot in `types_mask` on the new port (so a
+ * single port covering multiple types holds N refs, balanced at
+ * teardown).  Passing port=NULL clears the named slots.
+ *
+ * Returns MACH_MSG_OK or MACH_E_INVAL if `types_mask` has bits
+ * outside EXC_MASK_ALL.  Empty mask is a no-op success.
+ */
+int			 task_set_exception_ports(struct task *t,
+			    uint32_t types_mask, struct port *port);
 
 #endif /* !_SYS_TASK_H_ */

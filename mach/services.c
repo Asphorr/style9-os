@@ -10,6 +10,7 @@
 
 #include "bootstrap.h"
 #include "clock.h"
+#include "launchd.h"
 #include "kmem.h"
 #include "kprintf.h"
 #include "panic.h"
@@ -17,6 +18,7 @@
 #include "port.h"
 #include "sched.h"
 #include "services.h"
+#include "smap.h"
 #include "spinlock.h"
 #include "task.h"
 #include "thread.h"
@@ -173,6 +175,14 @@ svc_tasks_dispatch(const struct mach_msg_header *req, struct port_space *from)
  */
 extern uint8_t	_binary_port_9_txt_start[];
 extern uint8_t	_binary_port_9_txt_end[];
+extern uint8_t	_binary_mach_msg_9_txt_start[];
+extern uint8_t	_binary_mach_msg_9_txt_end[];
+extern uint8_t	_binary_vm_allocate_9_txt_start[];
+extern uint8_t	_binary_vm_allocate_9_txt_end[];
+extern uint8_t	_binary_kassert_9_txt_start[];
+extern uint8_t	_binary_kassert_9_txt_end[];
+extern uint8_t	_binary_intro_9_txt_start[];
+extern uint8_t	_binary_intro_9_txt_end[];
 
 struct man_page {
 	const char	*name;
@@ -181,7 +191,16 @@ struct man_page {
 };
 
 static const struct man_page	man_pages[] = {
-	{ "port", _binary_port_9_txt_start, _binary_port_9_txt_end },
+	{ "port",        _binary_port_9_txt_start,
+	                 _binary_port_9_txt_end },
+	{ "mach_msg",    _binary_mach_msg_9_txt_start,
+	                 _binary_mach_msg_9_txt_end },
+	{ "vm_allocate", _binary_vm_allocate_9_txt_start,
+	                 _binary_vm_allocate_9_txt_end },
+	{ "kassert",     _binary_kassert_9_txt_start,
+	                 _binary_kassert_9_txt_end },
+	{ "intro",       _binary_intro_9_txt_start,
+	                 _binary_intro_9_txt_end },
 };
 static const size_t		man_pages_count =
 	sizeof(man_pages) / sizeof(man_pages[0]);
@@ -405,8 +424,17 @@ svc_echool_dispatch(const struct mach_msg_header *req, struct port_space *from)
 	if (size == 0) {
 		sum = 0u;
 	} else {
+		/*
+		 * OOL bytes live at the sender's user-VA `addr` (the
+		 * descriptor's `address` field); the special-port path
+		 * runs in the sender's pmap, so the bytes are reachable
+		 * but the kernel needs EFLAGS.AC = 1 to read them once
+		 * CR4.SMAP is set.  Bracket the single FNV-1a sweep.
+		 */
 		payload = (const uint8_t *)(uintptr_t)addr;
-		sum     = echool_fnv1a(payload, size);
+		smap_user_access_begin();
+		sum = echool_fnv1a(payload, size);
+		smap_user_access_end();
 	}
 
 	reply.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
@@ -463,4 +491,5 @@ services_init(void)
 	svc_tasks_port  = svc_register(SVC_TASKS_NAME,  svc_tasks_dispatch);
 	svc_echool_port = svc_register(SVC_ECHOOL_NAME, svc_echool_dispatch);
 	svc_man_port    = svc_register(SVC_MAN_NAME,    svc_man_dispatch);
+	launchd_subsystem_init();
 }
