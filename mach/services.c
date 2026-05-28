@@ -160,11 +160,133 @@ svc_tasks_dispatch(const struct mach_msg_header *req, struct port_space *from)
 	return (svc_reply_inline(req, from, &r, sizeof(r)));
 }
 
+/* ---- "echool" service ------------------------------------------------- */
+
+/*
+ * Walk the descriptor area of the inbound message looking for the first
+ * OOL descriptor; cap the search by msgh_size and use the same type-tag
+ * dispatch as port_msg.c.  Returns the OOL descriptor's address+size
+ * pair, or false if there is no usable OOL descriptor.  Validates
+ * everything against the wire format before touching sender memory.
+ */
+static bool
+echool_find_ool(const struct mach_msg_header *req, uint64_t *addr_out,
+    uint32_t *size_out)
+{
+	const uint8_t			*buf;
+	const struct mach_msg_body	*body;
+	const struct mach_msg_ool_descriptor *od;
+	const struct mach_msg_port_descriptor *pd;
+	size_t				 hdrs_off, off, msg_size;
+	uint32_t			 ndescs, walked;
+	uint8_t				 t;
+
+	if ((req->msgh_bits & MACH_MSGH_BITS_COMPLEX) == 0)
+		return (false);
+
+	msg_size = req->msgh_size;
+	hdrs_off = sizeof(struct mach_msg_header);
+	if (msg_size < hdrs_off + sizeof(struct mach_msg_body))
+		return (false);
+
+	buf  = (const uint8_t *)req;
+	body = (const struct mach_msg_body *)(buf + hdrs_off);
+	ndescs = body->msgh_descriptor_count;
+
+	off = hdrs_off + sizeof(struct mach_msg_body);
+	for (walked = 0; walked < ndescs; walked++) {
+		if (off >= msg_size)
+			return (false);
+		t = buf[off];
+		if (t == MACH_MSG_PORT_DESCRIPTOR) {
+			if (off + sizeof(struct mach_msg_port_descriptor) >
+			    msg_size)
+				return (false);
+			pd = (const struct mach_msg_port_descriptor *)
+			    (buf + off);
+			(void)pd;
+			off += sizeof(struct mach_msg_port_descriptor);
+		} else if (t == MACH_MSG_OOL_DESCRIPTOR) {
+			if (off + sizeof(struct mach_msg_ool_descriptor) >
+			    msg_size)
+				return (false);
+			od = (const struct mach_msg_ool_descriptor *)
+			    (buf + off);
+			*addr_out = od->address;
+			*size_out = od->size;
+			return (true);
+		} else {
+			return (false);
+		}
+	}
+	return (false);
+}
+
+static uint32_t
+echool_fnv1a(const uint8_t *buf, uint32_t size)
+{
+	uint32_t	h, i;
+
+	h = 0x811C9DC5u;
+	for (i = 0; i < size; i++) {
+		h ^= (uint32_t)buf[i];
+		h *= 0x01000193u;
+	}
+	return (h);
+}
+
+/*
+ * Special-port dispatcher: runs synchronously in the sender's thread,
+ * so the sender's pmap is current and OOL VA dereferences resolve via
+ * the user's own page tables.  Bypasses recv_install_ool entirely --
+ * stress_ool already covers that leg of the pipeline; this oracle's job
+ * is to verify userspace can construct a wire-format-correct OOL
+ * descriptor that the kernel parses cleanly.
+ *
+ * Cap the payload at MACH_MSG_OOL_MAX_BYTES so a misbehaving sender
+ * can't park us in a multi-megabyte byte-by-byte loop.  size_t is the
+ * type the loop ranges over even though `size` is uint32_t, so the
+ * 1 MiB cap is the real wall.
+ */
+static int
+svc_echool_dispatch(const struct mach_msg_header *req, struct port_space *from)
+{
+	struct mach_msg_header	reply;
+	const uint8_t		*payload;
+	uint64_t		 addr;
+	uint32_t		 size, sum;
+
+	if (req->msgh_id != ECHOOL_OP_CHECKSUM)
+		return (MACH_E_INVAL);
+	if (req->msgh_local == MACH_PORT_NULL)
+		return (MACH_E_INVAL);
+	if (!echool_find_ool(req, &addr, &size))
+		return (MACH_E_INVAL);
+	if (size > MACH_MSG_OOL_MAX_BYTES)
+		return (MACH_E_INVAL);
+
+	if (size == 0) {
+		sum = 0u;
+	} else {
+		payload = (const uint8_t *)(uintptr_t)addr;
+		sum     = echool_fnv1a(payload, size);
+	}
+
+	reply.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	reply.msgh_size    = sizeof(reply);
+	reply.msgh_remote  = req->msgh_local;
+	reply.msgh_local   = MACH_PORT_NULL;
+	reply.msgh_voucher = 0;
+	reply.msgh_id      = sum;
+	return (mach_msg_send(from, &reply));
+}
+
 /* ---- subsystem bring-up ----------------------------------------------- */
 
 static struct port	*svc_clock_port;	/* (c) */
 static struct port	*svc_stats_port;	/* (c) */
 static struct port	*svc_tasks_port;	/* (c) */
+static struct port	*svc_echool_port;	/* (c) */
 
 /*
  * Each service is a kernel-owned PORT_SPECIAL_SERVICE port (the
@@ -198,7 +320,8 @@ void
 services_init(void)
 {
 
-	svc_clock_port = svc_register(SVC_CLOCK_NAME, svc_clock_dispatch);
-	svc_stats_port = svc_register(SVC_STATS_NAME, svc_stats_dispatch);
-	svc_tasks_port = svc_register(SVC_TASKS_NAME, svc_tasks_dispatch);
+	svc_clock_port  = svc_register(SVC_CLOCK_NAME,  svc_clock_dispatch);
+	svc_stats_port  = svc_register(SVC_STATS_NAME,  svc_stats_dispatch);
+	svc_tasks_port  = svc_register(SVC_TASKS_NAME,  svc_tasks_dispatch);
+	svc_echool_port = svc_register(SVC_ECHOOL_NAME, svc_echool_dispatch);
 }

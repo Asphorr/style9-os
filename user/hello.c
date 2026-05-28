@@ -107,6 +107,85 @@ demo_task_self(void)
 	return (0);
 }
 
+/*
+ * OOL round-trip: build a user-VA buffer with a known pattern, send it
+ * as the sole OOL descriptor in a complex message to svc/echool, expect
+ * the kernel-side FNV-1a checksum to come back in msgh_id and match
+ * what we computed locally.  Validates the wire format end-to-end from
+ * ring 3: the body's descriptor-count, the OOL type tag at byte 0, the
+ * size and address fields, and the kernel's special-port intercept all
+ * have to line up for this to pass.
+ */
+static uint32_t
+demo_ool_fnv1a(const uint8_t *buf, uint32_t size)
+{
+	uint32_t	h, i;
+
+	h = 0x811C9DC5u;
+	for (i = 0; i < size; i++) {
+		h ^= (uint32_t)buf[i];
+		h *= 0x01000193u;
+	}
+	return (h);
+}
+
+static int
+demo_ool_roundtrip(void)
+{
+	struct {
+		struct mach_msg_header		hdr;
+		struct mach_msg_body		body;
+		struct mach_msg_ool_descriptor	ool;
+	} req;
+	struct mach_msg_header	reply;
+	uint8_t			buf[512];
+	mach_port_name_t	svc;
+	uint32_t		i, expected;
+	int			rv;
+
+	for (i = 0; i < sizeof(buf); i++)
+		buf[i] = (uint8_t)((i * 37u + 11u) & 0xFFu);
+	expected = demo_ool_fnv1a(buf, sizeof(buf));
+
+	svc = bootstrap_lookup(SVC_ECHOOL_NAME);
+	if (svc == MACH_PORT_NULL) {
+		printf("  bootstrap_lookup('echool') failed\n");
+		return (9);
+	}
+
+	req.hdr.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0)
+	    | MACH_MSGH_BITS_COMPLEX;
+	req.hdr.msgh_size    = sizeof(req);
+	req.hdr.msgh_remote  = svc;
+	req.hdr.msgh_local   = MACH_PORT_NULL;
+	req.hdr.msgh_voucher = 0;
+	req.hdr.msgh_id      = ECHOOL_OP_CHECKSUM;
+
+	req.body.msgh_descriptor_count = 1;
+
+	req.ool.type       = MACH_MSG_OOL_DESCRIPTOR;
+	req.ool.copy       = MACH_MSG_PHYSICAL_COPY;
+	req.ool.deallocate = 0;
+	req.ool.pad        = 0;
+	req.ool.size       = (uint32_t)sizeof(buf);
+	req.ool.address    = (uint64_t)(uintptr_t)buf;
+
+	rv = mach_msg_rpc(&req.hdr, &reply, sizeof(reply), 1000);
+	(void)mach_port_deallocate(svc);
+	if (rv != MACH_MSG_OK) {
+		printf("  echool rpc failed (rv=%d)\n", rv);
+		return (10);
+	}
+	if (reply.msgh_id != expected) {
+		printf("  OOL checksum MISMATCH: kernel=0x%x expected=0x%x\n",
+		    (unsigned)reply.msgh_id, (unsigned)expected);
+		return (11);
+	}
+	printf("  OOL round-trip %u bytes via echool: fnv1a=0x%x OK\n",
+	    (unsigned)sizeof(buf), (unsigned)expected);
+	return (0);
+}
+
 static int
 demo_bootstrap_chain(void)
 {
@@ -160,6 +239,10 @@ main(void)
 		return (rv);
 
 	rv = demo_bootstrap_chain();
+	if (rv != 0)
+		return (rv);
+
+	rv = demo_ool_roundtrip();
 	if (rv != 0)
 		return (rv);
 

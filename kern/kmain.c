@@ -139,6 +139,28 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	progreg_init();
 
 	/*
+	 * Run hello.elf once before handing the console to sh.elf.  Its
+	 * main() exercises the userspace surface end-to-end (port self-send,
+	 * task_self RPC, bootstrap_lookup chain, OOL round-trip via
+	 * svc/echool) and exits with rv==0 on success.  Doing it here gives
+	 * a headless boot a deterministic ring-3 smoke test without needing
+	 * a way to drive sh.elf's stdin.
+	 */
+	{
+		long	hello_id;
+
+		hello_id = progreg_spawn("hello");
+		if (hello_id > 0) {
+			while (task_is_alive((uint64_t)hello_id))
+				thread_yield();
+			sched_reap_zombies();
+		} else {
+			kprintf("kmain: spawn(hello) failed rv=%ld\n",
+			    hello_id);
+		}
+	}
+
+	/*
 	 * Phase 2: ring-3 shell takes over as the user-facing surface.
 	 *
 	 * sh.elf calls dev_open_stream("kbd"), which MOVE_RECEIVEs the

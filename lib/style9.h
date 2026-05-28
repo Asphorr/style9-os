@@ -348,4 +348,7 @@ struct svc_tasks_reply {
 	struct svc_tasks_entry	tr_entries[SVC_TASKS_MAX];
 };
 
+#define	SVC_ECHOOL_NAME		"echool"
+#define	ECHOOL_OP_CHECKSUM	1
+
 #endif /* !_STYLE9_H_ */

@@ -84,7 +84,24 @@ _Static_assert(sizeof(struct svc_tasks_reply) ==
     8 + SVC_TASKS_MAX * sizeof(struct svc_tasks_entry),
     "svc_tasks_reply layout pinned");
 
-/* Bring up + register all three services.  Call after bootstrap_init
+/* ---- "echool" service ---- */
+/*
+ * Tiny OOL round-trip oracle.  Caller sends a complex message carrying
+ * a single OOL descriptor; the dispatcher reads `size` bytes from the
+ * sender's address (sender's pmap is current under a special-port
+ * intercept), folds them through FNV-1a, and replies with the resulting
+ * 32-bit checksum riding in msgh_id.  The reply is an inline bare
+ * header on the reply port from msgh_local.
+ *
+ * Purpose: lets ring-3 prove its OOL wire-format construction byte-for-
+ * byte against the kernel's parser without dragging in a worker-thread
+ * receiver.  Stress_ool already covers the deliver_msg + recv_install_ool
+ * leg via a kernel-space worker task.
+ */
+#define	SVC_ECHOOL_NAME		"echool"
+#define	ECHOOL_OP_CHECKSUM	1
+
+/* Bring up + register all four services.  Call after bootstrap_init
  * and task_subsystem_init (so kernel_task exists for thread/task ID
  * accounting). */
 void	services_init(void);

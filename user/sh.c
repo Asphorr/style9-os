@@ -399,6 +399,8 @@ builtin_help(void)
 	puts(ESC_FG_GRAY);  puts("clear screen and repaint the splash\n");
 	puts(ESC_FG_WHITE); puts("  about    ");
 	puts(ESC_FG_GRAY);  puts("version banner + live counters\n");
+	puts(ESC_FG_WHITE); puts("  ool      ");
+	puts(ESC_FG_GRAY);  puts("OOL Mach IPC round-trip via svc/echool\n");
 
 	puts("\n");
 	puts(ESC_FG_WHITE); puts("  spawn    ");
@@ -437,6 +439,91 @@ builtin_clear(void)
 
 	puts(ESC_CLR_SCR);
 	paint_splash();
+}
+
+/*
+ * builtin_ool: round-trip a small buffer through the kernel's echool
+ * service as a single OOL descriptor, verify the kernel-computed
+ * FNV-1a matches the client-computed one byte-for-byte.  Proves that
+ * userspace can construct a valid OOL wire-format from its own VA
+ * space, that the kernel parses the variable-stride descriptor area
+ * correctly, and that the sender's pages are reachable from the
+ * special-port dispatcher.
+ */
+static uint32_t
+ool_fnv1a(const uint8_t *buf, uint32_t size)
+{
+	uint32_t	h, i;
+
+	h = 0x811C9DC5u;
+	for (i = 0; i < size; i++) {
+		h ^= (uint32_t)buf[i];
+		h *= 0x01000193u;
+	}
+	return (h);
+}
+
+static void
+builtin_ool(void)
+{
+	struct {
+		struct mach_msg_header		hdr;
+		struct mach_msg_body		body;
+		struct mach_msg_ool_descriptor	ool;
+	} req;
+	struct mach_msg_header	reply;
+	uint8_t			buf[256];
+	mach_port_name_t	svc;
+	uint32_t		i, expected;
+	int			rv;
+
+	for (i = 0; i < sizeof(buf); i++)
+		buf[i] = (uint8_t)((i * 31u + 7u) & 0xFFu);
+	expected = ool_fnv1a(buf, sizeof(buf));
+
+	svc = bootstrap_lookup(SVC_ECHOOL_NAME);
+	if (svc == MACH_PORT_NULL) {
+		puts(ESC_FG_GRAY);
+		puts("  echool: ");
+		puts(ESC_FG_WHITE);
+		puts("service lookup failed\n");
+		puts(ESC_RESET);
+		return;
+	}
+
+	req.hdr.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0)
+	    | MACH_MSGH_BITS_COMPLEX;
+	req.hdr.msgh_size    = sizeof(req);
+	req.hdr.msgh_remote  = svc;
+	req.hdr.msgh_local   = MACH_PORT_NULL;
+	req.hdr.msgh_voucher = 0;
+	req.hdr.msgh_id      = ECHOOL_OP_CHECKSUM;
+
+	req.body.msgh_descriptor_count = 1;
+
+	req.ool.type       = MACH_MSG_OOL_DESCRIPTOR;
+	req.ool.copy       = MACH_MSG_PHYSICAL_COPY;
+	req.ool.deallocate = 0;
+	req.ool.pad        = 0;
+	req.ool.size       = (uint32_t)sizeof(buf);
+	req.ool.address    = (uint64_t)(uintptr_t)buf;
+
+	rv = mach_msg_rpc(&req.hdr, &reply, sizeof(reply), 1000);
+	(void)mach_port_deallocate(svc);
+
+	puts(ESC_FG_GRAY);
+	puts("  ool ");
+	puts(ESC_FG_WHITE);
+	if (rv != MACH_MSG_OK) {
+		printf("rpc failed rv=%d\n", rv);
+	} else if (reply.msgh_id == expected) {
+		printf("OK  %u bytes  fnv1a=0x%x\n",
+		    (unsigned)sizeof(buf), (unsigned)expected);
+	} else {
+		printf("MISMATCH client=0x%x kernel=0x%x\n",
+		    (unsigned)expected, (unsigned)reply.msgh_id);
+	}
+	puts(ESC_RESET);
 }
 
 static void
@@ -522,6 +609,10 @@ dispatch(int argc, char *argv[])
 	}
 	if (streq(argv[0], "about")) {
 		builtin_about();
+		return (0);
+	}
+	if (streq(argv[0], "ool")) {
+		builtin_ool();
 		return (0);
 	}
 
