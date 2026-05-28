@@ -38,10 +38,25 @@ struct port_space;
 struct thread;
 struct vm_map;
 
+/*
+ * Syscall ABI personality.  Selects which syscall table a ring-3 thread in
+ * this task dispatches through, mirroring how XNU gates a process on the
+ * platform recorded in its Mach-O.  STYLE9 -- the default for every task
+ * and for every ELF program -- uses the native SYS_* numbers in syscall.h.
+ * DARWIN is set by macho_load when the image carries an LC_BUILD_VERSION
+ * naming PLATFORM_MACOS; it routes every syscall through darwin_dispatch
+ * (kern/darwin.c), which decodes the Apple class bits in %rax (Mach traps,
+ * BSD calls) and honours the carry-flag error convention.  The native path
+ * is left completely untouched: a STYLE9 task never enters darwin_dispatch.
+ */
+#define	TASK_PERSONALITY_STYLE9	0
+#define	TASK_PERSONALITY_DARWIN	1
+
 struct task {
 	struct spinlock		 t_lock;
 	uint64_t		 t_id;		/* (c) printable id        */
 	const char		*t_name;	/* (c) for ps-style listing */
+	uint32_t		 t_personality;	/* (c) TASK_PERSONALITY_*  */
 	struct port_space	*t_port_space;	/* (c) name table          */
 	struct port		*t_self_port;	/* (c) kernel-RECEIVE port  */
 	struct vm_map		*t_map;		/* (c) per-task vm map      */

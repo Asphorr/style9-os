@@ -106,6 +106,7 @@ OBJS	= \
 	$(OBJDIR)/dev_subsystem.o \
 	$(OBJDIR)/elf.o		\
 	$(OBJDIR)/macho.o	\
+	$(OBJDIR)/darwin.o	\
 	$(OBJDIR)/progreg.o	\
 	$(OBJDIR)/hello_elf.o	\
 	$(OBJDIR)/clock_elf.o	\
@@ -127,6 +128,7 @@ OBJS	= \
 	$(OBJDIR)/crasher_elf.o \
 	$(OBJDIR)/machotest_macho.o \
 	$(OBJDIR)/machotest_fat_macho.o \
+	$(OBJDIR)/darwinhello_macho.o \
 	$(OBJDIR)/ksym.o
 
 all: kernel.elf
@@ -239,6 +241,22 @@ $(OBJDIR)/machotest.macho: $(OBJDIR)/machotest.elf $(ELF2MACHO)
 
 $(OBJDIR)/machotest_fat.macho: $(OBJDIR)/machotest.elf $(ELF2MACHO)
 	$(ELF2MACHO) fat $< $@
+
+# darwinhello (S2): a freestanding Darwin-ABI stub -- raw class-encoded
+# syscalls, NO libstyle9 and NO crt0, so it links from its own object alone
+# (NOT through the libstyle9 %.elf rule).  elf2macho's `macos` mode stamps it
+# LC_BUILD_VERSION PLATFORM_MACOS, so macho_load flips the task to the Darwin
+# syscall personality and its write/getpid/exit + Mach traps exercise
+# darwin_dispatch (kern/darwin.c).  The generic %_macho.o rule below wraps the
+# .macho into _binary_darwinhello_macho_{start,end} for progreg.c.
+$(OBJDIR)/darwinhello.o: $(USER_DIR)/darwinhello.S | $(OBJDIR)
+	$(CC) $(USER_ASFLAGS) -c $< -o $@
+
+$(OBJDIR)/darwinhello.elf: $(OBJDIR)/darwinhello.o $(USER_DIR)/user.ld
+	$(LD) $(USER_LDFLAGS) -o $@ $(OBJDIR)/darwinhello.o
+
+$(OBJDIR)/darwinhello.macho: $(OBJDIR)/darwinhello.elf $(ELF2MACHO)
+	$(ELF2MACHO) macos $< $@
 
 # Wrap a .macho into a kernel-linkable object exposing
 # _binary_<name>_macho_start / _end.  Mirror of the %_elf.o rule.

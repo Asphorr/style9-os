@@ -16,12 +16,18 @@
  * for ring-3 programs -- the sibling of the ELF loader in elf.h.
  *
  * Apple ships every ring-3 binary as Mach-O; teaching the kernel to map
- * the container is the first rung of XNU binary compatibility (S1: the
- * container only).  The ABI INSIDE the container is unchanged here --
+ * the container was the first rung of XNU binary compatibility (S1: the
+ * container only).  By default the ABI INSIDE the container is unchanged --
  * the program still uses libstyle9's crt0 and the style9 SYS_* numbers,
  * so a Mach-O loaded by macho_load runs through the exact same launcher,
- * stack frame, and syscall path as an ELF.  Matching Apple's syscall
- * ABI + Mach trap layout is a later, separate step.
+ * stack frame, and syscall path as an ELF.
+ *
+ * The exception is the syscall personality (S2): an image that declares
+ * PLATFORM_MACOS through an LC_BUILD_VERSION is tagged TASK_PERSONALITY_DARWIN
+ * by macho_load, and syscall_dispatch then routes that task through
+ * darwin_dispatch (kern/darwin.c), which decodes Apple's class-encoded
+ * syscalls (Mach traps, BSD calls) and their carry-flag error convention.
+ * Binary-exact mach_msg / MIG and a real libSystem remain later steps.
  *
  * macho_load() parses an image already resident in kernel memory.  When
  * the image is a fat/universal archive it selects the CPU_TYPE_X86_64
@@ -58,6 +64,15 @@ struct task;
 #define	MACHO_LC_SEGMENT_64	0x19
 #define	MACHO_LC_UNIXTHREAD	0x5
 #define	MACHO_LC_MAIN		(0x28u | MACHO_LC_REQ_DYLD)
+#define	MACHO_LC_BUILD_VERSION	0x32
+
+/*
+ * LC_BUILD_VERSION.platform.  macho_load reads this to choose the task's
+ * syscall ABI personality: PLATFORM_MACOS flips the task to the Darwin
+ * personality (S2 -- the kernel honours Apple's class-encoded syscalls);
+ * any other value, or no LC_BUILD_VERSION at all, leaves it native style9.
+ */
+#define	MACHO_PLATFORM_MACOS	1
 
 /* LC_UNIXTHREAD flavor + register count for x86-64. */
 #define	MACHO_x86_THREAD_STATE64	4
@@ -130,6 +145,20 @@ struct mach_entry_point_command {
 	uint64_t	stacksize;
 };
 
+/*
+ * WIRE FORMAT.  LC_BUILD_VERSION (per-tool build_tool_version entries, if
+ * any, follow inline).  We honour only `platform`; minos/sdk/ntools are read
+ * past but ignored.
+ */
+struct mach_build_version_command {
+	uint32_t	cmd;
+	uint32_t	cmdsize;
+	uint32_t	platform;
+	uint32_t	minos;
+	uint32_t	sdk;
+	uint32_t	ntools;
+};
+
 /* WIRE FORMAT.  fat/universal header + per-arch entry (BIG-ENDIAN on disk). */
 struct mach_fat_header {
 	uint32_t	magic;
@@ -150,6 +179,7 @@ _Static_assert(sizeof(struct mach_segment_command_64) == 72, "segment_command_64
 _Static_assert(sizeof(struct mach_thread_command) == 16, "thread_command must be 16 bytes");
 _Static_assert(sizeof(struct mach_x86_thread_state64) == 168, "x86_thread_state64 must be 168 bytes");
 _Static_assert(sizeof(struct mach_entry_point_command) == 24, "entry_point_command must be 24 bytes");
+_Static_assert(sizeof(struct mach_build_version_command) == 24, "build_version_command must be 24 bytes");
 _Static_assert(sizeof(struct mach_fat_header) == 8, "fat_header must be 8 bytes");
 _Static_assert(sizeof(struct mach_fat_arch) == 20, "fat_arch must be 20 bytes");
 

@@ -92,6 +92,15 @@ extern uint8_t	_binary_machotest_fat_macho_start[];
 extern uint8_t	_binary_machotest_fat_macho_end[];
 
 /*
+ * Darwin-personality program (S2).  A freestanding stub (user/darwinhello.S,
+ * no libstyle9) delivered as a Mach-O that declares PLATFORM_MACOS, so
+ * macho_load runs its task under the Darwin syscall ABI -- it issues genuine
+ * Apple class-encoded syscalls answered by kern/darwin.c.
+ */
+extern uint8_t	_binary_darwinhello_macho_start[];
+extern uint8_t	_binary_darwinhello_macho_end[];
+
+/*
  * Bridge into the arch-specific user-thread spawn path.  Lives in
  * arch/amd64/usermode.c; declared here so progreg_spawn doesn't have
  * to pull in machine headers.  Returns the new task's t_id or a
@@ -179,6 +188,8 @@ progreg_init(void)
 	    _binary_machotest_macho_start, _binary_machotest_macho_end);
 	register_one("machotest_fat",
 	    _binary_machotest_fat_macho_start, _binary_machotest_fat_macho_end);
+	register_one("darwinhello",
+	    _binary_darwinhello_macho_start, _binary_darwinhello_macho_end);
 
 	kprintf("progreg: %zu programs registered\n", nentries);
 }

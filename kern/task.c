@@ -113,8 +113,9 @@ task_create(const char *name)
 		for (exi = 0; exi < EXC_TYPE_COUNT; exi++)
 			t->t_exc_ports[exi] = NULL;
 	}
-	t->t_exc_flags = 0;
-	t->t_killed    = false;
+	t->t_exc_flags   = 0;
+	t->t_killed      = false;
+	t->t_personality = TASK_PERSONALITY_STYLE9;
 
 	t->t_port_space = port_space_new();
 	if (t->t_port_space == NULL) {

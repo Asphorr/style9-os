@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "darwin.h"
 #include "kmem.h"
 #include "kprintf.h"
 #include "pmap.h"
@@ -266,7 +267,15 @@ syscall_dispatch(struct syscall_frame *f)
 		thread_exit();
 	/* NOTREACHED if killed */
 
-	rv = syscall_dispatch_body(f);
+	/*
+	 * Darwin-personality tasks (a Mach-O that declared PLATFORM_MACOS)
+	 * dispatch through the Apple class-encoded path; every native style9
+	 * task takes the untouched table below.  See kern/darwin.c.
+	 */
+	if (current_thread->th_task->t_personality == TASK_PERSONALITY_DARWIN)
+		rv = darwin_dispatch(f);
+	else
+		rv = syscall_dispatch_body(f);
 
 	/*
 	 * Detection point #5: syscall-exit kill check.  Catches the
@@ -289,13 +298,15 @@ syscall_dispatch(struct syscall_frame *f)
 }
 
 /*
- * sys_print: write `len` bytes from the user buffer to the kernel
- * console.  No copy-in yet -- the kernel reads the user VA directly
- * (shared PML4, US=1 on the leaf).  When SMAP lands the touch will
- * be bracketed by stac/clac.
+ * syscall_console_write: copy `len` bytes from the user buffer into a kernel
+ * scratch under an SMAP bracket, then push them to the tty (without holding
+ * AC=1 across the tty lock + console output).  Returns bytes written, or
+ * SYS_E_FAULT if the buffer escapes the user-VA window; the 4 KiB cap keeps
+ * the scratch on the kernel stack.  Backs both SYS_PRINT and the Darwin
+ * personality's write(2) (kern/darwin.c).
  */
-static long
-sys_print(const char *buf, size_t len)
+long
+syscall_console_write(const char *buf, size_t len)
 {
 	char	scratch[4096];
 	size_t	i;
@@ -322,6 +333,13 @@ sys_print(const char *buf, size_t len)
 		tty_putc(scratch[i]);
 
 	return ((long)len);
+}
+
+static long
+sys_print(const char *buf, size_t len)
+{
+
+	return (syscall_console_write(buf, len));
 }
 
 static long

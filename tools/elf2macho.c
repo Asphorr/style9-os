@@ -8,14 +8,21 @@
  * as a thin x86-64 Mach-O (optionally a single-slice fat/universal
  * archive).  It exists because this build host has no Darwin cross
  * toolchain (no clang/ld64), yet the kernel's Mach-O loader (kern/macho.c)
- * needs a genuine, spec-shaped Mach-O to parse.  The program inside the
- * container is an ordinary style9 binary -- same libstyle9 crt0, same
- * SYS_* numbers -- so this proves the *container* path (S1) without
- * pretending to be a Darwin-ABI binary; matching Apple's syscall/Mach
- * trap ABI is a separate, later step.
+ * needs a genuine, spec-shaped Mach-O to parse.  In the default and `fat`
+ * modes the program inside the container is an ordinary style9 binary --
+ * same libstyle9 crt0, same SYS_* numbers -- so it proves the *container*
+ * path (S1) without pretending to be a Darwin-ABI binary.
+ *
+ * The `macos` mode additionally stamps an LC_BUILD_VERSION naming
+ * PLATFORM_MACOS, which flips the loaded task to the kernel's Darwin syscall
+ * personality (S2).  It is used by the freestanding user/darwinhello stub,
+ * which issues genuine class-encoded Apple syscalls (write, getpid,
+ * task_self_trap, exit) rather than style9 ones.  Binary-exact mach_msg /
+ * MIG / a real libSystem remain later steps.
  *
  *	elf2macho       <in.elf> <out.macho>	thin x86-64 Mach-O
  *	elf2macho fat   <in.elf> <out.macho>	fat archive, one x86-64 slice
+ *	elf2macho macos <in.elf> <out.macho>	thin + LC_BUILD_VERSION macOS
  *
  * The translation is mechanical: one LC_SEGMENT_64 per PT_LOAD (vmaddr,
  * vmsize, fileoff, filesize, prot all carried across verbatim) plus one
@@ -216,11 +223,12 @@ seg_name(uint32_t pflags)
  */
 static uint8_t *
 build_thin(const struct localseg *segs, int nseg, uint64_t entry,
-    const uint8_t *elf, size_t *size_out)
+    const uint8_t *elf, int darwin, size_t *size_out)
 {
 	struct mach_header_64		 mh;
 	struct mach_thread_command	 tc;
 	struct mach_x86_thread_state64	 ts;
+	struct mach_build_version_command bv;
 	uint8_t				*out;
 	uint64_t			 foff[MAX_SEGS];
 	uint64_t			 sizeofcmds;
@@ -232,6 +240,8 @@ build_thin(const struct localseg *segs, int nseg, uint64_t entry,
 	sizeofcmds = (uint64_t)nseg * sizeof(struct mach_segment_command_64) +
 	    sizeof(struct mach_thread_command) +
 	    sizeof(struct mach_x86_thread_state64);
+	if (darwin)
+		sizeofcmds += sizeof(struct mach_build_version_command);
 	hdrtotal = sizeof(struct mach_header_64) + sizeofcmds;
 
 	/* Segment file data is packed directly after the load commands. */
@@ -250,7 +260,7 @@ build_thin(const struct localseg *segs, int nseg, uint64_t entry,
 	mh.cputype    = MACHO_CPU_TYPE_X86_64;
 	mh.cpusubtype = 3;			/* CPU_SUBTYPE_X86_64_ALL */
 	mh.filetype   = MACHO_MH_EXECUTE;
-	mh.ncmds      = (uint32_t)(nseg + 1);
+	mh.ncmds      = (uint32_t)(darwin ? nseg + 2 : nseg + 1);
 	mh.sizeofcmds = (uint32_t)sizeofcmds;
 	mh.flags      = 0;
 	memcpy(out, &mh, sizeof(mh));
@@ -293,6 +303,22 @@ build_thin(const struct localseg *segs, int nseg, uint64_t entry,
 	ts.rip = entry;
 	ts.rsp = USER_STACK_TOP;
 	memcpy(out + off, &ts, sizeof(ts));
+	off += sizeof(ts);
+
+	/*
+	 * S2: an LC_BUILD_VERSION naming PLATFORM_MACOS tells the kernel loader
+	 * to run this task under the Darwin syscall personality.  Emitted right
+	 * after LC_UNIXTHREAD; like every command it lives in [0, hdrtotal) and
+	 * is not covered by any segment.
+	 */
+	if (darwin) {
+		memset(&bv, 0, sizeof(bv));
+		bv.cmd      = MACHO_LC_BUILD_VERSION;
+		bv.cmdsize  = (uint32_t)sizeof(bv);
+		bv.platform = MACHO_PLATFORM_MACOS;
+		memcpy(out + off, &bv, sizeof(bv));
+		off += sizeof(bv);
+	}
 
 	/*
 	 * Lay each segment's file bytes down at the fileoff recorded in its
@@ -361,25 +387,31 @@ main(int argc, char **argv)
 	size_t		 image_size;
 	int		 nseg;
 	int		 fat;
+	int		 darwin;
 
-	fat = 0;
+	fat    = 0;
+	darwin = 0;
 	if (argc == 4 && strcmp(argv[1], "fat") == 0) {
 		fat = 1;
 		in  = argv[2];
 		out = argv[3];
+	} else if (argc == 4 && strcmp(argv[1], "macos") == 0) {
+		darwin = 1;
+		in     = argv[2];
+		out    = argv[3];
 	} else if (argc == 3) {
 		in  = argv[1];
 		out = argv[2];
 	} else {
 		fprintf(stderr,
-		    "usage: %s [fat] <in.elf> <out.macho>\n", argv[0]);
+		    "usage: %s [fat|macos] <in.elf> <out.macho>\n", argv[0]);
 		return (2);
 	}
 
 	elf  = read_file(in, &elf_size);
 	nseg = parse_elf(elf, elf_size, segs, &entry);
 
-	thin = build_thin(segs, nseg, entry, elf, &thin_size);
+	thin = build_thin(segs, nseg, entry, elf, darwin, &thin_size);
 
 	if (fat) {
 		image = wrap_fat(thin, thin_size, &image_size);
@@ -393,7 +425,8 @@ main(int argc, char **argv)
 
 	fprintf(stderr,
 	    "elf2macho: %s -> %s (%s, %d segment%s, entry=0x%llx, %zu bytes)\n",
-	    in, out, fat ? "fat/x86_64" : "thin/x86_64", nseg,
+	    in, out, fat ? "fat/x86_64" :
+	    (darwin ? "thin/x86_64+macos" : "thin/x86_64"), nseg,
 	    nseg == 1 ? "" : "s", (unsigned long long)entry, image_size);
 
 	free(elf);

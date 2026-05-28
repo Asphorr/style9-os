@@ -84,6 +84,14 @@ void	syscall_init(void);
 long	syscall_dispatch(struct syscall_frame *);
 
 /*
+ * Shared console write: copy `len` bytes from user buffer `buf` to the tty
+ * under an SMAP bracket.  Returns bytes written, or SYS_E_FAULT when `buf`
+ * is outside the user-VA window.  Backs SYS_PRINT and the Darwin
+ * personality's write(2) (kern/darwin.c).
+ */
+long	syscall_console_write(const char *buf, size_t len);
+
+/*
  * Per-thread bookkeeping the scheduler keeps in sync with the entry
  * stub: each time a ring-3 thread is about to run, sched stores that
  * thread's kernel-stack top into `syscall_kernel_rsp` so the stub

@@ -1591,6 +1591,36 @@ demo_macho_spawn(void)
 	return (0);
 }
 
+/*
+ * demo_darwin_spawn: exercise the Darwin syscall personality (S2,
+ * kern/darwin.c).  darwinhello is NOT a style9 program -- it is a
+ * freestanding stub that issues genuine Apple class-encoded syscalls
+ * (write, getpid, task_self_trap, mach_reply_port, exit, plus a deliberate
+ * unimplemented call to prove the carry/errno convention).  It ships as a
+ * Mach-O carrying an LC_BUILD_VERSION naming PLATFORM_MACOS, so the loader
+ * tags its task TASK_PERSONALITY_DARWIN and syscall_dispatch routes it
+ * through darwin_dispatch.  Its banner + the kernel's per-call trace appear
+ * in the boot transcript; we bounded-yield until it retires.
+ */
+static int
+demo_darwin_spawn(void)
+{
+	long	child_id;
+	int	i;
+
+	printf("\nDarwin syscall personality demo (kern/darwin.c):\n");
+
+	child_id = spawn("darwinhello");
+	if (child_id < 0) {
+		printf("  spawn('darwinhello') failed (rv=%ld)\n", child_id);
+		return (88);
+	}
+	for (i = 0; i < 64 && task_alive((uint64_t)child_id); i++)
+		(void)yield();
+	printf("  darwinhello (Darwin ABI) retired after %d yields\n", i);
+	return (0);
+}
+
 static int
 demo_bootstrap_publish(void)
 {
@@ -1835,6 +1865,10 @@ main(void)
 		return (rv);
 
 	rv = demo_macho_spawn();
+	if (rv != 0)
+		return (rv);
+
+	rv = demo_darwin_spawn();
 	if (rv != 0)
 		return (rv);
 

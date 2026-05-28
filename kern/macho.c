@@ -133,6 +133,7 @@ load_thin(struct task *target, const uint8_t *image, size_t image_size,
 	size_t				 off;
 	uint32_t			 i;
 	int				 rv;
+	bool				 darwin_platform;
 	bool				 have_base;
 	bool				 have_main;
 	bool				 have_thread;
@@ -150,12 +151,13 @@ load_thin(struct task *target, const uint8_t *image, size_t image_size,
 	if ((uint64_t)sizeof(*mh) + mh->sizeofcmds > image_size)
 		return (MACHO_E_TRUNCATED);
 
-	base_vmaddr   = 0;
-	entry         = 0;
-	main_entryoff = 0;
-	have_base     = false;
-	have_main     = false;
-	have_thread   = false;
+	base_vmaddr     = 0;
+	entry           = 0;
+	main_entryoff   = 0;
+	darwin_platform = false;
+	have_base       = false;
+	have_main       = false;
+	have_thread     = false;
 
 	end = sizeof(*mh) + mh->sizeofcmds;
 	off = sizeof(*mh);
@@ -217,6 +219,17 @@ load_thin(struct task *target, const uint8_t *image, size_t image_size,
 			have_main     = true;
 			break;
 		}
+		case MACHO_LC_BUILD_VERSION: {
+			const struct mach_build_version_command	*bv;
+
+			if (cmdsize < sizeof(*bv))
+				return (MACHO_E_BADCMD);
+			bv = (const struct mach_build_version_command *)
+			    (image + off);
+			if (bv->platform == MACHO_PLATFORM_MACOS)
+				darwin_platform = true;
+			break;
+		}
 		default:
 			/* LC_LOAD_DYLINKER, LC_SYMTAB, etc.: not needed yet. */
 			break;
@@ -224,6 +237,17 @@ load_thin(struct task *target, const uint8_t *image, size_t image_size,
 
 		off += cmdsize;
 	}
+
+	/*
+	 * Stamp the task's syscall personality from the platform the image
+	 * declared.  A PLATFORM_MACOS LC_BUILD_VERSION opts the task into the
+	 * Darwin ABI -- class-encoded syscalls routed through darwin_dispatch;
+	 * anything else (including no LC_BUILD_VERSION) leaves it native
+	 * style9.  Set before the entry resolves so the tag holds regardless
+	 * of which entry command the binary carries.
+	 */
+	target->t_personality = darwin_platform ?
+	    TASK_PERSONALITY_DARWIN : TASK_PERSONALITY_STYLE9;
 
 	if (have_thread) {
 		*entry_out = entry;

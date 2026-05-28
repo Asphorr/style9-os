@@ -4,6 +4,13 @@ A BSD `style(9)` hobby kernel for x86_64.  Boots via PVH (QEMU `-kernel`
 for ELF64) or Multiboot1/2, runs preemptive multitasking with
 Mach-style ports as the IPC primitive.
 
+Monolithic and XNU-shaped — a BSD/Mach hybrid in one address space, not a
+microkernel.  Ring-3 programs load from ELF *or* Mach-O containers, and a
+Mach-O that declares macOS as its platform runs under a Darwin syscall
+personality: the kernel decodes Apple's class-encoded `syscall`s (BSD
+calls + Mach traps) directly.  That is the working base for running XNU
+binaries — see *XNU binary compatibility* below.
+
 Built from scratch — no upstream tree, no glue from another OS.
 
 ## What's in it
@@ -14,9 +21,11 @@ Built from scratch — no upstream tree, no glue from another OS.
 | gdt | `arch/amd64/gdt.c` | 8-entry GDT laid out for `SYSCALL`/`SYSRET` MSR arithmetic; 104-byte TSS with `rsp0` for the ring-3 → ring-0 stack switch on IRQs/exceptions |
 | syscall | `arch/amd64/syscall_entry.S`, `kern/syscall.c` | `SYSCALL` entry stub: stashes user RSP, switches to per-thread kernel stack via `syscall_kernel_rsp`, builds `struct syscall_frame`, calls the C dispatcher, `SYSRETQ` back; MSRs (EFER.SCE / STAR / LSTAR / FMASK) wired in `syscall_init`.  Caller-save registers are restored from the frame on the way out so user code matches the Linux x86_64 ABI |
 | syscalls list | `kern/syscall.c` | `SYS_PRINT`, `SYS_EXIT`, `SYS_YIELD`, `SYS_PORT_ALLOC`, `SYS_PORT_DEALLOC`, `SYS_MSG_SEND`, `SYS_MSG_RECV`, `SYS_MSG_RECV_TIMED`, `SYS_MSG_RPC`, `SYS_SPAWN`, `SYS_TASK_ALIVE` -- Mach IPC surface fully exposed plus minimal task lifecycle |
-| usermode | `arch/amd64/usermode.c` | per-task PML4 staged at task creation; ELF loader maps PT_LOAD segments at U=1 + the requested prot bits; `iretq` lands at `e_entry` with a fresh user stack |
+| usermode | `arch/amd64/usermode.c` | per-task PML4 staged at task creation; the launcher sniffs the image's 4-byte magic and routes ELF to `elf_load` or Mach-O to `macho_load` (shared `(task, image, size, &entry)` contract, shared argv/stack/port-injection path); `iretq` lands at the entry RIP with a fresh user stack |
 | elf loader | `kern/elf.c` | static ELF64 parser.  Walks PT_LOAD program headers, allocates 4 KiB user pages and maps them via the task's pmap with R/W/X taken from p_flags, copies file data via `pmm_kva_from_pa` of the freshly-allocated frame |
-| progreg | `kern/progreg.c` | "program registry" -- four user ELFs (`hello`, `clock`, `tasks`, `sh`) embedded in the kernel image via objcopy.  `progreg_spawn(name)` creates a task and loads the matching ELF into it; `SYS_SPAWN` is the userspace door |
+| macho loader | `kern/macho.c`, `tools/elf2macho.c` | XNU binary compat, S1: thin x86-64 Mach-O + fat/universal slice picker, mapping each `LC_SEGMENT_64` the way the ELF loader maps PT_LOAD and resolving the entry from `LC_UNIXTHREAD`/`LC_MAIN`.  The build host has no Darwin cross-toolchain, so the host tool `elf2macho` rewraps a style9 ELF into a spec-shaped Mach-O; `-Ikern` shares the wire structs so loader and converter never drift |
+| darwin abi | `kern/darwin.c` | XNU binary compat, S2: a per-task syscall personality.  A Mach-O carrying an `LC_BUILD_VERSION` for macOS is tagged `TASK_PERSONALITY_DARWIN`, and `syscall_dispatch` routes it to `darwin_dispatch`, which decodes Apple's class-encoded `%rax` (class 2 = BSD `write`/`getpid`/`exit`, class 1 = Mach `task_self_trap`/`mach_reply_port`) and honours the carry-flag errno convention.  The native style9 syscall table is left untouched |
+| progreg | `kern/progreg.c` | "program registry" -- two dozen user programs embedded in the kernel image via objcopy, delivered as ELF or (for the Mach-O loader + Darwin demos) Mach-O containers.  `progreg_spawn(name)` creates a task and loads the matching image into it; `SYS_SPAWN` is the userspace door |
 | traps | `arch/amd64/idt.c`, `intr.c`, `isr.S` | 48-vector IDT, trap-frame dispatcher, symbolicated autopsy on exception |
 | irqs | `arch/amd64/pic.c`, `pit.c` | 8259 remap to 0x20/0x28, PIT @ 100 Hz with quantum tracking |
 | clock | `kern/tsc.c`, `clock.c` | rdtsc + PIT-anchored calibration, `uptime_ms`, busy-sleep |
@@ -189,6 +198,34 @@ surface (`mem`, `memmap`, `pmap`, `task`, `thread`, `sched`, `port list`,
 `stress <subcommand>`, `crash <variant>`, `panic`).  The same surface is
 reachable interactively via `ddb` once that's invoked from a panic path.
 
+## XNU binary compatibility
+
+style9-os is monolithic and XNU-shaped (BSD + Mach in one address space,
+not a microkernel), so the long game is running binaries built for XNU.
+That is staged as a four-rung ladder:
+
+- **S1 — Mach-O container (landed).**  `kern/macho.c` loads thin x86-64
+  and fat/universal Mach-O images alongside ELF; the spawn launcher sniffs
+  the 4-byte magic and dispatches.  With no Darwin cross-toolchain on the
+  build host, `tools/elf2macho` rewraps a style9 ELF into a spec-shaped
+  Mach-O so the loader has genuine containers to parse.
+- **S2 — Darwin syscall personality (landed).**  A Mach-O that declares
+  macOS via `LC_BUILD_VERSION` is tagged `TASK_PERSONALITY_DARWIN`;
+  `kern/darwin.c` then decodes Apple's class-encoded `syscall`s (BSD calls
+  in class 2, Mach traps in class 1) and honours the carry-flag errno
+  convention — the same bytes a macOS x86-64 binary's libSystem stubs
+  emit.  The freestanding `user/darwinhello` stub exercises it end to end,
+  and the native style9 syscall path is left untouched.
+- **S3 — binary-exact Mach IPC (ahead).**  A wire-exact `mach_msg` /
+  `mach_msg2` trap surface plus MIG, so a Darwin binary can do real IPC.
+- **S4 — libSystem + dyld (ahead).**  A minimal `libSystem` shim and
+  dynamic linker — the point where unmodified Apple binaries run, and
+  where standing up a Darwin cross-toolchain finally becomes worth it.
+
+The ABI *inside* a plain (non-macOS) Mach-O is still style9: only a binary
+that declares the macOS platform opts into the Darwin personality, so the
+existing ELF programs and the style9 Mach-O demos are unaffected.
+
 ## Design notes
 
 Loosely Mach-shape rather than BSD-shape:
@@ -278,11 +315,12 @@ The same kernel-side `mach_msg_send` / `mach_msg_recv_timed` that the
 14 stress tests exercise is what userspace calls -- the syscall layer
 just range-checks the user pointer and forwards.
 
-Next on the roadmap: SMAP so user-pointer derefs are bracketed by
-`stac/clac`; a `vm_allocate` syscall so userspace can ask the kernel for
-fresh user-VA ranges (unblocks the OOL `deallocate` flag and gets us a
-real heap); a filesystem on `dev/disk0` so ELFs can live on disk instead
-of being embedded; virtual-copy (COW) OOL semantics; real SMP.
+Next on the roadmap: the XNU binary-compatibility ladder above continues
+with S3 (binary-exact `mach_msg` + Mach traps + MIG) and S4 (a minimal
+libSystem + dyld).  Also open: a filesystem on `dev/disk0` so programs can
+live on disk instead of being embedded; virtual-copy (COW) OOL semantics;
+real SMP.  (SMAP user-pointer bracketing and the `vm_allocate` syscall,
+once on this list, have since landed.)
 
 ## License
 
