@@ -48,7 +48,7 @@ struct port {
 	struct port_set	*p_set;			/* (p) set this port belongs */
 	struct port	*p_set_link;		/* (p) next in set members   */
 	uint8_t		 p_special;		/* (c) PORT_SPECIAL_* tag    */
-	void		*p_special_arg;		/* (c) per-tag context ptr   */
+	void		*p_special_arg;		/* (c) SERVICE fn / TASK_SELF id */
 
 	/*
 	 * Inline-reply stash (see mach_msg_rpc + the send fast path in

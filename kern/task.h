@@ -181,6 +181,24 @@ bool			 task_kill_pending(struct task *t);
 struct port		*task_self_port_for(uint64_t task_id);
 
 /*
+ * task_lookup_ref: find the live task with `id` under tasks_lock and
+ * return it with one extra ref taken (caller drops via task_deref), or
+ * NULL if no live task has that id.  Unlike task_is_alive -- a bare
+ * liveness hint that is stale the instant tasks_lock drops -- the ref
+ * guarantees the returned task cannot be chain-removed + freed until
+ * the caller derefs, so the pointer is safe to dereference.
+ *
+ * Powers the task-self port dispatch: the port stores only the
+ * immutable task id (never a raw pointer that would dangle once the
+ * task is reaped while an external SEND keeps the port alive), so a
+ * stale port resolves to NULL here and the caller fails safe.
+ *
+ * Lock-order: tasks_lock -> t_lock (via task_ref), the same edge
+ * task_request_terminate already uses.
+ */
+struct task		*task_lookup_ref(uint64_t id);
+
+/*
  * Synchronous dispatcher invoked by mach_msg_send when the destination
  * port is tagged PORT_SPECIAL_TASK_SELF.  Reads `req->msgh_id` to pick
  * an op (see TASK_OP_* in port.h), assembles a reply message, and

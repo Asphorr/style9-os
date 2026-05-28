@@ -18,10 +18,12 @@
  * them before mapping in elf.c's load_segment().  No initializer loop
  * needed here.
  *
- * Argc / argv is plumbed as zero / NULL for now.  When the program
- * loader grows command-line argument passing, we'll spell out the
- * stack layout it puts together and adjust this stub to pull argv
- * off it the way SysV mandates.
+ * Argc / argv: the kernel launcher (arch/amd64/usermode.c
+ * build_user_arg_stack) lays down a SysV-style frame at entry %rsp --
+ * argc at 0(%rsp), the argv pointer array (argc entries + a NULL
+ * terminator) starting at 8(%rsp).  %rsp is 16-byte aligned on entry.
+ * An argument-free spawn still gets a valid (argc=0, argv[0]=NULL)
+ * frame, so this path is taken unconditionally.  No envp / auxv yet.
  */
 
 	.section .text._start, "ax", @progbits
@@ -30,9 +32,9 @@
 	.type	_start, @function
 _start:
 	xorq	%rbp, %rbp		/* terminate frame chain        */
-	xorq	%rdi, %rdi		/* argc = 0                     */
-	xorq	%rsi, %rsi		/* argv = NULL                  */
-	andq	$-16, %rsp		/* SysV: 16-byte alignment      */
+	movq	0(%rsp), %rdi		/* argc                         */
+	leaq	8(%rsp), %rsi		/* argv (&argv[0])              */
+	andq	$-16, %rsp		/* SysV: keep 16-byte alignment */
 	call	main
 	movl	%eax, %edi		/* main return -> exit code     */
 	call	exit

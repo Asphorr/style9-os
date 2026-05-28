@@ -17,6 +17,7 @@
 #include "pmm.h"
 #include "port.h"
 #include "port_internal.h"
+#include "progreg.h"
 #include "sched.h"
 #include "syscall.h"
 #include "task.h"
@@ -44,12 +45,20 @@ static void	usermode_launcher(void *) __attribute__((noreturn));
  * SEND right on it into the child's port_space at MACH_PORT_PARENT.
  * Caller has already taken one SEND ref on the port; the install
  * transfers that ref into the child's name table (space_install_no_ref).
+ *
+ * sa_argv is the optional command line: a kernel-owned flattened block
+ * (the leading sa_argc char* slots point into the trailing packed
+ * strings) or NULL.  The launcher copies the strings onto the child's
+ * stack and kfrees the block; arch_spawn_user kfrees it on any failure
+ * path before the launcher ever runs.
  */
 struct user_spawn_arg {
 	const char	*sa_name;
 	const uint8_t	*sa_image;
 	size_t		 sa_image_size;
 	struct port	*sa_inject_port;
+	char	       **sa_argv;
+	int		 sa_argc;
 };
 
 static void	usermode_elf_launcher(void *) __attribute__((noreturn));
@@ -84,7 +93,7 @@ usermode_run_first_blob(void)
 long
 arch_spawn_user(const char *name, const uint8_t *image, size_t image_size,
     struct port *inject_port, struct port_space *caller_space,
-    mach_port_name_t *out_taskport_name)
+    mach_port_name_t *out_taskport_name, int argc, char **argv)
 {
 	struct user_spawn_arg	*sa;
 	struct task		*ut;
@@ -95,6 +104,8 @@ arch_spawn_user(const char *name, const uint8_t *image, size_t image_size,
 	if (name == NULL || image == NULL || image_size == 0) {
 		if (inject_port != NULL)
 			port_deref(inject_port, MACH_PORT_RIGHT_SEND);
+		if (argv != NULL)
+			kfree(argv);
 		return (SYS_E_INVAL);
 	}
 
@@ -102,17 +113,23 @@ arch_spawn_user(const char *name, const uint8_t *image, size_t image_size,
 	if (sa == NULL) {
 		if (inject_port != NULL)
 			port_deref(inject_port, MACH_PORT_RIGHT_SEND);
+		if (argv != NULL)
+			kfree(argv);
 		return (SYS_E_NOSYS);	/* OOM; closest in our small set */
 	}
 	sa->sa_name        = name;
 	sa->sa_image       = image;
 	sa->sa_image_size  = image_size;
 	sa->sa_inject_port = inject_port;
+	sa->sa_argc        = argv != NULL ? argc : 0;
+	sa->sa_argv        = argv;
 
 	ut = task_create(name);
 	if (ut == NULL) {
 		if (inject_port != NULL)
 			port_deref(inject_port, MACH_PORT_RIGHT_SEND);
+		if (argv != NULL)
+			kfree(argv);
 		kfree(sa);
 		return (SYS_E_NOSYS);
 	}
@@ -136,6 +153,8 @@ arch_spawn_user(const char *name, const uint8_t *image, size_t image_size,
 		if (rv != MACH_MSG_OK) {
 			if (inject_port != NULL)
 				port_deref(inject_port, MACH_PORT_RIGHT_SEND);
+			if (argv != NULL)
+				kfree(argv);
 			task_deref(ut);
 			kfree(sa);
 			return (SYS_E_NOSYS);
@@ -147,6 +166,8 @@ arch_spawn_user(const char *name, const uint8_t *image, size_t image_size,
 	if (th == NULL) {
 		if (inject_port != NULL)
 			port_deref(inject_port, MACH_PORT_RIGHT_SEND);
+		if (argv != NULL)
+			kfree(argv);
 		if (caller_space != NULL && out_taskport_name != NULL) {
 			/*
 			 * Roll back the taskport install on thread-create
@@ -185,6 +206,93 @@ arch_spawn_user(const char *name, const uint8_t *image, size_t image_size,
 	return ((long)ut->t_id);
 }
 
+static size_t
+spawn_strlen(const char *s)
+{
+	size_t	n;
+
+	n = 0;
+	while (s[n] != '\0')
+		n++;
+	return (n);
+}
+
+/*
+ * Materialise the SysV-style initial stack for a freshly loaded ring-3
+ * program in its (already mapped + zeroed) stack page, writing through
+ * the kernel alias `kva_base` of the page's USER_STACK_VA base.  The
+ * layout, low address to high, starting at the returned %rsp:
+ *
+ *	[ argc           ]   <- returned user %rsp (16-byte aligned)
+ *	[ argv[0]        ]      user VA of the first string
+ *	[ ...            ]
+ *	[ argv[argc-1]   ]
+ *	[ NULL           ]      argv terminator
+ *	[ (alignment gap)]
+ *	[ packed strings ]   <- top of the page
+ *
+ * crt0.S reads argc at %rsp and argv at %rsp+8.  argc==0 still lays
+ * down a valid (argc=0, argv[0]=NULL) frame, so every program -- with
+ * arguments or not -- enters through the one path.  The progreg.h caps
+ * (SPAWN_ARGV_MAX / SPAWN_ARG_BYTES_MAX) guarantee the whole block fits
+ * the page with room to spare; the KASSERT documents that invariant
+ * rather than handling an overflow the syscall layer already excluded.
+ */
+static uint64_t
+build_user_arg_stack(uint64_t kva_base, int argc, char *const *argv)
+{
+	uint64_t	argv_uva[SPAWN_ARGV_MAX];
+	uint64_t	sp;
+	uint64_t	rsp;
+	uint64_t	slot;
+	uint8_t		*dst;
+	const char	*s;
+	size_t		len;
+	size_t		j;
+	int		i;
+
+	if (argc < 0)
+		argc = 0;
+	if (argc > SPAWN_ARGV_MAX)
+		argc = SPAWN_ARGV_MAX;
+
+	/* Pack the argument strings downward from the top of the page. */
+	sp = USER_STACK_TOP;
+	for (i = 0; i < argc; i++) {
+		s = argv[i];
+		len = spawn_strlen(s) + 1;	/* include the NUL */
+		sp -= len;
+		dst = (uint8_t *)(uintptr_t)(kva_base + (sp - USER_STACK_VA));
+		for (j = 0; j < len; j++)
+			dst[j] = (uint8_t)s[j];
+		argv_uva[i] = sp;
+	}
+
+	/*
+	 * Reserve the argc slot + (argc+1) pointer slots below the strings,
+	 * then align the argc slot down to 16 bytes (the SysV entry
+	 * invariant).  Aligning down only widens the unused gap up to the
+	 * strings, never overruns them.
+	 */
+	rsp = sp - (uint64_t)(8 * (argc + 2));
+	rsp &= ~(uint64_t)15;
+
+	KASSERT(rsp >= USER_STACK_VA,
+	    "build_user_arg_stack: arg block underflows the user stack page");
+
+	*(uint64_t *)(uintptr_t)(kva_base + (rsp - USER_STACK_VA)) =
+	    (uint64_t)argc;
+	for (i = 0; i < argc; i++) {
+		slot = rsp + 8 + (uint64_t)(8 * i);
+		*(uint64_t *)(uintptr_t)(kva_base + (slot - USER_STACK_VA)) =
+		    argv_uva[i];
+	}
+	slot = rsp + 8 + (uint64_t)(8 * argc);
+	*(uint64_t *)(uintptr_t)(kva_base + (slot - USER_STACK_VA)) = 0;
+
+	return (rsp);
+}
+
 /*
  * Launcher for a ring-3 program shipped as an embedded ELF64.  Differs
  * from usermode_launcher in that elf_load handles segment mapping and
@@ -204,6 +312,7 @@ usermode_elf_launcher(void *arg)
 	uint64_t		 entry;
 	uint64_t		 stack_pa;
 	uint64_t		 ksp;
+	uint64_t		 user_rsp;
 	size_t			 i;
 	int			 rv;
 
@@ -228,6 +337,15 @@ usermode_elf_launcher(void *arg)
 	kva = (uint64_t *)pmm_kva_from_pa(stack_pa);
 	for (i = 0; i < 512; i++)
 		kva[i] = 0;
+
+	/*
+	 * Lay down argc/argv at the bottom of the freshly zeroed page and
+	 * take the entry %rsp from the builder.  With no command line this
+	 * still produces a (argc=0, argv[0]=NULL) frame just below
+	 * USER_STACK_TOP, so the crt0 entry path is identical either way.
+	 */
+	user_rsp = build_user_arg_stack((uint64_t)kva, sa->sa_argc,
+	    sa->sa_argv);
 
 	ksp = (uint64_t)current_thread->th_kstack_base +
 	    current_thread->th_kstack_size;
@@ -257,13 +375,15 @@ usermode_elf_launcher(void *arg)
 	}
 
 	kprintf("usermode: spawn '%s' entry=0x%llx (image=%zu bytes), "
-	    "stack=0x%llx%s\n",
+	    "rsp=0x%llx argc=%d%s\n",
 	    sa->sa_name, (unsigned long long)entry, sa->sa_image_size,
-	    (unsigned long long)USER_STACK_TOP,
+	    (unsigned long long)user_rsp, sa->sa_argc,
 	    sa->sa_inject_port != NULL ? ", parent port injected" : "");
 
+	if (sa->sa_argv != NULL)
+		kfree(sa->sa_argv);
 	kfree(sa);
-	usermode_enter(entry, USER_STACK_TOP);
+	usermode_enter(entry, user_rsp);
 }
 
 /*

@@ -1056,15 +1056,13 @@ dispatch(int argc, char *argv[])
 		return (builtin_kill(argc, argv));
 
 	/*
-	 * Not a builtin -- hand to SYS_SPAWN_RETURNS_TASKPORT so we
-	 * also receive a SEND right on the child's task-self port and
-	 * can deliver Ctrl-C / kill builtins against it.  argv[1..]
-	 * are ignored for now; the kernel's progreg_spawn takes only a
-	 * name.  Real argv delivery to the child waits on a stack-
-	 * loader update.
+	 * Not a builtin -- hand to SYS_SPAWN_ARGS so the child both
+	 * receives the full command line (argv[0..argc-1]) AND we get a
+	 * SEND right on its task-self port for Ctrl-C / the kill builtin.
+	 * argv[0] is the program name the kernel resolves in progreg.
 	 */
 	taskport = MACH_PORT_NULL;
-	rv = spawn_returns_taskport(argv[0], &taskport);
+	rv = spawn_args(argv[0], argc, argv, &taskport);
 	if (rv <= 0) {
 		puts(ESC_FG_GRAY);
 		puts("  ");

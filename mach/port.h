@@ -454,7 +454,10 @@ _Static_assert(sizeof(struct mach_port_snapshot_entry) == 40,
  *
  * Tag values:
  *	NONE		regular Mach port -- normal send/recv semantics
- *	TASK_SELF	p_special_arg is (struct task *), the target task
+ *	TASK_SELF	p_special_arg holds the target task's id (uint64_t
+ *			stored as uintptr_t), NOT a struct task *.  A task-
+ *			self port can outlive its task, so dispatch resolves
+ *			the id via task_lookup_ref and fails safe if reaped
  *	BOOTSTRAP	the single global service registry; arg is unused
  *	SERVICE		p_special_arg is a (port_service_fn) -- generic
  *			kernel-side service hook, used by clock/stats/tasks

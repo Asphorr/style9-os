@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "kmem.h"
 #include "kprintf.h"
 #include "panic.h"
 #include "port.h"
@@ -70,6 +71,12 @@ extern uint8_t	_binary_top_elf_end[];
 extern uint8_t	_binary_heartbeatd_elf_start[];
 extern uint8_t	_binary_heartbeatd_elf_end[];
 
+extern uint8_t	_binary_argecho_elf_start[];
+extern uint8_t	_binary_argecho_elf_end[];
+
+extern uint8_t	_binary_crasher_elf_start[];
+extern uint8_t	_binary_crasher_elf_end[];
+
 /*
  * Bridge into the arch-specific user-thread spawn path.  Lives in
  * arch/amd64/usermode.c; declared here so progreg_spawn doesn't have
@@ -87,7 +94,8 @@ extern long	arch_spawn_user(const char *name,
 		    const uint8_t *image, size_t image_size,
 		    struct port *inject_port,
 		    struct port_space *caller_space,
-		    mach_port_name_t *out_taskport_name);
+		    mach_port_name_t *out_taskport_name,
+		    int argc, char **argv);
 
 /*
  * Lock key:
@@ -149,6 +157,10 @@ progreg_init(void)
 	    _binary_top_elf_start, _binary_top_elf_end);
 	register_one("heartbeatd",
 	    _binary_heartbeatd_elf_start, _binary_heartbeatd_elf_end);
+	register_one("argecho",
+	    _binary_argecho_elf_start, _binary_argecho_elf_end);
+	register_one("crasher",
+	    _binary_crasher_elf_start, _binary_crasher_elf_end);
 
 	kprintf("progreg: %zu programs registered\n", nentries);
 }
@@ -206,7 +218,7 @@ progreg_spawn_with_port(const char *name, struct port *inject_port)
 		return (SYS_E_INVAL);
 	}
 	return (arch_spawn_user(e->pr_name, e->pr_image, e->pr_size,
-	    inject_port, NULL, NULL));
+	    inject_port, NULL, NULL, 0, NULL));
 }
 
 /*
@@ -233,5 +245,30 @@ progreg_spawn_returning_taskport(const char *name,
 	if (e == NULL)
 		return (SYS_E_INVAL);
 	return (arch_spawn_user(e->pr_name, e->pr_image, e->pr_size,
-	    NULL, caller_space, out_taskport_name));
+	    NULL, caller_space, out_taskport_name, 0, NULL));
+}
+
+/*
+ * progreg_spawn_args: spawn `name` with a command line.  `argv` is a
+ * kernel-owned flattened block (see progreg.h) or NULL when argc==0;
+ * `caller_space`/`out_taskport_name` are the optional taskport install
+ * (pass NULL/NULL to skip it).  Ownership of `argv` transfers into the
+ * spawn: arch_spawn_user frees it on every failure path and the
+ * launcher frees it on success.  The one path that bypasses
+ * arch_spawn_user -- an unknown program name -- frees it here.
+ */
+long
+progreg_spawn_args(const char *name, int argc, char **argv,
+    struct port_space *caller_space, mach_port_name_t *out_taskport_name)
+{
+	const struct progreg_entry	*e;
+
+	e = progreg_find(name);
+	if (e == NULL) {
+		if (argv != NULL)
+			kfree(argv);
+		return (SYS_E_INVAL);
+	}
+	return (arch_spawn_user(e->pr_name, e->pr_image, e->pr_size,
+	    NULL, caller_space, out_taskport_name, argc, argv));
 }

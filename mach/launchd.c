@@ -10,6 +10,7 @@
 #include <stdint.h>
 
 #include "bootstrap.h"
+#include "clock.h"
 #include "kmem.h"
 #include "kprintf.h"
 #include "launchd.h"
@@ -74,11 +75,26 @@ struct launchd_cell {
 	bool		lc_keepalive;	/* respawn on unexpected exit    */
 	uint8_t		lc_state;	/* LAUNCHD_STATE_*               */
 	uint8_t		lc_pad;
-	uint32_t	lc_pad2;
+	uint32_t	lc_fast_crashes; /* consecutive sub-throttle exits */
 	uint64_t	lc_task_id;
+	uint64_t	lc_last_spawn_ms; /* clock_uptime_ms at last spawn */
 	char		lc_name[LAUNCHD_NAME_MAX];
 	char		lc_program[LAUNCHD_PROGRAM_MAX];
 };
+
+/*
+ * keep_alive respawn throttle.  A keep_alive job that dies in under
+ * LAUNCHD_THROTTLE_MS lived "too fast"; after LAUNCHD_THROTTLE_MAX such
+ * fast deaths in a row the worker stops respawning it and parks it in
+ * LAUNCHD_STATE_THROTTLED (a launchctl START clears the count and
+ * revives it).  Any single run lasting at least LAUNCHD_THROTTLE_MS
+ * resets the counter -- the job proved it can stay up.  This is the
+ * crash-loop backoff every supervisor grows; we give up rather than
+ * delay-and-retry because the cooperative worker has no timer wheel to
+ * schedule a deferred respawn against.
+ */
+#define	LAUNCHD_THROTTLE_MS	1000u
+#define	LAUNCHD_THROTTLE_MAX	3u
 
 static struct spinlock		 s9launchd_lock = SPINLOCK_INIT("s9launchd");
 static struct launchd_cell	 s9launchd_cells[LAUNCHD_MAX_SERVICES];
@@ -175,6 +191,20 @@ refresh_state_locked(struct launchd_cell *c)
 		if (!task_is_alive(c->lc_task_id))
 			c->lc_state = LAUNCHD_STATE_EXITED;
 	}
+}
+
+/*
+ * Stamp the cell's spawn time, under s9launchd_lock, right after a
+ * (re)spawn records the new task id.  launchd_handle_death diffs the
+ * death time against this stamp to classify the run as a fast crash or
+ * a healthy run for the respawn throttle.  Leaves lc_fast_crashes alone
+ * -- the death path owns that counter.
+ */
+static void
+note_spawn_locked(struct launchd_cell *c)
+{
+
+	c->lc_last_spawn_ms = clock_uptime_ms();
 }
 
 /*
@@ -361,8 +391,9 @@ op_load(const struct mach_msg_header *req, struct port_space *from)
 		copy_bounded(c->lc_program, body.lr_program, LAUNCHD_PROGRAM_MAX);
 		c->lc_keepalive = (body.lr_flags &
 		    LAUNCHD_LOAD_FLAG_KEEPALIVE) != 0;
-		c->lc_state   = LAUNCHD_STATE_FAILED;	/* pessimistic */
-		c->lc_task_id = 0;
+		c->lc_state        = LAUNCHD_STATE_FAILED;	/* pessimistic */
+		c->lc_task_id      = 0;
+		c->lc_fast_crashes = 0;
 
 		spin_unlock(&s9launchd_lock);
 
@@ -376,6 +407,7 @@ op_load(const struct mach_msg_header *req, struct port_space *from)
 		} else {
 			c->lc_state   = LAUNCHD_STATE_RUNNING;
 			c->lc_task_id = (uint64_t)child_id;
+			note_spawn_locked(c);
 			reply.ls_status  = MACH_MSG_OK;
 		}
 		reply.ls_state   = c->lc_state;
@@ -652,8 +684,14 @@ op_start(const struct mach_msg_header *req, struct port_space *from)
 		s9launchd_cells[hit_idx].lc_task_id = 0;
 		reply.ls_status  = (int32_t)child_id;
 	} else {
-		s9launchd_cells[hit_idx].lc_state   = LAUNCHD_STATE_RUNNING;
-		s9launchd_cells[hit_idx].lc_task_id = (uint64_t)child_id;
+		/*
+		 * A manual START is an operator override: clear the fast-crash
+		 * count so a job that had been THROTTLED gets a clean slate.
+		 */
+		s9launchd_cells[hit_idx].lc_state        = LAUNCHD_STATE_RUNNING;
+		s9launchd_cells[hit_idx].lc_task_id      = (uint64_t)child_id;
+		s9launchd_cells[hit_idx].lc_fast_crashes = 0;
+		note_spawn_locked(&s9launchd_cells[hit_idx]);
 		reply.ls_status  = MACH_MSG_OK;
 	}
 	reply.ls_state   = s9launchd_cells[hit_idx].lc_state;
@@ -705,27 +743,54 @@ svc_launchd_dispatch(const struct mach_msg_header *req, struct port_space *from)
 static void
 launchd_handle_death(int idx)
 {
-	char	program[LAUNCHD_PROGRAM_MAX];
-	long	child_id;
-	bool	respawn;
+	char		program[LAUNCHD_PROGRAM_MAX];
+	long		child_id;
+	uint32_t	crashes;
+	bool		respawn;
+	bool		throttled;
 
 	if (idx < 0 || idx >= LAUNCHD_MAX_SERVICES)
 		return;
 
-	respawn = false;
+	respawn   = false;
+	throttled = false;
+	crashes   = 0;
 	spin_lock(&s9launchd_lock);
 	if (s9launchd_cells[idx].lc_used &&
 	    s9launchd_cells[idx].lc_keepalive &&
 	    s9launchd_cells[idx].lc_state == LAUNCHD_STATE_RUNNING &&
 	    !task_is_alive(s9launchd_cells[idx].lc_task_id)) {
-		copy_bounded(program, s9launchd_cells[idx].lc_program,
-		    LAUNCHD_PROGRAM_MAX);
-		s9launchd_cells[idx].lc_state   = LAUNCHD_STATE_FAILED;
-		s9launchd_cells[idx].lc_task_id = 0;
-		respawn = true;
+		struct launchd_cell	*c;
+		uint64_t		 lifetime_ms;
+
+		c = &s9launchd_cells[idx];
+		lifetime_ms = clock_uptime_ms() - c->lc_last_spawn_ms;
+		copy_bounded(program, c->lc_program, LAUNCHD_PROGRAM_MAX);
+		c->lc_task_id = 0;
+
+		if (lifetime_ms >= LAUNCHD_THROTTLE_MS) {
+			/* Ran long enough to be healthy: forgive past crashes. */
+			c->lc_fast_crashes = 0;
+			c->lc_state        = LAUNCHD_STATE_FAILED;
+			respawn            = true;
+		} else if (++c->lc_fast_crashes >= LAUNCHD_THROTTLE_MAX) {
+			/* Crash loop: stop respawning until a manual START. */
+			c->lc_state = LAUNCHD_STATE_THROTTLED;
+			throttled   = true;
+			crashes     = c->lc_fast_crashes;
+		} else {
+			c->lc_state = LAUNCHD_STATE_FAILED;
+			respawn     = true;
+		}
 	}
 	spin_unlock(&s9launchd_lock);
 
+	if (throttled) {
+		kprintf("launchd: keep_alive '%s' respawning too fast "
+		    "(%u crashes under %ums) -- throttled, START to revive\n",
+		    program, (unsigned)crashes, LAUNCHD_THROTTLE_MS);
+		return;
+	}
 	if (!respawn)
 		return;
 
@@ -743,6 +808,7 @@ launchd_handle_death(int idx)
 	} else {
 		s9launchd_cells[idx].lc_state   = LAUNCHD_STATE_RUNNING;
 		s9launchd_cells[idx].lc_task_id = (uint64_t)child_id;
+		note_spawn_locked(&s9launchd_cells[idx]);
 	}
 	spin_unlock(&s9launchd_lock);
 
@@ -865,8 +931,9 @@ launchd_boot_load(const char *label, const char *program, bool keepalive,
 	c->lc_used      = true;
 	copy_bounded(c->lc_name,    label,   LAUNCHD_NAME_MAX);
 	copy_bounded(c->lc_program, program, LAUNCHD_PROGRAM_MAX);
-	c->lc_keepalive = keepalive;
-	c->lc_task_id   = 0;
+	c->lc_keepalive    = keepalive;
+	c->lc_task_id      = 0;
+	c->lc_fast_crashes = 0;
 
 	if (!runatload) {
 		c->lc_state = LAUNCHD_STATE_STOPPED;
@@ -888,6 +955,7 @@ launchd_boot_load(const char *label, const char *program, bool keepalive,
 	} else {
 		s9launchd_cells[free_idx].lc_state   = LAUNCHD_STATE_RUNNING;
 		s9launchd_cells[free_idx].lc_task_id = (uint64_t)child_id;
+		note_spawn_locked(&s9launchd_cells[free_idx]);
 	}
 	spin_unlock(&s9launchd_lock);
 
@@ -973,10 +1041,12 @@ launchd_subsystem_init(void)
 	size_t			i;
 
 	for (i = 0; i < LAUNCHD_MAX_SERVICES; i++) {
-		s9launchd_cells[i].lc_used      = false;
-		s9launchd_cells[i].lc_keepalive = false;
-		s9launchd_cells[i].lc_state     = LAUNCHD_STATE_EXITED;
-		s9launchd_cells[i].lc_task_id   = 0;
+		s9launchd_cells[i].lc_used         = false;
+		s9launchd_cells[i].lc_keepalive    = false;
+		s9launchd_cells[i].lc_state        = LAUNCHD_STATE_EXITED;
+		s9launchd_cells[i].lc_fast_crashes = 0;
+		s9launchd_cells[i].lc_task_id      = 0;
+		s9launchd_cells[i].lc_last_spawn_ms = 0;
 		s9launchd_cells[i].lc_name[0]    = '\0';
 		s9launchd_cells[i].lc_program[0] = '\0';
 	}

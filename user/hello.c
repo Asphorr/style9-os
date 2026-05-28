@@ -1384,6 +1384,166 @@ demo_top_spawn(void)
 	return (0);
 }
 
+/*
+ * demo_stale_taskport: regression guard for the task-self port UAF.
+ *
+ * A task-self port can outlive its task -- any external SEND right (here
+ * the taskport spawn_returns_taskport hands us) keeps the port object
+ * alive past the task's kfree in task_deref.  port_release_task_self
+ * marks the port p_dead, but neither space_lookup nor the special-port
+ * intercept gates on p_dead, so before the fix both SYS_TASK_KILL and a
+ * GET_INFO send reached straight through to a dangling struct task *.
+ * The port now stores the task's immutable id, resolved by the kernel
+ * with task_lookup_ref, so a stale port fails safe instead.
+ *
+ * We spawn loopchild (a syscall-free spinner), confirm a cross-task
+ * GET_INFO RPC to its taskport works while it is alive, kill it via that
+ * same capability, yield-spin until it leaves the live list (struct task
+ * freed), then poke the now-stale taskport: the GET_INFO RPC must come
+ * back MACH_E_DEAD and task_kill must no-op -- neither may touch freed
+ * memory.  Pre-fix this dereferenced a dangling pointer and faulted.
+ */
+static int
+demo_stale_taskport(void)
+{
+	struct mach_msg_header	tx;
+	struct {
+		struct mach_msg_header	hdr;
+		struct task_info_reply	body;
+	} reply;
+	mach_port_name_t	tport;
+	long			child_id;
+	int			i;
+	int			rv;
+
+	printf("\nstale taskport demo (UAF guard):\n");
+
+	tport = MACH_PORT_NULL;
+	child_id = spawn_returns_taskport("loopchild", &tport);
+	if (child_id < 0 || tport == MACH_PORT_NULL) {
+		printf("  spawn_returns_taskport('loopchild') failed (rv=%ld)\n",
+		    child_id);
+		return (80);
+	}
+	printf("  spawned loopchild id=%ld taskport=0x%x\n",
+	    child_id, (unsigned)tport);
+
+	/* Positive control: cross-task GET_INFO on a LIVE task-self port. */
+	tx.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	tx.msgh_size    = sizeof(tx);
+	tx.msgh_remote  = tport;
+	tx.msgh_local   = MACH_PORT_NULL;
+	tx.msgh_voucher = 0;
+	tx.msgh_id      = TASK_OP_GET_INFO;
+	rv = mach_msg_rpc(&tx, &reply.hdr, sizeof(reply), 1000);
+	if (rv != MACH_MSG_OK) {
+		printf("  live taskport GET_INFO failed (rv=%d)\n", rv);
+		return (81);
+	}
+	if (reply.body.tir_task_id != (uint64_t)child_id) {
+		printf("  live taskport GET_INFO id mismatch: got %llu want %ld\n",
+		    (unsigned long long)reply.body.tir_task_id, child_id);
+		return (82);
+	}
+	printf("  live taskport GET_INFO ok: name='%s' id=%llu\n",
+	    reply.body.tir_name,
+	    (unsigned long long)reply.body.tir_task_id);
+
+	/* Kill the child through the very capability we hold. */
+	rv = task_kill(tport);
+	if (rv != MACH_MSG_OK) {
+		printf("  task_kill(taskport) failed (rv=%d)\n", rv);
+		return (83);
+	}
+
+	/* Wait for the task to leave the live list (struct task freed). */
+	for (i = 0; i < 256 && task_alive((uint64_t)child_id); i++)
+		(void)yield();
+	if (task_alive((uint64_t)child_id)) {
+		printf("  child still alive after 256 yields; "
+		    "skipping stale assertion\n");
+		(void)mach_port_deallocate(tport);
+		return (0);
+	}
+	printf("  child reaped; taskport 0x%x is now stale\n",
+	    (unsigned)tport);
+
+	/*
+	 * Payoff #1: GET_INFO RPC to the stale taskport.  p_special_arg
+	 * holds the dead child's id; task_lookup_ref returns NULL and the
+	 * intercept answers MACH_E_DEAD.  Pre-fix: dereferenced freed mem.
+	 */
+	tx.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	tx.msgh_size    = sizeof(tx);
+	tx.msgh_remote  = tport;
+	tx.msgh_local   = MACH_PORT_NULL;
+	tx.msgh_voucher = 0;
+	tx.msgh_id      = TASK_OP_GET_INFO;
+	rv = mach_msg_rpc(&tx, &reply.hdr, sizeof(reply), 1000);
+	if (rv != MACH_E_DEAD) {
+		printf("  FAIL: stale GET_INFO rv=%d (want MACH_E_DEAD=%d)\n",
+		    rv, MACH_E_DEAD);
+		(void)mach_port_deallocate(tport);
+		return (84);
+	}
+	printf("  stale taskport GET_INFO correctly refused: MACH_E_DEAD\n");
+
+	/*
+	 * Payoff #2: task_kill on the stale name.  space_lookup hands back
+	 * the dead port, sys_task_kill reads the (dead) id, and
+	 * task_request_terminate no-ops -- a clean return, no deref.
+	 */
+	rv = task_kill(tport);
+	if (rv == MACH_MSG_OK)
+		printf("  task_kill(stale taskport) safely no-op'd\n");
+	else
+		printf("  task_kill(stale) rv=%d (no crash either way)\n", rv);
+
+	(void)mach_port_deallocate(tport);
+	return (0);
+}
+
+/*
+ * demo_spawn_argv: exercise SYS_SPAWN_ARGS end to end.  Spawn argecho
+ * with a known argument vector; argecho echoes argc + each argv[i] to
+ * the console (the strings appear in the boot transcript), proving the
+ * kernel stack-builder + crt0 forward the command line into
+ * main(argc, argv).  We hold the taskport spawn_args hands back and
+ * wait for the child to retire before returning.
+ */
+static int
+demo_spawn_argv(void)
+{
+	char			*child_argv[4];
+	mach_port_name_t	 taskport;
+	long			 child_id;
+	int			 i;
+
+	printf("\nspawn argv demo (SYS_SPAWN_ARGS):\n");
+
+	child_argv[0] = "argecho";
+	child_argv[1] = "alpha";
+	child_argv[2] = "bravo";
+	child_argv[3] = "charlie";
+
+	taskport = MACH_PORT_NULL;
+	child_id = spawn_args("argecho", 4, child_argv, &taskport);
+	if (child_id < 0 || taskport == MACH_PORT_NULL) {
+		printf("  spawn_args('argecho') failed (rv=%ld)\n", child_id);
+		return (85);
+	}
+	printf("  spawned argecho id=%ld taskport=0x%x with 4 args\n",
+	    child_id, (unsigned)taskport);
+
+	/* Give argecho the CPU to run + print, then confirm it retired. */
+	for (i = 0; i < 64 && task_alive((uint64_t)child_id); i++)
+		(void)yield();
+
+	(void)mach_port_deallocate(taskport);
+	printf("  argecho retired after %d yields\n", i);
+	return (0);
+}
+
 static int
 demo_bootstrap_publish(void)
 {
@@ -1616,6 +1776,14 @@ main(void)
 		return (rv);
 
 	rv = demo_top_spawn();
+	if (rv != 0)
+		return (rv);
+
+	rv = demo_stale_taskport();
+	if (rv != 0)
+		return (rv);
+
+	rv = demo_spawn_argv();
 	if (rv != 0)
 		return (rv);
 

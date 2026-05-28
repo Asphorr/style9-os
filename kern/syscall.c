@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "kmem.h"
 #include "kprintf.h"
 #include "pmap.h"
 #include "pmm.h"
@@ -80,6 +81,8 @@ static long	sys_task_get_vm_regions(uint64_t task_id,
 static long	sys_task_kill(mach_port_name_t target_port_name);
 static long	sys_spawn_returns_taskport(const char *uname,
 		    mach_port_name_t *out_taskport_name);
+static long	sys_spawn_args(const char *uname, char *const *uargv,
+		    uint64_t argc, mach_port_name_t *out_taskport_name);
 
 static bool	user_range_ok(uint64_t addr, size_t len);
 
@@ -233,6 +236,12 @@ syscall_dispatch_body(struct syscall_frame *f)
 		return (sys_spawn_returns_taskport(
 		    (const char *)f->sf_arg0,
 		    (mach_port_name_t *)f->sf_arg1));
+	case SYS_SPAWN_ARGS:
+		return (sys_spawn_args(
+		    (const char *)f->sf_arg0,
+		    (char *const *)f->sf_arg1,
+		    (uint64_t)f->sf_arg2,
+		    (mach_port_name_t *)f->sf_arg3));
 	default:
 		return (SYS_E_NOSYS);
 	}
@@ -973,8 +982,9 @@ sys_task_get_vm_regions(uint64_t task_id,
  * `target_port_name` is a port name in the caller's space.  The kernel
  * resolves it, verifies the SEND right, checks that the port's special
  * tag is PORT_SPECIAL_TASK_SELF (i.e., the named port IS a task's
- * task-self port), extracts the linked struct task from p_special_arg,
- * and fires task_request_terminate against that task's id.
+ * task-self port), reads the target task id stored in p_special_arg
+ * (never a raw struct task * -- a task-self port can outlive its task),
+ * and fires task_request_terminate against it.
  *
  * Caller can trivially kill itself by passing MACH_PORT_TASK_SELF (==1)
  * -- every task has its own task-self port wired into slot 1 of its
@@ -1001,9 +1011,8 @@ static long
 sys_task_kill(mach_port_name_t target_port_name)
 {
 	struct port	*p;
-	struct task	*target;
-	uint8_t		 dummy;
 	uint64_t	 target_id;
+	uint8_t		 dummy;
 
 	p = space_lookup(current_thread->th_task->t_port_space,
 	    target_port_name, MACH_PORT_RIGHT_SEND, &dummy);
@@ -1013,11 +1022,20 @@ sys_task_kill(mach_port_name_t target_port_name)
 	if (p->p_special != PORT_SPECIAL_TASK_SELF)
 		return ((long)MACH_E_INVAL);
 
-	target = (struct task *)p->p_special_arg;
-	if (target == NULL || target == kernel_task)
+	/*
+	 * The task-self port stores the target's immutable id, never a
+	 * raw struct task * (which would dangle once the task is reaped
+	 * while this SEND right keeps the port object alive -- the very
+	 * UAF this avoids).  Hand the id to task_request_terminate, which
+	 * re-validates it under tasks_lock and silently no-ops if the
+	 * task is already gone; a stale taskport name thus kills nothing
+	 * instead of dereferencing freed memory.  kernel_task is id 1 and
+	 * is refused explicitly.
+	 */
+	target_id = (uint64_t)(uintptr_t)p->p_special_arg;
+	if (target_id == 0 || target_id == kernel_task->t_id)
 		return ((long)MACH_E_INVAL);
 
-	target_id = target->t_id;
 	task_request_terminate(target_id);
 
 	/*
@@ -1094,6 +1112,142 @@ sys_spawn_returns_taskport(const char *uname,
 	*out_taskport_name = kname_out;
 	smap_user_access_end();
 
+	return (rv);
+}
+
+/*
+ * sys_spawn_args: the full spawn -- a program name, a command-line
+ * argument vector, AND (exactly like SYS_SPAWN_RETURNS_TASKPORT) a SEND
+ * right on the new task's task-self port installed in the caller's
+ * space.  The argv strings are copied into one kernel-side flattened
+ * block: (argc+1) leading char* slots (the last is the NULL
+ * terminator) followed by the packed, NUL-separated strings, so each
+ * kargv[i] points into the same allocation and a single kfree releases
+ * it.  Ownership of that block transfers to progreg_spawn_args, which
+ * frees it on failure and hands it to the launcher (which materialises
+ * it onto the child's stack, then frees it) on success.
+ *
+ * argc 0 / uargv NULL degrades to the argument-free returns-taskport
+ * spawn.  Bounds: argc <= SPAWN_ARGV_MAX, total string bytes <
+ * SPAWN_ARG_BYTES_MAX -- a violation is SYS_E_INVAL.  On any failure
+ * *out_taskport_name is untouched.
+ */
+static long
+sys_spawn_args(const char *uname, char *const *uargv, uint64_t argc,
+    mach_port_name_t *out_taskport_name)
+{
+	char			 kname[PROGREG_NAME_MAX];
+	char			*block;
+	char		       **kargv;
+	char			*strs;
+	const char		*uarg;
+	mach_port_name_t	 kname_out;
+	size_t			 ptrs_sz;
+	size_t			 used;
+	size_t			 i;
+	size_t			 k;
+	long			 uaddr;
+	long			 rv;
+
+	if (uname == NULL || out_taskport_name == NULL)
+		return (SYS_E_FAULT);
+	if (argc > SPAWN_ARGV_MAX)
+		return (SYS_E_INVAL);
+
+	uaddr = (long)(uintptr_t)uname;
+	if (!user_range_ok((uint64_t)uaddr, 1))
+		return (SYS_E_FAULT);
+	if (!user_range_ok((uint64_t)(uintptr_t)out_taskport_name,
+	    sizeof(mach_port_name_t)))
+		return (SYS_E_FAULT);
+
+	/* Copy the program name (bounded, NUL-terminated). */
+	smap_user_access_begin();
+	for (i = 0; i < PROGREG_NAME_MAX; i++) {
+		if (!user_range_ok((uint64_t)(uaddr + (long)i), 1)) {
+			smap_user_access_end();
+			return (SYS_E_FAULT);
+		}
+		kname[i] = uname[i];
+		if (uname[i] == '\0')
+			break;
+	}
+	smap_user_access_end();
+	if (i == PROGREG_NAME_MAX)
+		return (SYS_E_INVAL);
+
+	/* No argument vector: identical to sys_spawn_returns_taskport. */
+	if (argc == 0 || uargv == NULL) {
+		kname_out = MACH_PORT_NULL;
+		rv = progreg_spawn_args(kname, 0, NULL,
+		    current_thread->th_task->t_port_space, &kname_out);
+		if (rv < 0)
+			return (rv);
+		smap_user_access_begin();
+		*out_taskport_name = kname_out;
+		smap_user_access_end();
+		return (rv);
+	}
+
+	if (!user_range_ok((uint64_t)(uintptr_t)uargv, argc * sizeof(char *)))
+		return (SYS_E_FAULT);
+
+	ptrs_sz = (size_t)(argc + 1) * sizeof(char *);
+	block = (char *)kmalloc(ptrs_sz + SPAWN_ARG_BYTES_MAX);
+	if (block == NULL)
+		return (SYS_E_NOMEM);
+	kargv = (char **)block;
+	strs  = block + ptrs_sz;
+	used  = 0;
+
+	for (i = 0; i < argc; i++) {
+		/* Pull the i'th user pointer out of the argv array. */
+		smap_user_access_begin();
+		uarg = uargv[i];
+		smap_user_access_end();
+
+		if (uarg == NULL ||
+		    !user_range_ok((uint64_t)(uintptr_t)uarg, 1)) {
+			kfree(block);
+			return (SYS_E_FAULT);
+		}
+
+		kargv[i] = strs + used;
+
+		/* Copy this argument (NUL included) into the packed region. */
+		k = 0;
+		smap_user_access_begin();
+		for (;;) {
+			if (used >= SPAWN_ARG_BYTES_MAX) {
+				smap_user_access_end();
+				kfree(block);
+				return (SYS_E_INVAL);
+			}
+			if (!user_range_ok((uint64_t)(uintptr_t)(uarg + k), 1)) {
+				smap_user_access_end();
+				kfree(block);
+				return (SYS_E_FAULT);
+			}
+			strs[used] = uarg[k];
+			used++;
+			if (uarg[k] == '\0')
+				break;
+			k++;
+		}
+		smap_user_access_end();
+	}
+	kargv[argc] = NULL;
+
+	/* Ownership of `block` passes to progreg_spawn_args from here. */
+	kname_out = MACH_PORT_NULL;
+	rv = progreg_spawn_args(kname, (int)argc, kargv,
+	    current_thread->th_task->t_port_space, &kname_out);
+	if (rv < 0)
+		return (rv);
+
+	smap_user_access_begin();
+	*out_taskport_name = kname_out;
+	smap_user_access_end();
 	return (rv);
 }
 

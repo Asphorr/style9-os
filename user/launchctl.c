@@ -34,6 +34,9 @@
 #define	KA_LABEL	"com.style9.guardian"
 #define	KA_PROGRAM	"loopchild"	/* keep_alive restart target */
 
+#define	THR_LABEL	"com.style9.flaky"
+#define	THR_PROGRAM	"crasher"	/* exits immediately -> throttle */
+
 /* ---- helpers --------------------------------------------------------- */
 
 static mach_port_name_t
@@ -48,11 +51,12 @@ state_name(uint32_t s)
 {
 
 	switch (s) {
-	case LAUNCHD_STATE_RUNNING: return ("running");
-	case LAUNCHD_STATE_EXITED:  return ("exited");
-	case LAUNCHD_STATE_FAILED:  return ("failed");
-	case LAUNCHD_STATE_STOPPED: return ("stopped");
-	default:                    return ("?");
+	case LAUNCHD_STATE_RUNNING:   return ("running");
+	case LAUNCHD_STATE_EXITED:    return ("exited");
+	case LAUNCHD_STATE_FAILED:    return ("failed");
+	case LAUNCHD_STATE_STOPPED:   return ("stopped");
+	case LAUNCHD_STATE_THROTTLED: return ("throttled");
+	default:                      return ("?");
 	}
 }
 
@@ -545,6 +549,24 @@ main(void)
 			    "after crash (expect running, NEW task_id)");
 			(void)do_unload(launchd, KA_LABEL);
 		}
+	}
+
+	/*
+	 * v2 respawn-throttle demo: load a keep_alive job whose program
+	 * (crasher) exits the instant it runs.  The worker respawns it, it
+	 * exits again, and after a few such fast exits launchd's throttle
+	 * trips and parks it in `throttled' instead of respawning forever.
+	 * We yield generously to let the crash loop play out, then LIST to
+	 * observe the throttled state and UNLOAD to clean up.  START would
+	 * revive it (clearing the fast-crash count), but here we just reap.
+	 */
+	printf("\nlaunchctl respawn-throttle demo:\n");
+	if (do_load(launchd, THR_LABEL, THR_PROGRAM,
+	    LAUNCHD_LOAD_FLAG_KEEPALIVE, NULL, NULL) == MACH_MSG_OK) {
+		for (i = 0; i < 256; i++)
+			(void)yield();
+		(void)do_list(launchd, "after crash loop (expect throttled)");
+		(void)do_unload(launchd, THR_LABEL);
 	}
 
 	(void)mach_port_deallocate(launchd);

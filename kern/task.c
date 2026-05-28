@@ -567,6 +567,36 @@ task_self_port_for(uint64_t task_id)
 }
 
 /*
+ * task_lookup_ref: resolve a task id to a ref'd, safe-to-deref task.
+ * Mirrors task_self_port_for's scan, but bumps the task's own ref under
+ * tasks_lock so the struct cannot be freed under the caller.  Returns
+ * NULL for an unknown id -- the natural answer for a task-self port
+ * whose task has already been reaped.  kernel_task is returned like any
+ * other live task (callers that must exclude it check the id).
+ *
+ * Lock-order: tasks_lock -> t_lock (inside task_ref); identical to the
+ * edge task_request_terminate takes, so no new cycle.
+ */
+struct task *
+task_lookup_ref(uint64_t id)
+{
+	struct task	*t;
+	size_t		 i;
+
+	t = NULL;
+	spin_lock(&tasks_lock);
+	for (i = 0; i < TASK_LIST_MAX; i++) {
+		if (task_list[i] != NULL && task_list[i]->t_id == id) {
+			t = task_list[i];
+			task_ref(t);
+			break;
+		}
+	}
+	spin_unlock(&tasks_lock);
+	return (t);
+}
+
+/*
  * task_request_terminate: async-kill on a live target.  Three phases:
  *
  *	1. Identify the target under tasks_lock + bump a ref so it

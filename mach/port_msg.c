@@ -1076,10 +1076,27 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 			    msg->msgh_remote, remote_right);
 		}
 		switch (dest->p_special) {
-		case PORT_SPECIAL_TASK_SELF:
-			special_rv = task_self_dispatch(
-			    (struct task *)dest->p_special_arg, msg, from);
+		case PORT_SPECIAL_TASK_SELF: {
+			struct task	*t;
+			uint64_t	 tid;
+
+			/*
+			 * p_special_arg holds the target's task id, not a
+			 * raw pointer (the port can outlive the task).
+			 * Resolve it to a ref'd task so dispatch operates on
+			 * live memory; a stale port (task already reaped)
+			 * resolves to NULL and fails safe with MACH_E_DEAD.
+			 */
+			tid = (uint64_t)(uintptr_t)dest->p_special_arg;
+			t = task_lookup_ref(tid);
+			if (t == NULL) {
+				special_rv = MACH_E_DEAD;
+				break;
+			}
+			special_rv = task_self_dispatch(t, msg, from);
+			task_deref(t);
 			break;
+		}
 		case PORT_SPECIAL_BOOTSTRAP:
 			special_rv = bootstrap_dispatch(msg, from);
 			break;

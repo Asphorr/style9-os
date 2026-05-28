@@ -462,7 +462,21 @@ port_install_task_self(struct task *t)
 	 * really meant for synchronous dispatch.
 	 */
 	p->p_special     = PORT_SPECIAL_TASK_SELF;
-	p->p_special_arg = (void *)t;
+	/*
+	 * Store the task's immutable id, NOT a raw struct task *.  A
+	 * task-self port can outlive its task: any external holder of a
+	 * SEND right (launchctl, the launchd keep_alive worker, the
+	 * shell's child registry) keeps the port object alive past the
+	 * task's kfree in task_deref.  A stored pointer would dangle and
+	 * the dispatch + SYS_TASK_KILL paths would dereference freed
+	 * memory.  The id is stable for the life of the task and resolves
+	 * via task_lookup_ref, which returns NULL once the task has been
+	 * reaped -- so a stale port fails safe.  Task ids start at 1
+	 * (next_task_id in task.c), so the value never collides with the
+	 * NULL p_special_arg of a non-special port.
+	 */
+	KASSERT(t->t_id != 0, "port_install_task_self: task id 0");
+	p->p_special_arg = (void *)(uintptr_t)t->t_id;
 
 	port_ref(p, MACH_PORT_RIGHT_RECEIVE);
 

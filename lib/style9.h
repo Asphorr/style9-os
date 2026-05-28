@@ -74,6 +74,7 @@ typedef long long		int64_t;
 #define	SYS_TASK_GET_VM_REGIONS	24
 #define	SYS_TASK_KILL		25
 #define	SYS_SPAWN_RETURNS_TASKPORT 26
+#define	SYS_SPAWN_ARGS		27
 
 #define	SYS_E_NOSYS		(-1)
 #define	SYS_E_FAULT		(-2)
@@ -516,6 +517,20 @@ int	task_kill(mach_port_name_t target_port);
 long	spawn_returns_taskport(const char *name, mach_port_name_t *out_taskport);
 
 /*
+ * spawn_args: spawn_returns_taskport plus a command line.  argv is the
+ * usual vector; `argc` entries argv[0..argc-1] are copied into the
+ * child, which receives them as main(argc, argv) (the kernel builds a
+ * SysV-style initial stack and crt0 forwards it).  argv[0] is
+ * conventionally the program name.  `out_taskport` is required (the
+ * call always hands back the child's task-self SEND right, exactly as
+ * spawn_returns_taskport does).  Returns the new task_id on success,
+ * negative SYS_E_* on failure; on failure *out_taskport is untouched.
+ * argc 0 behaves like spawn_returns_taskport.
+ */
+long	spawn_args(const char *name, int argc, char *const argv[],
+	    mach_port_name_t *out_taskport);
+
+/*
  * task_set_exception_port: install (or replace) the calling task's
  * exception port for every type.  Equivalent to
  * task_set_exception_ports(EXC_MASK_ALL, notify_port).  Kept for
@@ -743,6 +758,7 @@ _Static_assert(sizeof(struct svc_tasks_reply) ==
 #define	LAUNCHD_STATE_EXITED	1
 #define	LAUNCHD_STATE_FAILED	2
 #define	LAUNCHD_STATE_STOPPED	3
+#define	LAUNCHD_STATE_THROTTLED	4
 
 /* WIRE FORMAT.  Mirrors mach/services.h. */
 struct svc_launchctl_load_req {

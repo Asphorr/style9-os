@@ -53,6 +53,15 @@ void	usermode_run_first_blob(void);
  * SYS_SPAWN_RETURNS_TASKPORT shape (parent-managed children, used by
  * the shell + task-manager-style services).
  *
+ * `argc` + `argv` carry the child's command line: `argv` is a
+ * kernel-owned flattened block (the leading char* slots point into the
+ * trailing packed strings) or NULL when argc==0.  The launcher copies
+ * the strings onto the child's initial stack in the SysV layout
+ * (`argc` at the entry %rsp, then the argv pointer array + NULL
+ * terminator) and frees the block; on every failure path here the
+ * block is kfree'd before returning.  Pass 0/NULL for the no-argument
+ * spawn shapes.
+ *
  * Returns the new task's t_id on success, negative SYS_E_* on failure.
  */
 struct port;
@@ -62,7 +71,8 @@ struct port_space;
 long	arch_spawn_user(const char *name, const uint8_t *image,
 	    size_t image_size, struct port *inject_port,
 	    struct port_space *caller_space,
-	    mach_port_name_t *out_taskport_name);
+	    mach_port_name_t *out_taskport_name,
+	    int argc, char **argv);
 
 /*
  * usermode_enter: never returns to its caller.  Pushes a synthetic

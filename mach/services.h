@@ -95,7 +95,7 @@ _Static_assert(sizeof(struct svc_tasks_reply) ==
 /* ---- "man" service ---- */
 /*
  * Manual-page registry.  Holds a small static table of embedded
- * mdoc-rendered text blobs (built from docs/man/*.9 via the Makefile
+ * mdoc-rendered text blobs (built from the docs/man .9 pages via the Makefile
  * mandoc pipeline).  Op MAN_OP_GET takes the page name in the inline
  * body and ships the rendered text back as a single OOL descriptor.
  *
@@ -195,6 +195,9 @@ _Static_assert(sizeof(struct svc_tasks_reply) ==
 #define	LAUNCHD_STATE_EXITED	1
 #define	LAUNCHD_STATE_FAILED	2
 #define	LAUNCHD_STATE_STOPPED	3	/* explicit STOP; no auto-restart */
+#define	LAUNCHD_STATE_THROTTLED	4	/* keep_alive gave up: respawned   */
+					/* too fast too many times.  A     */
+					/* launchctl START clears it.      */
 
 /* WIRE FORMAT.  ABI-stable.  LOAD request body. */
 struct svc_launchctl_load_req {

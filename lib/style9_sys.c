@@ -183,6 +183,15 @@ spawn_returns_taskport(const char *name, mach_port_name_t *out_taskport)
 	    (long)out_taskport));
 }
 
+long
+spawn_args(const char *name, int argc, char *const argv[],
+    mach_port_name_t *out_taskport)
+{
+
+	return (syscall4(SYS_SPAWN_ARGS, (long)name, (long)argv,
+	    (long)argc, (long)out_taskport));
+}
+
 /* ---- vm ------------------------------------------------------------ */
 
 void *

@@ -25,8 +25,19 @@
  * SYS_SPAWN ABI does not move.
  */
 
-#define	PROGREG_MAX		16
+#define	PROGREG_MAX		24
 #define	PROGREG_NAME_MAX	24
+
+/*
+ * Command-line argument limits for the SYS_SPAWN_ARGS path.  The
+ * syscall layer copies the caller's argv into a kernel-side flattened
+ * block bounded by these; the launcher then materialises it onto the
+ * child's initial user stack (arch/amd64/usermode.c).  Kept small: the
+ * user stack is a single page, and these caps leave it comfortably
+ * unspent (16 ptrs + 512 string bytes + framing << 4 KiB).
+ */
+#define	SPAWN_ARGV_MAX		16
+#define	SPAWN_ARG_BYTES_MAX	512
 
 struct progreg_entry {
 	const char	*pr_name;	/* lookup key                   */
@@ -84,6 +95,24 @@ long	progreg_spawn_with_port(const char *name, struct port *inject_port);
 struct port_space;
 #include "port.h"		/* mach_port_name_t */
 long	progreg_spawn_returning_taskport(const char *name,
+	    struct port_space *caller_space,
+	    mach_port_name_t *out_taskport_name);
+
+/*
+ * Full spawn: name + a command-line argument vector + the optional
+ * caller-space taskport install of progreg_spawn_returning_taskport.
+ * `argc`/`argv` carry the child's arguments -- `argv` is a kernel-owned
+ * flattened block (the (argc+1) leading char* slots point into the
+ * trailing packed strings; element argc is NULL), or NULL when argc==0.
+ * Ownership of `argv` transfers in: it is kfree'd on every failure path
+ * and handed to the launcher (which frees it after building the child's
+ * stack) on success -- the caller must not touch or free it afterward.
+ *
+ * `caller_space`/`out_taskport_name` behave exactly as in
+ * progreg_spawn_returning_taskport; pass NULL/NULL to skip the install.
+ * Powers SYS_SPAWN_ARGS.
+ */
+long	progreg_spawn_args(const char *name, int argc, char **argv,
 	    struct port_space *caller_space,
 	    mach_port_name_t *out_taskport_name);
 
