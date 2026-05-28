@@ -401,6 +401,8 @@ builtin_help(void)
 	puts(ESC_FG_GRAY);  puts("version banner + live counters\n");
 	puts(ESC_FG_WHITE); puts("  ool      ");
 	puts(ESC_FG_GRAY);  puts("OOL Mach IPC round-trip via svc/echool\n");
+	puts(ESC_FG_WHITE); puts("  man      ");
+	puts(ESC_FG_GRAY);  puts("show a manual page (try: man port)\n");
 
 	puts("\n");
 	puts(ESC_FG_WHITE); puts("  spawn    ");
@@ -557,6 +559,244 @@ builtin_about(void)
 	puts(ESC_RESET);
 }
 
+/* ---- pager + man builtin ----------------------------------------- */
+
+/*
+ * Tiny in-shell pager modelled on less(1).
+ *
+ * Takes a flat text buffer plus a title, paints PAGER_ROWS lines at a
+ * time, and lets the user scroll with:
+ *
+ *	Space, PgDn, Ctrl-F	page down
+ *	b, PgUp, Ctrl-B		page up
+ *	j, Enter, Down arrow	line down
+ *	k, Up arrow		line up
+ *	g			top
+ *	G			bottom
+ *	q, ESC ESC		quit
+ *
+ * Arrow keys arrive as multi-byte CSI sequences (\x1b[A etc.), so the
+ * read loop runs a three-state machine (NORMAL -> ESC -> CSI) and
+ * collects an optional numeric argument before the final letter.
+ *
+ * Line metadata is cached up front: an array of (offset, length) tuples
+ * per source line.  Capped at PAGER_MAX_LINES so a runaway input never
+ * scribbles past the static buffers.  port.9 rendered is ~300 lines;
+ * 4096 leaves ten-fold headroom.
+ */
+
+#define	PAGER_MAX_LINES		4096
+#define	PAGER_SCREEN_ROWS	22
+
+static uint32_t	pager_line_off[PAGER_MAX_LINES];
+static uint32_t	pager_line_len[PAGER_MAX_LINES];
+
+static size_t
+pager_index_lines(const char *text, size_t len)
+{
+	size_t	i;
+	size_t	lines;
+	size_t	line_start;
+
+	lines = 0;
+	line_start = 0;
+	for (i = 0; i < len && lines < PAGER_MAX_LINES; i++) {
+		if (text[i] == '\n') {
+			pager_line_off[lines] = (uint32_t)line_start;
+			pager_line_len[lines] = (uint32_t)(i - line_start);
+			lines++;
+			line_start = i + 1;
+		}
+	}
+	if (line_start < len && lines < PAGER_MAX_LINES) {
+		pager_line_off[lines] = (uint32_t)line_start;
+		pager_line_len[lines] = (uint32_t)(len - line_start);
+		lines++;
+	}
+	return (lines);
+}
+
+static void
+pager_repaint(const char *text, size_t total_lines, size_t top,
+    const char *title)
+{
+	size_t	end;
+	size_t	i;
+
+	puts(ESC_CLR_SCR);
+
+	end = top + PAGER_SCREEN_ROWS;
+	if (end > total_lines)
+		end = total_lines;
+
+	for (i = top; i < end; i++) {
+		(void)write(text + pager_line_off[i], pager_line_len[i]);
+		putchar('\n');
+	}
+	for (i = end - top; i < PAGER_SCREEN_ROWS; i++)
+		putchar('\n');
+
+	puts("\x1b[7m");	/* inverse video for the status bar */
+	printf(" %s  %llu-%llu/%llu  "
+	    "[Space/b page  j/k line  g/G top/bot  q quit] ",
+	    title,
+	    (unsigned long long)(top + 1),
+	    (unsigned long long)end,
+	    (unsigned long long)total_lines);
+	puts(ESC_RESET);
+}
+
+static void
+pager_show(const char *text, size_t len, const char *title)
+{
+	size_t	max_top;
+	size_t	top;
+	size_t	total_lines;
+	int	act;
+	int	c;
+	int	csi_arg;
+	int	state;	/* 0 = normal, 1 = saw ESC, 2 = inside CSI */
+
+	if (text == NULL || len == 0)
+		return;
+
+	total_lines = pager_index_lines(text, len);
+	if (total_lines == 0)
+		return;
+
+	max_top = total_lines > PAGER_SCREEN_ROWS ?
+	    total_lines - PAGER_SCREEN_ROWS : 0;
+	top      = 0;
+	state    = 0;
+	csi_arg  = 0;
+
+	pager_repaint(text, total_lines, top, title);
+
+	for (;;) {
+		c = read_byte();
+		if (c < 0)
+			break;
+
+		act = 0;
+
+		if (state == 0) {
+			if (c == 0x1b) {
+				state = 1;
+				continue;
+			}
+			if (c == 'q')
+				break;
+			if (c == ' ' || c == 0x06) {
+				top += PAGER_SCREEN_ROWS;
+				act = 1;
+			} else if (c == 'b' || c == 0x02) {
+				top = top >= PAGER_SCREEN_ROWS ?
+				    top - PAGER_SCREEN_ROWS : 0;
+				act = 1;
+			} else if (c == 'j' || c == '\n' || c == '\r') {
+				top++;
+				act = 1;
+			} else if (c == 'k') {
+				if (top > 0)
+					top--;
+				act = 1;
+			} else if (c == 'g') {
+				top = 0;
+				act = 1;
+			} else if (c == 'G') {
+				top = max_top;
+				act = 1;
+			}
+		} else if (state == 1) {
+			if (c == '[') {
+				state   = 2;
+				csi_arg = 0;
+				continue;
+			}
+			/* bare ESC followed by anything (incl. ESC) quits */
+			if (c == 0x1b)
+				break;
+			state = 0;
+			continue;
+		} else {
+			if (c >= '0' && c <= '9') {
+				csi_arg = csi_arg * 10 + (c - '0');
+				continue;
+			}
+			state = 0;
+			if (c == 'A') {
+				if (top > 0)
+					top--;
+				act = 1;
+			} else if (c == 'B') {
+				top++;
+				act = 1;
+			} else if (c == '~' && csi_arg == 5) {
+				top = top >= PAGER_SCREEN_ROWS ?
+				    top - PAGER_SCREEN_ROWS : 0;
+				act = 1;
+			} else if (c == '~' && csi_arg == 6) {
+				top += PAGER_SCREEN_ROWS;
+				act = 1;
+			}
+		}
+
+		if (act) {
+			if (top > max_top)
+				top = max_top;
+			pager_repaint(text, total_lines, top, title);
+		}
+	}
+
+	puts(ESC_CLR_SCR);
+}
+
+/*
+ * builtin_man: bootstrap_lookup("man") + RPC for the requested page +
+ * hand the OOL-installed text to the pager.  Title is "<name>(9)".
+ * On not-found prints a short error to stdout and returns; on RPC
+ * failure same shape but with the error code.
+ */
+static void
+builtin_man(int argc, char *argv[])
+{
+	const char	*name;
+	const char	*text;
+	char		 title[MAN_NAME_MAX + 4];
+	size_t		 i;
+	size_t		 len;
+	int		 rv;
+
+	if (argc < 2) {
+		puts("usage: man <topic>   (try: man port)\n");
+		return;
+	}
+	name = argv[1];
+
+	rv = man_fetch(name, &text, &len);
+	if (rv != MACH_MSG_OK) {
+		if (rv == MACH_E_NAME) {
+			puts("no man page for '");
+			puts(name);
+			puts("'\n");
+		} else {
+			printf("man: fetch failed, rv=%d\n", rv);
+		}
+		return;
+	}
+
+	for (i = 0;
+	    i < sizeof(title) - 4 && name[i] != '\0';
+	    i++)
+		title[i] = name[i];
+	title[i++] = '(';
+	title[i++] = '9';
+	title[i++] = ')';
+	title[i]   = '\0';
+
+	pager_show(text, len, title);
+}
+
 /* ---- spawn + yield-spin wait ------------------------------------- */
 
 static void
@@ -613,6 +853,10 @@ dispatch(int argc, char *argv[])
 	}
 	if (streq(argv[0], "ool")) {
 		builtin_ool();
+		return (0);
+	}
+	if (streq(argv[0], "man")) {
+		builtin_man(argc, argv);
 		return (0);
 	}
 

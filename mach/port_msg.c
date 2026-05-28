@@ -439,18 +439,26 @@ send_capture_ool(struct port_space *from,
 	 * task's user VA window.  This is a coarse check -- a perfect
 	 * one would walk t_map for full coverage, but the subsequent
 	 * memcpy will already fault on any unmapped page within the
-	 * window, so we just guard the obvious wraparound + out-of-
-	 * window cases here.
+	 * window, so the obvious wraparound + out-of-window cases are
+	 * all that need explicit guarding here.
 	 *
-	 * kernel_task is exempt: its t_map covers the user VA window but
-	 * kernel-side senders ship blobs out of kmalloc'd kernel addresses,
-	 * which legitimately sit outside that window.  The kernel is also
-	 * trusted not to point at unmapped memory; the subsequent memcpy
-	 * triple-faults if it ever does, which is a louder bug than the
-	 * silent userspace EINVAL we want for ring-3 senders.
+	 * Two exemptions, both for kernel-internal senders that ship
+	 * blobs out of kmalloc'd / .rodata kernel addresses:
+	 *
+	 *	- kernel_task itself (kernel threads sending OOL)
+	 *	- a thread with th_trusted_send set, toggled by
+	 *	  mach_msg_send_trusted around a single send call
+	 *	  (used by special-service dispatchers replying out of
+	 *	  kernel rodata; see kern/thread.h)
+	 *
+	 * The kernel is trusted not to point at unmapped memory; if it
+	 * ever does the subsequent memcpy triple-faults, which is a
+	 * louder bug than the silent E_INVAL appropriate for ring-3
+	 * senders.
 	 */
 	sender = current_thread != NULL ? current_thread->th_task : NULL;
-	if (sender != NULL && sender != kernel_task && sender->t_map != NULL) {
+	if (sender != NULL && sender != kernel_task && sender->t_map != NULL &&
+	    !(current_thread != NULL && current_thread->th_trusted_send)) {
 		uint64_t end = addr + size;
 		if (end < addr)
 			return (MACH_E_INVAL);	/* wraparound */
@@ -605,6 +613,21 @@ recv_install_ool(struct port_space *to_space,
 	pd->pd_ool_buf  = NULL;
 	pd->pd_ool_size = 0;
 	return (MACH_MSG_OK);
+}
+
+int
+mach_msg_send_trusted(struct port_space *from,
+    const struct mach_msg_header *msg)
+{
+	int	rv;
+
+	if (current_thread == NULL)
+		return (mach_msg_send(from, msg));
+
+	current_thread->th_trusted_send = true;
+	rv = mach_msg_send(from, msg);
+	current_thread->th_trusted_send = false;
+	return (rv);
 }
 
 int

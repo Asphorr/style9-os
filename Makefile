@@ -143,7 +143,8 @@ LIB_OBJS = \
 	$(OBJDIR)/style9_mem.o	\
 	$(OBJDIR)/style9_io.o	\
 	$(OBJDIR)/style9_mach.o	\
-	$(OBJDIR)/style9_dev.o
+	$(OBJDIR)/style9_dev.o	\
+	$(OBJDIR)/style9_man.o
 
 $(OBJDIR)/crt0.o: $(LIB_DIR)/crt0.S | $(OBJDIR)
 	$(CC) $(USER_ASFLAGS) -c $< -o $@
@@ -180,6 +181,27 @@ $(OBJDIR)/%_elf.o: $(OBJDIR)/%.elf
 
 USER_ELFS = $(foreach p,$(USER_PROGRAMS),$(OBJDIR)/$(p).elf)
 
+# ---- man pages -----------------------------------------------------------
+# Render each docs/man/<name>.9 mdoc source to plain ASCII via mandoc, then
+# embed the bytes in the kernel image via objcopy.  `col -b` strips the
+# backspace-overstrike sequences mandoc uses for bold so the embedded text
+# is clean ASCII the in-kernel renderer does not have to decode.  The
+# resulting kernel symbols are _binary_<name>_9_txt_start and _end, used
+# by mach/services.c's "man" service to ship pages to ring-3 callers.
+#
+# Auto-detected: every *.9 under docs/man/ contributes one .o.
+MAN_SOURCES := $(wildcard docs/man/*.9)
+MAN_TXTS    := $(MAN_SOURCES:docs/man/%.9=$(OBJDIR)/%.9.txt)
+MAN_OBJS    := $(MAN_SOURCES:docs/man/%.9=$(OBJDIR)/%_man.o)
+
+$(OBJDIR)/%.9.txt: docs/man/%.9 | $(OBJDIR)
+	mandoc -Tutf8 $< | col -b > $@
+
+$(OBJDIR)/%_man.o: $(OBJDIR)/%.9.txt
+	cd $(OBJDIR) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386	\
+	    --rename-section .data=.rodata.$*_man			\
+	    $*.9.txt $*_man.o
+
 #
 # Two-pass link to embed a kernel-symbol table in .ksymtab.
 #
@@ -205,8 +227,8 @@ $(KSYMS_STUB_S): | $(OBJDIR)
 $(OBJDIR)/ksyms_stub.o: $(KSYMS_STUB_S)
 	$(CC) $(ASFLAGS) -c $< -o $@
 
-$(KSYMS_STAGE1): $(OBJS) $(OBJDIR)/ksyms_stub.o $(ARCH)/linker.ld
-	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(OBJDIR)/ksyms_stub.o
+$(KSYMS_STAGE1): $(OBJS) $(MAN_OBJS) $(OBJDIR)/ksyms_stub.o $(ARCH)/linker.ld
+	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(MAN_OBJS) $(OBJDIR)/ksyms_stub.o
 
 $(KSYMS_REAL_S): $(KSYMS_STAGE1) tools/gen_ksyms.sh
 	tools/gen_ksyms.sh $(KSYMS_STAGE1) > $@
@@ -214,8 +236,8 @@ $(KSYMS_REAL_S): $(KSYMS_STAGE1) tools/gen_ksyms.sh
 $(OBJDIR)/ksyms_real.o: $(KSYMS_REAL_S)
 	$(CC) $(ASFLAGS) -c $< -o $@
 
-kernel.elf: $(OBJS) $(OBJDIR)/ksyms_real.o $(ARCH)/linker.ld
-	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(OBJDIR)/ksyms_real.o
+kernel.elf: $(OBJS) $(MAN_OBJS) $(OBJDIR)/ksyms_real.o $(ARCH)/linker.ld
+	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(MAN_OBJS) $(OBJDIR)/ksyms_real.o
 
 $(OBJDIR)/%.o: %.c | $(OBJDIR)
 	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@

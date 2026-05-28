@@ -160,6 +160,143 @@ svc_tasks_dispatch(const struct mach_msg_header *req, struct port_space *from)
 	return (svc_reply_inline(req, from, &r, sizeof(r)));
 }
 
+/* ---- "man" service ---------------------------------------------------- */
+
+/*
+ * Symbols emitted by `objcopy -I binary` when wrapping the rendered man
+ * page text.  See the Makefile MAN_OBJS section: docs/man/port.9 ->
+ * obj/port.9.txt -> obj/port_man.o with symbols _binary_port_9_txt_*.
+ *
+ * Adding a new page: drop docs/man/<name>.9 on disk (the Makefile auto-
+ * detects it), then declare the matching extern symbols here and
+ * append an entry to man_pages[] below.
+ */
+extern uint8_t	_binary_port_9_txt_start[];
+extern uint8_t	_binary_port_9_txt_end[];
+
+struct man_page {
+	const char	*name;
+	const uint8_t	*start;
+	const uint8_t	*end;
+};
+
+static const struct man_page	man_pages[] = {
+	{ "port", _binary_port_9_txt_start, _binary_port_9_txt_end },
+};
+static const size_t		man_pages_count =
+	sizeof(man_pages) / sizeof(man_pages[0]);
+
+static const struct man_page *
+man_find(const char *name)
+{
+	const struct man_page	*p;
+	size_t			 i, j;
+
+	if (name == NULL || name[0] == '\0')
+		return (NULL);
+
+	for (i = 0; i < man_pages_count; i++) {
+		p = &man_pages[i];
+		for (j = 0; ; j++) {
+			if (p->name[j] != name[j])
+				break;
+			if (p->name[j] == '\0')
+				return (p);
+		}
+	}
+	return (NULL);
+}
+
+/*
+ * MAN_OP_GET dispatcher.  Reads the requested page name from the inline
+ * body of the request, looks it up, and on success ships the rendered
+ * text back as a single OOL descriptor.  On miss returns a bare reply
+ * with msgh_id = MAN_NOT_FOUND so the caller can distinguish from a
+ * generic send error.
+ *
+ * Uses mach_msg_send_trusted so send_capture_ool accepts the kernel
+ * .rodata address in the OOL descriptor; without this exemption the
+ * sender-VA range validation rejects every send from this dispatcher
+ * (which runs in the ring-3 caller's thread context).
+ */
+static int
+svc_man_dispatch(const struct mach_msg_header *req, struct port_space *from)
+{
+	const struct man_page		*page;
+	const uint8_t			*body;
+	const char			*name;
+	size_t				 body_size, name_len, page_size;
+	uint8_t				 reply_buf[sizeof(struct mach_msg_header) +
+				    sizeof(struct mach_msg_body) +
+				    sizeof(struct mach_msg_ool_descriptor)];
+	struct mach_msg_header		 nfreply;
+	struct mach_msg_header		*rhdr;
+	struct mach_msg_body		*rbody;
+	struct mach_msg_ool_descriptor	*rool;
+
+	if (req->msgh_id != MAN_OP_GET)
+		return (MACH_E_INVAL);
+	if (req->msgh_local == MACH_PORT_NULL)
+		return (MACH_E_INVAL);
+	if (req->msgh_size < sizeof(struct mach_msg_header))
+		return (MACH_E_INVAL);
+
+	body      = (const uint8_t *)req + sizeof(struct mach_msg_header);
+	body_size = req->msgh_size - sizeof(struct mach_msg_header);
+	if (body_size == 0 || body_size > MAN_NAME_MAX)
+		return (MACH_E_INVAL);
+
+	name = (const char *)body;
+	for (name_len = 0; name_len < body_size; name_len++) {
+		if (body[name_len] == '\0')
+			break;
+	}
+	if (name_len == body_size)
+		return (MACH_E_INVAL);	/* not NUL-terminated */
+
+	page = man_find(name);
+	if (page == NULL) {
+		nfreply.msgh_bits    =
+		    MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+		nfreply.msgh_size    = sizeof(nfreply);
+		nfreply.msgh_remote  = req->msgh_local;
+		nfreply.msgh_local   = MACH_PORT_NULL;
+		nfreply.msgh_voucher = 0;
+		nfreply.msgh_id      = MAN_NOT_FOUND;
+		return (mach_msg_send(from, &nfreply));
+	}
+
+	page_size = (size_t)(page->end - page->start);
+	if (page_size == 0 || page_size > MACH_MSG_OOL_MAX_BYTES)
+		return (MACH_E_NOMEM);
+
+	rhdr  = (struct mach_msg_header *)reply_buf;
+	rbody = (struct mach_msg_body *)
+	    (reply_buf + sizeof(struct mach_msg_header));
+	rool  = (struct mach_msg_ool_descriptor *)
+	    (reply_buf + sizeof(struct mach_msg_header) +
+	    sizeof(struct mach_msg_body));
+
+	rhdr->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) |
+	    MACH_MSGH_BITS_COMPLEX;
+	rhdr->msgh_size    = sizeof(reply_buf);
+	rhdr->msgh_remote  = req->msgh_local;
+	rhdr->msgh_local   = MACH_PORT_NULL;
+	rhdr->msgh_voucher = 0;
+	rhdr->msgh_id      = MAN_OP_GET;
+
+	rbody->msgh_descriptor_count = 1;
+
+	rool->type       = MACH_MSG_OOL_DESCRIPTOR;
+	rool->copy       = MACH_MSG_PHYSICAL_COPY;
+	rool->deallocate = 0;
+	rool->pad        = 0;
+	rool->size       = (uint32_t)page_size;
+	rool->address    = (uint64_t)(uintptr_t)page->start;
+
+	return (mach_msg_send_trusted(from, rhdr));
+}
+
 /* ---- "echool" service ------------------------------------------------- */
 
 /*
@@ -287,6 +424,7 @@ static struct port	*svc_clock_port;	/* (c) */
 static struct port	*svc_stats_port;	/* (c) */
 static struct port	*svc_tasks_port;	/* (c) */
 static struct port	*svc_echool_port;	/* (c) */
+static struct port	*svc_man_port;		/* (c) */
 
 /*
  * Each service is a kernel-owned PORT_SPECIAL_SERVICE port (the
@@ -324,4 +462,5 @@ services_init(void)
 	svc_stats_port  = svc_register(SVC_STATS_NAME,  svc_stats_dispatch);
 	svc_tasks_port  = svc_register(SVC_TASKS_NAME,  svc_tasks_dispatch);
 	svc_echool_port = svc_register(SVC_ECHOOL_NAME, svc_echool_dispatch);
+	svc_man_port    = svc_register(SVC_MAN_NAME,    svc_man_dispatch);
 }
