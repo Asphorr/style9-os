@@ -387,6 +387,43 @@ user_range_ok(uint64_t addr, size_t len)
 	return (true);
 }
 
+/*
+ * Shared copyin for a NUL-terminated user string.  Walks up to kbuf_size
+ * bytes from uptr, range-checking every byte under one SMAP bracket and
+ * stopping at the first NUL.  Returns the length (excluding NUL), SYS_E_FAULT
+ * on a bad pointer, or SYS_E_INVAL when no NUL appears in kbuf_size bytes.
+ * The textbook copyin_str the inline copies in sys_spawn et al. predate; the
+ * Darwin dyld backchannel (kern/darwin.c) routes its path argument through it.
+ */
+long
+syscall_copyin_str(const char *uptr, char *kbuf, size_t kbuf_size)
+{
+	uintptr_t	uaddr;
+	size_t		i;
+
+	if (uptr == NULL || kbuf == NULL || kbuf_size == 0)
+		return (SYS_E_FAULT);
+
+	uaddr = (uintptr_t)uptr;
+	if (!user_range_ok((uint64_t)uaddr, 1))
+		return (SYS_E_FAULT);
+
+	smap_user_access_begin();
+	for (i = 0; i < kbuf_size; i++) {
+		if (!user_range_ok((uint64_t)(uaddr + i), 1)) {
+			smap_user_access_end();
+			return (SYS_E_FAULT);
+		}
+		kbuf[i] = uptr[i];
+		if (uptr[i] == '\0') {
+			smap_user_access_end();
+			return ((long)i);
+		}
+	}
+	smap_user_access_end();
+	return (SYS_E_INVAL);	/* no NUL within kbuf_size */
+}
+
 static long
 sys_port_alloc(uint8_t rights)
 {

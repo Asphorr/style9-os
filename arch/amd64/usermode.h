@@ -30,6 +30,18 @@
 #define	USER_STACK_VA	0x4000F000ULL	/* high in the first user page run */
 #define	USER_STACK_TOP	(USER_STACK_VA + 0x1000ULL)
 
+/*
+ * A dynamically-linked Darwin image (figlet et al.) runs with a larger stack
+ * than the single page a style9 ELF gets: real Apple binaries build sizable
+ * frames and probe variable-length allocations via ____chkstk_darwin, which a
+ * 4 KiB stack would overflow.  The region grows down from DARWIN_STACK_TOP,
+ * placed just below the relocated main-image base (MACHO_IMAGE_BASE =
+ * 0x50000000) in the otherwise-empty low user window, clear of the image, dyld
+ * (0x60000000), and the dylibs (0x70000000+).
+ */
+#define	DARWIN_STACK_TOP	0x50000000ULL
+#define	DARWIN_STACK_PAGES	64		/* 256 KiB */
+
 void	usermode_run_first_blob(void);
 
 /*

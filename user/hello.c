@@ -1600,7 +1600,9 @@ demo_macho_spawn(void)
  * Mach-O carrying an LC_BUILD_VERSION naming PLATFORM_MACOS, so the loader
  * tags its task TASK_PERSONALITY_DARWIN and syscall_dispatch routes it
  * through darwin_dispatch.  Then darwinmsg (S3) does a real mach_msg()
- * round-trip on its own port through the same personality.  Each program's
+ * round-trip on its own port through the same personality.  Then dyldhello
+ * (S4) is a real clang/ld64 dynamic Mach-O, entered through our clean-room
+ * dyld, which binds it against our libSystem.  Each program's
  * banner + the kernel's per-call trace appear in the boot transcript; we
  * bounded-yield until each retires.
  */
@@ -1629,6 +1631,53 @@ demo_darwin_spawn(void)
 	for (i = 0; i < 64 && task_alive((uint64_t)child_id); i++)
 		(void)yield();
 	printf("  darwinmsg (Darwin mach_msg) retired after %d yields\n", i);
+
+	child_id = spawn("dyldhello");
+	if (child_id < 0) {
+		printf("  spawn('dyldhello') failed (rv=%ld)\n", child_id);
+		return (90);
+	}
+	for (i = 0; i < 64 && task_alive((uint64_t)child_id); i++)
+		(void)yield();
+	printf("  dyldhello (dyld + libSystem) retired after %d yields\n", i);
+
+	child_id = spawn("dyldbig");
+	if (child_id < 0) {
+		printf("  spawn('dyldbig') failed (rv=%ld)\n", child_id);
+		return (91);
+	}
+	for (i = 0; i < 64 && task_alive((uint64_t)child_id); i++)
+		(void)yield();
+	printf("  dyldbig (real-Apple base 0x100000000, relocated low) retired "
+	    "after %d yields\n", i);
+
+	/*
+	 * The north star: a REAL Apple x86-64 macOS CLI binary (figlet, a
+	 * Homebrew bottle).  Not one of our builds -- a genuine Apple-toolchain
+	 * dynamic Mach-O, relocated low by macho_load, bound by our clean-room
+	 * dyld against our clean-room libSystem (43 imported symbols), running
+	 * its own LC_MAIN.  Spawned with an argument vector so it parses options
+	 * via our getopt and emits through our stdio.
+	 */
+	{
+		mach_port_name_t	figlet_tp;
+		char			*figlet_argv[2];
+
+		figlet_tp = MACH_PORT_NULL;
+		figlet_argv[0] = "figlet";
+		figlet_argv[1] = "hi";
+		printf("  >>> spawning figlet -- a REAL Apple x86-64 macOS "
+		    "binary <<<\n");
+		child_id = spawn_args("figlet", 2, figlet_argv, &figlet_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('figlet') failed (rv=%ld)\n",
+			    child_id);
+			return (92);
+		}
+		for (i = 0; i < 256 && task_alive((uint64_t)child_id); i++)
+			(void)yield();
+		printf("  figlet retired after %d yields\n", i);
+	}
 	return (0);
 }
 

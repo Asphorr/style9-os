@@ -104,6 +104,35 @@ extern uint8_t	_binary_darwinmsg_macho_start[];
 extern uint8_t	_binary_darwinmsg_macho_end[];
 
 /*
+ * S4 dynamic-linking test program: a real clang/ld64.lld dynamic Mach-O that
+ * imports from /usr/lib/libSystem.B.dylib and names /usr/lib/dyld as its
+ * LC_LOAD_DYLINKER.  The launcher maps our clean-room dyld (user/dyld.c)
+ * alongside it and enters through dyld, which binds it against our libSystem.
+ * dyld itself is NOT registered here -- it is the linker, never spawned by name.
+ */
+extern uint8_t	_binary_dyldhello_macho_start[];
+extern uint8_t	_binary_dyldhello_macho_end[];
+
+/*
+ * Load-bias proxy: dyldhello relinked at the default base (__TEXT @
+ * 0x100000000, the addressing of a real Apple binary).  Exercises
+ * macho_load's relocate-low path -- the prerequisite for loading an
+ * arbitrary Apple binary that cannot be relinked at the source.
+ */
+extern uint8_t	_binary_dyldbig_macho_start[];
+extern uint8_t	_binary_dyldbig_macho_end[];
+
+/*
+ * The S5 north star: a REAL Apple x86-64 macOS CLI binary (figlet, a Homebrew
+ * bottle vendored in extern/).  Not one of our own builds -- a genuine
+ * Apple-toolchain dynamic Mach-O (chained fixups, __TEXT @ 0x100000000,
+ * /usr/lib/libSystem.B.dylib only).  macho_load relocates it low, our dyld
+ * binds it against our libSystem, and it runs its own LC_MAIN.
+ */
+extern uint8_t	_binary_figlet_macho_start[];
+extern uint8_t	_binary_figlet_macho_end[];
+
+/*
  * Bridge into the arch-specific user-thread spawn path.  Lives in
  * arch/amd64/usermode.c; declared here so progreg_spawn doesn't have
  * to pull in machine headers.  Returns the new task's t_id or a
@@ -195,6 +224,12 @@ progreg_init(void)
 	    _binary_darwinhello_macho_start, _binary_darwinhello_macho_end);
 	register_one("darwinmsg",
 	    _binary_darwinmsg_macho_start, _binary_darwinmsg_macho_end);
+	register_one("dyldhello",
+	    _binary_dyldhello_macho_start, _binary_dyldhello_macho_end);
+	register_one("dyldbig",
+	    _binary_dyldbig_macho_start, _binary_dyldbig_macho_end);
+	register_one("figlet",
+	    _binary_figlet_macho_start, _binary_figlet_macho_end);
 
 	kprintf("progreg: %zu programs registered\n", nentries);
 }

@@ -131,6 +131,16 @@ struct thread {
 	 * reap (sched_reap_zombies before kfree).
 	 */
 	struct port		*th_exc_ports[EXC_TYPE_COUNT];
+
+	/*
+	 * x87/SSE register file (FXSAVE area), saved/restored by
+	 * thread_switch_asm on every context switch so two ring-3 tasks using
+	 * SSE never clobber each other's XMM/x87 state.  Architecturally 512
+	 * bytes; 16-byte aligned because FXSAVE/FXRSTOR require it (the thread
+	 * is kmalloc'd 16-aligned and the attribute pins this field's offset).
+	 * Seeded to a clean state by fpu_clean_state at create.
+	 */
+	uint8_t			 th_fpu[512] __attribute__((aligned(16)));
 };
 
 extern struct thread		*current_thread;	/* per-CPU later    */
@@ -157,6 +167,7 @@ int		thread_set_exception_ports(struct thread *th,
 		    uint32_t types_mask, struct port *port);
 
 /* defined in switch.S */
-void		thread_switch_asm(uint64_t *old_rsp_save, uint64_t new_rsp);
+void		thread_switch_asm(uint64_t *old_rsp_save, uint64_t new_rsp,
+		    void *old_fpu, void *new_fpu);
 
 #endif /* !_SYS_THREAD_H_ */

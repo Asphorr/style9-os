@@ -18,6 +18,7 @@ param(
     [string] $Disk         = 'D:\style9\os\disk.img',
     [string] $LogFile      = 'D:\style9\os\serial.log',
     [string] $Qemu         = 'C:\Program Files\qemu\qemu-system-x86_64.exe',
+    [string] $Cpu          = 'Penryn',  # macOS x86_64 baseline: SSE4.1, no AVX (ring-3 Darwin bins need it; default qemu64 #UDs)
     [switch] $NoDisk,
     [switch] $KillExisting
 )
@@ -42,6 +43,7 @@ Remove-Item $LogFile -ErrorAction SilentlyContinue
 $logFwd = $LogFile.Replace('\','/')
 
 $qemuArgs = @(
+    '-cpu',     $Cpu,
     '-kernel',  $Kernel,
     '-no-reboot',
     '-serial',  "file:$logFwd"

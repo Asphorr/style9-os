@@ -11,6 +11,7 @@
 
 #include "darwin.h"
 #include "kprintf.h"
+#include "macho.h"
 #include "port.h"
 #include "sched.h"
 #include "syscall.h"
@@ -45,6 +46,36 @@ static long	darwin_unix(struct syscall_frame *f, uint32_t nr);
 static long	darwin_mach(struct syscall_frame *f, uint32_t trap);
 static long	darwin_mach_msg(struct syscall_frame *f);
 static long	darwin_mach_msg_err(long rv, bool sending);
+static long	darwin_style9(struct syscall_frame *f, uint32_t num);
+static long	darwin_s9_map_image(struct syscall_frame *f);
+static bool	darwin_streq(const char *a, const char *b);
+
+/*
+ * The clean-room libSystem.B.dylib (user/libsystem.c), embedded as a Mach-O
+ * blob.  The dyld backchannel maps it by path on demand -- it is the only
+ * dependency the S4 programs name.  objcopy derives these symbols from the
+ * input file name "libSystem.B.dylib" (every non-alphanumeric byte -> '_').
+ * As Tier-1 grows, add a row to darwin_dylibs[] and embed the matching dylib;
+ * dyld + this service already resolve an arbitrary canonical path against the
+ * table, so no linker rewrite is needed -- only more dylibs and more symbols.
+ */
+extern uint8_t	_binary_libSystem_B_dylib_start[];
+extern uint8_t	_binary_libSystem_B_dylib_end[];
+
+#define	DARWIN_DYLIB_PATH_MAX	256
+
+struct darwin_dylib {
+	const char	*dy_path;
+	const uint8_t	*dy_start;
+	const uint8_t	*dy_end;
+};
+
+static const struct darwin_dylib	darwin_dylibs[] = {
+	{ "/usr/lib/libSystem.B.dylib",
+	    _binary_libSystem_B_dylib_start, _binary_libSystem_B_dylib_end },
+};
+
+#define	DARWIN_NDYLIBS	(sizeof(darwin_dylibs) / sizeof(darwin_dylibs[0]))
 
 /* Success: carry clear, `val` in %rax. */
 static long
@@ -79,6 +110,8 @@ darwin_dispatch(struct syscall_frame *f)
 		return (darwin_unix(f, num));
 	case DARWIN_SYSCALL_CLASS_MACH:
 		return (darwin_mach(f, num));
+	case DARWIN_SYSCALL_CLASS_STYLE9:
+		return (darwin_style9(f, num));
 	default:
 		kprintf("darwin: unhandled syscall class %u (nr=0x%llx)\n",
 		    (unsigned)class, (unsigned long long)f->sf_nr);
@@ -238,4 +271,87 @@ darwin_mach_msg(struct syscall_frame *f)
 	kprintf("darwin: MACH mach_msg(option=0x%x) -> KERN_SUCCESS\n",
 	    (unsigned)option);
 	return (darwin_ok(f, DARWIN_MACH_MSG_SUCCESS));
+}
+
+/*
+ * style9-private call gate (class DARWIN_SYSCALL_CLASS_STYLE9), reached only
+ * from our own dyld -- never from a genuine Apple binary.  See darwin.h.
+ */
+static long
+darwin_style9(struct syscall_frame *f, uint32_t num)
+{
+
+	switch (num) {
+	case DARWIN_S9_dyld_map_image:
+		return (darwin_s9_map_image(f));
+	default:
+		kprintf("darwin: unimplemented style9 call %u\n",
+		    (unsigned)num);
+		return (darwin_err(f, DARWIN_ENOSYS));
+	}
+}
+
+/*
+ * map_image(const char *path): map the embedded dylib registered under `path`
+ * into the calling task at its next dylib base, and return that base in %rax.
+ * dyld reads the dependency name out of the main image's LC_LOAD_DYLIB and
+ * hands it here; the kernel owns the actual mapping (it holds the blob + the
+ * VM machinery), which keeps the user/kernel SMAP boundary clean.  Carry set
+ * with 0 in %rax on any failure (unknown path, fault, OOM) so dyld can branch.
+ */
+static long
+darwin_s9_map_image(struct syscall_frame *f)
+{
+	char		path[DARWIN_DYLIB_PATH_MAX];
+	struct task	*t;
+	uint64_t	bias;
+	uint64_t	span;
+	size_t		i;
+	long		n;
+	int		rv;
+
+	t = current_thread->th_task;
+
+	n = syscall_copyin_str((const char *)f->sf_arg0, path, sizeof(path));
+	if (n < 0)
+		return (darwin_err(f, DARWIN_EFAULT));
+
+	for (i = 0; i < DARWIN_NDYLIBS; i++)
+		if (darwin_streq(path, darwin_dylibs[i].dy_path))
+			break;
+	if (i == DARWIN_NDYLIBS) {
+		kprintf("darwin: s9 map_image '%s' -> not registered\n", path);
+		return (darwin_err(f, DARWIN_ENOENT));
+	}
+
+	if (t->t_darwin_dylib_next == 0)
+		t->t_darwin_dylib_next = DARWIN_DYLIB_BASE;
+	bias = t->t_darwin_dylib_next;
+
+	rv = macho_map_dylib(t, darwin_dylibs[i].dy_start,
+	    (size_t)(darwin_dylibs[i].dy_end - darwin_dylibs[i].dy_start),
+	    bias, &span);
+	if (rv != MACHO_E_OK) {
+		kprintf("darwin: s9 map_image '%s' map rv=%d\n", path, rv);
+		return (darwin_err(f, DARWIN_ENOMEM));
+	}
+	t->t_darwin_dylib_next = bias + span;
+
+	kprintf("darwin: s9 map_image '%s' -> base=0x%llx span=0x%llx\n",
+	    path, (unsigned long long)bias, (unsigned long long)span);
+	return (darwin_ok(f, (long)bias));
+}
+
+/* Tiny NUL-terminated string compare for the dylib registry lookup. */
+static bool
+darwin_streq(const char *a, const char *b)
+{
+	size_t	i;
+
+	for (i = 0; ; i++) {
+		if (a[i] != b[i])
+			return (false);
+		if (a[i] == '\0')
+			return (true);
+	}
 }

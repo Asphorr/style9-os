@@ -94,6 +94,16 @@ long	syscall_dispatch(struct syscall_frame *);
 long	syscall_console_write(const char *buf, size_t len);
 
 /*
+ * Copy a NUL-terminated string from user pointer `uptr` into `kbuf` (capacity
+ * `kbuf_size`) under the same user-VA range check + SMAP bracket as the rest of
+ * the syscall surface.  Returns the string length excluding the NUL on success,
+ * SYS_E_FAULT if the pointer leaves the user window, or SYS_E_INVAL if no NUL
+ * appears within `kbuf_size`.  Shared by the native spawn path and the Darwin
+ * personality's dyld backchannel (kern/darwin.c).
+ */
+long	syscall_copyin_str(const char *uptr, char *kbuf, size_t kbuf_size);
+
+/*
  * Mach message send/recv core: user-range-check + SMAP bracket + the
  * matching mach_msg_* call.  Back SYS_MSG_SEND / SYS_MSG_RECV[_TIMED] and
  * the Darwin personality's mach_msg trap (kern/darwin.c).  Return MACH_MSG_OK

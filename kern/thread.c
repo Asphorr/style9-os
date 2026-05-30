@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "fpu.h"
 #include "kmem.h"
 #include "kprintf.h"
 #include "panic.h"
@@ -75,6 +76,8 @@ thread_subsystem_init(void)
 		for (exi = 0; exi < EXC_TYPE_COUNT; exi++)
 			boot->th_exc_ports[exi] = NULL;
 	}
+
+	fpu_clean_state(boot->th_fpu);
 
 	current_thread = boot;
 	task_attach_thread(kernel_task, boot);
@@ -150,6 +153,8 @@ thread_create(struct task *t, void (*entry)(void *), void *arg,
 		for (exi = 0; exi < EXC_TYPE_COUNT; exi++)
 			th->th_exc_ports[exi] = NULL;
 	}
+
+	fpu_clean_state(th->th_fpu);
 
 	/*
 	 * Fake-call frame at the high end of the kstack.  switch.S

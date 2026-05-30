@@ -116,6 +116,15 @@ struct task {
 	 * (a) atomic, set-once semantics; readers use ACQUIRE load.
 	 */
 	volatile bool		 t_killed;
+
+	/*
+	 * Next base VA at which the Darwin dynamic linker's "map image by
+	 * path" backchannel (kern/darwin.c, S4) maps a dylib into this task.
+	 * A bump pointer: 0 until the first map, then DARWIN_DYLIB_BASE and
+	 * upward by each mapped image's page-rounded span.  Touched only by
+	 * this task's own (single-threaded) dyld, so it carries no lock.
+	 */
+	uint64_t		 t_darwin_dylib_next;
 };
 
 extern struct task		*kernel_task;

@@ -25,7 +25,7 @@
  * SYS_SPAWN ABI does not move.
  */
 
-#define	PROGREG_MAX		24
+#define	PROGREG_MAX		32
 #define	PROGREG_NAME_MAX	24
 
 /*

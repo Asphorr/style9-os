@@ -293,7 +293,8 @@ thread_yield(void)
 
 	switch_pmap_if_needed(self, next);
 	switch_user_kstack(next);
-	thread_switch_asm(&self->th_rsp_save, next->th_rsp_save);
+	thread_switch_asm(&self->th_rsp_save, next->th_rsp_save,
+	    self->th_fpu, next->th_fpu);
 
 	/* Resumed: release the lock the OTHER thread acquired before switching. */
 	spin_unlock(&sched_lock);
@@ -384,7 +385,8 @@ thread_block_release(int reason, void *target, struct spinlock *external)
 
 	switch_pmap_if_needed(self, next);
 	switch_user_kstack(next);
-	thread_switch_asm(&self->th_rsp_save, next->th_rsp_save);
+	thread_switch_asm(&self->th_rsp_save, next->th_rsp_save,
+	    self->th_fpu, next->th_fpu);
 
 	/* Woken by thread_wake; release sched_lock and return. */
 	spin_unlock(&sched_lock);
@@ -554,7 +556,8 @@ sched_handoff_zombie(struct thread *self)
 
 	switch_pmap_if_needed(self, next);
 	switch_user_kstack(next);
-	thread_switch_asm(&self->th_rsp_save, next->th_rsp_save);
+	thread_switch_asm(&self->th_rsp_save, next->th_rsp_save,
+	    self->th_fpu, next->th_fpu);
 
 	/* NOTREACHED -- self is zombie. */
 	panic("sched_handoff_zombie: returned from switch");

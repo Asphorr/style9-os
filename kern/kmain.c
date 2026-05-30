@@ -14,6 +14,7 @@
 #include "progreg.h"
 #include "services.h"
 #include "vm.h"
+#include "fpu.h"
 #include "gdt.h"
 #include "idt.h"
 #include "intr.h"
@@ -336,6 +337,13 @@ kmain_memory(uint32_t mb_magic, uint32_t mb_info)
 	port_subsystem_init();
 	bootstrap_init();
 	task_subsystem_init();
+	/*
+	 * Enable SSE/x87 for ring 3 and capture the clean FXSAVE template
+	 * BEFORE any thread exists: thread_subsystem_init's boot thread and
+	 * every thread_create seed th_fpu from it, and the first context
+	 * switch FXRSTORs it.
+	 */
+	fpu_init();
 	thread_subsystem_init();
 	sched_init();
 

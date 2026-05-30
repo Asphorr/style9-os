@@ -42,6 +42,15 @@
 #define	DARWIN_SYSCALL_CLASS_IPC	5	/* IPC                     */
 
 /*
+ * style9-private syscall class -- NOT one of Apple's.  Our clean-room dyld
+ * (user/dyld.c) issues it to ask the kernel to map a dependency by path: the
+ * stand-in for the open()+mmap() / dyld-shared-cache machinery we deliberately
+ * do not have.  A genuine Apple binary never encodes this class; only our own
+ * linker does.  Chosen well clear of Apple's 0..5 so the two cannot collide.
+ */
+#define	DARWIN_SYSCALL_CLASS_STYLE9	0x2A
+
+/*
  * BSD (class 2) call numbers we translate -- Darwin's numbering from
  * bsd/kern/syscalls.master, NOT Linux's.  A class-2 call returns its result
  * in %rax with the carry flag clear, or a positive errno in %rax with carry
@@ -63,11 +72,28 @@
 #define	DARWIN_MACH_mach_msg_trap	31	/* classic combined mach_msg() */
 
 /*
+ * style9-private calls (class DARWIN_SYSCALL_CLASS_STYLE9), issued only by our
+ * dyld.  map_image(const char *path) maps the embedded dylib registered under
+ * `path` into the caller's task and returns the base it landed at in %rax (0 +
+ * carry on failure).
+ */
+#define	DARWIN_S9_dyld_map_image	1
+
+/*
+ * Base VA at which the first dylib is mapped into a Darwin task; further
+ * dylibs bump upward from there (struct task.t_darwin_dylib_next).  Inside the
+ * style9 user-VA window [0x40000000, 0x80000000) and clear of the main image
+ * (0x50000000), dyld (0x60000000), and the user stack (0x4000F000).
+ */
+#define	DARWIN_DYLIB_BASE	0x70000000ULL
+
+/*
  * BSD errno values (Darwin <sys/errno.h>) for the failures we can produce.
  * style9 has no errno of its own -- the kernel speaks MACH_E_* / ELF_E_* --
  * so darwin.c maps its internal failures onto these on the carry-set path.
  */
 #define	DARWIN_EPERM	1
+#define	DARWIN_ENOENT	2
 #define	DARWIN_EBADF	9
 #define	DARWIN_ENOMEM	12
 #define	DARWIN_EFAULT	14

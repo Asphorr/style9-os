@@ -30,6 +30,15 @@ extern uint8_t	user_blob_start[];
 extern uint8_t	user_blob_end[];
 
 /*
+ * The clean-room dynamic linker (user/dyld.c), embedded as a Mach-O blob.
+ * The launcher maps it alongside any image that carries an LC_LOAD_DYLINKER
+ * and enters through it -- see usermode_elf_launcher.  Not a progreg program:
+ * dyld is the linker, never spawned by name.
+ */
+extern uint8_t	_binary_dyld_macho_start[];
+extern uint8_t	_binary_dyld_macho_end[];
+
+/*
  * Boot-time blob path: the very first ring-3 program (a hand-written
  * scrap of asm in arch/amd64/user_blob.S) for early SYS_PRINT/EXIT
  * smoke testing.  Kept around because it is still a viable "no libc"
@@ -295,6 +304,99 @@ build_user_arg_stack(uint64_t kva_base, int argc, char *const *argv)
 }
 
 /*
+ * Materialise the dyld handoff frame for a dynamically-linked Darwin image.
+ * Mirrors the dyld4 _dyld_start contract: %rsp points at the main image's
+ * mach_header, immediately followed by the SysV argument vector, then empty
+ * envp[] and apple[] terminators:
+ *
+ *	[ main mach_header ]	<- returned user %rsp (16-byte aligned)
+ *	[ argc ]
+ *	[ argv[0] ... ]
+ *	[ NULL ]		argv terminator
+ *	[ NULL ]		envp (empty)
+ *	[ NULL ]		apple (empty)
+ *	[ (alignment gap) ]
+ *	[ packed strings ]	<- top of the page
+ *
+ * Our dyld reads main_mh at [rsp], walks its chained fixups, and jumps to the
+ * main LC_MAIN entry.  The string packing is identical to build_user_arg_stack;
+ * only the leading mach_header word and the trailing envp/apple terminators
+ * differ.
+ */
+static uint64_t
+build_dyld_arg_stack(uint64_t kva_base, uint64_t main_mh, uint64_t stack_top,
+    int argc, char *const *argv)
+{
+	uint64_t	argv_uva[SPAWN_ARGV_MAX];
+	uint64_t	rsp;
+	uint64_t	slot;
+	uint64_t	sp;
+	uint64_t	top_base;
+	uint8_t		*dst;
+	const char	*s;
+	size_t		j;
+	size_t		len;
+	int		i;
+	int		nwords;
+
+	if (argc < 0)
+		argc = 0;
+	if (argc > SPAWN_ARGV_MAX)
+		argc = SPAWN_ARGV_MAX;
+
+	/*
+	 * `kva_base` aliases the TOP page of the stack -- [top_base, stack_top)
+	 * -- so every store is addressed relative to top_base.  The whole
+	 * handoff frame (strings + pointer block) lives in that one page; the
+	 * SPAWN_* caps keep it well under 4 KiB, which the KASSERT documents.
+	 */
+	top_base = stack_top - 0x1000;
+
+	/* Pack the argument strings downward from the top of the stack. */
+	sp = stack_top;
+	for (i = 0; i < argc; i++) {
+		s = argv[i];
+		len = spawn_strlen(s) + 1;	/* include the NUL */
+		sp -= len;
+		dst = (uint8_t *)(uintptr_t)(kva_base + (sp - top_base));
+		for (j = 0; j < len; j++)
+			dst[j] = (uint8_t)s[j];
+		argv_uva[i] = sp;
+	}
+
+	/*
+	 * Reserve the handoff block below the strings:
+	 *	mach_header + argc + argv[argc] + argv NULL + envp NULL + apple NULL
+	 * = argc + 5 quadwords.  Align the base (where %rsp lands) down to 16.
+	 */
+	nwords = argc + 5;
+	rsp = sp - (uint64_t)(8 * nwords);
+	rsp &= ~(uint64_t)15;
+
+	KASSERT(rsp >= top_base,
+	    "build_dyld_arg_stack: handoff block underflows the stack top page");
+
+	slot = rsp;
+	*(uint64_t *)(uintptr_t)(kva_base + (slot - top_base)) = main_mh;
+	slot += 8;
+	*(uint64_t *)(uintptr_t)(kva_base + (slot - top_base)) =
+	    (uint64_t)argc;
+	slot += 8;
+	for (i = 0; i < argc; i++) {
+		*(uint64_t *)(uintptr_t)(kva_base + (slot - top_base)) =
+		    argv_uva[i];
+		slot += 8;
+	}
+	*(uint64_t *)(uintptr_t)(kva_base + (slot - top_base)) = 0; /* argv  */
+	slot += 8;
+	*(uint64_t *)(uintptr_t)(kva_base + (slot - top_base)) = 0; /* envp  */
+	slot += 8;
+	*(uint64_t *)(uintptr_t)(kva_base + (slot - top_base)) = 0; /* apple */
+
+	return (rsp);
+}
+
+/*
  * Launcher for a ring-3 program shipped as an embedded image.  Differs
  * from usermode_launcher in that the format loader handles segment
  * mapping and picks the entry RIP off the image header; we only own the
@@ -317,24 +419,39 @@ usermode_elf_launcher(void *arg)
 	struct task		*ut;
 	uint64_t		*kva;
 	uint64_t		 entry;
-	uint64_t		 stack_pa;
 	uint64_t		 ksp;
+	uint64_t		 main_base;
+	uint64_t		 stack_pa;
+	uint64_t		 stack_top;
+	uint64_t		 stack_va;
+	uint64_t		 top_pa;
 	uint64_t		 user_rsp;
 	size_t			 i;
+	size_t			 npages;
+	size_t			 p;
 	uint32_t		 magic;
 	int			 rv;
+	bool			 needs_dyld;
 
 	sa = (struct user_spawn_arg *)arg;
 	ut = current_thread->th_task;
+
+	needs_dyld = false;
+	main_base  = 0;
 
 	magic = sa->sa_image_size >= sizeof(uint32_t) ?
 	    *(const uint32_t *)sa->sa_image : 0;
 	if (magic == MACHO_MAGIC_64 || magic == MACHO_FAT_MAGIC ||
 	    magic == MACHO_FAT_CIGAM) {
-		rv = macho_load(ut, sa->sa_image, sa->sa_image_size, &entry);
+		struct macho_load_result	mres;
+
+		rv = macho_load(ut, sa->sa_image, sa->sa_image_size, &mres);
 		if (rv != MACHO_E_OK)
 			panic("usermode_elf_launcher: macho_load %s rv=%d",
 			    sa->sa_name, rv);
+		entry      = mres.entry;
+		needs_dyld = mres.needs_dyld;
+		main_base  = mres.image_base;
 	} else {
 		rv = elf_load(ut, sa->sa_image, sa->sa_image_size, &entry);
 		if (rv != ELF_E_OK)
@@ -342,28 +459,76 @@ usermode_elf_launcher(void *arg)
 			    sa->sa_name, rv);
 	}
 
-	stack_pa = pmm_alloc_page();
-	if (stack_pa == PA_INVALID)
-		panic("usermode_elf_launcher: stack alloc failed");
-	if (!pmap_enter(ut->t_pmap, USER_STACK_VA, stack_pa,
-	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_USER))
-		panic("usermode_elf_launcher: stack map failed");
-	if (!vm_map_enter(ut->t_map, USER_STACK_VA, 0x1000,
+	/*
+	 * Map the initial user stack.  A dynamically-linked Darwin image gets a
+	 * multi-page stack (DARWIN_STACK_PAGES) growing down from
+	 * DARWIN_STACK_TOP -- real Apple binaries build large and
+	 * variable-length frames (probed by ____chkstk_darwin) that a single
+	 * page would overflow.  Every other image keeps the historical single
+	 * page at USER_STACK_VA.  Pages are allocated one at a time (the pmm is
+	 * page-granular and they need not be contiguous); the handoff frame is
+	 * built entirely within the TOP page, whose kernel alias `kva` the frame
+	 * builders write through.
+	 */
+	if (needs_dyld) {
+		stack_top = DARWIN_STACK_TOP;
+		npages    = DARWIN_STACK_PAGES;
+	} else {
+		stack_top = USER_STACK_TOP;
+		npages    = 1;
+	}
+	stack_va = stack_top - (uint64_t)npages * 0x1000;
+
+	top_pa = PA_INVALID;
+	for (p = 0; p < npages; p++) {
+		uint64_t	page_va;
+
+		page_va  = stack_top - (uint64_t)(p + 1) * 0x1000;
+		stack_pa = pmm_alloc_page();
+		if (stack_pa == PA_INVALID)
+			panic("usermode_elf_launcher: stack alloc failed");
+		if (!pmap_enter(ut->t_pmap, page_va, stack_pa,
+		    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_USER))
+			panic("usermode_elf_launcher: stack map failed");
+		kva = (uint64_t *)pmm_kva_from_pa(stack_pa);
+		for (i = 0; i < 512; i++)
+			kva[i] = 0;
+		if (p == 0)
+			top_pa = stack_pa;	/* TOP page -- carries the frame */
+	}
+	if (!vm_map_enter(ut->t_map, stack_va, (uint64_t)npages * 0x1000,
 	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_USER, VME_F_ANON))
 		panic("usermode_elf_launcher: vm_map_enter stack");
 
-	kva = (uint64_t *)pmm_kva_from_pa(stack_pa);
-	for (i = 0; i < 512; i++)
-		kva[i] = 0;
+	kva = (uint64_t *)pmm_kva_from_pa(top_pa);
 
 	/*
-	 * Lay down argc/argv at the bottom of the freshly zeroed page and
-	 * take the entry %rsp from the builder.  With no command line this
-	 * still produces a (argc=0, argv[0]=NULL) frame just below
-	 * USER_STACK_TOP, so the crt0 entry path is identical either way.
+	 * Resolve the entry RIP and the initial stack.  A dynamically-linked
+	 * Darwin image (LC_LOAD_DYLINKER present) is not entered directly: the
+	 * kernel maps our clean-room dyld alongside it and enters dyld with a
+	 * dyld4-shaped handoff stack carrying the main image's mach_header.
+	 * dyld binds the image, then jumps to its LC_MAIN entry.  Every other
+	 * image -- a style9 ELF, or a non-dynamic Mach-O -- takes the ordinary
+	 * SysV argc/argv frame and is entered at its own RIP.
 	 */
-	user_rsp = build_user_arg_stack((uint64_t)kva, sa->sa_argc,
-	    sa->sa_argv);
+	if (needs_dyld) {
+		struct macho_load_result	dres;
+		const uint8_t			*dyld_img;
+		size_t				 dyld_sz;
+
+		dyld_img = _binary_dyld_macho_start;
+		dyld_sz  = (size_t)(_binary_dyld_macho_end -
+		    _binary_dyld_macho_start);
+		rv = macho_load(ut, dyld_img, dyld_sz, &dres);
+		if (rv != MACHO_E_OK)
+			panic("usermode_elf_launcher: dyld load failed rv=%d", rv);
+		entry    = dres.entry;
+		user_rsp = build_dyld_arg_stack((uint64_t)kva, main_base,
+		    stack_top, sa->sa_argc, sa->sa_argv);
+	} else {
+		user_rsp = build_user_arg_stack((uint64_t)kva, sa->sa_argc,
+		    sa->sa_argv);
+	}
 
 	ksp = (uint64_t)current_thread->th_kstack_base +
 	    current_thread->th_kstack_size;
@@ -393,10 +558,11 @@ usermode_elf_launcher(void *arg)
 	}
 
 	kprintf("usermode: spawn '%s' entry=0x%llx (image=%zu bytes), "
-	    "rsp=0x%llx argc=%d%s\n",
+	    "rsp=0x%llx argc=%d%s%s\n",
 	    sa->sa_name, (unsigned long long)entry, sa->sa_image_size,
 	    (unsigned long long)user_rsp, sa->sa_argc,
-	    sa->sa_inject_port != NULL ? ", parent port injected" : "");
+	    sa->sa_inject_port != NULL ? ", parent port injected" : "",
+	    needs_dyld ? ", via dyld" : "");
 
 	if (sa->sa_argv != NULL)
 		kfree(sa->sa_argv);

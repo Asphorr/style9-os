@@ -116,6 +116,7 @@ task_create(const char *name)
 	t->t_exc_flags   = 0;
 	t->t_killed      = false;
 	t->t_personality = TASK_PERSONALITY_STYLE9;
+	t->t_darwin_dylib_next = 0;
 
 	t->t_port_space = port_space_new();
 	if (t->t_port_space == NULL) {

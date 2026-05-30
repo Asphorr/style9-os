@@ -16,6 +16,11 @@ CC	= gcc
 LD	= ld
 OBJCOPY	= objcopy
 QEMU	= /mnt/c/Program\ Files/qemu/qemu-system-x86_64.exe
+# Emulated CPU.  The macOS x86_64 baseline is Penryn (SSE4.1, no AVX): ring-3
+# Darwin binaries -- our clang/ld64 dyld + real Apple binaries -- assume SSE4.1,
+# which the QEMU default (qemu64) lacks, so an XMM insn #UDs there.  Penryn has
+# no AVX, which keeps the FXSAVE-only FPU context switch (no XSAVE/YMM) correct.
+QEMU_CPU = Penryn
 
 # Directories that contain sources and their public headers.  Listed in
 # include-search order: arch first so e.g. machine/io.h-style headers
@@ -66,6 +71,7 @@ OBJS	= \
 	$(OBJDIR)/pit.o		\
 	$(OBJDIR)/pmap.o	\
 	$(OBJDIR)/smap.o	\
+	$(OBJDIR)/fpu.o		\
 	$(OBJDIR)/syscall_entry.o \
 	$(OBJDIR)/syscall.o	\
 	$(OBJDIR)/usermode.o	\
@@ -130,6 +136,11 @@ OBJS	= \
 	$(OBJDIR)/machotest_fat_macho.o \
 	$(OBJDIR)/darwinhello_macho.o \
 	$(OBJDIR)/darwinmsg_macho.o \
+	$(OBJDIR)/dyld_macho.o \
+	$(OBJDIR)/dyldhello_macho.o \
+	$(OBJDIR)/dyldbig_macho.o \
+	$(OBJDIR)/figlet_macho.o \
+	$(OBJDIR)/libSystem_dylib.o \
 	$(OBJDIR)/ksym.o
 
 all: kernel.elf
@@ -272,6 +283,86 @@ $(OBJDIR)/darwinmsg.elf: $(OBJDIR)/darwinmsg.o $(USER_DIR)/user.ld
 $(OBJDIR)/darwinmsg.macho: $(OBJDIR)/darwinmsg.elf $(ELF2MACHO)
 	$(ELF2MACHO) macos $< $@
 
+# ---- ring-3 programs delivered as DYNAMIC Mach-O (S4: real Darwin toolchain) -
+# S1-S3 rewrap a style9 ELF with elf2macho because the host had no Darwin
+# toolchain.  S4 brings the real one: clang emits Mach-O objects for the
+# x86_64-apple-macos target and ld64.lld links genuine DYNAMIC Mach-Os
+# (LC_LOAD_DYLINKER + LC_LOAD_DYLIB + LC_DYLD_CHAINED_FIXUPS) -- exactly what an
+# Apple binary carries.  They are bound at runtime by our own clean-room dyld
+# (user/dyld.c) against our own libSystem (user/libsystem.c); no Apple bits.
+#
+# Everything is relinked LOW into the style9 user-VA window [0x40000000,
+# 0x80000000) (kern/vm.h): the main exe and the linker via -pagezero_size (the
+# linker is an MH_EXECUTE so the existing loader maps it), each clear of the
+# others and of the user stack at 0x4000F000.  -fixup_chains gives the dyld a
+# single fixup format with no lazy-binding / stub-helper path.
+DARWIN_CC     = clang-18
+DARWIN_LD     = ld64.lld-18
+DARWIN_TARGET = x86_64-apple-macos11
+# SSE is intentionally LEFT ON here (unlike the style9 USER_CFLAGS): the kernel
+# now enables it for ring 3 (fpu_init -> CR4.OSFXSR|OSXMMEXCPT) and saves and
+# restores XMM/x87 per-thread (thread_switch_asm FXSAVE/FXRSTOR), so clang may
+# vectorise freely -- which is also exactly why a real Apple binary's baseline
+# SSE2 will run.  Removing -mno-sse here re-introduces the XMM insns that #UD'd
+# before the FPU rung; their now-clean execution is the proof SSE works.
+DARWIN_CFLAGS = -target $(DARWIN_TARGET) -O2 -fno-builtin -Wall -Wextra
+DARWIN_LDF    = -arch x86_64 -platform_version macos 11.0 11.0 -fixup_chains
+
+DYLD_BASE      = 0x60000000
+DYLDHELLO_BASE = 0x50000000
+
+# clean-room libSystem.B.dylib -- the link-time + runtime dependency of every
+# dynamic program; its -install_name is the path the dyld resolves at runtime.
+$(OBJDIR)/libsystem.dwn.o: $(USER_DIR)/libsystem.c | $(OBJDIR)
+	$(DARWIN_CC) $(DARWIN_CFLAGS) -c $< -o $@
+
+$(OBJDIR)/libSystem.B.dylib: $(OBJDIR)/libsystem.dwn.o
+	$(DARWIN_LD) -dylib $(DARWIN_LDF) -o $@ $< \
+	    -install_name /usr/lib/libSystem.B.dylib -undefined dynamic_lookup
+
+# our dynamic linker: a freestanding MH_EXECUTE at a fixed base, entry _dyld_start.
+$(OBJDIR)/dyld.dwn.o: $(USER_DIR)/dyld.c | $(OBJDIR)
+	$(DARWIN_CC) $(DARWIN_CFLAGS) -c $< -o $@
+
+$(OBJDIR)/dyld.macho: $(OBJDIR)/dyld.dwn.o
+	$(DARWIN_LD) $(DARWIN_LDF) -o $@ $< -e _dyld_start \
+	    -pagezero_size $(DYLD_BASE)
+
+# dyldhello: the dynamic test program -- imports write/exit from libSystem and
+# names /usr/lib/dyld as its LC_LOAD_DYLINKER; entry _entry.
+$(OBJDIR)/dyldhello.dwn.o: $(USER_DIR)/dyldhello.c | $(OBJDIR)
+	$(DARWIN_CC) $(DARWIN_CFLAGS) -c $< -o $@
+
+$(OBJDIR)/dyldhello.macho: $(OBJDIR)/dyldhello.dwn.o $(OBJDIR)/libSystem.B.dylib
+	$(DARWIN_LD) $(DARWIN_LDF) -o $@ $< -L$(OBJDIR) -lSystem.B -e _entry \
+	    -pagezero_size $(DYLDHELLO_BASE)
+
+# dyldbig: dyldhello relinked WITHOUT -pagezero_size, so ld64 gives it the
+# default 4 GiB __PAGEZERO and __TEXT at 0x100000000 -- the exact addressing of
+# a real Apple binary.  It exercises macho_load's load-bias path (relocate-low
+# into the user window), the structural prerequisite for loading an arbitrary
+# Apple binary; everything else is identical to dyldhello.
+$(OBJDIR)/dyldbig.macho: $(OBJDIR)/dyldhello.dwn.o $(OBJDIR)/libSystem.B.dylib
+	$(DARWIN_LD) $(DARWIN_LDF) -o $@ $< -L$(OBJDIR) -lSystem.B -e _entry
+
+# figlet: a REAL Apple x86-64 macOS CLI binary -- a Homebrew bottle, vendored in
+# extern/figlet.macho (NOT built from source).  This is the S5 north-star test:
+# a genuine Apple-toolchain dynamic Mach-O (chained fixups, __TEXT @ 0x100000000,
+# depends only on /usr/lib/libSystem.B.dylib) loaded by macho_load's relocate-low
+# path, bound by our clean-room dyld against our clean-room libSystem, and run.
+# Copied into the build dir so the generic %_macho.o rule embeds it like the rest.
+$(OBJDIR)/figlet.macho: extern/figlet.macho | $(OBJDIR)
+	cp $< $@
+
+# libSystem is embedded so the dyld backchannel (kern/darwin.c) can map it by
+# path -- it is a dependency to bind against, not a program to run, so it gets
+# its own wrap rule (a .dylib, not a .macho).  objcopy derives the symbols
+# _binary_libSystem_B_dylib_{start,end} from the input file name.
+$(OBJDIR)/libSystem_dylib.o: $(OBJDIR)/libSystem.B.dylib
+	cd $(OBJDIR) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386	\
+	    --rename-section .data=.rodata.libSystem_dylib		\
+	    libSystem.B.dylib libSystem_dylib.o
+
 # Wrap a .macho into a kernel-linkable object exposing
 # _binary_<name>_macho_start / _end.  Mirror of the %_elf.o rule.
 $(OBJDIR)/%_macho.o: $(OBJDIR)/%.macho
@@ -356,7 +447,7 @@ $(OBJDIR):
 	mkdir -p $(OBJDIR)
 
 run: kernel.elf
-	$(QEMU) -kernel kernel.elf -no-reboot
+	$(QEMU) -cpu $(QEMU_CPU) -kernel kernel.elf -no-reboot
 
 # `make log` boots the kernel headlessly with debugcon routed to QEMU's
 # stdout, captures it to obj/boot.log via tee, kills QEMU after a short
@@ -368,7 +459,7 @@ LOGSEC	?= 2
 log: kernel.elf
 	@mkdir -p $(OBJDIR)
 	@rm -f $(LOGFILE)
-	@($(QEMU) -kernel kernel.elf -no-reboot -display none			\
+	@($(QEMU) -cpu $(QEMU_CPU) -kernel kernel.elf -no-reboot -display none	\
 	    -serial file:$$PWD/$(LOGFILE) 2>/dev/null &);			\
 	  sleep $(LOGSEC);							\
 	  taskkill.exe /F /IM qemu-system-x86_64.exe >/dev/null 2>&1 || true

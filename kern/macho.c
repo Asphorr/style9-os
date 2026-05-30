@@ -16,13 +16,22 @@
 #include "task.h"
 #include "vm.h"
 
+/*
+ * Where a main image whose linked __TEXT lies outside the user window gets
+ * relocated to (see load_thin).  In [VM_USER_VA_LO, VM_USER_VA_HI) and clear
+ * of dyld (0x60000000), the dylib region (0x70000000+), and the user stack
+ * (0x4000F000); leaves ~256 MiB of headroom below dyld for a large image.
+ */
+#define	MACHO_IMAGE_BASE	0x50000000ULL
+
 static int		load_thin(struct task *target, const uint8_t *image,
-			    size_t image_size, uint64_t *entry_out);
+			    size_t image_size, struct macho_load_result *out);
 static int		load_fat(struct task *target, const uint8_t *image,
-			    size_t image_size, uint64_t *entry_out);
+			    size_t image_size, struct macho_load_result *out);
 static int		load_segment(struct task *target, const uint8_t *image,
 			    size_t image_size,
-			    const struct mach_segment_command_64 *sg);
+			    const struct mach_segment_command_64 *sg,
+			    uint64_t bias);
 static uint32_t		be32(uint32_t v);
 
 /*
@@ -35,22 +44,26 @@ static uint32_t		be32(uint32_t v);
  */
 int
 macho_load(struct task *target, const void *image, size_t image_size,
-    uint64_t *entry_out)
+    struct macho_load_result *out)
 {
 	const uint8_t	*bytes;
 	uint32_t	 magic;
 
-	if (target == NULL || image == NULL || entry_out == NULL)
+	if (target == NULL || image == NULL || out == NULL)
 		return (MACHO_E_TRUNCATED);
 	if (image_size < sizeof(uint32_t))
 		return (MACHO_E_TRUNCATED);
+
+	out->entry      = 0;
+	out->image_base = 0;
+	out->needs_dyld = false;
 
 	bytes = (const uint8_t *)image;
 	magic = *(const uint32_t *)image;
 
 	if (magic == MACHO_FAT_MAGIC || magic == MACHO_FAT_CIGAM)
-		return (load_fat(target, bytes, image_size, entry_out));
-	return (load_thin(target, bytes, image_size, entry_out));
+		return (load_fat(target, bytes, image_size, out));
+	return (load_thin(target, bytes, image_size, out));
 }
 
 /*
@@ -63,7 +76,7 @@ macho_load(struct task *target, const void *image, size_t image_size,
  */
 static int
 load_fat(struct task *target, const uint8_t *image, size_t image_size,
-    uint64_t *entry_out)
+    struct macho_load_result *out)
 {
 	const struct mach_fat_arch	*fa;
 	const struct mach_fat_header	*fh;
@@ -107,7 +120,7 @@ load_fat(struct task *target, const uint8_t *image, size_t image_size,
 		kprintf("macho: fat archive, %u slices -- selected x86_64 "
 		    "at off=%u size=%u\n",
 		    (unsigned)narch, (unsigned)offset, (unsigned)size);
-		return (load_thin(target, image + offset, size, entry_out));
+		return (load_thin(target, image + offset, size, out));
 	}
 
 	return (MACHO_E_BADCPU);	/* no x86-64 slice in this archive */
@@ -118,16 +131,23 @@ load_fat(struct task *target, const uint8_t *image, size_t image_size,
  * walks the load commands bounded by sizeofcmds, maps every LC_SEGMENT_64
  * into the target address space, and resolves the entry point from
  * LC_UNIXTHREAD (rip taken verbatim) or LC_MAIN (entryoff added to the
- * vmaddr of the file-offset-0 segment, i.e. the mach-header base, which is
- * how dyld computes it).  LC_UNIXTHREAD wins if both are present.
+ * mach-header base, which is how dyld computes it).  LC_UNIXTHREAD wins if
+ * both are present.
+ *
+ * An image whose __TEXT is linked outside the user window [VM_USER_VA_LO,
+ * VM_USER_VA_HI) -- e.g. a real Apple binary at 0x100000000, which we cannot
+ * relink at the source -- is relocated wholesale to MACHO_IMAGE_BASE by a load
+ * bias added to every segment vmaddr and to the entry.  Our own
+ * -pagezero_size'd binaries already sit in the window and take a zero bias.
  */
 static int
 load_thin(struct task *target, const uint8_t *image, size_t image_size,
-    uint64_t *entry_out)
+    struct macho_load_result *out)
 {
 	const struct mach_header_64	*mh;
 	uint64_t			 base_vmaddr;
 	uint64_t			 entry;
+	uint64_t			 load_bias;
 	uint64_t			 main_entryoff;
 	size_t				 end;
 	size_t				 off;
@@ -153,6 +173,7 @@ load_thin(struct task *target, const uint8_t *image, size_t image_size,
 
 	base_vmaddr     = 0;
 	entry           = 0;
+	load_bias       = 0;
 	main_entryoff   = 0;
 	darwin_platform = false;
 	have_base       = false;
@@ -183,13 +204,29 @@ load_thin(struct task *target, const uint8_t *image, size_t image_size,
 				return (MACHO_E_BADCMD);
 			sg = (const struct mach_segment_command_64 *)
 			    (image + off);
-			rv = load_segment(target, image, image_size, sg);
-			if (rv != MACHO_E_OK)
-				return (rv);
+			/*
+			 * The first file-offset-0, non-empty segment is __TEXT
+			 * -- the image base.  If its linked vmaddr is outside
+			 * the user window (a real Apple binary lives at
+			 * 0x100000000), relocate the whole image down to
+			 * MACHO_IMAGE_BASE: choose the bias here, before
+			 * mapping __TEXT, so every segment lands biased.  Only
+			 * __PAGEZERO precedes __TEXT and it is never mapped
+			 * (initprot 0), so its zero bias is harmless.  dyld
+			 * re-derives the slide from the biased mach-header we
+			 * report, keeping its chained-fixup walk correct.
+			 */
 			if (sg->fileoff == 0 && sg->filesize > 0 && !have_base) {
-				base_vmaddr = sg->vmaddr;
+				if (sg->vmaddr < VM_USER_VA_LO ||
+				    sg->vmaddr >= VM_USER_VA_HI)
+					load_bias = MACHO_IMAGE_BASE - sg->vmaddr;
+				base_vmaddr = sg->vmaddr + load_bias;
 				have_base   = true;
 			}
+			rv = load_segment(target, image, image_size, sg,
+			    load_bias);
+			if (rv != MACHO_E_OK)
+				return (rv);
 			break;
 		}
 		case MACHO_LC_UNIXTHREAD: {
@@ -230,8 +267,13 @@ load_thin(struct task *target, const uint8_t *image, size_t image_size,
 				darwin_platform = true;
 			break;
 		}
+		case MACHO_LC_LOAD_DYLINKER:
+			if (cmdsize < sizeof(struct mach_dylinker_command))
+				return (MACHO_E_BADCMD);
+			out->needs_dyld = true;
+			break;
 		default:
-			/* LC_LOAD_DYLINKER, LC_SYMTAB, etc.: not needed yet. */
+			/* LC_SYMTAB, LC_DYSYMTAB, LC_UUID, etc.: not needed. */
 			break;
 		}
 
@@ -249,12 +291,14 @@ load_thin(struct task *target, const uint8_t *image, size_t image_size,
 	target->t_personality = darwin_platform ?
 	    TASK_PERSONALITY_DARWIN : TASK_PERSONALITY_STYLE9;
 
+	out->image_base = base_vmaddr;
+
 	if (have_thread) {
-		*entry_out = entry;
+		out->entry = entry + load_bias;
 		return (MACHO_E_OK);
 	}
 	if (have_main && have_base) {
-		*entry_out = base_vmaddr + main_entryoff;
+		out->entry = base_vmaddr + main_entryoff;
 		return (MACHO_E_OK);
 	}
 	return (MACHO_E_NOENTRY);
@@ -262,10 +306,12 @@ load_thin(struct task *target, const uint8_t *image, size_t image_size,
 
 /*
  * Bring one LC_SEGMENT_64 into the target task's address space.  A
- * structural twin of elf.c's load_segment():
+ * structural twin of elf.c's load_segment().  `bias` is added to the
+ * segment's vmaddr before mapping: 0 for an MH_EXECUTE loaded at its linked
+ * address, the load base for a relocatable MH_DYLIB (see macho_map_dylib):
  *	- skip no-access guard segments (__PAGEZERO has initprot 0 and a
  *	  4 GiB vmsize -- mapping it would be both pointless and ruinous),
- *	- round [vmaddr, vmaddr+vmsize) out to whole pages,
+ *	- round [bias+vmaddr, bias+vmaddr+vmsize) out to whole pages,
  *	- allocate + map each page U=1 with R/W/X from initprot,
  *	- zero the freshly-allocated frame (covers the bss tail where
  *	  vmsize > filesize),
@@ -276,9 +322,10 @@ load_thin(struct task *target, const uint8_t *image, size_t image_size,
  */
 static int
 load_segment(struct task *target, const uint8_t *image, size_t image_size,
-    const struct mach_segment_command_64 *sg)
+    const struct mach_segment_command_64 *sg, uint64_t bias)
 {
 	uint64_t	va, va_start, va_end;
+	uint64_t	seg_va;
 	uint64_t	pa;
 	uint64_t	src_off;
 	uint64_t	remaining;
@@ -295,7 +342,8 @@ load_segment(struct task *target, const uint8_t *image, size_t image_size,
 		return (MACHO_E_BADCMD);
 	if (sg->fileoff + sg->filesize > image_size)
 		return (MACHO_E_TRUNCATED);
-	if (sg->vmaddr + sg->vmsize < sg->vmaddr)
+	seg_va = bias + sg->vmaddr;
+	if (seg_va + sg->vmsize < seg_va)
 		return (MACHO_E_BADCMD);
 
 	prot = VM_PROT_USER;
@@ -306,8 +354,8 @@ load_segment(struct task *target, const uint8_t *image, size_t image_size,
 	if (sg->initprot & MACHO_VM_PROT_EXECUTE)
 		prot |= VM_PROT_EXEC;
 
-	va_start = sg->vmaddr & ~(uint64_t)PAGE_MASK;
-	va_end   = (sg->vmaddr + sg->vmsize + PAGE_MASK) &
+	va_start = seg_va & ~(uint64_t)PAGE_MASK;
+	va_end   = (seg_va + sg->vmsize + PAGE_MASK) &
 	    ~(uint64_t)PAGE_MASK;
 
 	for (va = va_start; va < va_end; va += PAGE_SIZE) {
@@ -329,7 +377,7 @@ load_segment(struct task *target, const uint8_t *image, size_t image_size,
 
 	src_off   = sg->fileoff;
 	remaining = sg->filesize;
-	cur_va    = sg->vmaddr;
+	cur_va    = seg_va;
 
 	while (remaining > 0) {
 		page_off = cur_va & PAGE_MASK;
@@ -350,6 +398,83 @@ load_segment(struct task *target, const uint8_t *image, size_t image_size,
 		remaining -= chunk;
 	}
 
+	return (MACHO_E_OK);
+}
+
+/*
+ * Map a relocatable MH_DYLIB into `target` at `bias`.  Validates the header,
+ * walks the load commands, and drops every LC_SEGMENT_64 at bias+vmaddr via
+ * the shared load_segment (so __LINKEDIT -- carrying the export trie + chained
+ * fixups our dyld reads back -- is mapped just like __TEXT).  No entry point,
+ * no LC_MAIN, no personality stamp: a dylib is data to be bound into an
+ * already-running task, not a program to enter.  *out_span gets the page-
+ * rounded VA span consumed from `bias` so the caller can place the next dylib.
+ */
+int
+macho_map_dylib(struct task *target, const void *image, size_t image_size,
+    uint64_t bias, uint64_t *out_span)
+{
+	const struct mach_header_64	*mh;
+	const uint8_t			*bytes;
+	uint64_t			 span_end;
+	size_t				 end;
+	size_t				 off;
+	uint32_t			 i;
+	int				 rv;
+
+	if (target == NULL || image == NULL || out_span == NULL)
+		return (MACHO_E_TRUNCATED);
+	if (image_size < sizeof(*mh))
+		return (MACHO_E_TRUNCATED);
+
+	bytes = (const uint8_t *)image;
+	mh = (const struct mach_header_64 *)image;
+	if (mh->magic != MACHO_MAGIC_64)
+		return (MACHO_E_BADMAG);
+	if (mh->cputype != MACHO_CPU_TYPE_X86_64)
+		return (MACHO_E_BADCPU);
+	if (mh->filetype != MACHO_MH_DYLIB)
+		return (MACHO_E_BADTYPE);
+	if ((uint64_t)sizeof(*mh) + mh->sizeofcmds > image_size)
+		return (MACHO_E_TRUNCATED);
+
+	span_end = bias;
+	end = sizeof(*mh) + mh->sizeofcmds;
+	off = sizeof(*mh);
+
+	for (i = 0; i < mh->ncmds; i++) {
+		const struct mach_load_command	*lc;
+		uint32_t			 cmd;
+		uint32_t			 cmdsize;
+
+		if (off + sizeof(*lc) > end)
+			return (MACHO_E_BADCMD);
+		lc      = (const struct mach_load_command *)(bytes + off);
+		cmd     = lc->cmd;
+		cmdsize = lc->cmdsize;
+		if (cmdsize < sizeof(*lc) || off + cmdsize > end)
+			return (MACHO_E_BADCMD);
+
+		if (cmd == MACHO_LC_SEGMENT_64) {
+			const struct mach_segment_command_64	*sg;
+			uint64_t				 seg_end;
+
+			if (cmdsize < sizeof(*sg))
+				return (MACHO_E_BADCMD);
+			sg = (const struct mach_segment_command_64 *)
+			    (bytes + off);
+			rv = load_segment(target, bytes, image_size, sg, bias);
+			if (rv != MACHO_E_OK)
+				return (rv);
+			seg_end = bias + sg->vmaddr + sg->vmsize;
+			if (seg_end > span_end)
+				span_end = seg_end;
+		}
+
+		off += cmdsize;
+	}
+
+	*out_span = (span_end - bias + PAGE_MASK) & ~(uint64_t)PAGE_MASK;
 	return (MACHO_E_OK);
 }
 
