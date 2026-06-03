@@ -34,4 +34,14 @@
 
 void	ata_drv_init(void);
 
+/*
+ * Direct kernel-side block read, bypassing the Mach device protocol -- the
+ * in-kernel filesystem (kern/fs_fat.c) reads sectors with this rather than
+ * messaging its own disk service from inside the kernel.  Reads `count`
+ * sectors at `lba` from drive `drive_idx` (0 = first ATA drive detected) into
+ * `buf`.  Returns 0 on success or a positive MACH_E_* (no such drive, I/O
+ * error, LBA out of range).
+ */
+int	ata_kread(unsigned drive_idx, uint64_t lba, uint32_t count, void *buf);
+
 #endif /* !_SYS_ATA_DRV_H_ */

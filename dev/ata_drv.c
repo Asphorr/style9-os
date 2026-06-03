@@ -775,6 +775,21 @@ ata_sync(struct ata_drive *d)
 	return (MACH_MSG_OK);
 }
 
+/*
+ * Kernel-facing block read.  The in-kernel filesystem runs in the kernel and
+ * has no reason to message its own disk service, so it reaches the PIO path
+ * directly through here.  Bounds the drive index and presence; ata_read does
+ * the LBA range check.
+ */
+int
+ata_kread(unsigned drive_idx, uint64_t lba, uint32_t count, void *buf)
+{
+
+	if (drive_idx >= ATA_NDRIVES_MAX || !drives[drive_idx].d_present)
+		return (MACH_E_DEAD);
+	return (ata_read(&drives[drive_idx], lba, count, buf));
+}
+
 /* ---- helpers ------------------------------------------------------- */
 
 static void

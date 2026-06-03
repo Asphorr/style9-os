@@ -10,6 +10,9 @@
 #include <stdint.h>
 
 #include "darwin.h"
+#include "fs_fat.h"
+#include "host.h"
+#include "kmem.h"
 #include "kprintf.h"
 #include "macho.h"
 #include "port.h"
@@ -48,6 +51,9 @@ static long	darwin_mach_msg(struct syscall_frame *f);
 static long	darwin_mach_msg_err(long rv, bool sending);
 static long	darwin_style9(struct syscall_frame *f, uint32_t num);
 static long	darwin_s9_map_image(struct syscall_frame *f);
+static long	darwin_s9_fs_stat(struct syscall_frame *f);
+static long	darwin_s9_fs_readdir(struct syscall_frame *f);
+static long	darwin_s9_uname(struct syscall_frame *f);
 static bool	darwin_streq(const char *a, const char *b);
 
 /*
@@ -120,6 +126,35 @@ darwin_dispatch(struct syscall_frame *f)
 }
 
 /*
+ * Darwin open-file table helpers.  fds 0..2 are the std streams (handled
+ * without a slot); real files occupy slots 3..DARWIN_NOFILE-1 of the task's
+ * table.  darwin_fd_alloc returns a free fd or -1; darwin_fd_slot resolves an
+ * fd to its open slot or NULL.
+ */
+static int
+darwin_fd_alloc(struct task *t)
+{
+	int	i;
+
+	for (i = 3; i < DARWIN_NOFILE; i++) {
+		if (!t->t_darwin_files[i].of_used)
+			return (i);
+	}
+	return (-1);
+}
+
+static struct darwin_ofile *
+darwin_fd_slot(struct task *t, int fd)
+{
+
+	if (fd < 3 || fd >= DARWIN_NOFILE)
+		return (NULL);
+	if (!t->t_darwin_files[fd].of_used)
+		return (NULL);
+	return (&t->t_darwin_files[fd]);
+}
+
+/*
  * Class 2: the BSD/Unix call gate.  Arguments are already in sf_arg0..5 in
  * the right order, so each case just hands them to the style9 primitive.
  */
@@ -139,8 +174,6 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		    (size_t)f->sf_arg2);
 		if (rv < 0)
 			return (darwin_err(f, DARWIN_EFAULT));
-		kprintf("darwin: UNIX write(fd=%d, %ld bytes) -> %ld\n",
-		    fd, (long)f->sf_arg2, rv);
 		return (darwin_ok(f, rv));
 	}
 	case DARWIN_SYS_getpid: {
@@ -156,6 +189,126 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		thread_exit();
 		/* NOTREACHED */
 		return (darwin_ok(f, 0));
+	case DARWIN_SYS_open: {
+		char		 path[256];
+		struct task	*t;
+		uint8_t		*buf;
+		uint32_t	 size;
+		long		 len;
+		int		 fd;
+		int		 rv;
+
+		/* Read-only FS: the O_* flags (sf_arg1) and mode are ignored. */
+		len = syscall_copyin_str((const char *)f->sf_arg0, path,
+		    sizeof(path));
+		if (len < 0) {
+			kprintf("darwin: open: bad path pointer\n");
+			return (darwin_err(f, DARWIN_EFAULT));
+		}
+
+		rv = fs_fat_slurp(path, &buf, &size);
+		if (rv != FS_FAT_E_OK) {
+			kprintf("darwin: open('%s') -> fs_fat rv=%d\n",
+			    path, rv);
+			if (rv == FS_FAT_E_NOTFOUND || rv == FS_FAT_E_NOMOUNT)
+				return (darwin_err(f, DARWIN_ENOENT));
+			if (rv == FS_FAT_E_NOMEM || rv == FS_FAT_E_TOOBIG)
+				return (darwin_err(f, DARWIN_ENOMEM));
+			return (darwin_err(f, DARWIN_EIO));
+		}
+
+		t  = current_thread->th_task;
+		fd = darwin_fd_alloc(t);
+		if (fd < 0) {
+			kfree(buf);
+			return (darwin_err(f, DARWIN_EMFILE));
+		}
+		t->t_darwin_files[fd].of_buf  = buf;
+		t->t_darwin_files[fd].of_size = size;
+		t->t_darwin_files[fd].of_off  = 0;
+		t->t_darwin_files[fd].of_used = true;
+		kprintf("darwin: UNIX open('%s') -> fd=%d (%u bytes)\n",
+		    path, fd, (unsigned)size);
+		return (darwin_ok(f, fd));
+	}
+	case DARWIN_SYS_read: {
+		struct darwin_ofile	*of;
+		struct task		*t;
+		uint32_t		 avail;
+		size_t			 n;
+		long			 rv;
+		int			 fd;
+
+		fd = (int)f->sf_arg0;
+		n  = (size_t)f->sf_arg2;
+		if (fd == 0)			/* stdin: nothing to read -> EOF */
+			return (darwin_ok(f, 0));
+		t  = current_thread->th_task;
+		of = darwin_fd_slot(t, fd);
+		if (of == NULL)
+			return (darwin_err(f, DARWIN_EBADF));
+
+		avail = of->of_size - of->of_off;
+		if (n > (size_t)avail)
+			n = avail;
+		if (n > 0) {
+			rv = syscall_copyout((void *)f->sf_arg1,
+			    of->of_buf + of->of_off, n);
+			if (rv != 0)
+				return (darwin_err(f, DARWIN_EFAULT));
+			of->of_off += (uint32_t)n;
+		}
+		return (darwin_ok(f, (long)n));
+	}
+	case DARWIN_SYS_close: {
+		struct darwin_ofile	*of;
+		struct task		*t;
+		int			 fd;
+
+		fd = (int)f->sf_arg0;
+		if (fd >= 0 && fd <= 2)		/* std streams: no backing */
+			return (darwin_ok(f, 0));
+		t  = current_thread->th_task;
+		of = darwin_fd_slot(t, fd);
+		if (of == NULL)
+			return (darwin_err(f, DARWIN_EBADF));
+		kfree(of->of_buf);
+		of->of_buf  = NULL;
+		of->of_size = 0;
+		of->of_off  = 0;
+		of->of_used = false;
+		return (darwin_ok(f, 0));
+	}
+	case DARWIN_SYS_lseek: {
+		struct darwin_ofile	*of;
+		struct task		*t;
+		int64_t			 base;
+		int64_t			 off;
+		int64_t			 pos;
+		int			 fd;
+		int			 whence;
+
+		fd     = (int)f->sf_arg0;
+		off    = (int64_t)f->sf_arg1;
+		whence = (int)f->sf_arg2;
+		t  = current_thread->th_task;
+		of = darwin_fd_slot(t, fd);
+		if (of == NULL)
+			return (darwin_err(f, DARWIN_EBADF));
+
+		switch (whence) {
+		case 0:	base = 0;				break; /* SET */
+		case 1:	base = (int64_t)of->of_off;		break; /* CUR */
+		case 2:	base = (int64_t)of->of_size;		break; /* END */
+		default:
+			return (darwin_err(f, DARWIN_EINVAL));
+		}
+		pos = base + off;
+		if (pos < 0 || pos > (int64_t)of->of_size)
+			return (darwin_err(f, DARWIN_EINVAL));
+		of->of_off = (uint32_t)pos;
+		return (darwin_ok(f, (long)pos));
+	}
 	default:
 		kprintf("darwin: unimplemented BSD syscall %u\n",
 		    (unsigned)nr);
@@ -177,6 +330,22 @@ darwin_mach(struct syscall_frame *f, uint32_t trap)
 		kprintf("darwin: MACH task_self_trap() -> name=%u\n",
 		    (unsigned)MACH_PORT_TASK_SELF);
 		return (darwin_ok(f, (long)MACH_PORT_TASK_SELF));
+	case DARWIN_MACH_host_self_trap: {
+		mach_port_name_t	n;
+
+		/*
+		 * Install a fresh SEND right to the kernel's host port in the
+		 * caller's space and hand back the name.  MACH_PORT_NULL on
+		 * failure (host_init has not run / table full), matching the
+		 * port-returning-trap convention task_self_trap uses.
+		 */
+		n = MACH_PORT_NULL;
+		(void)host_self_acquire(current_thread->th_task->t_port_space,
+		    &n);
+		kprintf("darwin: MACH host_self_trap() -> name=%u\n",
+		    (unsigned)n);
+		return (darwin_ok(f, (long)n));
+	}
 	case DARWIN_MACH_mach_reply_port: {
 		mach_port_name_t	n;
 
@@ -284,6 +453,12 @@ darwin_style9(struct syscall_frame *f, uint32_t num)
 	switch (num) {
 	case DARWIN_S9_dyld_map_image:
 		return (darwin_s9_map_image(f));
+	case DARWIN_S9_fs_stat:
+		return (darwin_s9_fs_stat(f));
+	case DARWIN_S9_fs_readdir:
+		return (darwin_s9_fs_readdir(f));
+	case DARWIN_S9_uname:
+		return (darwin_s9_uname(f));
 	default:
 		kprintf("darwin: unimplemented style9 call %u\n",
 		    (unsigned)num);
@@ -340,6 +515,96 @@ darwin_s9_map_image(struct syscall_frame *f)
 	kprintf("darwin: s9 map_image '%s' -> base=0x%llx span=0x%llx\n",
 	    path, (unsigned long long)bias, (unsigned long long)span);
 	return (darwin_ok(f, (long)bias));
+}
+
+/*
+ * fs_stat(const char *path, struct fs_fat_statbuf *out): existence + size +
+ * type + inode probe behind libSystem's stat$INODE64.  Copies the small
+ * fs_fat_statbuf out to the caller and returns 0 (carry clear) if the file is
+ * present, carry set otherwise.  The kernel reports only this neutral struct;
+ * libSystem turns it into Apple's struct stat, so the macOS ABI layout stays
+ * out of the kernel.
+ */
+static long
+darwin_s9_fs_stat(struct syscall_frame *f)
+{
+	char			path[256];
+	struct fs_fat_statbuf	sb;
+	long			n;
+	int			rv;
+
+	n = syscall_copyin_str((const char *)f->sf_arg0, path, sizeof(path));
+	if (n < 0)
+		return (darwin_err(f, DARWIN_EFAULT));
+
+	rv = fs_fat_stat2(path, &sb);
+	if (rv != FS_FAT_E_OK)
+		return (darwin_err(f, DARWIN_ENOENT));
+	if (syscall_copyout((void *)f->sf_arg1, &sb, sizeof(sb)) != 0)
+		return (darwin_err(f, DARWIN_EFAULT));
+	return (darwin_ok(f, 0));
+}
+
+/*
+ * fs_readdir(const char *path, uint32_t index, struct fs_fat_dirent *out):
+ * fill *out with the index-th entry of the directory at `path`, behind
+ * libSystem's opendir/readdir.  Returns 1 in %rax when an entry was written, 0
+ * at end-of-directory (carry clear either way), carry set on error.  The
+ * kernel keeps no per-fd cursor: each call re-resolves and re-scans to
+ * `index`, which is cheap for the small read-only directories this serves.
+ */
+static long
+darwin_s9_fs_readdir(struct syscall_frame *f)
+{
+	char			path[256];
+	struct fs_fat_dirent	de;
+	long			n;
+	int			rv;
+
+	n = syscall_copyin_str((const char *)f->sf_arg0, path, sizeof(path));
+	if (n < 0)
+		return (darwin_err(f, DARWIN_EFAULT));
+
+	rv = fs_fat_readdir(path, (uint32_t)f->sf_arg1, &de);
+	if (rv < 0)
+		return (darwin_err(f, DARWIN_ENOENT));
+	if (rv == 0)
+		return (darwin_ok(f, 0));		/* end of directory */
+	if (syscall_copyout((void *)f->sf_arg2, &de, sizeof(de)) != 0)
+		return (darwin_err(f, DARWIN_EFAULT));
+	return (darwin_ok(f, 1));
+}
+
+/*
+ * The fabricated Darwin identity this kernel reports through uname().  None of
+ * it is "real" -- style9 is not XNU -- but a libSystem-only CLI tool cannot
+ * tell: it calls uname(2) and prints whatever comes back, never validating it.
+ * The release (23.x == macOS 14 Sonoma) and machine name a plausible x86-64
+ * Mac; the version banner is branded style9 so the lie is at least honest about
+ * its provenance.  The hostname matches libSystem's gethostname() ("style9").
+ */
+static const struct darwin_uname	darwin_uname_id = {
+	"Darwin",
+	"style9",
+	"23.6.0",
+	"Darwin Kernel Version 23.6.0: style9 clean-room; "
+	    "root:xnu-style9/RELEASE_X86_64",
+	"x86_64",
+};
+
+/*
+ * uname(struct darwin_uname *out): copy the identity card out to the caller.
+ * libSystem reshapes it into Apple's struct utsname.  Returns 0 (carry clear);
+ * carry set only if the destination pointer faults.
+ */
+static long
+darwin_s9_uname(struct syscall_frame *f)
+{
+
+	if (syscall_copyout((void *)f->sf_arg0, &darwin_uname_id,
+	    sizeof(darwin_uname_id)) != 0)
+		return (darwin_err(f, DARWIN_EFAULT));
+	return (darwin_ok(f, 0));
 }
 
 /* Tiny NUL-terminated string compare for the dylib registry lookup. */

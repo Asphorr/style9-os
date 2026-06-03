@@ -510,6 +510,9 @@ typedef int (*port_service_fn)(const struct mach_msg_header *req,
  * Reply layouts are pinned by _Static_assert in this header.
  */
 #define	TASK_OP_GET_INFO		1
+#define	TASK_OP_VM_ALLOCATE		2
+#define	TASK_OP_VM_DEALLOCATE		3
+#define	TASK_OP_GET_SPECIAL_PORT	4
 
 /*
  * Reply payload for TASK_OP_GET_INFO.  Sits right after the
@@ -525,6 +528,71 @@ struct task_info_reply {
 
 _Static_assert(sizeof(struct task_info_reply) == 48,
     "task_info_reply must be 48 bytes (wire format)");
+
+/*
+ * TASK_OP_VM_ALLOCATE / TASK_OP_VM_DEALLOCATE wire format.  Expose the
+ * SYS_VM_ALLOCATE anonymous-range allocator through the task port the way
+ * a Darwin binary reaches mach_vm_allocate: the request rides inline after
+ * the header; the reply carries an in-band status (the allocation can fail
+ * even when the message machinery succeeds) plus the chosen VA.
+ */
+/* WIRE FORMAT.  ABI-stable. */
+struct task_vm_allocate_request {
+	uint64_t	tva_size;	/* bytes; kernel page-rounds  */
+	uint32_t	tva_prot;	/* VM_PROT_* (READ/WRITE/EXEC) */
+	uint32_t	tva_pad;
+};
+
+_Static_assert(sizeof(struct task_vm_allocate_request) == 16,
+    "task_vm_allocate_request must be 16 bytes (wire format)");
+
+/* WIRE FORMAT.  ABI-stable. */
+struct task_vm_allocate_reply {
+	uint64_t	tvar_address;	/* allocated VA, 0 on failure */
+	int32_t		tvar_status;	/* MACH_MSG_OK or a MACH_E_*   */
+	uint32_t	tvar_pad;
+};
+
+_Static_assert(sizeof(struct task_vm_allocate_reply) == 16,
+    "task_vm_allocate_reply must be 16 bytes (wire format)");
+
+/* WIRE FORMAT.  ABI-stable. */
+struct task_vm_deallocate_request {
+	uint64_t	tvd_address;	/* base VA to release          */
+	uint64_t	tvd_size;	/* byte length (page-rounded)  */
+};
+
+_Static_assert(sizeof(struct task_vm_deallocate_request) == 16,
+    "task_vm_deallocate_request must be 16 bytes (wire format)");
+
+/* WIRE FORMAT.  ABI-stable. */
+struct task_vm_deallocate_reply {
+	int32_t		tvdr_status;	/* MACH_MSG_OK or a MACH_E_*   */
+	uint32_t	tvdr_pad;
+};
+
+_Static_assert(sizeof(struct task_vm_deallocate_reply) == 8,
+    "task_vm_deallocate_reply must be 8 bytes (wire format)");
+
+/*
+ * TASK_OP_GET_SPECIAL_PORT: ask a task port to hand back a SEND right to a
+ * well-known special port named by `tsp_which`.  The reply is COMPLEX and
+ * carries one port_descriptor (like a bootstrap lookup); a non-complex
+ * reply means the which was unknown / unavailable.  Indices mirror XNU's
+ * task_get_special_port() numbering -- 1/3 (kernel, name) are reserved for
+ * a later increment, so the sparseness is deliberate.
+ */
+#define	TASK_SPECIAL_HOST		2	/* the host port      */
+#define	TASK_SPECIAL_BOOTSTRAP		4	/* the bootstrap port */
+
+/* WIRE FORMAT.  ABI-stable. */
+struct task_special_port_request {
+	uint32_t	tsp_which;	/* TASK_SPECIAL_* */
+	uint32_t	tsp_pad;
+};
+
+_Static_assert(sizeof(struct task_special_port_request) == 8,
+    "task_special_port_request must be 8 bytes (wire format)");
 
 /* Opaque kernel objects. */
 struct port;

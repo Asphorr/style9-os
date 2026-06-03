@@ -52,6 +52,22 @@ struct vm_map;
 #define	TASK_PERSONALITY_STYLE9	0
 #define	TASK_PERSONALITY_DARWIN	1
 
+/*
+ * Per-task open-file table for the Darwin file syscalls (open/read/close/
+ * lseek, kern/darwin.c).  A file opened by a TASK_PERSONALITY_DARWIN task is
+ * slurped whole from the read-only FS into of_buf at open() time; read/lseek
+ * move of_off over it; close frees of_buf.  fds 0..2 are the std streams
+ * (handled without a slot); real files occupy slots 3..DARWIN_NOFILE-1.
+ */
+#define	DARWIN_NOFILE	16
+
+struct darwin_ofile {
+	uint8_t		*of_buf;	/* kmalloc'd file image, or NULL */
+	uint32_t	 of_size;	/* valid bytes in of_buf         */
+	uint32_t	 of_off;	/* current read cursor           */
+	bool		 of_used;	/* slot occupied                 */
+};
+
 struct task {
 	struct spinlock		 t_lock;
 	uint64_t		 t_id;		/* (c) printable id        */
@@ -125,6 +141,14 @@ struct task {
 	 * this task's own (single-threaded) dyld, so it carries no lock.
 	 */
 	uint64_t		 t_darwin_dylib_next;
+
+	/*
+	 * Open files for the Darwin file syscalls (see struct darwin_ofile).
+	 * Zeroed at task_create; any buffers still open are freed on task
+	 * teardown (task_deref).  Indexed by fd; slots 0..2 stay empty (the
+	 * std streams need no backing).
+	 */
+	struct darwin_ofile	 t_darwin_files[DARWIN_NOFILE];
 };
 
 extern struct task		*kernel_task;

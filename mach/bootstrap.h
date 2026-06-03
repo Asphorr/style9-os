@@ -96,6 +96,12 @@ _Static_assert(sizeof(struct bootstrap_status_reply) == 8,
  * the well-known SEND at name 2). */
 void		bootstrap_init(void);
 
+/* Publish a persistent kernel_space SEND for the bootstrap port (so
+ * task_get_special_port can hand it out).  MUST run after
+ * task_subsystem_init so it does not steal kernel_space's well-known low
+ * names (TASK_SELF=1, BOOTSTRAP=2).  Idempotent. */
+void		bootstrap_publish(void);
+
 /* Make `name` resolve to the port currently bound at `kernel_name` in
  * kernel_space.  Stores the name; caller is responsible for keeping
  * that kernel name valid for the lifetime of the registration.  Returns
@@ -116,6 +122,11 @@ int		bootstrap_unregister(const char *name,
 /* Returns the port object backing the bootstrap port -- used by
  * port_install_bootstrap to take a fresh SEND ref into a task's space. */
 struct port	*bootstrap_get_port(void);
+
+/* Persistent kernel_space SEND name for the bootstrap port (minted in
+ * bootstrap_init).  task_get_special_port COPY_SENDs it to hand the
+ * bootstrap port to a task; MACH_PORT_NULL before bootstrap_init. */
+mach_port_name_t bootstrap_get_kernel_name(void);
 
 /* Synchronous dispatcher for incoming bootstrap_port messages.
  * Called from mach_msg_send when dest->p_special == PORT_SPECIAL_BOOTSTRAP. */

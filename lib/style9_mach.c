@@ -253,3 +253,202 @@ bootstrap_deregister_service(const char *service)
 		return (rv);
 	return ((int)reply.body.bsr_status);
 }
+
+/*
+ * mach_host_self: acquire a SEND right to the kernel host port.  Native
+ * tasks reach it through the bootstrap registry just like any other
+ * service; the Darwin host_self_trap is the equivalent for genuine
+ * binaries.  Returns MACH_PORT_NULL on any failure.
+ */
+mach_port_name_t
+mach_host_self(void)
+{
+
+	return (bootstrap_lookup(SVC_HOST_NAME));
+}
+
+/*
+ * host_page_size: RPC HOST_OP_PAGE_SIZE to the host port and write the
+ * machine page size through *page_size_out.  Returns MACH_MSG_OK or a
+ * MACH_E_* code.
+ */
+int
+host_page_size(mach_port_name_t host, uint32_t *page_size_out)
+{
+	struct mach_msg_header	req;
+	struct {
+		struct mach_msg_header		hdr;
+		struct svc_host_page_size_reply	body;
+	} reply;
+	int	rv;
+
+	if (page_size_out == NULL)
+		return (MACH_E_INVAL);
+
+	req.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	req.msgh_size    = sizeof(req);
+	req.msgh_remote  = host;
+	req.msgh_local   = MACH_PORT_NULL;
+	req.msgh_voucher = 0;
+	req.msgh_id      = HOST_OP_PAGE_SIZE;
+
+	rv = mach_msg_rpc(&req, &reply.hdr, sizeof(reply), 1000);
+	if (rv != MACH_MSG_OK)
+		return (rv);
+	*page_size_out = reply.body.hps_page_size;
+	return (MACH_MSG_OK);
+}
+
+/*
+ * host_info: RPC HOST_OP_INFO to the host port and fill *out with the
+ * machine snapshot (cpu count + type, total + free memory).  Returns
+ * MACH_MSG_OK or a MACH_E_* code.
+ */
+int
+host_info(mach_port_name_t host, struct svc_host_info_reply *out)
+{
+	struct mach_msg_header	req;
+	struct {
+		struct mach_msg_header		hdr;
+		struct svc_host_info_reply	body;
+	} reply;
+	int	rv;
+
+	if (out == NULL)
+		return (MACH_E_INVAL);
+
+	req.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	req.msgh_size    = sizeof(req);
+	req.msgh_remote  = host;
+	req.msgh_local   = MACH_PORT_NULL;
+	req.msgh_voucher = 0;
+	req.msgh_id      = HOST_OP_INFO;
+
+	rv = mach_msg_rpc(&req, &reply.hdr, sizeof(reply), 1000);
+	if (rv != MACH_MSG_OK)
+		return (rv);
+	*out = reply.body;
+	return (MACH_MSG_OK);
+}
+
+/*
+ * task_vm_allocate: RPC TASK_OP_VM_ALLOCATE to a task port and write the
+ * allocated VA through *addr_out.  `task` is MACH_PORT_TASK_SELF for the
+ * caller's own task.  Returns MACH_MSG_OK, the reply's in-band MACH_E_*
+ * status if the allocation itself failed, or a transport MACH_E_* code.
+ */
+int
+task_vm_allocate(mach_port_name_t task, uint64_t size, uint32_t prot,
+    uint64_t *addr_out)
+{
+	struct {
+		struct mach_msg_header			hdr;
+		struct task_vm_allocate_request		body;
+	} req;
+	struct {
+		struct mach_msg_header			hdr;
+		struct task_vm_allocate_reply		body;
+	} reply;
+	int	rv;
+
+	if (addr_out == NULL)
+		return (MACH_E_INVAL);
+
+	req.body.tva_size = size;
+	req.body.tva_prot = prot;
+	req.body.tva_pad  = 0;
+
+	req.hdr.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	req.hdr.msgh_size    = sizeof(req);
+	req.hdr.msgh_remote  = task;
+	req.hdr.msgh_local   = MACH_PORT_NULL;
+	req.hdr.msgh_voucher = 0;
+	req.hdr.msgh_id      = TASK_OP_VM_ALLOCATE;
+
+	rv = mach_msg_rpc(&req.hdr, &reply.hdr, sizeof(reply), 1000);
+	if (rv != MACH_MSG_OK)
+		return (rv);
+	if (reply.body.tvar_status != MACH_MSG_OK)
+		return ((int)reply.body.tvar_status);
+	*addr_out = reply.body.tvar_address;
+	return (MACH_MSG_OK);
+}
+
+/*
+ * task_vm_deallocate: RPC TASK_OP_VM_DEALLOCATE to a task port to release a
+ * range previously handed out by task_vm_allocate.  (addr, size) must
+ * mirror the allocation.  Returns MACH_MSG_OK or a MACH_E_* code.
+ */
+int
+task_vm_deallocate(mach_port_name_t task, uint64_t addr, uint64_t size)
+{
+	struct {
+		struct mach_msg_header			hdr;
+		struct task_vm_deallocate_request	body;
+	} req;
+	struct {
+		struct mach_msg_header			hdr;
+		struct task_vm_deallocate_reply		body;
+	} reply;
+	int	rv;
+
+	req.body.tvd_address = addr;
+	req.body.tvd_size    = size;
+
+	req.hdr.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	req.hdr.msgh_size    = sizeof(req);
+	req.hdr.msgh_remote  = task;
+	req.hdr.msgh_local   = MACH_PORT_NULL;
+	req.hdr.msgh_voucher = 0;
+	req.hdr.msgh_id      = TASK_OP_VM_DEALLOCATE;
+
+	rv = mach_msg_rpc(&req.hdr, &reply.hdr, sizeof(reply), 1000);
+	if (rv != MACH_MSG_OK)
+		return (rv);
+	return ((int)reply.body.tvdr_status);
+}
+
+/*
+ * task_get_special_port: RPC TASK_OP_GET_SPECIAL_PORT to a task port and
+ * write the SEND-right name it hands back through *port_out.  `which` is a
+ * TASK_SPECIAL_* index.  Success is signalled by the COMPLEX bit on the
+ * reply (the port rides in a descriptor, like a bootstrap lookup); a
+ * non-complex reply maps to MACH_E_INVAL.  Caller mach_port_deallocate's
+ * the returned name.
+ */
+int
+task_get_special_port(mach_port_name_t task, uint32_t which,
+    mach_port_name_t *port_out)
+{
+	struct {
+		struct mach_msg_header			hdr;
+		struct task_special_port_request	body;
+	} req;
+	struct {
+		struct mach_msg_header			hdr;
+		struct mach_msg_body			body;
+		struct mach_msg_port_descriptor		pd;
+	} reply;
+	int	rv;
+
+	if (port_out == NULL)
+		return (MACH_E_INVAL);
+
+	req.body.tsp_which = which;
+	req.body.tsp_pad   = 0;
+
+	req.hdr.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	req.hdr.msgh_size    = sizeof(req);
+	req.hdr.msgh_remote  = task;
+	req.hdr.msgh_local   = MACH_PORT_NULL;
+	req.hdr.msgh_voucher = 0;
+	req.hdr.msgh_id      = TASK_OP_GET_SPECIAL_PORT;
+
+	rv = mach_msg_rpc(&req.hdr, &reply.hdr, sizeof(reply), 1000);
+	if (rv != MACH_MSG_OK)
+		return (rv);
+	if (!(reply.hdr.msgh_bits & MACH_MSGH_BITS_COMPLEX))
+		return (MACH_E_INVAL);
+	*port_out = reply.pd.name;
+	return (MACH_MSG_OK);
+}

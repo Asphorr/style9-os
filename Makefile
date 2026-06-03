@@ -93,6 +93,7 @@ OBJS	= \
 	$(OBJDIR)/services.o	\
 	$(OBJDIR)/launchd.o	\
 	$(OBJDIR)/klog.o	\
+	$(OBJDIR)/host.o	\
 	$(OBJDIR)/vm.o		\
 	$(OBJDIR)/task.o	\
 	$(OBJDIR)/thread.o	\
@@ -113,6 +114,7 @@ OBJS	= \
 	$(OBJDIR)/elf.o		\
 	$(OBJDIR)/macho.o	\
 	$(OBJDIR)/darwin.o	\
+	$(OBJDIR)/fs_fat.o	\
 	$(OBJDIR)/progreg.o	\
 	$(OBJDIR)/hello_elf.o	\
 	$(OBJDIR)/clock_elf.o	\
@@ -140,6 +142,9 @@ OBJS	= \
 	$(OBJDIR)/dyldhello_macho.o \
 	$(OBJDIR)/dyldbig_macho.o \
 	$(OBJDIR)/figlet_macho.o \
+	$(OBJDIR)/dirlist_macho.o \
+	$(OBJDIR)/tree_macho.o \
+	$(OBJDIR)/guname_macho.o \
 	$(OBJDIR)/libSystem_dylib.o \
 	$(OBJDIR)/ksym.o
 
@@ -353,6 +358,32 @@ $(OBJDIR)/dyldbig.macho: $(OBJDIR)/dyldhello.dwn.o $(OBJDIR)/libSystem.B.dylib
 # Copied into the build dir so the generic %_macho.o rule embeds it like the rest.
 $(OBJDIR)/figlet.macho: extern/figlet.macho | $(OBJDIR)
 	cp $< $@
+
+# tree: a SECOND real Apple x86-64 macOS CLI binary (Homebrew bottle, tree
+# 2.3.2, vendored in extern/tree.macho).  Depends only on libSystem; it walks a
+# directory hierarchy via opendir/readdir/lstat -- the binary that motivated the
+# FAT VFS gaining real subdirectories.  Embedded like figlet for the loader.
+$(OBJDIR)/tree.macho: extern/tree.macho | $(OBJDIR)
+	cp $< $@
+
+# guname: a THIRD real Apple x86-64 macOS CLI binary (GNU coreutils 9.11's
+# uname, a Homebrew bottle vendored in extern/guname.macho).  Depends only on
+# libSystem.  It exercises the machine-identity trick: it calls uname(2) and
+# prints what it is told, so our kernel's fabricated Darwin identity card makes
+# a genuine Apple binary report a Mac that does not exist.  Embedded like figlet.
+$(OBJDIR)/guname.macho: extern/guname.macho | $(OBJDIR)
+	cp $< $@
+
+# dirlist (directory-enumeration probe): a self-authored Darwin-ABI binary that
+# imports opendir$INODE64 / readdir$INODE64 / stat$INODE64 from our libSystem to
+# walk the FAT volume.  Same real toolchain + low relink as dyldhello -- it
+# de-risks the readdir syscalls before a genuine binary (tree) depends on them.
+$(OBJDIR)/dirlist.dwn.o: $(USER_DIR)/dirlist.c | $(OBJDIR)
+	$(DARWIN_CC) $(DARWIN_CFLAGS) -c $< -o $@
+
+$(OBJDIR)/dirlist.macho: $(OBJDIR)/dirlist.dwn.o $(OBJDIR)/libSystem.B.dylib
+	$(DARWIN_LD) $(DARWIN_LDF) -o $@ $< -L$(OBJDIR) -lSystem.B -e _entry \
+	    -pagezero_size $(DYLDHELLO_BASE)
 
 # libSystem is embedded so the dyld backchannel (kern/darwin.c) can map it by
 # path -- it is a dependency to bind against, not a program to run, so it gets

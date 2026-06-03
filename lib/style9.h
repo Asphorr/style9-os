@@ -398,6 +398,9 @@ struct mach_port_snapshot_entry {
 
 /* Op codes the kernel exposes on its well-known ports. */
 #define	TASK_OP_GET_INFO		1
+#define	TASK_OP_VM_ALLOCATE		2
+#define	TASK_OP_VM_DEALLOCATE		3
+#define	TASK_OP_GET_SPECIAL_PORT	4
 #define	BOOTSTRAP_OP_LOOKUP		1
 #define	BOOTSTRAP_OP_REGISTER		2
 #define	BOOTSTRAP_OP_DEREGISTER		3
@@ -410,6 +413,39 @@ struct task_info_reply {
 	uint32_t	tir_nthreads;
 	uint32_t	tir_pad;
 	char		tir_name[32];
+};
+
+/* WIRE FORMAT.  Mirrors mach/port.h.  Task-port vm_allocate/deallocate. */
+struct task_vm_allocate_request {
+	uint64_t	tva_size;
+	uint32_t	tva_prot;
+	uint32_t	tva_pad;
+};
+
+struct task_vm_allocate_reply {
+	uint64_t	tvar_address;
+	int32_t		tvar_status;
+	uint32_t	tvar_pad;
+};
+
+struct task_vm_deallocate_request {
+	uint64_t	tvd_address;
+	uint64_t	tvd_size;
+};
+
+struct task_vm_deallocate_reply {
+	int32_t		tvdr_status;
+	uint32_t	tvdr_pad;
+};
+
+/* TASK_OP_GET_SPECIAL_PORT which-index (mirrors mach/port.h). */
+#define	TASK_SPECIAL_HOST		2
+#define	TASK_SPECIAL_BOOTSTRAP		4
+
+/* WIRE FORMAT.  Mirrors mach/port.h. */
+struct task_special_port_request {
+	uint32_t	tsp_which;
+	uint32_t	tsp_pad;
 };
 
 /* WIRE FORMAT.  Mirrors mach/bootstrap.h. */
@@ -735,6 +771,60 @@ _Static_assert(sizeof(struct svc_tasks_reply) ==
 
 #define	SVC_ECHOOL_NAME		"echool"
 #define	ECHOOL_OP_CHECKSUM	1
+
+/* ---- host port (mirrors mach/host.h) ----------------------------- */
+
+#define	SVC_HOST_NAME		"host"
+#define	HOST_OP_PAGE_SIZE	1
+#define	HOST_OP_INFO		2
+
+#define	HOST_CPU_TYPE_X86_64		0x01000007
+#define	HOST_CPU_SUBTYPE_X86_64_ALL	3
+
+/* WIRE FORMAT.  Mirrors mach/host.h. */
+struct svc_host_page_size_reply {
+	uint32_t	hps_page_size;
+	uint32_t	hps_pad;
+};
+
+/* WIRE FORMAT.  Mirrors mach/host.h. */
+struct svc_host_info_reply {
+	uint32_t	hi_max_cpus;
+	uint32_t	hi_avail_cpus;
+	uint64_t	hi_memory_size;
+	uint32_t	hi_cpu_type;
+	uint32_t	hi_cpu_subtype;
+	uint64_t	hi_memory_free;
+};
+
+/*
+ * Host-port client helpers (lib/style9_mach.c).
+ *
+ *	mach_host_self	-- bootstrap_lookup("host"); returns a SEND-right name
+ *			   (MACH_PORT_NULL on failure).  mach_port_deallocate
+ *			   it when done.
+ *	host_page_size	-- RPC HOST_OP_PAGE_SIZE; writes the page size out.
+ *	host_info	-- RPC HOST_OP_INFO; fills *out with the host snapshot.
+ *
+ * The two RPC helpers return MACH_MSG_OK or a MACH_E_* code.
+ */
+mach_port_name_t mach_host_self(void);
+int		host_page_size(mach_port_name_t host, uint32_t *page_size_out);
+int		host_info(mach_port_name_t host, struct svc_host_info_reply *out);
+
+/*
+ * Task-port client helpers (lib/style9_mach.c).  Drive vm_allocate /
+ * vm_deallocate as Mach RPCs to a task port (MACH_PORT_TASK_SELF for the
+ * caller's own task) -- the message interface a Darwin binary uses, not
+ * the native SYS_VM_* fast path.  Both return MACH_MSG_OK or a MACH_E_*
+ * code; task_vm_allocate writes the chosen VA through *addr_out.
+ */
+int		task_vm_allocate(mach_port_name_t task, uint64_t size,
+		    uint32_t prot, uint64_t *addr_out);
+int		task_vm_deallocate(mach_port_name_t task, uint64_t addr,
+		    uint64_t size);
+int		task_get_special_port(mach_port_name_t task, uint32_t which,
+		    mach_port_name_t *port_out);
 
 /*
  * launchd service wire mirror.  Match mach/services.h exactly --

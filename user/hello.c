@@ -1652,6 +1652,163 @@ demo_darwin_spawn(void)
 	    "after %d yields\n", i);
 
 	/*
+	 * dirlist: a self-authored Darwin-ABI probe that walks the FAT volume
+	 * through our libSystem's opendir/readdir/stat (the $INODE64 imports a
+	 * real binary uses).  It de-risks the directory-enumeration syscalls --
+	 * proving the export naming and struct-dirent round-trip -- before a
+	 * genuine directory-walking binary (tree) depends on them.
+	 */
+	child_id = spawn("dirlist");
+	if (child_id < 0) {
+		printf("  spawn('dirlist') failed (rv=%ld)\n", child_id);
+		return (93);
+	}
+	for (i = 0; i < 256 && task_alive((uint64_t)child_id); i++)
+		(void)yield();
+	printf("  dirlist (FAT opendir/readdir probe) retired after %d "
+	    "yields\n", i);
+
+	/*
+	 * The host port: the kernel object behind mach_host_self().  A pure
+	 * native exercise of the freshly-built Mach service -- look the port
+	 * up, RPC its page-size + machine-info opcodes, and print what the
+	 * kernel reports.  Drives the full IPC round-trip (bootstrap lookup
+	 * -> SEND right -> mach_msg_rpc -> synchronous dispatch -> reply)
+	 * against a brand-new PORT_SPECIAL_SERVICE port.
+	 */
+	{
+		struct svc_host_info_reply	info;
+		mach_port_name_t		host;
+		uint32_t			ps;
+		int				rv;
+
+		printf("  >>> host port: mach_host_self + host_page_size + "
+		    "host_info <<<\n");
+		host = mach_host_self();
+		if (host == MACH_PORT_NULL) {
+			printf("  mach_host_self() failed\n");
+			return (96);
+		}
+		rv = host_page_size(host, &ps);
+		if (rv != MACH_MSG_OK) {
+			printf("  host_page_size rv=%d\n", rv);
+			(void)mach_port_deallocate(host);
+			return (96);
+		}
+		rv = host_info(host, &info);
+		if (rv != MACH_MSG_OK) {
+			printf("  host_info rv=%d\n", rv);
+			(void)mach_port_deallocate(host);
+			return (96);
+		}
+		printf("  host: page_size=%u cpus=%u/%u mem=%lluMiB "
+		    "free=%lluMiB cpu_type=0x%x sub=%u\n",
+		    ps, info.hi_avail_cpus, info.hi_max_cpus,
+		    (unsigned long long)(info.hi_memory_size >> 20),
+		    (unsigned long long)(info.hi_memory_free >> 20),
+		    info.hi_cpu_type, info.hi_cpu_subtype);
+		(void)mach_port_deallocate(host);
+	}
+
+	/*
+	 * The task port (mach_task_self()): exercise the freshly-grown
+	 * resource-control surface on our OWN task port -- vm_allocate a
+	 * range as a Mach RPC (the way a Darwin binary reaches
+	 * mach_vm_allocate), prove it is real the same way demo_vm_allocate
+	 * proves the direct syscall (zero-filled + writable), then
+	 * vm_deallocate it back through the port.
+	 */
+	{
+		uint64_t	addr;
+		uint8_t		*buf;
+		uint32_t	i;
+		int		rv;
+
+		printf("  >>> task port: task_vm_allocate + write + "
+		    "task_vm_deallocate <<<\n");
+		addr = 0;
+		rv = task_vm_allocate(MACH_PORT_TASK_SELF, 8192,
+		    VM_PROT_READ | VM_PROT_WRITE, &addr);
+		if (rv != MACH_MSG_OK || addr == 0) {
+			printf("  task_vm_allocate rv=%d addr=%p\n", rv,
+			    (void *)(uintptr_t)addr);
+			return (95);
+		}
+		buf = (uint8_t *)(uintptr_t)addr;
+
+		for (i = 0; i < 8192; i++) {
+			if (buf[i] != 0) {
+				printf("  task vm: not zero at i=%u\n",
+				    (unsigned)i);
+				(void)task_vm_deallocate(MACH_PORT_TASK_SELF,
+				    addr, 8192);
+				return (95);
+			}
+		}
+		for (i = 0; i < 8192; i++)
+			buf[i] = (uint8_t)(i & 0xFFu);
+		for (i = 0; i < 8192; i++) {
+			if (buf[i] != (uint8_t)(i & 0xFFu)) {
+				printf("  task vm: mismatch at i=%u\n",
+				    (unsigned)i);
+				(void)task_vm_deallocate(MACH_PORT_TASK_SELF,
+				    addr, 8192);
+				return (95);
+			}
+		}
+
+		rv = task_vm_deallocate(MACH_PORT_TASK_SELF, addr, 8192);
+		if (rv != MACH_MSG_OK) {
+			printf("  task_vm_deallocate rv=%d\n", rv);
+			return (95);
+		}
+		printf("  task vm: VA=%p (zero-filled, writable, freed "
+		    "via task port)\n", buf);
+	}
+
+	/*
+	 * task_get_special_port: ask our task port to hand back the HOST
+	 * port (a port riding in a descriptor, the way task_get_special_port
+	 * works on real Mach), then PROVE the handed-back port is live by
+	 * RPC'ing host_page_size on it; also confirm the BOOTSTRAP index
+	 * resolves.  Exercises the task port's COMPLEX port-carrying reply.
+	 */
+	{
+		mach_port_name_t	bs;
+		mach_port_name_t	h2;
+		uint32_t		ps;
+		int			rv;
+
+		printf("  >>> task port: task_get_special_port(HOST, "
+		    "BOOTSTRAP) <<<\n");
+		rv = task_get_special_port(MACH_PORT_TASK_SELF,
+		    TASK_SPECIAL_HOST, &h2);
+		if (rv != MACH_MSG_OK || h2 == MACH_PORT_NULL) {
+			printf("  get_special_port(HOST) rv=%d\n", rv);
+			return (94);
+		}
+		ps = 0;
+		rv = host_page_size(h2, &ps);
+		if (rv != MACH_MSG_OK || ps != 4096) {
+			printf("  host_page_size via task port rv=%d ps=%u\n",
+			    rv, (unsigned)ps);
+			(void)mach_port_deallocate(h2);
+			return (94);
+		}
+		(void)mach_port_deallocate(h2);
+
+		rv = task_get_special_port(MACH_PORT_TASK_SELF,
+		    TASK_SPECIAL_BOOTSTRAP, &bs);
+		if (rv != MACH_MSG_OK || bs == MACH_PORT_NULL) {
+			printf("  get_special_port(BOOTSTRAP) rv=%d\n", rv);
+			return (94);
+		}
+		(void)mach_port_deallocate(bs);
+		printf("  task get_special_port: HOST live (page_size=%u) "
+		    "+ BOOTSTRAP resolved\n", (unsigned)ps);
+	}
+
+	/*
 	 * The north star: a REAL Apple x86-64 macOS CLI binary (figlet, a
 	 * Homebrew bottle).  Not one of our builds -- a genuine Apple-toolchain
 	 * dynamic Mach-O, relocated low by macho_load, bound by our clean-room
@@ -1677,6 +1834,60 @@ demo_darwin_spawn(void)
 		for (i = 0; i < 256 && task_alive((uint64_t)child_id); i++)
 			(void)yield();
 		printf("  figlet retired after %d yields\n", i);
+	}
+
+	/*
+	 * A SECOND real Apple binary: tree(1) (Homebrew bottle).  It descends
+	 * the FAT hierarchy through our libSystem's opendir/readdir/lstat/stat
+	 * plus the ~30 libc symbols added for it, and prints the directory tree.
+	 * Spawned with "/" so it walks the whole disk.
+	 */
+	{
+		mach_port_name_t	tree_tp;
+		char			*tree_argv[2];
+
+		tree_tp = MACH_PORT_NULL;
+		tree_argv[0] = "tree";
+		tree_argv[1] = "/";
+		printf("  >>> spawning tree -- a REAL Apple x86-64 macOS "
+		    "binary <<<\n");
+		child_id = spawn_args("tree", 2, tree_argv, &tree_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('tree') failed (rv=%ld)\n",
+			    child_id);
+			return (94);
+		}
+		for (i = 0; i < 512 && task_alive((uint64_t)child_id); i++)
+			(void)yield();
+		printf("  tree retired after %d yields\n", i);
+	}
+
+	/*
+	 * A THIRD real Apple binary: guname (GNU coreutils' uname).  The
+	 * machine-identity trick -- it asks uname(2) what it is running on and
+	 * prints the answer, never validating it.  Our kernel hands back a
+	 * fabricated Darwin identity card, so this genuine Apple binary reports
+	 * "Darwin style9 23.6.0 ... x86_64" and cannot tell it is not on a Mac.
+	 * Spawned with "-a" for the full identity line.
+	 */
+	{
+		mach_port_name_t	guname_tp;
+		char			*guname_argv[2];
+
+		guname_tp = MACH_PORT_NULL;
+		guname_argv[0] = "guname";
+		guname_argv[1] = "-a";
+		printf("  >>> spawning guname -- a REAL Apple x86-64 macOS "
+		    "binary (machine-identity trick) <<<\n");
+		child_id = spawn_args("guname", 2, guname_argv, &guname_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('guname') failed (rv=%ld)\n",
+			    child_id);
+			return (95);
+		}
+		for (i = 0; i < 512 && task_alive((uint64_t)child_id); i++)
+			(void)yield();
+		printf("  guname retired after %d yields\n", i);
 	}
 	return (0);
 }

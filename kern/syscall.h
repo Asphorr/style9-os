@@ -104,6 +104,15 @@ long	syscall_console_write(const char *buf, size_t len);
 long	syscall_copyin_str(const char *uptr, char *kbuf, size_t kbuf_size);
 
 /*
+ * Copy `n` bytes from kernel `kbuf` to user `uptr`, range-checking the whole
+ * destination span under one SMAP bracket.  Returns 0 on success or
+ * SYS_E_FAULT if the buffer leaves the user window (or its length wraps).
+ * Backs the Darwin personality's read(2), which delivers file bytes
+ * (kern/darwin.c).
+ */
+long	syscall_copyout(void *uptr, const void *kbuf, size_t n);
+
+/*
  * Mach message send/recv core: user-range-check + SMAP bracket + the
  * matching mach_msg_* call.  Back SYS_MSG_SEND / SYS_MSG_RECV[_TIMED] and
  * the Darwin personality's mach_msg trap (kern/darwin.c).  Return MACH_MSG_OK
@@ -114,6 +123,18 @@ long	syscall_msg_recv(mach_port_name_t name, struct mach_msg_header *ubuf,
 	    size_t ubuf_size);
 long	syscall_msg_recv_timed(mach_port_name_t name,
 	    struct mach_msg_header *ubuf, size_t ubuf_size, uint64_t timeout_ms);
+
+/*
+ * VM allocate/deallocate core, factored from SYS_VM_ALLOCATE /
+ * SYS_VM_DEALLOCATE so the task-self port's TASK_OP_VM_* dispatch
+ * (kern/task.c) reuses the exact find-space -> pmap_enter -> vm_map_enter
+ * path (and its rollback) against an explicit target task.  `t` may be any
+ * task, not just the caller.  syscall_vm_allocate writes the chosen VA
+ * through *va_out; both return 0 on success or a negative SYS_E_*.
+ */
+long	syscall_vm_allocate(struct task *t, uint64_t size, uint32_t prot,
+	    uint64_t *va_out);
+long	syscall_vm_deallocate(struct task *t, uint64_t va, uint64_t size);
 
 /*
  * Per-thread bookkeeping the scheduler keeps in sync with the entry

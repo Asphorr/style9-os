@@ -8,8 +8,10 @@
 #include <stdint.h>
 
 #include "ata_drv.h"
+#include "fs_fat.h"
 #include "bootstrap.h"
 #include "clock.h"
+#include "host.h"
 #include "klog.h"
 #include "progreg.h"
 #include "services.h"
@@ -99,6 +101,7 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	kbd_drv_init();
 	uart_drv_init();
 	ata_drv_init();
+	fs_fat_init();
 
 	/*
 	 * Register a demo service under the bootstrap port so ring-3
@@ -120,6 +123,24 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	 * the standard bootstrap_lookup path.
 	 */
 	services_init();
+
+	/*
+	 * Publish the host port (machine-identity + page-size service) on the
+	 * same bootstrap registry.  Native tasks reach it via
+	 * bootstrap_lookup("host"); genuine Darwin binaries via the
+	 * mach_host_self() trap.  Runs after services_init since it shares the
+	 * bootstrap registry and the kernel_space install path.
+	 */
+	host_init();
+
+	/*
+	 * Publish the bootstrap port's own kernel_space SEND so a task can
+	 * fetch it via task_get_special_port(TASK_SPECIAL_BOOTSTRAP).  Runs
+	 * here (Phase 2), not in bootstrap_init: kernel_space's well-known low
+	 * names (TASK_SELF=1, BOOTSTRAP=2) must be claimed by
+	 * task_subsystem_init first.
+	 */
+	bootstrap_publish();
 
 	/*
 	 * Bring up the structured kernel log on the same machinery.

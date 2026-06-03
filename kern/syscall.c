@@ -424,6 +424,40 @@ syscall_copyin_str(const char *uptr, char *kbuf, size_t kbuf_size)
 	return (SYS_E_INVAL);	/* no NUL within kbuf_size */
 }
 
+/*
+ * Shared copyout for a fixed-length buffer: copy `n` bytes from kernel `kbuf`
+ * to user `uptr`, range-checking the whole destination span once under one
+ * SMAP bracket.  Returns 0, or SYS_E_FAULT for a NULL/wrapping/out-of-window
+ * destination.  The Darwin read(2) path (kern/darwin.c) delivers file bytes
+ * through it.
+ */
+long
+syscall_copyout(void *uptr, const void *kbuf, size_t n)
+{
+	const uint8_t	*src;
+	uint8_t		*dst;
+	uintptr_t	 uaddr;
+	size_t		 i;
+
+	if (n == 0)
+		return (0);
+	if (uptr == NULL)
+		return (SYS_E_FAULT);
+	uaddr = (uintptr_t)uptr;
+	if (uaddr + n < uaddr)			/* length wrap */
+		return (SYS_E_FAULT);
+	if (!user_range_ok((uint64_t)uaddr, n))
+		return (SYS_E_FAULT);
+
+	src = (const uint8_t *)kbuf;
+	dst = (uint8_t *)uptr;
+	smap_user_access_begin();
+	for (i = 0; i < n; i++)
+		dst[i] = src[i];
+	smap_user_access_end();
+	return (0);
+}
+
 static long
 sys_port_alloc(uint8_t rights)
 {
@@ -627,22 +661,28 @@ sys_task_alive(uint64_t task_id)
 }
 
 /*
- * sys_vm_allocate: hand back a fresh user-VA range, populated with
- * anonymous (zeroed) pages, mapped read/write (and execute if asked)
- * with U=1.  `size` is rounded up to a multiple of 4 KiB; `prot`
- * carries any of VM_PROT_READ / VM_PROT_WRITE / VM_PROT_EXEC --
- * VM_PROT_USER is set unconditionally since vm_allocate is always
- * user-facing.  Returns the chosen VA on success, negative SYS_E_*
- * on failure.
+ * syscall_vm_allocate: the task-parameterized core behind SYS_VM_ALLOCATE.
+ * Allocate an anonymous, zeroed, page-rounded range in `t`'s address space
+ * with the requested VM_PROT_* (VM_PROT_USER forced on -- vm_allocate is
+ * always user-facing) and write the chosen VA through *va_out.  Returns 0
+ * on success or a negative SYS_E_*.
  *
- * Failure paths unwind: pmm_alloc_page or pmap_enter failures, and a
- * final vm_map_enter failure, roll back every page touched so far so
- * a partial allocation never leaks frames.
+ * Factored out so the task-self port's TASK_OP_VM_ALLOCATE dispatch
+ * (kern/task.c) drives the identical find-space -> per-page pmap_enter ->
+ * vm_map_enter path -- including the rollback below -- the way a Darwin
+ * binary's mach_vm_allocate would.  `t` need not be the current task: the
+ * zeroing writes through each frame's direct-map KVA and pmap_enter targets
+ * t->t_pmap explicitly, so installing into a not-currently-loaded address
+ * space is correct (a cross-task allocate).
+ *
+ * Failure paths unwind: pmm_alloc_page or pmap_enter failures, and a final
+ * vm_map_enter failure, roll back every page touched so far so a partial
+ * allocation never leaks frames.
  */
-static long
-sys_vm_allocate(uint64_t size, uint32_t prot)
+long
+syscall_vm_allocate(struct task *t, uint64_t size, uint32_t prot,
+    uint64_t *va_out)
 {
-	struct task	*t;
 	uint8_t		*kva;
 	uint64_t	 pa;
 	uint64_t	 v;
@@ -652,6 +692,8 @@ sys_vm_allocate(uint64_t size, uint32_t prot)
 	size_t		 pages;
 	uint32_t	 pmap_flags;
 
+	if (t == NULL || va_out == NULL)
+		return (SYS_E_INVAL);
 	if (size == 0)
 		return (SYS_E_INVAL);
 
@@ -662,8 +704,6 @@ sys_vm_allocate(uint64_t size, uint32_t prot)
 	prot      &= (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXEC);
 	pmap_flags = prot | VM_PROT_USER;
 	pages      = (size_t)(size >> 12);
-
-	t = current_thread->th_task;
 
 	if (!vm_map_find_space(t->t_map, size, &va))
 		return (SYS_E_NOMEM);
@@ -686,7 +726,8 @@ sys_vm_allocate(uint64_t size, uint32_t prot)
 	    (uint8_t)pmap_flags, VME_F_ANON))
 		goto unwind;
 
-	return ((long)va);
+	*va_out = va;
+	return (0);
 
 unwind:
 	for (j = 0; j < i; j++) {
@@ -700,18 +741,39 @@ unwind:
 }
 
 /*
- * sys_vm_deallocate: release a previously vm_allocate'd range.  v1
- * requires the (va, size) pair to mirror the allocate exactly -- the
- * range must start at a known anonymous vm_map_entry whose extent
- * covers the request.  Partial deallocate and ranges crossing entry
- * boundaries are rejected via vm_map_release returning false.  Returns
- * 0 on success, negative SYS_E_* otherwise.
+ * sys_vm_allocate: hand back a fresh user-VA range in the calling task,
+ * populated with anonymous (zeroed) pages, mapped read/write (and execute
+ * if asked) with U=1.  Thin wrapper over syscall_vm_allocate; returns the
+ * chosen VA on success, negative SYS_E_* on failure.
  */
 static long
-sys_vm_deallocate(uint64_t va, uint64_t size)
+sys_vm_allocate(uint64_t size, uint32_t prot)
 {
-	struct task	*t;
+	uint64_t	va;
+	long		rv;
 
+	va = 0;
+	rv = syscall_vm_allocate(current_thread->th_task, size, prot, &va);
+	if (rv != 0)
+		return (rv);
+	return ((long)va);
+}
+
+/*
+ * syscall_vm_deallocate: the task-parameterized core behind
+ * SYS_VM_DEALLOCATE.  Release a range previously handed out by
+ * syscall_vm_allocate in `t`'s map.  v1 requires the (va, size) pair to
+ * mirror the allocate exactly -- the range must start at a known anonymous
+ * vm_map_entry whose extent covers the request.  Partial deallocate and
+ * ranges crossing entry boundaries are rejected via vm_map_release
+ * returning false.  Returns 0 on success, negative SYS_E_* otherwise.
+ */
+long
+syscall_vm_deallocate(struct task *t, uint64_t va, uint64_t size)
+{
+
+	if (t == NULL)
+		return (SYS_E_INVAL);
 	if (size == 0)
 		return (SYS_E_INVAL);
 	if ((va & 0xFFFull) != 0)
@@ -721,10 +783,20 @@ sys_vm_deallocate(uint64_t va, uint64_t size)
 	if (size == 0)
 		return (SYS_E_INVAL);
 
-	t = current_thread->th_task;
 	if (!vm_map_release(t->t_map, t->t_pmap, va, size))
 		return (SYS_E_INVAL);
 	return (0);
+}
+
+/*
+ * sys_vm_deallocate: release a previously vm_allocate'd range in the
+ * calling task.  Thin wrapper over syscall_vm_deallocate.
+ */
+static long
+sys_vm_deallocate(uint64_t va, uint64_t size)
+{
+
+	return (syscall_vm_deallocate(current_thread->th_task, va, size));
 }
 
 /*

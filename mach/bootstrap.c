@@ -25,6 +25,9 @@
 extern struct port	*port_create_kernel_owned(uint8_t special_kind,
 			    void *special_arg);
 
+extern int		 port_install_send_in_kernel(struct port *p,
+			    mach_port_name_t *name_out);
+
 extern struct port_space	*kernel_space;
 
 /*
@@ -41,6 +44,8 @@ static struct spinlock		registry_lock = SPINLOCK_INIT("bootstrap");
 static struct bootstrap_service	registry[BOOTSTRAP_MAX_SERVICES];	/* (registry_lock) */
 static size_t			registry_count;				/* (registry_lock) */
 static struct port		*the_bootstrap_port;			/* (c) */
+
+static mach_port_name_t		the_bootstrap_kn;			/* (c) */
 
 void
 bootstrap_init(void)
@@ -59,11 +64,43 @@ bootstrap_init(void)
 	    (unsigned)BOOTSTRAP_MAX_SERVICES);
 }
 
+/*
+ * Publish a persistent kernel_space SEND for the bootstrap port so
+ * task_get_special_port can COPY_SEND it (leak-free: the caller's copy is
+ * released on its own deallocate; this kernel name lives for the kernel's
+ * life).  Must run AFTER task_subsystem_init -- kernel_space reserves the
+ * well-known low names (TASK_SELF=1, BOOTSTRAP=2) for kernel_task, so
+ * grabbing a kernel_space name before those are claimed would bump the
+ * task-self install off name 1.  Idempotent.
+ */
+void
+bootstrap_publish(void)
+{
+
+	if (the_bootstrap_kn != MACH_PORT_NULL)
+		return;
+	if (port_install_send_in_kernel(the_bootstrap_port,
+	    &the_bootstrap_kn) != MACH_MSG_OK)
+		panic("bootstrap_publish: install bootstrap in kernel_space");
+}
+
 struct port *
 bootstrap_get_port(void)
 {
 
 	return (the_bootstrap_port);
+}
+
+/*
+ * Persistent kernel_space SEND name for the bootstrap port (minted in
+ * bootstrap_init).  task_get_special_port COPY_SENDs it; MACH_PORT_NULL
+ * before bootstrap_init has run.
+ */
+mach_port_name_t
+bootstrap_get_kernel_name(void)
+{
+
+	return (the_bootstrap_kn);
 }
 
 static bool

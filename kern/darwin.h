@@ -59,7 +59,10 @@
 #define	DARWIN_SYS_exit		1
 #define	DARWIN_SYS_read		3
 #define	DARWIN_SYS_write	4
+#define	DARWIN_SYS_open		5
+#define	DARWIN_SYS_close	6
 #define	DARWIN_SYS_getpid	20
+#define	DARWIN_SYS_lseek	199
 
 /*
  * Mach traps (class 1) we answer -- positive indices into xnu's
@@ -69,6 +72,7 @@
 #define	DARWIN_MACH_mach_reply_port	26
 #define	DARWIN_MACH_thread_self_trap	27
 #define	DARWIN_MACH_task_self_trap	28
+#define	DARWIN_MACH_host_self_trap	29	/* mach_host_self()            */
 #define	DARWIN_MACH_mach_msg_trap	31	/* classic combined mach_msg() */
 
 /*
@@ -78,6 +82,45 @@
  * carry on failure).
  */
 #define	DARWIN_S9_dyld_map_image	1
+
+/*
+ * fs_stat(const char *path, struct fs_fat_statbuf *out): report whether a file
+ * exists in the read-only FS, plus its size / type / inode, WITHOUT the kernel
+ * knowing anything about Apple's struct stat.  libSystem's stat$INODE64 issues
+ * this, then fills the macOS-ABI struct itself (keeping the layout knowledge in
+ * the clean-room ABI layer, not the kernel).  Copies the small fs_fat_statbuf
+ * (kern/fs_fat.h) out to *out; returns 0 in %rax (carry clear), or carry set on
+ * absence.
+ *
+ * fs_readdir(const char *path, uint32_t index, struct fs_fat_dirent *out):
+ * fill *out with the index-th entry of the directory at `path`.  Returns 1 in
+ * %rax when an entry was written, 0 at end-of-directory, carry set on error.
+ * libSystem's opendir/readdir drive it (stateless: re-resolved per index).
+ */
+#define	DARWIN_S9_fs_stat		2
+#define	DARWIN_S9_fs_readdir		3
+#define	DARWIN_S9_uname			4
+
+/*
+ * uname(struct darwin_uname *out): report the machine's identity card.  A
+ * libSystem-only tool that asks "what am I running on?" (guname) reaches here
+ * via libSystem's uname(3); the kernel is the thing claiming to be Darwin, so
+ * the (fabricated) identity it answers with lives here.  As with fs_stat, the
+ * kernel hands back a neutral struct and libSystem reshapes it into Apple's
+ * struct utsname (256-byte fields) -- the macOS ABI layout stays in the
+ * clean-room library, not the kernel.  Fields are generously sized for the
+ * (long) version string; libSystem bounds the copy into utsname.  Returns 0 in
+ * %rax (carry clear); carry set only if *out faults.
+ */
+#define	DARWIN_UNAME_FIELD	128
+
+struct darwin_uname {
+	char	un_sysname[DARWIN_UNAME_FIELD];	 /* "Darwin"            */
+	char	un_nodename[DARWIN_UNAME_FIELD]; /* host name           */
+	char	un_release[DARWIN_UNAME_FIELD];	 /* "23.6.0" (kernel)   */
+	char	un_version[DARWIN_UNAME_FIELD];	 /* build/version banner */
+	char	un_machine[DARWIN_UNAME_FIELD];	 /* "x86_64"            */
+};
 
 /*
  * Base VA at which the first dylib is mapped into a Darwin task; further
@@ -94,10 +137,12 @@
  */
 #define	DARWIN_EPERM	1
 #define	DARWIN_ENOENT	2
+#define	DARWIN_EIO	5
 #define	DARWIN_EBADF	9
 #define	DARWIN_ENOMEM	12
 #define	DARWIN_EFAULT	14
 #define	DARWIN_EINVAL	22
+#define	DARWIN_EMFILE	24
 #define	DARWIN_ENOSYS	78
 
 /*

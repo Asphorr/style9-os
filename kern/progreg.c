@@ -133,6 +133,31 @@ extern uint8_t	_binary_figlet_macho_start[];
 extern uint8_t	_binary_figlet_macho_end[];
 
 /*
+ * Directory-enumeration probe (dirlist): a self-authored Darwin-ABI binary
+ * that walks the FAT volume through libSystem's opendir/readdir/stat -- the
+ * de-risking step before a genuine directory-walking binary (tree) runs.
+ */
+extern uint8_t	_binary_dirlist_macho_start[];
+extern uint8_t	_binary_dirlist_macho_end[];
+
+/*
+ * A second REAL Apple binary: tree(1) (Homebrew bottle).  It descends a
+ * directory hierarchy through libSystem's opendir/readdir/lstat -- the genuine
+ * binary the FAT VFS's directory support was built to serve.
+ */
+extern uint8_t	_binary_tree_macho_start[];
+extern uint8_t	_binary_tree_macho_end[];
+
+/*
+ * A third REAL Apple binary: guname (GNU coreutils' uname, a Homebrew bottle).
+ * It calls uname(2) and prints the result -- the machine-identity trick: the
+ * kernel feeds it a fabricated Darwin identity (kern/darwin.c) it cannot tell
+ * is false, so it reports a Mac that does not exist.
+ */
+extern uint8_t	_binary_guname_macho_start[];
+extern uint8_t	_binary_guname_macho_end[];
+
+/*
  * Bridge into the arch-specific user-thread spawn path.  Lives in
  * arch/amd64/usermode.c; declared here so progreg_spawn doesn't have
  * to pull in machine headers.  Returns the new task's t_id or a
@@ -230,6 +255,12 @@ progreg_init(void)
 	    _binary_dyldbig_macho_start, _binary_dyldbig_macho_end);
 	register_one("figlet",
 	    _binary_figlet_macho_start, _binary_figlet_macho_end);
+	register_one("dirlist",
+	    _binary_dirlist_macho_start, _binary_dirlist_macho_end);
+	register_one("tree",
+	    _binary_tree_macho_start, _binary_tree_macho_end);
+	register_one("guname",
+	    _binary_guname_macho_start, _binary_guname_macho_end);
 
 	kprintf("progreg: %zu programs registered\n", nentries);
 }
