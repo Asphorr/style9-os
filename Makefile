@@ -108,6 +108,8 @@ OBJS	= \
 	$(OBJDIR)/uart.o	\
 	$(OBJDIR)/kbd.o		\
 	$(OBJDIR)/kbd_drv.o	\
+	$(OBJDIR)/mouse.o	\
+	$(OBJDIR)/mouse_drv.o	\
 	$(OBJDIR)/uart_drv.o	\
 	$(OBJDIR)/ata_drv.o	\
 	$(OBJDIR)/dev_subsystem.o \

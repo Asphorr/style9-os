@@ -25,6 +25,8 @@
 #include "kmem.h"
 #include "kprintf.h"
 #include "memmap.h"
+#include "mouse.h"
+#include "mouse_drv.h"
 #include "panic.h"
 #include "pic.h"
 #include "pmap.h"
@@ -99,6 +101,16 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	kmain_run_tests();
 
 	kbd_drv_init();
+	/*
+	 * Mouse comes up here, not beside kbd_init: lighting IRQ12 before
+	 * clock_init would let a pending aux byte fire an IRQ whose
+	 * intr_dispatch -> sched_check_timeouts -> clock_uptime_ms path
+	 * divides by the still-zero pit_hz().  The keyboard is unmasked
+	 * early because the boot shell needs it; the mouse has no
+	 * early-boot consumer, so deferring it to here costs nothing.
+	 */
+	mouse_init();
+	mouse_drv_init();
 	uart_drv_init();
 	ata_drv_init();
 	fs_fat_init();
