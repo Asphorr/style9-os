@@ -2278,6 +2278,212 @@ out:
 }
 
 /* ----------------------------------------------------------------------- *
+ *  stress_deadname_multi
+ *
+ *  Exercises the dead-name machinery (Mach audit gap #4): multi-registrant
+ *  MACH_NOTIFY_DEAD_NAME plus the lazy flip of a SEND name to a dead name.
+ *
+ *  Single-threaded, public API.  Build a target port T (we hold its
+ *  RECEIVE via name `t`) and a second SEND-only name `s` to the same port
+ *  -- the surviving holder we will observe.  Arm three dead-name watches
+ *  on `s`, each on a distinct notify port with a distinct tag, then re-arm
+ *  the first target to prove re-arm updates its tag in place (dedup)
+ *  rather than queueing a second notification.  Kill T by dropping `t`,
+ *  then confirm:
+ *	- each notify port carries exactly one MACH_NOTIFY_DEAD_NAME with its
+ *	  expected tag (the re-armed one carries the updated tag, no second),
+ *	- mach_port_type(s) read the live SEND mask before death and flips to
+ *	  MACH_PORT_TYPE_DEAD_NAME after -- distinct from 0 for an absent name,
+ *	- the dead name deallocates cleanly with no name leak.
+ * ----------------------------------------------------------------------- */
+#define	DEADNAME_WATCHERS	3
+
+int
+stress_deadname_multi(void)
+{
+	struct mach_notify_header	note;
+	size_t				cached0, cached1, cons0, cons1;
+	size_t				inuse0, inuse1, pmm0, pmm1;
+	mach_port_name_t		nport[DEADNAME_WATCHERS];
+	mach_port_name_t		prev, s, t, tname;
+	uint32_t			ty;
+	unsigned int			i;
+	int				rv;
+
+	inuse0  = port_space_inuse(kernel_space);
+	cached0 = kmem_cached_pages();
+	pmm0    = pmm_used_pages();
+	cons0   = pmm0 - cached0;
+
+	for (i = 0; i < DEADNAME_WATCHERS; i++)
+		nport[i] = MACH_PORT_NULL;
+	s     = MACH_PORT_NULL;
+	t     = MACH_PORT_NULL;
+	tname = MACH_PORT_NULL;
+
+	/* Target port: we hold RECEIVE+SEND under `t`. */
+	t = port_allocate(kernel_space,
+	    MACH_PORT_RIGHT_RECEIVE | MACH_PORT_RIGHT_SEND);
+	if (t == MACH_PORT_NULL) {
+		kprintf("stress_deadname_multi: alloc t fail\n");
+		rv = 1;
+		goto out;
+	}
+	tname = t;
+
+	/* A second SEND-only name to the same port: the holder we observe. */
+	rv = port_space_inject_send(kernel_space, t, kernel_space, &s);
+	if (rv != MACH_MSG_OK) {
+		kprintf("stress_deadname_multi: inject_send: %s\n",
+		    mach_msg_strerror(rv));
+		goto out;
+	}
+
+	/* The live SEND name reports its right, not dead. */
+	ty = mach_port_type(kernel_space, s);
+	if (ty != MACH_PORT_RIGHT_SEND) {
+		kprintf("stress_deadname_multi: live type 0x%x (want 0x%x)\n",
+		    (unsigned)ty, (unsigned)MACH_PORT_RIGHT_SEND);
+		rv = 2;
+		goto out;
+	}
+
+	/* Arm one dead-name watch per notify port, distinct tags 10/11/12. */
+	for (i = 0; i < DEADNAME_WATCHERS; i++) {
+		nport[i] = port_allocate(kernel_space,
+		    MACH_PORT_RIGHT_RECEIVE | MACH_PORT_RIGHT_SEND);
+		if (nport[i] == MACH_PORT_NULL) {
+			kprintf("stress_deadname_multi: alloc nport%u\n", i);
+			rv = 3;
+			goto out;
+		}
+		rv = port_request_notification(kernel_space, s,
+		    MACH_NOTIFY_DEAD_NAME, nport[i], 10u + i, &prev);
+		if (rv != MACH_MSG_OK) {
+			kprintf("stress_deadname_multi: arm %u: %s\n", i,
+			    mach_msg_strerror(rv));
+			goto out;
+		}
+	}
+
+	/* Re-arm the first target: dedup must update its tag (10 -> 99). */
+	rv = port_request_notification(kernel_space, s,
+	    MACH_NOTIFY_DEAD_NAME, nport[0], 99u, &prev);
+	if (rv != MACH_MSG_OK) {
+		kprintf("stress_deadname_multi: re-arm: %s\n",
+		    mach_msg_strerror(rv));
+		goto out;
+	}
+
+	/* Kill the port: drop `t` (RECEIVE+SEND).  `s` keeps the object live. */
+	rv = port_deallocate(kernel_space, t);
+	t = MACH_PORT_NULL;
+	if (rv != MACH_MSG_OK) {
+		kprintf("stress_deadname_multi: kill t: %s\n",
+		    mach_msg_strerror(rv));
+		goto out;
+	}
+
+	/* Every notify port: exactly one DEAD_NAME with its tag, no second. */
+	for (i = 0; i < DEADNAME_WATCHERS; i++) {
+		uint32_t	want;
+
+		want = (i == 0) ? 99u : (10u + i);
+		rv = mach_msg_recv_timed(kernel_space, nport[i],
+		    (struct mach_msg_header *)&note, sizeof(note), 1000);
+		if (rv != MACH_MSG_OK) {
+			kprintf("stress_deadname_multi: recv %u: %s\n", i,
+			    mach_msg_strerror(rv));
+			goto out;
+		}
+		if (note.hdr.msgh_id != (uint32_t)MACH_NOTIFY_DEAD_NAME) {
+			kprintf("stress_deadname_multi: id %u not DEAD_NAME\n",
+			    (unsigned)note.hdr.msgh_id);
+			rv = 4;
+			goto out;
+		}
+		if (note.nh_msgid != want) {
+			kprintf("stress_deadname_multi: port %u tag %u != %u\n",
+			    i, (unsigned)note.nh_msgid, (unsigned)want);
+			rv = 5;
+			goto out;
+		}
+		rv = mach_msg_recv_timed(kernel_space, nport[i],
+		    (struct mach_msg_header *)&note, sizeof(note),
+		    MACH_TIMEOUT_NONE);
+		if (rv != MACH_E_NOMSG) {
+			kprintf("stress_deadname_multi: extra msg on %u: %s\n",
+			    i, mach_msg_strerror(rv));
+			rv = 6;
+			goto out;
+		}
+	}
+
+	/* The SEND name has flipped to a dead name. */
+	ty = mach_port_type(kernel_space, s);
+	if (ty != MACH_PORT_TYPE_DEAD_NAME) {
+		kprintf("stress_deadname_multi: type 0x%x not DEAD_NAME\n",
+		    (unsigned)ty);
+		rv = 7;
+		goto out;
+	}
+	/* An unallocated name reports 0: dead is distinct from absent. */
+	if (mach_port_type(kernel_space, tname) != 0) {
+		kprintf("stress_deadname_multi: freed name not absent\n");
+		rv = 8;
+		goto out;
+	}
+
+	/* The dead name deallocates cleanly. */
+	rv = port_deallocate(kernel_space, s);
+	if (rv != MACH_MSG_OK) {
+		kprintf("stress_deadname_multi: dealloc dead name: %s\n",
+		    mach_msg_strerror(rv));
+		goto out;
+	}
+	s = MACH_PORT_NULL;
+
+	rv = MACH_MSG_OK;
+
+out:
+	if (s != MACH_PORT_NULL)
+		port_deallocate(kernel_space, s);
+	if (t != MACH_PORT_NULL)
+		port_deallocate(kernel_space, t);
+	for (i = 0; i < DEADNAME_WATCHERS; i++)
+		if (nport[i] != MACH_PORT_NULL)
+			port_deallocate(kernel_space, nport[i]);
+
+	inuse1  = port_space_inuse(kernel_space);
+	cached1 = kmem_cached_pages();
+	pmm1    = pmm_used_pages();
+	cons1   = pmm1 - cached1;
+
+	kprintf("stress_deadname_multi: names %zu -> %zu, conserved %zu -> "
+	    "%zu\n", inuse0, inuse1, cons0, cons1);
+
+	if (rv != MACH_MSG_OK) {
+		kprintf("stress_deadname_multi: FAIL rv=%d\n", rv);
+		return (rv);
+	}
+	if (inuse1 != inuse0) {
+		kprintf("stress_deadname_multi: FAIL name leak (delta=%lld)\n",
+		    (long long)((long long)inuse1 - (long long)inuse0));
+		return (90);
+	}
+	if (cons1 != cons0) {
+		kprintf("stress_deadname_multi: FAIL conservation broken "
+		    "(delta=%lld)\n",
+		    (long long)((long long)cons1 - (long long)cons0));
+		return (91);
+	}
+
+	kprintf("stress_deadname_multi: PASS (multi-registrant DEAD_NAME + "
+	    "name flip)\n");
+	return (0);
+}
+
+/* ----------------------------------------------------------------------- *
  *  stress_sendblock
  *
  *  Producer thread sends `rounds` messages as fast as it can; the main

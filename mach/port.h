@@ -77,6 +77,15 @@ typedef uint32_t	mach_port_name_t;
 #define	MACH_PORT_RIGHT_PORT_SET	0x08u	/* recv-on-many aggregator */
 
 /*
+ * Extra bit returned by mach_port_type() (never stored as a held right):
+ * the name once carried a SEND / SEND_ONCE right but the port behind it
+ * has died, so the name is now a dead-name tombstone.  Distinct from the
+ * live-right bits above and from 0 (no such name), so a holder can tell
+ * "dead" from "wrong right" from "absent" without attempting a send.
+ */
+#define	MACH_PORT_TYPE_DEAD_NAME	0x10u
+
+/*
  * msgh_bits layout (same as Mach):
  *   bits  0..7   disposition for msgh_remote_port
  *   bits  8..15  disposition for msgh_local_port
@@ -136,9 +145,14 @@ typedef uint32_t	mach_port_name_t;
  *				arrive -- the server dropped the reply right
  *				or died -- is unblocked.  v1.
  *
- *	MACH_NOTIFY_DEAD_NAME	(v2, reserved) the port behind a name
- *				in this space has died, so the name now
- *				refers to MACH_PORT_DEAD.
+ *	MACH_NOTIFY_DEAD_NAME	the port behind a SEND name a holder is
+ *				watching has died; the name in the holder's
+ *				space becomes a dead name (mach_port_type
+ *				then reports MACH_PORT_TYPE_DEAD_NAME).
+ *				Multi-registrant: every SEND holder that
+ *				armed a watch on the port is notified when
+ *				it dies, each on its own registered notify
+ *				port with its own tag.  v1.
  */
 #define	MACH_NOTIFY_FIRST		64
 #define	MACH_NOTIFY_NO_SENDERS		(MACH_NOTIFY_FIRST + 6)
@@ -643,6 +657,22 @@ int			 port_deallocate(struct port_space *,
 			    mach_port_name_t);
 
 /*
+ * Report what `name` refers to in `space`, without sending anything:
+ *	0				name is unallocated.
+ *	a MACH_PORT_RIGHT_* mask		a live right (the rights held).
+ *	MACH_PORT_TYPE_DEAD_NAME		the port died; the name is now a
+ *					dead-name tombstone.
+ * The dead case is resolved lazily: the first query that finds a SEND /
+ * SEND_ONCE name whose port has died converts the entry to a tombstone
+ * (releasing the held ref on the dead port) and reports DEAD thereafter.
+ * A name holding RECEIVE is reported by its rights regardless -- the
+ * receiver defines the port's life, so it is never seen as dead here.
+ * port_deallocate frees a dead name like any other entry.
+ */
+uint32_t		 mach_port_type(struct port_space *,
+			    mach_port_name_t);
+
+/*
  * Port sets: aggregate multiple ports' receive queues behind one
  * name, so a single thread can serve many endpoints via one recv.
  *
@@ -696,14 +726,18 @@ int			 port_mod_refs(struct port_space *,
  * message's nh_msgid field so callers serving many ports through one
  * notify port can distinguish them.
  *
- * If a notification of this type was already registered on `name`, the
- * previous notify-port name is returned via *prev_out so the caller can
- * mach_port_deallocate it; MACH_PORT_NULL is written otherwise.  The
- * kernel takes a SEND ref on the new notify port and drops it when the
- * notification fires (one-shot) or when the source port's RECV right
- * is finally released.
+ * NO_SENDERS is single-slot (the one receiver owns it): re-registering
+ * replaces the prior target.  DEAD_NAME is multi-registrant: each distinct
+ * notify target arms its own watch, so every SEND holder of a port is
+ * notified when it dies; re-arming the same target merely updates its tag.
+ * *prev_out is always MACH_PORT_NULL in v1 (the kernel does not resolve a
+ * replaced target back to a name); tracking prior registrations is the
+ * caller's job.  The kernel takes a SEND ref on the notify port and drops
+ * it when the notification fires or when the source port's RECV is
+ * released.
  *
- * v1 supports only MACH_NOTIFY_NO_SENDERS; other types return MACH_E_INVAL.
+ * Supports MACH_NOTIFY_NO_SENDERS and MACH_NOTIFY_DEAD_NAME; other types
+ * return MACH_E_INVAL.
  */
 int			 port_request_notification(struct port_space *space,
 			    mach_port_name_t name, uint32_t notify_type,

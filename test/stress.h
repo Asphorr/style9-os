@@ -42,6 +42,7 @@ int	stress_thread(unsigned int rounds);
 int	stress_preempt(unsigned int n_workers, unsigned int sleep_ms);
 int	stress_sendonce(unsigned int rounds);
 int	stress_sendonce_notify(void);
+int	stress_deadname_multi(void);
 int	stress_portset(unsigned int n_members, unsigned int per_member);
 int	stress_intertask(unsigned int rounds);
 int	stress_moverecv(unsigned int rounds);

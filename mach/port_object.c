@@ -109,9 +109,8 @@ port_create(void)
 	p->p_stash_size   = 0;
 	p->p_stash_rv     = MACH_E_NOMSG;
 	p->p_notify_no_senders     = NULL;
-	p->p_notify_dead_name      = NULL;
 	p->p_notify_no_senders_id  = 0;
-	p->p_notify_dead_name_id   = 0;
+	p->p_notify_dead_name      = NULL;
 	return (p);
 }
 
@@ -141,6 +140,21 @@ port_free(struct port *p)
 		kfree(m);
 		m = next;
 	}
+
+	/*
+	 * Defensive: any DEAD_NAME watch still armed here never fired (the
+	 * RECV-drop path normally detaches + fires the list before the last
+	 * ref goes).  Drop each node's SEND ref and free it so we don't leak.
+	 */
+	while (p->p_notify_dead_name != NULL) {
+		struct port_notify_node *next_n = p->p_notify_dead_name->nn_next;
+
+		port_deref(p->p_notify_dead_name->nn_port,
+		    MACH_PORT_RIGHT_SEND);
+		kfree(p->p_notify_dead_name);
+		p->p_notify_dead_name = next_n;
+	}
+
 	kfree(p);
 }
 
@@ -174,11 +188,9 @@ port_deref(struct port *p, uint8_t rights)
 	struct thread	*wake_head = NULL;
 	struct thread	*send_wake_head = NULL;
 	struct port	*notify_no_senders = NULL;
-	struct port	*notify_dead_name = NULL;
+	struct port_notify_node *dead_name_list = NULL;
 	uint32_t	 notify_no_senders_id = 0;
-	uint32_t	 notify_dead_name_id = 0;
 	bool		 fire_no_senders = false;
-	bool		 fire_dead_name = false;
 
 	spin_lock(&p->p_lock);
 
@@ -230,17 +242,12 @@ port_deref(struct port *p, uint8_t rights)
 			p->p_notify_no_senders_id = 0;
 		}
 		/*
-		 * DEAD_NAME slot: receiver going away IS the trigger.
-		 * Snapshot + tag, mark for firing, release the SEND ref
-		 * post-unlock (after the notification is delivered).
+		 * DEAD_NAME list: receiver going away IS the trigger.
+		 * Detach the whole list; post-unlock we fire each watcher,
+		 * drop its SEND ref, and free the node.
 		 */
-		if (p->p_notify_dead_name != NULL) {
-			notify_dead_name    = p->p_notify_dead_name;
-			notify_dead_name_id = p->p_notify_dead_name_id;
-			p->p_notify_dead_name    = NULL;
-			p->p_notify_dead_name_id = 0;
-			fire_dead_name = true;
-		}
+		dead_name_list = p->p_notify_dead_name;
+		p->p_notify_dead_name = NULL;
 	}
 
 	/*
@@ -293,12 +300,20 @@ port_deref(struct port *p, uint8_t rights)
 		 */
 		port_deref(notify_no_senders, MACH_PORT_RIGHT_SEND);
 	}
-	if (fire_dead_name) {
-		(void)port_notify_enqueue(notify_dead_name,
-		    MACH_NOTIFY_DEAD_NAME, notify_dead_name_id);
+	/*
+	 * Fire every armed DEAD_NAME watcher (multi-registrant): post the
+	 * notification, drop the SEND ref the node held on its target, free
+	 * the node.  An empty list (the common case) is a no-op.
+	 */
+	while (dead_name_list != NULL) {
+		struct port_notify_node *next = dead_name_list->nn_next;
+
+		(void)port_notify_enqueue(dead_name_list->nn_port,
+		    MACH_NOTIFY_DEAD_NAME, dead_name_list->nn_tag);
+		port_deref(dead_name_list->nn_port, MACH_PORT_RIGHT_SEND);
+		kfree(dead_name_list);
+		dead_name_list = next;
 	}
-	if (notify_dead_name != NULL)
-		port_deref(notify_dead_name, MACH_PORT_RIGHT_SEND);
 
 	while (drain_head != NULL) {
 		struct port_msg *next = drain_head->m_next;
@@ -518,48 +533,82 @@ port_release_task_self(struct task *t)
 }
 
 /*
+ * port_dead_name_link: link a DEAD_NAME watcher node onto `watched`.
+ * Shared by the in-kernel arm (port_arm_dead_name_object) and the
+ * userspace path (port_request_notification); both pre-allocate the node
+ * and take the SEND ref outside p_lock so nothing allocates under it.
+ * See the header comment in port_internal.h for the node/ref ownership
+ * contract.  Lock-order: only watched->p_lock is taken here.
+ */
+int
+port_dead_name_link(struct port *watched, struct port *notify,
+    struct port_notify_node *node, uint32_t tag, bool *was_dup)
+{
+	struct port_notify_node	*n;
+
+	*was_dup = false;
+
+	spin_lock(&watched->p_lock);
+	if (watched->p_dead || !watched->p_has_receive) {
+		spin_unlock(&watched->p_lock);
+		return (MACH_E_DEAD);
+	}
+	for (n = watched->p_notify_dead_name; n != NULL; n = n->nn_next) {
+		if (n->nn_port == notify) {
+			n->nn_tag = tag;
+			*was_dup = true;
+			spin_unlock(&watched->p_lock);
+			return (MACH_MSG_OK);
+		}
+	}
+	node->nn_port = notify;
+	node->nn_tag  = tag;
+	node->nn_pad  = 0;
+	node->nn_next = watched->p_notify_dead_name;
+	watched->p_notify_dead_name = node;
+	spin_unlock(&watched->p_lock);
+	return (MACH_MSG_OK);
+}
+
+/*
  * port_arm_dead_name_object: kernel-internal DEAD_NAME arming on port
  * objects rather than names.  The userspace path
  * (port_request_notification) resolves names in a space + checks the
  * caller's rights; an in-kernel watcher (the launchd keep_alive worker)
  * already holds port pointers, so it arms directly.
  *
- * Takes one SEND ref on `notify` for the registration; that ref is
- * dropped automatically when the one-shot fires (port_deref's
- * fire_dead_name path) or when `watched`'s RECEIVE is finally released
- * without firing.  Replacing an existing registration drops the old
- * notify ref.  Returns MACH_E_DEAD if `watched` is already dead (the
- * event the caller wanted can no longer be observed).
+ * Multi-registrant: appends a watch (deduped on `notify`) so several
+ * watchers can observe the same port's death.  Takes one SEND ref on
+ * `notify`; that ref is dropped automatically when the notification fires
+ * or when `watched`'s RECEIVE is released without firing.  Returns
+ * MACH_E_DEAD if `watched` is already dead, MACH_E_NOMEM if the watch node
+ * cannot be allocated.
  *
- * Lock-order: ref `notify` BEFORE taking watched->p_lock so the two
- * per-port locks never nest.  The old-notify deref happens after the
- * unlock for the same reason.
+ * Lock-order: ref `notify` and allocate the node BEFORE taking
+ * watched->p_lock so nothing nests under or allocates beneath it.
  */
 int
 port_arm_dead_name_object(struct port *watched, struct port *notify,
     uint32_t tag)
 {
-	struct port	*old;
+	struct port_notify_node	*node;
+	bool			 dup;
+	int			 rv;
 
 	if (watched == NULL || notify == NULL)
 		return (MACH_E_INVAL);
 
+	node = (struct port_notify_node *)kmalloc(sizeof(*node));
+	if (node == NULL)
+		return (MACH_E_NOMEM);
+
 	port_ref(notify, MACH_PORT_RIGHT_SEND);
-
-	spin_lock(&watched->p_lock);
-	if (watched->p_dead || !watched->p_has_receive) {
-		spin_unlock(&watched->p_lock);
+	rv = port_dead_name_link(watched, notify, node, tag, &dup);
+	if (rv != MACH_MSG_OK || dup) {
 		port_deref(notify, MACH_PORT_RIGHT_SEND);
-		return (MACH_E_DEAD);
+		kfree(node);
 	}
-	old = watched->p_notify_dead_name;
-	watched->p_notify_dead_name    = notify;
-	watched->p_notify_dead_name_id = tag;
-	spin_unlock(&watched->p_lock);
-
-	if (old != NULL)
-		port_deref(old, MACH_PORT_RIGHT_SEND);
-	return (MACH_MSG_OK);
+	return (rv);
 }
 
 /*

@@ -338,6 +338,10 @@ kmain_run_tests(void)
 	int rv_so_notify = stress_sendonce_notify();
 	kprintf("  sendonce-notify      : %s (rv=%d)\n",
 	    rv_so_notify == 0 ? "PASS" : "FAIL", rv_so_notify);
+
+	int rv_deadname = stress_deadname_multi();
+	kprintf("  deadname-multi       : %s (rv=%d)\n",
+	    rv_deadname == 0 ? "PASS" : "FAIL", rv_deadname);
 }
 
 /*

@@ -134,14 +134,16 @@ retry:
 	start = ps->ps_hint == 0 ? 1 : ps->ps_hint;
 	for (i = start; i < ps->ps_capacity; i++) {
 		if (ps->ps_table[i].pe_port == NULL &&
-		    ps->ps_table[i].pe_set == NULL) {
+		    ps->ps_table[i].pe_set == NULL &&
+		    !ps->ps_table[i].pe_dead) {
 			n = (mach_port_name_t)i;
 			goto found;
 		}
 	}
 	for (i = 1; i < start && i < ps->ps_capacity; i++) {
 		if (ps->ps_table[i].pe_port == NULL &&
-		    ps->ps_table[i].pe_set == NULL) {
+		    ps->ps_table[i].pe_set == NULL &&
+		    !ps->ps_table[i].pe_dead) {
 			n = (mach_port_name_t)i;
 			goto found;
 		}
@@ -263,6 +265,95 @@ space_lookup_set(struct port_space *ps, mach_port_name_t name)
 	return (set);
 }
 
+/*
+ * Read-only: is `name` a dead-name tombstone?  Used by the send path to
+ * report MACH_E_DEAD (rather than MACH_E_NAME) when the remote name has
+ * already been converted by a prior mach_port_type / observation.
+ */
+bool
+space_name_is_dead(struct port_space *ps, mach_port_name_t name)
+{
+	bool	dead;
+
+	if (ps == NULL || name == MACH_PORT_NULL || name == MACH_PORT_DEAD)
+		return (false);
+
+	spin_lock(&ps->ps_lock);
+	dead = (name < ps->ps_capacity && ps->ps_table[name].pe_dead != 0);
+	spin_unlock(&ps->ps_lock);
+	return (dead);
+}
+
+uint32_t
+mach_port_type(struct port_space *ps, mach_port_name_t name)
+{
+	struct port	*p;
+	uint8_t		 r;
+	bool		 dead;
+
+	if (ps == NULL || name == MACH_PORT_NULL || name == MACH_PORT_DEAD)
+		return (0);
+
+	spin_lock(&ps->ps_lock);
+	if (name >= ps->ps_capacity) {
+		spin_unlock(&ps->ps_lock);
+		return (0);
+	}
+	if (ps->ps_table[name].pe_dead) {
+		spin_unlock(&ps->ps_lock);
+		return (MACH_PORT_TYPE_DEAD_NAME);
+	}
+	p = ps->ps_table[name].pe_port;
+	r = ps->ps_table[name].pe_rights;
+	if (p == NULL && ps->ps_table[name].pe_set == NULL) {
+		spin_unlock(&ps->ps_lock);
+		return (0);
+	}
+
+	/*
+	 * A port set, or a name still holding RECEIVE, is reported by its
+	 * rights mask regardless of p_dead: the receiver defines the port's
+	 * life (style9 also marks p_dead in the no-senders fallback while
+	 * RECEIVE is still held).  Only a SEND / SEND_ONCE-only name can
+	 * become a dead name.
+	 */
+	if (ps->ps_table[name].pe_set != NULL ||
+	    (r & MACH_PORT_RIGHT_RECEIVE) != 0) {
+		spin_unlock(&ps->ps_lock);
+		return ((uint32_t)r);
+	}
+
+	/*
+	 * Peek p_dead under p_lock while holding ps_lock.  The order
+	 * ps_lock (outer) -> p_lock (inner) is acyclic: no path takes a
+	 * port_space lock while holding a port lock.  ps_lock pins the
+	 * entry; the entry's own ref keeps `p` alive across the peek.
+	 */
+	spin_lock(&p->p_lock);
+	dead = p->p_dead;
+	spin_unlock(&p->p_lock);
+
+	if (!dead) {
+		spin_unlock(&ps->ps_lock);
+		return ((uint32_t)r);
+	}
+
+	/*
+	 * Lazy dead-name conversion: the port died, so transmute the entry
+	 * into a tombstone and release the ref it held on the dead port
+	 * (which may free it).  The slot stays occupied until the holder
+	 * deallocates the dead name.  Done after both locks drop.
+	 */
+	ps->ps_table[name].pe_port   = NULL;
+	ps->ps_table[name].pe_set    = NULL;
+	ps->ps_table[name].pe_rights = 0;
+	ps->ps_table[name].pe_dead   = 1;
+	spin_unlock(&ps->ps_lock);
+
+	port_deref(p, r);
+	return (MACH_PORT_TYPE_DEAD_NAME);
+}
+
 static int
 space_drop(struct port_space *ps, mach_port_name_t name)
 {
@@ -274,9 +365,25 @@ space_drop(struct port_space *ps, mach_port_name_t name)
 		return (MACH_E_INVAL);
 
 	spin_lock(&ps->ps_lock);
-	if (name >= ps->ps_capacity ||
-	    (ps->ps_table[name].pe_port == NULL &&
-	     ps->ps_table[name].pe_set == NULL)) {
+	if (name >= ps->ps_capacity) {
+		spin_unlock(&ps->ps_lock);
+		return (MACH_E_NAME);
+	}
+	/*
+	 * Dead-name tombstone: the entry names no live object (the ref on the
+	 * dead port was dropped at conversion), so just reclaim the slot.
+	 * Deallocating the dead name is how a holder finally lets go of it.
+	 */
+	if (ps->ps_table[name].pe_dead) {
+		ps->ps_table[name].pe_dead = 0;
+		ps->ps_inuse--;
+		if (name < ps->ps_hint)
+			ps->ps_hint = name;
+		spin_unlock(&ps->ps_lock);
+		return (MACH_MSG_OK);
+	}
+	if (ps->ps_table[name].pe_port == NULL &&
+	    ps->ps_table[name].pe_set == NULL) {
 		spin_unlock(&ps->ps_lock);
 		return (MACH_E_NAME);
 	}
@@ -690,37 +797,54 @@ port_request_notification(struct port_space *space, mach_port_name_t name,
 		return (MACH_E_INVAL);
 
 	/*
-	 * Take a SEND ref for the slot.  Released by port_deref's
-	 * firing branch (one-shot) or the RECV-drop cleanup branch.
-	 * Done before swapping the field so an interleaving fire reads
-	 * a live ref.
+	 * DEAD_NAME is multi-registrant: pre-allocate a node and take a
+	 * fresh SEND ref outside source->p_lock, then hand both to
+	 * port_dead_name_link.  It appends a new watch, or -- if this target
+	 * is already armed -- updates its tag and hands the spare node + ref
+	 * back (dup) for us to release.
+	 */
+	if (notify_type == MACH_NOTIFY_DEAD_NAME) {
+		struct port_notify_node	*node;
+		bool			 dup;
+		int			 rv;
+
+		node = (struct port_notify_node *)kmalloc(sizeof(*node));
+		if (node == NULL)
+			return (MACH_E_NOMEM);
+		port_ref(notify_port, MACH_PORT_RIGHT_SEND);
+		rv = port_dead_name_link(source, notify_port, node,
+		    notify_msgid, &dup);
+		if (rv != MACH_MSG_OK || dup) {
+			port_deref(notify_port, MACH_PORT_RIGHT_SEND);
+			kfree(node);
+		}
+		*prev_out = MACH_PORT_NULL;
+		return (rv);
+	}
+
+	/*
+	 * NO_SENDERS is single-slot (one receiver per port).  Take a SEND
+	 * ref before swapping the field so an interleaving fire reads a live
+	 * ref; the prior registration's ref is dropped after the swap.  That
+	 * ref is released by port_deref's firing branch or the RECV-drop
+	 * cleanup branch.
 	 */
 	port_ref(notify_port, MACH_PORT_RIGHT_SEND);
 
 	spin_lock(&source->p_lock);
-	if (notify_type == MACH_NOTIFY_NO_SENDERS) {
-		prev_target                    = source->p_notify_no_senders;
-		source->p_notify_no_senders    = notify_port;
-		source->p_notify_no_senders_id = notify_msgid;
-	} else {
-		prev_target                    = source->p_notify_dead_name;
-		source->p_notify_dead_name     = notify_port;
-		source->p_notify_dead_name_id  = notify_msgid;
-	}
+	prev_target                    = source->p_notify_no_senders;
+	source->p_notify_no_senders    = notify_port;
+	source->p_notify_no_senders_id = notify_msgid;
 	spin_unlock(&source->p_lock);
 
-	/*
-	 * The kernel held a SEND ref for the previous registration; drop
-	 * it now that the slot points elsewhere.
-	 */
 	if (prev_target != NULL)
 		port_deref(prev_target, MACH_PORT_RIGHT_SEND);
 
 	/*
-	 * v1 makes no attempt to resolve prev_target back to a name in
-	 * the caller's space (would require walking ps_table or
-	 * stashing the name alongside the pointer).  Tracking the
-	 * previous registration is the application's job.
+	 * v1 makes no attempt to resolve prev_target back to a name in the
+	 * caller's space (would require walking ps_table or stashing the
+	 * name alongside the pointer).  Tracking the previous registration
+	 * is the application's job.
 	 */
 	*prev_out = MACH_PORT_NULL;
 	return (MACH_MSG_OK);

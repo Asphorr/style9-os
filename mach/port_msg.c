@@ -993,6 +993,13 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 	    &dummy_rights);
 	if (dest == NULL) {
 		kfree(m);
+		/*
+		 * A name whose port died and was converted to a dead-name
+		 * tombstone reads as absent here; report it as dead so the
+		 * sender sees MACH_E_DEAD rather than MACH_E_RIGHT.
+		 */
+		if (space_name_is_dead(from, msg->msgh_remote))
+			return (MACH_E_DEAD);
 		return (MACH_E_RIGHT);
 	}
 

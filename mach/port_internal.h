@@ -28,6 +28,7 @@
 /* ---- types ----------------------------------------------------------- */
 
 struct port_set;
+struct port_notify_node;
 
 struct port {
 	struct spinlock	 p_lock;
@@ -59,27 +60,31 @@ struct port {
 	int		 p_stash_rv;
 
 	/*
-	 * Notification slots (one-shot per type).
+	 * Notification slots.
 	 *
 	 *	NO_SENDERS	registered by the receiver of THIS port; fires
 	 *			when the last send-bearing right drops while
-	 *			RECEIVE is still held.
-	 *	DEAD_NAME	registered by a SEND holder of THIS port; fires
+	 *			RECEIVE is still held.  Single-slot (one
+	 *			receiver per port): a second registration
+	 *			replaces the first.
+	 *	DEAD_NAME	registered by SEND holders of THIS port; fires
 	 *			when RECEIVE is dropped and the port goes dead
-	 *			(the watcher's SEND name in their own space
-	 *			becomes a dead name).
+	 *			(each watcher's SEND name in their own space
+	 *			becomes a dead name).  Multi-registrant: a
+	 *			singly-linked list of p_notify_dead_name nodes,
+	 *			one per distinct notify target, so every holder
+	 *			that armed a watch is notified -- not just the
+	 *			last to register.
 	 *
 	 * The kernel holds a SEND ref on each notify port to keep it
 	 * alive until the notification fires or the source's RECV
-	 * drops (whichever first); both refs are released through
-	 * port_deref's notify-cleanup branches.  v1 is single-slot per
-	 * type: a second registration replaces the first.  All under
-	 * p_lock.
+	 * drops (whichever first); the NO_SENDERS ref is released through
+	 * port_deref's notify-cleanup branch, the DEAD_NAME refs as the
+	 * list is walked on death.  All under p_lock.
 	 */
-	struct port	*p_notify_no_senders;
-	struct port	*p_notify_dead_name;
-	uint32_t	 p_notify_no_senders_id;
-	uint32_t	 p_notify_dead_name_id;
+	struct port		*p_notify_no_senders;
+	uint32_t		 p_notify_no_senders_id;
+	struct port_notify_node	*p_notify_dead_name;
 };
 
 struct port_set {
@@ -91,6 +96,20 @@ struct port_set {
 	struct port	*ps_members_head;	/* (p) SLL via p_set_link    */
 	struct thread	*ps_waiters_head;	/* (p) recv-blocked threads  */
 	struct thread	*ps_waiters_tail;	/* (p)                       */
+};
+
+/*
+ * One armed DEAD_NAME watch.  Linked off port->p_notify_dead_name; the
+ * list is built as SEND holders register and walked (fired + freed) when
+ * the port dies.  nn_port carries one kernel-held SEND ref on the notify
+ * target, released as the node is freed.  Deduped on nn_port so re-arming
+ * the same target updates its tag rather than queueing a second message.
+ */
+struct port_notify_node {
+	struct port_notify_node	*nn_next;
+	struct port		*nn_port;	/* notify target, holds 1 SEND */
+	uint32_t		 nn_tag;	/* user msgid handed back      */
+	uint32_t		 nn_pad;
 };
 
 /*
@@ -125,7 +144,8 @@ struct port_entry {
 	struct port	*pe_port;	/* non-NULL when this is a port    */
 	struct port_set	*pe_set;	/* non-NULL when this is a set     */
 	uint8_t		 pe_rights;	/* MACH_PORT_RIGHT_* mask          */
-	uint8_t		 pe_pad[3];
+	uint8_t		 pe_dead;	/* dead-name tombstone (port died) */
+	uint8_t		 pe_pad[2];
 };
 
 struct port_space {
@@ -157,6 +177,19 @@ void		 port_free(struct port *);
 void		 port_ref(struct port *, uint8_t rights);
 void		 port_deref(struct port *, uint8_t rights);
 
+/*
+ * Link a DEAD_NAME watcher onto `watched`.  Caller hands in a port that
+ * already carries one fresh SEND ref (`notify`) and a pre-allocated node
+ * (so no kmalloc happens under p_lock).  On a fresh registration the node
+ * and ref are consumed; if a node for the same target already exists its
+ * tag is updated and *was_dup is set true so the caller frees the spare
+ * node and drops the spare ref.  Returns MACH_E_DEAD if `watched` has
+ * already died (the event can no longer be observed).
+ */
+int		 port_dead_name_link(struct port *watched, struct port *notify,
+		    struct port_notify_node *node, uint32_t tag,
+		    bool *was_dup);
+
 struct port_set	*port_set_create(void);
 void		 port_set_free(struct port_set *);
 void		 port_set_ref(struct port_set *);
@@ -170,6 +203,7 @@ int		 space_install_no_ref(struct port_space *, struct port *p,
 struct port	*space_lookup(struct port_space *, mach_port_name_t name,
 		    uint8_t need_right, uint8_t *rights_out);
 struct port_set	*space_lookup_set(struct port_space *, mach_port_name_t);
+bool		 space_name_is_dead(struct port_space *, mach_port_name_t);
 int		 space_drop_one_right(struct port_space *,
 		    mach_port_name_t name, uint8_t right);
 int		 space_unbind_no_deref(struct port_space *,
