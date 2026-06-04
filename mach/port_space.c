@@ -81,6 +81,10 @@ port_space_destroy(struct port_space *ps)
 		ps->ps_table[i].pe_set    = NULL;
 		ps->ps_table[i].pe_rights = 0;
 		spin_unlock(&ps->ps_lock);
+		/* Send-once right torn down unused -> notify its target. */
+		if (p != NULL && (r & MACH_PORT_RIGHT_SEND_ONCE) != 0)
+			(void)port_notify_enqueue(p,
+			    MACH_NOTIFY_SEND_ONCE, 0);
 		if (p != NULL)
 			port_deref(p, r);
 		if (set != NULL)
@@ -286,6 +290,19 @@ space_drop(struct port_space *ps, mach_port_name_t name)
 	if (name < ps->ps_hint)
 		ps->ps_hint = name;
 	spin_unlock(&ps->ps_lock);
+
+	/*
+	 * A send-once right destroyed without being used to send its one
+	 * message auto-fires MACH_NOTIFY_SEND_ONCE to its target port, so a
+	 * client blocked awaiting a reply that will never come is unblocked.
+	 * This is the explicit-deallocate path (teardown is handled in
+	 * port_space_destroy).  The used path -- consuming the right by
+	 * sending -- goes through space_drop_one_right and never lands here,
+	 * so a normal reply produces no spurious notification.  Fire before
+	 * port_deref, while the right's own ref still keeps `p` alive.
+	 */
+	if (p != NULL && (r & MACH_PORT_RIGHT_SEND_ONCE) != 0)
+		(void)port_notify_enqueue(p, MACH_NOTIFY_SEND_ONCE, 0);
 
 	if (p != NULL)
 		port_deref(p, r);

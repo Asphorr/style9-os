@@ -1316,6 +1316,116 @@ out:
 	return (0);
 }
 
+/* ---- stress_sendonce_notify ------------------------------------------- */
+
+/*
+ * Verify the send-once *notification* (MACH_NOTIFY_SEND_ONCE): a send-once
+ * right destroyed WITHOUT being used to send its one message must auto-fire
+ * the notification to its target port, so a client blocked awaiting a reply
+ * that will never come is unblocked.
+ *
+ * Single-threaded, public API only: allocate a reply port (we hold
+ * RECEIVE) and a sink port, send a request to the sink carrying a
+ * MAKE_SEND_ONCE right to the reply port, recv that request ourselves so
+ * the send-once right lands in our space, then port_deallocate it UNUSED
+ * and confirm exactly one MACH_NOTIFY_SEND_ONCE arrives on the reply port.
+ * stress_sendonce above covers the used path: if a normal reply ever fired
+ * a spurious notification, its reply recv would see an extra message.
+ */
+int
+stress_sendonce_notify(void)
+{
+	struct stress_msg		req, got;
+	struct mach_notify_header	note;
+	size_t				inuse0, inuse1;
+	mach_port_name_t		reply, sink, so;
+	int				rv;
+
+	inuse0 = port_space_inuse(kernel_space);
+
+	reply = port_allocate(kernel_space, MACH_PORT_RIGHT_RECEIVE);
+	sink  = port_allocate(kernel_space,
+	    MACH_PORT_RIGHT_RECEIVE | MACH_PORT_RIGHT_SEND);
+	if (reply == MACH_PORT_NULL || sink == MACH_PORT_NULL) {
+		kprintf("stress_sendonce_notify: port_allocate failed\n");
+		return (1);
+	}
+
+	req.hdr.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) |
+	    MACH_MSGH_BITS_COMPLEX;
+	req.hdr.msgh_size    = sizeof(req);
+	req.hdr.msgh_remote  = sink;
+	req.hdr.msgh_local   = MACH_PORT_NULL;
+	req.hdr.msgh_voucher = 0;
+	req.hdr.msgh_id      = 1;
+	req.body.msgh_descriptor_count = 1;
+	req.reply_pd.name        = reply;
+	req.reply_pd.pad1        = 0;
+	req.reply_pd.disposition = MACH_MSG_TYPE_MAKE_SEND_ONCE;
+	req.reply_pd.type        = MACH_MSG_PORT_DESCRIPTOR;
+	req.reply_pd.pad2        = 0;
+	req.payload              = 0;
+
+	rv = mach_msg_send(kernel_space, &req.hdr);
+	if (rv != MACH_MSG_OK) {
+		kprintf("stress_sendonce_notify: req send: %s\n",
+		    mach_msg_strerror(rv));
+		goto out;
+	}
+
+	/* Receive our own request: the send-once right is in got.reply_pd. */
+	rv = mach_msg_recv_block(kernel_space, sink, &got.hdr, sizeof(got));
+	if (rv != MACH_MSG_OK) {
+		kprintf("stress_sendonce_notify: req recv: %s\n",
+		    mach_msg_strerror(rv));
+		goto out;
+	}
+	so = got.reply_pd.name;
+
+	/* Destroy the send-once right UNUSED; the notification must fire. */
+	rv = port_deallocate(kernel_space, so);
+	if (rv != MACH_MSG_OK) {
+		kprintf("stress_sendonce_notify: deallocate: %s\n",
+		    mach_msg_strerror(rv));
+		goto out;
+	}
+
+	rv = mach_msg_recv_timed(kernel_space, reply,
+	    (struct mach_msg_header *)&note, sizeof(note), 1000);
+	if (rv != MACH_MSG_OK) {
+		kprintf("stress_sendonce_notify: notify recv: %s\n",
+		    mach_msg_strerror(rv));
+		goto out;
+	}
+	if (note.hdr.msgh_id != MACH_NOTIFY_SEND_ONCE) {
+		kprintf("stress_sendonce_notify: wrong id 0x%x (want 0x%x)\n",
+		    (unsigned)note.hdr.msgh_id,
+		    (unsigned)MACH_NOTIFY_SEND_ONCE);
+		rv = 3;
+		goto out;
+	}
+	rv = 0;
+
+out:
+	port_deallocate(kernel_space, reply);
+	port_deallocate(kernel_space, sink);
+
+	inuse1 = port_space_inuse(kernel_space);
+	if (rv != MACH_MSG_OK && rv != 0) {
+		kprintf("stress_sendonce_notify: FAIL rv=%d\n", rv);
+		return (rv);
+	}
+	if (inuse1 != inuse0) {
+		kprintf("stress_sendonce_notify: FAIL name leak (delta=%lld)\n",
+		    (long long)((long long)inuse1 - (long long)inuse0));
+		return (40);
+	}
+
+	kprintf("stress_sendonce_notify: PASS (MACH_NOTIFY_SEND_ONCE on "
+	    "unused destroy)\n");
+	return (0);
+}
+
 /* ---- stress_portset --------------------------------------------------- */
 
 /*

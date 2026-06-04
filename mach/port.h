@@ -127,12 +127,22 @@ typedef uint32_t	mach_port_name_t;
  *				services to detect "client has gone
  *				away" without polling.  v1.
  *
+ *	MACH_NOTIFY_SEND_ONCE	a send-once right was destroyed without
+ *				being used to send its one message.  Unlike
+ *				the others this is NOT routed through a
+ *				registered notify port: the kernel posts it
+ *				to the right's own target port, so a client
+ *				blocked awaiting a reply that will never
+ *				arrive -- the server dropped the reply right
+ *				or died -- is unblocked.  v1.
+ *
  *	MACH_NOTIFY_DEAD_NAME	(v2, reserved) the port behind a name
  *				in this space has died, so the name now
  *				refers to MACH_PORT_DEAD.
  */
 #define	MACH_NOTIFY_FIRST		64
 #define	MACH_NOTIFY_NO_SENDERS		(MACH_NOTIFY_FIRST + 6)
+#define	MACH_NOTIFY_SEND_ONCE		(MACH_NOTIFY_FIRST + 7)
 #define	MACH_NOTIFY_DEAD_NAME		(MACH_NOTIFY_FIRST + 8)
 
 /*

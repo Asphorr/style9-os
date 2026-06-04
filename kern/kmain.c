@@ -334,6 +334,10 @@ kmain_run_tests(void)
 	    rv_rpc == 0 ? "PASS" : "FAIL", rv_rpc);
 	kprintf("  stress ool 4         : %s (rv=%d)\n",
 	    rv_ool == 0 ? "PASS" : "FAIL", rv_ool);
+
+	int rv_so_notify = stress_sendonce_notify();
+	kprintf("  sendonce-notify      : %s (rv=%d)\n",
+	    rv_so_notify == 0 ? "PASS" : "FAIL", rv_so_notify);
 }
 
 /*
