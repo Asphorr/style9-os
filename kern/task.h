@@ -53,19 +53,35 @@ struct vm_map;
 #define	TASK_PERSONALITY_DARWIN	1
 
 /*
- * Per-task open-file table for the Darwin file syscalls (open/read/close/
- * lseek, kern/darwin.c).  A file opened by a TASK_PERSONALITY_DARWIN task is
- * slurped whole from the read-only FS into of_buf at open() time; read/lseek
- * move of_off over it; close frees of_buf.  fds 0..2 are the std streams
- * (handled without a slot); real files occupy slots 3..DARWIN_NOFILE-1.
+ * Per-task open-file table for the Darwin file syscalls (kern/darwin.c).
+ * Slots are typed.  A FILE slot holds a whole file slurped from the
+ * read-only FS into of_buf at open() time (read/lseek move of_off over it;
+ * close frees of_buf).  A CONSOLE slot is an explicit std-stream binding
+ * (write -> tty, read -> EOF).  A PIPE_R/PIPE_W slot is one end of a
+ * kernel pipe; the struct darwin_pipe is shared (reference-counted per
+ * end) with every other fd cloned from it by dup2/fork.
+ *
+ * fds 0..2 whose slot is FREE keep the historical implicit std-stream
+ * behavior (stdin EOF, stdout/stderr -> console).  dup2 can overwrite
+ * them with a typed slot -- a pipe end standing in for stdout is exactly
+ * what a shell's redirection plumbing does.
  */
 #define	DARWIN_NOFILE	16
 
+#define	DARWIN_OF_FREE		0
+#define	DARWIN_OF_FILE		1
+#define	DARWIN_OF_CONSOLE	2
+#define	DARWIN_OF_PIPE_R	3
+#define	DARWIN_OF_PIPE_W	4
+
+struct darwin_pipe;
+
 struct darwin_ofile {
-	uint8_t		*of_buf;	/* kmalloc'd file image, or NULL */
-	uint32_t	 of_size;	/* valid bytes in of_buf         */
-	uint32_t	 of_off;	/* current read cursor           */
-	bool		 of_used;	/* slot occupied                 */
+	struct darwin_pipe	*of_pipe;	/* PIPE_*: shared object   */
+	uint8_t			*of_buf;	/* FILE: kmalloc'd image   */
+	uint32_t		 of_size;	/* FILE: valid bytes       */
+	uint32_t		 of_off;	/* FILE: read cursor       */
+	uint8_t			 of_type;	/* DARWIN_OF_*             */
 };
 
 struct task {
@@ -143,10 +159,18 @@ struct task {
 	uint64_t		 t_darwin_dylib_next;
 
 	/*
+	 * Darwin parentage: the t_id of the Darwin task that fork()ed
+	 * this one, or 0 when no Darwin parent exists (the native spawn
+	 * rig).  Read by getppid(2) and by wait4(2), which matches both
+	 * zombies and live children against the caller's id.  Set once
+	 * at fork, before the child's first instruction; never changed.
+	 */
+	uint64_t		 t_darwin_ppid;
+
+	/*
 	 * Open files for the Darwin file syscalls (see struct darwin_ofile).
-	 * Zeroed at task_create; any buffers still open are freed on task
-	 * teardown (task_deref).  Indexed by fd; slots 0..2 stay empty (the
-	 * std streams need no backing).
+	 * Zeroed at task_create (all slots DARWIN_OF_FREE); anything still
+	 * open is released on task teardown via darwin_files_teardown.
 	 */
 	struct darwin_ofile	 t_darwin_files[DARWIN_NOFILE];
 };
@@ -187,6 +211,18 @@ size_t			 task_snapshot(struct task **out, size_t max);
  * until a spawned child drops off the live list.
  */
 bool			 task_is_alive(uint64_t id);
+
+/*
+ * Count the live tasks whose t_darwin_ppid is `ppid` -- restricted to the
+ * single child `pid` when pid != 0.  Walks the task list under tasks_lock;
+ * the count is stale the instant the lock drops, so callers treat it as a
+ * hint.  Powers the Darwin wait4(2): "do I still have a child that could
+ * produce a zombie?" -- the loop re-checks the zombie table first, so a
+ * child that exits between samples is never missed (its zombie record is
+ * written before its task leaves the live list).
+ */
+int			 task_count_darwin_children(uint64_t ppid,
+			    uint64_t pid);
 
 /*
  * Request asynchronous termination of the task identified by `task_id`.

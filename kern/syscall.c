@@ -458,6 +458,134 @@ syscall_copyout(void *uptr, const void *kbuf, size_t n)
 	return (0);
 }
 
+/*
+ * Shared copyin for a fixed-length buffer: the mirror of syscall_copyout.
+ * Copies `n` bytes from user `uptr` into kernel `kbuf` after one range
+ * check, under one SMAP bracket.  Returns 0 or SYS_E_FAULT.  The Darwin
+ * pipe write path (kern/darwin.c) pulls its payload through it.
+ */
+long
+syscall_copyin(void *kbuf, const void *uptr, size_t n)
+{
+	const uint8_t	*src;
+	uint8_t		*dst;
+	uintptr_t	 uaddr;
+	size_t		 i;
+
+	if (n == 0)
+		return (0);
+	if (uptr == NULL)
+		return (SYS_E_FAULT);
+	uaddr = (uintptr_t)uptr;
+	if (uaddr + n < uaddr)			/* length wrap */
+		return (SYS_E_FAULT);
+	if (!user_range_ok((uint64_t)uaddr, n))
+		return (SYS_E_FAULT);
+
+	src = (const uint8_t *)uptr;
+	dst = (uint8_t *)kbuf;
+	smap_user_access_begin();
+	for (i = 0; i < n; i++)
+		dst[i] = src[i];
+	smap_user_access_end();
+	return (0);
+}
+
+/*
+ * Copy a NUL-terminated user argument vector (execve shape: char *argv[]
+ * ending in a NULL pointer) into one kernel-owned flat block, laid out
+ * exactly like sys_spawn_args' block: argc+1 leading char * slots (the
+ * last NULL) whose non-NULL entries point into the packed strings that
+ * follow.  Caps mirror the spawn path: SPAWN_ARGV_MAX pointers,
+ * SPAWN_ARG_BYTES_MAX total string bytes.  On success *blockp owns the
+ * kmalloc'd block (kfree when done), *argcp the count, and 0 returns; a
+ * NULL uargv is argc 0 with no block.  Negative SYS_E_* on fault/limit.
+ */
+long
+syscall_copyin_argv(char *const *uargv, char ***blockp, int *argcp)
+{
+	char		**kargv;
+	char		 *block;
+	char		 *strs;
+	const char	 *uarg;
+	size_t		  ptrs_sz;
+	size_t		  used;
+	size_t		  i;
+	size_t		  k;
+	size_t		  n;
+
+	*blockp = NULL;
+	*argcp  = 0;
+	if (uargv == NULL)
+		return (0);
+	if (!user_range_ok((uint64_t)(uintptr_t)uargv, sizeof(char *)))
+		return (SYS_E_FAULT);
+
+	/* First pass: count entries up to the NULL terminator. */
+	n = 0;
+	for (;;) {
+		if (n > SPAWN_ARGV_MAX)
+			return (SYS_E_INVAL);
+		if (!user_range_ok((uint64_t)(uintptr_t)(uargv + n),
+		    sizeof(char *)))
+			return (SYS_E_FAULT);
+		smap_user_access_begin();
+		uarg = uargv[n];
+		smap_user_access_end();
+		if (uarg == NULL)
+			break;
+		n++;
+	}
+	if (n == 0)
+		return (0);
+
+	ptrs_sz = (n + 1) * sizeof(char *);
+	block = (char *)kmalloc(ptrs_sz + SPAWN_ARG_BYTES_MAX);
+	if (block == NULL)
+		return (SYS_E_NOMEM);
+	kargv = (char **)block;
+	strs  = block + ptrs_sz;
+	used  = 0;
+
+	for (i = 0; i < n; i++) {
+		smap_user_access_begin();
+		uarg = uargv[i];
+		smap_user_access_end();
+		if (uarg == NULL ||
+		    !user_range_ok((uint64_t)(uintptr_t)uarg, 1)) {
+			kfree(block);
+			return (SYS_E_FAULT);
+		}
+		kargv[i] = strs + used;
+		k = 0;
+		smap_user_access_begin();
+		for (;;) {
+			if (used >= SPAWN_ARG_BYTES_MAX) {
+				smap_user_access_end();
+				kfree(block);
+				return (SYS_E_INVAL);
+			}
+			if (!user_range_ok((uint64_t)(uintptr_t)(uarg + k),
+			    1)) {
+				smap_user_access_end();
+				kfree(block);
+				return (SYS_E_FAULT);
+			}
+			strs[used] = uarg[k];
+			used++;
+			if (uarg[k] == '\0')
+				break;
+			k++;
+		}
+		smap_user_access_end();
+	}
+	kargv[n] = NULL;
+
+	*blockp = kargv;
+	*argcp  = (int)n;
+	return (0);
+}
+
 static long
 sys_port_alloc(uint8_t rights)
 {

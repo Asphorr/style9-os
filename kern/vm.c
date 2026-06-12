@@ -156,6 +156,80 @@ vm_map_release(struct vm_map *map, struct pmap *pm,
 	return (true);
 }
 
+void
+vm_map_reset(struct vm_map *map)
+{
+	struct vm_map_entry	*e, *next;
+
+	if (map == NULL)
+		return;
+
+	/*
+	 * Same no-lock single-thread invariant as vm_map_destroy: the
+	 * owning task sits between images inside execve, and its only
+	 * thread is the one running this reset.
+	 */
+	e = map->vm_head;
+	while (e != NULL) {
+		next = e->vme_next;
+		kfree(e);
+		e = next;
+	}
+	map->vm_head  = NULL;
+	map->vm_count = 0;
+	map->vm_hint  = map->vm_lo;
+}
+
+bool
+vm_map_fork_copy(struct vm_map *src, struct pmap *src_pm,
+    struct vm_map *dst, struct pmap *dst_pm)
+{
+	struct vm_map_entry	*e;
+	uint64_t		*dk;
+	uint64_t		*sk;
+	uint64_t		 npa;
+	uint64_t		 pa;
+	uint64_t		 va;
+	size_t			 i;
+
+	if (src == NULL || src_pm == NULL || dst == NULL || dst_pm == NULL)
+		return (false);
+
+	/*
+	 * No lock on src: the parent's only thread is parked in the fork
+	 * syscall, so no mutator can race the walk (the same invariant
+	 * vm_map_release_anon documents).  dst belongs to a task that has
+	 * not run yet.
+	 *
+	 * The copy is eager: every present leaf gets its own frame in the
+	 * child.  Holes inside an entry (PA_INVALID) are preserved as
+	 * holes, mirroring exactly what the parent had faulted in -- with
+	 * the current eager loaders that simply means "everything".
+	 */
+	for (e = src->vm_head; e != NULL; e = e->vme_next) {
+		if (!vm_map_enter(dst, e->vme_start,
+		    e->vme_end - e->vme_start, e->vme_prot, e->vme_flags))
+			return (false);
+		for (va = e->vme_start; va < e->vme_end; va += VM_PAGE_SIZE) {
+			pa = pmap_extract(src_pm, va);
+			if (pa == PA_INVALID)
+				continue;
+			npa = pmm_alloc_page();
+			if (npa == PA_INVALID)
+				return (false);
+			sk = (uint64_t *)pmm_kva_from_pa(pa);
+			dk = (uint64_t *)pmm_kva_from_pa(npa);
+			for (i = 0; i < VM_PAGE_SIZE / sizeof(uint64_t); i++)
+				dk[i] = sk[i];
+			if (!pmap_enter(dst_pm, va, npa, e->vme_prot)) {
+				pmm_free_page(npa);
+				return (false);
+			}
+		}
+	}
+	return (true);
+}
+
 /*
  * Caller holds vm_lock.  Returns true if [va, va+size) does not
  * overlap any existing entry, false otherwise.

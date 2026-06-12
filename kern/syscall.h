@@ -113,6 +113,23 @@ long	syscall_copyin_str(const char *uptr, char *kbuf, size_t kbuf_size);
 long	syscall_copyout(void *uptr, const void *kbuf, size_t n);
 
 /*
+ * Copy `n` bytes from user `uptr` into kernel `kbuf` -- the mirror of
+ * syscall_copyout, same range-check + SMAP discipline.  Returns 0 or
+ * SYS_E_FAULT.  Backs the Darwin pipe write path (kern/darwin.c).
+ */
+long	syscall_copyin(void *kbuf, const void *uptr, size_t n);
+
+/*
+ * Copy a NUL-terminated user argv (execve shape) into one kernel-owned
+ * flat block (argc+1 leading char * slots, packed strings trailing --
+ * the sys_spawn_args layout).  *blockp owns the block on success (kfree
+ * it), *argcp the count; NULL uargv is argc 0 with no block.  Returns 0
+ * or a negative SYS_E_* on fault / cap overflow.  Backs the Darwin
+ * execve(2) path (kern/darwin.c).
+ */
+long	syscall_copyin_argv(char *const *uargv, char ***blockp, int *argcp);
+
+/*
  * Mach message send/recv core: user-range-check + SMAP bracket + the
  * matching mach_msg_* call.  Back SYS_MSG_SEND / SYS_MSG_RECV[_TIMED] and
  * the Darwin personality's mach_msg trap (kern/darwin.c).  Return MACH_MSG_OK

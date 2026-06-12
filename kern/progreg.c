@@ -158,6 +158,34 @@ extern uint8_t	_binary_guname_macho_start[];
 extern uint8_t	_binary_guname_macho_end[];
 
 /*
+ * A fourth REAL Apple binary: gfactor (GNU coreutils' factor, a Homebrew
+ * bottle).  Unlike the libSystem-only binaries above, it also links libgmp --
+ * the first program to drive a SECOND dependency, so our dyld maps the whole
+ * closure (gfactor -> libgmp -> libSystem) and binds each import against the
+ * dylib its lib_ordinal names.  It factors integers, calling into libgmp for
+ * values past the built-in word width: a verifiable cross-dylib computation.
+ */
+extern uint8_t	_binary_gfactor_macho_start[];
+extern uint8_t	_binary_gfactor_macho_end[];
+
+/*
+ * The multi-process rung.  pipefork is the self-authored Darwin-ABI probe
+ * for fork/execve/wait4/pipe/dup2 (the dirlist of process control); genv and
+ * gtimeout are the FIFTH and SIXTH real Apple binaries (GNU coreutils 9.11's
+ * env and timeout) -- env exec(2)s its command in place, timeout fork(2)s,
+ * wait4(2)s, and kill(2)s it, so genuine Apple code drives every process-
+ * lifecycle syscall the Darwin personality grew.
+ */
+extern uint8_t	_binary_pipefork_macho_start[];
+extern uint8_t	_binary_pipefork_macho_end[];
+
+extern uint8_t	_binary_genv_macho_start[];
+extern uint8_t	_binary_genv_macho_end[];
+
+extern uint8_t	_binary_gtimeout_macho_start[];
+extern uint8_t	_binary_gtimeout_macho_end[];
+
+/*
  * Bridge into the arch-specific user-thread spawn path.  Lives in
  * arch/amd64/usermode.c; declared here so progreg_spawn doesn't have
  * to pull in machine headers.  Returns the new task's t_id or a
@@ -261,6 +289,14 @@ progreg_init(void)
 	    _binary_tree_macho_start, _binary_tree_macho_end);
 	register_one("guname",
 	    _binary_guname_macho_start, _binary_guname_macho_end);
+	register_one("gfactor",
+	    _binary_gfactor_macho_start, _binary_gfactor_macho_end);
+	register_one("pipefork",
+	    _binary_pipefork_macho_start, _binary_pipefork_macho_end);
+	register_one("genv",
+	    _binary_genv_macho_start, _binary_genv_macho_end);
+	register_one("gtimeout",
+	    _binary_gtimeout_macho_start, _binary_gtimeout_macho_end);
 
 	kprintf("progreg: %zu programs registered\n", nentries);
 }

@@ -523,11 +523,12 @@ wcscat(wchar_t *dst, const wchar_t *src)
 typedef struct __sFILE {
 	int	fd;
 	int	eof;
+	int	unget;		/* one-char ungetc() pushback; EOF == empty */
 } FILE;
 
-static FILE	__stdin_file  = { 0, 0 };
-static FILE	__stdout_file = { 1, 0 };
-static FILE	__stderr_file = { 2, 0 };
+static FILE	__stdin_file  = { 0, 0, EOF };
+static FILE	__stdout_file = { 1, 0, EOF };
+static FILE	__stderr_file = { 2, 0, EOF };
 
 /* The stdio.h macros stdin/stdout/stderr expand to these exported pointers. */
 FILE	*__stdinp  = &__stdin_file;
@@ -616,6 +617,7 @@ fopen(const char *path, const char *mode)
 	}
 	fp->fd  = fd;
 	fp->eof = 0;
+	fp->unget = EOF;
 	return (fp);
 }
 
@@ -1505,6 +1507,30 @@ strtoul(const char *s, char **end, int base)
 	return (v);
 }
 
+/*
+ * strtol: the signed sibling of strtoul.  Consume an optional sign, convert the
+ * magnitude with strtoul, then apply it.  gmp uses this to parse small decimal
+ * fields; the LONG_MIN/MAX saturation a full libc does is unneeded here.
+ */
+long
+strtol(const char *s, char **end, int base)
+{
+	const char	*p;
+	unsigned long	 v;
+	int		 neg;
+
+	p = s;
+	while (*p == ' ' || (*p >= '\t' && *p <= '\r'))
+		p++;
+	neg = 0;
+	if (*p == '+' || *p == '-') {
+		neg = (*p == '-');
+		p++;
+	}
+	v = strtoul(p, end, base);
+	return (neg ? -(long)v : (long)v);
+}
+
 /* __strcpy_chk: clang's _FORTIFY_SOURCE strcpy.  Bounded so it cannot overrun. */
 char *
 __strcpy_chk(char *dst, const char *src, size_t dstlen)
@@ -1620,6 +1646,81 @@ fgets(char *s, int size, FILE *fp)
 		return (NULL);
 	s[i] = '\0';
 	return (s);
+}
+
+/*
+ * Read side of stdio.  Our streams are unbuffered, so getc/__srget reduce to a
+ * single-byte read; a one-slot pushback backs ungetc.  factor invoked with
+ * command-line operands never reads a stream, but gmp imports these, so they
+ * must bind -- and behave if some other input path reaches them.
+ */
+int
+fgetc(FILE *fp)
+{
+	unsigned char	ch;
+	int		c;
+
+	if (fp == NULL)
+		return (EOF);
+	if (fp->unget != EOF) {
+		c = fp->unget;
+		fp->unget = EOF;
+		return (c);
+	}
+	if (s_read(fp->fd, &ch, 1) != 1) {
+		fp->eof = 1;
+		return (EOF);
+	}
+	return ((int)ch);
+}
+
+int
+getc(FILE *fp)
+{
+
+	return (fgetc(fp));
+}
+
+/* __srget: the getc() macro's refill primitive -- unbuffered, so just fgetc. */
+int
+__srget(FILE *fp)
+{
+
+	return (fgetc(fp));
+}
+
+int
+ungetc(int c, FILE *fp)
+{
+
+	if (fp == NULL || c == EOF)
+		return (EOF);
+	fp->unget = (int)(unsigned char)c;
+	fp->eof = 0;
+	return (c);
+}
+
+/* No sticky error flag is tracked; report "no error". */
+int
+ferror(FILE *fp)
+{
+
+	(void)fp;
+	return (0);
+}
+
+/*
+ * fscanf: gmp links it for formatted input, but factor on the command line
+ * never reaches a scan.  With no scan engine we report input failure (EOF) so a
+ * caller sees "nothing matched" rather than undefined behaviour.
+ */
+int
+fscanf(FILE *fp, const char *fmt, ...)
+{
+
+	(void)fp;
+	(void)fmt;
+	return (EOF);
 }
 
 /* ---- POSIX / locale stubs (present so the bind resolves) ---------------- */
@@ -1844,6 +1945,42 @@ abort(void)
 		;
 }
 
+/*
+ * __assert_rtn: Darwin's assert(3) failure handler.  A tripped assertion in
+ * gfactor or gmp must terminate, not return, so print a diagnostic and abort.
+ */
+void
+__assert_rtn(const char *func, const char *file, int line, const char *expr)
+{
+
+	(void)line;
+	write(2, "Assertion failed: ", 18);
+	if (expr != NULL)
+		write(2, expr, strlen(expr));
+	write(2, " (", 2);
+	if (func != NULL)
+		write(2, func, strlen(func));
+	write(2, ", ", 2);
+	if (file != NULL)
+		write(2, file, strlen(file));
+	write(2, ")\n", 2);
+	abort();
+}
+
+/*
+ * raise: we deliver no signals.  raise(SIGABRT) must still terminate -- it is
+ * how abort(3) is specified to act -- so route it to abort; any other signal is
+ * a no-op success (there is no handler to run).
+ */
+int
+raise(int sig)
+{
+
+	if (sig == 6)				/* SIGABRT */
+		abort();
+	return (0);
+}
+
 int
 atexit(void (*fn)(void))
 {
@@ -1883,6 +2020,59 @@ memcmp(const void *a, const void *b, size_t n)
 			return ((int)pa[i] - (int)pb[i]);
 	}
 	return (0);
+}
+
+/*
+ * memmove: copy n bytes, correct even when the regions overlap.  gmp's mpn
+ * shifting and gfactor both pull it in; memcpy alone is not enough because the
+ * source and destination can alias.
+ */
+void *
+memmove(void *dst, const void *src, size_t n)
+{
+	unsigned char		*d;
+	const unsigned char	*s;
+	size_t			 i;
+
+	d = (unsigned char *)dst;
+	s = (const unsigned char *)src;
+	if (d == s || n == 0)
+		return (dst);
+	if (d < s) {
+		for (i = 0; i < n; i++)
+			d[i] = s[i];
+	} else {
+		for (i = n; i > 0; i--)
+			d[i - 1] = s[i - 1];
+	}
+	return (dst);
+}
+
+/*
+ * __memmove_chk / __memset_chk: clang's _FORTIFY_SOURCE wrappers.  When the
+ * compiler cannot size the destination it passes (size_t)-1, so the check is a
+ * no-op; a genuine overflow (n > dstlen) aborts, as real Darwin does.
+ */
+void *
+__memmove_chk(void *dst, const void *src, size_t n, size_t dstlen)
+{
+
+	if (n > dstlen) {
+		write(2, "libSystem: __memmove_chk overflow\n", 34);
+		abort();
+	}
+	return (memmove(dst, src, n));
+}
+
+void *
+__memset_chk(void *dst, int c, size_t n, size_t dstlen)
+{
+
+	if (n > dstlen) {
+		write(2, "libSystem: __memset_chk overflow\n", 33);
+		abort();
+	}
+	return (memset(dst, c, n));
 }
 
 /* Length of the leading run of *s consisting only of bytes in `set`. */
@@ -1937,6 +2127,25 @@ lseek(int fd, long off, int whence)
 {
 
 	return (s_lseek(fd, off, whence));
+}
+
+/*
+ * Public read(2)/close(2): until the process rung, every consumer went
+ * through stdio and only the s_* internals existed.  pipefork reads its
+ * pipe end raw, and shell-shaped tools close fds they dup2'd away.
+ */
+long
+read(int fd, void *buf, unsigned long n)
+{
+
+	return (s_read(fd, buf, n));
+}
+
+int
+close(int fd)
+{
+
+	return (s_close(fd));
 }
 
 /* No mutable fd flags on the read-only FS: pretend every request succeeds. */
@@ -2025,6 +2234,18 @@ vfprintf(FILE *fp, const char *fmt, __builtin_va_list ap)
 }
 
 /*
+ * vsprintf: unbounded formatted write into `dst`.  We have no way to know the
+ * buffer size, so the cap is SIZE_MAX -- gmp's callers size dst from the value
+ * being printed, the same trust the real vsprintf extends.
+ */
+int
+vsprintf(char *dst, const char *fmt, __builtin_va_list ap)
+{
+
+	return (vfmt(-1, dst, (size_t)-1, fmt, ap));
+}
+
+/*
  * getprogname(): the program's short name.  We run no libc startup to capture
  * argv[0] (our dyld jumps straight to LC_MAIN), so we return a fixed name.
  * guname reads this only for diagnostics, never on the path that prints the
@@ -2100,3 +2321,484 @@ __asm__(
 	"_dyld_stub_binder:\n"
 	"\tud2\n"
 );
+
+/* ---- process control (fork / exec / wait / pipes) ------------------------ */
+
+/*
+ * Carry-capturing BSD syscalls that also set errno.  The process-control
+ * wrappers below report failure through the errno protocol -- coreutils'
+ * gnulib branches on ENOENT vs EACCES after a failed exec, on ECHILD
+ * after wait -- unlike the early fd routines (bsd_call) that predate
+ * g_errno.  The 4-argument form loads %r10, the SYSCALL slot for arg3
+ * (wait4's rusage pointer).
+ */
+static long
+bsd_call_e(long nr, long a, long b, long c)
+{
+	long		ret;
+	unsigned char	cf;
+
+	__asm__ __volatile__(
+	    "syscall\n\t"
+	    "setc %1\n"
+	    : "=a"(ret), "=r"(cf)
+	    : "a"(nr), "D"(a), "S"(b), "d"(c)
+	    : "rcx", "r11", "memory");
+	if (cf) {
+		g_errno = (int)ret;
+		return (-1);
+	}
+	return (ret);
+}
+
+static long
+bsd_call4_e(long nr, long a, long b, long c, long d)
+{
+	register long	r10 __asm__("r10");
+	long		ret;
+	unsigned char	cf;
+
+	r10 = d;
+	__asm__ __volatile__(
+	    "syscall\n\t"
+	    "setc %1\n"
+	    : "=a"(ret), "=r"(cf)
+	    : "a"(nr), "D"(a), "S"(b), "d"(c), "r"(r10)
+	    : "rcx", "r11", "memory");
+	if (cf) {
+		g_errno = (int)ret;
+		return (-1);
+	}
+	return (ret);
+}
+
+/*
+ * fork(2).  The kernel rebuilds the child's register file from almost
+ * nothing: the child re-enters userspace at the instruction after this
+ * `syscall` with only %rax (= 0), %rsp, and %rip guaranteed.  That is
+ * exactly the C ABI's caller-save set gone -- so the wrapper parks the
+ * six callee-saved registers on the stack first.  The address-space copy
+ * duplicates that stack, and parent and child alike restore from their
+ * own copy on the way out.  Carry set means no child: errno in %rax,
+ * fold to -1 via fork_fail (kept out-of-line so the hot path is pop+ret).
+ */
+long
+fork_fail(long err)
+{
+
+	g_errno = (int)err;
+	return (-1);
+}
+
+__asm__(
+	".text\n"
+	".globl _fork\n"
+	"_fork:\n"
+	"\tpushq %rbx\n"
+	"\tpushq %rbp\n"
+	"\tpushq %r12\n"
+	"\tpushq %r13\n"
+	"\tpushq %r14\n"
+	"\tpushq %r15\n"
+	"\tmovl $0x2000002, %eax\n"
+	"\tsyscall\n"
+	"\tjnc 1f\n"
+	"\tmovq %rax, %rdi\n"
+	"\tcall _fork_fail\n"
+	"1:\n"
+	"\tpopq %r15\n"
+	"\tpopq %r14\n"
+	"\tpopq %r13\n"
+	"\tpopq %r12\n"
+	"\tpopq %rbp\n"
+	"\tpopq %rbx\n"
+	"\tret\n"
+);
+
+extern int	fork(void);
+
+/*
+ * vfork: with a full-copy fork underneath, fork semantics are a strict
+ * superset of what a vfork caller may rely on (child and parent own
+ * private stacks, so the child's "until it execs" window cannot scribble
+ * on the parent).
+ */
+int
+vfork(void)
+{
+
+	return (fork());
+}
+
+/* execve(2): only ever returns on failure, -1 with errno set. */
+int
+execve(const char *path, char *const argv[], char *const envp[])
+{
+
+	return ((int)bsd_call_e(0x200003B, (long)path, (long)argv,
+	    (long)envp));
+}
+
+int
+execv(const char *path, char *const argv[])
+{
+
+	return (execve(path, argv, NULL));
+}
+
+/*
+ * execvp: PATH search collapses to a single try -- the kernel resolves
+ * the final path component against its program registry, so a bare name
+ * and any absolute spelling land on the same image.
+ */
+int
+execvp(const char *file, char *const argv[])
+{
+
+	return (execve(file, argv, NULL));
+}
+
+int
+wait4(int pid, int *status, int options, void *rusage)
+{
+
+	return ((int)bsd_call4_e(0x2000007, pid, (long)status, options,
+	    (long)rusage));
+}
+
+int
+waitpid(int pid, int *status, int options)
+{
+
+	return (wait4(pid, status, options, NULL));
+}
+
+int
+wait(int *status)
+{
+
+	return (wait4(-1, status, 0, NULL));
+}
+
+/*
+ * pipe(2): the kernel hands both ends back packed in %rax (read end in
+ * the low half, write end in the high half) -- see kern/darwin.c for why
+ * the native %rax/%rdx convention is not used.  This wrapper is the only
+ * caller, so the packing is private ABI between it and the kernel.
+ */
+int
+pipe(int fds[2])
+{
+	long	rv;
+
+	rv = bsd_call_e(0x200002A, 0, 0, 0);
+	if (rv < 0)
+		return (-1);
+	fds[0] = (int)(rv & 0x7FFFFFFF);
+	fds[1] = (int)((unsigned long)rv >> 32);
+	return (0);
+}
+
+int
+dup(int fd)
+{
+
+	return ((int)bsd_call_e(0x2000029, fd, 0, 0));
+}
+
+int
+dup2(int oldfd, int newfd)
+{
+
+	return ((int)bsd_call_e(0x200005A, oldfd, newfd, 0));
+}
+
+int
+kill(int pid, int sig)
+{
+
+	return ((int)bsd_call_e(0x2000025, pid, sig, 0));
+}
+
+int
+getppid(void)
+{
+
+	return ((int)dsys(0x2000027, 0, 0, 0));
+}
+
+/*
+ * Signal management: delivery does not exist in this kernel, so the
+ * POSIX surface is satisfied locally -- record nothing, report success,
+ * and zero any out-parameter a caller might inspect.  Tools that install
+ * handlers defensively (timeout, shells) run their no-signal fast paths
+ * unchanged.  Apple's sigset_t is a 32-bit mask; struct sigaction is
+ * handler + mask + flags (16 bytes) -- zeroing reports "default, empty".
+ */
+int
+sigaction(int sig, const void *act, void *oact)
+{
+
+	(void)sig;
+	(void)act;
+	if (oact != NULL)
+		(void)memset(oact, 0, 16);
+	return (0);
+}
+
+void *
+signal(int sig, void *handler)
+{
+
+	(void)sig;
+	(void)handler;
+	return (NULL);				/* previous handler: SIG_DFL */
+}
+
+int
+sigprocmask(int how, const void *set, void *oset)
+{
+
+	(void)how;
+	(void)set;
+	if (oset != NULL)
+		(void)memset(oset, 0, 4);
+	return (0);
+}
+
+int
+sigemptyset(void *set)
+{
+
+	if (set != NULL)
+		(void)memset(set, 0, 4);
+	return (0);
+}
+
+int
+sigaddset(void *set, int sig)
+{
+
+	(void)set;
+	(void)sig;
+	return (0);
+}
+
+int
+sigismember(const void *set, int sig)
+{
+
+	(void)set;
+	(void)sig;
+	return (0);
+}
+
+int
+setitimer(int which, const void *val, void *oval)
+{
+
+	(void)which;
+	(void)val;
+	(void)oval;
+	return (0);
+}
+
+unsigned int
+alarm(unsigned int secs)
+{
+
+	(void)secs;
+	return (0);
+}
+
+/* ---- the genv / gtimeout gap ---------------------------------------------- */
+
+/*
+ * _NSGetEnviron: Apple's accessor for the environ location (crt vends no
+ * direct `environ` data symbol in a dylib world).  Ring 3 has no
+ * environment; hand back a stable pointer to an empty, NULL-terminated
+ * vector so callers can iterate it and find nothing.
+ */
+static char	*environ_empty[1];
+static char	**environ_ptr = environ_empty;
+
+char ***
+_NSGetEnviron(void)
+{
+
+	return (&environ_ptr);
+}
+
+/* No working directory to change on the read-only single-root FS. */
+int
+chdir(const char *path)
+{
+
+	(void)path;
+	return (0);
+}
+
+int
+unsetenv(const char *name)
+{
+
+	(void)name;
+	return (0);
+}
+
+int
+setenv(const char *name, const char *value, int overwrite)
+{
+
+	(void)name;
+	(void)value;
+	(void)overwrite;
+	return (0);
+}
+
+/* Process groups and resource limits do not exist yet: report success. */
+int
+setpgid(int pid, int pgid)
+{
+
+	(void)pid;
+	(void)pgid;
+	return (0);
+}
+
+int
+setrlimit(int which, const void *rlp)
+{
+
+	(void)which;
+	(void)rlp;
+	return (0);
+}
+
+/* Apple sigset_t is a 32-bit mask; these two complete the sigset family. */
+int
+sigfillset(void *set)
+{
+
+	if (set != NULL)
+		*(unsigned int *)set = 0xFFFFFFFFu;
+	return (0);
+}
+
+int
+sigdelset(void *set, int sig)
+{
+
+	if (set != NULL && sig >= 1 && sig <= 32)
+		*(unsigned int *)set &= ~(1u << (sig - 1));
+	return (0);
+}
+
+/*
+ * sigsuspend: POSIX blocks here until a signal fires; no signal will ever
+ * fire, so return the mandated -1/EINTR immediately.  gtimeout's wait loop
+ * is `while (waitpid(pid, .., WNOHANG) == 0) sigsuspend(..)` -- with an
+ * immediate EINTR that degrades to polling, and the loop still terminates
+ * the moment the child exits.
+ */
+int
+sigsuspend(const void *mask)
+{
+
+	(void)mask;
+	g_errno = 4;				/* EINTR */
+	return (-1);
+}
+
+/* No locale machinery: failure is the documented, handled answer. */
+void *
+newlocale(int mask, const char *name, void *base)
+{
+
+	(void)mask;
+	(void)name;
+	(void)base;
+	return (NULL);
+}
+
+/* Leftmost byte of *s that appears in `set`, or NULL. */
+char *
+strpbrk(const char *s, const char *set)
+{
+	size_t	i;
+
+	for (; *s != '\0'; s++) {
+		for (i = 0; set[i] != '\0'; i++) {
+			if (*s == set[i])
+				return ((char *)s);
+		}
+	}
+	return (NULL);
+}
+
+/*
+ * strtod: decimal + optional fraction + optional e-notation -- what
+ * gtimeout's duration parser ("10", "1.5", "2e1") consumes.  No hex
+ * floats, no INF/NAN spellings; SSE2 double arithmetic is the Penryn
+ * baseline, so plain multiply-accumulate is fine.
+ */
+double
+strtod(const char *s, char **endp)
+{
+	const char	*p;
+	double		 frac;
+	double		 val;
+	int		 esign;
+	int		 expn;
+	int		 i;
+	int		 neg;
+
+	p = s;
+	while (*p == ' ' || *p == '\t' || *p == '\n')
+		p++;
+	neg = 0;
+	if (*p == '+' || *p == '-') {
+		neg = (*p == '-');
+		p++;
+	}
+	val = 0.0;
+	while (*p >= '0' && *p <= '9') {
+		val = val * 10.0 + (double)(*p - '0');
+		p++;
+	}
+	if (*p == '.') {
+		p++;
+		frac = 0.1;
+		while (*p >= '0' && *p <= '9') {
+			val += (double)(*p - '0') * frac;
+			frac *= 0.1;
+			p++;
+		}
+	}
+	if (*p == 'e' || *p == 'E') {
+		p++;
+		esign = 0;
+		if (*p == '+' || *p == '-') {
+			esign = (*p == '-');
+			p++;
+		}
+		expn = 0;
+		while (*p >= '0' && *p <= '9') {
+			expn = expn * 10 + (*p - '0');
+			p++;
+		}
+		for (i = 0; i < expn; i++)
+			val = esign ? val / 10.0 : val * 10.0;
+	}
+	if (endp != NULL)
+		*endp = (char *)p;
+	return (neg ? -val : val);
+}
+
+double
+strtod_l(const char *s, char **endp, void *loc)
+{
+
+	(void)loc;
+	return (strtod(s, endp));
+}

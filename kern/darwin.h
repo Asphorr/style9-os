@@ -57,12 +57,26 @@
  * set; see darwin.c.
  */
 #define	DARWIN_SYS_exit		1
+#define	DARWIN_SYS_fork		2
 #define	DARWIN_SYS_read		3
 #define	DARWIN_SYS_write	4
 #define	DARWIN_SYS_open		5
 #define	DARWIN_SYS_close	6
+#define	DARWIN_SYS_wait4	7
 #define	DARWIN_SYS_getpid	20
+#define	DARWIN_SYS_kill		37
+#define	DARWIN_SYS_getppid	39
+#define	DARWIN_SYS_dup		41
+#define	DARWIN_SYS_pipe		42
+#define	DARWIN_SYS_sigaction	46
+#define	DARWIN_SYS_sigprocmask	48
+#define	DARWIN_SYS_execve	59
+#define	DARWIN_SYS_setitimer	83
+#define	DARWIN_SYS_dup2		90
 #define	DARWIN_SYS_lseek	199
+
+/* wait4 option bits (Darwin <sys/wait.h>). */
+#define	DARWIN_WNOHANG	1
 
 /*
  * Mach traps (class 1) we answer -- positive indices into xnu's
@@ -137,12 +151,18 @@ struct darwin_uname {
  */
 #define	DARWIN_EPERM	1
 #define	DARWIN_ENOENT	2
+#define	DARWIN_ESRCH	3
+#define	DARWIN_EINTR	4
 #define	DARWIN_EIO	5
+#define	DARWIN_ENOEXEC	8
 #define	DARWIN_EBADF	9
+#define	DARWIN_ECHILD	10
 #define	DARWIN_ENOMEM	12
 #define	DARWIN_EFAULT	14
 #define	DARWIN_EINVAL	22
 #define	DARWIN_EMFILE	24
+#define	DARWIN_ESPIPE	29
+#define	DARWIN_EPIPE	32
 #define	DARWIN_ENOSYS	78
 
 /*
@@ -166,6 +186,7 @@ struct darwin_uname {
 #define	DARWIN_MACH_RCV_INVALID_DATA	0x10004005
 
 struct syscall_frame;
+struct task;
 
 /*
  * Dispatch one syscall issued by a TASK_PERSONALITY_DARWIN task.  Decodes
@@ -174,5 +195,45 @@ struct syscall_frame;
  * convention.  Returns the value to land in the caller's %rax.
  */
 long	darwin_dispatch(struct syscall_frame *f);
+
+/*
+ * Open-file table lifecycle (kern/darwin.c).  darwin_files_teardown
+ * releases every typed slot in t's table -- FILE buffers freed, pipe-end
+ * references dropped -- and is the one teardown path task_deref calls.
+ * darwin_files_fork_copy clones the parent's table into the child at
+ * fork: FILE slots get their own copy of the buffer, CONSOLE slots copy
+ * plainly, PIPE slots share the pipe object with the matching end's
+ * reference count bumped.  Returns 0 or a negative SYS_E_* (the caller
+ * derefs the half-built child; teardown releases what was cloned).
+ */
+void	darwin_files_teardown(struct task *t);
+int	darwin_files_fork_copy(struct task *parent, struct task *child);
+
+/*
+ * Zombie bookkeeping (kern/darwin.c).  Records {pid, ppid, wait4-format
+ * status} for a dying Darwin task so the parent's wait4 can reap it; a
+ * ppid of 0 (no Darwin parent) records nothing.  Also sweeps the dying
+ * task's own unreaped zombie children -- orphans no one is left to wait
+ * for.  Called from the exit(2) path and from the execve point-of-no-
+ * return failure path (arch/amd64/usermode.c).
+ */
+void	darwin_zombie_record(unsigned long long pid, unsigned long long ppid,
+	    int status);
+
+/*
+ * Process-lifecycle arch hooks (arch/amd64/usermode.c).  arch_darwin_fork
+ * builds the child task -- address-space copy, fd-table clone, a thread
+ * that iretqs to the parent's saved user rip/rsp with %rax = 0 -- and
+ * returns the child's pid, or a negative SYS_E_*.  arch_darwin_execve
+ * replaces the calling task's user address space with `image` (argv is a
+ * kernel-owned flat block) and rewrites the frame's user rip/rsp so the
+ * sysret lands in the fresh image; returns 0, and does not return at all
+ * if setup fails past the point of no return (the task exits with wait4
+ * status 127).
+ */
+long	arch_darwin_fork(struct syscall_frame *f);
+long	arch_darwin_execve(const unsigned char *image,
+	    unsigned long image_size, int argc, char **argv,
+	    struct syscall_frame *f);
 
 #endif /* !_SYS_DARWIN_H_ */

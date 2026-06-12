@@ -51,6 +51,7 @@ typedef __UINT16_TYPE__		uint16_t;
 typedef __UINT32_TYPE__		uint32_t;
 typedef __UINT64_TYPE__		uint64_t;
 typedef __INT32_TYPE__		int32_t;
+typedef __INT64_TYPE__		int64_t;
 typedef __UINTPTR_TYPE__	uintptr_t;
 
 /* ---- Mach-O on-disk structures (subset we parse) ------------------------ */
@@ -63,6 +64,8 @@ typedef __UINTPTR_TYPE__	uintptr_t;
 #define	LC_MAIN			(0x28u | LC_REQ_DYLD)
 #define	LC_DYLD_CHAINED_FIXUPS	(0x34u | LC_REQ_DYLD)
 #define	LC_DYLD_EXPORTS_TRIE	(0x33u | LC_REQ_DYLD)
+#define	LC_DYLD_INFO		0x22u
+#define	LC_DYLD_INFO_ONLY	(0x22u | LC_REQ_DYLD)
 
 struct mach_header_64 {
 	uint32_t	magic;
@@ -254,9 +257,39 @@ uleb(const uint8_t **pp, const uint8_t *end)
 	return (r);
 }
 
+/* Signed LEB128 -- the form a classic bind stream uses for SET_ADDEND_SLEB. */
+static int64_t
+sleb(const uint8_t **pp, const uint8_t *end)
+{
+	const uint8_t	*p;
+	int64_t		 r;
+	int		 shift;
+	uint8_t		 b;
+
+	p = *pp;
+	r = 0;
+	shift = 0;
+	b = 0;
+	while (p < end) {
+		b = *p++;
+		r |= (int64_t)(b & 0x7F) << shift;
+		shift += 7;
+		if ((b & 0x80) == 0)
+			break;
+		if (shift >= 64)
+			break;
+	}
+	if (shift < 64 && (b & 0x40) != 0)
+		r |= -((int64_t)1 << shift);	/* sign-extend */
+	*pp = p;
+	return (r);
+}
+
 /* ---- parsed image ------------------------------------------------------- */
 
 #define	IMAGE_MAX_SEGS	8
+#define	IMAGE_MAX_DEPS	16	/* LC_LOAD_DYLIB entries we record per image  */
+#define	LINKSET_MAX	8	/* images in one closure: main + dependencies */
 
 struct image {
 	uint64_t	mh;		/* runtime mach_header address       */
@@ -267,7 +300,14 @@ struct image {
 	uint64_t	 fixups_size;
 	const uint8_t	*trie;		/* runtime ptr to export trie blob   */
 	uint64_t	 trie_size;
-	const char	*dylib_path;	/* first LC_LOAD_DYLIB name (runtime) */
+	const uint8_t	*rebase;	/* classic LC_DYLD_INFO rebase opcodes */
+	uint64_t	 rebase_size;
+	const uint8_t	*bind;		/* classic non-lazy bind opcodes      */
+	uint64_t	 bind_size;
+	const uint8_t	*lazy;		/* classic lazy bind opcodes          */
+	uint64_t	 lazy_size;
+	const char	*deps[IMAGE_MAX_DEPS];	/* LC_LOAD_DYLIB names (runtime) */
+	int		 ndeps;
 	int		 nsegs;
 	int		 have_text;
 	struct {
@@ -275,6 +315,18 @@ struct image {
 		uint64_t	fileoff;
 		uint64_t	filesize;
 	} segs[IMAGE_MAX_SEGS];
+};
+
+/*
+ * The loaded set: index 0 is the main image, 1..n-1 are mapped dependencies.
+ * path[i] is the LC_LOAD_DYLIB string a dependency was mapped under (NULL for
+ * the main image), so a bind's lib_ordinal -> dependency name -> loaded image
+ * resolves by a string compare against this table.
+ */
+struct linkset {
+	struct image	im[LINKSET_MAX];
+	const char	*path[LINKSET_MAX];
+	int		 n;
 };
 
 /* Map a file offset (e.g. a __LINKEDIT dataoff) to its runtime address. */
@@ -301,6 +353,9 @@ parse_image(uint64_t mh, struct image *im)
 	uint64_t			 off;
 	uint32_t			 cf_dataoff, cf_datasize;
 	uint32_t			 tr_dataoff, tr_datasize;
+	uint32_t			 rb_off, rb_size;
+	uint32_t			 bd_off, bd_size;
+	uint32_t			 lz_off, lz_size;
 	uint32_t			 i;
 
 	h = (const struct mach_header_64 *)(uintptr_t)mh;
@@ -314,11 +369,20 @@ parse_image(uint64_t mh, struct image *im)
 	im->fixups_size = 0;
 	im->trie = 0;
 	im->trie_size = 0;
-	im->dylib_path = 0;
+	im->rebase = 0;
+	im->rebase_size = 0;
+	im->bind = 0;
+	im->bind_size = 0;
+	im->lazy = 0;
+	im->lazy_size = 0;
+	im->ndeps = 0;
 	im->nsegs = 0;
 	im->have_text = 0;
 	cf_dataoff = cf_datasize = 0;
 	tr_dataoff = tr_datasize = 0;
+	rb_off = rb_size = 0;
+	bd_off = bd_size = 0;
+	lz_off = lz_size = 0;
 
 	off = sizeof(*h);
 	for (i = 0; i < h->ncmds; i++) {
@@ -359,12 +423,37 @@ parse_image(uint64_t mh, struct image *im)
 			tr_datasize = ld->datasize;
 			break;
 		}
+		case LC_DYLD_INFO:
+		case LC_DYLD_INFO_ONLY: {
+			const uint8_t	*q;
+
+			/*
+			 * The classic (pre-chained-fixups) metadata of a dylib
+			 * built for an older target -- libgmp uses this.  Read
+			 * the rebase/bind/lazy opcode streams and, if no
+			 * LC_DYLD_EXPORTS_TRIE was present, the export trie from
+			 * export_off.  Field offsets are from the dyld_info_command
+			 * layout (loader.h).
+			 */
+			q = (const uint8_t *)lc;
+			rb_off  = rd32(q + 8);
+			rb_size = rd32(q + 12);
+			bd_off  = rd32(q + 16);
+			bd_size = rd32(q + 20);
+			lz_off  = rd32(q + 32);
+			lz_size = rd32(q + 36);
+			if (tr_datasize == 0) {
+				tr_dataoff  = rd32(q + 40);
+				tr_datasize = rd32(q + 44);
+			}
+			break;
+		}
 		case LC_LOAD_DYLIB: {
 			const struct dylib_command	*dl;
 
 			dl = (const struct dylib_command *)lc;
-			if (im->dylib_path == 0)
-				im->dylib_path =
+			if (im->ndeps < IMAGE_MAX_DEPS)
+				im->deps[im->ndeps++] =
 				    (const char *)((const uint8_t *)lc +
 				    dl->name);
 			break;
@@ -392,6 +481,21 @@ parse_image(uint64_t mh, struct image *im)
 		im->trie = (const uint8_t *)(uintptr_t)
 		    fileoff_to_runtime(im, tr_dataoff);
 		im->trie_size = tr_datasize;
+	}
+	if (rb_size != 0) {
+		im->rebase = (const uint8_t *)(uintptr_t)
+		    fileoff_to_runtime(im, rb_off);
+		im->rebase_size = rb_size;
+	}
+	if (bd_size != 0) {
+		im->bind = (const uint8_t *)(uintptr_t)
+		    fileoff_to_runtime(im, bd_off);
+		im->bind_size = bd_size;
+	}
+	if (lz_size != 0) {
+		im->lazy = (const uint8_t *)(uintptr_t)
+		    fileoff_to_runtime(im, lz_off);
+		im->lazy_size = lz_size;
 	}
 }
 
@@ -465,16 +569,81 @@ trie_lookup(const uint8_t *trie, const uint8_t *end, const char *sym)
 	}
 }
 
+/* ---- dependency resolution ---------------------------------------------- */
+
+static int
+streq(const char *a, const char *b)
+{
+
+	while (*a != '\0' && *a == *b) {
+		a++;
+		b++;
+	}
+	return (*a == *b);
+}
+
+/*
+ * Index of the loaded image registered under `path`, or -1.  The main image
+ * (slot 0) carries a NULL path, so it never matches a dependency name.
+ */
+static int
+find_path(const struct linkset *ls, const char *path)
+{
+	int	i;
+
+	if (path == 0)
+		return (-1);
+	for (i = 0; i < ls->n; i++)
+		if (ls->path[i] != 0 && streq(ls->path[i], path))
+			return (i);
+	return (-1);
+}
+
+/*
+ * Resolve imported `name` for the importing image `im` to a runtime address,
+ * or 0 if absent.  A positive lib_ordinal is the 1-based index into `im`'s own
+ * LC_LOAD_DYLIB list (Darwin two-level namespace): the symbol is resolved
+ * strictly in that one dependency.  The special ordinals -- self (0) and
+ * flat-lookup (0xFE) -- search the whole closure instead.  This per-ordinal
+ * dispatch is what lets one bind table draw symbols from several dylibs (a
+ * gfactor binding both libgmp and libSystem), the multi-dylib capability.
+ */
+static uint64_t
+resolve_sym(const struct linkset *ls, const struct image *im,
+    uint64_t lib_ord, const char *name)
+{
+	const struct image	*lib;
+	uint64_t		 sym;
+	int			 i;
+	int			 li;
+
+	if (lib_ord >= 1 && (int)lib_ord <= im->ndeps) {
+		li = find_path(ls, im->deps[lib_ord - 1]);
+		if (li < 0)
+			return (0);
+		lib = &ls->im[li];
+		sym = trie_lookup(lib->trie, lib->trie + lib->trie_size, name);
+		return (sym == 0 ? (uint64_t)0 : lib->mh + sym);
+	}
+
+	for (i = 0; i < ls->n; i++) {
+		lib = &ls->im[i];
+		sym = trie_lookup(lib->trie, lib->trie + lib->trie_size, name);
+		if (sym != 0)
+			return (lib->mh + sym);
+	}
+	return (0);
+}
+
 /* ---- chained fixups ----------------------------------------------------- */
 
 /*
  * Apply `im`'s LC_DYLD_CHAINED_FIXUPS chain.  Rebases get `im`'s slide added;
- * binds resolve the imported symbol against `lib`'s export trie and patch the
- * slot.  M2 has a single dependency, so every bind's lib_ordinal is libSystem
- * and `lib` is it; a Tier-1 graph would index an array of libs by ordinal.
+ * binds resolve the imported symbol through resolve_sym(), which honours each
+ * import's lib_ordinal so a bind lands in the dependency that exports it.
  */
 static void
-apply_fixups(const struct image *im, const struct image *lib)
+apply_fixups(const struct image *im, const struct linkset *ls)
 {
 	const uint8_t	*blob;
 	const uint8_t	*starts;
@@ -540,26 +709,31 @@ apply_fixups(const struct image *im, const struct image *lib)
 				next = (val >> 51) & 0xFFF;
 				if ((val >> 63) & 1) {		/* bind */
 					const char	*name;
-					uint64_t	 ordinal;
+					uint64_t	 imp_index;
 					uint64_t	 addend;
 					uint64_t	 noff;
-					uint64_t	 sym;
+					uint64_t	 lib_ord;
+					uint64_t	 base;
 					uint32_t	 imp;
+					int		 weak;
 
-					ordinal = val & 0xFFFFFF;
+					imp_index = val & 0xFFFFFF;
 					addend  = (val >> 24) & 0xFF;
-					imp = rd32(imports + ordinal * 4);
+					imp = rd32(imports + imp_index * 4);
+					lib_ord = imp & 0xFF;
+					weak = (int)((imp >> 8) & 1);
 					noff = (imp >> 9) & 0x7FFFFF;
 					name = symbols + noff;
-					sym = trie_lookup(lib->trie,
-					    lib->trie + lib->trie_size, name);
-					if (sym == 0) {
-						d_puts("dyld: unresolved ");
-						d_puts(name);
-						d_puts("\n");
+					base = resolve_sym(ls, im, lib_ord, name);
+					if (base == 0) {
+						if (!weak) {
+							d_puts("dyld: unresolved ");
+							d_puts(name);
+							d_puts("\n");
+						}
 						*slot = 0;
 					} else {
-						*slot = lib->mh + sym + addend;
+						*slot = base + addend;
 					}
 				} else {			/* rebase */
 					uint64_t	high8;
@@ -590,6 +764,213 @@ apply_fixups(const struct image *im, const struct image *lib)
 	}
 }
 
+/* ---- classic LC_DYLD_INFO fixups (rebase + bind opcode streams) --------- */
+
+/* Resolve and patch one classic bind at runtime address `addr`. */
+static void
+bind_one(const struct image *im, const struct linkset *ls, uint64_t lib_ord,
+    const char *name, int64_t addend, int weak, uint64_t addr)
+{
+	uint64_t	*slot;
+	uint64_t	 base;
+
+	slot = (uint64_t *)(uintptr_t)addr;
+	base = resolve_sym(ls, im, lib_ord, name);
+	if (base == 0) {
+		if (!weak) {
+			d_puts("dyld: unresolved ");
+			d_puts(name != 0 ? name : "(null)");
+			d_puts("\n");
+		}
+		*slot = 0;
+	} else {
+		*slot = base + (uint64_t)addend;
+	}
+}
+
+/*
+ * Interpret a classic rebase opcode stream: slide every POINTER the dylib's own
+ * segments hold (libgmp's GOT and internal tables).  Rebase type beyond POINTER
+ * is ignored -- POINTER is all an x86-64 dylib emits.
+ */
+static void
+apply_rebases(const struct image *im)
+{
+	const uint8_t	*p;
+	const uint8_t	*end;
+	uint64_t	 addr;
+	uint64_t	 count;
+	uint64_t	 skip;
+	uint64_t	 i;
+	uint8_t		 op;
+	uint8_t		 imm;
+
+	if (im->rebase == 0 || im->rebase_size == 0)
+		return;
+	p = im->rebase;
+	end = p + im->rebase_size;
+	addr = im->mh;
+	while (p < end) {
+		op  = (uint8_t)(*p & 0xF0);
+		imm = (uint8_t)(*p & 0x0F);
+		p++;
+		switch (op) {
+		case 0x00:		/* DONE (separator / padding) */
+		case 0x10:		/* SET_TYPE_IMM */
+			break;
+		case 0x20:		/* SET_SEGMENT_AND_OFFSET_ULEB */
+			addr = im->segs[imm].vmaddr + im->slide + uleb(&p, end);
+			break;
+		case 0x30:		/* ADD_ADDR_ULEB */
+			addr += uleb(&p, end);
+			break;
+		case 0x40:		/* ADD_ADDR_IMM_SCALED */
+			addr += (uint64_t)imm * 8;
+			break;
+		case 0x50:		/* DO_REBASE_IMM_TIMES */
+			for (i = 0; i < imm; i++) {
+				*(uint64_t *)(uintptr_t)addr += im->slide;
+				addr += 8;
+			}
+			break;
+		case 0x60:		/* DO_REBASE_ULEB_TIMES */
+			count = uleb(&p, end);
+			for (i = 0; i < count; i++) {
+				*(uint64_t *)(uintptr_t)addr += im->slide;
+				addr += 8;
+			}
+			break;
+		case 0x70:		/* DO_REBASE_ADD_ADDR_ULEB */
+			*(uint64_t *)(uintptr_t)addr += im->slide;
+			addr += 8 + uleb(&p, end);
+			break;
+		case 0x80:		/* DO_REBASE_ULEB_TIMES_SKIPPING_ULEB */
+			count = uleb(&p, end);
+			skip = uleb(&p, end);
+			for (i = 0; i < count; i++) {
+				*(uint64_t *)(uintptr_t)addr += im->slide;
+				addr += 8 + skip;
+			}
+			break;
+		default:
+			d_puts("dyld: bad rebase op\n");
+			return;
+		}
+	}
+}
+
+/*
+ * Interpret a classic bind (or lazy-bind) opcode stream.  Each DO_BIND resolves
+ * the current symbol through resolve_sym -- honouring the dylib ordinal the
+ * stream last selected -- and patches the pointer.  DONE is a separator (the
+ * lazy stream emits one per symbol), so iteration runs to `end`; we bind
+ * eagerly, so the lazy stream is resolved here too rather than on first call.
+ */
+static void
+apply_binds(const struct image *im, const struct linkset *ls,
+    const uint8_t *p, uint64_t size)
+{
+	const uint8_t	*end;
+	const char	*sym;
+	uint64_t	 addr;
+	uint64_t	 lib_ord;
+	uint64_t	 count;
+	uint64_t	 skip;
+	uint64_t	 i;
+	int64_t		 addend;
+	uint8_t		 op;
+	uint8_t		 imm;
+	int		 weak;
+
+	if (p == 0 || size == 0)
+		return;
+	end = p + size;
+	sym = 0;
+	addr = im->mh;
+	lib_ord = 0;
+	addend = 0;
+	weak = 0;
+	while (p < end) {
+		op  = (uint8_t)(*p & 0xF0);
+		imm = (uint8_t)(*p & 0x0F);
+		p++;
+		switch (op) {
+		case 0x00:		/* DONE (separator) */
+			break;
+		case 0x10:		/* SET_DYLIB_ORDINAL_IMM */
+			lib_ord = imm;
+			break;
+		case 0x20:		/* SET_DYLIB_ORDINAL_ULEB */
+			lib_ord = uleb(&p, end);
+			break;
+		case 0x30:		/* SET_DYLIB_SPECIAL_IMM */
+			lib_ord = 0xFE;	/* self/flat -> search the closure */
+			break;
+		case 0x40:		/* SET_SYMBOL_TRAILING_FLAGS_IMM */
+			weak = (int)(imm & 1);		/* WEAK_IMPORT */
+			sym = (const char *)p;
+			while (p < end && *p != 0)
+				p++;
+			if (p < end)
+				p++;			/* skip the NUL */
+			break;
+		case 0x50:		/* SET_TYPE_IMM */
+			break;
+		case 0x60:		/* SET_ADDEND_SLEB */
+			addend = sleb(&p, end);
+			break;
+		case 0x70:		/* SET_SEGMENT_AND_OFFSET_ULEB */
+			addr = im->segs[imm].vmaddr + im->slide + uleb(&p, end);
+			break;
+		case 0x80:		/* ADD_ADDR_ULEB */
+			addr += uleb(&p, end);
+			break;
+		case 0x90:		/* DO_BIND */
+			bind_one(im, ls, lib_ord, sym, addend, weak, addr);
+			addr += 8;
+			break;
+		case 0xA0:		/* DO_BIND_ADD_ADDR_ULEB */
+			bind_one(im, ls, lib_ord, sym, addend, weak, addr);
+			addr += 8 + uleb(&p, end);
+			break;
+		case 0xB0:		/* DO_BIND_ADD_ADDR_IMM_SCALED */
+			bind_one(im, ls, lib_ord, sym, addend, weak, addr);
+			addr += 8 + (uint64_t)imm * 8;
+			break;
+		case 0xC0:		/* DO_BIND_ULEB_TIMES_SKIPPING_ULEB */
+			count = uleb(&p, end);
+			skip = uleb(&p, end);
+			for (i = 0; i < count; i++) {
+				bind_one(im, ls, lib_ord, sym, addend, weak,
+				    addr);
+				addr += 8 + skip;
+			}
+			break;
+		default:
+			d_puts("dyld: bad bind op\n");
+			return;
+		}
+	}
+}
+
+/*
+ * Link one image: chained fixups when present (our libSystem, the Apple
+ * executables), otherwise the classic LC_DYLD_INFO opcode streams (libgmp).
+ * Rebases first, then non-lazy and lazy binds.
+ */
+static void
+link_image(const struct image *im, const struct linkset *ls)
+{
+
+	if (im->fixups != 0) {
+		apply_fixups(im, ls);
+		return;
+	}
+	apply_rebases(im);
+	apply_binds(im, ls, im->bind, im->bind_size);
+	apply_binds(im, ls, im->lazy, im->lazy_size);
+}
+
 /* ---- entry -------------------------------------------------------------- */
 
 /*
@@ -599,17 +980,19 @@ apply_fixups(const struct image *im, const struct image *lib)
 void
 dyld_main(uint64_t *sp)
 {
-	struct image			 main_im;
-	struct image			 lib_im;
+	struct linkset			 ls;
 	const struct mach_header_64	*mh;
 	char				**argv;
 	char				**envp;
 	char				**apple;
 	char				**w;
 	uint64_t			 main_mh;
-	uint64_t			 libbase;
+	uint64_t			 base;
 	uint64_t			 entry;
+	uint64_t			 exit_addr;
 	int				 argc;
+	int				 i;
+	int				 k;
 	int				 rc;
 
 	main_mh = sp[0];
@@ -621,7 +1004,7 @@ dyld_main(uint64_t *sp)
 		w++;
 	apple = w + 1;
 
-	d_puts("dyld: M2 link, main_mh=");
+	d_puts("dyld: link main_mh=");
 	d_puthex(main_mh);
 
 	mh = (const struct mach_header_64 *)(uintptr_t)main_mh;
@@ -630,42 +1013,82 @@ dyld_main(uint64_t *sp)
 		dsys(0x2000001, 71, 0, 0);
 	}
 
-	parse_image(main_mh, &main_im);
-	if (main_im.dylib_path == 0) {
+	/* Slot 0 is the main image; it owns no dependency path. */
+	ls.n = 1;
+	ls.path[0] = 0;
+	parse_image(main_mh, &ls.im[0]);
+	if (ls.im[0].ndeps == 0) {
 		d_puts("dyld: main names no LC_LOAD_DYLIB\n");
 		dsys(0x2000001, 72, 0, 0);
 	}
-	d_puts("dyld: dependency ");
-	d_puts(main_im.dylib_path);
-	d_puts("\n");
-
-	libbase = map_image(main_im.dylib_path);
-	if (libbase == 0) {
-		d_puts("dyld: map_image failed\n");
-		dsys(0x2000001, 73, 0, 0);
-	}
-	d_puts("dyld: libSystem mapped @ ");
-	d_puthex(libbase);
-
-	parse_image(libbase, &lib_im);
 
 	/*
-	 * libSystem first (its own rebases; it has no binds), then the main
-	 * image bound against libSystem's exports.  Mapping at the preferred
-	 * base would make libSystem's rebases no-ops, but applying them keeps
-	 * the path correct for any future relocated dependency.
+	 * Map the transitive dependency closure.  The worklist walks every image
+	 * already in `ls` (main first, then each dependency as it is added) and
+	 * maps any LC_LOAD_DYLIB it has not seen before -- so libgmp's own
+	 * dependency on libSystem is satisfied by the copy main already mapped,
+	 * never twice.  `ls.n` grows inside the loop and the `i < ls.n` test
+	 * picks up the freshly mapped images, walking the graph to a fixpoint.
 	 */
-	apply_fixups(&lib_im, &lib_im);
-	apply_fixups(&main_im, &lib_im);
+	for (i = 0; i < ls.n; i++) {
+		for (k = 0; k < ls.im[i].ndeps; k++) {
+			const char	*path;
 
-	entry = main_mh + main_im.entryoff;
+			path = ls.im[i].deps[k];
+			if (find_path(&ls, path) >= 0)
+				continue;
+			if (ls.n >= LINKSET_MAX) {
+				d_puts("dyld: dependency closure too large\n");
+				dsys(0x2000001, 74, 0, 0);
+			}
+			base = map_image(path);
+			if (base == 0) {
+				d_puts("dyld: map_image failed for ");
+				d_puts(path);
+				d_puts("\n");
+				dsys(0x2000001, 73, 0, 0);
+			}
+			d_puts("dyld: mapped ");
+			d_puts(path);
+			d_puts(" @ ");
+			d_puthex(base);
+			parse_image(base, &ls.im[ls.n]);
+			ls.path[ls.n] = path;
+			ls.n++;
+		}
+	}
+
+	/*
+	 * Apply every image's fixups.  Order is immaterial: a bind only reads its
+	 * target's export trie (parsed for all images above), not the target's
+	 * applied state.  Each image binds through its own lib_ordinal list, so
+	 * libgmp's imports land in libSystem and gfactor's split between libgmp
+	 * and libSystem.  link_image picks chained fixups or the classic
+	 * LC_DYLD_INFO opcode streams per image.
+	 */
+	for (i = 0; i < ls.n; i++)
+		link_image(&ls.im[i], &ls);
+
+	entry = main_mh + ls.im[0].entryoff;
 	d_puts("dyld: enter main @ ");
 	d_puthex(entry);
 
 	rc = ((int (*)(int, char **, char **, char **))(uintptr_t)entry)(
 	    argc, argv, envp, apple);
 
-	dsys(0x2000001, rc, 0, 0);	/* exit(rc) if main ever returns */
+	/*
+	 * main returned.  Darwin's LC_MAIN convention returns into libSystem's
+	 * exit(3), which runs the atexit handlers before the terminating _exit
+	 * syscall -- coreutils flushes its output line buffer from one of those
+	 * handlers, so issuing the raw exit syscall here (skipping atexit) loses
+	 * any buffered output.  Dispatch through the program's exit() resolved
+	 * from the closure instead; fall back to the syscall if it is absent.
+	 */
+	exit_addr = resolve_sym(&ls, &ls.im[0], 0xFE, "_exit");
+	if (exit_addr != 0)
+		((void (*)(int))(uintptr_t)exit_addr)(rc);
+
+	dsys(0x2000001, rc, 0, 0);	/* fallback: raw _exit if no exit(3) */
 	for (;;)
 		;
 }

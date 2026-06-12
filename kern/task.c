@@ -10,6 +10,7 @@
 #include <stdint.h>
 
 #include "bootstrap.h"
+#include "darwin.h"
 #include "host.h"
 #include "kmem.h"
 #include "kprintf.h"
@@ -120,14 +121,16 @@ task_create(const char *name)
 	t->t_killed      = false;
 	t->t_personality = TASK_PERSONALITY_STYLE9;
 	t->t_darwin_dylib_next = 0;
+	t->t_darwin_ppid = 0;
 	{
 		size_t	fi;
 
 		for (fi = 0; fi < DARWIN_NOFILE; fi++) {
+			t->t_darwin_files[fi].of_pipe = NULL;
 			t->t_darwin_files[fi].of_buf  = NULL;
 			t->t_darwin_files[fi].of_size = 0;
 			t->t_darwin_files[fi].of_off  = 0;
-			t->t_darwin_files[fi].of_used = false;
+			t->t_darwin_files[fi].of_type = DARWIN_OF_FREE;
 		}
 	}
 
@@ -303,21 +306,14 @@ task_deref(struct task *t)
 	}
 
 	/*
-	 * Free any Darwin open-file buffers the task never close()d -- e.g. a
-	 * crash with a font still open.  The common path frees them at close;
-	 * this catches the leak on abnormal exit.  kernel_task's slots are
-	 * always empty, so this is a no-op for it.
+	 * Release any Darwin open-file slots the task never close()d --
+	 * e.g. a crash with a font still open, or the far end of a pipe a
+	 * sibling still reads (the ref drop is what turns the reader's
+	 * next read into EOF).  The common path releases at close; this
+	 * catches abnormal exit.  kernel_task's slots are always empty,
+	 * so this is a no-op for it.
 	 */
-	{
-		size_t	fi;
-
-		for (fi = 0; fi < DARWIN_NOFILE; fi++) {
-			if (t->t_darwin_files[fi].of_buf != NULL) {
-				kfree(t->t_darwin_files[fi].of_buf);
-				t->t_darwin_files[fi].of_buf = NULL;
-			}
-		}
-	}
+	darwin_files_teardown(t);
 
 	if (t != kernel_task) {
 		port_space_destroy(t->t_port_space);
@@ -732,6 +728,32 @@ task_is_alive(uint64_t id)
 	}
 	spin_unlock(&tasks_lock);
 	return (alive);
+}
+
+/*
+ * Count live tasks whose t_darwin_ppid is `ppid`, restricted to t_id ==
+ * pid when pid != 0.  Same best-effort discipline as task_is_alive --
+ * see task.h for how wait4's loop keeps the staleness harmless.
+ */
+int
+task_count_darwin_children(uint64_t ppid, uint64_t pid)
+{
+	size_t	i;
+	int	n;
+
+	n = 0;
+	spin_lock(&tasks_lock);
+	for (i = 0; i < TASK_LIST_MAX; i++) {
+		if (task_list[i] == NULL)
+			continue;
+		if (task_list[i]->t_darwin_ppid != ppid)
+			continue;
+		if (pid != 0 && task_list[i]->t_id != pid)
+			continue;
+		n++;
+	}
+	spin_unlock(&tasks_lock);
+	return (n);
 }
 
 /*

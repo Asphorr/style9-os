@@ -147,7 +147,12 @@ OBJS	= \
 	$(OBJDIR)/dirlist_macho.o \
 	$(OBJDIR)/tree_macho.o \
 	$(OBJDIR)/guname_macho.o \
+	$(OBJDIR)/gfactor_macho.o \
+	$(OBJDIR)/genv_macho.o \
+	$(OBJDIR)/gtimeout_macho.o \
+	$(OBJDIR)/pipefork_macho.o \
 	$(OBJDIR)/libSystem_dylib.o \
+	$(OBJDIR)/libgmp_dylib.o \
 	$(OBJDIR)/ksym.o
 
 all: kernel.elf
@@ -376,6 +381,21 @@ $(OBJDIR)/tree.macho: extern/tree.macho | $(OBJDIR)
 $(OBJDIR)/guname.macho: extern/guname.macho | $(OBJDIR)
 	cp $< $@
 
+# gfactor: a FOURTH real Apple x86-64 macOS CLI binary (GNU coreutils 9.11's
+# factor, a Homebrew bottle vendored in extern/gfactor.macho).  Unlike the
+# libSystem-only binaries above, it also depends on libgmp -- the first binary
+# to drive a SECOND dependency, so our dyld must map the whole closure and bind
+# each import against the dylib its lib_ordinal names.  Embedded like figlet.
+$(OBJDIR)/gfactor.macho: extern/gfactor.macho | $(OBJDIR)
+	cp $< $@
+
+# libgmp: the real Homebrew x86_64 libgmp.10.dylib (GMP 6.3.0), gfactor's
+# second dependency.  Not a program -- a dylib to bind against -- so it gets the
+# dylib wrap rule below rather than a %_macho.o.  The kernel registers it under
+# its literal install name (kern/darwin.c) and the dyld backchannel maps it.
+$(OBJDIR)/libgmp.10.dylib: extern/libgmp.10.dylib | $(OBJDIR)
+	cp $< $@
+
 # dirlist (directory-enumeration probe): a self-authored Darwin-ABI binary that
 # imports opendir$INODE64 / readdir$INODE64 / stat$INODE64 from our libSystem to
 # walk the FAT volume.  Same real toolchain + low relink as dyldhello -- it
@@ -387,6 +407,28 @@ $(OBJDIR)/dirlist.macho: $(OBJDIR)/dirlist.dwn.o $(OBJDIR)/libSystem.B.dylib
 	$(DARWIN_LD) $(DARWIN_LDF) -o $@ $< -L$(OBJDIR) -lSystem.B -e _entry \
 	    -pagezero_size $(DYLDHELLO_BASE)
 
+# pipefork (multi-process probe): a self-authored Darwin-ABI binary that
+# exercises fork/execve/wait4/pipe/dup2 through our libSystem -- the probe that
+# de-risks the process syscalls before genuine Apple binaries (genv, gtimeout)
+# depend on them.  Same toolchain + low relink as dirlist.
+$(OBJDIR)/pipefork.dwn.o: $(USER_DIR)/pipefork.c | $(OBJDIR)
+	$(DARWIN_CC) $(DARWIN_CFLAGS) -c $< -o $@
+
+$(OBJDIR)/pipefork.macho: $(OBJDIR)/pipefork.dwn.o $(OBJDIR)/libSystem.B.dylib
+	$(DARWIN_LD) $(DARWIN_LDF) -o $@ $< -L$(OBJDIR) -lSystem.B -e _entry \
+	    -pagezero_size $(DYLDHELLO_BASE)
+
+# genv / gtimeout: the FIFTH and SIXTH real Apple x86-64 macOS CLI binaries
+# (GNU coreutils 9.11's env and timeout, from the same Homebrew bottle as
+# guname/gfactor, vendored in extern/).  They are the multi-process oracles:
+# env exec(2)s its command in place, timeout fork(2)s it and wait4(2)s --
+# genuine Apple binaries driving the Darwin process-lifecycle syscalls.
+$(OBJDIR)/genv.macho: extern/genv.macho | $(OBJDIR)
+	cp $< $@
+
+$(OBJDIR)/gtimeout.macho: extern/gtimeout.macho | $(OBJDIR)
+	cp $< $@
+
 # libSystem is embedded so the dyld backchannel (kern/darwin.c) can map it by
 # path -- it is a dependency to bind against, not a program to run, so it gets
 # its own wrap rule (a .dylib, not a .macho).  objcopy derives the symbols
@@ -395,6 +437,13 @@ $(OBJDIR)/libSystem_dylib.o: $(OBJDIR)/libSystem.B.dylib
 	cd $(OBJDIR) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386	\
 	    --rename-section .data=.rodata.libSystem_dylib		\
 	    libSystem.B.dylib libSystem_dylib.o
+
+# libgmp embedded the same way: objcopy derives the kernel symbols
+# _binary_libgmp_10_dylib_{start,end} from the file name "libgmp.10.dylib".
+$(OBJDIR)/libgmp_dylib.o: $(OBJDIR)/libgmp.10.dylib
+	cd $(OBJDIR) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386	\
+	    --rename-section .data=.rodata.libgmp_dylib			\
+	    libgmp.10.dylib libgmp_dylib.o
 
 # Wrap a .macho into a kernel-linkable object exposing
 # _binary_<name>_macho_start / _end.  Mirror of the %_elf.o rule.

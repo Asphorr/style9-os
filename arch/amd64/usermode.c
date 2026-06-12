@@ -8,6 +8,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "darwin.h"
 #include "elf.h"
 #include "gdt.h"
 #include "kmem.h"
@@ -397,78 +398,77 @@ build_dyld_arg_stack(uint64_t kva_base, uint64_t main_mh, uint64_t stack_top,
 }
 
 /*
- * Launcher for a ring-3 program shipped as an embedded image.  Differs
- * from usermode_launcher in that the format loader handles segment
- * mapping and picks the entry RIP off the image header; we only own the
- * stack mapping.  The image is format-sniffed on its first four bytes:
- * an ELF magic routes to elf_load, a Mach-O (thin MH_MAGIC_64 or a
- * fat/universal archive) routes to macho_load.  Both loaders share the
- * (task, image, size, &entry) contract, so everything downstream of the
- * sniff -- stack frame, port injection, ring-3 transition -- is identical
- * regardless of container format.
+ * usermode_setup_image: the shared image-construction core behind both
+ * the spawn launcher and the Darwin execve(2).  Loads `image` into `ut`
+ * -- format-sniffed on its first four bytes: an ELF magic routes to
+ * elf_load, a Mach-O (thin MH_MAGIC_64 or a fat/universal archive) to
+ * macho_load -- maps the initial user stack, builds the entry frame, and
+ * writes the ring-3 rip/rsp through the out parameters.
  *
- * Runs as a kernel thread attached to the freshly-created user task, so
- * by the time we get here the scheduler has already loaded our task's
- * CR3 -- the loader's pmap_enter calls land in (and TLB-flush) the live
- * page table.
+ * A dynamically-linked Darwin image (LC_LOAD_DYLINKER present) is not
+ * entered directly: our clean-room dyld is mapped alongside it and
+ * entered with a dyld4-shaped handoff stack carrying the main image's
+ * mach_header (build_dyld_arg_stack); it also gets a multi-page stack
+ * (DARWIN_STACK_PAGES below DARWIN_STACK_TOP) -- real Apple binaries
+ * build frames a single page would overflow.  Every other image keeps
+ * the historical single page at USER_STACK_VA and the SysV argc/argv
+ * frame, entered at its own RIP.
+ *
+ * Returns 0 or a negative SYS_E_*.  On failure the task's user address
+ * space may be partially populated; the caller owns the consequences
+ * (the spawn launcher panics, execve exits the task).
  */
-static void
-usermode_elf_launcher(void *arg)
+static long
+usermode_setup_image(struct task *ut, const uint8_t *image,
+    size_t image_size, const char *name, int argc, char *const *argv,
+    uint64_t *rip_out, uint64_t *rsp_out)
 {
-	struct user_spawn_arg	*sa;
-	struct task		*ut;
-	uint64_t		*kva;
-	uint64_t		 entry;
-	uint64_t		 ksp;
-	uint64_t		 main_base;
-	uint64_t		 stack_pa;
-	uint64_t		 stack_top;
-	uint64_t		 stack_va;
-	uint64_t		 top_pa;
-	uint64_t		 user_rsp;
-	size_t			 i;
-	size_t			 npages;
-	size_t			 p;
-	uint32_t		 magic;
-	int			 rv;
-	bool			 needs_dyld;
-
-	sa = (struct user_spawn_arg *)arg;
-	ut = current_thread->th_task;
+	uint64_t	*kva;
+	uint64_t	 entry;
+	uint64_t	 main_base;
+	uint64_t	 stack_pa;
+	uint64_t	 stack_top;
+	uint64_t	 stack_va;
+	uint64_t	 top_pa;
+	uint64_t	 user_rsp;
+	size_t		 i;
+	size_t		 npages;
+	size_t		 p;
+	uint32_t	 magic;
+	int		 rv;
+	bool		 needs_dyld;
 
 	needs_dyld = false;
 	main_base  = 0;
+	entry      = 0;
 
-	magic = sa->sa_image_size >= sizeof(uint32_t) ?
-	    *(const uint32_t *)sa->sa_image : 0;
+	magic = image_size >= sizeof(uint32_t) ?
+	    *(const uint32_t *)image : 0;
 	if (magic == MACHO_MAGIC_64 || magic == MACHO_FAT_MAGIC ||
 	    magic == MACHO_FAT_CIGAM) {
 		struct macho_load_result	mres;
 
-		rv = macho_load(ut, sa->sa_image, sa->sa_image_size, &mres);
-		if (rv != MACHO_E_OK)
-			panic("usermode_elf_launcher: macho_load %s rv=%d",
-			    sa->sa_name, rv);
+		rv = macho_load(ut, image, image_size, &mres);
+		if (rv != MACHO_E_OK) {
+			kprintf("usermode: macho_load %s rv=%d\n", name, rv);
+			return (SYS_E_INVAL);
+		}
 		entry      = mres.entry;
 		needs_dyld = mres.needs_dyld;
 		main_base  = mres.image_base;
 	} else {
-		rv = elf_load(ut, sa->sa_image, sa->sa_image_size, &entry);
-		if (rv != ELF_E_OK)
-			panic("usermode_elf_launcher: elf_load %s rv=%d",
-			    sa->sa_name, rv);
+		rv = elf_load(ut, image, image_size, &entry);
+		if (rv != ELF_E_OK) {
+			kprintf("usermode: elf_load %s rv=%d\n", name, rv);
+			return (SYS_E_INVAL);
+		}
 	}
 
 	/*
-	 * Map the initial user stack.  A dynamically-linked Darwin image gets a
-	 * multi-page stack (DARWIN_STACK_PAGES) growing down from
-	 * DARWIN_STACK_TOP -- real Apple binaries build large and
-	 * variable-length frames (probed by ____chkstk_darwin) that a single
-	 * page would overflow.  Every other image keeps the historical single
-	 * page at USER_STACK_VA.  Pages are allocated one at a time (the pmm is
-	 * page-granular and they need not be contiguous); the handoff frame is
-	 * built entirely within the TOP page, whose kernel alias `kva` the frame
-	 * builders write through.
+	 * Map the initial user stack.  Pages are allocated one at a time
+	 * (the pmm is page-granular and they need not be contiguous); the
+	 * handoff frame is built entirely within the TOP page, whose
+	 * kernel alias `kva` the frame builders write through.
 	 */
 	if (needs_dyld) {
 		stack_top = DARWIN_STACK_TOP;
@@ -486,10 +486,12 @@ usermode_elf_launcher(void *arg)
 		page_va  = stack_top - (uint64_t)(p + 1) * 0x1000;
 		stack_pa = pmm_alloc_page();
 		if (stack_pa == PA_INVALID)
-			panic("usermode_elf_launcher: stack alloc failed");
+			return (SYS_E_NOMEM);
 		if (!pmap_enter(ut->t_pmap, page_va, stack_pa,
-		    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_USER))
-			panic("usermode_elf_launcher: stack map failed");
+		    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_USER)) {
+			pmm_free_page(stack_pa);
+			return (SYS_E_NOMEM);
+		}
 		kva = (uint64_t *)pmm_kva_from_pa(stack_pa);
 		for (i = 0; i < 512; i++)
 			kva[i] = 0;
@@ -498,19 +500,10 @@ usermode_elf_launcher(void *arg)
 	}
 	if (!vm_map_enter(ut->t_map, stack_va, (uint64_t)npages * 0x1000,
 	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_USER, VME_F_ANON))
-		panic("usermode_elf_launcher: vm_map_enter stack");
+		return (SYS_E_NOMEM);
 
 	kva = (uint64_t *)pmm_kva_from_pa(top_pa);
 
-	/*
-	 * Resolve the entry RIP and the initial stack.  A dynamically-linked
-	 * Darwin image (LC_LOAD_DYLINKER present) is not entered directly: the
-	 * kernel maps our clean-room dyld alongside it and enters dyld with a
-	 * dyld4-shaped handoff stack carrying the main image's mach_header.
-	 * dyld binds the image, then jumps to its LC_MAIN entry.  Every other
-	 * image -- a style9 ELF, or a non-dynamic Mach-O -- takes the ordinary
-	 * SysV argc/argv frame and is entered at its own RIP.
-	 */
 	if (needs_dyld) {
 		struct macho_load_result	dres;
 		const uint8_t			*dyld_img;
@@ -520,15 +513,52 @@ usermode_elf_launcher(void *arg)
 		dyld_sz  = (size_t)(_binary_dyld_macho_end -
 		    _binary_dyld_macho_start);
 		rv = macho_load(ut, dyld_img, dyld_sz, &dres);
-		if (rv != MACHO_E_OK)
-			panic("usermode_elf_launcher: dyld load failed rv=%d", rv);
+		if (rv != MACHO_E_OK) {
+			kprintf("usermode: dyld load failed rv=%d\n", rv);
+			return (SYS_E_INVAL);
+		}
 		entry    = dres.entry;
 		user_rsp = build_dyld_arg_stack((uint64_t)kva, main_base,
-		    stack_top, sa->sa_argc, sa->sa_argv);
+		    stack_top, argc, argv);
 	} else {
-		user_rsp = build_user_arg_stack((uint64_t)kva, sa->sa_argc,
-		    sa->sa_argv);
+		user_rsp = build_user_arg_stack((uint64_t)kva, argc, argv);
 	}
+
+	*rip_out = entry;
+	*rsp_out = user_rsp;
+	return (0);
+}
+
+/*
+ * Launcher for a ring-3 program shipped as an embedded image.  Differs
+ * from usermode_launcher in that usermode_setup_image handles loading,
+ * stack mapping, and frame construction; this only owns the spawn-side
+ * trimmings (kernel-stack registration, port injection) and the ring-3
+ * transition.
+ *
+ * Runs as a kernel thread attached to the freshly-created user task, so
+ * by the time we get here the scheduler has already loaded our task's
+ * CR3 -- the loader's pmap_enter calls land in (and TLB-flush) the live
+ * page table.
+ */
+static void
+usermode_elf_launcher(void *arg)
+{
+	struct user_spawn_arg	*sa;
+	struct task		*ut;
+	uint64_t		 entry;
+	uint64_t		 ksp;
+	uint64_t		 user_rsp;
+	long			 rv;
+
+	sa = (struct user_spawn_arg *)arg;
+	ut = current_thread->th_task;
+
+	rv = usermode_setup_image(ut, sa->sa_image, sa->sa_image_size,
+	    sa->sa_name, sa->sa_argc, sa->sa_argv, &entry, &user_rsp);
+	if (rv < 0)
+		panic("usermode_elf_launcher: setup_image %s rv=%ld",
+		    sa->sa_name, rv);
 
 	ksp = (uint64_t)current_thread->th_kstack_base +
 	    current_thread->th_kstack_size;
@@ -558,11 +588,10 @@ usermode_elf_launcher(void *arg)
 	}
 
 	kprintf("usermode: spawn '%s' entry=0x%llx (image=%zu bytes), "
-	    "rsp=0x%llx argc=%d%s%s\n",
+	    "rsp=0x%llx argc=%d%s\n",
 	    sa->sa_name, (unsigned long long)entry, sa->sa_image_size,
 	    (unsigned long long)user_rsp, sa->sa_argc,
-	    sa->sa_inject_port != NULL ? ", parent port injected" : "",
-	    needs_dyld ? ", via dyld" : "");
+	    sa->sa_inject_port != NULL ? ", parent port injected" : "");
 
 	if (sa->sa_argv != NULL)
 		kfree(sa->sa_argv);
@@ -691,4 +720,213 @@ usermode_enter(uint64_t user_rip, uint64_t user_rsp)
 	    : "memory");
 
 	__builtin_unreachable();
+}
+
+/*
+ * Ring-3 entry for a fork(2) child: usermode_enter with the GPR file
+ * scrubbed.  The child resumes at the instruction after the parent's
+ * `syscall` with %rax = 0 (the fork-child return value) -- everything
+ * else a C caller may rely on is callee-saved, and our libSystem fork
+ * wrapper parked those six registers on the user stack (which the
+ * address-space copy duplicated) and pops them after the syscall, in
+ * parent and child alike.  Caller-save registers are legally clobbered
+ * by any C call, so zeroing the rest leaks nothing and promises nothing.
+ */
+__attribute__((noreturn))
+static void
+usermode_enter_forked(uint64_t user_rip, uint64_t user_rsp)
+{
+
+	__asm__ __volatile__ (
+	    "pushq $0x23		\n"	/* SS               */
+	    "pushq %0			\n"	/* RSP              */
+	    "pushq $0x202		\n"	/* RFLAGS           */
+	    "pushq $0x2B		\n"	/* CS               */
+	    "pushq %1			\n"	/* RIP              */
+	    "xorl %%eax, %%eax		\n"	/* fork() -> 0      */
+	    "xorl %%ebx, %%ebx		\n"
+	    "xorl %%ecx, %%ecx		\n"
+	    "xorl %%edx, %%edx		\n"
+	    "xorl %%esi, %%esi		\n"
+	    "xorl %%edi, %%edi		\n"
+	    "xorl %%ebp, %%ebp		\n"
+	    "xorl %%r8d, %%r8d		\n"
+	    "xorl %%r9d, %%r9d		\n"
+	    "xorl %%r10d, %%r10d	\n"
+	    "xorl %%r11d, %%r11d	\n"
+	    "xorl %%r12d, %%r12d	\n"
+	    "xorl %%r13d, %%r13d	\n"
+	    "xorl %%r14d, %%r14d	\n"
+	    "xorl %%r15d, %%r15d	\n"
+	    "iretq			\n"
+	    :
+	    : "r"(user_rsp), "r"(user_rip)
+	    : "memory");
+
+	__builtin_unreachable();
+}
+
+/*
+ * Carries the parent's saved user context across the thread boundary to
+ * the fork child's launcher.  Allocated by arch_darwin_fork, freed by
+ * the launcher before it iretqs.
+ */
+struct darwin_fork_arg {
+	uint64_t	fa_rip;
+	uint64_t	fa_rsp;
+};
+
+/*
+ * Kernel-side trampoline for a fork child.  Runs as the child task's
+ * first (and only) thread; the address space was fully copied before
+ * thread_start, so all that remains is registering this thread's kernel
+ * stack for syscall/IRQ entry -- the same dance usermode_elf_launcher
+ * does -- and dropping into ring 3 at the parent's saved rip/rsp.
+ */
+static void
+darwin_fork_child_launcher(void *arg)
+{
+	struct darwin_fork_arg	*fa;
+	uint64_t		 ksp;
+	uint64_t		 rip;
+	uint64_t		 rsp;
+
+	fa  = (struct darwin_fork_arg *)arg;
+	rip = fa->fa_rip;
+	rsp = fa->fa_rsp;
+	kfree(fa);
+
+	ksp = (uint64_t)current_thread->th_kstack_base +
+	    current_thread->th_kstack_size;
+	tss_set_rsp0(ksp);
+	syscall_kernel_rsp = ksp;
+
+	usermode_enter_forked(rip, rsp);
+}
+
+/*
+ * arch_darwin_fork: the fork(2) engine.  Clones the calling Darwin
+ * task -- eager address-space copy (vm_map_fork_copy), open-file table
+ * clone (darwin_files_fork_copy), dylib bump pointer, parentage -- and
+ * starts a thread that enters ring 3 at the parent's saved user rip/rsp
+ * with %rax = 0.  Returns the child's pid (its task id), or a negative
+ * SYS_E_*.  Failure paths task_deref the half-built child; its normal
+ * teardown reclaims whatever was already copied.
+ */
+long
+arch_darwin_fork(struct syscall_frame *f)
+{
+	struct darwin_fork_arg	*fa;
+	struct task		*child;
+	struct task		*parent;
+	struct thread		*th;
+	long			 pid;
+
+	parent = current_thread->th_task;
+
+	fa = (struct darwin_fork_arg *)kmalloc(sizeof(*fa));
+	if (fa == NULL)
+		return (SYS_E_NOMEM);
+	fa->fa_rip = f->sf_user_rip;
+	fa->fa_rsp = f->sf_user_rsp;
+
+	child = task_create(parent->t_name);
+	if (child == NULL) {
+		kfree(fa);
+		return (SYS_E_NOMEM);
+	}
+
+	/*
+	 * Identity before address space: the child must look like a
+	 * Darwin process from its very first instruction (its first
+	 * syscall dispatches on t_personality), and wait4/getppid key
+	 * on t_darwin_ppid.
+	 */
+	child->t_personality       = TASK_PERSONALITY_DARWIN;
+	child->t_darwin_ppid       = parent->t_id;
+	child->t_darwin_dylib_next = parent->t_darwin_dylib_next;
+
+	if (!vm_map_fork_copy(parent->t_map, parent->t_pmap,
+	    child->t_map, child->t_pmap)) {
+		task_deref(child);
+		kfree(fa);
+		return (SYS_E_NOMEM);
+	}
+
+	if (darwin_files_fork_copy(parent, child) != 0) {
+		task_deref(child);
+		kfree(fa);
+		return (SYS_E_NOMEM);
+	}
+
+	th = thread_create(child, darwin_fork_child_launcher, fa, "fork");
+	if (th == NULL) {
+		task_deref(child);
+		kfree(fa);
+		return (SYS_E_NOMEM);
+	}
+	pid = (long)child->t_id;
+	thread_start(th);
+
+	/*
+	 * Drop the creator's ref now that the thread anchors the task --
+	 * the same release arch_spawn_user documents at length.
+	 */
+	task_deref(child);
+	return (pid);
+}
+
+/*
+ * arch_darwin_execve: replace the calling task's user image.  The
+ * pre-commit validation (registry lookup, argv copyin) already happened
+ * in the caller (kern/darwin.c); from here on the old image is gone.
+ *
+ * Teardown mirrors the task-death path -- release the anonymous frames,
+ * then drop every map entry -- but keeps the task, its fd table, its
+ * port space, and this thread alive.  Unmapping the user half while
+ * executing here is safe: we run on the thread's kernel stack and the
+ * kernel half of the page tables is untouched.  usermode_setup_image
+ * then rebuilds a fresh image + stack, and the frame rewrite makes the
+ * sysret land on the new entry: syscall_entry.S restores user rip/rsp/
+ * rflags from the frame, so returning 0 here IS the jump.
+ *
+ * A setup failure past the point of no return cannot return to the
+ * caller (there is nothing to return to); the task exits with wait4
+ * status 127, the shell convention for "command could not be run".
+ */
+long
+arch_darwin_execve(const unsigned char *image, unsigned long image_size,
+    int argc, char **argv, struct syscall_frame *f)
+{
+	struct task	*t;
+	uint64_t	 rip;
+	uint64_t	 rsp;
+	long		 rv;
+
+	t = current_thread->th_task;
+
+	vm_map_release_anon(t->t_map, t->t_pmap);
+	vm_map_reset(t->t_map);
+	t->t_darwin_dylib_next = 0;
+
+	rv = usermode_setup_image(t, image, (size_t)image_size, t->t_name,
+	    argc, argv, &rip, &rsp);
+	if (rv < 0) {
+		kprintf("darwin: execve setup failed rv=%ld, task exits\n",
+		    rv);
+		darwin_zombie_record(t->t_id, t->t_darwin_ppid, 127 << 8);
+		thread_exit();
+		/* NOTREACHED */
+	}
+
+	f->sf_user_rip    = rip;
+	f->sf_user_rsp    = rsp;
+	f->sf_user_rflags = 0x202;
+	f->sf_arg0 = 0;
+	f->sf_arg1 = 0;
+	f->sf_arg2 = 0;
+	f->sf_arg3 = 0;
+	f->sf_arg4 = 0;
+	f->sf_arg5 = 0;
+	return (0);
 }

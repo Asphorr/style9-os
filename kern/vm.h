@@ -197,4 +197,29 @@ void			 vm_map_release_anon(struct vm_map *,
 bool			 vm_map_release(struct vm_map *,
 			    struct pmap *pm, uint64_t va, uint64_t size);
 
+/*
+ * Drop every entry in `map` but keep the map itself usable -- the
+ * execve(2) middle step.  The caller must already have released the
+ * anonymous backing frames (vm_map_release_anon); this only frees the
+ * vme storage and rewinds the allocation hint.  Same single-thread
+ * invariant as vm_map_destroy: the owning task is between images, its
+ * only thread is the one running this teardown.
+ */
+void			 vm_map_reset(struct vm_map *map);
+
+/*
+ * Duplicate `src`'s address space into `dst` -- the fork(2) engine.
+ * Every entry is re-entered in dst's map with identical range, prot,
+ * and flags; every present 4 KiB leaf in src_pm is copied into a fresh
+ * frame mapped at the same VA in dst_pm with the entry's prot.  Eager
+ * copy, no COW in v1.  Returns false on allocation failure with dst
+ * partially populated -- the caller derefs the child task, whose normal
+ * teardown (vm_map_release_anon + vm_map_destroy) reclaims the partial
+ * copy.  Caller guarantees src is quiescent (its one thread is parked
+ * in the fork syscall).
+ */
+bool			 vm_map_fork_copy(struct vm_map *src,
+			    struct pmap *src_pm, struct vm_map *dst,
+			    struct pmap *dst_pm);
+
 #endif /* !_SYS_VM_H_ */

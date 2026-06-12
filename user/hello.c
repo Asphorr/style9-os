@@ -1889,6 +1889,108 @@ demo_darwin_spawn(void)
 			(void)yield();
 		printf("  guname retired after %d yields\n", i);
 	}
+
+	/*
+	 * A FOURTH real Apple binary: gfactor (GNU coreutils' factor) -- and the
+	 * first to need a SECOND dependency.  Its bind table mixes libgmp's
+	 * __gmpz_ and __gmpn_ symbols with libSystem's libc, so our dyld maps the
+	 * whole closure (gfactor -> libgmp -> libSystem) and resolves each import
+	 * against the dylib its lib_ordinal names -- the multi-dylib capability.
+	 * Run twice: a 12-digit value factored by factor's own word arithmetic
+	 * (proving the binds resolved and it runs), then 2^128, which is past the
+	 * built-in width and forces the computation INTO libgmp -- a real
+	 * cross-dylib call path exercised on the Penryn baseline.
+	 */
+	{
+		const char		*gtests[3];
+		mach_port_name_t	 gfactor_tp;
+		char			*gfactor_argv[2];
+		int			 t;
+
+		gtests[0] = "42";          /* native path: 42: 2 3 7 */
+		gtests[1] = "600851475143"; /* native: 71 839 1471 6857 (Euler P3) */
+		gtests[2] = "340282366920938463463374607431768211456"; /* 2^128: gmp */
+		gfactor_argv[0] = "gfactor";
+		printf("  >>> spawning gfactor -- a REAL Apple binary linking a "
+		    "SECOND dylib (libgmp) <<<\n");
+		for (t = 0; t < 3; t++) {
+			gfactor_tp = MACH_PORT_NULL;
+			gfactor_argv[1] = (char *)gtests[t];
+			printf("  >>> gfactor %s <<<\n", gfactor_argv[1]);
+			child_id = spawn_args("gfactor", 2, gfactor_argv,
+			    &gfactor_tp);
+			if (child_id < 0) {
+				printf("  spawn_args('gfactor') failed "
+				    "(rv=%ld)\n", child_id);
+				return (96);
+			}
+			for (i = 0; i < 4096 &&
+			    task_alive((uint64_t)child_id); i++)
+				(void)yield();
+			printf("  gfactor[%d] retired after %d yields\n", t, i);
+		}
+	}
+
+	/*
+	 * The multi-process rung: Darwin tasks creating, replacing, and
+	 * reaping other Darwin tasks.  pipefork is our own Darwin-ABI probe
+	 * (fork + execve + wait4 + a kernel pipe carrying a real Apple
+	 * binary's stdout across a task boundary); genv and gtimeout are
+	 * REAL Apple binaries -- env exec(2)s gfactor in place, timeout
+	 * fork(2)s it, wait4(2)s it, and would kill(2) it on expiry.
+	 */
+	{
+		mach_port_name_t	 proc_tp;
+		char			*proc_argv[5];
+
+		printf("  >>> pipefork: fork/execve/wait4/pipe/dup2 probe "
+		    "<<<\n");
+		proc_tp = MACH_PORT_NULL;
+		child_id = spawn_args("pipefork", 0, NULL, &proc_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('pipefork') failed (rv=%ld)\n",
+			    child_id);
+			return (97);
+		}
+		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
+			(void)yield();
+		printf("  pipefork retired after %d yields\n", i);
+
+		printf("  >>> genv /bin/gfactor 42 -- a REAL Apple binary "
+		    "exec(2)ing another <<<\n");
+		proc_tp = MACH_PORT_NULL;
+		proc_argv[0] = "genv";
+		proc_argv[1] = "/bin/gfactor";
+		proc_argv[2] = "42";
+		proc_argv[3] = NULL;
+		child_id = spawn_args("genv", 3, proc_argv, &proc_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('genv') failed (rv=%ld)\n",
+			    child_id);
+			return (98);
+		}
+		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
+			(void)yield();
+		printf("  genv retired after %d yields\n", i);
+
+		printf("  >>> gtimeout 10 /bin/gfactor 42 -- a REAL Apple "
+		    "binary fork+exec+waiting another <<<\n");
+		proc_tp = MACH_PORT_NULL;
+		proc_argv[0] = "gtimeout";
+		proc_argv[1] = "10";
+		proc_argv[2] = "/bin/gfactor";
+		proc_argv[3] = "42";
+		proc_argv[4] = NULL;
+		child_id = spawn_args("gtimeout", 4, proc_argv, &proc_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('gtimeout') failed (rv=%ld)\n",
+			    child_id);
+			return (99);
+		}
+		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
+			(void)yield();
+		printf("  gtimeout retired after %d yields\n", i);
+	}
 	return (0);
 }
 
