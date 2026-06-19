@@ -192,6 +192,13 @@ spawn_args(const char *name, int argc, char *const argv[],
 	    (long)argc, (long)out_taskport));
 }
 
+long
+cons_feed(const char *buf, unsigned long len)
+{
+
+	return (syscall2(SYS_CONS_FEED, (long)buf, (long)len));
+}
+
 /* ---- vm ------------------------------------------------------------ */
 
 void *

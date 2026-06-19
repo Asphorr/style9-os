@@ -247,6 +247,16 @@ void	darwin_files_teardown(struct task *t);
 int	darwin_files_fork_copy(struct task *parent, struct task *child);
 
 /*
+ * Console input feed (kern/darwin.c).  Appends bytes to the Darwin
+ * console-input ring that the personality's read(2) drains for a console
+ * fd, and marks end-of-input.  Backs the SYS_CONS_FEED native syscall
+ * (kern/syscall.c): the userspace driver pre-loads a command script so an
+ * interactive Darwin shell runs a deterministic session over the real
+ * read(2) path.
+ */
+void	darwin_cons_feed(const char *buf, size_t n);
+
+/*
  * Zombie bookkeeping (kern/darwin.c).  Records {pid, ppid, wait4-format
  * status} for a dying Darwin task so the parent's wait4 can reap it; a
  * ppid of 0 (no Darwin parent) records nothing.  Also sweeps the dying

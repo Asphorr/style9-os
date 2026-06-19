@@ -55,6 +55,7 @@
 #define	SYS_TASK_KILL		25	/* (mach_port_name_t task_port) -> 0/err  */
 #define	SYS_SPAWN_RETURNS_TASKPORT 26	/* (const char *name, mach_port_name_t *out) -> task_id */
 #define	SYS_SPAWN_ARGS		27	/* (name, char *const argv[], argc, mach_port_name_t *out) -> task_id */
+#define	SYS_CONS_FEED		28	/* (const char *buf, size_t len) -> bytes fed */
 
 #define	SYS_E_NOSYS	(-1)
 #define	SYS_E_FAULT	(-2)

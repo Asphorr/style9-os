@@ -84,6 +84,7 @@ static long	sys_spawn_returns_taskport(const char *uname,
 		    mach_port_name_t *out_taskport_name);
 static long	sys_spawn_args(const char *uname, char *const *uargv,
 		    uint64_t argc, mach_port_name_t *out_taskport_name);
+static long	sys_cons_feed(const char *ubuf, size_t len);
 
 static bool	user_range_ok(uint64_t addr, size_t len);
 
@@ -243,6 +244,10 @@ syscall_dispatch_body(struct syscall_frame *f)
 		    (char *const *)f->sf_arg1,
 		    (uint64_t)f->sf_arg2,
 		    (mach_port_name_t *)f->sf_arg3));
+	case SYS_CONS_FEED:
+		return (sys_cons_feed(
+		    (const char *)f->sf_arg0,
+		    (size_t)f->sf_arg1));
 	default:
 		return (SYS_E_NOSYS);
 	}
@@ -340,6 +345,36 @@ sys_print(const char *buf, size_t len)
 {
 
 	return (syscall_console_write(buf, len));
+}
+
+/*
+ * sys_cons_feed: copy up to 256 bytes from the user buffer into a kernel
+ * scratch under an SMAP bracket, then hand them to the Darwin console-input
+ * ring (darwin_cons_feed).  The userspace demo driver uses this to pre-load
+ * a command script for an interactive Darwin shell, which then reads it back
+ * through the personality's real read(2)/console path.  Returns bytes fed,
+ * or SYS_E_FAULT if the buffer escapes the user-VA window.
+ */
+static long
+sys_cons_feed(const char *ubuf, size_t len)
+{
+	char	scratch[256];
+	size_t	i;
+
+	if (len > sizeof(scratch))
+		len = sizeof(scratch);
+	if (len == 0)
+		return (0);
+	if (!user_range_ok((uint64_t)(uintptr_t)ubuf, len))
+		return (SYS_E_FAULT);
+
+	smap_user_access_begin();
+	for (i = 0; i < len; i++)
+		scratch[i] = ubuf[i];
+	smap_user_access_end();
+
+	darwin_cons_feed(scratch, len);
+	return ((long)len);
 }
 
 static long

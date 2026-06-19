@@ -75,6 +75,7 @@ typedef long long		int64_t;
 #define	SYS_TASK_KILL		25
 #define	SYS_SPAWN_RETURNS_TASKPORT 26
 #define	SYS_SPAWN_ARGS		27
+#define	SYS_CONS_FEED		28
 
 #define	SYS_E_NOSYS		(-1)
 #define	SYS_E_FAULT		(-2)
@@ -565,6 +566,15 @@ long	spawn_returns_taskport(const char *name, mach_port_name_t *out_taskport);
  */
 long	spawn_args(const char *name, int argc, char *const argv[],
 	    mach_port_name_t *out_taskport);
+
+/*
+ * cons_feed: queue `len` bytes of console input in the kernel for an
+ * interactive Darwin shell to read back through its real read(2) path.
+ * v1 is single-shot: the feed marks end-of-input, so a shell that drains
+ * it sees EOF and exits.  Returns the number of bytes accepted (capped in
+ * the kernel) or a negative SYS_E_*.
+ */
+long	cons_feed(const char *buf, unsigned long len);
 
 /*
  * task_set_exception_port: install (or replace) the calling task's

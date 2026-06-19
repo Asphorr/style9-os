@@ -23,6 +23,7 @@
 #include "syscall.h"
 #include "task.h"
 #include "thread.h"
+#include "tty.h"
 
 /*
  * Darwin (XNU) syscall personality dispatcher -- S2 of the Mach-O ladder.
@@ -56,6 +57,19 @@
 #define	DARWIN_BIN_DIR		"/bin"
 #define	DARWIN_BIN_INO_BASE	0xB1000000u
 
+/*
+ * Darwin console input.  The DARWIN_OF_CONSOLE / implicit-stdin read path
+ * drains this ring; darwin_cons_feed() (driven by the SYS_CONS_FEED native
+ * syscall) fills it.  Deliberately ISOLATED from the kbd/uart Mach input
+ * ports the native shell consumes -- a Darwin binary reading its stdin never
+ * competes with sh.elf for keystrokes, and nothing it leaves behind can leak
+ * into the native surface.  v1 is single-shot: a feed marks end-of-input, so
+ * once the ring drains read(2) returns 0 (EOF), which an interactive shell
+ * treats as ^D and exits on.
+ */
+#define	DARWIN_CONS_BUF		512u
+#define	DARWIN_CONS_MASK	(DARWIN_CONS_BUF - 1u)
+
 static long	darwin_unix(struct syscall_frame *f, uint32_t nr);
 static long	darwin_mach(struct syscall_frame *f, uint32_t trap);
 static long	darwin_mach_msg(struct syscall_frame *f);
@@ -79,6 +93,13 @@ static void	darwin_ofile_clear(struct darwin_ofile *of);
 static int	darwin_dup_install(struct task *t, int oldfd, int newfd);
 static bool	darwin_zombie_reap(uint64_t ppid, uint64_t pid,
 		    int *status_out, uint64_t *pid_out);
+static long	darwin_cons_read(struct syscall_frame *f, void *ubuf,
+		    size_t n);
+
+static char	darwin_cons_buf[DARWIN_CONS_BUF];
+static uint32_t	darwin_cons_head;	/* producer: darwin_cons_feed   */
+static uint32_t	darwin_cons_tail;	/* consumer: darwin_cons_read   */
+static bool	darwin_cons_eof;	/* set once a feed completes    */
 
 /*
  * The clean-room libSystem.B.dylib (user/libsystem.c), embedded as a Mach-O
@@ -400,6 +421,70 @@ darwin_ofile_clear(struct darwin_ofile *of)
 	of->of_size = 0;
 	of->of_off  = 0;
 	of->of_type = DARWIN_OF_FREE;
+}
+
+/*
+ * Append up to `n` bytes of console input to the ring, dropping any that
+ * would overflow (scripted feeds are far smaller than DARWIN_CONS_BUF).
+ * Marks end-of-input: a feed is a whole-input, single-shot delivery, so
+ * the reader returns EOF once it drains what was queued here.  Driven by
+ * the SYS_CONS_FEED native syscall (kern/syscall.c).
+ */
+void
+darwin_cons_feed(const char *buf, size_t n)
+{
+	uint32_t	next;
+	size_t		i;
+
+	for (i = 0; i < n; i++) {
+		next = darwin_cons_head + 1u;
+		if (next - darwin_cons_tail > DARWIN_CONS_BUF)
+			break;
+		darwin_cons_buf[darwin_cons_head & DARWIN_CONS_MASK] = buf[i];
+		darwin_cons_head = next;
+	}
+	darwin_cons_eof = true;
+}
+
+/*
+ * read(2) on a console fd (implicit stdin or an explicit CONSOLE slot):
+ * serve one line of console input.  Drains the feed ring up to `n` bytes,
+ * stopping after a newline -- canonical-mode shape, so an interactive
+ * shell gets one complete line per read -- and echoes each consumed byte
+ * so a scripted session reads like a live terminal.  An empty ring
+ * returns EOF (0) once the feed is exhausted; otherwise it yields until
+ * the producer delivers more.
+ */
+static long
+darwin_cons_read(struct syscall_frame *f, void *ubuf, size_t n)
+{
+	char	line[256];
+	size_t	got;
+	char	c;
+
+	got = 0;
+	if (n > sizeof(line))
+		n = sizeof(line);
+
+	for (;;) {
+		while (got < n && darwin_cons_tail != darwin_cons_head) {
+			c = darwin_cons_buf[darwin_cons_tail & DARWIN_CONS_MASK];
+			darwin_cons_tail++;
+			line[got++] = c;
+			tty_putc(c);
+			if (c == '\n')
+				break;
+		}
+		if (got > 0)
+			break;
+		if (darwin_cons_eof)
+			return (darwin_ok(f, 0));	/* EOF */
+		thread_yield();
+	}
+
+	if (syscall_copyout(ubuf, line, got) != 0)
+		return (darwin_err(f, DARWIN_EFAULT));
+	return (darwin_ok(f, (long)got));
 }
 
 void
@@ -766,11 +851,12 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		of = &t->t_darwin_files[fd];
 		switch (of->of_type) {
 		case DARWIN_OF_FREE:
-			if (fd == 0)	/* legacy stdin: nothing -> EOF */
-				return (darwin_ok(f, 0));
+			if (fd == 0)	/* implicit stdin == console */
+				return (darwin_cons_read(f,
+				    (void *)f->sf_arg1, n));
 			return (darwin_err(f, DARWIN_EBADF));
 		case DARWIN_OF_CONSOLE:
-			return (darwin_ok(f, 0));	/* no console input */
+			return (darwin_cons_read(f, (void *)f->sf_arg1, n));
 		case DARWIN_OF_FILE:
 			avail = of->of_size - of->of_off;
 			if (n > (size_t)avail)

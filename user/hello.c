@@ -2050,6 +2050,31 @@ demo_darwin_spawn(void)
 		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
 			(void)yield();
 		printf("  dash[script] retired after %d yields\n", i);
+
+		printf("  >>> dash -i  -- a REAL Apple shell, INTERACTIVE "
+		    "over a scripted console feed <<<\n");
+		{
+			static const char	feed[] =
+			    "echo interactive dash is alive on style9\n"
+			    "gfactor 42\n"
+			    "echo \"captured: $(echo 600851475143 | gfactor)\"\n"
+			    "exit\n";
+
+			(void)cons_feed(feed, sizeof(feed) - 1);
+		}
+		sh_tp = MACH_PORT_NULL;
+		sh_argv[0] = "dash";
+		sh_argv[1] = "-i";
+		sh_argv[2] = NULL;
+		child_id = spawn_args("dash", 2, sh_argv, &sh_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('dash -i') failed (rv=%ld)\n",
+			    child_id);
+			return (103);
+		}
+		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
+			(void)yield();
+		printf("  dash[interactive] retired after %d yields\n", i);
 	}
 	return (0);
 }

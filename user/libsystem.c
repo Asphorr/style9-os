@@ -1869,12 +1869,22 @@ fscanf(FILE *fp, const char *fmt, ...)
  */
 int	__mb_cur_max = 1;		/* C locale: single-byte encoding */
 
+/*
+ * isatty: classify an open fd via the fs_fstat backchannel.  The kernel
+ * reports a console fd (implicit stdin/out/err, or an explicit CONSOLE
+ * slot) as DARWIN_FDSTAT_CHR; a character device is a tty as far as a CLI
+ * binary cares (interactive prompts, line-buffered output).  Files, pipes,
+ * and bad fds are not ttys -- ENOTTY / EBADF.  An honest answer here is
+ * what flips a no-argument dash into its interactive REPL.
+ */
 int
 isatty(int fd)
 {
+	struct s9_fdstat	ds;
 
-	(void)fd;
-	return (0);			/* not a tty -> no colour, default width */
+	if (bsd_call(0x2A000005, fd, (long)&ds, 0) < 0)
+		return (0);			/* bad fd -> not a tty   */
+	return (ds.fds_kind == 1);		/* DARWIN_FDSTAT_CHR -> tty */
 }
 
 char *
