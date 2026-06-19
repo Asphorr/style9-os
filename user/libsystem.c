@@ -353,12 +353,28 @@ atoi(const char *s)
 	return (neg ? -v : v);
 }
 
+/*
+ * getenv scans the exported environ (defined with _NSGetEnviron below) --
+ * a forward declaration here since the storage lives with its accessor.
+ */
+extern char	**environ;
+
 char *
 getenv(const char *name)
 {
+	size_t	j;
+	size_t	i;
 
-	(void)name;
-	return (NULL);				/* no environment in ring 3 */
+	if (name == NULL || environ == NULL)
+		return (NULL);
+	for (i = 0; environ[i] != NULL; i++) {
+		for (j = 0; name[j] != '\0' &&
+		    environ[i][j] == name[j]; j++)
+			;
+		if (name[j] == '\0' && environ[i][j] == '=')
+			return (&environ[i][j + 1]);
+	}
+	return (NULL);
 }
 
 /* ---- ctype / locale ----------------------------------------------------- */
@@ -515,20 +531,37 @@ wcscat(wchar_t *dst, const wchar_t *src)
 /* ---- stdio -------------------------------------------------------------- */
 
 /*
- * figlet treats FILE as opaque -- it only passes FILE* to the stdio calls --
- * so the layout is entirely ours: just the underlying fd.  The std streams use
- * fds 0/1/2; fopen() gets a real fd from the kernel's read-only filesystem
- * (kern/fs_fat.c, reached via the BSD open/read/lseek/close calls).
+ * FILE is NOT entirely opaque to an Apple binary: Apple's <stdio.h> inlines
+ * getc() as __sgetc() -- `(--fp->_r < 0 ? __srget(fp) : (int)(*fp->_p++))`
+ * -- and feof()/fileno() the same way, so compiled-in macro expansions
+ * dereference Apple's struct __sFILE field OFFSETS directly (gfactor's
+ * stdin reader does exactly this; it imports __srget, the macro's refill
+ * hook).  The head of our FILE therefore mirrors Apple's layout where the
+ * macros look: _r at offset 8 is pinned <= 0 so EVERY inlined getc takes
+ * the __srget path (which re-pins it) and our unbuffered read logic stays
+ * the single point of truth; _w at 12 is pinned 0 (the __sputc inline would
+ * call __swbuf, which nothing here imports -- the preflight would catch a
+ * binary that does); _flags at 16 carries the real __SEOF bit for the
+ * feof() inline; _file at 18 carries the fd for the fileno() inline.  The
+ * buffer pointer _p (offset 0) is never dereferenced while _r/_w are kept
+ * non-positive, so it doubles as our fd + eof storage.  Everything past
+ * Apple's first 20 bytes is ours (the ungetc pushback).
  */
 typedef struct __sFILE {
-	int	fd;
-	int	eof;
+	int	fd;		/* offset 0: Apple's _p, never deref'd  */
+	int	eof;		/* offset 4: high half of _p            */
+	int	rspace;		/* offset 8: Apple's _r -- keep <= 0    */
+	int	wspace;		/* offset 12: Apple's _w -- keep 0      */
+	short	aflags;		/* offset 16: Apple's _flags (__SEOF)   */
+	short	afile;		/* offset 18: Apple's _file (the fd)    */
 	int	unget;		/* one-char ungetc() pushback; EOF == empty */
 } FILE;
 
-static FILE	__stdin_file  = { 0, 0, EOF };
-static FILE	__stdout_file = { 1, 0, EOF };
-static FILE	__stderr_file = { 2, 0, EOF };
+#define	APPLE_SEOF	0x0020		/* Apple's __SEOF flag bit */
+
+static FILE	__stdin_file  = { 0, 0, 0, 0, 0, 0, EOF };
+static FILE	__stdout_file = { 1, 0, 0, 0, 0, 1, EOF };
+static FILE	__stderr_file = { 2, 0, 0, 0, 0, 2, EOF };
 
 /* The stdio.h macros stdin/stdout/stderr expand to these exported pointers. */
 FILE	*__stdinp  = &__stdin_file;
@@ -591,8 +624,10 @@ fread(void *ptr, size_t size, size_t nmemb, FILE *fp)
 
 		r = s_read(fp->fd, p + got, want - got);
 		if (r <= 0) {
-			if (r == 0)
+			if (r == 0) {
 				fp->eof = 1;
+				fp->aflags |= APPLE_SEOF;
+			}
 			break;			/* EOF or error: short read */
 		}
 		got += (size_t)r;
@@ -615,9 +650,13 @@ fopen(const char *path, const char *mode)
 		s_close(fd);
 		return (NULL);
 	}
-	fp->fd  = fd;
-	fp->eof = 0;
-	fp->unget = EOF;
+	fp->fd     = fd;
+	fp->eof    = 0;
+	fp->rspace = 0;
+	fp->wspace = 0;
+	fp->aflags = 0;
+	fp->afile  = (short)fd;
+	fp->unget  = EOF;
 	return (fp);
 }
 
@@ -644,6 +683,7 @@ fseek(FILE *fp, long off, int whence)
 	if (s_lseek(fp->fd, off, whence) < 0)
 		return (-1);
 	fp->eof = 0;
+	fp->aflags &= ~APPLE_SEOF;
 	return (0);
 }
 
@@ -1111,10 +1151,14 @@ sscanf(const char *str, const char *fmt, ...)
  * The classic BSD getopt.  optind/optarg/opterr/optopt are exported globals --
  * figlet binds to optind/optarg and reads them between calls, while getopt (in
  * this library) writes the same storage.  `g_place` is our private scan cursor.
+ * optreset is the BSD re-scan protocol: a shell's getopts builtin sets it (with
+ * optind) to parse a fresh vector, and getopt clears it after dropping the
+ * stale cursor.
  */
 int	 opterr = 1;
 int	 optind = 1;
 int	 optopt = 0;
+int	 optreset = 0;
 char	*optarg = NULL;
 
 static const char	*g_place = "";
@@ -1125,6 +1169,10 @@ getopt(int argc, char *const argv[], const char *optstring)
 	const char	*oli;
 	int		 c;
 
+	if (optreset) {
+		optreset = 0;
+		g_place = "";
+	}
 	if (*g_place == '\0') {
 		if (optind >= argc || argv[optind][0] != '-' ||
 		    argv[optind][1] == '\0')
@@ -1272,6 +1320,82 @@ lstat_inode64(const char *path, void *buf)
 {
 
 	return (stat_inode64(path, buf));
+}
+
+/*
+ * stat64/lstat64/fstat64: the pre-INODE64 symbol names.  Same struct
+ * layout as the $INODE64 variants (both are the 144-byte 64-bit-inode
+ * form), just the older exported spelling -- a binary built against a
+ * lower deployment target (dash) binds these.  fstat64 classifies an OPEN
+ * fd via the fs_fstat backchannel: the kernel says reg/chr/fifo in a
+ * neutral struct and the S_IF* spelling happens here.
+ */
+struct s9_fdstat {			/* mirrors kern/darwin.h */
+	uint32_t	fds_size;
+	uint8_t		fds_kind;	/* 0 reg / 1 chr / 2 fifo */
+};
+
+int
+stat64(const char *path, void *buf)
+{
+
+	return (stat_inode64(path, buf));
+}
+
+int
+lstat64(const char *path, void *buf)
+{
+
+	return (stat_inode64(path, buf));
+}
+
+int
+fstat64(int fd, void *buf)
+{
+	struct s9_fdstat	 ds;
+	unsigned char		*p;
+	int			 i;
+
+	if (bsd_call(0x2A000005, fd, (long)&ds, 0) < 0)
+		return (-1);
+
+	p = (unsigned char *)buf;
+	for (i = 0; i < 144; i++)
+		p[i] = 0;
+	switch (ds.fds_kind) {
+	case 1:					/* console */
+		*(uint16_t *)(p + 4) = 0x2190u;	/* S_IFCHR | 0620 */
+		break;
+	case 2:					/* pipe end */
+		*(uint16_t *)(p + 4) = 0x1180u;	/* S_IFIFO | 0600 */
+		break;
+	default:				/* buffered regular file */
+		*(uint16_t *)(p + 4) = 0x81A4u;	/* S_IFREG | 0644 */
+		*(int64_t  *)(p + 96) = (int64_t)(uint64_t)ds.fds_size;
+		break;
+	}
+	*(uint16_t *)(p + 6)   = 1;			/* st_nlink   */
+	*(uint32_t *)(p + 112) = 512;			/* st_blksize */
+	return (0);
+}
+
+/*
+ * faccessat: existence (and on this FS, any-permission) probe.  dash tests
+ * X_OK on PATH candidates; present == executable on a volume where
+ * everything readable is runnable-or-openable.  Only AT_FDCWD-relative
+ * absolute paths exist here, so dirfd is moot.
+ */
+int
+faccessat(int dirfd, const char *path, int mode, int flags)
+{
+	struct fs_fat_statbuf	sb;
+
+	(void)dirfd;
+	(void)mode;
+	(void)flags;
+	if (s9_fs_stat(path, &sb) < 0)
+		return (-1);			/* absent */
+	return (0);
 }
 
 /* ---- directory streams (opendir / readdir / closedir) ------------------- */
@@ -1634,8 +1758,10 @@ fgets(char *s, int size, FILE *fp)
 
 		r = s_read(fp->fd, &c, 1);
 		if (r <= 0) {
-			if (r == 0)
+			if (r == 0) {
 				fp->eof = 1;
+				fp->aflags |= APPLE_SEOF;
+			}
 			break;
 		}
 		s[i++] = (char)c;
@@ -1669,6 +1795,7 @@ fgetc(FILE *fp)
 	}
 	if (s_read(fp->fd, &ch, 1) != 1) {
 		fp->eof = 1;
+		fp->aflags |= APPLE_SEOF;	/* the feof() inline reads this */
 		return (EOF);
 	}
 	return ((int)ch);
@@ -1681,11 +1808,19 @@ getc(FILE *fp)
 	return (fgetc(fp));
 }
 
-/* __srget: the getc() macro's refill primitive -- unbuffered, so just fgetc. */
+/*
+ * __srget: the refill hook of Apple's inlined getc() macro, which has just
+ * decremented _r below zero to get here.  Re-pin _r at 0 FIRST -- that is
+ * what keeps the next inlined getc funneling back into this function
+ * instead of dereferencing the fake buffer pointer -- then read.
+ */
 int
 __srget(FILE *fp)
 {
 
+	if (fp == NULL)
+		return (EOF);
+	fp->rspace = 0;
 	return (fgetc(fp));
 }
 
@@ -1697,6 +1832,7 @@ ungetc(int c, FILE *fp)
 		return (EOF);
 	fp->unget = (int)(unsigned char)c;
 	fp->eof = 0;
+	fp->aflags &= ~APPLE_SEOF;
 	return (c);
 }
 
@@ -2130,10 +2266,15 @@ lseek(int fd, long off, int whence)
 }
 
 /*
- * Public read(2)/close(2): until the process rung, every consumer went
- * through stdio and only the s_* internals existed.  pipefork reads its
- * pipe end raw, and shell-shaped tools close fds they dup2'd away.
+ * Public read(2)/close(2)/open(2): until the process rung, every consumer
+ * went through stdio and only the s_* internals existed.  pipefork reads
+ * its pipe end raw, shell-shaped tools close fds they dup2'd away, and a
+ * shell open(2)s its script file directly -- through the errno-recording
+ * trap wrapper (defined with the process-control section below) so its
+ * "cannot open x" diagnostics name the real reason.
  */
+static long	bsd_call_e(long nr, long a, long b, long c);
+
 long
 read(int fd, void *buf, unsigned long n)
 {
@@ -2148,14 +2289,37 @@ close(int fd)
 	return (s_close(fd));
 }
 
-/* No mutable fd flags on the read-only FS: pretend every request succeeds. */
+int
+open(const char *path, int flags, ...)
+{
+
+	return ((int)bsd_call_e(0x2000005, (long)path, flags, 0));
+}
+
+/*
+ * fcntl: F_DUPFD (cmd 0) has real semantics -- a shell parks its saved std
+ * fds at 10+ with it around redirections -- so it travels to the kernel
+ * (Darwin #92), which duplicates the slot at the lowest free fd >= arg.
+ * The flag commands stay accepted-and-ignored: there is nothing to set on
+ * this fd table.
+ */
 int
 fcntl(int fd, int cmd, ...)
 {
+	__builtin_va_list	ap;
+	long			arg;
 
-	(void)fd;
-	(void)cmd;
-	return (0);
+	__builtin_va_start(ap, cmd);
+	arg = __builtin_va_arg(ap, long);
+	__builtin_va_end(ap);
+	/*
+	 * Every command travels to the kernel -- it knows which ones carry
+	 * semantics (F_DUPFD and its CLOEXEC twin) and answers the flag
+	 * commands itself.  Swallowing a command here would hand the caller
+	 * a fake 0, and 0 is a valid fd: dash once "moved" its script to
+	 * stdin that way.
+	 */
+	return ((int)bsd_call_e(0x200005C, fd, cmd, arg));
 }
 
 /* Our stdio is unbuffered -- writes hit the kernel immediately. */
@@ -2207,6 +2371,7 @@ fseeko(FILE *fp, int64_t off, int whence)
 	if (s_lseek(fp->fd, (long)off, whence) < 0)
 		return (-1);			/* e.g. a non-seekable std stream */
 	fp->eof = 0;
+	fp->aflags &= ~APPLE_SEOF;
 	return (0);
 }
 
@@ -2614,19 +2779,27 @@ alarm(unsigned int secs)
 /* ---- the genv / gtimeout gap ---------------------------------------------- */
 
 /*
- * _NSGetEnviron: Apple's accessor for the environ location (crt vends no
- * direct `environ` data symbol in a dylib world).  Ring 3 has no
- * environment; hand back a stable pointer to an empty, NULL-terminated
- * vector so callers can iterate it and find nothing.
+ * The process environment.  The kernel passes no envp, so this library IS
+ * the environment's source of truth: a single PATH entry pointing at the
+ * synthetic /bin (the program registry presented as a directory by
+ * kern/darwin.c), which is where every runnable thing on this system
+ * lives.  A shell imports it and its PATH search then stats and execs
+ * straight out of /bin; env(1) prints it.
+ *
+ * Both Apple access routes land on the same storage: older binaries bind
+ * the `environ` data symbol directly, newer ones call _NSGetEnviron()
+ * (crt does not vend `environ` from a dylib, but our dyld binds data
+ * symbols fine, so we can simply export it).
  */
-static char	*environ_empty[1];
-static char	**environ_ptr = environ_empty;
+static char	*environ_default[] = { (char *)"PATH=/bin", 0 };
+
+char	**environ = environ_default;
 
 char ***
 _NSGetEnviron(void)
 {
 
-	return (&environ_ptr);
+	return (&environ);
 }
 
 /* No working directory to change on the read-only single-root FS. */
@@ -2801,4 +2974,506 @@ strtod_l(const char *s, char **endp, void *loc)
 
 	(void)loc;
 	return (strtod(s, endp));
+}
+
+/* ---- the shell rung (dash) ----------------------------------------------- */
+
+/*
+ * Everything below exists because a real POSIX shell (Homebrew dash) binds
+ * it.  A shell is the most demanding libc consumer yet: it longjmps out of
+ * errors, saves fds around redirections, walks PATH with stat, asks who it
+ * is, and parses with the wide-char and string family.  The answers stay
+ * true to this system: single user (root), one process group, no ttys on
+ * the serial console, a read-only volume.
+ */
+
+/*
+ * setjmp/longjmp -- the real thing, in asm; dash's error handling (exraise)
+ * longjmps across arbitrary call depth, so no stub survives contact.  Both
+ * jumpers are OUR code (this library is the only setjmp provider in the
+ * closure), so the jmp_buf layout is private: the six callee-saved
+ * registers + rsp + rip = 64 bytes, comfortably inside Apple's 148-byte
+ * jmp_buf.  C `setjmp` does not save the signal mask on Darwin (`sigsetjmp`
+ * does); our masks are no-ops anyway, so the register file is the entire
+ * context.  longjmp(env, 0) must deliver 1, per POSIX.
+ */
+__asm__(
+	".text\n"
+	".globl _setjmp\n"
+	"_setjmp:\n"
+	"\tmovq %rbx,  0(%rdi)\n"
+	"\tmovq %rbp,  8(%rdi)\n"
+	"\tmovq %r12, 16(%rdi)\n"
+	"\tmovq %r13, 24(%rdi)\n"
+	"\tmovq %r14, 32(%rdi)\n"
+	"\tmovq %r15, 40(%rdi)\n"
+	"\tleaq 8(%rsp), %rax\n"
+	"\tmovq %rax, 48(%rdi)\n"
+	"\tmovq (%rsp), %rax\n"
+	"\tmovq %rax, 56(%rdi)\n"
+	"\txorl %eax, %eax\n"
+	"\tret\n"
+	".globl _longjmp\n"
+	"_longjmp:\n"
+	"\tmovq  0(%rdi), %rbx\n"
+	"\tmovq  8(%rdi), %rbp\n"
+	"\tmovq 16(%rdi), %r12\n"
+	"\tmovq 24(%rdi), %r13\n"
+	"\tmovq 32(%rdi), %r14\n"
+	"\tmovq 40(%rdi), %r15\n"
+	"\tmovq 48(%rdi), %rsp\n"
+	"\tmovl %esi, %eax\n"
+	"\ttestl %eax, %eax\n"
+	"\tjnz 1f\n"
+	"\tmovl $1, %eax\n"
+	"1:\tjmpq *56(%rdi)\n"
+);
+
+/*
+ * Identity: one user, root, one group, one process group (its leader being
+ * whoever asks).  dash compares uid==euid to decide privileged mode --
+ * equal answers keep it in normal mode.
+ */
+int
+getuid(void)
+{
+
+	return (0);
+}
+
+int
+geteuid(void)
+{
+
+	return (0);
+}
+
+int
+getgid(void)
+{
+
+	return (0);
+}
+
+int
+getegid(void)
+{
+
+	return (0);
+}
+
+int
+getpgrp(void)
+{
+
+	return (getpid());
+}
+
+/* No passwd database: tilde expansion of ~user finds nobody. */
+void *
+getpwnam(const char *name)
+{
+
+	(void)name;
+	return (NULL);
+}
+
+/* The single root directory is every process's working directory. */
+char *
+getcwd(char *buf, size_t size)
+{
+
+	if (buf == NULL) {
+		buf = (char *)malloc(2);
+		if (buf == NULL)
+			return (NULL);
+	} else if (size < 2) {
+		g_errno = 34;			/* ERANGE */
+		return (NULL);
+	}
+	buf[0] = '/';
+	buf[1] = '\0';
+	return (buf);
+}
+
+/* umask on a read-only volume: the historical default, never consulted. */
+int
+umask(int mask)
+{
+
+	(void)mask;
+	return (022);
+}
+
+/* Nothing to delete and nowhere to create a temp file: read-only volume. */
+int
+unlink(const char *path)
+{
+
+	(void)path;
+	g_errno = 30;				/* EROFS */
+	return (-1);
+}
+
+int
+mkstemp(char *tmpl)
+{
+
+	(void)tmpl;
+	g_errno = 30;				/* EROFS */
+	return (-1);
+}
+
+/*
+ * Resource limits: everything unlimited (Darwin RLIM_INFINITY).  dash's
+ * ulimit builtin reads these; struct rlimit is two 64-bit counts.
+ */
+int
+getrlimit(int which, void *rlp)
+{
+	unsigned long long	*r;
+
+	(void)which;
+	r = (unsigned long long *)rlp;
+	r[0] = 0x7FFFFFFFFFFFFFFFULL;		/* rlim_cur */
+	r[1] = 0x7FFFFFFFFFFFFFFFULL;		/* rlim_max */
+	return (0);
+}
+
+/*
+ * sysconf: dash asks for the clock tick to scale its times builtin.
+ * struct tms below answers in those (fictional) ticks.
+ */
+long
+sysconf(int name)
+{
+
+	switch (name) {
+	case 3:					/* _SC_CLK_TCK */
+		return (100);
+	case 5:					/* _SC_OPEN_MAX */
+		return (32);
+	case 29:				/* _SC_PAGESIZE */
+		return (4096);
+	default:
+		return (-1);
+	}
+}
+
+/* No CPU accounting yet: every process has consumed zero ticks. */
+long
+times(void *buf)
+{
+	unsigned long	*t;
+	int		 i;
+
+	t = (unsigned long *)buf;
+	for (i = 0; i < 4; i++)
+		t[i] = 0;
+	return (0);
+}
+
+/*
+ * killpg: with one process group per session, the group IS the process --
+ * forward to kill(2).  Only dash's interactive job control sends group
+ * signals, so this is bind-resolution insurance more than a hot path.
+ */
+int
+killpg(int pgrp, int sig)
+{
+
+	return (kill(pgrp, sig));
+}
+
+/* The pre-sigprocmask mask call: masks are no-ops here (see sigprocmask). */
+int
+sigsetmask(int mask)
+{
+
+	(void)mask;
+	return (0);
+}
+
+/* wait3 is wait4 with "any child" implied. */
+int
+wait3(int *status, int options, void *rusage)
+{
+
+	return (wait4(-1, status, options, rusage));
+}
+
+/*
+ * Terminal control: the serial console is not a tty (isatty already says
+ * 0), so the termios family reports ENOTTY consistently.  dash only walks
+ * this path when deciding whether to start job control; a uniform "no
+ * terminal" keeps it non-interactive.
+ */
+int
+tcgetattr(int fd, void *termios_p)
+{
+
+	(void)fd;
+	(void)termios_p;
+	g_errno = 25;				/* ENOTTY */
+	return (-1);
+}
+
+int
+tcgetpgrp(int fd)
+{
+
+	(void)fd;
+	g_errno = 25;				/* ENOTTY */
+	return (-1);
+}
+
+int
+tcsetpgrp(int fd, int pgrp)
+{
+
+	(void)fd;
+	(void)pgrp;
+	g_errno = 25;				/* ENOTTY */
+	return (-1);
+}
+
+/*
+ * fdopen (Apple exports it as fdopen$DARWIN_EXTSN under unix2003
+ * versioning): wrap an existing fd in a fresh FILE.  Our FILE is just
+ * {fd, eof, unget}, so the mode string only needs to exist.
+ */
+FILE	*fdopen_extsn(int fd, const char *mode) __asm__("_fdopen$DARWIN_EXTSN");
+
+FILE *
+fdopen_extsn(int fd, const char *mode)
+{
+	FILE	*fp;
+
+	(void)mode;
+	if (fd < 0)
+		return (NULL);
+	fp = (FILE *)malloc(sizeof(*fp));
+	if (fp == NULL)
+		return (NULL);
+	fp->fd     = fd;
+	fp->eof    = 0;
+	fp->rspace = 0;
+	fp->wspace = 0;
+	fp->aflags = 0;
+	fp->afile  = (short)fd;
+	fp->unget  = EOF;
+	return (fp);
+}
+
+/* ---- string/scan helpers a shell leans on -------------------------------- */
+
+void *
+bsearch(const void *key, const void *base, size_t nmemb, size_t size,
+    int (*compar)(const void *, const void *))
+{
+	const unsigned char	*b;
+	size_t			 lo;
+	size_t			 hi;
+	size_t			 mid;
+	int			 c;
+
+	b  = (const unsigned char *)base;
+	lo = 0;
+	hi = nmemb;
+	while (lo < hi) {
+		mid = lo + (hi - lo) / 2;
+		c = compar(key, b + mid * size);
+		if (c == 0)
+			return ((void *)(b + mid * size));
+		if (c < 0)
+			hi = mid;
+		else
+			lo = mid + 1;
+	}
+	return (NULL);
+}
+
+char *
+stpcpy(char *dst, const char *src)
+{
+
+	while ((*dst = *src) != '\0') {
+		dst++;
+		src++;
+	}
+	return (dst);
+}
+
+char *
+stpncpy(char *dst, const char *src, size_t n)
+{
+	size_t	end;
+	size_t	i;
+
+	for (i = 0; i < n && src[i] != '\0'; i++)
+		dst[i] = src[i];
+	end = i;			/* dst+end: the NUL, or dst+n  */
+	for (; i < n; i++)
+		dst[i] = '\0';
+	return (dst + end);
+}
+
+char *
+strdup(const char *s)
+{
+	char	*d;
+	size_t	 n;
+
+	n = strlen(s) + 1;
+	d = (char *)malloc(n);
+	if (d == NULL)
+		return (NULL);
+	memcpy(d, s, n);
+	return (d);
+}
+
+/* intmax_t == long on LP64: the strto*max family is strtol/strtoul. */
+long long
+strtoimax(const char *s, char **end, int base)
+{
+
+	return (strtol(s, end, base));
+}
+
+unsigned long long
+strtoumax(const char *s, char **end, int base)
+{
+
+	return (strtoul(s, end, base));
+}
+
+/*
+ * strerror/strsignal: name the errnos this system can actually produce
+ * (kern/darwin.h's set); anything else formats numerically into a static
+ * buffer, which is all the POSIX lifetime contract requires.
+ */
+static char	strerror_buf[32];
+
+static void
+strerror_fmt(const char *prefix, int n)
+{
+	size_t	i;
+	int	 d;
+
+	for (i = 0; prefix[i] != '\0'; i++)
+		strerror_buf[i] = prefix[i];
+	if (n < 0) {
+		strerror_buf[i++] = '-';
+		n = -n;
+	}
+	d = (n >= 100) ? 100 : (n >= 10) ? 10 : 1;
+	for (; d > 0; d /= 10)
+		strerror_buf[i++] = (char)('0' + (n / d) % 10);
+	strerror_buf[i] = '\0';
+}
+
+char *
+strerror(int errnum)
+{
+
+	switch (errnum) {
+	case 1:	 return ((char *)"Operation not permitted");
+	case 2:	 return ((char *)"No such file or directory");
+	case 3:	 return ((char *)"No such process");
+	case 4:	 return ((char *)"Interrupted system call");
+	case 5:	 return ((char *)"Input/output error");
+	case 8:	 return ((char *)"Exec format error");
+	case 9:	 return ((char *)"Bad file descriptor");
+	case 10: return ((char *)"No child processes");
+	case 12: return ((char *)"Cannot allocate memory");
+	case 13: return ((char *)"Permission denied");
+	case 14: return ((char *)"Bad address");
+	case 22: return ((char *)"Invalid argument");
+	case 24: return ((char *)"Too many open files");
+	case 25: return ((char *)"Inappropriate ioctl for device");
+	case 29: return ((char *)"Illegal seek");
+	case 30: return ((char *)"Read-only file system");
+	case 32: return ((char *)"Broken pipe");
+	case 34: return ((char *)"Result too large");
+	case 78: return ((char *)"Function not implemented");
+	default:
+		strerror_fmt("Unknown error: ", errnum);
+		return (strerror_buf);
+	}
+}
+
+char *
+strsignal(int sig)
+{
+
+	switch (sig) {
+	case 1:	 return ((char *)"Hangup");
+	case 2:	 return ((char *)"Interrupt");
+	case 3:	 return ((char *)"Quit");
+	case 6:	 return ((char *)"Abort trap");
+	case 9:	 return ((char *)"Killed");
+	case 13: return ((char *)"Broken pipe");
+	case 15: return ((char *)"Terminated");
+	default:
+		strerror_fmt("Signal ", sig);
+		return (strerror_buf);
+	}
+}
+
+/*
+ * Wide/multibyte: the C locale is single-byte (__mb_cur_max == 1), so
+ * every conversion is a 1:1 byte<->wchar walk and no shift state exists.
+ */
+size_t
+mbrlen(const char *s, size_t n, void *ps)
+{
+
+	(void)ps;
+	if (s == NULL)
+		return (0);
+	if (n == 0)
+		return ((size_t)-2);		/* incomplete (no bytes) */
+	return (*s == '\0' ? 0 : 1);
+}
+
+size_t
+mbsrtowcs(wchar_t *dst, const char **src, size_t len, void *ps)
+{
+	const char	*s;
+	size_t		 i;
+
+	(void)ps;
+	s = *src;
+	if (dst == NULL)
+		return (strlen(s));
+	for (i = 0; i < len; i++) {
+		dst[i] = (wchar_t)(unsigned char)s[i];
+		if (s[i] == '\0') {
+			*src = NULL;
+			return (i);
+		}
+	}
+	*src = s + len;
+	return (len);
+}
+
+wchar_t *
+wcschr(const wchar_t *ws, wchar_t wc)
+{
+
+	for (;; ws++) {
+		if (*ws == wc)
+			return ((wchar_t *)ws);
+		if (*ws == 0)
+			return (NULL);
+	}
+}
+
+/* No named character classes: 0 is wctype(3)'s documented "no such class". */
+unsigned long
+wctype(const char *property)
+{
+
+	(void)property;
+	return (0);
 }

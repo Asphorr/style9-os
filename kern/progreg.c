@@ -186,6 +186,21 @@ extern uint8_t	_binary_gtimeout_macho_start[];
 extern uint8_t	_binary_gtimeout_macho_end[];
 
 /*
+ * The shell rung.  dash is the SEVENTH real Apple binary -- a genuine
+ * POSIX shell (Homebrew dash 0.5.13.4) that parses scripts, forks
+ * pipelines, and reaps children entirely through the Darwin personality.
+ * demo.sh is not a program at all: a plain-text shell script registered
+ * here so the synthetic /bin (kern/darwin.c) can stat and open it for
+ * dash to interpret -- execve refuses it by magic, exactly like a real
+ * kernel refuses a script without a working #! interpreter.
+ */
+extern uint8_t	_binary_dash_macho_start[];
+extern uint8_t	_binary_dash_macho_end[];
+
+extern uint8_t	_binary_demo_sh_macho_start[];
+extern uint8_t	_binary_demo_sh_macho_end[];
+
+/*
  * Bridge into the arch-specific user-thread spawn path.  Lives in
  * arch/amd64/usermode.c; declared here so progreg_spawn doesn't have
  * to pull in machine headers.  Returns the new task's t_id or a
@@ -297,6 +312,10 @@ progreg_init(void)
 	    _binary_genv_macho_start, _binary_genv_macho_end);
 	register_one("gtimeout",
 	    _binary_gtimeout_macho_start, _binary_gtimeout_macho_end);
+	register_one("dash",
+	    _binary_dash_macho_start, _binary_dash_macho_end);
+	register_one("demo.sh",
+	    _binary_demo_sh_macho_start, _binary_demo_sh_macho_end);
 
 	kprintf("progreg: %zu programs registered\n", nentries);
 }
@@ -333,6 +352,15 @@ progreg_snapshot(struct progreg_entry *out, size_t max)
 	for (i = 0; i < n; i++)
 		out[i] = entries[i];
 	return (n);
+}
+
+const struct progreg_entry *
+progreg_at(size_t idx)
+{
+
+	if (idx >= nentries)
+		return (NULL);
+	return (&entries[idx]);
 }
 
 long

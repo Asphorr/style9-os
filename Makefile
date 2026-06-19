@@ -151,8 +151,11 @@ OBJS	= \
 	$(OBJDIR)/genv_macho.o \
 	$(OBJDIR)/gtimeout_macho.o \
 	$(OBJDIR)/pipefork_macho.o \
+	$(OBJDIR)/dash_macho.o \
+	$(OBJDIR)/demo_sh_macho.o \
 	$(OBJDIR)/libSystem_dylib.o \
 	$(OBJDIR)/libgmp_dylib.o \
+	$(OBJDIR)/libedit_dylib.o \
 	$(OBJDIR)/ksym.o
 
 all: kernel.elf
@@ -429,6 +432,35 @@ $(OBJDIR)/genv.macho: extern/genv.macho | $(OBJDIR)
 $(OBJDIR)/gtimeout.macho: extern/gtimeout.macho | $(OBJDIR)
 	cp $< $@
 
+# dash: the SEVENTH real Apple x86-64 macOS CLI binary, and the first SHELL
+# (Homebrew dash-shell 0.5.13.4, vendored in extern/dash.macho).  It binds
+# libSystem AND libedit -- the latter answered by our clean-room stub dylib
+# below -- and drives the whole process substrate at once: PATH search via
+# stat64 against the synthetic /bin, fork/execve/wait3 for commands, pipe +
+# dup2 for pipelines, fcntl(F_DUPFD) for saved fds, setjmp/longjmp for its
+# error unwinding.  Embedded like figlet.
+$(OBJDIR)/dash.macho: extern/dash.macho | $(OBJDIR)
+	cp $< $@
+
+# demo.sh: not a binary -- a plain-text shell script carried in progreg so
+# the synthetic /bin can serve it to dash (open/stat work on it; execve
+# refuses it by magic).  The .macho name is only to ride the generic embed
+# rule; nothing ever parses it as Mach-O.
+$(OBJDIR)/demo_sh.macho: $(USER_DIR)/demo.sh | $(OBJDIR)
+	cp $< $@
+
+# clean-room libedit.3.dylib -- dash's interactive line-editor dependency,
+# stubbed (el_init returns NULL -> dash falls back to raw reads; it only
+# consults libedit when stdin is a tty anyway).  Zero imports, so the dyld
+# closure terminates at it; registered under /usr/lib/libedit.3.dylib in
+# kern/darwin.c exactly like libSystem.
+$(OBJDIR)/libedit.dwn.o: $(USER_DIR)/libedit_stub.c | $(OBJDIR)
+	$(DARWIN_CC) $(DARWIN_CFLAGS) -c $< -o $@
+
+$(OBJDIR)/libedit.3.dylib: $(OBJDIR)/libedit.dwn.o
+	$(DARWIN_LD) -dylib $(DARWIN_LDF) -o $@ $< \
+	    -install_name /usr/lib/libedit.3.dylib
+
 # libSystem is embedded so the dyld backchannel (kern/darwin.c) can map it by
 # path -- it is a dependency to bind against, not a program to run, so it gets
 # its own wrap rule (a .dylib, not a .macho).  objcopy derives the symbols
@@ -444,6 +476,13 @@ $(OBJDIR)/libgmp_dylib.o: $(OBJDIR)/libgmp.10.dylib
 	cd $(OBJDIR) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386	\
 	    --rename-section .data=.rodata.libgmp_dylib			\
 	    libgmp.10.dylib libgmp_dylib.o
+
+# libedit embedded the same way: objcopy derives the kernel symbols
+# _binary_libedit_3_dylib_{start,end} from the file name "libedit.3.dylib".
+$(OBJDIR)/libedit_dylib.o: $(OBJDIR)/libedit.3.dylib
+	cd $(OBJDIR) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386	\
+	    --rename-section .data=.rodata.libedit_dylib		\
+	    libedit.3.dylib libedit_dylib.o
 
 # Wrap a .macho into a kernel-linkable object exposing
 # _binary_<name>_macho_start / _end.  Mirror of the %_elf.o rule.

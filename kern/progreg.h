@@ -62,6 +62,13 @@ const struct progreg_entry *progreg_find(const char *name);
 size_t	progreg_snapshot(struct progreg_entry *out, size_t max);
 
 /*
+ * Index the registry directly: entry `idx` in registration order, or
+ * NULL past the end.  Powers the Darwin personality's synthetic /bin
+ * (kern/darwin.c), which enumerates the registry as a directory.
+ */
+const struct progreg_entry *progreg_at(size_t idx);
+
+/*
  * Spawn the named program: build a fresh task, load its ELF image into
  * the new pmap + vm_map, attach a ring-3 thread that iretq's to the
  * entry point.  Returns the new task_id on success, or a negative

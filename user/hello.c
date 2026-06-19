@@ -1991,6 +1991,66 @@ demo_darwin_spawn(void)
 			(void)yield();
 		printf("  gtimeout retired after %d yields\n", i);
 	}
+
+	/*
+	 * The shell rung: dash, a REAL Apple POSIX shell, orchestrating
+	 * real Apple binaries.  Three escalating scenes: a builtin (pure
+	 * parser/evaluator), a pipeline (dash forks both sides, a kernel
+	 * pipe carries a builtin's output into gfactor's stdin), and a
+	 * script file (dash stat64s PATH candidates against the synthetic
+	 * /bin, open(2)s the script, saves the fd with fcntl(F_DUPFD),
+	 * and runs a command substitution).
+	 */
+	{
+		mach_port_name_t	 sh_tp;
+		char			*sh_argv[4];
+
+		printf("  >>> dash -c 'echo ...' -- a REAL Apple shell, "
+		    "builtin only <<<\n");
+		sh_tp = MACH_PORT_NULL;
+		sh_argv[0] = "dash";
+		sh_argv[1] = "-c";
+		sh_argv[2] = "echo hello from a real shell on style9";
+		sh_argv[3] = NULL;
+		child_id = spawn_args("dash", 3, sh_argv, &sh_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('dash') failed (rv=%ld)\n",
+			    child_id);
+			return (100);
+		}
+		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
+			(void)yield();
+		printf("  dash[builtin] retired after %d yields\n", i);
+
+		printf("  >>> dash -c 'echo 600851475143 | gfactor' -- a "
+		    "shell pipeline <<<\n");
+		sh_tp = MACH_PORT_NULL;
+		sh_argv[2] = "echo 600851475143 | gfactor";
+		child_id = spawn_args("dash", 3, sh_argv, &sh_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('dash|') failed (rv=%ld)\n",
+			    child_id);
+			return (101);
+		}
+		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
+			(void)yield();
+		printf("  dash[pipeline] retired after %d yields\n", i);
+
+		printf("  >>> dash /bin/demo.sh -- a shell SCRIPT from the "
+		    "synthetic /bin <<<\n");
+		sh_tp = MACH_PORT_NULL;
+		sh_argv[1] = "/bin/demo.sh";
+		sh_argv[2] = NULL;
+		child_id = spawn_args("dash", 2, sh_argv, &sh_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('dash script') failed "
+			    "(rv=%ld)\n", child_id);
+			return (102);
+		}
+		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
+			(void)yield();
+		printf("  dash[script] retired after %d yields\n", i);
+	}
 	return (0);
 }
 

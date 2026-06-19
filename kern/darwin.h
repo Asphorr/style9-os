@@ -8,6 +8,8 @@
 #ifndef _SYS_DARWIN_H_
 #define	_SYS_DARWIN_H_
 
+#include <stdint.h>
+
 /*
  * Darwin (XNU) syscall personality -- the second rung of the Mach-O
  * compatibility ladder (S2).  S1 taught the kernel to map the Mach-O
@@ -73,10 +75,26 @@
 #define	DARWIN_SYS_execve	59
 #define	DARWIN_SYS_setitimer	83
 #define	DARWIN_SYS_dup2		90
+#define	DARWIN_SYS_fcntl	92
 #define	DARWIN_SYS_lseek	199
 
 /* wait4 option bits (Darwin <sys/wait.h>). */
 #define	DARWIN_WNOHANG	1
+
+/*
+ * fcntl(2) commands (Darwin <sys/fcntl.h>).  F_DUPFD is the one with real
+ * semantics here (a shell parks its saved fds at 10+ with it); the fd-flag
+ * and status-flag commands are accepted and answer 0 -- there is nothing
+ * to set on this fd table (no close-on-exec: exec already preserves fds
+ * deliberately, and a shell's FD_CLOEXEC requests are about hygiene it
+ * re-establishes anyway).
+ */
+#define	DARWIN_F_DUPFD		0
+#define	DARWIN_F_GETFD		1
+#define	DARWIN_F_SETFD		2
+#define	DARWIN_F_GETFL		3
+#define	DARWIN_F_SETFL		4
+#define	DARWIN_F_DUPFD_CLOEXEC	67	/* dash's savefd uses this one */
 
 /*
  * Mach traps (class 1) we answer -- positive indices into xnu's
@@ -114,6 +132,24 @@
 #define	DARWIN_S9_fs_stat		2
 #define	DARWIN_S9_fs_readdir		3
 #define	DARWIN_S9_uname			4
+#define	DARWIN_S9_fs_fstat		5
+
+/*
+ * fs_fstat(int fd, struct darwin_fdstat *out): the fd-flavored sibling of
+ * fs_stat, behind libSystem's fstat64.  The kernel classifies what the fd
+ * actually holds (regular buffered file / console / pipe end) into this
+ * neutral struct and libSystem reshapes it into Apple's struct stat --
+ * same division of ABI knowledge as fs_stat.  Returns 0 (carry clear) or
+ * carry set with EBADF/EFAULT.
+ */
+#define	DARWIN_FDSTAT_REG	0
+#define	DARWIN_FDSTAT_CHR	1
+#define	DARWIN_FDSTAT_FIFO	2
+
+struct darwin_fdstat {
+	uint32_t	fds_size;	/* byte length (regular files)   */
+	uint8_t		fds_kind;	/* DARWIN_FDSTAT_*               */
+};
 
 /*
  * uname(struct darwin_uname *out): report the machine's identity card.  A
@@ -162,6 +198,7 @@ struct darwin_uname {
 #define	DARWIN_EINVAL	22
 #define	DARWIN_EMFILE	24
 #define	DARWIN_ESPIPE	29
+#define	DARWIN_EROFS	30
 #define	DARWIN_EPIPE	32
 #define	DARWIN_ENOSYS	78
 

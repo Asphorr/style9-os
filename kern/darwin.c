@@ -48,6 +48,14 @@
 
 #define	RFLAGS_CF	(1u << 0)
 
+/*
+ * The synthetic /bin: where darwin_bin_lookup (below) presents the program
+ * registry as a directory.  Inode numbers are synthesized well clear of
+ * the FAT volume's cluster-derived ones.
+ */
+#define	DARWIN_BIN_DIR		"/bin"
+#define	DARWIN_BIN_INO_BASE	0xB1000000u
+
 static long	darwin_unix(struct syscall_frame *f, uint32_t nr);
 static long	darwin_mach(struct syscall_frame *f, uint32_t trap);
 static long	darwin_mach_msg(struct syscall_frame *f);
@@ -57,7 +65,9 @@ static long	darwin_s9_map_image(struct syscall_frame *f);
 static long	darwin_s9_fs_stat(struct syscall_frame *f);
 static long	darwin_s9_fs_readdir(struct syscall_frame *f);
 static long	darwin_s9_uname(struct syscall_frame *f);
+static long	darwin_s9_fs_fstat(struct syscall_frame *f);
 static bool	darwin_streq(const char *a, const char *b);
+static const struct progreg_entry *darwin_bin_lookup(const char *path);
 
 static struct darwin_pipe *darwin_pipe_create(void);
 static void	darwin_pipe_drop(struct darwin_pipe *p, bool writer);
@@ -93,6 +103,17 @@ extern uint8_t	_binary_libSystem_B_dylib_end[];
 extern uint8_t	_binary_libgmp_10_dylib_start[];
 extern uint8_t	_binary_libgmp_10_dylib_end[];
 
+/*
+ * libedit (clean-room stub, user/libedit_stub.c).  dash names Apple's
+ * /usr/lib/libedit.3.dylib for its interactive line editor and only ever
+ * calls into it when stdin is a tty; this stub answers the bind with
+ * el_init returning NULL, which dash's own guards treat as "no editor".
+ * Like libSystem it is OUR code -- the third dylib in the registry and the
+ * second clean-room one.
+ */
+extern uint8_t	_binary_libedit_3_dylib_start[];
+extern uint8_t	_binary_libedit_3_dylib_end[];
+
 #define	DARWIN_DYLIB_PATH_MAX	256
 
 struct darwin_dylib {
@@ -106,6 +127,8 @@ static const struct darwin_dylib	darwin_dylibs[] = {
 	    _binary_libSystem_B_dylib_start, _binary_libSystem_B_dylib_end },
 	{ "@@HOMEBREW_PREFIX@@/opt/gmp/lib/libgmp.10.dylib",
 	    _binary_libgmp_10_dylib_start, _binary_libgmp_10_dylib_end },
+	{ "/usr/lib/libedit.3.dylib",
+	    _binary_libedit_3_dylib_start, _binary_libedit_3_dylib_end },
 };
 
 #define	DARWIN_NDYLIBS	(sizeof(darwin_dylibs) / sizeof(darwin_dylibs[0]))
@@ -325,20 +348,32 @@ darwin_pipe_write(struct syscall_frame *f, struct darwin_pipe *p,
 /* ---- open-file table ------------------------------------------------------ */
 
 /*
- * darwin_fd_alloc returns the lowest FREE slot at 3 or above (0..2 keep
- * their implicit std-stream meaning until dup2 explicitly retargets
- * them), or -1 when the table is full.
+ * darwin_fd_alloc_from returns the lowest FREE slot at `min` or above;
+ * darwin_fd_alloc is the common floor-3 form (0..2 keep their implicit
+ * std-stream meaning until dup2 explicitly retargets them).  The floored
+ * variant serves fcntl(F_DUPFD): a shell saves its std fds at 10+ before
+ * a redirection and restores them after.  Returns -1 when the table is
+ * full above the floor.
  */
 static int
-darwin_fd_alloc(struct task *t)
+darwin_fd_alloc_from(struct task *t, int min)
 {
 	int	i;
 
-	for (i = 3; i < DARWIN_NOFILE; i++) {
+	if (min < 3)
+		min = 3;
+	for (i = min; i < DARWIN_NOFILE; i++) {
 		if (t->t_darwin_files[i].of_type == DARWIN_OF_FREE)
 			return (i);
 	}
 	return (-1);
+}
+
+static int
+darwin_fd_alloc(struct task *t)
+{
+
+	return (darwin_fd_alloc_from(t, 3));
 }
 
 /* Release whatever one slot holds and return it to FREE. */
@@ -652,15 +687,16 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		return (darwin_ok(f, 0));
 	}
 	case DARWIN_SYS_open: {
-		char		 path[256];
-		struct task	*t;
-		uint8_t		*buf;
-		uint32_t	 size;
-		long		 len;
-		int		 fd;
-		int		 rv;
+		char				 path[256];
+		const struct progreg_entry	*pe;
+		struct task			*t;
+		uint8_t				*buf;
+		uint32_t			 size;
+		uint32_t			 k;
+		long				 len;
+		int				 fd;
+		int				 rv;
 
-		/* Read-only FS: the O_* flags (sf_arg1) and mode are ignored. */
 		len = syscall_copyin_str((const char *)f->sf_arg0, path,
 		    sizeof(path));
 		if (len < 0) {
@@ -668,12 +704,33 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			return (darwin_err(f, DARWIN_EFAULT));
 		}
 
+		/*
+		 * Everything reachable here is read-only; say so instead of
+		 * accepting a write-mode open whose writes would then vanish.
+		 * O_WRONLY/O_RDWR live in the low access-mode bits; O_APPEND
+		 * is 0x8, O_CREAT 0x200, O_TRUNC 0x400 (Darwin <sys/fcntl.h>).
+		 */
+		if ((f->sf_arg1 & 3) != 0 || (f->sf_arg1 & 0x608) != 0)
+			return (darwin_err(f, DARWIN_EROFS));
+
 		rv = fs_fat_slurp(path, &buf, &size);
-		if (rv != FS_FAT_E_OK) {
+		if (rv == FS_FAT_E_NOTFOUND || rv == FS_FAT_E_NOMOUNT) {
+			/* FAT miss: try the synthetic /bin (progreg). */
+			pe = darwin_bin_lookup(path);
+			if (pe == NULL)
+				return (darwin_err(f, DARWIN_ENOENT));
+			if (pe->pr_size > 0x7FFFFFFF)
+				return (darwin_err(f, DARWIN_ENOMEM));
+			buf = (uint8_t *)kmalloc(pe->pr_size != 0 ?
+			    pe->pr_size : 1);
+			if (buf == NULL)
+				return (darwin_err(f, DARWIN_ENOMEM));
+			for (k = 0; k < (uint32_t)pe->pr_size; k++)
+				buf[k] = pe->pr_image[k];
+			size = (uint32_t)pe->pr_size;
+		} else if (rv != FS_FAT_E_OK) {
 			kprintf("darwin: open('%s') -> fs_fat rv=%d\n",
 			    path, rv);
-			if (rv == FS_FAT_E_NOTFOUND || rv == FS_FAT_E_NOMOUNT)
-				return (darwin_err(f, DARWIN_ENOENT));
 			if (rv == FS_FAT_E_NOMEM || rv == FS_FAT_E_TOOBIG)
 				return (darwin_err(f, DARWIN_ENOMEM));
 			return (darwin_err(f, DARWIN_EIO));
@@ -912,6 +969,44 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		if (rv < 0)
 			return (darwin_err(f, -rv));
 		return (darwin_ok(f, newfd));
+	}
+	case DARWIN_SYS_fcntl: {
+		struct task	*t;
+		int		 cmd;
+		int		 newfd;
+		int		 oldfd;
+		int		 rv;
+
+		oldfd = (int)f->sf_arg0;
+		cmd   = (int)f->sf_arg1;
+		t     = current_thread->th_task;
+		if (oldfd < 0 || oldfd >= DARWIN_NOFILE)
+			return (darwin_err(f, DARWIN_EBADF));
+		switch (cmd) {
+		case DARWIN_F_DUPFD:
+		case DARWIN_F_DUPFD_CLOEXEC:
+			/*
+			 * Close-on-exec is moot here (exec preserves fds by
+			 * design and the table has no flag bits), so the
+			 * CLOEXEC flavor degenerates to plain F_DUPFD.
+			 */
+			newfd = darwin_fd_alloc_from(t, (int)f->sf_arg2);
+			if (newfd < 0)
+				return (darwin_err(f, DARWIN_EMFILE));
+			rv = darwin_dup_install(t, oldfd, newfd);
+			if (rv < 0)
+				return (darwin_err(f, -rv));
+			return (darwin_ok(f, newfd));
+		case DARWIN_F_GETFD:
+		case DARWIN_F_SETFD:
+		case DARWIN_F_GETFL:
+		case DARWIN_F_SETFL:
+			return (darwin_ok(f, 0));
+		default:
+			kprintf("darwin: fcntl(%d, cmd=%d) unsupported\n",
+			    oldfd, cmd);
+			return (darwin_err(f, DARWIN_EINVAL));
+		}
 	}
 	case DARWIN_SYS_execve: {
 		char				  path[256];
@@ -1157,6 +1252,8 @@ darwin_style9(struct syscall_frame *f, uint32_t num)
 		return (darwin_s9_fs_readdir(f));
 	case DARWIN_S9_uname:
 		return (darwin_s9_uname(f));
+	case DARWIN_S9_fs_fstat:
+		return (darwin_s9_fs_fstat(f));
 	default:
 		kprintf("darwin: unimplemented style9 call %u\n",
 		    (unsigned)num);
@@ -1226,18 +1323,31 @@ darwin_s9_map_image(struct syscall_frame *f)
 static long
 darwin_s9_fs_stat(struct syscall_frame *f)
 {
-	char			path[256];
-	struct fs_fat_statbuf	sb;
-	long			n;
-	int			rv;
+	char				 path[256];
+	struct fs_fat_statbuf		 sb;
+	const struct progreg_entry	*pe;
+	long				 n;
+	int				 rv;
 
 	n = syscall_copyin_str((const char *)f->sf_arg0, path, sizeof(path));
 	if (n < 0)
 		return (darwin_err(f, DARWIN_EFAULT));
 
-	rv = fs_fat_stat2(path, &sb);
-	if (rv != FS_FAT_E_OK)
-		return (darwin_err(f, DARWIN_ENOENT));
+	/* The synthetic /bin answers before the FAT volume (see below). */
+	if (darwin_streq(path, DARWIN_BIN_DIR)) {
+		sb.fs_size   = 0;
+		sb.fs_ino    = DARWIN_BIN_INO_BASE;
+		sb.fs_is_dir = 1;
+	} else if ((pe = darwin_bin_lookup(path)) != NULL) {
+		sb.fs_size   = (uint32_t)pe->pr_size;
+		sb.fs_ino    = DARWIN_BIN_INO_BASE + 1 +
+		    (uint32_t)(pe - progreg_at(0));
+		sb.fs_is_dir = 0;
+	} else {
+		rv = fs_fat_stat2(path, &sb);
+		if (rv != FS_FAT_E_OK)
+			return (darwin_err(f, DARWIN_ENOENT));
+	}
 	if (syscall_copyout((void *)f->sf_arg1, &sb, sizeof(sb)) != 0)
 		return (darwin_err(f, DARWIN_EFAULT));
 	return (darwin_ok(f, 0));
@@ -1254,23 +1364,105 @@ darwin_s9_fs_stat(struct syscall_frame *f)
 static long
 darwin_s9_fs_readdir(struct syscall_frame *f)
 {
-	char			path[256];
-	struct fs_fat_dirent	de;
-	long			n;
-	int			rv;
+	char				 path[256];
+	struct fs_fat_dirent		 de;
+	const struct progreg_entry	*pe;
+	uint32_t			 index;
+	long				 n;
+	int				 i;
+	int				 rv;
 
 	n = syscall_copyin_str((const char *)f->sf_arg0, path, sizeof(path));
 	if (n < 0)
 		return (darwin_err(f, DARWIN_EFAULT));
+	index = (uint32_t)f->sf_arg1;
 
-	rv = fs_fat_readdir(path, (uint32_t)f->sf_arg1, &de);
-	if (rv < 0)
-		return (darwin_err(f, DARWIN_ENOENT));
-	if (rv == 0)
-		return (darwin_ok(f, 0));		/* end of directory */
+	if (darwin_streq(path, DARWIN_BIN_DIR)) {
+		/* The synthetic /bin enumerates the program registry. */
+		pe = progreg_at(index);
+		if (pe == NULL)
+			return (darwin_ok(f, 0));	/* end of directory */
+		de.fde_ino    = DARWIN_BIN_INO_BASE + 1 + index;
+		de.fde_size   = (uint32_t)pe->pr_size;
+		de.fde_is_dir = 0;
+		for (i = 0; i + 1 < FS_FAT_NAME_MAX &&
+		    pe->pr_name[i] != '\0'; i++)
+			de.fde_name[i] = pe->pr_name[i];
+		de.fde_name[i] = '\0';
+	} else {
+		rv = fs_fat_readdir(path, index, &de);
+		if (rv < 0)
+			return (darwin_err(f, DARWIN_ENOENT));
+		if (rv == 0) {
+			/*
+			 * End of the FAT listing.  The root grows one
+			 * synthetic entry -- "bin" -- at exactly the first
+			 * end index (a probe at index-1 still yielding an
+			 * entry proves this is that index), so a directory
+			 * walker discovers the program registry.
+			 */
+			if (!darwin_streq(path, "/"))
+				return (darwin_ok(f, 0));
+			if (index > 0 &&
+			    fs_fat_readdir(path, index - 1, &de) != 1)
+				return (darwin_ok(f, 0));
+			de.fde_ino    = DARWIN_BIN_INO_BASE;
+			de.fde_size   = 0;
+			de.fde_is_dir = 1;
+			de.fde_name[0] = 'b';
+			de.fde_name[1] = 'i';
+			de.fde_name[2] = 'n';
+			de.fde_name[3] = '\0';
+		}
+	}
 	if (syscall_copyout((void *)f->sf_arg2, &de, sizeof(de)) != 0)
 		return (darwin_err(f, DARWIN_EFAULT));
 	return (darwin_ok(f, 1));
+}
+
+/*
+ * fs_fstat(int fd, struct darwin_fdstat *out): classify what an open fd
+ * holds for libSystem's fstat64.  The neutral kinds map onto S_IFREG /
+ * S_IFCHR / S_IFIFO in the clean-room library; the implicit std streams
+ * (FREE at 0..2) classify as the console they reach.
+ */
+static long
+darwin_s9_fs_fstat(struct syscall_frame *f)
+{
+	struct darwin_fdstat	 ds;
+	struct darwin_ofile	*of;
+	struct task		*t;
+	int			 fd;
+
+	fd = (int)f->sf_arg0;
+	t  = current_thread->th_task;
+	if (fd < 0 || fd >= DARWIN_NOFILE)
+		return (darwin_err(f, DARWIN_EBADF));
+	of = &t->t_darwin_files[fd];
+	ds.fds_size = 0;
+	switch (of->of_type) {
+	case DARWIN_OF_FREE:
+		if (fd > 2)
+			return (darwin_err(f, DARWIN_EBADF));
+		ds.fds_kind = DARWIN_FDSTAT_CHR;
+		break;
+	case DARWIN_OF_CONSOLE:
+		ds.fds_kind = DARWIN_FDSTAT_CHR;
+		break;
+	case DARWIN_OF_FILE:
+		ds.fds_size = of->of_size;
+		ds.fds_kind = DARWIN_FDSTAT_REG;
+		break;
+	case DARWIN_OF_PIPE_R:
+	case DARWIN_OF_PIPE_W:
+		ds.fds_kind = DARWIN_FDSTAT_FIFO;
+		break;
+	default:
+		return (darwin_err(f, DARWIN_EBADF));
+	}
+	if (syscall_copyout((void *)f->sf_arg1, &ds, sizeof(ds)) != 0)
+		return (darwin_err(f, DARWIN_EFAULT));
+	return (darwin_ok(f, 0));
 }
 
 /*
@@ -1317,4 +1509,26 @@ darwin_streq(const char *a, const char *b)
 		if (a[i] == '\0')
 			return (true);
 	}
+}
+
+/*
+ * The synthetic /bin: the program registry presented as a directory.  A
+ * shell's PATH machinery stat(2)s each candidate before committing to an
+ * execve, so the registry the execve resolves against must also be visible
+ * to the path calls -- otherwise every registered program is runnable yet
+ * "not found".  This helper answers "/bin/<name>" lookups for the FS-shaped
+ * services (open / fs_stat / fs_readdir above); execve keeps its own
+ * basename resolution, and the FAT volume keeps every other path.
+ */
+static const struct progreg_entry *
+darwin_bin_lookup(const char *path)
+{
+	size_t	i;
+
+	for (i = 0; DARWIN_BIN_DIR[i] != '\0'; i++)
+		if (path[i] != DARWIN_BIN_DIR[i])
+			return (NULL);
+	if (path[i] != '/')
+		return (NULL);
+	return (progreg_find(path + i + 1));
 }
