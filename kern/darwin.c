@@ -339,6 +339,15 @@ darwin_pipe_write(struct syscall_frame *f, struct darwin_pipe *p,
 				spin_unlock(&p->p_lock);
 				if (done > 0)
 					return (darwin_ok(f, (long)done));
+				/*
+				 * Reader-less pipe: post SIGPIPE to the writer.
+				 * Ignored or caught, the write just fails with
+				 * EPIPE (POSIX); otherwise the default-terminate
+				 * signal retires the writer when this syscall
+				 * returns and the EPIPE is never observed.
+				 */
+				darwin_signal_post(current_thread->th_task,
+				    DARWIN_SIGPIPE);
 				return (darwin_err(f, DARWIN_EPIPE));
 			}
 			space = DARWIN_PIPE_BUF - p->p_count;
@@ -638,6 +647,131 @@ static struct darwin_zombie	darwin_zombies[DARWIN_NZOMBIE];	/* (z) */
 static struct spinlock		darwin_zombie_lock =
     SPINLOCK_INIT("dzombie");					/* (z) */
 
+/* ---- signals -------------------------------------------------------------- */
+
+/*
+ * Bit for signal `signo` in the pending / mask words.  Valid signals are
+ * 1..DARWIN_NSIG-1; signal 0 (the kill(2) existence probe) and anything out
+ * of range map to no bit, so posting them is a silent no-op.
+ */
+static inline uint32_t
+darwin_sigbit(int signo)
+{
+
+	if (signo <= 0 || signo >= DARWIN_NSIG)
+		return (0);
+	return ((uint32_t)1 << signo);
+}
+
+/*
+ * Default action for a SIG_DFL signal.  Only SIGCHLD defaults to ignore;
+ * every other signal we can post (SIGINT, SIGPIPE, SIGTERM, SIGKILL)
+ * defaults to terminating the task.
+ */
+static bool
+darwin_sig_default_is_ignore(int signo)
+{
+
+	return (signo == DARWIN_SIGCHLD);
+}
+
+void
+darwin_signal_post(struct task *t, int signo)
+{
+	uint32_t	bit;
+
+	bit = darwin_sigbit(signo);
+	if (t == NULL || bit == 0)
+		return;
+	__atomic_fetch_or(&t->t_sig_pending, bit, __ATOMIC_RELEASE);
+}
+
+/*
+ * Notify a Darwin parent that a child changed state: post SIGCHLD to the
+ * task whose id is `ppid`.  Best-effort -- a parent that already exited is a
+ * silent no-op.  Kept out of darwin_zombie_lock: task_lookup_ref takes
+ * tasks_lock, and no path holds a task lock under darwin_zombie_lock.
+ */
+static void
+darwin_signal_notify_parent(uint64_t ppid)
+{
+	struct task	*parent;
+
+	if (ppid == 0)
+		return;
+	parent = task_lookup_ref(ppid);
+	if (parent == NULL)
+		return;
+	darwin_signal_post(parent, DARWIN_SIGCHLD);
+	task_deref(parent);
+}
+
+/*
+ * Pick the next signal to act on out of `t`'s deliverable set
+ * (pending & ~mask), lowest number first, reporting its disposition through
+ * *disp_out.  IGN and default-ignore signals are consumed here and skipped;
+ * a SIG_DFL-terminate signal is consumed and returned; a caught signal
+ * (handler VA) is left pending -- returned so phase 2 can deliver it
+ * on-stack -- which also stops the scan, so a terminate queued behind a
+ * caught signal waits until the handler is serviced.  Returns 0 when
+ * nothing remains deliverable.
+ */
+static int
+darwin_signal_next(struct task *t, uint64_t *disp_out)
+{
+	uint32_t	deliverable;
+	uint32_t	bit;
+	uint64_t	disp;
+	int		signo;
+
+	for (;;) {
+		deliverable = __atomic_load_n(&t->t_sig_pending,
+		    __ATOMIC_ACQUIRE) & ~t->t_sig_mask;
+		if (deliverable == 0)
+			return (0);
+		signo = __builtin_ctz(deliverable);
+		bit   = (uint32_t)1 << signo;
+		disp  = t->t_sig_handler[signo];
+		if (disp != DARWIN_SIG_DFL && disp != DARWIN_SIG_IGN) {
+			*disp_out = disp;
+			return (signo);		/* caught: leave pending */
+		}
+		__atomic_fetch_and(&t->t_sig_pending, ~bit, __ATOMIC_RELEASE);
+		if (disp == DARWIN_SIG_IGN)
+			continue;		/* explicit ignore -- discard */
+		if (darwin_sig_default_is_ignore(signo))
+			continue;		/* default ignore -- discard */
+		*disp_out = DARWIN_SIG_DFL;
+		return (signo);			/* default terminate */
+	}
+}
+
+void
+darwin_signal_deliver(struct task *t)
+{
+	uint64_t	disp;
+	int		signo;
+
+	disp = DARWIN_SIG_DFL;
+	if (t == NULL)
+		return;
+	signo = darwin_signal_next(t, &disp);
+	if (signo == 0)
+		return;
+	if (disp != DARWIN_SIG_DFL)
+		return;		/* caught: phase 2 delivers on-stack */
+	/*
+	 * SIG_DFL, terminate.  A signalled task never reaches its own exit(2),
+	 * so this is the sole writer of its wait4 status (termsig in the low 7
+	 * bits -- WIFSIGNALED for the parent's wait4).
+	 */
+	darwin_zombie_record(t->t_id, t->t_darwin_ppid, signo & 0x7F);
+	thread_exit();
+	/* NOTREACHED */
+}
+
+/* ---- zombies -------------------------------------------------------------- */
+
 void
 darwin_zombie_record(unsigned long long pid, unsigned long long ppid,
     int status)
@@ -673,6 +807,7 @@ darwin_zombie_record(unsigned long long pid, unsigned long long ppid,
 		spin_unlock(&darwin_zombie_lock);
 		kprintf("darwin: zombie table full, status of pid %llu "
 		    "dropped\n", pid);
+		darwin_signal_notify_parent(ppid);
 		return;
 	}
 	darwin_zombies[slot].z_pid    = pid;
@@ -680,6 +815,7 @@ darwin_zombie_record(unsigned long long pid, unsigned long long ppid,
 	darwin_zombies[slot].z_status = status;
 	darwin_zombies[slot].z_used   = true;
 	spin_unlock(&darwin_zombie_lock);
+	darwin_signal_notify_parent(ppid);
 }
 
 /*
@@ -1162,12 +1298,22 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		target = task_lookup_ref((uint64_t)pid);
 		if (target == NULL)
 			return (darwin_err(f, DARWIN_ESRCH));
-		if (sig != 0) {
+		if (sig != 0 && darwin_sig_default_is_ignore(sig)) {
 			/*
-			 * No signal delivery exists -- kill IS terminate.
-			 * Record the wait4 status here (termsig in the
-			 * low bits): a terminated task never reaches its
-			 * own exit(2), so this is the only writer.
+			 * A default-ignore signal (SIGCHLD): post it but do
+			 * not terminate -- the target consumes or handles it
+			 * at its next return to user.
+			 */
+			darwin_signal_post(target, sig);
+		} else if (sig != 0) {
+			/*
+			 * Default-terminate signal.  Phase 1 has no separate
+			 * signal-wake, so kill still hard-terminates: record
+			 * the wait4 status here (termsig in the low bits -- a
+			 * terminated task never reaches its own exit(2), so
+			 * this is the only writer) and request async kill.
+			 * Phase 2 will consult the target's disposition so a
+			 * caught signal runs its handler instead.
 			 */
 			kprintf("darwin: UNIX kill(%ld, %d) -> terminate\n",
 			    pid, sig);
@@ -1178,14 +1324,60 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		task_deref(target);
 		return (darwin_ok(f, 0));
 	}
-	case DARWIN_SYS_sigaction:
-	case DARWIN_SYS_sigprocmask:
+	case DARWIN_SYS_sigaction: {
+		int	signo;
+
+		/*
+		 * libSystem's sigaction/signal marshal (signo, handler) into
+		 * arg0/arg1: arg1 is the ring-3 handler VA -- DARWIN_SIG_DFL
+		 * (0), DARWIN_SIG_IGN (1), or a function pointer.  We record the
+		 * disposition here; on-stack invocation of a caught handler is
+		 * phase 2 (until then a caught signal simply stays pending and
+		 * never terminates).  SIGKILL is uncatchable.
+		 */
+		signo = (int)f->sf_arg0;
+		if (signo <= 0 || signo >= DARWIN_NSIG ||
+		    signo == DARWIN_SIGKILL)
+			return (darwin_err(f, DARWIN_EINVAL));
+		current_thread->th_task->t_sig_handler[signo] = f->sf_arg1;
+		return (darwin_ok(f, 0));
+	}
+	case DARWIN_SYS_sigprocmask: {
+		struct task	*t;
+		uint32_t	 old;
+		uint32_t	 set;
+		int		 how;
+
+		/*
+		 * (how, newmask) arrive in arg0/arg1; how == 0 means "query
+		 * only, no change" (libSystem sends it for a NULL set).  The
+		 * old mask returns in %rax so libSystem can store *oset.
+		 * SIGKILL can never be blocked.
+		 */
+		t   = current_thread->th_task;
+		old = t->t_sig_mask;
+		how = (int)f->sf_arg0;
+		set = (uint32_t)f->sf_arg1;
+		switch (how) {
+		case DARWIN_SIG_BLOCK:
+			t->t_sig_mask |= set;
+			break;
+		case DARWIN_SIG_UNBLOCK:
+			t->t_sig_mask &= ~set;
+			break;
+		case DARWIN_SIG_SETMASK:
+			t->t_sig_mask = set;
+			break;
+		default:
+			break;			/* how == 0: no change */
+		}
+		t->t_sig_mask &= ~darwin_sigbit(DARWIN_SIGKILL);
+		return (darwin_ok(f, (long)old));
+	}
 	case DARWIN_SYS_setitimer:
 		/*
-		 * Signal delivery does not exist yet; these succeed
-		 * without recording anything.  Enough for tools that
-		 * install handlers defensively (timeout, shells) on runs
-		 * where no signal ever fires.
+		 * No interval timers yet; succeed so a defensive disarm
+		 * (setitimer with a zero value) is a clean no-op.
 		 */
 		return (darwin_ok(f, 0));
 	default:

@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "darwin.h"
 #include "ddb.h"
 #include "intr.h"
 #include "kprintf.h"
@@ -136,10 +137,19 @@ intr_check_async_kill_on_user_return(const struct trapframe *tf)
 		return;
 	if (current_thread->th_task == kernel_task)
 		return;
-	if (!task_kill_pending(current_thread->th_task))
-		return;
-	thread_exit();
-	/* NOTREACHED */
+	if (task_kill_pending(current_thread->th_task))
+		thread_exit();
+	/*
+	 * Signal delivery for a compute loop that never syscalls: a
+	 * default-terminate signal (SIGINT/SIGTERM/SIGPIPE) posted while the
+	 * thread ran in ring 3 retires it here as this IRQ iretq's back to
+	 * user.  A caught signal is left pending for phase-2 on-stack
+	 * delivery.  Darwin-personality tasks only; native tasks have no
+	 * signal state.
+	 */
+	if (current_thread->th_task->t_personality == TASK_PERSONALITY_DARWIN)
+		darwin_signal_deliver(current_thread->th_task);
+	/* NOTREACHED if terminated */
 }
 
 /*

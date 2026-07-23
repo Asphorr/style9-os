@@ -44,6 +44,13 @@ extern long	 read(int fd, void *buf, unsigned long n);
 extern int	 getpid(void);
 extern int	 getppid(void);
 extern int	*__error(void);
+extern long	 write(int fd, const void *buf, unsigned long n);
+extern void	*signal(int sig, void *handler);
+
+#define	SIG_DFL	((void *)0)
+#define	SIG_IGN	((void *)1)
+#define	SIGPIPE	13
+#define	EPIPE	32
 
 static int	failures;
 
@@ -151,6 +158,64 @@ scene_pipeline(void)
 	check(status == 0, "gfactor exited 0");
 }
 
+/*
+ * Scene C: SIGPIPE.  A write to a pipe with no readers posts SIGPIPE.
+ * Ignored, the write fails EPIPE and we run on; at the default disposition
+ * it terminates the writer, which the parent reads out of wait4 as a
+ * WIFSIGNALED status carrying signal 13.
+ */
+static void
+scene_sigpipe(void)
+{
+	long	n;
+	int	fds[2];
+	int	pid;
+	int	rpid;
+	int	status;
+	char	byte;
+
+	/*
+	 * Part 1: SIG_IGN -- the broken-pipe write must not terminate us.
+	 * libSystem's write() returns the raw kernel result (it does not fold
+	 * the carry flag into -1/errno), so a broken pipe surfaces as the
+	 * positive EPIPE code rather than the 1 a good write returns; reaching
+	 * the check at all proves the ignored SIGPIPE let the writer live.
+	 */
+	signal(SIGPIPE, SIG_IGN);
+	if (pipe(fds) != 0) {
+		check(0, "pipe for sigpipe(ign)");
+		return;
+	}
+	close(fds[0]);			/* no readers */
+	byte = 'x';
+	n = write(fds[1], &byte, 1);
+	check(n == EPIPE, "ignored SIGPIPE: broken-pipe write -> EPIPE, writer lives");
+	close(fds[1]);
+
+	/* Part 2: SIG_DFL -- the child writer is terminated by SIGPIPE. */
+	signal(SIGPIPE, SIG_DFL);
+	if (pipe(fds) != 0) {
+		check(0, "pipe for sigpipe(dfl)");
+		return;
+	}
+	close(fds[0]);			/* readers 0 BEFORE fork: deterministic */
+	pid = fork();
+	if (pid < 0) {
+		check(0, "fork for sigpipe");
+		return;
+	}
+	if (pid == 0) {
+		byte = 'x';
+		(void)write(fds[1], &byte, 1);	/* reader-less -> SIGPIPE */
+		_exit(55);			/* NOTREACHED if SIGPIPE fires */
+	}
+	close(fds[1]);
+	status = -1;
+	rpid = wait4(pid, &status, 0, NULL);
+	check(rpid == pid, "wait4 reaps the sigpipe'd child");
+	check((status & 0x7f) == 13, "child terminated by SIGPIPE (13)");
+}
+
 int
 entry(void)
 {
@@ -158,6 +223,7 @@ entry(void)
 	printf("[pipefork] pid=%d ppid=%d\n", getpid(), getppid());
 	scene_fork_wait();
 	scene_pipeline();
+	scene_sigpipe();
 	if (failures == 0)
 		printf("[pipefork] ALL TESTS PASSED\n");
 	else

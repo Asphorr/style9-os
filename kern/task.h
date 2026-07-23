@@ -68,6 +68,16 @@ struct vm_map;
  */
 #define	DARWIN_NOFILE	16
 
+/*
+ * Darwin signal sizing.  Signals are numbered 1..31 (Darwin's NSIG is 32);
+ * the per-task disposition table t_sig_handler[] is indexed by that number.
+ * A slot holds DARWIN_SIG_DFL (take the default action), DARWIN_SIG_IGN
+ * (discard on delivery), or a ring-3 handler VA (on-stack delivery, phase 2).
+ */
+#define	DARWIN_NSIG	32
+#define	DARWIN_SIG_DFL	0
+#define	DARWIN_SIG_IGN	1
+
 #define	DARWIN_OF_FREE		0
 #define	DARWIN_OF_FILE		1
 #define	DARWIN_OF_CONSOLE	2
@@ -148,6 +158,26 @@ struct task {
 	 * (a) atomic, set-once semantics; readers use ACQUIRE load.
 	 */
 	volatile bool		 t_killed;
+
+	/*
+	 * Darwin signal state (kern/darwin.c).  t_sig_pending is the set of
+	 * posted-but-undelivered signals (bit N == Darwin signal N), OR'd in
+	 * atomically by darwin_signal_post from any context (a child's exit
+	 * posting SIGCHLD to its parent, a broken-pipe write posting SIGPIPE
+	 * to itself).  t_sig_mask is the blocked set installed via sigprocmask;
+	 * t_sig_handler[N] records the disposition (DARWIN_SIG_DFL /
+	 * DARWIN_SIG_IGN / a ring-3 handler VA).  The deliverable set
+	 * (pending & ~mask) is applied at the return-to-user points by
+	 * darwin_signal_deliver.  Zeroed at task_create: no pending, nothing
+	 * blocked, every signal at its default.
+	 *
+	 * (a) t_sig_pending atomic (RELEASE post / ACQUIRE load); t_sig_mask
+	 * and t_sig_handler are mutated only by the owning task, on its own
+	 * thread, via sigaction/sigprocmask -- single-writer, no lock.
+	 */
+	uint64_t		 t_sig_handler[DARWIN_NSIG];
+	volatile uint32_t	 t_sig_pending;
+	uint32_t		 t_sig_mask;
 
 	/*
 	 * Next base VA at which the Darwin dynamic linker's "map image by

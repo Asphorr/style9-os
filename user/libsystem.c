@@ -2713,31 +2713,50 @@ getppid(void)
 int
 sigaction(int sig, const void *act, void *oact)
 {
+	long	handler;
 
-	(void)sig;
-	(void)act;
+	/*
+	 * Apple's struct sigaction leads with the handler union (sa_handler /
+	 * sa_sigaction) at offset 0; extract it and record the disposition in
+	 * the kernel (SYS_sigaction = 0x200002E).  We do not read back a prior
+	 * action, so a caller inspecting *oact sees "default, empty".
+	 */
+	handler = (act != NULL) ? (long)*(const unsigned long *)act : 0;
 	if (oact != NULL)
 		(void)memset(oact, 0, 16);
-	return (0);
+	return ((int)bsd_call_e(0x200002E, sig, handler, 0));
 }
 
 void *
 signal(int sig, void *handler)
 {
 
-	(void)sig;
-	(void)handler;
-	return (NULL);				/* previous handler: SIG_DFL */
+	/*
+	 * signal(3) records through the same kernel path as sigaction.  We do
+	 * not track the previous disposition, so report SIG_DFL (NULL) --
+	 * callers that install a handler rarely inspect the return.
+	 */
+	(void)bsd_call_e(0x200002E, sig, (long)handler, 0);
+	return (NULL);
 }
 
 int
 sigprocmask(int how, const void *set, void *oset)
 {
+	unsigned int	newmask;
+	long		old;
 
-	(void)how;
-	(void)set;
+	/*
+	 * Apple's sigset_t is a 32-bit mask.  A NULL set means "query only":
+	 * pass how == 0 so the kernel leaves the mask untouched and hands back
+	 * the current one in %rax (SYS_sigprocmask = 0x2000030) for *oset.
+	 */
+	newmask = (set != NULL) ? *(const unsigned int *)set : 0u;
+	if (set == NULL)
+		how = 0;
+	old = bsd_call_e(0x2000030, how, (long)newmask, 0);
 	if (oset != NULL)
-		(void)memset(oset, 0, 4);
+		*(unsigned int *)oset = (unsigned int)old;
 	return (0);
 }
 

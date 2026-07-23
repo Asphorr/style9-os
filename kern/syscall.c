@@ -299,6 +299,18 @@ syscall_dispatch(struct syscall_frame *f)
 		thread_exit();
 	/* NOTREACHED if killed */
 
+	/*
+	 * Signal delivery point.  Apply any signal posted to this Darwin task
+	 * during the syscall -- most notably SIGPIPE from a write to a
+	 * reader-less pipe.  A default-terminate signal retires the thread
+	 * here (so the syscall's return value is never observed); a caught
+	 * signal is left pending for phase-2 on-stack delivery.  Native tasks
+	 * carry no Darwin signal state and are skipped.
+	 */
+	if (current_thread->th_task != kernel_task &&
+	    current_thread->th_task->t_personality == TASK_PERSONALITY_DARWIN)
+		darwin_signal_deliver(current_thread->th_task);
+
 	return (rv);
 }
 

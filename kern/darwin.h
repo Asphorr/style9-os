@@ -82,6 +82,22 @@
 #define	DARWIN_WNOHANG	1
 
 /*
+ * Signal numbers we act on (Darwin <sys/signal.h>).  A task's disposition
+ * for each lives in struct task.t_sig_handler[]; posting, masking, default
+ * actions, and return-to-user delivery are in kern/darwin.c.
+ */
+#define	DARWIN_SIGINT	2	/* interrupt (Ctrl-C)        -- default terminate */
+#define	DARWIN_SIGKILL	9	/* uncatchable kill          -- always terminate  */
+#define	DARWIN_SIGPIPE	13	/* write to reader-less pipe -- default terminate */
+#define	DARWIN_SIGTERM	15	/* termination request       -- default terminate */
+#define	DARWIN_SIGCHLD	20	/* child exited/stopped      -- default ignore    */
+
+/* sigprocmask(2) `how` values (Darwin); 0 is our "no change" (query only). */
+#define	DARWIN_SIG_BLOCK	1
+#define	DARWIN_SIG_UNBLOCK	2
+#define	DARWIN_SIG_SETMASK	3
+
+/*
  * fcntl(2) commands (Darwin <sys/fcntl.h>).  F_DUPFD is the one with real
  * semantics here (a shell parks its saved fds at 10+ with it); the fd-flag
  * and status-flag commands are accepted and answer 0 -- there is nothing
@@ -266,6 +282,20 @@ void	darwin_cons_feed(const char *buf, size_t n);
  */
 void	darwin_zombie_record(unsigned long long pid, unsigned long long ppid,
 	    int status);
+
+/*
+ * Signal subsystem (kern/darwin.c).  darwin_signal_post OR's `signo` into
+ * `t`'s pending set from any context -- it never delivers synchronously, the
+ * signal takes effect at `t`'s next return to user.  darwin_signal_deliver is
+ * that return-to-user hook: it applies the current task's deliverable set,
+ * silently discarding ignored (and default-ignore) signals, leaving a caught
+ * signal pending for phase-2 on-stack delivery, and, for a signal whose
+ * default action is terminate, recording the wait4 status and retiring the
+ * thread -- NORETURN in that case.  Both no-op on a NULL task; deliver is
+ * only ever called for a TASK_PERSONALITY_DARWIN task.
+ */
+void	darwin_signal_post(struct task *t, int signo);
+void	darwin_signal_deliver(struct task *t);
 
 /*
  * Process-lifecycle arch hooks (arch/amd64/usermode.c).  arch_darwin_fork
