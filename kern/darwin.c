@@ -231,7 +231,7 @@ darwin_pipe_create(void)
 {
 	struct darwin_pipe	*p;
 
-	p = (struct darwin_pipe *)kmalloc(sizeof(*p));
+	p = kmalloc(sizeof(*p));
 	if (p == NULL)
 		return (NULL);
 	spin_init(&p->p_lock, "dpipe");
@@ -521,7 +521,7 @@ darwin_files_fork_copy(struct task *parent, struct task *child)
 			 * the read-only slurped files this serves, cursor
 			 * divergence after fork is unobservable.
 			 */
-			buf = (uint8_t *)kmalloc(src->of_size != 0 ?
+			buf = kmalloc(src->of_size != 0 ?
 			    src->of_size : 1);
 			if (buf == NULL)
 				return (-1);
@@ -584,7 +584,7 @@ darwin_dup_install(struct task *t, int oldfd, int newfd)
 		dst->of_type = DARWIN_OF_CONSOLE;
 		return (0);
 	case DARWIN_OF_FILE:
-		buf = (uint8_t *)kmalloc(src->of_size != 0 ?
+		buf = kmalloc(src->of_size != 0 ?
 		    src->of_size : 1);
 		if (buf == NULL)
 			return (-DARWIN_ENOMEM);
@@ -806,7 +806,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 				return (darwin_err(f, DARWIN_ENOENT));
 			if (pe->pr_size > 0x7FFFFFFF)
 				return (darwin_err(f, DARWIN_ENOMEM));
-			buf = (uint8_t *)kmalloc(pe->pr_size != 0 ?
+			buf = kmalloc(pe->pr_size != 0 ?
 			    pe->pr_size : 1);
 			if (buf == NULL)
 				return (darwin_err(f, DARWIN_ENOMEM));

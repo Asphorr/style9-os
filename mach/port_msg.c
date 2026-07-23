@@ -281,7 +281,7 @@ port_notify_enqueue(struct port *notify_port, uint32_t notify_id,
 	if (notify_port == NULL)
 		return (MACH_E_INVAL);
 
-	m = (struct port_msg *)kmalloc(sizeof(*m) +
+	m = kmalloc(sizeof(*m) +
 	    sizeof(struct mach_notify_header));
 	if (m == NULL)
 		return (MACH_E_NOMEM);
@@ -326,7 +326,7 @@ port_exception_post(struct port *port, uint32_t trapno, uint32_t err,
 	if (port == NULL)
 		return (MACH_E_INVAL);
 
-	m = (struct port_msg *)kmalloc(sizeof(*m) +
+	m = kmalloc(sizeof(*m) +
 	    sizeof(struct mach_exception_header));
 	if (m == NULL)
 		return (MACH_E_NOMEM);
@@ -628,7 +628,7 @@ send_capture_ool(struct port_space *from,
 			return (MACH_E_INVAL);
 	}
 
-	staging = (uint8_t *)kmalloc((size_t)size);
+	staging = kmalloc((size_t)size);
 	if (staging == NULL)
 		return (MACH_E_NOMEM);
 
@@ -969,7 +969,7 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 		return (MACH_E_INVAL);
 	}
 
-	m = (struct port_msg *)kmalloc(sizeof(*m) + hdr_copy.msgh_size);
+	m = kmalloc(sizeof(*m) + hdr_copy.msgh_size);
 	if (m == NULL)
 		return (MACH_E_NOMEM);
 	m->m_next   = NULL;

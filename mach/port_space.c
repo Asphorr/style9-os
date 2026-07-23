@@ -38,7 +38,7 @@ port_space_new(void)
 {
 	struct port_space	*ps;
 
-	ps = (struct port_space *)kmalloc(sizeof(*ps));
+	ps = kmalloc(sizeof(*ps));
 	if (ps == NULL)
 		return (NULL);
 
@@ -808,7 +808,7 @@ port_request_notification(struct port_space *space, mach_port_name_t name,
 		bool			 dup;
 		int			 rv;
 
-		node = (struct port_notify_node *)kmalloc(sizeof(*node));
+		node = kmalloc(sizeof(*node));
 		if (node == NULL)
 			return (MACH_E_NOMEM);
 		port_ref(notify_port, MACH_PORT_RIGHT_SEND);

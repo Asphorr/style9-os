@@ -582,7 +582,7 @@ fs_fat_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size)
 	 */
 	bufcap = e.fe_size == 0 ? 1u :
 	    ((e.fe_size + clus_bytes - 1) / clus_bytes) * clus_bytes;
-	buf = (uint8_t *)kmalloc(bufcap);
+	buf = kmalloc(bufcap);
 	if (buf == NULL)
 		return (FS_FAT_E_NOMEM);
 

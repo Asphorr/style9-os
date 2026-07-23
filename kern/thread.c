@@ -46,7 +46,7 @@ thread_subsystem_init(void)
 	 * AWAY from this thread -- at that point the switch asm fills
 	 * it in.
 	 */
-	boot = (struct thread *)kmalloc(sizeof(*boot));
+	boot = kmalloc(sizeof(*boot));
 	if (boot == NULL)
 		panic("thread_subsystem_init: kmalloc(boot thread) failed");
 
@@ -115,11 +115,11 @@ thread_create(struct task *t, void (*entry)(void *), void *arg,
 	if (t == NULL || entry == NULL)
 		return (NULL);
 
-	th = (struct thread *)kmalloc(sizeof(*th));
+	th = kmalloc(sizeof(*th));
 	if (th == NULL)
 		return (NULL);
 
-	kstack = (uint8_t *)kmalloc(THREAD_DEFAULT_KSTACK);
+	kstack = kmalloc(THREAD_DEFAULT_KSTACK);
 	if (kstack == NULL) {
 		kfree(th);
 		return (NULL);

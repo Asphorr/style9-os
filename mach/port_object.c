@@ -79,7 +79,7 @@ port_create(void)
 {
 	struct port	*p;
 
-	p = (struct port *)kmalloc(sizeof(*p));
+	p = kmalloc(sizeof(*p));
 	if (p == NULL)
 		return (NULL);
 
@@ -372,7 +372,7 @@ port_set_create(void)
 {
 	struct port_set	*ps;
 
-	ps = (struct port_set *)kmalloc(sizeof(*ps));
+	ps = kmalloc(sizeof(*ps));
 	if (ps == NULL)
 		return (NULL);
 	spin_init(&ps->ps_lock, "port_set");
@@ -598,7 +598,7 @@ port_arm_dead_name_object(struct port *watched, struct port *notify,
 	if (watched == NULL || notify == NULL)
 		return (MACH_E_INVAL);
 
-	node = (struct port_notify_node *)kmalloc(sizeof(*node));
+	node = kmalloc(sizeof(*node));
 	if (node == NULL)
 		return (MACH_E_NOMEM);
 

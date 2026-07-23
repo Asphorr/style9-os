@@ -120,7 +120,7 @@ arch_spawn_user(const char *name, const uint8_t *image, size_t image_size,
 		return (SYS_E_INVAL);
 	}
 
-	sa = (struct user_spawn_arg *)kmalloc(sizeof(*sa));
+	sa = kmalloc(sizeof(*sa));
 	if (sa == NULL) {
 		if (inject_port != NULL)
 			port_deref(inject_port, MACH_PORT_RIGHT_SEND);
@@ -824,7 +824,7 @@ arch_darwin_fork(struct syscall_frame *f)
 
 	parent = current_thread->th_task;
 
-	fa = (struct darwin_fork_arg *)kmalloc(sizeof(*fa));
+	fa = kmalloc(sizeof(*fa));
 	if (fa == NULL)
 		return (SYS_E_NOMEM);
 	fa->fa_rip = f->sf_user_rip;

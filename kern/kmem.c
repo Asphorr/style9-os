@@ -175,7 +175,7 @@ kcalloc(size_t n, size_t size)
 		return (NULL);
 	total = n * size;
 
-	p = (uint8_t *)kmalloc(total);
+	p = kmalloc(total);
 	if (p == NULL)
 		return (NULL);
 

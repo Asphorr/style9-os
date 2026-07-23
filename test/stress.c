@@ -3059,7 +3059,7 @@ stress_ool(unsigned int rounds)
 	}
 	thread_start(server);
 
-	kbuf = (uint8_t *)kmalloc(max_size);
+	kbuf = kmalloc(max_size);
 	if (kbuf == NULL) {
 		kprintf("stress_ool: kmalloc %u failed\n", (unsigned)max_size);
 		rv = 4;

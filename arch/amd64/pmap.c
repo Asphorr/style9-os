@@ -154,7 +154,7 @@ pmap_create(void)
 	uint64_t	 e;
 	size_t		 i;
 
-	pm = (struct pmap *)kmalloc(sizeof(*pm));
+	pm = kmalloc(sizeof(*pm));
 	if (pm == NULL)
 		return (NULL);
 

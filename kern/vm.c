@@ -51,7 +51,7 @@ vm_map_create(uint64_t lo, uint64_t hi)
 	if (lo >= hi || (lo & VM_PAGE_MASK) != 0 || (hi & VM_PAGE_MASK) != 0)
 		return (NULL);
 
-	map = (struct vm_map *)kmalloc(sizeof(*map));
+	map = kmalloc(sizeof(*map));
 	if (map == NULL)
 		return (NULL);
 
@@ -269,7 +269,7 @@ vm_map_enter(struct vm_map *map, uint64_t va, uint64_t size,
 	if (va < map->vm_lo || end > map->vm_hi)
 		return (false);
 
-	ne = (struct vm_map_entry *)kmalloc(sizeof(*ne));
+	ne = kmalloc(sizeof(*ne));
 	if (ne == NULL)
 		return (false);
 	ne->vme_start  = va;

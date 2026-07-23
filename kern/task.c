@@ -94,7 +94,7 @@ task_create(const char *name)
 {
 	struct task	*t;
 
-	t = (struct task *)kmalloc(sizeof(*t));
+	t = kmalloc(sizeof(*t));
 	if (t == NULL)
 		return (NULL);
 

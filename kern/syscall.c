@@ -575,7 +575,7 @@ syscall_copyin_argv(char *const *uargv, char ***blockp, int *argcp)
 		return (0);
 
 	ptrs_sz = (n + 1) * sizeof(char *);
-	block = (char *)kmalloc(ptrs_sz + SPAWN_ARG_BYTES_MAX);
+	block = kmalloc(ptrs_sz + SPAWN_ARG_BYTES_MAX);
 	if (block == NULL)
 		return (SYS_E_NOMEM);
 	kargv = (char **)block;
@@ -1508,7 +1508,7 @@ sys_spawn_args(const char *uname, char *const *uargv, uint64_t argc,
 		return (SYS_E_FAULT);
 
 	ptrs_sz = (size_t)(argc + 1) * sizeof(char *);
-	block = (char *)kmalloc(ptrs_sz + SPAWN_ARG_BYTES_MAX);
+	block = kmalloc(ptrs_sz + SPAWN_ARG_BYTES_MAX);
 	if (block == NULL)
 		return (SYS_E_NOMEM);
 	kargv = (char **)block;
