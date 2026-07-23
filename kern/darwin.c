@@ -433,19 +433,37 @@ darwin_ofile_clear(struct darwin_ofile *of)
 }
 
 /*
+ * Foreground task for console input: the id of the last Darwin task to
+ * read(2) the console.  A Ctrl-C (ETX) in the feed posts SIGINT here.  This
+ * is a stand-in for process groups -- enough for the common case of one
+ * interactive shell draining the console.
+ */
+static uint64_t	darwin_cons_fg_id;
+
+/*
  * Append up to `n` bytes of console input to the ring, dropping any that
  * would overflow (scripted feeds are far smaller than DARWIN_CONS_BUF).
- * Marks end-of-input: a feed is a whole-input, single-shot delivery, so
- * the reader returns EOF once it drains what was queued here.  Driven by
- * the SYS_CONS_FEED native syscall (kern/syscall.c).
+ * An ETX (Ctrl-C, 0x03) is not enqueued: it posts SIGINT to the foreground
+ * task instead.  Marks end-of-input: a feed is a whole-input, single-shot
+ * delivery, so the reader returns EOF once it drains what was queued here.
+ * Driven by the SYS_CONS_FEED native syscall (kern/syscall.c).
  */
 void
 darwin_cons_feed(const char *buf, size_t n)
 {
-	uint32_t	next;
-	size_t		i;
+	struct task	*fg;
+	size_t		 i;
+	uint32_t	 next;
 
 	for (i = 0; i < n; i++) {
+		if (buf[i] == 0x03) {		/* Ctrl-C -> SIGINT to fg task */
+			fg = task_lookup_ref(darwin_cons_fg_id);
+			if (fg != NULL) {
+				darwin_signal_post(fg, DARWIN_SIGINT);
+				task_deref(fg);
+			}
+			continue;
+		}
 		next = darwin_cons_head + 1u;
 		if (next - darwin_cons_tail > DARWIN_CONS_BUF)
 			break;
@@ -472,6 +490,7 @@ darwin_cons_read(struct syscall_frame *f, void *ubuf, size_t n)
 	char	c;
 
 	got = 0;
+	darwin_cons_fg_id = current_thread->th_task->t_id;
 	if (n > sizeof(line))
 		n = sizeof(line);
 
@@ -488,6 +507,15 @@ darwin_cons_read(struct syscall_frame *f, void *ubuf, size_t n)
 			break;
 		if (darwin_cons_eof)
 			return (darwin_ok(f, 0));	/* EOF */
+		/*
+		 * A pending, unblocked signal (e.g. SIGINT from Ctrl-C) breaks
+		 * the blocking read with EINTR; the syscall-exit path then
+		 * delivers it -- a caught handler runs, an uncaught SIGINT
+		 * terminates.  Mirrors the pipe read's interrupt check.
+		 */
+		if ((current_thread->th_task->t_sig_pending &
+		    ~current_thread->th_task->t_sig_mask) != 0)
+			return (darwin_err(f, DARWIN_EINTR));
 		thread_yield();
 	}
 
@@ -765,6 +793,82 @@ darwin_signal_deliver(struct task *t)
 	 * so this is the sole writer of its wait4 status (termsig in the low 7
 	 * bits -- WIFSIGNALED for the parent's wait4).
 	 */
+	darwin_zombie_record(t->t_id, t->t_darwin_ppid, signo & 0x7F);
+	thread_exit();
+	/* NOTREACHED */
+}
+
+/*
+ * Build the on-stack signal frame for a caught signal and reshape `f` so the
+ * syscall-exit sysret enters the task's _sigtramp.  Returns 0 on success, -1
+ * if the frame could not be written (no trampoline registered, or a bad user
+ * stack) -- the caller then falls back to termination.  Stack layout below
+ * f's user rsp:
+ *
+ *	[ 128-byte red zone -- preserved ]
+ *	[ darwin_sigframe (48 B, 16-aligned) ]   <- ucontext + saved context
+ *	[ 8-byte pad ]                            <- new rsp (%16 == 8 at entry)
+ *
+ * The exit asm reloads rdi/rsi/rdx/r10 from f->sf_arg0..3, so the trampoline
+ * enters with (signo, siginfo=0, ucontext, handler).
+ */
+static int
+darwin_signal_setup_frame(struct syscall_frame *f, int signo, uint64_t handler,
+    long rv)
+{
+	struct darwin_sigframe	frame;
+	struct task		*t;
+	uint64_t		 base;
+	uint64_t		 fa;
+
+	t = current_thread->th_task;
+	if (t->t_sig_tramp == 0)
+		return (-1);
+
+	frame.sf_magic  = DARWIN_SIGFRAME_MAGIC;
+	frame.sf_signo  = (uint64_t)signo;
+	frame.sf_rip    = f->sf_user_rip;
+	frame.sf_rsp    = f->sf_user_rsp;
+	frame.sf_rflags = f->sf_user_rflags;
+	frame.sf_rax    = (uint64_t)rv;
+
+	base = (f->sf_user_rsp - 128) & ~(uint64_t)15;
+	fa   = base - sizeof(frame);
+	if (syscall_copyout((void *)fa, &frame, sizeof(frame)) != 0)
+		return (-1);
+
+	f->sf_user_rip = t->t_sig_tramp;
+	f->sf_user_rsp = fa - 8;			/* %16 == 8 at entry */
+	f->sf_arg0 = (uint64_t)signo;			/* rdi: signo        */
+	f->sf_arg1 = 0;					/* rsi: siginfo      */
+	f->sf_arg2 = fa;				/* rdx: ucontext     */
+	f->sf_arg3 = handler;				/* r10: handler      */
+	return (0);
+}
+
+void
+darwin_signal_deliver_syscall(struct syscall_frame *f, long rv)
+{
+	struct task	*t;
+	uint64_t	 disp;
+	int		 signo;
+
+	t = current_thread->th_task;
+	disp = DARWIN_SIG_DFL;
+	signo = darwin_signal_next(t, &disp);
+	if (signo == 0)
+		return;
+	if (disp != DARWIN_SIG_DFL) {
+		/*
+		 * Caught: consume the pending bit and deliver to the ring-3
+		 * handler on the user stack.  If the frame cannot be built
+		 * (no trampoline / bad stack) fall through to terminate.
+		 */
+		__atomic_fetch_and(&t->t_sig_pending,
+		    ~((uint32_t)1 << signo), __ATOMIC_RELEASE);
+		if (darwin_signal_setup_frame(f, signo, disp, rv) == 0)
+			return;
+	}
 	darwin_zombie_record(t->t_id, t->t_darwin_ppid, signo & 0x7F);
 	thread_exit();
 	/* NOTREACHED */
@@ -1298,22 +1402,25 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		target = task_lookup_ref((uint64_t)pid);
 		if (target == NULL)
 			return (darwin_err(f, DARWIN_ESRCH));
-		if (sig != 0 && darwin_sig_default_is_ignore(sig)) {
+		if (sig != 0 && (darwin_sig_default_is_ignore(sig) ||
+		    target == current_thread->th_task)) {
 			/*
-			 * A default-ignore signal (SIGCHLD): post it but do
-			 * not terminate -- the target consumes or handles it
-			 * at its next return to user.
+			 * Post and let return-to-user delivery decide: a
+			 * default-ignore signal (SIGCHLD), or ANY self-signal.
+			 * A self-signal is applied at THIS kill syscall's own
+			 * exit -- so a caught SIGINT runs its handler and an
+			 * uncaught one terminates -- without the hard-kill path.
 			 */
 			darwin_signal_post(target, sig);
 		} else if (sig != 0) {
 			/*
-			 * Default-terminate signal.  Phase 1 has no separate
-			 * signal-wake, so kill still hard-terminates: record
-			 * the wait4 status here (termsig in the low bits -- a
-			 * terminated task never reaches its own exit(2), so
-			 * this is the only writer) and request async kill.
-			 * Phase 2 will consult the target's disposition so a
-			 * caught signal runs its handler instead.
+			 * Cross-task default-terminate.  There is no signal-wake
+			 * for another task's blocked thread yet, so kill still
+			 * hard-terminates it (a caught handler on the target is
+			 * bypassed -- a known gap).  Record the wait4 status
+			 * (termsig in the low bits -- a terminated task never
+			 * reaches its own exit(2), so this is the only writer)
+			 * and request async kill.
 			 */
 			kprintf("darwin: UNIX kill(%ld, %d) -> terminate\n",
 			    pid, sig);
@@ -1340,6 +1447,9 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		    signo == DARWIN_SIGKILL)
 			return (darwin_err(f, DARWIN_EINVAL));
 		current_thread->th_task->t_sig_handler[signo] = f->sf_arg1;
+		/* arg2 carries libSystem's _sigtramp VA (same for every sig). */
+		if (f->sf_arg2 != 0)
+			current_thread->th_task->t_sig_tramp = f->sf_arg2;
 		return (darwin_ok(f, 0));
 	}
 	case DARWIN_SYS_sigprocmask: {
@@ -1373,6 +1483,36 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		}
 		t->t_sig_mask &= ~darwin_sigbit(DARWIN_SIGKILL);
 		return (darwin_ok(f, (long)old));
+	}
+	case DARWIN_SYS_sigreturn: {
+		struct darwin_sigframe	frame;
+		struct task		*t;
+		uint64_t		 uctx;
+
+		/*
+		 * Restore the context saved at delivery.  _sigtramp passes the
+		 * ucontext (our darwin_sigframe) in arg0.  Reshape THIS frame so
+		 * the sysret lands back at the interrupted rip/rsp/rflags with
+		 * the original %rax -- sigreturn does not "return" normally.  A
+		 * bad pointer or wrong magic means a corrupt/forged frame; kill
+		 * the task rather than resume into nonsense.
+		 */
+		t    = current_thread->th_task;
+		uctx = f->sf_arg0;
+		if (syscall_copyin(&frame, (const void *)uctx,
+		    sizeof(frame)) != 0 ||
+		    frame.sf_magic != DARWIN_SIGFRAME_MAGIC) {
+			kprintf("darwin: bad sigreturn frame @0x%llx\n",
+			    (unsigned long long)uctx);
+			darwin_zombie_record(t->t_id, t->t_darwin_ppid,
+			    DARWIN_SIGKILL);
+			thread_exit();
+			/* NOTREACHED */
+		}
+		f->sf_user_rip    = frame.sf_rip;
+		f->sf_user_rsp    = frame.sf_rsp;
+		f->sf_user_rflags = frame.sf_rflags;
+		return ((long)frame.sf_rax);		/* becomes user %rax */
 	}
 	case DARWIN_SYS_setitimer:
 		/*

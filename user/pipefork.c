@@ -46,9 +46,11 @@ extern int	 getppid(void);
 extern int	*__error(void);
 extern long	 write(int fd, const void *buf, unsigned long n);
 extern void	*signal(int sig, void *handler);
+extern int	 kill(int pid, int sig);
 
 #define	SIG_DFL	((void *)0)
 #define	SIG_IGN	((void *)1)
+#define	SIGINT	2
 #define	SIGPIPE	13
 #define	EPIPE	32
 
@@ -216,6 +218,67 @@ scene_sigpipe(void)
 	check((status & 0x7f) == 13, "child terminated by SIGPIPE (13)");
 }
 
+static volatile int	sigpipe_caught;
+
+static void
+on_sigpipe(int signo)
+{
+
+	sigpipe_caught = signo;
+}
+
+/*
+ * Scene D: a CAUGHT SIGPIPE runs its ring-3 handler and execution resumes.
+ * The write to a reader-less pipe posts SIGPIPE; the kernel delivers it to
+ * on_sigpipe on the user stack; sigreturn brings us back so the write still
+ * reports EPIPE and the program runs on.
+ */
+static void
+scene_sigpipe_handler(void)
+{
+	long	n;
+	int	fds[2];
+
+	sigpipe_caught = 0;
+	signal(SIGPIPE, (void *)on_sigpipe);
+	if (pipe(fds) != 0) {
+		check(0, "pipe for sigpipe(handler)");
+		return;
+	}
+	close(fds[0]);			/* no readers */
+	n = write(fds[1], "x", 1);	/* broken pipe -> SIGPIPE -> on_sigpipe */
+	check(sigpipe_caught == 13, "caught SIGPIPE ran its handler");
+	check(n == EPIPE, "execution resumed after handler (write -> EPIPE)");
+	close(fds[1]);
+	signal(SIGPIPE, SIG_DFL);
+}
+
+static volatile int	sigint_caught;
+
+static void
+on_sigint(int signo)
+{
+
+	sigint_caught = signo;
+}
+
+/*
+ * Scene E: a caught SIGINT delivered to a handler.  Self-raised via
+ * kill(getpid(), SIGINT) -- the kernel applies a self-signal at that kill's
+ * own syscall exit, so the handler runs and kill returns normally.  Same
+ * delivery path a Ctrl-C (SIGINT from the console) takes.
+ */
+static void
+scene_sigint_handler(void)
+{
+
+	sigint_caught = 0;
+	signal(SIGINT, (void *)on_sigint);
+	kill(getpid(), SIGINT);
+	check(sigint_caught == 2, "caught SIGINT (self-kill) ran its handler");
+	signal(SIGINT, SIG_DFL);
+}
+
 int
 entry(void)
 {
@@ -224,6 +287,8 @@ entry(void)
 	scene_fork_wait();
 	scene_pipeline();
 	scene_sigpipe();
+	scene_sigpipe_handler();
+	scene_sigint_handler();
 	if (failures == 0)
 		printf("[pipefork] ALL TESTS PASSED\n");
 	else

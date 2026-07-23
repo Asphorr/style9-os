@@ -76,6 +76,7 @@
 #define	DARWIN_SYS_setitimer	83
 #define	DARWIN_SYS_dup2		90
 #define	DARWIN_SYS_fcntl	92
+#define	DARWIN_SYS_sigreturn	184
 #define	DARWIN_SYS_lseek	199
 
 /* wait4 option bits (Darwin <sys/wait.h>). */
@@ -296,6 +297,36 @@ void	darwin_zombie_record(unsigned long long pid, unsigned long long ppid,
  */
 void	darwin_signal_post(struct task *t, int signo);
 void	darwin_signal_deliver(struct task *t);
+
+/*
+ * Phase-2 on-stack delivery.  darwin_signal_deliver_syscall is the
+ * syscall-exit variant of darwin_signal_deliver: with the caller's
+ * syscall_frame in hand (and `rv`, the value the syscall was about to
+ * return), it can deliver a CAUGHT signal to a ring-3 handler -- it saves
+ * the interrupted context into a darwin_sigframe on the user stack, then
+ * reshapes the frame so the sysret enters the task's registered _sigtramp
+ * with (signo, siginfo, ucontext, handler).  Default-terminate and ignore
+ * are handled exactly as darwin_signal_deliver.  The trampoline calls the
+ * handler then issues DARWIN_SYS_sigreturn, which restores the sigframe.
+ */
+struct syscall_frame;
+void	darwin_signal_deliver_syscall(struct syscall_frame *f, long rv);
+
+/*
+ * On-stack signal context the kernel writes at delivery and reads back at
+ * sigreturn.  Private to the clean-room ABI (our _sigtramp is the only
+ * producer of the sigreturn call), so the layout is ours to define.
+ */
+#define	DARWIN_SIGFRAME_MAGIC	0x5347465231ULL		/* "SGFR1" */
+
+struct darwin_sigframe {
+	uint64_t	sf_magic;
+	uint64_t	sf_signo;
+	uint64_t	sf_rip;
+	uint64_t	sf_rsp;
+	uint64_t	sf_rflags;
+	uint64_t	sf_rax;
+};
 
 /*
  * Process-lifecycle arch hooks (arch/amd64/usermode.c).  arch_darwin_fork

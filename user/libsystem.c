@@ -2703,28 +2703,42 @@ getppid(void)
 }
 
 /*
- * Signal management: delivery does not exist in this kernel, so the
- * POSIX surface is satisfied locally -- record nothing, report success,
- * and zero any out-parameter a caller might inspect.  Tools that install
- * handlers defensively (timeout, shells) run their no-signal fast paths
- * unchanged.  Apple's sigset_t is a 32-bit mask; struct sigaction is
- * handler + mask + flags (16 bytes) -- zeroing reports "default, empty".
+ * Signal management.  The kernel delivers signals now: sigaction/signal
+ * record a ring-3 handler (or SIG_DFL/SIG_IGN) and hand the kernel the
+ * address of the trampoline below (arg2, like Apple's sa_tramp) so it knows
+ * where to enter ring 3 on a caught signal.  Apple's sigset_t is a 32-bit
+ * mask; struct sigaction leads with the handler at offset 0.
+ *
+ * _sig_tramp is where the kernel resumes ring 3 on a caught signal.  It is
+ * entered with rdi=signo, rsi=siginfo, rdx=ucontext, r10=handler and rsp
+ * 16-aligned-plus-8 (as if called).  It calls the handler, then issues
+ * sigreturn(ucontext) (SYS_sigreturn = 0x20000B8), which never returns.
+ * ucontext is carried across the handler call in callee-saved rbx.
  */
+extern void	sig_tramp(void);
+
+__asm__(
+	".globl _sig_tramp\n"
+	"_sig_tramp:\n"
+	"\tpushq %rbx\n"
+	"\tmovq %rdx, %rbx\n"		/* ucontext -> callee-saved            */
+	"\tmovq %r10, %rax\n"		/* handler                             */
+	"\tcall *%rax\n"		/* handler(signo, siginfo, ucontext)   */
+	"\tmovq %rbx, %rdi\n"		/* ucontext -> sigreturn arg0          */
+	"\tmovq $0x20000B8, %rax\n"	/* SYS_sigreturn (184), BSD class      */
+	"\tsyscall\n"
+	"\tud2\n"			/* sigreturn does not return           */
+);
+
 int
 sigaction(int sig, const void *act, void *oact)
 {
 	long	handler;
 
-	/*
-	 * Apple's struct sigaction leads with the handler union (sa_handler /
-	 * sa_sigaction) at offset 0; extract it and record the disposition in
-	 * the kernel (SYS_sigaction = 0x200002E).  We do not read back a prior
-	 * action, so a caller inspecting *oact sees "default, empty".
-	 */
 	handler = (act != NULL) ? (long)*(const unsigned long *)act : 0;
 	if (oact != NULL)
 		(void)memset(oact, 0, 16);
-	return ((int)bsd_call_e(0x200002E, sig, handler, 0));
+	return ((int)bsd_call_e(0x200002E, sig, handler, (long)&sig_tramp));
 }
 
 void *
@@ -2732,11 +2746,11 @@ signal(int sig, void *handler)
 {
 
 	/*
-	 * signal(3) records through the same kernel path as sigaction.  We do
-	 * not track the previous disposition, so report SIG_DFL (NULL) --
-	 * callers that install a handler rarely inspect the return.
+	 * signal(3) records through the same path as sigaction, handing the
+	 * kernel the trampoline too.  We do not track the previous
+	 * disposition, so report SIG_DFL (NULL).
 	 */
-	(void)bsd_call_e(0x200002E, sig, (long)handler, 0);
+	(void)bsd_call_e(0x200002E, sig, (long)handler, (long)&sig_tramp);
 	return (NULL);
 }
 

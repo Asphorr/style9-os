@@ -176,6 +176,7 @@ struct task {
 	 * thread, via sigaction/sigprocmask -- single-writer, no lock.
 	 */
 	uint64_t		 t_sig_handler[DARWIN_NSIG];
+	uint64_t		 t_sig_tramp;	/* libSystem _sigtramp VA     */
 	volatile uint32_t	 t_sig_pending;
 	uint32_t		 t_sig_mask;
 

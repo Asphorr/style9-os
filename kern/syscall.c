@@ -309,7 +309,7 @@ syscall_dispatch(struct syscall_frame *f)
 	 */
 	if (current_thread->th_task != kernel_task &&
 	    current_thread->th_task->t_personality == TASK_PERSONALITY_DARWIN)
-		darwin_signal_deliver(current_thread->th_task);
+		darwin_signal_deliver_syscall(f, rv);
 
 	return (rv);
 }
