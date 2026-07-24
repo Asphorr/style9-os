@@ -1921,6 +1921,30 @@ demo_darwin_spawn(void)
 	}
 
 	/*
+	 * Demand paging, from ring 3.  Everything above this line got its
+	 * memory the moment it asked for it; mmap hands back an address and
+	 * nothing else, and the pages appear one fault at a time.  The probe
+	 * maps more than the machine has, makes the KERNEL be the first writer
+	 * of an untouched page, and holds a file mapping up against read(2).
+	 */
+	{
+		mach_port_name_t	mprobe_tp;
+
+		mprobe_tp = MACH_PORT_NULL;
+		printf("  >>> spawning mmaptest -- demand-paging probe "
+		    "(mmap / munmap / the pager) <<<\n");
+		child_id = spawn_args("mmaptest", 0, NULL, &mprobe_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('mmaptest') failed (rv=%ld)\n",
+			    child_id);
+			return (95);
+		}
+		for (i = 0; i < 4096 && task_alive((uint64_t)child_id); i++)
+			(void)yield();
+		printf("  mmaptest retired after %d yields\n", i);
+	}
+
+	/*
 	 * A THIRD real Apple binary: guname (GNU coreutils' uname).  The
 	 * machine-identity trick -- it asks uname(2) what it is running on and
 	 * prints the answer, never validating it.  Our kernel hands back a

@@ -77,6 +77,19 @@ const char	*fs_kind(void);
  */
 int		fs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size);
 
+/*
+ * Read at most `len` bytes of a file starting at byte offset `off` into `buf`,
+ * writing the count actually delivered through *out_got.  A read that starts
+ * at or past end-of-file is not an error -- it returns FS_E_OK with zero bytes,
+ * the way pread(2) does -- and a read that runs off the end is short.
+ *
+ * This is the ranged read the whole-file fs_slurp cannot be: it is what backs
+ * the pager (kern/vm_object.c), which needs one 4 KiB page of a file and has
+ * nowhere to put the rest of it.
+ */
+int		fs_pread(const char *path, uint64_t off, uint8_t *buf,
+		    uint32_t len, uint32_t *out_got);
+
 /* Metadata for a path.  Returns FS_E_OK and fills *out, or a negative FS_E_*. */
 int		fs_stat(const char *path, struct fs_statbuf *out);
 

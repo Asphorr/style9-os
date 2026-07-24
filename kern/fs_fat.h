@@ -86,6 +86,15 @@ int	fs_fat_ready(void);
 int	fs_fat_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size);
 
 /*
+ * Read at most `len` bytes of `path` starting at file offset `off` into the
+ * caller's buffer, reporting the count delivered through *out_got.  Reads that
+ * begin at or past end-of-file return FS_FAT_E_OK with zero bytes; reads that
+ * run off the end come back short.  Same path resolution as fs_fat_slurp.
+ */
+int	fs_fat_pread(const char *path, uint64_t off, uint8_t *buf,
+	    uint32_t len, uint32_t *out_got);
+
+/*
  * Report a file-or-directory's metadata without reading it -- the existence +
  * size + type probe behind the Darwin stat path.  Same path resolution as
  * fs_fat_slurp.  Returns FS_FAT_E_OK and fills *out, or a negative FS_FAT_E_*.

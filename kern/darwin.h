@@ -73,12 +73,30 @@
 #define	DARWIN_SYS_sigaction	46
 #define	DARWIN_SYS_sigprocmask	48
 #define	DARWIN_SYS_execve	59
+#define	DARWIN_SYS_munmap	73
 #define	DARWIN_SYS_setitimer	83
 #define	DARWIN_SYS_dup2		90
 #define	DARWIN_SYS_gettimeofday	116
 #define	DARWIN_SYS_fcntl	92
 #define	DARWIN_SYS_sigreturn	184
+#define	DARWIN_SYS_mmap		197
 #define	DARWIN_SYS_lseek	199
+
+/*
+ * mmap(2)'s vocabulary, as <sys/mman.h> spells it on Darwin.  The protection
+ * bits happen to match this kernel's VM_PROT_READ/WRITE/EXEC one for one --
+ * both descend from the same BSD ancestor -- but the syscall layer translates
+ * them explicitly rather than trusting a coincidence to survive.
+ */
+#define	DARWIN_PROT_NONE	0x00
+#define	DARWIN_PROT_READ	0x01
+#define	DARWIN_PROT_WRITE	0x02
+#define	DARWIN_PROT_EXEC	0x04
+
+#define	DARWIN_MAP_SHARED	0x0001
+#define	DARWIN_MAP_PRIVATE	0x0002
+#define	DARWIN_MAP_FIXED	0x0010
+#define	DARWIN_MAP_ANON		0x1000
 
 /* wait4 option bits (Darwin <sys/wait.h>). */
 #define	DARWIN_WNOHANG	1
@@ -234,6 +252,7 @@ struct darwin_uname {
 #define	DARWIN_ECHILD	10
 #define	DARWIN_ENOMEM	12
 #define	DARWIN_EFAULT	14
+#define	DARWIN_ENODEV	19
 #define	DARWIN_EINVAL	22
 #define	DARWIN_EMFILE	24
 #define	DARWIN_ESPIPE	29

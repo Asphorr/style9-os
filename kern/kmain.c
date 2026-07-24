@@ -206,6 +206,14 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 			kprintf("kmain: spawn(hello) failed rv=%ld\n",
 			    hello_id);
 		}
+		/*
+		 * What the demos actually cost in pages.  Reported here rather
+		 * than beside the block-cache line above because nothing has
+		 * faulted yet at mount time -- every mapping the loader makes
+		 * is populated eagerly, and only the ring-3 programs above ask
+		 * for memory they have not touched.
+		 */
+		vm_fault_stats();
 	}
 
 	/*

@@ -177,6 +177,15 @@ extern uint8_t	_binary_timeprobe_macho_start[];
 extern uint8_t	_binary_timeprobe_macho_end[];
 
 /*
+ * mmaptest: the same kind of self-authored probe, for mmap(2) and the demand
+ * paging under it.  Maps more memory than the machine has, makes the kernel
+ * write the first byte of an untouched page, and checks a file mapping's
+ * bytes against read(2)'s.
+ */
+extern uint8_t	_binary_mmaptest_macho_start[];
+extern uint8_t	_binary_mmaptest_macho_end[];
+
+/*
  * A fourth REAL Apple binary: gfactor (GNU coreutils' factor, a Homebrew
  * bottle).  Unlike the libSystem-only binaries above, it also links libgmp --
  * the first program to drive a SECOND dependency, so our dyld maps the whole
@@ -327,6 +336,8 @@ progreg_init(void)
 	    _binary_gcat_macho_start, _binary_gcat_macho_end);
 	register_one("timeprobe",
 	    _binary_timeprobe_macho_start, _binary_timeprobe_macho_end);
+	register_one("mmaptest",
+	    _binary_mmaptest_macho_start, _binary_mmaptest_macho_end);
 	register_one("gfactor",
 	    _binary_gfactor_macho_start, _binary_gfactor_macho_end);
 	register_one("pipefork",

@@ -95,6 +95,7 @@ OBJS	= \
 	$(OBJDIR)/klog.o	\
 	$(OBJDIR)/host.o	\
 	$(OBJDIR)/vm.o		\
+	$(OBJDIR)/vm_object.o	\
 	$(OBJDIR)/task.o	\
 	$(OBJDIR)/thread.o	\
 	$(OBJDIR)/sched.o	\
@@ -150,6 +151,7 @@ OBJS	= \
 	$(OBJDIR)/figlet_macho.o \
 	$(OBJDIR)/dirlist_macho.o \
 	$(OBJDIR)/timeprobe_macho.o \
+	$(OBJDIR)/mmaptest_macho.o \
 	$(OBJDIR)/tree_macho.o \
 	$(OBJDIR)/guname_macho.o \
 	$(OBJDIR)/gcat_macho.o \
@@ -433,6 +435,18 @@ $(OBJDIR)/timeprobe.dwn.o: $(USER_DIR)/timeprobe.c | $(OBJDIR)
 	$(DARWIN_CC) $(DARWIN_CFLAGS) -c $< -o $@
 
 $(OBJDIR)/timeprobe.macho: $(OBJDIR)/timeprobe.dwn.o $(OBJDIR)/libSystem.B.dylib
+	$(DARWIN_LD) $(DARWIN_LDF) -o $@ $< -L$(OBJDIR) -lSystem.B -e _entry \
+	    -pagezero_size $(DYLDHELLO_BASE)
+
+# mmaptest (demand-paging probe): the same shape again, for mmap(2).  Checks
+# that a mapping bigger than the machine's memory succeeds, that a page whose
+# first writer is the KERNEL (read(2) into an untouched mapping) faults in
+# correctly, and that a file mapping's bytes are the file's -- read(2) at the
+# same offsets being the oracle.
+$(OBJDIR)/mmaptest.dwn.o: $(USER_DIR)/mmaptest.c | $(OBJDIR)
+	$(DARWIN_CC) $(DARWIN_CFLAGS) -c $< -o $@
+
+$(OBJDIR)/mmaptest.macho: $(OBJDIR)/mmaptest.dwn.o $(OBJDIR)/libSystem.B.dylib
 	$(DARWIN_LD) $(DARWIN_LDF) -o $@ $< -L$(OBJDIR) -lSystem.B -e _entry \
 	    -pagezero_size $(DYLDHELLO_BASE)
 

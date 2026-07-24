@@ -48,11 +48,30 @@
  *	  arch/amd64/pmap.h so call sites do not have to translate.
  */
 
-struct vm_object;	/* defined when vm_object support lands */
+struct vm_object;	/* kern/vm_object.h -- what the pages are made of */
 struct task;
 
+/*
+ * What an entry says about its pages.  The two questions are separate and
+ * this is the vocabulary for both:
+ *
+ *	VME_F_ANON  -- the frames under this range belong to this entry.
+ *	  Nothing else references them, so teardown frees them.  True of
+ *	  every mapping here, including a private file mapping: its frames
+ *	  are private copies of the file's bytes, which is what MAP_PRIVATE
+ *	  means.  What the initial content was is a separate question,
+ *	  answered by vme_object (NULL = zeroes, otherwise a file).
+ *
+ *	VME_F_LAZY  -- the range is promised but not populated.  There are no
+ *	  page-table leaves under it yet; the first touch of each page takes
+ *	  a fault, and vm_fault installs a frame then.  Without this flag an
+ *	  entry is fully populated at creation and a missing leaf inside it
+ *	  is a bug, not an invitation to page something in -- which is why
+ *	  vm_fault refuses to fill an entry that does not carry it.
+ */
 #define	VME_F_ANON		0x01	/* anonymous (pmm) backing       */
 #define	VME_F_COW		0x02	/* future: copy-on-write share   */
+#define	VME_F_LAZY		0x04	/* populate on first touch       */
 
 struct vm_map_entry {
 	uint64_t		 vme_start;	/* (m) inclusive       */
@@ -102,6 +121,21 @@ void			 vm_map_destroy(struct vm_map *);
 bool			 vm_map_enter(struct vm_map *,
 			    uint64_t va, uint64_t size,
 			    uint8_t prot, uint8_t flags);
+
+/*
+ * vm_map_enter with a pager attached: pages of this range start life holding
+ * the bytes of `obj` from `offset` onward (NULL `obj` means zero-fill, and is
+ * exactly what vm_map_enter passes).  On success the entry takes over the
+ * caller's reference on `obj`; on failure the caller still owns it.
+ *
+ * Only meaningful together with VME_F_LAZY -- an eagerly populated entry has
+ * already been filled by whoever populated it, and nothing will ever consult
+ * its object.
+ */
+bool			 vm_map_enter_backed(struct vm_map *,
+			    uint64_t va, uint64_t size,
+			    uint8_t prot, uint8_t flags,
+			    struct vm_object *obj, uint64_t offset);
 
 /*
  * Remove every entry that lies fully inside [va, va+size).  Partial
@@ -184,11 +218,11 @@ void			 vm_map_release_anon(struct vm_map *,
  * Tear down a single anonymous range previously installed by some
  * combination of vm_map_find_space + per-page pmap_enter + vm_map_enter.
  *
- * Strict semantics in v1: (va, size) MUST mirror a single VME_F_ANON
- * vm_map_entry whose extent covers the request.  Partial deallocate,
- * ranges spanning multiple entries, or ranges naming a non-anonymous
- * entry all return false with no side effect.  Used both by
- * SYS_VM_DEALLOCATE and by send_capture_ool's deallocate-on-send hook.
+ * Strict semantics: (va, size) MUST name a single VME_F_ANON vm_map_entry
+ * EXACTLY -- same start, same end.  Partial deallocate, ranges spanning
+ * multiple entries, or ranges naming a non-anonymous entry all return false
+ * with no side effect.  Used by SYS_VM_DEALLOCATE, by send_capture_ool's
+ * deallocate-on-send hook, and by the Darwin personality's munmap.
  *
  * On success: each present pmap leaf is unmapped, the backing frame is
  * pmm_free_page'd, the matching vm_map_entry is dropped, and true is
@@ -221,5 +255,34 @@ void			 vm_map_reset(struct vm_map *map);
 bool			 vm_map_fork_copy(struct vm_map *src,
 			    struct pmap *src_pm, struct vm_map *dst,
 			    struct pmap *dst_pm);
+
+/*
+ * Outcomes of a fault.  Only VM_FAULT_OK means "resume the instruction";
+ * every other value means the faulting thread should be retired the way an
+ * unhandled fault always was.
+ */
+#define	VM_FAULT_OK		0
+#define	VM_FAULT_NOMAP		1	/* no entry, or not a lazy one  */
+#define	VM_FAULT_PROT		2	/* mapped, but not like that    */
+#define	VM_FAULT_IO		3	/* the pager could not read it  */
+#define	VM_FAULT_NOMEM		4	/* out of frames                */
+
+/*
+ * Populate the page containing `va` in `map`/`pm`.  Called from the #PF
+ * handler for a ring-3 not-present fault, and it is the only thing that
+ * turns a VME_F_LAZY promise into memory: an anonymous range gets a zeroed
+ * frame, a file-backed range gets a frame holding that file's bytes.
+ *
+ * `write` is the fault's access type, so a store to a read-only range is
+ * refused here rather than papered over with a writable page.
+ *
+ * MUST be called with no locks held: filling a file-backed page reads the
+ * disk, and that sleeps.
+ */
+int			 vm_fault(struct vm_map *map, struct pmap *pm,
+			    uint64_t va, bool write);
+
+/* Fault counters, for the shell and the boot banner. */
+void			 vm_fault_stats(void);
 
 #endif /* !_SYS_VM_H_ */

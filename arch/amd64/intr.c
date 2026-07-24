@@ -24,6 +24,7 @@
 #include "task.h"
 #include "thread.h"
 #include "tty.h"
+#include "vm.h"
 
 static irq_handler_t	irq_handlers[16];
 
@@ -64,6 +65,7 @@ static const char *const exception_names[32] = {
 
 static void	intr_panic(const struct trapframe *) __attribute__((noreturn));
 static void	user_fault_die(struct trapframe *);
+static bool	fault_fill(const struct trapframe *tf);
 static uint32_t	deliver_exception_and_wait(struct port *exc,
 		    const struct trapframe *tf,
 		    uint32_t *rip_advance_out);
@@ -166,6 +168,16 @@ intr_dispatch(struct trapframe *tf)
 	unsigned int	irq;
 
 	if (tf->tf_trapno < 32) {
+		/*
+		 * Not every fault is a mistake.  A lazily mapped page
+		 * announces itself exactly this way, and filling it is the
+		 * whole point of mmap; only if nothing claims the address
+		 * does the fault stay a fault.
+		 */
+		if (fault_fill(tf)) {
+			intr_check_async_kill_on_user_return(tf);
+			return;
+		}
 		/*
 		 * Exceptions originating from ring 3 do not bring the
 		 * kernel down: they retire the offending user thread
@@ -369,6 +381,82 @@ deliver_exception_and_wait(struct port *exc, const struct trapframe *tf,
 
 	(void)port_deallocate(kernel_space, reply_name);
 	return (verdict);
+}
+
+/*
+ * The demand-paging half of the #PF handler: decide whether this fault is
+ * a mapping asking to be populated, and populate it if so.  Returns true
+ * when the faulting instruction should simply be re-run.
+ *
+ * Kernel-mode faults come here too, and they must.  A syscall that copies
+ * into a buffer the program mmap'd but has not touched yet -- read(2) into a
+ * fresh malloc'd block is the everyday case -- faults from ring 0 on a user
+ * address, and before demand paging existed that could only ever have been a
+ * bug.  Now it is a page asking to be filled like any other, so the rule is
+ * about the address rather than the ring: a fault on a user VA in the current
+ * task's map is serviceable, a fault on a kernel VA is still a bug and still
+ * panics.
+ *
+ * The one condition either kind of fault has to meet is that the interrupted
+ * code could have slept, because filling a page can sleep: no spinlock was
+ * held.  The preempt count is global here, so that is the whole test -- a
+ * thread that blocks holding a lock is never woken again (kern/bio.c has the
+ * account).  The kernel's user-copy paths satisfy it by construction: they
+ * bounce through a stack buffer and drop their locks before copying, which
+ * they already did for other reasons.  A fault that fails the test is telling
+ * us about a caller that should not have been touching user memory there, and
+ * panicking is the right answer.
+ *
+ * Note what is NOT done here: interrupts are not re-enabled.  Every IDT gate
+ * is an interrupt gate and SYSCALL's FMASK clears IF too, so the entire
+ * kernel side of this system runs with interrupts off and gets its wakeups by
+ * switching away -- the thread that blocks on the disk hands the CPU to
+ * another thread, whose restored RFLAGS turn interrupts back on, and the
+ * drive's interrupt lands there.  ata_wait_intr has always worked this way
+ * from the syscall path; the pager is one more caller on it.  Turning IF on
+ * here would only widen the window in which this fault handler can itself be
+ * interrupted, and buy nothing.
+ *
+ * CR2 is read first and once.  It holds the faulting address only until the
+ * next fault overwrites it, and everything below -- a nested fault, another
+ * thread running while this one waits for the disk -- happens after this
+ * point.
+ */
+static bool
+fault_fill(const struct trapframe *tf)
+{
+	struct task	*t;
+	uint64_t	 cr2;
+	bool		 from_user;
+	bool		 write;
+	int		 rv;
+
+	if (tf->tf_trapno != 14)
+		return (false);
+	/*
+	 * A protection violation means the page IS there and the access was
+	 * not allowed -- a real fault, never a missing mapping.
+	 */
+	if ((tf->tf_err & 0x1) != 0)
+		return (false);
+	if (current_thread == NULL)
+		return (false);
+	t = current_thread->th_task;
+	if (t == NULL || t == kernel_task || t->t_map == NULL ||
+	    t->t_pmap == NULL)
+		return (false);
+
+	cr2       = read_cr2();
+	write     = (tf->tf_err & 0x2) != 0;
+	from_user = (tf->tf_cs & 3) == 3;
+
+	if (!preempt_is_enabled())		/* a lock is held: cannot sleep */
+		return (false);
+	if (!from_user && (cr2 < VM_USER_VA_LO || cr2 >= VM_USER_VA_HI))
+		return (false);			/* a kernel VA: a real bug */
+
+	rv = vm_fault(t->t_map, t->t_pmap, cr2, write);
+	return (rv == VM_FAULT_OK);
 }
 
 /*

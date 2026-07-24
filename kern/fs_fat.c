@@ -613,6 +613,91 @@ fs_fat_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size)
 	return (FS_FAT_E_OK);
 }
 
+/*
+ * The ranged read behind fs_pread.  FAT has no extent map: the only way to
+ * reach byte N is to follow the cluster chain from the start, which is what
+ * the skip loop below does.  That makes a pread O(offset) in chain links --
+ * cheap enough here (the links are FAT-sector reads, and the block cache has
+ * the FAT resident after the first file), and it is the shape of the
+ * filesystem rather than a shortcut in the reader.
+ */
+int
+fs_fat_pread(const char *path, uint64_t off, uint8_t *buf, uint32_t len,
+    uint32_t *out_got)
+{
+	struct fat_ent	 e;
+	uint8_t		*bounce;
+	uint32_t	 clus;
+	uint32_t	 clus_bytes;
+	uint32_t	 skip;
+	uint32_t	 within;
+	uint32_t	 done;
+	uint32_t	 n;
+	uint32_t	 i;
+	int		 rv;
+
+	if (path == NULL || buf == NULL || out_got == NULL)
+		return (FS_FAT_E_INVAL);
+	if (!g_fat.fv_mounted)
+		return (FS_FAT_E_NOMOUNT);
+
+	*out_got = 0;
+	if (len == 0)
+		return (FS_FAT_E_OK);
+
+	rv = resolve_entry(path, &e);
+	if (rv != FS_FAT_E_OK)
+		return (rv);
+	if (e.fe_is_dir)
+		return (FS_FAT_E_NOTFOUND);
+	if (off >= e.fe_size)		/* at or past EOF: zero bytes, no error */
+		return (FS_FAT_E_OK);
+	if ((uint64_t)len > e.fe_size - off)
+		len = (uint32_t)(e.fe_size - off);
+
+	clus_bytes = (uint32_t)g_fat.fv_sec_per_clus * FAT_SECTOR_BYTES;
+	skip       = (uint32_t)(off / clus_bytes);
+	within     = (uint32_t)(off % clus_bytes);
+
+	clus = e.fe_clus;
+	for (i = 0; i < skip; i++) {
+		if (clus < 2 || clus >= FAT16_EOC_MIN)
+			return (FS_FAT_E_IO);	/* chain ended before the file did */
+		clus = fat_next(clus);
+	}
+
+	bounce = kmalloc(clus_bytes);
+	if (bounce == NULL)
+		return (FS_FAT_E_NOMEM);
+
+	done = 0;
+	while (done < len && clus >= 2 && clus < FAT16_EOC_MIN) {
+		uint32_t	lba;
+
+		lba = g_fat.fv_data_start + (clus - 2) * g_fat.fv_sec_per_clus;
+		if (bio_read(0, (uint64_t)lba, g_fat.fv_sec_per_clus,
+		    bounce) != 0) {
+			kfree(bounce);
+			return (FS_FAT_E_IO);
+		}
+		n = clus_bytes - within;
+		if (n > len - done)
+			n = len - done;
+		for (i = 0; i < n; i++)
+			buf[done + i] = bounce[within + i];
+		done  += n;
+		within = 0;
+		clus   = fat_next(clus);
+	}
+	kfree(bounce);
+
+	if (done < len)			/* chain ended before the file did */
+		return (FS_FAT_E_IO);
+
+	*out_got = done;
+	return (FS_FAT_E_OK);
+}
+
 /* ---- stat -------------------------------------------------------------- */
 
 int

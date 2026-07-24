@@ -118,6 +118,7 @@ cmd_mem(int argc, char *argv[])
 	pmm_stats();
 	kmem_stats();
 	bio_stats();
+	vm_fault_stats();
 	return (0);
 }
 

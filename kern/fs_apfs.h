@@ -526,6 +526,15 @@ int	fs_apfs_stat(const char *path, struct fs_apfs_statbuf *out);
 int	fs_apfs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size);
 
 /*
+ * Read at most `len` bytes of `path` starting at file offset `off` into the
+ * caller's buffer, reporting the count delivered through *out_got.  Reads that
+ * begin at or past end-of-file return FS_APFS_E_OK with zero bytes; reads that
+ * run off the end come back short.  Holes read back as zeroes.
+ */
+int	fs_apfs_pread(const char *path, uint64_t off, uint8_t *buf,
+	    uint32_t len, uint32_t *out_got);
+
+/*
  * Read APFS block `bno` into `buf` (which must hold a whole block) and verify
  * its Fletcher-64.  Returns FS_APFS_E_OK, or a negative FS_APFS_E_*.  Exposed
  * because every layer above -- omap, B-trees, volume superblocks -- reads

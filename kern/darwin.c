@@ -19,6 +19,7 @@
 #include "kprintf.h"
 #include "macho.h"
 #include "panic.h"
+#include "pmap.h"
 #include "port.h"
 #include "progreg.h"
 #include "sched.h"
@@ -27,6 +28,8 @@
 #include "task.h"
 #include "thread.h"
 #include "tty.h"
+#include "vm.h"
+#include "vm_object.h"
 
 /*
  * Darwin (XNU) syscall personality dispatcher -- S2 of the Mach-O ladder.
@@ -409,6 +412,32 @@ darwin_fd_alloc(struct task *t)
 	return (darwin_fd_alloc_from(t, 3));
 }
 
+/*
+ * Keep a copy of what a file was opened as.  An fd holds the file's bytes,
+ * but mmap needs its *name*: the pager reads pages one at a time, long after
+ * the open, and with no vnode layer here a path is the only durable handle a
+ * file has.  Returns NULL on allocation failure, which is not fatal -- the fd
+ * still works, it just cannot be mapped.
+ */
+static char *
+darwin_path_dup(const char *path)
+{
+	char	*copy;
+	size_t	 n;
+
+	if (path == NULL)
+		return (NULL);
+	for (n = 0; path[n] != '\0'; n++)
+		continue;
+	copy = kmalloc(n + 1);
+	if (copy == NULL)
+		return (NULL);
+	for (n = 0; path[n] != '\0'; n++)
+		copy[n] = path[n];
+	copy[n] = '\0';
+	return (copy);
+}
+
 /* Release whatever one slot holds and return it to FREE. */
 static void
 darwin_ofile_clear(struct darwin_ofile *of)
@@ -418,6 +447,8 @@ darwin_ofile_clear(struct darwin_ofile *of)
 	case DARWIN_OF_FILE:
 		if (of->of_buf != NULL)
 			kfree(of->of_buf);
+		if (of->of_path != NULL)
+			kfree(of->of_path);
 		break;
 	case DARWIN_OF_PIPE_R:
 		darwin_pipe_drop(of->of_pipe, false);
@@ -430,6 +461,7 @@ darwin_ofile_clear(struct darwin_ofile *of)
 	}
 	of->of_pipe = NULL;
 	of->of_buf  = NULL;
+	of->of_path = NULL;
 	of->of_size = 0;
 	of->of_off  = 0;
 	of->of_type = DARWIN_OF_FREE;
@@ -568,6 +600,7 @@ darwin_files_fork_copy(struct task *parent, struct task *child)
 			for (k = 0; k < src->of_size; k++)
 				buf[k] = src->of_buf[k];
 			dst->of_buf  = buf;
+			dst->of_path = darwin_path_dup(src->of_path);
 			dst->of_size = src->of_size;
 			dst->of_off  = src->of_off;
 			dst->of_type = DARWIN_OF_FILE;
@@ -631,6 +664,7 @@ darwin_dup_install(struct task *t, int oldfd, int newfd)
 		for (k = 0; k < src->of_size; k++)
 			buf[k] = src->of_buf[k];
 		dst->of_buf  = buf;
+		dst->of_path = darwin_path_dup(src->of_path);
 		dst->of_size = src->of_size;
 		dst->of_off  = src->of_off;
 		dst->of_type = DARWIN_OF_FILE;
@@ -1223,6 +1257,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		long				 len;
 		int				 fd;
 		int				 rv;
+		bool				 on_disk;
 
 		len = syscall_copyin_str((const char *)f->sf_arg0, path,
 		    sizeof(path));
@@ -1240,6 +1275,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		if ((f->sf_arg1 & 3) != 0 || (f->sf_arg1 & 0x608) != 0)
 			return (darwin_err(f, DARWIN_EROFS));
 
+		on_disk = true;
 		rv = fs_slurp(path, &buf, &size);
 		if (rv == FS_E_NOTFOUND || rv == FS_E_NOMOUNT) {
 			/* Not on the disk: try the synthetic /bin (progreg). */
@@ -1255,6 +1291,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			for (k = 0; k < (uint32_t)pe->pr_size; k++)
 				buf[k] = pe->pr_image[k];
 			size = (uint32_t)pe->pr_size;
+			on_disk = false;
 		} else if (rv != FS_E_OK) {
 			kprintf("darwin: open('%s') -> %s rv=%d\n",
 			    path, fs_kind(), rv);
@@ -1270,6 +1307,15 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			return (darwin_err(f, DARWIN_EMFILE));
 		}
 		t->t_darwin_files[fd].of_buf  = buf;
+		/*
+		 * Only a file that really is on the volume gets a name kept
+		 * for it.  The synthetic /bin entries are built into the
+		 * kernel image and no path resolves to them, so an fd on one
+		 * is readable but not mappable -- better than handing mmap a
+		 * name its pager would fail on at the first fault.
+		 */
+		t->t_darwin_files[fd].of_path =
+		    on_disk ? darwin_path_dup(path) : NULL;
 		t->t_darwin_files[fd].of_size = size;
 		t->t_darwin_files[fd].of_off  = 0;
 		t->t_darwin_files[fd].of_type = DARWIN_OF_FILE;
@@ -1741,6 +1787,117 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		f->sf_user_rsp    = frame.sf_rsp;
 		f->sf_user_rflags = darwin_signal_rflags(frame.sf_rflags);
 		return ((long)frame.sf_rax);		/* becomes user %rax */
+	}
+	case DARWIN_SYS_mmap: {
+		struct darwin_ofile	*of;
+		struct vm_object	*obj;
+		struct task		*t;
+		uint64_t		 size;
+		uint64_t		 off;
+		uint64_t		 va;
+		uint32_t		 uprot;
+		uint32_t		 flags;
+		uint8_t			 prot;
+		int			 fd;
+
+		size  = f->sf_arg1;
+		uprot = (uint32_t)f->sf_arg2;
+		flags = (uint32_t)f->sf_arg3;
+		fd    = (int)f->sf_arg4;
+		off   = f->sf_arg5;
+		t     = current_thread->th_task;
+
+		if (size == 0)
+			return (darwin_err(f, DARWIN_EINVAL));
+		/*
+		 * The address argument is a hint and this takes it as one: the
+		 * map picks the range.  MAP_FIXED is the case where the caller
+		 * is not asking but telling, and honouring it means splitting
+		 * or replacing whatever already lives there -- say no rather
+		 * than quietly place the mapping somewhere else, which is the
+		 * one answer a MAP_FIXED caller cannot cope with.
+		 */
+		if ((flags & DARWIN_MAP_FIXED) != 0)
+			return (darwin_err(f, DARWIN_EINVAL));
+		if ((flags & (DARWIN_MAP_SHARED | DARWIN_MAP_PRIVATE)) == 0)
+			return (darwin_err(f, DARWIN_EINVAL));
+
+		size = (size + 0xFFFull) & ~0xFFFull;
+		if (size == 0)			/* rounded past 64 bits */
+			return (darwin_err(f, DARWIN_ENOMEM));
+
+		prot = VM_PROT_USER;
+		if ((uprot & DARWIN_PROT_READ) != 0)
+			prot |= VM_PROT_READ;
+		if ((uprot & DARWIN_PROT_WRITE) != 0)
+			prot |= VM_PROT_WRITE;
+		if ((uprot & DARWIN_PROT_EXEC) != 0)
+			prot |= VM_PROT_EXEC;
+
+		obj = NULL;
+		if ((flags & DARWIN_MAP_ANON) != 0) {
+			if (off != 0)
+				return (darwin_err(f, DARWIN_EINVAL));
+		} else {
+			if (fd < 0 || fd >= DARWIN_NOFILE)
+				return (darwin_err(f, DARWIN_EBADF));
+			of = &t->t_darwin_files[fd];
+			if (of->of_type != DARWIN_OF_FILE)
+				return (darwin_err(f, DARWIN_EBADF));
+			if (of->of_path == NULL)
+				return (darwin_err(f, DARWIN_ENODEV));
+			if ((off & 0xFFFull) != 0)
+				return (darwin_err(f, DARWIN_EINVAL));
+			obj = vm_object_file(of->of_path, of->of_size);
+			if (obj == NULL)
+				return (darwin_err(f, DARWIN_ENOMEM));
+		}
+
+		if (!vm_map_find_space(t->t_map, size, &va)) {
+			vm_object_deref(obj);
+			return (darwin_err(f, DARWIN_ENOMEM));
+		}
+		/*
+		 * No frames are allocated here and no page tables are touched:
+		 * the entry is the whole mapping until something reads or
+		 * writes it.  That is the difference between this and
+		 * vm_allocate, and it is why mapping a 4 MiB file costs a
+		 * kmalloc rather than 4 MiB.
+		 */
+		if (!vm_map_enter_backed(t->t_map, va, size, prot,
+		    VME_F_ANON | VME_F_LAZY, obj, off)) {
+			vm_object_deref(obj);
+			return (darwin_err(f, DARWIN_ENOMEM));
+		}
+		kprintf("darwin: UNIX mmap(%llu KiB, prot=%u, %s) -> 0x%llx\n",
+		    (unsigned long long)(size >> 10), (unsigned)uprot,
+		    (obj != NULL) ? obj->vo_path : "anon",
+		    (unsigned long long)va);
+		return (darwin_ok(f, (long)va));
+	}
+	case DARWIN_SYS_munmap: {
+		struct task	*t;
+		uint64_t	 va;
+		uint64_t	 size;
+
+		va   = f->sf_arg0;
+		size = f->sf_arg1;
+		t    = current_thread->th_task;
+
+		if (size == 0 || (va & 0xFFFull) != 0)
+			return (darwin_err(f, DARWIN_EINVAL));
+		size = (size + 0xFFFull) & ~0xFFFull;
+		if (size == 0)
+			return (darwin_err(f, DARWIN_EINVAL));
+		/*
+		 * Whole mappings only.  Unmapping the middle of a range means
+		 * splitting an entry in two, which this vm_map cannot do yet;
+		 * refusing is honest, where succeeding without doing it would
+		 * leave the caller believing memory had been returned.
+		 */
+		if (!vm_map_release(t->t_map, t->t_pmap, va, size))
+			return (darwin_err(f, DARWIN_EINVAL));
+		return (darwin_ok(f, 0));
 	}
 	case DARWIN_SYS_setitimer:
 		/*

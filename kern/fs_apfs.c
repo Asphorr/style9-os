@@ -747,15 +747,19 @@ fs_apfs_stat(const char *path, struct fs_apfs_statbuf *out)
 }
 
 /*
- * Copying a file's extents into a buffer.  er_bounce holds the one partial
- * block a file that does not end on a block boundary needs -- allocated once
- * by the caller rather than per extent.
+ * Copying part of a file's extents into a buffer.  The wanted byte window is
+ * [er_lo, er_hi) of the file and er_buf holds er_lo; a whole-file read is just
+ * the window [0, size).  er_bounce holds the one partial block a window whose
+ * edges do not land on block boundaries needs -- allocated once by the caller
+ * rather than per extent.
  */
 struct extent_read {
 	uint64_t	 er_id;		/* the dstream this belongs to */
-	uint8_t		*er_buf;
+	uint8_t		*er_buf;	/* holds file byte er_lo       */
 	uint8_t		*er_bounce;
-	uint64_t	 er_size;
+	uint64_t	 er_size;	/* end of the file's content   */
+	uint64_t	 er_lo;		/* window start, in file bytes */
+	uint64_t	 er_hi;		/* window end,   in file bytes */
 	uint64_t	 er_got;
 	int		 er_rv;
 };
@@ -771,6 +775,8 @@ extent_copy(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 	uint64_t				 phys;
 	uint64_t				 off;
 	uint64_t				 dst;
+	uint64_t				 lo;
+	uint64_t				 hi;
 	uint64_t				 n;
 
 	er = arg;
@@ -787,32 +793,54 @@ extent_copy(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 
 	if (logical >= er->er_size)
 		return (true);
+	/*
+	 * Past the window.  Records sort by (oid, logical), so once one of
+	 * this file's extents starts beyond what was asked for, no later
+	 * record can be wanted either -- stop the walk rather than read the
+	 * rest of the tree for nothing.  For a whole-file read the window is
+	 * the whole file and this never fires.
+	 */
+	if (logical >= er->er_hi)
+		return (false);
 	if (phys == 0)
 		return (true);		/* a hole: the buffer is already zero */
 
 	for (off = 0; off < len; off += APFS_BLOCK_SIZE) {
-		dst = logical + off;
+		dst = logical + off;		/* file offset of this block */
 		/*
 		 * An extent is an ALLOCATED run and can reach past the end of
 		 * the file; the tail of its last block is not ours to copy.
 		 */
-		if (dst >= er->er_size)
+		if (dst >= er->er_size || dst >= er->er_hi)
 			break;
-		n = er->er_size - dst;
-		if (n >= APFS_BLOCK_SIZE) {
+		if (dst + APFS_BLOCK_SIZE <= er->er_lo)
+			continue;		/* entirely before the window */
+
+		/* The slice of this block that is both real content and wanted. */
+		lo = (dst < er->er_lo) ? er->er_lo : dst;
+		hi = dst + APFS_BLOCK_SIZE;
+		if (hi > er->er_size)
+			hi = er->er_size;
+		if (hi > er->er_hi)
+			hi = er->er_hi;
+		if (lo >= hi)
+			continue;
+		n = hi - lo;
+
+		if (n == APFS_BLOCK_SIZE) {
 			if (read_block_raw(phys + off / APFS_BLOCK_SIZE,
-			    er->er_buf + dst) != FS_APFS_E_OK) {
+			    er->er_buf + (lo - er->er_lo)) != FS_APFS_E_OK) {
 				er->er_rv = FS_APFS_E_IO;
 				return (false);
 			}
-			n = APFS_BLOCK_SIZE;
 		} else {
 			if (read_block_raw(phys + off / APFS_BLOCK_SIZE,
 			    er->er_bounce) != FS_APFS_E_OK) {
 				er->er_rv = FS_APFS_E_IO;
 				return (false);
 			}
-			mem_copy(er->er_buf + dst, er->er_bounce, (size_t)n);
+			mem_copy(er->er_buf + (lo - er->er_lo),
+			    er->er_bounce + (lo - dst), (size_t)n);
 		}
 		er->er_got += n;
 	}
@@ -872,6 +900,8 @@ fs_apfs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size)
 	er.er_buf    = buf;
 	er.er_bounce = bounce;
 	er.er_size   = st.afs_size;
+	er.er_lo     = 0;
+	er.er_hi     = st.afs_size;
 	er.er_got    = 0;
 	er.er_rv     = FS_APFS_E_OK;
 	stopped = false;
@@ -885,6 +915,82 @@ fs_apfs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size)
 	}
 	*out_buf  = buf;
 	*out_size = (uint32_t)st.afs_size;
+	return (FS_APFS_E_OK);
+}
+
+/*
+ * The ranged read behind fs_pread.  Same extent walk as the slurp above,
+ * pointed at a window instead of at the whole file: the caller's buffer holds
+ * file byte `off`, and only the blocks overlapping [off, off+len) are read.
+ *
+ * The buffer is zeroed first for the same reason the slurp zeroes its own --
+ * a hole has no block to read, so its bytes have to be put there by hand --
+ * and that also covers a window that reaches past end-of-file.
+ */
+int
+fs_apfs_pread(const char *path, uint64_t off, uint8_t *buf, uint32_t len,
+    uint32_t *out_got)
+{
+	struct inode_info	 ii;
+	struct extent_read	 er;
+	uint8_t			*bounce;
+	uint64_t		 oid;
+	uint64_t		 hi;
+	int			 is_dir;
+	int			 rv;
+	bool			 stopped;
+
+	if (path == NULL || buf == NULL || out_got == NULL)
+		return (FS_APFS_E_IO);
+	if (!g_apfs.ac_mounted)
+		return (FS_APFS_E_NOMOUNT);
+
+	*out_got = 0;
+	if (len == 0)
+		return (FS_APFS_E_OK);
+
+	rv = fs_apfs_lookup(path, &oid, &is_dir);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	if (is_dir)
+		return (FS_APFS_E_NOTFOUND);
+	rv = inode_info(oid, &ii);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+
+	if (off >= ii.ii_size)		/* at or past EOF: zero bytes, no error */
+		return (FS_APFS_E_OK);
+	hi = off + (uint64_t)len;
+	if (hi > ii.ii_size)
+		hi = ii.ii_size;
+
+	mem_zero(buf, (size_t)(hi - off));
+
+	bounce = kmalloc(APFS_BLOCK_SIZE);
+	if (bounce == NULL)
+		return (FS_APFS_E_NOMEM);
+
+	er.er_id     = ii.ii_private_id;
+	er.er_buf    = buf;
+	er.er_bounce = bounce;
+	er.er_size   = ii.ii_size;
+	er.er_lo     = off;
+	er.er_hi     = hi;
+	er.er_got    = 0;
+	er.er_rv     = FS_APFS_E_OK;
+	stopped = false;
+	if (!btree_walk(g_apfs.ac_root_tree_bno, extent_copy, &er, 0, &stopped))
+		er.er_rv = FS_APFS_E_IO;
+	kfree(bounce);
+
+	if (er.er_rv != FS_APFS_E_OK)
+		return (er.er_rv);
+
+	/*
+	 * The window's whole length is delivered, not er_got: the bytes a hole
+	 * contributes are real zeroes that no block was read for.
+	 */
+	*out_got = (uint32_t)(hi - off);
 	return (FS_APFS_E_OK);
 }
 

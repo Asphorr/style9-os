@@ -89,6 +89,7 @@ struct darwin_pipe;
 struct darwin_ofile {
 	struct darwin_pipe	*of_pipe;	/* PIPE_*: shared object   */
 	uint8_t			*of_buf;	/* FILE: kmalloc'd image   */
+	char			*of_path;	/* FILE: what it was named */
 	uint32_t		 of_size;	/* FILE: valid bytes       */
 	uint32_t		 of_off;	/* FILE: read cursor       */
 	uint8_t			 of_type;	/* DARWIN_OF_*             */

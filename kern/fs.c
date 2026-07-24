@@ -90,6 +90,18 @@ fs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size)
 }
 
 int
+fs_pread(const char *path, uint64_t off, uint8_t *buf, uint32_t len,
+    uint32_t *out_got)
+{
+
+	if (fs_apfs_ready())
+		return (apfs_err(fs_apfs_pread(path, off, buf, len, out_got)));
+	if (fs_fat_ready())
+		return (fat_err(fs_fat_pread(path, off, buf, len, out_got)));
+	return (FS_E_NOMOUNT);
+}
+
+int
 fs_stat(const char *path, struct fs_statbuf *out)
 {
 	struct fs_apfs_statbuf	asb;
