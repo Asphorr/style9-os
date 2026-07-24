@@ -25,6 +25,16 @@
 
 void		tsc_calibrate(void);
 uint64_t	tsc_hz(void);
+
+/*
+ * The TSC value and the PIT tick count latched at the same instant, at the
+ * end of calibration.  Together they are the reference a caller interpolates
+ * from when it needs finer resolution than the 100 Hz tick: ticks give a
+ * drift-free base, the TSC delta gives the microseconds between them.  Both
+ * read 0 before tsc_calibrate has run.
+ */
+uint64_t	tsc_anchor_cycles(void);
+uint64_t	tsc_anchor_ticks(void);
 uint64_t	tsc_to_ns(uint64_t cycles);
 uint64_t	tsc_to_us(uint64_t cycles);
 

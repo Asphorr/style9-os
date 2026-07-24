@@ -16,6 +16,15 @@
 static uint64_t	tsc_freq_hz;
 
 /*
+ * The end-of-calibration instant, latched from both clocks at once.  This
+ * pair is what lets a caller read time BETWEEN PIT ticks: the tick count is a
+ * coarse but drift-free base, and the TSC delta since the same instant fills
+ * in the microseconds the 100 Hz tick cannot express.  (c) as above.
+ */
+static uint64_t	tsc_anchor_tsc;
+static uint64_t	tsc_anchor_pit;
+
+/*
  * Calibration loop: spin until the PIT tick counter has advanced by
  * `samples` ticks, sampling TSC at both ends.  At PIT_DEFAULT_HZ this
  * is `samples * 10 ms` of wall clock.  We use ACQUIRE-ordered tick
@@ -55,6 +64,8 @@ tsc_calibrate(void)
 		panic("tsc_calibrate: PIT did not advance");
 
 	tsc_freq_hz = (delta_tsc * pit_hz()) / delta_pit;
+	tsc_anchor_tsc = t1;
+	tsc_anchor_pit = p1;
 
 	kprintf("tsc: %llu Hz (~%llu MHz) over %llu PIT ticks "
 	    "(%llu cycles)\n",
@@ -69,6 +80,20 @@ tsc_hz(void)
 {
 
 	return (tsc_freq_hz);
+}
+
+uint64_t
+tsc_anchor_cycles(void)
+{
+
+	return (tsc_anchor_tsc);
+}
+
+uint64_t
+tsc_anchor_ticks(void)
+{
+
+	return (tsc_anchor_pit);
 }
 
 /*

@@ -75,6 +75,7 @@
 #define	DARWIN_SYS_execve	59
 #define	DARWIN_SYS_setitimer	83
 #define	DARWIN_SYS_dup2		90
+#define	DARWIN_SYS_gettimeofday	116
 #define	DARWIN_SYS_fcntl	92
 #define	DARWIN_SYS_sigreturn	184
 #define	DARWIN_SYS_lseek	199
@@ -167,6 +168,27 @@ struct darwin_fdstat {
 	uint32_t	fds_size;	/* byte length (regular files)   */
 	uint8_t		fds_kind;	/* DARWIN_FDSTAT_*               */
 };
+
+/*
+ * struct timeval, EXACTLY as x86_64 Darwin lays it out -- this one is written
+ * into a genuine Apple binary's own storage, so the layout is not ours to
+ * choose.  tv_sec is time_t (64-bit); tv_usec is suseconds_t, a 32-BIT int at
+ * offset 8, with the last four bytes pure alignment padding.  Spelling the
+ * padding out beats writing a 64-bit microsecond field and relying on
+ * little-endian byte order to make it come out right.
+ *
+ * The time is UTC.  There is no timezone database in this kernel, and the
+ * second argument gettimeofday(2) accepts for one has been ignored by every
+ * real system for decades.
+ */
+struct darwin_timeval {
+	int64_t		tv_sec;
+	int32_t		tv_usec;
+	int32_t		tv_pad;
+};
+
+_Static_assert(sizeof(struct darwin_timeval) == 16,
+    "struct timeval is 16 bytes on x86_64 Darwin");
 
 /*
  * uname(struct darwin_uname *out): report the machine's identity card.  A

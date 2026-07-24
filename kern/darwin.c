@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "clock.h"
 #include "darwin.h"
 #include "fs.h"
 #include "gdt.h"
@@ -1165,6 +1166,30 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		default:
 			return (darwin_err(f, DARWIN_EBADF));
 		}
+	}
+	case DARWIN_SYS_gettimeofday: {
+		struct darwin_timeval	tv;
+		int64_t			us;
+
+		/*
+		 * The only wall-clock source a program has.  A machine with no
+		 * usable RTC reports EPERM rather than handing back 1970: a
+		 * program that knows the time is unavailable can say so, while
+		 * one told it is the epoch will print a date and be believed.
+		 */
+		if (!clock_walltime_valid())
+			return (darwin_err(f, DARWIN_EPERM));
+		us = clock_walltime_us();
+		tv.tv_sec  = us / 1000000LL;
+		tv.tv_usec = (int32_t)(us % 1000000LL);
+		tv.tv_pad  = 0;
+
+		/* NULL is legal: a caller may want only the return value. */
+		if (f->sf_arg0 != 0 &&
+		    syscall_copyout((void *)f->sf_arg0, &tv, sizeof(tv)) != 0)
+			return (darwin_err(f, DARWIN_EFAULT));
+		/* arg1 is the timezone pointer; ignored, as everywhere else. */
+		return (darwin_ok(f, 0));
 	}
 	case DARWIN_SYS_getpid: {
 		uint64_t	id;

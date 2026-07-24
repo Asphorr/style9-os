@@ -21,6 +21,7 @@
 #include "pmm.h"
 #include "port.h"
 #include "progreg.h"
+#include "rtc.h"
 #include "sched.h"
 #include "services.h"
 #include "shell.h"
@@ -33,6 +34,7 @@
 static int	cmd_help(int, char **);
 static int	cmd_mem(int, char **);
 static int	cmd_uptime(int, char **);
+static int	cmd_date(int, char **);
 static int	cmd_pmap(int, char **);
 static int	cmd_memmap(int, char **);
 static int	cmd_clear(int, char **);
@@ -67,6 +69,7 @@ const struct shell_cmd	shell_cmds[] = {
 	{ "memmap", "firmware-supplied physical map",         cmd_memmap },
 	{ "pmap",   "kernel pmap state",                      cmd_pmap   },
 	{ "uptime", "kernel uptime",                          cmd_uptime },
+	{ "date",   "wall-clock time (UTC)",                  cmd_date   },
 	{ "clear",  "clear the screen",                       cmd_clear  },
 	{ "echo",   "echo arguments",                         cmd_echo   },
 	{ "port",   "port <list|new|send N|recv N|pingpong>", cmd_port   },
@@ -153,6 +156,33 @@ cmd_uptime(int argc, char *argv[])
 	    (unsigned long long)ms,
 	    (unsigned long long)clock_ticks(),
 	    (unsigned long long)clock_hz());
+	return (0);
+}
+
+/*
+ * date -- what the calendar says, as opposed to uptime's how-long-since-boot.
+ * Prints ISO 8601 in UTC: no timezone database exists here, and a made-up
+ * local time would be worse than an honest Z.
+ */
+static int
+cmd_date(int argc, char *argv[])
+{
+	struct rtc_time	t;
+	int64_t		us;
+
+	(void)argc;
+	(void)argv;
+
+	if (!clock_walltime_valid()) {
+		kprintf("date: no RTC -- wall time unavailable\n");
+		return (1);
+	}
+	us = clock_walltime_us();
+	rtc_from_epoch(us / 1000000LL, &t);
+	kprintf("%u-%02u-%02uT%02u:%02u:%02uZ (epoch %lld.%06u)\n",
+	    (unsigned)t.rt_year, (unsigned)t.rt_month, (unsigned)t.rt_day,
+	    (unsigned)t.rt_hour, (unsigned)t.rt_min, (unsigned)t.rt_sec,
+	    (long long)(us / 1000000LL), (unsigned)(us % 1000000LL));
 	return (0);
 }
 

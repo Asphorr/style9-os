@@ -112,6 +112,7 @@ OBJS	= \
 	$(OBJDIR)/mouse_drv.o	\
 	$(OBJDIR)/uart_drv.o	\
 	$(OBJDIR)/ata_drv.o	\
+	$(OBJDIR)/rtc.o		\
 	$(OBJDIR)/dev_subsystem.o \
 	$(OBJDIR)/elf.o		\
 	$(OBJDIR)/macho.o	\
@@ -147,6 +148,7 @@ OBJS	= \
 	$(OBJDIR)/dyldbig_macho.o \
 	$(OBJDIR)/figlet_macho.o \
 	$(OBJDIR)/dirlist_macho.o \
+	$(OBJDIR)/timeprobe_macho.o \
 	$(OBJDIR)/tree_macho.o \
 	$(OBJDIR)/guname_macho.o \
 	$(OBJDIR)/gcat_macho.o \
@@ -419,6 +421,17 @@ $(OBJDIR)/dirlist.dwn.o: $(USER_DIR)/dirlist.c | $(OBJDIR)
 	$(DARWIN_CC) $(DARWIN_CFLAGS) -c $< -o $@
 
 $(OBJDIR)/dirlist.macho: $(OBJDIR)/dirlist.dwn.o $(OBJDIR)/libSystem.B.dylib
+	$(DARWIN_LD) $(DARWIN_LDF) -o $@ $< -L$(OBJDIR) -lSystem.B -e _entry \
+	    -pagezero_size $(DYLDHELLO_BASE)
+
+# timeprobe (wall-clock probe): the same kind of self-authored Darwin-ABI
+# binary, for the clock.  It checks that the time is plausible, that it
+# advances, and that it never runs backwards -- de-risking gettimeofday and
+# clock_gettime before gdate or a timestamped listing depends on them.
+$(OBJDIR)/timeprobe.dwn.o: $(USER_DIR)/timeprobe.c | $(OBJDIR)
+	$(DARWIN_CC) $(DARWIN_CFLAGS) -c $< -o $@
+
+$(OBJDIR)/timeprobe.macho: $(OBJDIR)/timeprobe.dwn.o $(OBJDIR)/libSystem.B.dylib
 	$(DARWIN_LD) $(DARWIN_LDF) -o $@ $< -L$(OBJDIR) -lSystem.B -e _entry \
 	    -pagezero_size $(DYLDHELLO_BASE)
 

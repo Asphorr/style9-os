@@ -2028,13 +2028,68 @@ realpath_extsn(const char *path, char *resolved)
 	return (out);
 }
 
-/* time: no RTC wired to ring 3 -> a fixed epoch. */
+/*
+ * Wall clock.  The kernel reads the CMOS RTC once at boot and reports the
+ * anchor plus elapsed uptime, so these are cheap and monotonic.  UTC only --
+ * no timezone database exists on this system, and gettimeofday's second
+ * argument has been ignored by real systems for decades.
+ */
+struct s9_timeval {			/* mirrors kern/darwin.h exactly */
+	long		tv_sec;
+	int		tv_usec;
+	int		tv_pad;
+};
+
+/* The carry-capturing trap wrapper; defined with the process-control block. */
+static long	bsd_call_e(long nr, long a, long b, long c);
+
+int
+gettimeofday(struct s9_timeval *tv, void *tz)
+{
+
+	(void)tz;
+	return ((int)bsd_call_e(0x2000074, (long)tv, 0, 0));
+}
+
 long
 time(long *t)
 {
+	struct s9_timeval	tv;
 
+	if (gettimeofday(&tv, (void *)0) != 0)
+		tv.tv_sec = 0;		/* no clock: (time_t)-1 is the C answer,
+					   but 0 is what our callers can print */
 	if (t != NULL)
-		*t = 0;
+		*t = tv.tv_sec;
+	return (tv.tv_sec);
+}
+
+/*
+ * clock_gettime.  Every clock id gets the same answer here, and that is a
+ * fact about this system rather than a shortcut: the kernel's wall time IS
+ * uptime plus a boot-time anchor that nothing can change afterwards, so it
+ * already has the property MONOTONIC exists to promise -- it cannot be
+ * stepped, slewed, or set backwards.  The only difference from a textbook
+ * MONOTONIC clock is which instant counts as zero, and a program measuring an
+ * interval subtracts two readings and never notices.
+ */
+struct s9_timespec {
+	long	tv_sec;
+	long	tv_nsec;
+};
+
+int
+clock_gettime(int clk, struct s9_timespec *ts)
+{
+	struct s9_timeval	tv;
+
+	(void)clk;
+	if (ts == (void *)0)
+		return (-1);
+	if (gettimeofday(&tv, (void *)0) != 0)
+		return (-1);
+	ts->tv_sec  = tv.tv_sec;
+	ts->tv_nsec = (long)tv.tv_usec * 1000L;
 	return (0);
 }
 

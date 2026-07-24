@@ -1898,6 +1898,29 @@ demo_darwin_spawn(void)
 	}
 
 	/*
+	 * The wall clock, from ring 3.  Uptime has been available since the
+	 * PIT came up, but the calendar needs a chip that was running before
+	 * we were; this probe is where that distinction gets tested rather
+	 * than assumed -- plausible date, advances, never runs backwards.
+	 */
+	{
+		mach_port_name_t	tprobe_tp;
+
+		tprobe_tp = MACH_PORT_NULL;
+		printf("  >>> spawning timeprobe -- wall-clock probe "
+		    "(gettimeofday / clock_gettime / time) <<<\n");
+		child_id = spawn_args("timeprobe", 0, NULL, &tprobe_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('timeprobe') failed (rv=%ld)\n",
+			    child_id);
+			return (95);
+		}
+		for (i = 0; i < 512 && task_alive((uint64_t)child_id); i++)
+			(void)yield();
+		printf("  timeprobe retired after %d yields\n", i);
+	}
+
+	/*
 	 * A THIRD real Apple binary: guname (GNU coreutils' uname).  The
 	 * machine-identity trick -- it asks uname(2) what it is running on and
 	 * prints the answer, never validating it.  Our kernel hands back a

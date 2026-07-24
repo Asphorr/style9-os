@@ -168,6 +168,15 @@ extern uint8_t	_binary_gcat_macho_start[];
 extern uint8_t	_binary_gcat_macho_end[];
 
 /*
+ * timeprobe: the self-authored Darwin-ABI probe for the wall clock -- the
+ * dirlist of timekeeping.  Checks that the time is plausible, advances, and
+ * never runs backwards, so the clock is proven from ring 3 before a genuine
+ * binary's dates depend on it.
+ */
+extern uint8_t	_binary_timeprobe_macho_start[];
+extern uint8_t	_binary_timeprobe_macho_end[];
+
+/*
  * A fourth REAL Apple binary: gfactor (GNU coreutils' factor, a Homebrew
  * bottle).  Unlike the libSystem-only binaries above, it also links libgmp --
  * the first program to drive a SECOND dependency, so our dyld maps the whole
@@ -316,6 +325,8 @@ progreg_init(void)
 	    _binary_guname_macho_start, _binary_guname_macho_end);
 	register_one("gcat",
 	    _binary_gcat_macho_start, _binary_gcat_macho_end);
+	register_one("timeprobe",
+	    _binary_timeprobe_macho_start, _binary_timeprobe_macho_end);
 	register_one("gfactor",
 	    _binary_gfactor_macho_start, _binary_gfactor_macho_end);
 	register_one("pipefork",
