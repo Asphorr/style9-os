@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 
+#include "fs.h"
 #include "spinlock.h"
 
 /*
@@ -34,12 +35,12 @@
  * them.  When a writable shared mapping is wanted, this is the struct that
  * grows a page list.
  *
- * A file object names its file by path rather than by any handle, because
- * there are no vnodes here: kern/fs.h is a path-addressed interface, so a
- * path is the only durable name a file has.  The pager therefore re-walks
- * the directory tree once per page fault.  That is the honest cost of not
- * having a vnode layer, it is bounded (the walk hits the block cache), and
- * it is the first thing to fix if the pager ever shows up in a profile.
+ * A file object holds the file RESOLVED (a struct fs_handle), not its path.
+ * That distinction was measured, not assumed: resolving "/var/db/big.txt"
+ * costs a tree walk per component plus one for the inode, and a pager that
+ * re-resolved per fault spent 936 us on each 4 KiB page, nearly all of it
+ * re-answering a question it had already answered.  The path is kept beside
+ * the handle, but only so diagnostics can say which file a mapping is.
  */
 
 #define	VM_OBJ_PATH_MAX		256
@@ -51,18 +52,21 @@
  */
 struct vm_object {
 	struct spinlock	 vo_lock;
+	struct fs_handle vo_handle;	/* (c) the file, resolved        */
 	uint64_t	 vo_size;	/* (c) bytes of real content     */
 	uint64_t	 vo_n_page;	/* (o) pages served so far       */
 	uint32_t	 vo_refs;	/* (o) map entries naming it     */
-	char		 vo_path[VM_OBJ_PATH_MAX];	/* (c)           */
+	char		 vo_path[VM_OBJ_PATH_MAX];	/* (c) for humans */
 };
 
 /*
- * Create a file-backed object naming `path`, whose content is `size` bytes
- * long.  Returns it with one reference, which the caller hands to the
- * vm_map_entry it is about to create.  NULL on allocation failure.
+ * Create a file-backed object over an already-resolved file, remembering
+ * `path` for diagnostics.  Returns it with one reference, which the caller
+ * hands to the vm_map_entry it is about to create.  NULL on allocation
+ * failure.
  */
-struct vm_object	*vm_object_file(const char *path, uint64_t size);
+struct vm_object	*vm_object_file(const struct fs_handle *h,
+			    const char *path);
 
 void			 vm_object_ref(struct vm_object *);
 void			 vm_object_deref(struct vm_object *);

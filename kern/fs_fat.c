@@ -621,11 +621,37 @@ fs_fat_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size)
  * the FAT resident after the first file), and it is the shape of the
  * filesystem rather than a shortcut in the reader.
  */
+/*
+ * Resolve a path to its starting cluster and length -- the expensive half of
+ * reading on this filesystem too, since resolving walks a directory per path
+ * component.  Paid once, by whoever opens the file.
+ */
 int
-fs_fat_pread(const char *path, uint64_t off, uint8_t *buf, uint32_t len,
-    uint32_t *out_got)
+fs_fat_open(const char *path, uint64_t *id_out, uint64_t *size_out)
 {
-	struct fat_ent	 e;
+	struct fat_ent	e;
+	int		rv;
+
+	if (path == NULL || id_out == NULL || size_out == NULL)
+		return (FS_FAT_E_INVAL);
+	if (!g_fat.fv_mounted)
+		return (FS_FAT_E_NOMOUNT);
+
+	rv = resolve_entry(path, &e);
+	if (rv != FS_FAT_E_OK)
+		return (rv);
+	if (e.fe_is_dir)
+		return (FS_FAT_E_NOTFOUND);
+
+	*id_out   = e.fe_clus;
+	*size_out = e.fe_size;
+	return (FS_FAT_E_OK);
+}
+
+int
+fs_fat_pread(uint64_t id, uint64_t size, uint64_t off, uint8_t *buf,
+    uint32_t len, uint32_t *out_got)
+{
 	uint8_t		*bounce;
 	uint32_t	 clus;
 	uint32_t	 clus_bytes;
@@ -634,9 +660,8 @@ fs_fat_pread(const char *path, uint64_t off, uint8_t *buf, uint32_t len,
 	uint32_t	 done;
 	uint32_t	 n;
 	uint32_t	 i;
-	int		 rv;
 
-	if (path == NULL || buf == NULL || out_got == NULL)
+	if (buf == NULL || out_got == NULL)
 		return (FS_FAT_E_INVAL);
 	if (!g_fat.fv_mounted)
 		return (FS_FAT_E_NOMOUNT);
@@ -645,21 +670,16 @@ fs_fat_pread(const char *path, uint64_t off, uint8_t *buf, uint32_t len,
 	if (len == 0)
 		return (FS_FAT_E_OK);
 
-	rv = resolve_entry(path, &e);
-	if (rv != FS_FAT_E_OK)
-		return (rv);
-	if (e.fe_is_dir)
-		return (FS_FAT_E_NOTFOUND);
-	if (off >= e.fe_size)		/* at or past EOF: zero bytes, no error */
+	if (off >= size)		/* at or past EOF: zero bytes, no error */
 		return (FS_FAT_E_OK);
-	if ((uint64_t)len > e.fe_size - off)
-		len = (uint32_t)(e.fe_size - off);
+	if ((uint64_t)len > size - off)
+		len = (uint32_t)(size - off);
 
 	clus_bytes = (uint32_t)g_fat.fv_sec_per_clus * FAT_SECTOR_BYTES;
 	skip       = (uint32_t)(off / clus_bytes);
 	within     = (uint32_t)(off % clus_bytes);
 
-	clus = e.fe_clus;
+	clus = (uint32_t)id;
 	for (i = 0; i < skip; i++) {
 		if (clus < 2 || clus >= FAT16_EOC_MIN)
 			return (FS_FAT_E_IO);	/* chain ended before the file did */

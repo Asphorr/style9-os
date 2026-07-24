@@ -438,6 +438,61 @@ darwin_path_dup(const char *path)
 	return (copy);
 }
 
+/*
+ * read(2) from a disk-backed fd: fetch through the filesystem into a bounce
+ * buffer, then hand it to the caller.
+ *
+ * The bounce exists because fs_pread writes into kernel memory and the user
+ * buffer must be crossed under an SMAP bracket; reading straight into ring-3
+ * memory would also mean holding a user page while the disk read sleeps.  It
+ * is capped rather than sized to the request so that one enormous read cannot
+ * ask the heap for an enormous allocation -- the loop delivers the whole
+ * length regardless, one chunk at a time.
+ */
+#define	DARWIN_READ_CHUNK	(64u * 1024u)
+
+static long
+darwin_file_read(struct syscall_frame *f, struct darwin_ofile *of, void *ubuf,
+    size_t n)
+{
+	uint8_t		*bounce;
+	size_t		 done;
+	size_t		 chunk;
+	uint32_t	 got;
+	int		 rv;
+
+	bounce = kmalloc(n < DARWIN_READ_CHUNK ? n : DARWIN_READ_CHUNK);
+	if (bounce == NULL)
+		return (darwin_err(f, DARWIN_ENOMEM));
+
+	for (done = 0; done < n; done += chunk) {
+		chunk = n - done;
+		if (chunk > DARWIN_READ_CHUNK)
+			chunk = DARWIN_READ_CHUNK;
+		got = 0;
+		rv = fs_pread(&of->of_handle, of->of_off + done, bounce,
+		    (uint32_t)chunk, &got);
+		if (rv != FS_E_OK) {
+			kfree(bounce);
+			return (darwin_err(f, DARWIN_EIO));
+		}
+		if (got == 0)			/* end of file, short read */
+			break;
+		if (syscall_copyout((uint8_t *)ubuf + done, bounce,
+		    got) != 0) {
+			kfree(bounce);
+			return (darwin_err(f, DARWIN_EFAULT));
+		}
+		if (got < chunk) {
+			done += got;
+			break;
+		}
+	}
+	kfree(bounce);
+	of->of_off += (uint32_t)done;
+	return (darwin_ok(f, (long)done));
+}
+
 /* Release whatever one slot holds and return it to FREE. */
 static void
 darwin_ofile_clear(struct darwin_ofile *of)
@@ -459,12 +514,15 @@ darwin_ofile_clear(struct darwin_ofile *of)
 	default:
 		break;
 	}
-	of->of_pipe = NULL;
-	of->of_buf  = NULL;
-	of->of_path = NULL;
-	of->of_size = 0;
-	of->of_off  = 0;
-	of->of_type = DARWIN_OF_FREE;
+	of->of_pipe          = NULL;
+	of->of_buf           = NULL;
+	of->of_path          = NULL;
+	of->of_handle.fh_kind = FS_HANDLE_NONE;
+	of->of_handle.fh_id   = 0;
+	of->of_handle.fh_size = 0;
+	of->of_size          = 0;
+	of->of_off           = 0;
+	of->of_type          = DARWIN_OF_FREE;
 }
 
 /*
@@ -588,22 +646,27 @@ darwin_files_fork_copy(struct task *parent, struct task *child)
 			break;
 		case DARWIN_OF_FILE:
 			/*
-			 * Private copy, private cursor.  POSIX shares the
-			 * offset through the open-file description; for
-			 * the read-only slurped files this serves, cursor
-			 * divergence after fork is unobservable.
+			 * Private cursor.  POSIX shares the offset through the
+			 * open-file description; for the read-only files this
+			 * serves, cursor divergence after fork is unobservable.
+			 * A disk-backed fd copies its handle -- three words --
+			 * where it used to copy the file's entire contents.
 			 */
-			buf = kmalloc(src->of_size != 0 ?
-			    src->of_size : 1);
-			if (buf == NULL)
-				return (-1);
-			for (k = 0; k < src->of_size; k++)
-				buf[k] = src->of_buf[k];
-			dst->of_buf  = buf;
-			dst->of_path = darwin_path_dup(src->of_path);
-			dst->of_size = src->of_size;
-			dst->of_off  = src->of_off;
-			dst->of_type = DARWIN_OF_FILE;
+			buf = NULL;
+			if (src->of_buf != NULL) {
+				buf = kmalloc(src->of_size != 0 ?
+				    src->of_size : 1);
+				if (buf == NULL)
+					return (-1);
+				for (k = 0; k < src->of_size; k++)
+					buf[k] = src->of_buf[k];
+			}
+			dst->of_buf    = buf;
+			dst->of_handle = src->of_handle;
+			dst->of_path   = darwin_path_dup(src->of_path);
+			dst->of_size   = src->of_size;
+			dst->of_off    = src->of_off;
+			dst->of_type   = DARWIN_OF_FILE;
 			break;
 		case DARWIN_OF_PIPE_R:
 			spin_lock(&src->of_pipe->p_lock);
@@ -657,17 +720,21 @@ darwin_dup_install(struct task *t, int oldfd, int newfd)
 		dst->of_type = DARWIN_OF_CONSOLE;
 		return (0);
 	case DARWIN_OF_FILE:
-		buf = kmalloc(src->of_size != 0 ?
-		    src->of_size : 1);
-		if (buf == NULL)
-			return (-DARWIN_ENOMEM);
-		for (k = 0; k < src->of_size; k++)
-			buf[k] = src->of_buf[k];
-		dst->of_buf  = buf;
-		dst->of_path = darwin_path_dup(src->of_path);
-		dst->of_size = src->of_size;
-		dst->of_off  = src->of_off;
-		dst->of_type = DARWIN_OF_FILE;
+		buf = NULL;
+		if (src->of_buf != NULL) {
+			buf = kmalloc(src->of_size != 0 ?
+			    src->of_size : 1);
+			if (buf == NULL)
+				return (-DARWIN_ENOMEM);
+			for (k = 0; k < src->of_size; k++)
+				buf[k] = src->of_buf[k];
+		}
+		dst->of_buf    = buf;
+		dst->of_handle = src->of_handle;
+		dst->of_path   = darwin_path_dup(src->of_path);
+		dst->of_size   = src->of_size;
+		dst->of_off    = src->of_off;
+		dst->of_type   = DARWIN_OF_FILE;
 		return (0);
 	case DARWIN_OF_PIPE_R:
 		spin_lock(&src->of_pipe->p_lock);
@@ -1250,6 +1317,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 	case DARWIN_SYS_open: {
 		char				 path[256];
 		const struct progreg_entry	*pe;
+		struct fs_handle		 handle;
 		struct task			*t;
 		uint8_t				*buf;
 		uint32_t			 size;
@@ -1275,8 +1343,17 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		if ((f->sf_arg1 & 3) != 0 || (f->sf_arg1 & 0x608) != 0)
 			return (darwin_err(f, DARWIN_EROFS));
 
+		/*
+		 * Resolve, do not read.  What an fd needs is the answer to
+		 * "which file"; the bytes come later and only the ones asked
+		 * for.  This used to slurp the whole file into the kernel
+		 * heap on every open, which cost the file's length per open
+		 * and put a ceiling on how large a file could be opened at
+		 * all.
+		 */
+		buf = NULL;
 		on_disk = true;
-		rv = fs_slurp(path, &buf, &size);
+		rv = fs_open(path, &handle);
 		if (rv == FS_E_NOTFOUND || rv == FS_E_NOMOUNT) {
 			/* Not on the disk: try the synthetic /bin (progreg). */
 			pe = darwin_bin_lookup(path);
@@ -1291,6 +1368,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			for (k = 0; k < (uint32_t)pe->pr_size; k++)
 				buf[k] = pe->pr_image[k];
 			size = (uint32_t)pe->pr_size;
+			handle.fh_kind = FS_HANDLE_NONE;
 			on_disk = false;
 		} else if (rv != FS_E_OK) {
 			kprintf("darwin: open('%s') -> %s rv=%d\n",
@@ -1298,29 +1376,30 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			if (rv == FS_E_NOMEM || rv == FS_E_TOOBIG)
 				return (darwin_err(f, DARWIN_ENOMEM));
 			return (darwin_err(f, DARWIN_EIO));
+		} else {
+			if (handle.fh_size > 0xFFFFFFFFULL)
+				return (darwin_err(f, DARWIN_ENOMEM));
+			size = (uint32_t)handle.fh_size;
 		}
 
 		t  = current_thread->th_task;
 		fd = darwin_fd_alloc(t);
 		if (fd < 0) {
-			kfree(buf);
+			if (buf != NULL)
+				kfree(buf);
 			return (darwin_err(f, DARWIN_EMFILE));
 		}
-		t->t_darwin_files[fd].of_buf  = buf;
-		/*
-		 * Only a file that really is on the volume gets a name kept
-		 * for it.  The synthetic /bin entries are built into the
-		 * kernel image and no path resolves to them, so an fd on one
-		 * is readable but not mappable -- better than handing mmap a
-		 * name its pager would fail on at the first fault.
-		 */
+		t->t_darwin_files[fd].of_buf    = buf;
+		t->t_darwin_files[fd].of_handle = handle;
+		/* Kept for diagnostics; the handle is what gets read. */
 		t->t_darwin_files[fd].of_path =
 		    on_disk ? darwin_path_dup(path) : NULL;
 		t->t_darwin_files[fd].of_size = size;
 		t->t_darwin_files[fd].of_off  = 0;
 		t->t_darwin_files[fd].of_type = DARWIN_OF_FILE;
-		kprintf("darwin: UNIX open('%s') -> fd=%d (%u bytes)\n",
-		    path, fd, (unsigned)size);
+		kprintf("darwin: UNIX open('%s') -> fd=%d (%u bytes, %s)\n",
+		    path, fd, (unsigned)size,
+		    on_disk ? "on the volume" : "built in");
 		return (darwin_ok(f, fd));
 	}
 	case DARWIN_SYS_read: {
@@ -1349,14 +1428,18 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			avail = of->of_size - of->of_off;
 			if (n > (size_t)avail)
 				n = avail;
-			if (n > 0) {
+			if (n == 0)
+				return (darwin_ok(f, 0));
+			if (of->of_buf != NULL) {
+				/* Built-in image: the bytes are already here. */
 				rv = syscall_copyout((void *)f->sf_arg1,
 				    of->of_buf + of->of_off, n);
 				if (rv != 0)
 					return (darwin_err(f, DARWIN_EFAULT));
 				of->of_off += (uint32_t)n;
+				return (darwin_ok(f, (long)n));
 			}
-			return (darwin_ok(f, (long)n));
+			return (darwin_file_read(f, of, (void *)f->sf_arg1, n));
 		case DARWIN_OF_PIPE_R:
 			return (darwin_pipe_read(f, of->of_pipe,
 			    (void *)f->sf_arg1, n));
@@ -1844,11 +1927,16 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			of = &t->t_darwin_files[fd];
 			if (of->of_type != DARWIN_OF_FILE)
 				return (darwin_err(f, DARWIN_EBADF));
-			if (of->of_path == NULL)
+			/*
+			 * Only a file that lives on the volume can be paged
+			 * in.  The synthetic /bin entries are built into the
+			 * kernel image and have no handle to read through.
+			 */
+			if (of->of_handle.fh_kind == FS_HANDLE_NONE)
 				return (darwin_err(f, DARWIN_ENODEV));
 			if ((off & 0xFFFull) != 0)
 				return (darwin_err(f, DARWIN_EINVAL));
-			obj = vm_object_file(of->of_path, of->of_size);
+			obj = vm_object_file(&of->of_handle, of->of_path);
 			if (obj == NULL)
 				return (darwin_err(f, DARWIN_ENOMEM));
 		}

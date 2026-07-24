@@ -12,6 +12,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "fs.h"
 #include "port.h"
 #include "spinlock.h"
 
@@ -86,10 +87,17 @@ struct vm_map;
 
 struct darwin_pipe;
 
+/*
+ * An open file.  A disk-backed one is a HANDLE plus a cursor: the bytes stay
+ * on the volume and are read as they are asked for.  The synthetic /bin
+ * entries have no volume to be read from -- they are built into the kernel
+ * image -- so those keep a buffer, which is what every open used to do.
+ */
 struct darwin_ofile {
 	struct darwin_pipe	*of_pipe;	/* PIPE_*: shared object   */
-	uint8_t			*of_buf;	/* FILE: kmalloc'd image   */
-	char			*of_path;	/* FILE: what it was named */
+	struct fs_handle	 of_handle;	/* FILE: the file, resolved */
+	uint8_t			*of_buf;	/* FILE: image, if no handle */
+	char			*of_path;	/* FILE: what it was named  */
 	uint32_t		 of_size;	/* FILE: valid bytes       */
 	uint32_t		 of_off;	/* FILE: read cursor       */
 	uint8_t			 of_type;	/* DARWIN_OF_*             */

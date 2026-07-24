@@ -50,6 +50,16 @@ static struct {
 	bool		ac_mounted;		/* (m) */
 } g_apfs;
 
+/*
+ * What the whole-tree walk costs.  Counted rather than argued about: the
+ * reader visits every record for every question, and whether that is worth
+ * replacing with a keyed descent is a question about these three numbers,
+ * not about how the walk reads on the page.
+ */
+static uint64_t	g_n_walks;	/* whole-tree walks started      */
+static uint64_t	g_n_nodes;	/* B-tree nodes read during them */
+static uint64_t	g_n_recs;	/* leaf records handed to a callback */
+
 static size_t
 str_len(const char *s)
 {
@@ -477,6 +487,8 @@ btree_walk(uint64_t bno, apfs_rec_fn fn, void *arg, int depth, bool *stopped)
 
 	if (depth > 8)			/* corrupt tree must not spin us */
 		return (false);
+	if (depth == 0)
+		g_n_walks++;
 	node = kmalloc(APFS_BLOCK_SIZE);
 	if (node == NULL)
 		return (false);
@@ -484,6 +496,7 @@ btree_walk(uint64_t bno, apfs_rec_fn fn, void *arg, int depth, bool *stopped)
 		kfree(node);
 		return (false);
 	}
+	g_n_nodes++;
 	btree_layout(node, &bl);
 
 	ok = true;
@@ -493,6 +506,7 @@ btree_walk(uint64_t bno, apfs_rec_fn fn, void *arg, int depth, bool *stopped)
 			const uint8_t	*k;
 			uint64_t	 raw;
 
+			g_n_recs++;
 			k = bl.bl_keys + koff;
 			raw = *(const uint64_t *)k;
 			if (!fn(raw & APFS_J_OBJ_ID_MASK,
@@ -919,35 +933,25 @@ fs_apfs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size)
 }
 
 /*
- * The ranged read behind fs_pread.  Same extent walk as the slurp above,
- * pointed at a window instead of at the whole file: the caller's buffer holds
- * file byte `off`, and only the blocks overlapping [off, off+len) are read.
+ * Resolve a path to the two things a ranged read actually needs: the dstream
+ * id its extents are keyed on, and how many of its bytes are real.
  *
- * The buffer is zeroed first for the same reason the slurp zeroes its own --
- * a hole has no block to read, so its bytes have to be put there by hand --
- * and that also covers a window that reaches past end-of-file.
+ * This is the expensive half of reading, and splitting it out is the point:
+ * one walk per path component plus one for the inode, paid once, instead of
+ * once per 4 KiB the pager asks for.
  */
 int
-fs_apfs_pread(const char *path, uint64_t off, uint8_t *buf, uint32_t len,
-    uint32_t *out_got)
+fs_apfs_open(const char *path, uint64_t *id_out, uint64_t *size_out)
 {
-	struct inode_info	 ii;
-	struct extent_read	 er;
-	uint8_t			*bounce;
-	uint64_t		 oid;
-	uint64_t		 hi;
-	int			 is_dir;
-	int			 rv;
-	bool			 stopped;
+	struct inode_info	ii;
+	uint64_t		oid;
+	int			is_dir;
+	int			rv;
 
-	if (path == NULL || buf == NULL || out_got == NULL)
+	if (path == NULL || id_out == NULL || size_out == NULL)
 		return (FS_APFS_E_IO);
 	if (!g_apfs.ac_mounted)
 		return (FS_APFS_E_NOMOUNT);
-
-	*out_got = 0;
-	if (len == 0)
-		return (FS_APFS_E_OK);
 
 	rv = fs_apfs_lookup(path, &oid, &is_dir);
 	if (rv != FS_APFS_E_OK)
@@ -958,11 +962,44 @@ fs_apfs_pread(const char *path, uint64_t off, uint8_t *buf, uint32_t len,
 	if (rv != FS_APFS_E_OK)
 		return (rv);
 
-	if (off >= ii.ii_size)		/* at or past EOF: zero bytes, no error */
+	*id_out   = ii.ii_private_id;
+	*size_out = ii.ii_size;
+	return (FS_APFS_E_OK);
+}
+
+/*
+ * The ranged read behind fs_pread.  Same extent walk as the slurp above,
+ * pointed at a window instead of at the whole file: the caller's buffer holds
+ * file byte `off`, and only the blocks overlapping [off, off+len) are read.
+ * One tree walk, no path resolution -- that was done once, by fs_apfs_open.
+ *
+ * The buffer is zeroed first for the same reason the slurp zeroes its own --
+ * a hole has no block to read, so its bytes have to be put there by hand --
+ * and that also covers a window that reaches past end-of-file.
+ */
+int
+fs_apfs_pread(uint64_t id, uint64_t size, uint64_t off, uint8_t *buf,
+    uint32_t len, uint32_t *out_got)
+{
+	struct extent_read	 er;
+	uint8_t			*bounce;
+	uint64_t		 hi;
+	bool			 stopped;
+
+	if (buf == NULL || out_got == NULL)
+		return (FS_APFS_E_IO);
+	if (!g_apfs.ac_mounted)
+		return (FS_APFS_E_NOMOUNT);
+
+	*out_got = 0;
+	if (len == 0)
+		return (FS_APFS_E_OK);
+
+	if (off >= size)		/* at or past EOF: zero bytes, no error */
 		return (FS_APFS_E_OK);
 	hi = off + (uint64_t)len;
-	if (hi > ii.ii_size)
-		hi = ii.ii_size;
+	if (hi > size)
+		hi = size;
 
 	mem_zero(buf, (size_t)(hi - off));
 
@@ -970,10 +1007,10 @@ fs_apfs_pread(const char *path, uint64_t off, uint8_t *buf, uint32_t len,
 	if (bounce == NULL)
 		return (FS_APFS_E_NOMEM);
 
-	er.er_id     = ii.ii_private_id;
+	er.er_id     = id;
 	er.er_buf    = buf;
 	er.er_bounce = bounce;
-	er.er_size   = ii.ii_size;
+	er.er_size   = size;
 	er.er_lo     = off;
 	er.er_hi     = hi;
 	er.er_got    = 0;
@@ -1260,4 +1297,21 @@ fs_apfs_ready(void)
 {
 
 	return (g_apfs.ac_mounted ? 1 : 0);
+}
+
+void
+fs_apfs_stats(void)
+{
+
+	if (!g_apfs.ac_mounted) {
+		kprintf("apfs: not mounted\n");
+		return;
+	}
+	kprintf("apfs: %llu tree walks -- %llu nodes read, %llu records visited"
+	    " (%llu nodes, %llu records each)\n",
+	    (unsigned long long)g_n_walks,
+	    (unsigned long long)g_n_nodes,
+	    (unsigned long long)g_n_recs,
+	    (unsigned long long)(g_n_walks ? g_n_nodes / g_n_walks : 0),
+	    (unsigned long long)(g_n_walks ? g_n_recs / g_n_walks : 0));
 }

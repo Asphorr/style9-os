@@ -90,15 +90,53 @@ fs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size)
 }
 
 int
-fs_pread(const char *path, uint64_t off, uint8_t *buf, uint32_t len,
+fs_open(const char *path, struct fs_handle *out)
+{
+	uint64_t	id;
+	uint64_t	size;
+	int		rv;
+
+	if (out == NULL)
+		return (FS_E_NOTFOUND);
+	out->fh_kind = FS_HANDLE_NONE;
+	out->fh_id   = 0;
+	out->fh_size = 0;
+
+	if (fs_apfs_ready()) {
+		rv = fs_apfs_open(path, &id, &size);
+		if (rv != FS_APFS_E_OK)
+			return (apfs_err(rv));
+		out->fh_kind = FS_HANDLE_APFS;
+	} else if (fs_fat_ready()) {
+		rv = fs_fat_open(path, &id, &size);
+		if (rv != FS_FAT_E_OK)
+			return (fat_err(rv));
+		out->fh_kind = FS_HANDLE_FAT;
+	} else
+		return (FS_E_NOMOUNT);
+
+	out->fh_id   = id;
+	out->fh_size = size;
+	return (FS_E_OK);
+}
+
+int
+fs_pread(const struct fs_handle *h, uint64_t off, uint8_t *buf, uint32_t len,
     uint32_t *out_got)
 {
 
-	if (fs_apfs_ready())
-		return (apfs_err(fs_apfs_pread(path, off, buf, len, out_got)));
-	if (fs_fat_ready())
-		return (fat_err(fs_fat_pread(path, off, buf, len, out_got)));
-	return (FS_E_NOMOUNT);
+	if (h == NULL || out_got == NULL)
+		return (FS_E_NOTFOUND);
+	switch (h->fh_kind) {
+	case FS_HANDLE_APFS:
+		return (apfs_err(fs_apfs_pread(h->fh_id, h->fh_size, off, buf,
+		    len, out_got)));
+	case FS_HANDLE_FAT:
+		return (fat_err(fs_fat_pread(h->fh_id, h->fh_size, off, buf,
+		    len, out_got)));
+	default:
+		return (FS_E_NOMOUNT);
+	}
 }
 
 int

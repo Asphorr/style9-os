@@ -28,11 +28,11 @@ path_copy(char *dst, const char *src, size_t cap)
 }
 
 struct vm_object *
-vm_object_file(const char *path, uint64_t size)
+vm_object_file(const struct fs_handle *h, const char *path)
 {
 	struct vm_object	*obj;
 
-	if (path == NULL)
+	if (h == NULL || h->fh_kind == FS_HANDLE_NONE)
 		return (NULL);
 
 	obj = kmalloc(sizeof(*obj));
@@ -40,10 +40,12 @@ vm_object_file(const char *path, uint64_t size)
 		return (NULL);
 
 	spin_init(&obj->vo_lock, "vm_object");
-	obj->vo_size   = size;
+	obj->vo_handle = *h;
+	obj->vo_size   = h->fh_size;
 	obj->vo_n_page = 0;
 	obj->vo_refs   = 1;
-	path_copy(obj->vo_path, path, sizeof(obj->vo_path));
+	path_copy(obj->vo_path, path != NULL ? path : "?",
+	    sizeof(obj->vo_path));
 	return (obj);
 }
 
@@ -95,7 +97,7 @@ vm_object_page(struct vm_object *obj, uint64_t off, uint8_t *page)
 		want = (uint32_t)(obj->vo_size - off);
 
 	got = 0;
-	rv  = fs_pread(obj->vo_path, off, page, want, &got);
+	rv  = fs_pread(&obj->vo_handle, off, page, want, &got);
 	if (rv != FS_E_OK || got != want)
 		return (-1);
 

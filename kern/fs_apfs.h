@@ -483,6 +483,14 @@ void	fs_apfs_init(void);
 int	fs_apfs_ready(void);
 
 /*
+ * What the reader's whole-tree walk has cost so far: walks started, B-tree
+ * nodes read, leaf records handed to a callback.  The walk is O(tree) per
+ * question by construction, so these say whether that is a real cost on this
+ * volume or a theoretical one.
+ */
+void	fs_apfs_stats(void);
+
+/*
  * Translate a virtual object id to its block number through the object-map
  * B-tree rooted at `tree_bno`, taking the newest version no later than `xid`.
  * Returns FS_APFS_E_OK and stores the block in *paddr_out, or a negative
@@ -526,12 +534,20 @@ int	fs_apfs_stat(const char *path, struct fs_apfs_statbuf *out);
 int	fs_apfs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size);
 
 /*
- * Read at most `len` bytes of `path` starting at file offset `off` into the
- * caller's buffer, reporting the count delivered through *out_got.  Reads that
- * begin at or past end-of-file return FS_APFS_E_OK with zero bytes; reads that
- * run off the end come back short.  Holes read back as zeroes.
+ * Resolve `path` to the dstream id its extents are keyed on and its byte
+ * length -- the expensive half of reading, paid once instead of per call.
+ * Directories are refused.  Returns FS_APFS_E_OK or a negative FS_APFS_E_*.
  */
-int	fs_apfs_pread(const char *path, uint64_t off, uint8_t *buf,
+int	fs_apfs_open(const char *path, uint64_t *id_out, uint64_t *size_out);
+
+/*
+ * Read at most `len` bytes of the resolved file (`id`, `size`) starting at
+ * file offset `off` into the caller's buffer, reporting the count delivered
+ * through *out_got.  Reads that begin at or past end-of-file return
+ * FS_APFS_E_OK with zero bytes; reads that run off the end come back short.
+ * Holes read back as zeroes.
+ */
+int	fs_apfs_pread(uint64_t id, uint64_t size, uint64_t off, uint8_t *buf,
 	    uint32_t len, uint32_t *out_got);
 
 /*

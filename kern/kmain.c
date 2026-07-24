@@ -214,6 +214,11 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 		 * for memory they have not touched.
 		 */
 		vm_fault_stats();
+		if (fs_apfs_ready())
+			fs_apfs_stats();
+		bio_stats();
+		ata_irq_stats();
+		kmem_stats();
 	}
 
 	/*

@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "clock.h"
 #include "kmem.h"
 #include "kprintf.h"
 #include "panic.h"
@@ -37,6 +38,8 @@ static uint64_t	vm_n_fault_zero;	/* pages zero-filled            */
 static uint64_t	vm_n_fault_file;	/* pages paged in from a file   */
 static uint64_t	vm_n_fault_race;	/* someone else got there first */
 static uint64_t	vm_n_fault_fail;	/* refused or could not fill    */
+static uint64_t	vm_us_pager;		/* microseconds inside the pager */
+static uint64_t	vm_us_pager_max;	/* worst single page            */
 
 /*
  * Drop one entry.  An entry owns a reference on its object, so releasing the
@@ -334,11 +337,20 @@ vm_fault(struct vm_map *map, struct pmap *pm, uint64_t va, bool write)
 		kva[i] = 0;
 
 	/* The slow part, with nothing held.  Zeroes are already right for anon. */
-	if (obj != NULL && vm_object_page(obj, off, kva) != 0) {
-		vm_object_deref(obj);
-		pmm_free_page(pa);
-		vm_n_fault_fail++;
-		return (VM_FAULT_IO);
+	if (obj != NULL) {
+		uint64_t	t0, dt;
+
+		t0 = clock_uptime_us();
+		if (vm_object_page(obj, off, kva) != 0) {
+			vm_object_deref(obj);
+			pmm_free_page(pa);
+			vm_n_fault_fail++;
+			return (VM_FAULT_IO);
+		}
+		dt = clock_uptime_us() - t0;
+		vm_us_pager += dt;
+		if (dt > vm_us_pager_max)
+			vm_us_pager_max = dt;
 	}
 
 	spin_lock(&map->vm_lock);
@@ -386,6 +398,13 @@ vm_fault_stats(void)
 	    (unsigned long long)vm_n_fault_file,
 	    (unsigned long long)vm_n_fault_race,
 	    (unsigned long long)vm_n_fault_fail);
+	if (vm_n_fault_file != 0)
+		kprintf("vm: pager spent %llu us over %llu pages "
+		    "(%llu us each, worst %llu)\n",
+		    (unsigned long long)vm_us_pager,
+		    (unsigned long long)vm_n_fault_file,
+		    (unsigned long long)(vm_us_pager / vm_n_fault_file),
+		    (unsigned long long)vm_us_pager_max);
 }
 
 /*

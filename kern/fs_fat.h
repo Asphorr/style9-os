@@ -86,12 +86,20 @@ int	fs_fat_ready(void);
 int	fs_fat_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size);
 
 /*
- * Read at most `len` bytes of `path` starting at file offset `off` into the
- * caller's buffer, reporting the count delivered through *out_got.  Reads that
- * begin at or past end-of-file return FS_FAT_E_OK with zero bytes; reads that
- * run off the end come back short.  Same path resolution as fs_fat_slurp.
+ * Resolve `path` to its starting cluster and byte length -- the expensive
+ * half of reading, paid once instead of per call.  Same path resolution as
+ * fs_fat_slurp.  Directories are refused.
  */
-int	fs_fat_pread(const char *path, uint64_t off, uint8_t *buf,
+int	fs_fat_open(const char *path, uint64_t *id_out, uint64_t *size_out);
+
+/*
+ * Read at most `len` bytes of the resolved file (`id` = starting cluster,
+ * `size` = its length) starting at file offset `off` into the caller's buffer,
+ * reporting the count delivered through *out_got.  Reads that begin at or past
+ * end-of-file return FS_FAT_E_OK with zero bytes; reads that run off the end
+ * come back short.
+ */
+int	fs_fat_pread(uint64_t id, uint64_t size, uint64_t off, uint8_t *buf,
 	    uint32_t len, uint32_t *out_got);
 
 /*
