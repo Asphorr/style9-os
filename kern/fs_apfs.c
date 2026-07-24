@@ -55,6 +55,25 @@ str_len(const char *s)
 	return (n);
 }
 
+/* The kernel has no string.h; these are the two pieces this file needs. */
+static void
+mem_copy(uint8_t *dst, const uint8_t *src, size_t n)
+{
+	size_t	i;
+
+	for (i = 0; i < n; i++)
+		dst[i] = src[i];
+}
+
+static void
+mem_zero(uint8_t *dst, size_t n)
+{
+	size_t	i;
+
+	for (i = 0; i < n; i++)
+		dst[i] = 0;
+}
+
 uint64_t
 fs_apfs_fletcher64(const void *p, uint32_t len)
 {
@@ -604,6 +623,266 @@ fs_apfs_lookup(const char *path, uint64_t *oid_out, int *is_dir_out)
 	return (FS_APFS_E_OK);
 }
 
+/* ---- inodes, sizes, and bytes -------------------------------------------- */
+
+/*
+ * What an inode record tells us.  ii_private_id is the one field worth
+ * explaining: file extents are keyed on it rather than on the inode's own
+ * object id, and the two differ once hard links exist -- several names, one
+ * stream of bytes.  They are equal for every file on a freshly written volume,
+ * which is exactly why keying on the wrong one works right up until it
+ * silently doesn't.
+ */
+struct inode_info {
+	uint64_t	ii_oid;
+	uint64_t	ii_private_id;
+	uint64_t	ii_size;
+	uint16_t	ii_mode;
+	bool		ii_found;
+};
+
+static bool
+inode_pick(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
+    const uint8_t *val, uint32_t vlen, void *arg)
+{
+	const struct apfs_inode_val	*iv;
+	const struct apfs_xf_blob	*blob;
+	const struct apfs_x_field	*xf;
+	const struct apfs_dstream	*ds;
+	struct inode_info		*ii;
+	uint32_t			 nexts;
+	uint32_t			 ent;
+	uint32_t			 data;
+	uint32_t			 i;
+
+	(void)key;
+	(void)klen;
+	ii = arg;
+	if (type != APFS_TYPE_INODE || oid != ii->ii_oid)
+		return (true);
+	if (vlen < sizeof(*iv))
+		return (true);
+
+	iv = (const struct apfs_inode_val *)val;
+	ii->ii_private_id = iv->ai_private_id;
+	ii->ii_mode       = iv->ai_mode;
+	ii->ii_found      = true;
+
+	/*
+	 * No extended fields at all is normal, not an error: that is what an
+	 * inode with nothing to say beyond its fixed part looks like.  Its
+	 * size stays 0, which for a directory is the right answer.
+	 */
+	if (vlen < sizeof(*iv) + sizeof(*blob))
+		return (false);
+	blob  = (const struct apfs_xf_blob *)(val + sizeof(*iv));
+	nexts = blob->xb_num_exts;
+	ent   = sizeof(*iv) + sizeof(*blob);
+	data  = ent + nexts * sizeof(*xf);
+	if (data > vlen)
+		return (false);
+
+	for (i = 0; i < nexts; i++) {
+		xf = (const struct apfs_x_field *)(val + ent +
+		    i * sizeof(*xf));
+		if (xf->xf_size > vlen - data)
+			break;			/* truncated blob; stop */
+		if (xf->xf_type == APFS_INO_EXT_TYPE_DSTREAM &&
+		    xf->xf_size >= sizeof(*ds)) {
+			ds = (const struct apfs_dstream *)(val + data);
+			ii->ii_size = ds->ds_size;
+		}
+		/* Every datum is padded up to a multiple of 8. */
+		data += ((uint32_t)xf->xf_size + 7u) & ~7u;
+		if (data > vlen)
+			break;
+	}
+	return (false);
+}
+
+/* Read the inode record for `oid`.  Returns FS_APFS_E_*. */
+static int
+inode_info(uint64_t oid, struct inode_info *ii)
+{
+	bool	stopped;
+
+	ii->ii_oid        = oid;
+	ii->ii_private_id = oid;
+	ii->ii_size       = 0;
+	ii->ii_mode       = 0;
+	ii->ii_found      = false;
+	stopped = false;
+	if (!btree_walk(g_apfs.ac_root_tree_bno, inode_pick, ii, 0, &stopped))
+		return (FS_APFS_E_IO);
+	return (ii->ii_found ? FS_APFS_E_OK : FS_APFS_E_NOTFOUND);
+}
+
+int
+fs_apfs_stat(const char *path, struct fs_apfs_statbuf *out)
+{
+	struct inode_info	ii;
+	uint64_t		oid;
+	int			is_dir;
+	int			rv;
+
+	if (!g_apfs.ac_mounted)
+		return (FS_APFS_E_NOMOUNT);
+	rv = fs_apfs_lookup(path, &oid, &is_dir);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	rv = inode_info(oid, &ii);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+
+	out->afs_size   = is_dir ? 0 : ii.ii_size;
+	out->afs_ino    = oid;
+	out->afs_mode   = ii.ii_mode;
+	out->afs_is_dir = is_dir ? 1 : 0;
+	return (FS_APFS_E_OK);
+}
+
+/*
+ * Copying a file's extents into a buffer.  er_bounce holds the one partial
+ * block a file that does not end on a block boundary needs -- allocated once
+ * by the caller rather than per extent.
+ */
+struct extent_read {
+	uint64_t	 er_id;		/* the dstream this belongs to */
+	uint8_t		*er_buf;
+	uint8_t		*er_bounce;
+	uint64_t	 er_size;
+	uint64_t	 er_got;
+	int		 er_rv;
+};
+
+static bool
+extent_copy(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
+    const uint8_t *val, uint32_t vlen, void *arg)
+{
+	const struct apfs_file_extent_val	*fe;
+	struct extent_read			*er;
+	uint64_t				 logical;
+	uint64_t				 len;
+	uint64_t				 phys;
+	uint64_t				 off;
+	uint64_t				 dst;
+	uint64_t				 n;
+
+	er = arg;
+	if (type != APFS_TYPE_FILE_EXTENT || oid != er->er_id)
+		return (true);
+	/* Key is the record header plus the byte offset this run covers. */
+	if (klen < 16 || vlen < sizeof(*fe))
+		return (true);
+
+	logical = *(const uint64_t *)(key + 8);
+	fe      = (const struct apfs_file_extent_val *)val;
+	len     = fe->fe_len_and_flags & APFS_FILE_EXTENT_LEN_MASK;
+	phys    = fe->fe_phys_block_num;
+
+	if (logical >= er->er_size)
+		return (true);
+	if (phys == 0)
+		return (true);		/* a hole: the buffer is already zero */
+
+	for (off = 0; off < len; off += APFS_BLOCK_SIZE) {
+		dst = logical + off;
+		/*
+		 * An extent is an ALLOCATED run and can reach past the end of
+		 * the file; the tail of its last block is not ours to copy.
+		 */
+		if (dst >= er->er_size)
+			break;
+		n = er->er_size - dst;
+		if (n >= APFS_BLOCK_SIZE) {
+			if (read_block_raw(phys + off / APFS_BLOCK_SIZE,
+			    er->er_buf + dst) != FS_APFS_E_OK) {
+				er->er_rv = FS_APFS_E_IO;
+				return (false);
+			}
+			n = APFS_BLOCK_SIZE;
+		} else {
+			if (read_block_raw(phys + off / APFS_BLOCK_SIZE,
+			    er->er_bounce) != FS_APFS_E_OK) {
+				er->er_rv = FS_APFS_E_IO;
+				return (false);
+			}
+			mem_copy(er->er_buf + dst, er->er_bounce, (size_t)n);
+		}
+		er->er_got += n;
+	}
+	return (true);
+}
+
+int
+fs_apfs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size)
+{
+	struct fs_apfs_statbuf	 st;
+	struct inode_info	 ii;
+	struct extent_read	 er;
+	uint8_t			*buf;
+	uint8_t			*bounce;
+	uint64_t		 oid;
+	int			 is_dir;
+	int			 rv;
+	bool			 stopped;
+
+	if (!g_apfs.ac_mounted)
+		return (FS_APFS_E_NOMOUNT);
+	rv = fs_apfs_lookup(path, &oid, &is_dir);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	if (is_dir)
+		return (FS_APFS_E_NOTFOUND);
+	rv = inode_info(oid, &ii);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	st.afs_size = ii.ii_size;
+	if (st.afs_size > FS_APFS_MAX_FILE)
+		return (FS_APFS_E_TOOBIG);
+
+	/* kmalloc(0) is not a thing worth defining; an empty file gets a byte. */
+	buf = kmalloc(st.afs_size != 0 ? (size_t)st.afs_size : 1);
+	if (buf == NULL)
+		return (FS_APFS_E_NOMEM);
+	/*
+	 * Zero first.  A sparse file's holes have no blocks to read, so their
+	 * bytes are whatever the heap left behind unless we put zeroes there.
+	 */
+	mem_zero(buf, (size_t)st.afs_size);
+
+	if (st.afs_size == 0) {
+		*out_buf  = buf;
+		*out_size = 0;
+		return (FS_APFS_E_OK);
+	}
+
+	bounce = kmalloc(APFS_BLOCK_SIZE);
+	if (bounce == NULL) {
+		kfree(buf);
+		return (FS_APFS_E_NOMEM);
+	}
+
+	er.er_id     = ii.ii_private_id;
+	er.er_buf    = buf;
+	er.er_bounce = bounce;
+	er.er_size   = st.afs_size;
+	er.er_got    = 0;
+	er.er_rv     = FS_APFS_E_OK;
+	stopped = false;
+	if (!btree_walk(g_apfs.ac_root_tree_bno, extent_copy, &er, 0, &stopped))
+		er.er_rv = FS_APFS_E_IO;
+	kfree(bounce);
+
+	if (er.er_rv != FS_APFS_E_OK) {
+		kfree(buf);
+		return (er.er_rv);
+	}
+	*out_buf  = buf;
+	*out_size = (uint32_t)st.afs_size;
+	return (FS_APFS_E_OK);
+}
+
 struct readdir_search {
 	struct fs_apfs_dirent	*rs_out;
 	uint64_t		 rs_dir;
@@ -640,7 +919,7 @@ readdir_pick(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 		rs->rs_out->ade_name[i] = name[i];
 	rs->rs_out->ade_name[nlen] = '\0';
 	rs->rs_out->ade_ino    = dv->dv_file_id;
-	rs->rs_out->ade_size   = 0;		/* filled in once extents land */
+	rs->rs_out->ade_size   = 0;		/* the inode record has it */
 	rs->rs_out->ade_is_dir = (dv->dv_flags & 0x0F) == APFS_DT_DIR;
 	rs->rs_hit = true;
 	return (false);
@@ -650,6 +929,7 @@ int
 fs_apfs_readdir(const char *path, uint32_t index, struct fs_apfs_dirent *out)
 {
 	struct readdir_search	rs;
+	struct inode_info	ii;
 	uint64_t		oid;
 	int			is_dir;
 	int			rv;
@@ -671,16 +951,38 @@ fs_apfs_readdir(const char *path, uint32_t index, struct fs_apfs_dirent *out)
 	stopped = false;
 	if (!btree_walk(g_apfs.ac_root_tree_bno, readdir_pick, &rs, 0, &stopped))
 		return (FS_APFS_E_IO);
-	return (rs.rs_hit ? 1 : 0);
+	if (!rs.rs_hit)
+		return (0);
+
+	/*
+	 * A directory entry carries a name and an object id but no length --
+	 * that is in the inode, one more pass over the tree.  Deliberately not
+	 * fatal if it is missing: a name we can report with an unknown size
+	 * beats failing the whole enumeration.
+	 */
+	if (!out->ade_is_dir && inode_info(out->ade_ino, &ii) == FS_APFS_E_OK)
+		out->ade_size = ii.ii_size;
+	return (1);
 }
 
 /*
  * Mount-time listing.  Reading a container is only half the claim; walking
  * out of it by name is the other half, so the banner shows the tree it
- * actually resolved rather than asserting it could.
+ * actually resolved rather than asserting it could.  It also remembers the
+ * first small regular file it saw, which fs_apfs_init then reads: a size out
+ * of an inode proves the metadata path, and only bytes off the disk prove the
+ * extent path.
  */
+#define	APFS_PROBE_MAX	(64u * 1024u)	/* keep the boot-time read cheap */
+
+struct mount_probe {
+	char		mp_path[256];
+	uint64_t	mp_size;
+	bool		mp_have;
+};
+
 static void
-list_dir(const char *path, int depth)
+list_dir(const char *path, int depth, struct mount_probe *mp)
 {
 	struct fs_apfs_dirent	 de;
 	char			 child[256];
@@ -694,10 +996,13 @@ list_dir(const char *path, int depth)
 		kprintf("apfs:   ");
 		for (i = 0; i < (size_t)depth * 2; i++)
 			kprintf(" ");
-		kprintf("%s%s\n", de.ade_name, de.ade_is_dir ? "/" : "");
-		if (!de.ade_is_dir || depth >= 2)
-			continue;
+		if (de.ade_is_dir)
+			kprintf("%s/\n", de.ade_name);
+		else
+			kprintf("%s  %llu bytes\n", de.ade_name,
+			    (unsigned long long)de.ade_size);
 
+		/* Full path of this entry; needed to descend or to read it. */
 		base = str_len(path);
 		if (base + 1 + str_len(de.ade_name) + 1 > sizeof(child))
 			continue;
@@ -708,14 +1013,54 @@ list_dir(const char *path, int depth)
 		for (i = 0; de.ade_name[i] != '\0'; i++)
 			child[base + i] = de.ade_name[i];
 		child[base + i] = '\0';
-		list_dir(child, depth + 1);
+
+		if (de.ade_is_dir) {
+			if (depth < 2)
+				list_dir(child, depth + 1, mp);
+			continue;
+		}
+		if (!mp->mp_have && de.ade_size > 0 &&
+		    de.ade_size <= APFS_PROBE_MAX) {
+			for (i = 0; i <= base + str_len(de.ade_name); i++)
+				mp->mp_path[i] = child[i];
+			mp->mp_size = de.ade_size;
+			mp->mp_have = true;
+		}
 	}
+}
+
+/*
+ * Read one file at mount and report what came back.  The sum is over every
+ * byte, which makes it trivially reproducible on the host that wrote the
+ * image -- the point is to be checkable, not to be a good checksum.
+ */
+static void
+probe_read(const struct mount_probe *mp)
+{
+	uint8_t		*buf;
+	uint32_t	 size;
+	uint32_t	 sum;
+	uint32_t	 i;
+	int		 rv;
+
+	rv = fs_apfs_slurp(mp->mp_path, &buf, &size);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs: read \"%s\" failed (%d)\n", mp->mp_path, rv);
+		return;
+	}
+	sum = 0;
+	for (i = 0; i < size; i++)
+		sum += buf[i];
+	kprintf("apfs: read \"%s\" -- %u bytes, byte sum 0x%08x\n",
+	    mp->mp_path, (unsigned)size, (unsigned)sum);
+	kfree(buf);
 }
 
 void
 fs_apfs_init(void)
 {
 	struct apfs_nx_superblock	*anchor;
+	struct mount_probe		 probe;
 	uint8_t				*scratch;
 	int				 rv;
 
@@ -787,7 +1132,12 @@ fs_apfs_init(void)
 	    (unsigned long long)g_apfs.ac_root_tree_bno,
 	    (unsigned long long)g_apfs.ac_vol_omap_tree,
 	    g_apfs.ac_drec_hashed ? "hashed" : "plain");
-	list_dir("/", 0);
+
+	probe.mp_have = false;
+	probe.mp_size = 0;
+	list_dir("/", 0, &probe);
+	if (probe.mp_have)
+		probe_read(&probe);
 
 out:
 	kfree(anchor);

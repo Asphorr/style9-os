@@ -41,8 +41,10 @@
  *	   map (omap) B-tree first, because copy-on-write moves objects
  *	   without changing their identity.
  *
- * This rung implements (1) and (2): probe the container, verify it, and find
- * the live superblock.  Volume and file access build on top.
+ * Read-only, and that is the whole of it: no allocator, no checkpoint writer,
+ * no space manager.  Mounting a copy-on-write filesystem for reading is a much
+ * smaller claim than writing one, and it is the claim a Darwin personality
+ * needs -- a binary opens its data files, it does not reformat the disk.
  */
 
 /* 'NXSB' as it appears little-endian at offset 32 of the container block. */
@@ -374,8 +376,67 @@ _Static_assert(sizeof(struct apfs_inode_val) == 92,
 _Static_assert(__builtin_offsetof(struct apfs_inode_val, ai_mode) == 80,
     "ai_mode sits at +80");
 
+/*
+ * Extended fields.  A record that needs more than its fixed part appends a
+ * small blob of them: a count, then that many descriptors, then the data they
+ * describe, each datum padded up to a multiple of 8.  This is how APFS keeps a
+ * directory's inode from carrying a file's worth of empty fields -- and it is
+ * why a file's LENGTH is not where one would look for it.  Length lives in the
+ * DSTREAM field, so an inode without one names something with no bytes.
+ */
+#define	APFS_INO_EXT_TYPE_NAME		4
+#define	APFS_INO_EXT_TYPE_DSTREAM	8
+
+struct apfs_xf_blob {
+	uint16_t	xb_num_exts;
+	uint16_t	xb_used_data;
+};
+
+struct apfs_x_field {
+	uint8_t		xf_type;
+	uint8_t		xf_flags;
+	uint16_t	xf_size;
+};
+
+struct apfs_dstream {
+	uint64_t	ds_size;		/* the file's real length */
+	uint64_t	ds_alloced_size;
+	uint64_t	ds_default_crypto_id;
+	uint64_t	ds_total_bytes_written;
+	uint64_t	ds_total_bytes_read;
+} __attribute__((packed));
+
+_Static_assert(sizeof(struct apfs_xf_blob) == 4, "xf_blob is 4 bytes");
+_Static_assert(sizeof(struct apfs_x_field) == 4, "an x_field is 4 bytes");
+_Static_assert(sizeof(struct apfs_dstream) == 40, "a dstream is 40 bytes");
+
+/*
+ * File extent.  The key is the record header followed by the byte offset
+ * within the file; the value gives that run's length and the block it starts
+ * at.  Two things a reader has to respect: the run is ALLOCATED length and may
+ * overshoot the file's real size (the tail of the last block is garbage), and
+ * a physical block of zero means a HOLE -- a sparse region that was never
+ * written and reads back as zeroes rather than as anything on disk.
+ *
+ * Packed for the same reason the records above are: these sit at whatever
+ * offset the node's value area put them, which is not 8-byte aligned.
+ */
+#define	APFS_FILE_EXTENT_LEN_MASK	0x00FFFFFFFFFFFFFFULL
+
+struct apfs_file_extent_val {
+	uint64_t	fe_len_and_flags;
+	uint64_t	fe_phys_block_num;
+	uint64_t	fe_crypto_id;
+} __attribute__((packed));
+
+_Static_assert(sizeof(struct apfs_file_extent_val) == 24,
+    "a file-extent record is 24 bytes");
+
 /* Longest name fs_apfs_readdir reports. */
 #define	FS_APFS_NAME_MAX	255
+
+/* Largest file the slurp path will read (bounds the kmalloc). */
+#define	FS_APFS_MAX_FILE	(4u * 1024u * 1024u)
 
 /*
  * One directory entry as fs_apfs_readdir reports it.  Deliberately the same
@@ -389,6 +450,18 @@ struct fs_apfs_dirent {
 	char		ade_name[FS_APFS_NAME_MAX + 1];
 };
 
+/*
+ * A file's metadata, as fs_apfs_stat reports it.  Sizes are 64-bit because
+ * APFS's are; the Darwin syscall layer narrows them where its own wire format
+ * is 32-bit, which is the right place for that decision to be visible.
+ */
+struct fs_apfs_statbuf {
+	uint64_t	afs_size;	/* byte length (0 for a directory) */
+	uint64_t	afs_ino;	/* object id                       */
+	uint16_t	afs_mode;	/* BSD mode bits from the inode    */
+	uint8_t		afs_is_dir;
+};
+
 #define	FS_APFS_E_OK		0
 #define	FS_APFS_E_NOMOUNT	(-1)	/* no APFS container mounted    */
 #define	FS_APFS_E_IO		(-2)	/* block read failed            */
@@ -396,6 +469,7 @@ struct fs_apfs_dirent {
 #define	FS_APFS_E_INVAL		(-4)	/* not APFS / unsupported shape */
 #define	FS_APFS_E_CKSUM		(-5)	/* Fletcher-64 mismatch         */
 #define	FS_APFS_E_NOTFOUND	(-6)	/* name absent / not a dir      */
+#define	FS_APFS_E_TOOBIG	(-7)	/* file exceeds FS_APFS_MAX_FILE */
 
 /*
  * Probe the first ATA drive for an APFS container and adopt the newest valid
@@ -436,6 +510,20 @@ int	fs_apfs_lookup(const char *path, uint64_t *oid_out, int *is_dir_out);
  */
 int	fs_apfs_readdir(const char *path, uint32_t index,
 	    struct fs_apfs_dirent *out);
+
+/*
+ * Report a file-or-directory's metadata without reading its bytes.  Returns
+ * FS_APFS_E_OK and fills *out, or a negative FS_APFS_E_*.
+ */
+int	fs_apfs_stat(const char *path, struct fs_apfs_statbuf *out);
+
+/*
+ * Read the whole file named by `path` into a freshly kmalloc'd buffer.  On
+ * success returns FS_APFS_E_OK, stores the buffer in *out_buf (the caller
+ * kfree's it) and its byte length in *out_size.  Holes read back as zeroes.
+ * Returns FS_APFS_E_TOOBIG rather than attempting an unbounded allocation.
+ */
+int	fs_apfs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size);
 
 /*
  * Read APFS block `bno` into `buf` (which must hold a whole block) and verify
