@@ -1665,7 +1665,7 @@ demo_darwin_spawn(void)
 	}
 	for (i = 0; i < 256 && task_alive((uint64_t)child_id); i++)
 		(void)yield();
-	printf("  dirlist (FAT opendir/readdir probe) retired after %d "
+	printf("  dirlist (opendir/readdir probe) retired after %d "
 	    "yields\n", i);
 
 	/*

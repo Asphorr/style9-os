@@ -10,7 +10,7 @@
 #include <stdint.h>
 
 #include "darwin.h"
-#include "fs_fat.h"
+#include "fs.h"
 #include "gdt.h"
 #include "host.h"
 #include "intr.h"
@@ -1215,9 +1215,9 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		if ((f->sf_arg1 & 3) != 0 || (f->sf_arg1 & 0x608) != 0)
 			return (darwin_err(f, DARWIN_EROFS));
 
-		rv = fs_fat_slurp(path, &buf, &size);
-		if (rv == FS_FAT_E_NOTFOUND || rv == FS_FAT_E_NOMOUNT) {
-			/* FAT miss: try the synthetic /bin (progreg). */
+		rv = fs_slurp(path, &buf, &size);
+		if (rv == FS_E_NOTFOUND || rv == FS_E_NOMOUNT) {
+			/* Not on the disk: try the synthetic /bin (progreg). */
 			pe = darwin_bin_lookup(path);
 			if (pe == NULL)
 				return (darwin_err(f, DARWIN_ENOENT));
@@ -1230,10 +1230,10 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			for (k = 0; k < (uint32_t)pe->pr_size; k++)
 				buf[k] = pe->pr_image[k];
 			size = (uint32_t)pe->pr_size;
-		} else if (rv != FS_FAT_E_OK) {
-			kprintf("darwin: open('%s') -> fs_fat rv=%d\n",
-			    path, rv);
-			if (rv == FS_FAT_E_NOMEM || rv == FS_FAT_E_TOOBIG)
+		} else if (rv != FS_E_OK) {
+			kprintf("darwin: open('%s') -> %s rv=%d\n",
+			    path, fs_kind(), rv);
+			if (rv == FS_E_NOMEM || rv == FS_E_TOOBIG)
 				return (darwin_err(f, DARWIN_ENOMEM));
 			return (darwin_err(f, DARWIN_EIO));
 		}
@@ -1934,18 +1934,18 @@ darwin_s9_map_image(struct syscall_frame *f)
 }
 
 /*
- * fs_stat(const char *path, struct fs_fat_statbuf *out): existence + size +
- * type + inode probe behind libSystem's stat$INODE64.  Copies the small
- * fs_fat_statbuf out to the caller and returns 0 (carry clear) if the file is
- * present, carry set otherwise.  The kernel reports only this neutral struct;
- * libSystem turns it into Apple's struct stat, so the macOS ABI layout stays
- * out of the kernel.
+ * fs_stat(const char *path, struct fs_statbuf *out): existence + size + type +
+ * inode probe behind libSystem's stat$INODE64.  Copies the small fs_statbuf
+ * out to the caller and returns 0 (carry clear) if the file is present, carry
+ * set otherwise.  The kernel reports only this neutral struct; libSystem turns
+ * it into Apple's struct stat, so the macOS ABI layout stays out of the kernel
+ * -- and which filesystem answered stays out of libSystem.
  */
 static long
 darwin_s9_fs_stat(struct syscall_frame *f)
 {
 	char				 path[256];
-	struct fs_fat_statbuf		 sb;
+	struct fs_statbuf		 sb;
 	const struct progreg_entry	*pe;
 	long				 n;
 	int				 rv;
@@ -1954,19 +1954,24 @@ darwin_s9_fs_stat(struct syscall_frame *f)
 	if (n < 0)
 		return (darwin_err(f, DARWIN_EFAULT));
 
-	/* The synthetic /bin answers before the FAT volume (see below). */
+	/*
+	 * /bin answers as the overlay it is (see fs_readdir below): the
+	 * directory itself is neither the volume's nor the registry's alone,
+	 * so it keeps a stable synthetic inode even when the volume has a
+	 * /bin.  Everything under it resolves normally, registry first.
+	 */
 	if (darwin_streq(path, DARWIN_BIN_DIR)) {
 		sb.fs_size   = 0;
 		sb.fs_ino    = DARWIN_BIN_INO_BASE;
 		sb.fs_is_dir = 1;
 	} else if ((pe = darwin_bin_lookup(path)) != NULL) {
-		sb.fs_size   = (uint32_t)pe->pr_size;
+		sb.fs_size   = pe->pr_size;
 		sb.fs_ino    = DARWIN_BIN_INO_BASE + 1 +
 		    (uint32_t)(pe - progreg_at(0));
 		sb.fs_is_dir = 0;
 	} else {
-		rv = fs_fat_stat2(path, &sb);
-		if (rv != FS_FAT_E_OK)
+		rv = fs_stat(path, &sb);
+		if (rv != FS_E_OK)
 			return (darwin_err(f, DARWIN_ENOENT));
 	}
 	if (syscall_copyout((void *)f->sf_arg1, &sb, sizeof(sb)) != 0)
@@ -1975,7 +1980,7 @@ darwin_s9_fs_stat(struct syscall_frame *f)
 }
 
 /*
- * fs_readdir(const char *path, uint32_t index, struct fs_fat_dirent *out):
+ * fs_readdir(const char *path, uint32_t index, struct fs_dirent *out):
  * fill *out with the index-th entry of the directory at `path`, behind
  * libSystem's opendir/readdir.  Returns 1 in %rax when an entry was written, 0
  * at end-of-directory (carry clear either way), carry set on error.  The
@@ -1986,9 +1991,11 @@ static long
 darwin_s9_fs_readdir(struct syscall_frame *f)
 {
 	char				 path[256];
-	struct fs_fat_dirent		 de;
+	struct fs_dirent		 de;
+	struct fs_statbuf		 sb;
 	const struct progreg_entry	*pe;
 	uint32_t			 index;
+	uint32_t			 nreal;
 	long				 n;
 	int				 i;
 	int				 rv;
@@ -1999,24 +2006,43 @@ darwin_s9_fs_readdir(struct syscall_frame *f)
 	index = (uint32_t)f->sf_arg1;
 
 	if (darwin_streq(path, DARWIN_BIN_DIR)) {
-		/* The synthetic /bin enumerates the program registry. */
-		pe = progreg_at(index);
-		if (pe == NULL)
-			return (darwin_ok(f, 0));	/* end of directory */
-		de.fde_ino    = DARWIN_BIN_INO_BASE + 1 + index;
-		de.fde_size   = (uint32_t)pe->pr_size;
-		de.fde_is_dir = 0;
-		for (i = 0; i + 1 < FS_FAT_NAME_MAX &&
-		    pe->pr_name[i] != '\0'; i++)
-			de.fde_name[i] = pe->pr_name[i];
-		de.fde_name[i] = '\0';
+		/*
+		 * /bin is an OVERLAY: whatever the volume has there, with the
+		 * program registry appended.  open() and stat() already see
+		 * both -- they try the disk and fall back to the registry --
+		 * so a listing that showed only the registry was the one
+		 * operation disagreeing with the other two, and a file you can
+		 * open but cannot see is worse than either answer alone.
+		 */
+		if (fs_readdir(path, index, &de) != 1) {
+			/*
+			 * Past the volume's own entries.  How many there were
+			 * has to be counted, because the registry's numbering
+			 * starts where the disk's stops and neither side knows
+			 * about the other.
+			 */
+			for (nreal = 0; fs_readdir(path, nreal, &de) == 1;
+			    nreal++)
+				continue;
+			pe = progreg_at(index - nreal);
+			if (pe == NULL)
+				return (darwin_ok(f, 0));  /* end of directory */
+			de.fde_ino    = DARWIN_BIN_INO_BASE + 1 +
+			    (index - nreal);
+			de.fde_size   = pe->pr_size;
+			de.fde_is_dir = 0;
+			for (i = 0; i + 1 < FS_NAME_MAX &&
+			    pe->pr_name[i] != '\0'; i++)
+				de.fde_name[i] = pe->pr_name[i];
+			de.fde_name[i] = '\0';
+		}
 	} else {
-		rv = fs_fat_readdir(path, index, &de);
+		rv = fs_readdir(path, index, &de);
 		if (rv < 0)
 			return (darwin_err(f, DARWIN_ENOENT));
 		if (rv == 0) {
 			/*
-			 * End of the FAT listing.  The root grows one
+			 * End of the on-disk listing.  The root grows one
 			 * synthetic entry -- "bin" -- at exactly the first
 			 * end index (a probe at index-1 still yielding an
 			 * entry proves this is that index), so a directory
@@ -2025,7 +2051,15 @@ darwin_s9_fs_readdir(struct syscall_frame *f)
 			if (!darwin_streq(path, "/"))
 				return (darwin_ok(f, 0));
 			if (index > 0 &&
-			    fs_fat_readdir(path, index - 1, &de) != 1)
+			    fs_readdir(path, index - 1, &de) != 1)
+				return (darwin_ok(f, 0));
+			/*
+			 * Unless the volume already has a /bin of its own, in
+			 * which case the overlay above has merged the registry
+			 * into it and naming it again here would list one
+			 * directory twice.
+			 */
+			if (fs_stat(DARWIN_BIN_DIR, &sb) == FS_E_OK)
 				return (darwin_ok(f, 0));
 			de.fde_ino    = DARWIN_BIN_INO_BASE;
 			de.fde_size   = 0;

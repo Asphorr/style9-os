@@ -1225,34 +1225,40 @@ getopt(int argc, char *const argv[], const char *optstring)
 /*
  * The kernel reports filesystem metadata in these small neutral structs (the
  * style9-private class-0x2A calls fill them); this file then shapes them into
- * the macOS ABI the binary expects.  The layouts mirror kern/fs_fat.h exactly
- * -- a private kernel<->libSystem wire format, never seen by an Apple binary.
+ * the macOS ABI the binary expects.  The layouts mirror kern/fs.h exactly -- a
+ * private kernel<->libSystem wire format, never seen by an Apple binary, and
+ * deliberately saying nothing about WHICH filesystem answered.  The asserts
+ * are the same ones the kernel header carries: two hand-written copies of a
+ * layout drift, and a drifted copyout would be silent.
  */
-#define	FS_FAT_NAME_MAX	64
+#define	FS_NAME_MAX	256
 
-struct fs_fat_dirent {
-	uint32_t	fde_ino;
-	uint32_t	fde_size;
+struct fs_dirent {
+	uint64_t	fde_ino;
+	uint64_t	fde_size;
 	uint8_t		fde_is_dir;
-	char		fde_name[FS_FAT_NAME_MAX];
+	char		fde_name[FS_NAME_MAX];
 };
 
-struct fs_fat_statbuf {
-	uint32_t	fs_size;
-	uint32_t	fs_ino;
+struct fs_statbuf {
+	uint64_t	fs_size;
+	uint64_t	fs_ino;
 	uint8_t		fs_is_dir;
 };
 
+_Static_assert(sizeof(struct fs_dirent) == 280, "must match kern/fs.h");
+_Static_assert(sizeof(struct fs_statbuf) == 24, "must match kern/fs.h");
+
 /* fs_stat backchannel: fills *sb; returns 0, or -1 (carry set) if absent. */
 static long
-s9_fs_stat(const char *path, struct fs_fat_statbuf *sb)
+s9_fs_stat(const char *path, struct fs_statbuf *sb)
 {
 	return (bsd_call(0x2A000002, (long)path, (long)sb, 0));
 }
 
 /* fs_readdir backchannel: fills *out; returns 1 (entry), 0 (end), -1 (error). */
 static long
-s9_fs_readdir(const char *path, uint32_t index, struct fs_fat_dirent *out)
+s9_fs_readdir(const char *path, uint32_t index, struct fs_dirent *out)
 {
 	return (bsd_call(0x2A000003, (long)path, (long)index, (long)out));
 }
@@ -1284,7 +1290,7 @@ s9_uname(struct darwin_uname *out)
  * it a directory?), st_size, and st_ino (a path walker keys cycle detection on
  * st_ino).  We fill the macOS INODE64 struct stat layout here -- st_mode@4,
  * st_ino@8, st_size@96, ... -- so the ABI knowledge lives in libSystem while
- * the kernel reports only the neutral fs_fat_statbuf.  The import names hold a
+ * the kernel reports only the neutral fs_statbuf.  The import names hold a
  * '$' no C identifier can spell, so ordinary functions are aliased onto them;
  * the read-only FS has no symlinks, so lstat is just stat.
  */
@@ -1294,7 +1300,7 @@ int	lstat_inode64(const char *path, void *buf) __asm__("_lstat$INODE64");
 int
 stat_inode64(const char *path, void *buf)
 {
-	struct fs_fat_statbuf	sb;
+	struct fs_statbuf	sb;
 	unsigned char		*p;
 	int			 i;
 
@@ -1308,9 +1314,9 @@ stat_inode64(const char *path, void *buf)
 	*(uint16_t *)(p + 4)   = sb.fs_is_dir ? 0x41EDu : 0x81A4u;
 	*(uint16_t *)(p + 6)   = 1;			 /* st_nlink   */
 	*(uint64_t *)(p + 8)   = sb.fs_ino;		 /* st_ino     */
-	*(int64_t  *)(p + 96)  = (int64_t)(uint64_t)sb.fs_size;	/* st_size   */
+	*(int64_t  *)(p + 96)  = (int64_t)sb.fs_size;	 /* st_size    */
 	*(int64_t  *)(p + 104) =
-	    (int64_t)(((uint64_t)sb.fs_size + 511) / 512);	/* st_blocks */
+	    (int64_t)((sb.fs_size + 511) / 512);	 /* st_blocks  */
 	*(uint32_t *)(p + 112) = 512;			 /* st_blksize */
 	return (0);
 }
@@ -1388,7 +1394,7 @@ fstat64(int fd, void *buf)
 int
 faccessat(int dirfd, const char *path, int mode, int flags)
 {
-	struct fs_fat_statbuf	sb;
+	struct fs_statbuf	sb;
 
 	(void)dirfd;
 	(void)mode;
@@ -1432,7 +1438,7 @@ struct dirent *readdir_inode64(DIR *dp) __asm__("_readdir$INODE64");
 DIR *
 opendir_inode64(const char *path)
 {
-	struct fs_fat_statbuf	sb;
+	struct fs_statbuf	sb;
 	DIR			*dp;
 	size_t			 i;
 
@@ -1451,7 +1457,7 @@ opendir_inode64(const char *path)
 struct dirent *
 readdir_inode64(DIR *dp)
 {
-	struct fs_fat_dirent	kde;
+	struct fs_dirent	kde;
 	int			 i;
 
 	if (dp == NULL)

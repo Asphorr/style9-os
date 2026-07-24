@@ -96,18 +96,50 @@ list(const char *path, int depth)
 	closedir(d);
 }
 
+/*
+ * stat() the first real subdirectory of the root, whichever volume is
+ * mounted.  Naming a fixed path here would only prove that one image was
+ * attached; picking the name out of the listing proves the two calls agree
+ * about the same directory.
+ */
+static void
+stat_first_subdir(void)
+{
+	unsigned char	 sb[144];
+	char		 path[512];
+	struct dirent	*e;
+	DIR		*d;
+	int		 i;
+
+	d = opendir("/");
+	if (d == NULL)
+		return;
+	while ((e = readdir(d)) != NULL) {
+		if (e->d_type != DT_DIR ||
+		    streq(e->d_name, ".") || streq(e->d_name, ".."))
+			continue;
+		path[0] = '/';
+		for (i = 0; i < 500 && e->d_name[i] != '\0'; i++)
+			path[i + 1] = e->d_name[i];
+		path[i + 1] = '\0';
+		if (stat(path, sb) == 0)
+			printf("dirlist: stat(%s) -> mode=0%o size=%lld "
+			    "ino=%llu\n", path,
+			    (unsigned)*(uint16_t *)(sb + 4),
+			    (long long)*(int64_t *)(sb + 96),
+			    (unsigned long long)*(uint64_t *)(sb + 8));
+		break;
+	}
+	closedir(d);
+}
+
 int
 entry(void)
 {
-	unsigned char	sb[144];
 
-	printf("dirlist: walking the FAT volume via opendir/readdir + stat\n");
+	printf("dirlist: walking the volume via opendir/readdir + stat\n");
 	list("/", 0);
-	if (stat("/fonts", sb) == 0)
-		printf("dirlist: stat(/fonts) -> mode=0%o size=%lld ino=%llu\n",
-		    (unsigned)*(uint16_t *)(sb + 4),
-		    (long long)*(int64_t *)(sb + 96),
-		    (unsigned long long)*(uint64_t *)(sb + 8));
+	stat_first_subdir();
 	printf("dirlist: done\n");
 	exit(0);
 	return (0);

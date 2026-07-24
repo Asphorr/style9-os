@@ -1,0 +1,91 @@
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Copyright (c) 2026 The Hobby OS Project
+ * All rights reserved.
+ */
+
+#ifndef _SYS_FS_H_
+#define	_SYS_FS_H_
+
+#include <stddef.h>
+#include <stdint.h>
+
+/*
+ * Which filesystem answers a path.
+ *
+ * There is one disk and one volume on it, so this is not a mount table and
+ * not a VFS: it is the single question "who has the files?", asked once per
+ * call.  APFS answers if a container was found at boot, FAT otherwise.  The
+ * Darwin syscall layer talks only to this, so the two readers stay
+ * interchangeable and neither leaks its own error numbering or its own idea
+ * of how wide a size is into the syscall path.
+ *
+ * A real VFS -- mount points, vnodes, per-fd cursors -- is a different piece
+ * of work.  This is the seam where it would go.
+ */
+
+/*
+ * Longest name reported.  APFS allows 255 bytes; FAT 8.3 needs 12.  This is
+ * also the kernel<->libSystem wire format, so user/libsystem.c mirrors these
+ * structs exactly and the static asserts below are duplicated there: two hand
+ * written copies of a layout are exactly the kind of thing that drifts.
+ */
+#define	FS_NAME_MAX	256
+
+/*
+ * One directory entry.  Sizes and inode numbers are 64-bit because APFS's
+ * are, and because the macOS ABI these end up in ($INODE64 struct stat, struct
+ * dirent) is 64-bit too -- narrowing here would only have to be widened again
+ * on the other side of the syscall.
+ */
+struct fs_dirent {
+	uint64_t	fde_ino;
+	uint64_t	fde_size;	/* byte length (0 for a directory) */
+	uint8_t		fde_is_dir;
+	char		fde_name[FS_NAME_MAX];
+};
+
+/* A file-or-directory's metadata, without reading it. */
+struct fs_statbuf {
+	uint64_t	fs_size;
+	uint64_t	fs_ino;
+	uint8_t		fs_is_dir;
+};
+
+_Static_assert(sizeof(struct fs_dirent) == 280,
+    "fs_dirent is a wire format shared with user/libsystem.c");
+_Static_assert(sizeof(struct fs_statbuf) == 24,
+    "fs_statbuf is a wire format shared with user/libsystem.c");
+
+#define	FS_E_OK		0
+#define	FS_E_NOMOUNT	(-1)	/* nothing mounted            */
+#define	FS_E_NOTFOUND	(-2)	/* no such path               */
+#define	FS_E_IO		(-3)	/* the disk or the tree lied  */
+#define	FS_E_NOMEM	(-4)	/* out of kernel heap         */
+#define	FS_E_TOOBIG	(-5)	/* file too large to slurp    */
+
+/* Non-zero once some filesystem is mounted and can serve files. */
+int		fs_ready(void);
+
+/* "apfs", "fat", or "none" -- for banners and diagnostics. */
+const char	*fs_kind(void);
+
+/*
+ * Read a whole file into a freshly kmalloc'd buffer (the caller kfree's it).
+ * Returns FS_E_OK, or a negative FS_E_*.
+ */
+int		fs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size);
+
+/* Metadata for a path.  Returns FS_E_OK and fills *out, or a negative FS_E_*. */
+int		fs_stat(const char *path, struct fs_statbuf *out);
+
+/*
+ * Fill *out with the `index`-th entry of a directory.  Returns 1 when an entry
+ * was written, 0 at end-of-directory, or a negative FS_E_*.  Stateless: each
+ * call re-resolves and re-scans, so the kernel keeps no per-fd cursor.
+ */
+int		fs_readdir(const char *path, uint32_t index,
+		    struct fs_dirent *out);
+
+#endif /* !_SYS_FS_H_ */

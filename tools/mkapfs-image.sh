@@ -21,11 +21,16 @@
 # enables writing is spelled `readwrite`.  Without it every mkdir below fails
 # with EROFS and the image comes out empty.
 #
+# The figlet fonts are copied in from a directory given as $FONTS (default
+# /tmp/fonts); they are the same bytes the FAT test image carries, so the two
+# volumes differ only in what they can express -- see below.
+#
 # Usage: tools/mkapfs-image.sh [size-MiB] [output.gz]
 set -eu
 
 SIZE=${1:-512}		# under ~128 MiB mkapfs refuses: "small containers"
 OUT=${2:-style9.apfs.gz}
+FONTS=${FONTS:-/tmp/fonts}
 IMG=$(mktemp -u /tmp/style9-XXXXXX.apfs)
 MNT=$(mktemp -d)
 
@@ -40,20 +45,31 @@ case "$(mount | grep -F "$MNT")" in
 		exit 1 ;;
 esac
 
-# Contents the kernel-side tests key on.  Keep hello.txt tiny (one extent)
-# and big.txt large enough to need several, so the reader is exercised on
-# both shapes.
-sudo mkdir -p "$MNT/bin" "$MNT/etc"
+# Contents the kernel-side tests key on.  Keep hello.txt tiny (one extent) and
+# big.txt large enough to need several, so the reader is exercised on both
+# shapes.  /bin/echo is a real ELF and lives here on purpose: /bin is where the
+# Darwin layer overlays its built-in program registry, so a file there proves
+# the two are merged rather than one hiding the other.
+FIGDIR=usr/local/Cellar/figlet/2.2.5/share/figlet/fonts
+sudo mkdir -p "$MNT/bin" "$MNT/etc" "$MNT/var/db" "$MNT/$FIGDIR"
 printf 'style9-os reads a real APFS volume.\n' | sudo tee "$MNT/etc/hello.txt" >/dev/null
 sudo sh -c 'i=0; while [ $i -lt 4096 ]; do
 	printf "%08d style9 apfs extent test line\n" $i; i=$((i+1)); done' \
 	> /tmp/style9-big.txt
-sudo cp /tmp/style9-big.txt "$MNT/bin/big.txt"
+sudo cp /tmp/style9-big.txt "$MNT/var/db/big.txt"
+sudo cp /bin/echo "$MNT/bin/echo"
+
+# figlet's fonts, at the path figlet actually opens.  On the FAT image these
+# had to sit in the root and be found by a basename fallback, because 8.3
+# names cannot spell /usr/local/Cellar/figlet/2.2.5/share/figlet/fonts -- on
+# APFS the real path simply exists, and no fallback is involved.
+sudo cp "$FONTS"/*.flf "$MNT/$FIGDIR/"
 sync
 
 echo "--- contents ---"
-ls -lR "$MNT"
-md5sum "$MNT/etc/hello.txt" "$MNT/bin/big.txt"
+sudo ls -lR "$MNT"
+md5sum "$MNT/etc/hello.txt" "$MNT/var/db/big.txt" "$MNT/bin/echo" \
+    "$MNT/$FIGDIR/standard.flf"
 
 sudo umount "$MNT"
 apfsck "$IMG"			# must be silent: our writes left it valid

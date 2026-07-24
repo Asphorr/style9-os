@@ -118,6 +118,7 @@ OBJS	= \
 	$(OBJDIR)/darwin.o	\
 	$(OBJDIR)/fs_fat.o	\
 	$(OBJDIR)/fs_apfs.o	\
+	$(OBJDIR)/fs.o		\
 	$(OBJDIR)/progreg.o	\
 	$(OBJDIR)/hello_elf.o	\
 	$(OBJDIR)/clock_elf.o	\
