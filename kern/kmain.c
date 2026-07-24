@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 #include "ata_drv.h"
+#include "fs_apfs.h"
 #include "fs_fat.h"
 #include "bootstrap.h"
 #include "clock.h"
@@ -114,6 +115,7 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	uart_drv_init();
 	ata_drv_init();
 	fs_fat_init();
+	fs_apfs_init();
 
 	/*
 	 * Register a demo service under the bootstrap port so ring-3

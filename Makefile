@@ -117,6 +117,7 @@ OBJS	= \
 	$(OBJDIR)/macho.o	\
 	$(OBJDIR)/darwin.o	\
 	$(OBJDIR)/fs_fat.o	\
+	$(OBJDIR)/fs_apfs.o	\
 	$(OBJDIR)/progreg.o	\
 	$(OBJDIR)/hello_elf.o	\
 	$(OBJDIR)/clock_elf.o	\
@@ -567,8 +568,28 @@ $(OBJDIR)/%.o: %.S | $(OBJDIR)
 $(OBJDIR):
 	mkdir -p $(OBJDIR)
 
-run: kernel.elf
-	$(QEMU) -cpu $(QEMU_CPU) -kernel kernel.elf -no-reboot
+# Test disk: an APFS container carrying a couple of known files, which the
+# kernel's APFS probe mounts off drive 0.  Checked in gzipped -- 512 MiB
+# apparent but only a few hundred KiB of real content -- because BUILDING one
+# needs a Linux host running the out-of-tree APFS module (see
+# tools/mkapfs-image.sh), and no ordinary build should require that.
+#
+# Attaching it is the boot script's job, not make's: `make run` and `make log`
+# below shell out to the WINDOWS qemu binary, which only works where WSL
+# interop is enabled.  Where it is not, build here and boot with
+# tools/run.ps1 from PowerShell -- that path always works and takes -Disk.
+DISKFIX	= fixtures/style9.apfs.gz
+DISKIMG	= $(OBJDIR)/style9.apfs
+
+disk: $(DISKIMG)
+
+$(DISKIMG): $(DISKFIX) | $(OBJDIR)
+	gunzip -c $< > $@
+	@printf 'disk: %s\n' $@
+
+run: kernel.elf $(DISKIMG)
+	$(QEMU) -cpu $(QEMU_CPU) -kernel kernel.elf -no-reboot		\
+	    -drive file=$(DISKIMG),format=raw,if=ide,index=0,media=disk
 
 # `make log` boots the kernel headlessly with debugcon routed to QEMU's
 # stdout, captures it to obj/boot.log via tee, kills QEMU after a short
@@ -577,10 +598,11 @@ run: kernel.elf
 LOGFILE	= $(OBJDIR)/boot.log
 LOGSEC	?= 2
 
-log: kernel.elf
+log: kernel.elf $(DISKIMG)
 	@mkdir -p $(OBJDIR)
 	@rm -f $(LOGFILE)
 	@($(QEMU) -cpu $(QEMU_CPU) -kernel kernel.elf -no-reboot -display none	\
+	    -drive file=$(DISKIMG),format=raw,if=ide,index=0,media=disk		\
 	    -serial file:$$PWD/$(LOGFILE) 2>/dev/null &);			\
 	  sleep $(LOGSEC);							\
 	  taskkill.exe /F /IM qemu-system-x86_64.exe >/dev/null 2>&1 || true
@@ -591,4 +613,4 @@ log: kernel.elf
 clean:
 	rm -rf $(OBJDIR) kernel.elf
 
-.PHONY: all run log clean
+.PHONY: all run log disk clean
