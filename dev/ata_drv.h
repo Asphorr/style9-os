@@ -45,3 +45,6 @@ void	ata_drv_init(void);
 int	ata_kread(unsigned drive_idx, uint64_t lba, uint32_t count, void *buf);
 
 #endif /* !_SYS_ATA_DRV_H_ */
+
+/* Interrupt accounting, for the boot banner. */
+void	ata_irq_stats(void);

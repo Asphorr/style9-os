@@ -13,11 +13,15 @@
 #include "bio.h"
 #include "dev_proto.h"
 #include "dev_subsystem.h"
+#include "intr.h"
 #include "io.h"
 #include "kprintf.h"
 #include "panic.h"
+#include "pic.h"
 #include "port.h"
+#include "sched.h"
 #include "spinlock.h"
+#include "thread.h"
 
 extern struct port	*port_create_kernel_owned(uint8_t kind, void *arg);
 
@@ -104,10 +108,32 @@ extern struct port	*port_create_kernel_owned(uint8_t kind, void *arg);
  *	(c) const after probe
  *	(l) protected by ch_lock of the owning channel
  */
+/*
+ * Interrupt-driven completion.  The IRQ fields are deliberately NOT under
+ * ch_lock: a spinlock here disables preemption but not interrupts, so the
+ * handler runs while a transfer holds the channel and taking the lock from
+ * interrupt context would deadlock instantly.  They are plain atomics, and
+ * the handler touches nothing else.
+ *
+ * The lost-wake race that this shape would normally have -- device signals
+ * completion after the waiter checked the flag but before it committed to
+ * BLOCKED -- is closed by the scheduler, not by us: sched_post_irq_wake only
+ * queues the wake, and the queue is drained at the next point where
+ * preemption is enabled.  A waiter blocks with ch_lock held, hence with
+ * preemption disabled, so the drain cannot run until after the switch has
+ * happened and the thread really is BLOCKED.
+ */
 struct ata_channel {
 	struct spinlock	 ch_lock;
 	uint16_t	 ch_io_base;	/* (c) e.g. 0x1F0           */
 	uint16_t	 ch_ctrl_base;	/* (c) e.g. 0x3F6           */
+	unsigned	 ch_irq;	/* (c) 14 or 15             */
+	bool		 ch_irq_ok;	/* (c) INTRQ proven at probe */
+	struct thread	*volatile ch_waiter;	/* atomic */
+	volatile uint32_t	  ch_irq_seen;	/* atomic */
+	volatile uint8_t	  ch_irq_status;/* status latched by the ISR */
+	volatile uint32_t	  ch_n_irq;	/* diagnostics */
+	volatile uint32_t	  ch_n_block;	/* diagnostics */
 };
 
 struct ata_drive {
@@ -122,8 +148,8 @@ struct ata_drive {
 };
 
 static struct ata_channel	channels[2] = {
-	{ SPINLOCK_INIT("ata-ch0"), 0x1F0, 0x3F6 },
-	{ SPINLOCK_INIT("ata-ch1"), 0x170, 0x376 },
+	{ SPINLOCK_INIT("ata-ch0"), 0x1F0, 0x3F6, 14, false, NULL, 0, 0, 0, 0 },
+	{ SPINLOCK_INIT("ata-ch1"), 0x170, 0x376, 15, false, NULL, 0, 0, 0, 0 },
 };
 
 static struct ata_drive		drives[ATA_NDRIVES_MAX];
@@ -151,6 +177,10 @@ static int	ata_sync(struct ata_drive *d);
 
 static void	ata_select_drive(struct ata_drive *d, uint8_t extra);
 static int	ata_wait_ready(struct ata_channel *ch, uint8_t want, uint8_t *sr_out);
+static int	ata_wait_intr(struct ata_channel *ch, uint8_t want,
+		    uint8_t *sr_out);
+static void	ata_irq14(struct trapframe *tf);
+static void	ata_irq15(struct trapframe *tf);
 static void	ata_400ns(struct ata_channel *ch);
 static const char *ata_decode_err(uint8_t er);
 
@@ -172,14 +202,24 @@ ata_drv_init(void)
 		 * Software reset on the channel.  Pulse SRST in the
 		 * device-control register, wait, release.  This puts both
 		 * master and slave into a known state before IDENTIFY.
-		 * nIEN is set so the channel does not assert IRQs while
-		 * we poll.
+		 * nIEN is set for the pulse itself so a half-reset channel
+		 * cannot raise anything; it is cleared on release, below.
 		 */
 		outb(channels[ci].ch_ctrl_base + ATA_CTL_DEV_CONTROL,
 		    ATA_DCR_SRST | ATA_DCR_NIEN);
 		ata_400ns(&channels[ci]);
-		outb(channels[ci].ch_ctrl_base + ATA_CTL_DEV_CONTROL,
-		    ATA_DCR_NIEN);
+
+		/*
+		 * Release the reset with nIEN CLEAR, so the channel asserts
+		 * INTRQ from here on.  IDENTIFY below still polls: whether
+		 * the interrupt actually arrives is the question this probe
+		 * answers, and it cannot be answered by waiting for it.
+		 */
+		irq_install(channels[ci].ch_irq,
+		    ci == 0 ? ata_irq14 : ata_irq15);
+		pic_unmask(channels[ci].ch_irq);
+		channels[ci].ch_n_irq = 0;
+		outb(channels[ci].ch_ctrl_base + ATA_CTL_DEV_CONTROL, 0);
 		ata_400ns(&channels[ci]);
 
 		for (size_t slv = 0; slv < 2 && ndrives < ATA_NDRIVES_MAX;
@@ -237,6 +277,23 @@ ata_drv_init(void)
 
 			ndrives++;
 		}
+
+		/*
+		 * Did IDENTIFY's completion actually reach us as an
+		 * interrupt?  If so, transfers on this channel can sleep
+		 * instead of spinning.  If not -- a wiring quirk, a chipset
+		 * that needs its PCI IRQ routed, a virtual machine that does
+		 * not raise the legacy line -- keep polling, because a driver
+		 * that waits for an interrupt nobody sends hangs the machine
+		 * on its first read.  Deciding this from observed behaviour
+		 * rather than from a flag in a table is the whole point.
+		 */
+		channels[ci].ch_irq_ok = (channels[ci].ch_n_irq != 0);
+		kprintf("ata: channel %u IRQ%u -- %s (%u seen at probe)\n",
+		    (unsigned)ci, channels[ci].ch_irq,
+		    channels[ci].ch_irq_ok ? "interrupt-driven" :
+		    "silent, staying polled",
+		    (unsigned)channels[ci].ch_n_irq);
 	}
 
 	if (ndrives == 0)
@@ -625,10 +682,16 @@ ata_read(struct ata_drive *d, uint64_t lba, uint32_t count, void *buf)
 		cmd = ATA_CMD_READ_SECTORS;
 	}
 
+	/*
+	 * Arm the completion flag BEFORE issuing: the device can raise INTRQ
+	 * the moment it accepts a command, and clearing the flag afterwards
+	 * would erase the very interrupt being waited for.
+	 */
+	__atomic_store_n(&ch->ch_irq_seen, 0, __ATOMIC_RELAXED);
 	outb(ch->ch_io_base + ATA_REG_COMMAND, cmd);
 
 	for (s = 0; s < count; s++) {
-		if (ata_wait_ready(ch, ATA_SR_DRQ, &sr) != 0) {
+		if (ata_wait_intr(ch, ATA_SR_DRQ, &sr) != 0) {
 			er = inb(ch->ch_io_base + ATA_REG_ERROR);
 			kprintf("ata: %s read sector %llu failed: %s "
 			    "(sr=0x%02x er=0x%02x)\n",
@@ -639,6 +702,14 @@ ata_read(struct ata_drive *d, uint64_t lba, uint32_t count, void *buf)
 			return (MACH_E_INVAL);
 		}
 
+		/*
+		 * Re-arm before draining, not after.  The device raises the
+		 * next sector's INTRQ as soon as this sector's last word
+		 * leaves the data port, so a flag cleared after the copy
+		 * would throw that interrupt away and the next wait would
+		 * sleep for one that already happened.
+		 */
+		__atomic_store_n(&ch->ch_irq_seen, 0, __ATOMIC_RELAXED);
 		insw(ch->ch_io_base + ATA_REG_DATA,
 		    p + s * ATA_SECTOR_BYTES, ATA_SECTOR_BYTES / 2);
 	}
@@ -837,6 +908,104 @@ ata_400ns(struct ata_channel *ch)
  * `want` bits we're looking for (typically ATA_SR_DRQ on a transfer
  * step, 0 for "just wait for not-busy" after a flush).
  */
+/*
+ * Channel interrupt.  Reading the regular status register is what actually
+ * clears INTRQ on an ATA device -- the alternate status port deliberately
+ * does not -- so that read is the acknowledgement, not just an observation.
+ * Latch it for the waiter, since the bits it wants (DRQ, ERR) are only
+ * guaranteed meaningful at this instant.
+ */
+static void
+ata_irq(struct ata_channel *ch)
+{
+	struct thread	*w;
+
+	ch->ch_irq_status = inb(ch->ch_io_base + ATA_REG_STATUS);
+	ch->ch_n_irq++;
+	__atomic_store_n(&ch->ch_irq_seen, 1, __ATOMIC_RELEASE);
+
+	/*
+	 * Claim the waiter slot before waking, so a second interrupt cannot
+	 * post the same thread twice.  sched_post_irq_wake is the only
+	 * scheduler call legal from here: it appends to a lock-free list and
+	 * returns, leaving the actual wake to a safe preempt point.
+	 */
+	w = __atomic_exchange_n(&ch->ch_waiter, NULL, __ATOMIC_ACQUIRE);
+	if (w != NULL)
+		sched_post_irq_wake(w);
+}
+
+static void
+ata_irq14(struct trapframe *tf)
+{
+
+	(void)tf;
+	ata_irq(&channels[0]);
+}
+
+static void
+ata_irq15(struct trapframe *tf)
+{
+
+	(void)tf;
+	ata_irq(&channels[1]);
+}
+
+/*
+ * Wait for the channel to signal completion, sleeping rather than spinning.
+ * Called with ch_lock held; returns with it held.  Falls back to the polled
+ * path on a channel whose INTRQ did not prove itself at probe time -- a
+ * driver that can only ever wait for an interrupt is a driver that hangs the
+ * machine on hardware that does not send one.
+ */
+static int
+ata_wait_intr(struct ata_channel *ch, uint8_t want, uint8_t *sr_out)
+{
+	uint8_t	sr;
+
+	if (!ch->ch_irq_ok)
+		return (ata_wait_ready(ch, want, sr_out));
+
+	for (;;) {
+		if (__atomic_load_n(&ch->ch_irq_seen, __ATOMIC_ACQUIRE) != 0)
+			break;
+
+		/*
+		 * Install ourselves, then re-check: the interrupt may have
+		 * landed in the gap.  If it did, drop the slot again -- an
+		 * interrupt for the NEXT sector must not find a stale waiter.
+		 */
+		__atomic_store_n(&ch->ch_waiter, current_thread,
+		    __ATOMIC_RELEASE);
+		if (__atomic_load_n(&ch->ch_irq_seen, __ATOMIC_ACQUIRE) != 0) {
+			__atomic_store_n(&ch->ch_waiter, NULL,
+			    __ATOMIC_RELAXED);
+			break;
+		}
+
+		ch->ch_n_block++;
+		thread_block_release(THREAD_BLOCK_SLEEP, ch, &ch->ch_lock);
+		spin_lock(&ch->ch_lock);
+	}
+	__atomic_store_n(&ch->ch_waiter, NULL, __ATOMIC_RELAXED);
+
+	sr = ch->ch_irq_status;
+	if ((sr & (ATA_SR_ERR | ATA_SR_DF)) != 0) {
+		*sr_out = sr;
+		return (-1);
+	}
+	/*
+	 * The interrupt says the command reached a boundary, not that it
+	 * reached the one we asked about.  If the bits we need are not set
+	 * yet, settle it against the live register rather than the latched
+	 * copy -- cheap, since the device is already at that boundary.
+	 */
+	if (want != 0 && (sr & want) != want)
+		return (ata_wait_ready(ch, want, sr_out));
+	*sr_out = sr;
+	return (0);
+}
+
 static int
 ata_wait_ready(struct ata_channel *ch, uint8_t want, uint8_t *sr_out)
 {
@@ -883,4 +1052,20 @@ ata_decode_err(uint8_t er)
 	if (er & ATA_ER_MCR)   return ("media change request");
 	if (er & ATA_ER_BBK)   return ("bad block");
 	return ("unknown");
+}
+
+/*
+ * Interrupt accounting, for the boot banner.  How many INTRQs a channel
+ * actually delivered is the fact that decides whether waiting for one is a
+ * design or a hang.
+ */
+void
+ata_irq_stats(void)
+{
+	size_t	ci;
+
+	for (ci = 0; ci < 2; ci++)
+		kprintf("ata: channel %u -- %u interrupts, %u blocking waits\n",
+		    (unsigned)ci, (unsigned)channels[ci].ch_n_irq,
+		    (unsigned)channels[ci].ch_n_block);
 }

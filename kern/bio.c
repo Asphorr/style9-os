@@ -13,6 +13,7 @@
 #include "bio.h"
 #include "kmem.h"
 #include "kprintf.h"
+#include "sched.h"
 #include "spinlock.h"
 
 /* See bio.h for what this is and why. */
@@ -23,6 +24,7 @@ struct bio_buf {
 	uint8_t		*bb_data;	/* BIO_PAGE_BYTES of it          */
 	unsigned	bb_drive;
 	bool		bb_valid;
+	bool		bb_busy;	/* claimed, fetch in progress    */
 };
 
 /* (b) protected by bio_lock. */
@@ -76,21 +78,43 @@ bio_init(void)
 }
 
 /*
- * Find the buffer holding (drive, page), or make one hold it.  Called with
- * bio_lock held; may perform device I/O, which is why the lock is held across
- * it -- two readers racing for the same page would otherwise both fetch it,
- * and the loser's copy would be the one left in the cache.
+ * Look up (drive, page), fetching it if absent.  Called with bio_lock held;
+ * returns with it held, having possibly DROPPED it in the middle.
+ *
+ * Dropping it is not an optimisation, it is a correctness requirement.  The
+ * driver underneath sleeps waiting for the disk interrupt, and in this kernel
+ * the preempt counter is global: a thread that blocks while holding any
+ * spinlock leaves the count above zero, and the deferred wake queue is only
+ * drained when the count reaches zero.  Blocking with bio_lock held therefore
+ * parks the thread and guarantees nothing will ever wake it.  Holding a
+ * spinlock across device I/O is not slow here -- it is fatal.
+ *
+ * So a miss claims its buffer with a busy flag, drops the lock, fetches, and
+ * takes the lock back.  The flag is what keeps a second thread from claiming
+ * the same buffer or reading half-filled bytes out of it; a thread that finds
+ * one busy yields and retries, which is legal precisely because it is holding
+ * no lock at that point.
  */
 static struct bio_buf *
-page_get(unsigned drive, uint64_t page)
+page_get(unsigned drive, uint64_t page, bool *retry)
 {
 	struct bio_buf	*victim;
 	size_t		 i;
 	int		 rv;
 
+	*retry = false;
 	for (i = 0; i < BIO_NBUFS; i++) {
-		if (bio_bufs[i].bb_valid && bio_bufs[i].bb_page == page &&
-		    bio_bufs[i].bb_drive == drive) {
+		if (bio_bufs[i].bb_page != page || bio_bufs[i].bb_drive != drive)
+			continue;
+		if (bio_bufs[i].bb_busy) {
+			/* Someone else is fetching it; wait outside the lock. */
+			spin_unlock(&bio_lock);
+			thread_yield();
+			spin_lock(&bio_lock);
+			*retry = true;
+			return (NULL);
+		}
+		if (bio_bufs[i].bb_valid) {
 			bio_bufs[i].bb_stamp = ++bio_clock;
 			bio_n_hit++;
 			return (&bio_bufs[i]);
@@ -100,6 +124,8 @@ page_get(unsigned drive, uint64_t page)
 	/* Miss.  Take a free buffer, else the least recently used one. */
 	victim = NULL;
 	for (i = 0; i < BIO_NBUFS; i++) {
+		if (bio_bufs[i].bb_busy)
+			continue;
 		if (!bio_bufs[i].bb_valid) {
 			victim = &bio_bufs[i];
 			break;
@@ -107,22 +133,37 @@ page_get(unsigned drive, uint64_t page)
 		if (victim == NULL || bio_bufs[i].bb_stamp < victim->bb_stamp)
 			victim = &bio_bufs[i];
 	}
+	if (victim == NULL) {			/* every buffer is in flight */
+		spin_unlock(&bio_lock);
+		thread_yield();
+		spin_lock(&bio_lock);
+		*retry = true;
+		return (NULL);
+	}
 	if (victim->bb_valid)
 		bio_n_evict++;
 
 	/*
-	 * Mark it invalid BEFORE the read: if the device fails we must not
-	 * leave a buffer claiming to hold a page whose contents are stale or
-	 * half-transferred.
+	 * Claim it: invalid (so no one reads it) and busy (so no one takes
+	 * it), with its identity already set so a concurrent lookup for the
+	 * same page finds it busy rather than starting a second fetch.
 	 */
 	victim->bb_valid = false;
-	rv = ata_kread(drive, page * BIO_SECTORS_PER_PAGE,
-	    BIO_SECTORS_PER_PAGE, victim->bb_data);
-	if (rv != 0)
-		return (NULL);
-
+	victim->bb_busy  = true;
 	victim->bb_page  = page;
 	victim->bb_drive = drive;
+
+	spin_unlock(&bio_lock);
+	rv = ata_kread(drive, page * BIO_SECTORS_PER_PAGE,
+	    BIO_SECTORS_PER_PAGE, victim->bb_data);
+	spin_lock(&bio_lock);
+
+	victim->bb_busy = false;
+	if (rv != 0) {
+		/* Leave nothing behind claiming to hold this page. */
+		victim->bb_page = (uint64_t)-1;
+		return (NULL);
+	}
 	victim->bb_stamp = ++bio_clock;
 	victim->bb_valid = true;
 	bio_n_miss++;
@@ -138,6 +179,7 @@ bio_read(unsigned drive, uint64_t lba, uint32_t nsec, void *buf)
 	uint32_t	 done;
 	uint32_t	 within;
 	uint32_t	 run;
+	bool		 retry;
 
 	if (!bio_ready)				/* no cache: straight through */
 		return (ata_kread(drive, lba, nsec, buf));
@@ -154,11 +196,20 @@ bio_read(unsigned drive, uint64_t lba, uint32_t nsec, void *buf)
 		if (run > nsec - done)
 			run = nsec - done;
 
-		bb = page_get(drive, page);
+		bb = page_get(drive, page, &retry);
+		if (retry) {
+			run = 0;		/* nothing consumed; go round again */
+			continue;
+		}
 		if (bb == NULL) {
 			spin_unlock(&bio_lock);
 			return (1);		/* the driver's error, flattened */
 		}
+		/*
+		 * Copy under the lock, and only from a buffer that is valid
+		 * and not busy -- page_get guarantees both, and the copy is
+		 * short enough that holding the lock for it costs nothing.
+		 */
 		mem_copy(out + (size_t)done * BIO_SECTOR_BYTES,
 		    bb->bb_data + (size_t)within * BIO_SECTOR_BYTES,
 		    (size_t)run * BIO_SECTOR_BYTES);

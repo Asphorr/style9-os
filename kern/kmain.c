@@ -124,6 +124,7 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	 * blocks over and over.  Reporting here says what that cost.
 	 */
 	bio_stats();
+	ata_irq_stats();
 
 	/*
 	 * Register a demo service under the bootstrap port so ring-3
