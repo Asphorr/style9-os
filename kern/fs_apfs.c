@@ -10,6 +10,7 @@
 #include <stdint.h>
 
 #include "ata_drv.h"
+#include "bio.h"
 #include "fs_apfs.h"
 #include "kmem.h"
 #include "kprintf.h"
@@ -18,9 +19,13 @@
  * APFS container probe.  See fs_apfs.h for what the format is doing; this
  * file is the mechanics of getting at it.
  *
- * Block I/O goes straight to ata_kread, the way fs_fat does it -- no Mach
- * round trip from inside the kernel.  ata_kread speaks 512-byte sectors, so
- * one APFS block is APFS_BLOCK_SIZE / 512 of them.
+ * Block I/O goes through the block cache (kern/bio.c) -- no Mach round trip
+ * from inside the kernel.  It speaks 512-byte sectors, so one APFS block is
+ * APFS_BLOCK_SIZE / 512 of them.  The cache earns its keep here more than it
+ * would for a simpler filesystem: a B-tree descent re-reads the same interior
+ * nodes on every lookup, and this reader deliberately re-walks the tree rather
+ * than carry Apple's name hash, so the same few blocks are asked for
+ * constantly.
  */
 
 #define	ATA_SECTOR_BYTES	512
@@ -109,7 +114,7 @@ static int
 read_block_raw(uint64_t bno, void *buf)
 {
 
-	if (ata_kread(0, bno * APFS_SECTORS_PER_BLOCK, APFS_SECTORS_PER_BLOCK,
+	if (bio_read(0, bno * APFS_SECTORS_PER_BLOCK, APFS_SECTORS_PER_BLOCK,
 	    buf) != 0)
 		return (FS_APFS_E_IO);
 	return (FS_APFS_E_OK);

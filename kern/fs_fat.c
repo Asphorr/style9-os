@@ -10,6 +10,7 @@
 #include <stdint.h>
 
 #include "ata_drv.h"
+#include "bio.h"
 #include "fs_fat.h"
 #include "kmem.h"
 #include "kprintf.h"
@@ -105,7 +106,7 @@ static int
 read_sector(uint32_t lba, void *buf)
 {
 
-	return (ata_kread(0, (uint64_t)lba, 1, buf) == 0 ?
+	return (bio_read(0, (uint64_t)lba, 1, buf) == 0 ?
 	    FS_FAT_E_OK : FS_FAT_E_IO);
 }
 
@@ -593,7 +594,7 @@ fs_fat_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size)
 
 		lba = g_fat.fv_data_start +
 		    (clus - 2) * g_fat.fv_sec_per_clus;
-		if (ata_kread(0, (uint64_t)lba, g_fat.fv_sec_per_clus,
+		if (bio_read(0, (uint64_t)lba, g_fat.fv_sec_per_clus,
 		    buf + off) != 0) {
 			kfree(buf);
 			return (FS_FAT_E_IO);

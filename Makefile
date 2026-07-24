@@ -117,6 +117,7 @@ OBJS	= \
 	$(OBJDIR)/elf.o		\
 	$(OBJDIR)/macho.o	\
 	$(OBJDIR)/darwin.o	\
+	$(OBJDIR)/bio.o		\
 	$(OBJDIR)/fs_fat.o	\
 	$(OBJDIR)/fs_apfs.o	\
 	$(OBJDIR)/fs.o		\

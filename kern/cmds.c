@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "bio.h"
 #include "bootstrap.h"
 #include "clock.h"
 #include "dev_subsystem.h"
@@ -116,6 +117,7 @@ cmd_mem(int argc, char *argv[])
 
 	pmm_stats();
 	kmem_stats();
+	bio_stats();
 	return (0);
 }
 

@@ -10,6 +10,7 @@
 #include <stdint.h>
 
 #include "ata_drv.h"
+#include "bio.h"
 #include "dev_proto.h"
 #include "dev_subsystem.h"
 #include "io.h"
@@ -382,6 +383,15 @@ ata_dispatch_for_drive(struct ata_drive *d, const struct mach_msg_header *req,
 			return (MACH_E_INVAL);
 
 		rv = ata_write(d, lba, count, wrq->dbw_data);
+
+		/*
+		 * The block cache never sees writes -- they go straight at the
+		 * device from here -- so it cannot know which pages this one
+		 * invalidated.  Tell it to forget the drive rather than let it
+		 * keep serving what the disk no longer holds.
+		 */
+		if (rv == MACH_MSG_OK)
+			bio_invalidate_drive((unsigned)(d - drives));
 
 		rhdr = (struct mach_msg_header *)buf;
 		body = (struct dev_block_io_reply *)

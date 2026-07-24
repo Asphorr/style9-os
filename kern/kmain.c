@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 #include "ata_drv.h"
+#include "bio.h"
 #include "fs_apfs.h"
 #include "fs_fat.h"
 #include "bootstrap.h"
@@ -114,8 +115,15 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	mouse_drv_init();
 	uart_drv_init();
 	ata_drv_init();
+	bio_init();		/* before any filesystem reads a block */
 	fs_fat_init();
 	fs_apfs_init();
+	/*
+	 * Mounting is the block cache's worst honest workload: probing two
+	 * filesystems and walking a volume's tree asks for the same metadata
+	 * blocks over and over.  Reporting here says what that cost.
+	 */
+	bio_stats();
 
 	/*
 	 * Register a demo service under the bootstrap port so ring-3
