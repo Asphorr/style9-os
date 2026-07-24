@@ -275,40 +275,83 @@ memset_pattern16(void *b, const void *pat, size_t len)
 		d[i] = p[i & 15];
 }
 
-/* ---- malloc: a bump allocator over a static zero-fill arena ------------- */
+/* ---- malloc: a bump allocator over mmap'd chunks ------------------------ */
 
 /*
- * No VM syscalls are wired to ring 3 yet, so malloc hands out bytes from a
- * fixed BSS arena (the Mach-O loader zero-fills the segment's bss tail, so the
- * arena starts zeroed).  Each block carries a 16-byte header holding its
- * usable size, so realloc() can copy the old contents forward; free() is a
- * no-op, as the programs we host allocate near-monotonically and never depend
- * on reclamation.  The arena is 16-aligned and every size is rounded to 16, so
- * returned pointers meet the alignment the SSE string paths assume.  4 MiB
- * covers a font plus working buffers with room to spare; an exhausted arena
- * returns NULL exactly as a real malloc would.
+ * The heap is asked for, not declared.
+ *
+ * This used to be a 4 MiB array in BSS, because ring 3 had no way to ask the
+ * kernel for memory.  That array was not free: the Mach-O loader allocates and
+ * zeroes every page of a segment's bss tail when the image loads, so every
+ * program here paid 4 MiB of real frames up front and a fork copied all of
+ * them, whether it ever called malloc or not.
+ *
+ * Now malloc requests chunks with mmap(MAP_ANON) and bumps a cursor through
+ * them.  The kernel hands back only the promise; each page becomes a frame
+ * when it is first touched, so a program that allocates a kilobyte holds a
+ * page, and one that allocates nothing holds nothing.
+ *
+ * Everything else is as it was.  Each block carries a 16-byte header holding
+ * its usable size, so realloc() can copy the old contents forward; free() is
+ * a no-op, since the programs hosted here allocate near-monotonically and
+ * never depend on reclamation.  Chunks are page-aligned and every size is
+ * rounded to 16, so returned pointers meet the alignment the SSE string paths
+ * assume.  A request that does not fit the current chunk abandons its tail and
+ * maps a new one -- the same bargain free() already makes, bounded by the
+ * chunk size rather than by the whole heap.
  */
-#define	ARENA_SIZE	(4u * 1024u * 1024u)
+#define	CHUNK_BYTES	(256u * 1024u)
 
-static unsigned char	arena[ARENA_SIZE] __attribute__((aligned(16)));
-static size_t		arena_off;
+/* <sys/mman.h>, which this file is the stand-in for. */
+#define	PROT_NONE	0x00
+#define	PROT_READ	0x01
+#define	PROT_WRITE	0x02
+#define	PROT_EXEC	0x04
+#define	MAP_SHARED	0x0001
+#define	MAP_PRIVATE	0x0002
+#define	MAP_FIXED	0x0010
+#define	MAP_ANON	0x1000
+#define	MAP_FAILED	((void *)-1)
+
+/* Defined further down, next to errno; malloc is the first thing to need it. */
+void	*mmap(void *addr, size_t len, int prot, int flags, int fd, long off);
+int	 munmap(void *addr, size_t len);
+
+static unsigned char	*heap_base;	/* current chunk, NULL before the first */
+static size_t		 heap_size;
+static size_t		 heap_off;	/* bump cursor within it               */
 
 void *
 malloc(size_t n)
 {
-	size_t	need;
-	size_t	off;
+	unsigned char	*chunk;
+	size_t		 need;
+	size_t		 want;
+	size_t		 off;
 
 	n = (n + 15u) & ~(size_t)15u;		/* 16-byte alignment */
 	if (n == 0)
 		n = 16;
 	need = n + 16u;				/* + a 16-byte size header */
-	if (need < n || need > ARENA_SIZE || arena_off > ARENA_SIZE - need)
+	if (need < n)
 		return (NULL);
-	off = arena_off;
-	arena_off += need;
-	*(size_t *)(void *)&arena[off] = n;	/* usable size, for realloc */
-	return (&arena[off + 16]);
+
+	if (heap_base == NULL || need > heap_size ||
+	    heap_off > heap_size - need) {
+		want = (need > CHUNK_BYTES) ?
+		    ((need + 0xFFFu) & ~(size_t)0xFFFu) : CHUNK_BYTES;
+		chunk = mmap(NULL, want, PROT_READ | PROT_WRITE,
+		    MAP_ANON | MAP_PRIVATE, -1, 0);
+		if (chunk == MAP_FAILED)
+			return (NULL);
+		heap_base = chunk;
+		heap_size = want;
+		heap_off  = 0;
+	}
+	off = heap_off;
+	heap_off += need;
+	*(size_t *)(void *)&heap_base[off] = n;	/* usable size, for realloc */
+	return (&heap_base[off + 16]);
 }
 
 void
@@ -351,8 +394,8 @@ getpagesize(void)
  * above reads a block's usable size from the 16 bytes IN FRONT of the pointer
  * it was given, so the header has to be re-stamped in front of the ALIGNED
  * pointer, not left in front of the raw one -- otherwise a realloc of an
- * aligned block would copy whatever happened to sit there.  Since the arena is
- * 16-aligned and every size rounds to 16, any gap it opens is a multiple of
+ * aligned block would copy whatever happened to sit there.  Since a chunk is
+ * page-aligned and every size rounds to 16, any gap it opens is a multiple of
  * 16, so the restamped header never reaches back into another block.
  */
 int
@@ -2177,6 +2220,61 @@ __error(void)
 {
 
 	return (&g_errno);
+}
+
+/*
+ * mmap(2) / munmap(2).
+ *
+ * The only six-argument syscall in this file, and the argument that makes it
+ * six is the one the SYSCALL instruction cannot carry in %rcx -- so arg3
+ * (flags) travels in %r10, and args 4 and 5 (fd, offset) in %r8 and %r9,
+ * exactly as Apple's stubs load them.
+ *
+ * Failure is MAP_FAILED, not NULL: address zero is a legal mapping in
+ * principle, so mmap has never been allowed to use it as the error value.
+ */
+static long
+bsd_call6_e(long nr, long a, long b, long c, long d, long e, long f)
+{
+	register long	r10 __asm__("r10");
+	register long	r8  __asm__("r8");
+	register long	r9  __asm__("r9");
+	long		ret;
+	unsigned char	cf;
+
+	r10 = d;
+	r8  = e;
+	r9  = f;
+	__asm__ __volatile__(
+	    "syscall\n\t"
+	    "setc %1\n"
+	    : "=a"(ret), "=r"(cf)
+	    : "a"(nr), "D"(a), "S"(b), "d"(c), "r"(r10), "r"(r8), "r"(r9)
+	    : "rcx", "r11", "memory");
+	if (cf) {
+		g_errno = (int)ret;
+		return (-1);
+	}
+	return (ret);
+}
+
+void *
+mmap(void *addr, size_t len, int prot, int flags, int fd, long off)
+{
+	long	rv;
+
+	rv = bsd_call6_e(0x20000C5, (long)addr, (long)len, prot, flags,
+	    fd, off);
+	if (rv == -1)
+		return (MAP_FAILED);
+	return ((void *)rv);
+}
+
+int
+munmap(void *addr, size_t len)
+{
+
+	return ((int)bsd_call6_e(0x2000049, (long)addr, (long)len, 0, 0, 0, 0));
 }
 
 /*
