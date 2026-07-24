@@ -36,6 +36,10 @@ static struct {
 	uint64_t	ac_omap_oid;		/* (m) container object map */
 	uint64_t	ac_fs_oid;		/* (m) volume 0 superblock  */
 	uint64_t	ac_xp_desc_base;	/* (m) */
+	uint64_t	ac_vol_omap_tree;	/* (m) volume omap B-tree   */
+	uint64_t	ac_root_tree_bno;	/* (m) file-system B-tree   */
+	uint64_t	ac_num_files;		/* (m) */
+	uint64_t	ac_num_dirs;		/* (m) */
 	uint32_t	ac_xp_desc_blocks;	/* (m) */
 	bool		ac_mounted;		/* (m) */
 } g_apfs;
@@ -165,6 +169,215 @@ adopt_newest_checkpoint(const struct apfs_nx_superblock *anchor, void *scratch)
 	return (FS_APFS_E_OK);
 }
 
+/*
+ * Where a B-tree node keeps its three regions.  Pulled out because every
+ * tree in the format is read this way and the value base is the one piece
+ * that is easy to get subtly wrong: offsets run BACKWARDS from the end of
+ * the node, and a root node reserves the last 40 bytes for its btree_info.
+ */
+struct btree_layout {
+	const uint8_t	*bl_toc;
+	const uint8_t	*bl_keys;
+	const uint8_t	*bl_vals;	/* one past the last value byte */
+	uint32_t	 bl_nkeys;
+	uint16_t	 bl_flags;
+	uint16_t	 bl_level;
+	bool		 bl_fixed;
+};
+
+static void
+btree_layout(const void *node, struct btree_layout *out)
+{
+	const struct apfs_btree_node_phys	*n;
+	const uint8_t				*base;
+	uint32_t				 toc_off;
+	uint32_t				 toc_len;
+
+	n = (const struct apfs_btree_node_phys *)node;
+	base = (const uint8_t *)node;
+	toc_off = n->btn_table_space.nl_off;
+	toc_len = n->btn_table_space.nl_len;
+
+	out->bl_flags = n->btn_flags;
+	out->bl_level = n->btn_level;
+	out->bl_nkeys = n->btn_nkeys;
+	out->bl_fixed = (n->btn_flags & APFS_BTNODE_FIXED_KV_SIZE) != 0;
+	out->bl_toc   = base + APFS_BTNODE_HDR_SIZE + toc_off;
+	out->bl_keys  = out->bl_toc + toc_len;
+	out->bl_vals  = base + APFS_BLOCK_SIZE -
+	    (((n->btn_flags & APFS_BTNODE_ROOT) != 0) ?
+	    APFS_BTREE_INFO_SIZE : 0);
+}
+
+/*
+ * Read entry `i`'s key and value offsets out of the table of contents.  A
+ * fixed-KV tree stores bare 16-bit offsets; a variable-KV tree stores
+ * offset+length pairs, whose lengths we do not need here.
+ */
+static void
+btree_entry_off(const struct btree_layout *bl, uint32_t i, uint32_t *koff,
+    uint32_t *voff)
+{
+	const struct apfs_kvoff	*fixed;
+	const struct apfs_kvloc	*var;
+
+	if (bl->bl_fixed) {
+		fixed = (const struct apfs_kvoff *)bl->bl_toc;
+		*koff = fixed[i].k;
+		*voff = fixed[i].v;
+	} else {
+		var = (const struct apfs_kvloc *)bl->bl_toc;
+		*koff = var[i].k.nl_off;
+		*voff = var[i].v.nl_off;
+	}
+}
+
+int
+fs_apfs_omap_lookup(uint64_t tree_bno, uint64_t oid, uint64_t xid,
+    uint64_t *paddr_out)
+{
+	const struct apfs_omap_key	*k;
+	const struct apfs_omap_val	*v;
+	struct btree_layout		 bl;
+	uint8_t				*node;
+	uint64_t			 next;
+	uint64_t			 best_xid;
+	uint32_t			 koff;
+	uint32_t			 voff;
+	uint32_t			 i;
+	int				 depth;
+	int				 rv;
+
+	node = kmalloc(APFS_BLOCK_SIZE);
+	if (node == NULL)
+		return (FS_APFS_E_NOMEM);
+
+	rv = FS_APFS_E_INVAL;
+	/*
+	 * Bounded descent.  A malformed tree must not be able to spin the
+	 * kernel: the depth cap is the backstop, since a cycle in the child
+	 * pointers is exactly what a corrupt image would produce.
+	 */
+	for (depth = 0; depth < 16; depth++) {
+		rv = fs_apfs_read_block(tree_bno, node);
+		if (rv != FS_APFS_E_OK)
+			break;
+		btree_layout(node, &bl);
+
+		next = 0;
+		best_xid = 0;
+		for (i = 0; i < bl.bl_nkeys; i++) {
+			btree_entry_off(&bl, i, &koff, &voff);
+			k = (const struct apfs_omap_key *)(bl.bl_keys + koff);
+			if (k->ok_xid > xid)
+				continue;	/* newer than this checkpoint */
+			if ((bl.bl_flags & APFS_BTNODE_LEAF) != 0) {
+				/*
+				 * Leaf: take the exact oid, newest version
+				 * that this transaction can see.
+				 */
+				if (k->ok_oid != oid || k->ok_xid < best_xid)
+					continue;
+				v = (const struct apfs_omap_val *)
+				    (bl.bl_vals - voff);
+				best_xid = k->ok_xid;
+				next = v->ov_paddr;
+			} else {
+				/*
+				 * Interior: keys are sorted, so the child to
+				 * follow is the last one whose key does not
+				 * exceed what we are looking for.  Its value
+				 * is the child's block number.
+				 */
+				if (k->ok_oid > oid)
+					continue;
+				next = *(const uint64_t *)(bl.bl_vals - voff);
+			}
+		}
+		if (next == 0) {
+			rv = FS_APFS_E_INVAL;
+			break;
+		}
+		if ((bl.bl_flags & APFS_BTNODE_LEAF) != 0) {
+			*paddr_out = next;
+			rv = FS_APFS_E_OK;
+			break;
+		}
+		tree_bno = next;
+		rv = FS_APFS_E_INVAL;	/* in case the cap runs out */
+	}
+
+	kfree(node);
+	return (rv);
+}
+
+/*
+ * Follow the container object map to volume 0's superblock, then that
+ * volume's own object map to the root of its file-system B-tree.  Two omap
+ * hops, because the two live at different levels: the container's map finds
+ * volumes, and each volume's map finds that volume's trees.
+ */
+static int
+mount_volume(void *scratch)
+{
+	const struct apfs_omap_phys	*om;
+	const struct apfs_superblock	*sb;
+	uint64_t			 apsb_bno;
+	uint64_t			 vol_omap_tree;
+	uint64_t			 ctr_omap_tree;
+	int				 rv;
+
+	/* The container omap oid is PHYSICAL: it is already a block number. */
+	rv = fs_apfs_read_block(g_apfs.ac_omap_oid, scratch);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	om = (const struct apfs_omap_phys *)scratch;
+	ctr_omap_tree = om->om_tree_oid;
+
+	rv = fs_apfs_omap_lookup(ctr_omap_tree, g_apfs.ac_fs_oid, g_apfs.ac_xid,
+	    &apsb_bno);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+
+	rv = fs_apfs_read_block(apsb_bno, scratch);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	sb = (const struct apfs_superblock *)scratch;
+	if (sb->apfs_magic != APFS_APSB_MAGIC)
+		return (FS_APFS_E_INVAL);
+
+	kprintf("apfs: volume \"%s\" @%llu -- %llu files, %llu dirs\n",
+	    (const char *)sb->apfs_volname, (unsigned long long)apsb_bno,
+	    (unsigned long long)sb->apfs_num_files,
+	    (unsigned long long)sb->apfs_num_directories);
+
+	g_apfs.ac_num_files = sb->apfs_num_files;
+	g_apfs.ac_num_dirs  = sb->apfs_num_directories;
+
+	/* The volume's omap oid is physical too; its root tree oid is not. */
+	rv = fs_apfs_read_block(sb->apfs_omap_oid, scratch);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	om = (const struct apfs_omap_phys *)scratch;
+	vol_omap_tree = om->om_tree_oid;
+
+	/*
+	 * Re-read the volume superblock: the omap read above reused scratch,
+	 * so sb is stale.  Cheap, and clearer than juggling a third buffer.
+	 */
+	rv = fs_apfs_read_block(apsb_bno, scratch);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	sb = (const struct apfs_superblock *)scratch;
+
+	rv = fs_apfs_omap_lookup(vol_omap_tree, sb->apfs_root_tree_oid,
+	    g_apfs.ac_xid, &g_apfs.ac_root_tree_bno);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	g_apfs.ac_vol_omap_tree = vol_omap_tree;
+	return (FS_APFS_E_OK);
+}
+
 void
 fs_apfs_init(void)
 {
@@ -222,12 +435,22 @@ fs_apfs_init(void)
 		goto out;
 	}
 
-	g_apfs.ac_mounted = true;
-	kprintf("apfs: mounted -- newest xid %llu, omap oid %llu, "
-	    "volume oid %llu\n",
+	kprintf("apfs: container xid %llu, omap oid %llu, volume oid %llu\n",
 	    (unsigned long long)g_apfs.ac_xid,
 	    (unsigned long long)g_apfs.ac_omap_oid,
 	    (unsigned long long)g_apfs.ac_fs_oid);
+
+	rv = mount_volume(scratch);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs: volume 0 unreadable (%d) -- APFS unavailable\n",
+		    rv);
+		goto out;
+	}
+
+	g_apfs.ac_mounted = true;
+	kprintf("apfs: mounted -- fs B-tree root @%llu, volume omap @%llu\n",
+	    (unsigned long long)g_apfs.ac_root_tree_bno,
+	    (unsigned long long)g_apfs.ac_vol_omap_tree);
 
 out:
 	kfree(anchor);
