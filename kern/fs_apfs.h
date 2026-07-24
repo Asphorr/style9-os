@@ -290,12 +290,112 @@ _Static_assert(__builtin_offsetof(struct apfs_superblock, apfs_num_files)
 _Static_assert(__builtin_offsetof(struct apfs_superblock, apfs_volname) == 704,
     "apfs_volname sits at +704");
 
+/*
+ * File-system records.  A volume keeps inodes, directory entries, extents
+ * and extended attributes in ONE B-tree, told apart by the record type
+ * packed into the top 4 bits of the key's first word -- the low 60 bits are
+ * the object id.  Records sort by object id FIRST and type second, which is
+ * the opposite of what a raw 64-bit compare of that word would do; any
+ * search has to unpack before comparing.
+ */
+#define	APFS_J_OBJ_ID_MASK	0x0FFFFFFFFFFFFFFFULL
+#define	APFS_J_OBJ_TYPE_SHIFT	60
+
+#define	APFS_TYPE_INODE		3
+#define	APFS_TYPE_XATTR		4
+#define	APFS_TYPE_DSTREAM_ID	6
+#define	APFS_TYPE_FILE_EXTENT	8
+#define	APFS_TYPE_DIR_REC	9
+
+/* The root directory's object id is fixed by the format. */
+#define	APFS_ROOT_DIR_INO	2
+
+/*
+ * Directory-entry keys come in two shapes and the volume's incompatible
+ * feature flags pick which.  A case- or normalization-insensitive volume
+ * stores a 22-bit hash of the name alongside its length, and orders entries
+ * within a directory BY THAT HASH; a plain volume stores just the length and
+ * orders by name.  Computing the hash means reproducing Apple's Unicode
+ * normalization, so this reader does not: it descends on the object id --
+ * the primary sort key, and hash-independent -- and compares names directly
+ * once there.  Costlier for a huge directory, exact for any of them.
+ */
+#define	APFS_INCOMPAT_CASE_INSENSITIVE		0x00000001ULL
+#define	APFS_INCOMPAT_NORM_INSENSITIVE		0x00000008ULL
+#define	APFS_DREC_LEN_MASK			0x000003FFU
+
+/* j_drec_val_t.flags low bits: the dirent type, BSD DT_* numbering. */
+#define	APFS_DT_DIR		4
+#define	APFS_DT_REG		8
+
+/*
+ * Packed, and it matters: the on-disk record is 18 bytes, but the natural
+ * alignment of a struct ending in a uint16 after two uint64s would round
+ * sizeof up to 24 -- and a length check against that silently rejects every
+ * real directory entry.
+ */
+struct apfs_drec_val {
+	uint64_t	dv_file_id;
+	uint64_t	dv_date_added;
+	uint16_t	dv_flags;
+} __attribute__((packed));
+
+_Static_assert(sizeof(struct apfs_drec_val) == 18,
+    "a directory-entry record is 18 bytes before its extended fields");
+
+/*
+ * Inode record.  Note what is NOT here: the file's size.  That lives in a
+ * dstream extended field appended after this struct, because a plain
+ * directory has no need of one -- so the fixed part stops at 92 bytes and
+ * the extended fields follow.  The struct is packed: uncompressed_size sits
+ * at offset 84, which is not 8-byte aligned.
+ */
+struct apfs_inode_val {
+	uint64_t	ai_parent_id;
+	uint64_t	ai_private_id;
+	uint64_t	ai_create_time;
+	uint64_t	ai_mod_time;
+	uint64_t	ai_change_time;
+	uint64_t	ai_access_time;
+	uint64_t	ai_internal_flags;
+	int32_t		ai_nchildren_or_nlink;
+	uint32_t	ai_default_protection_class;
+	uint32_t	ai_write_generation_counter;
+	uint32_t	ai_bsd_flags;
+	uint32_t	ai_owner;
+	uint32_t	ai_group;
+	uint16_t	ai_mode;
+	uint16_t	ai_pad1;
+	uint64_t	ai_uncompressed_size;
+} __attribute__((packed));
+
+_Static_assert(sizeof(struct apfs_inode_val) == 92,
+    "the fixed part of an inode record is 92 bytes, extended fields follow");
+_Static_assert(__builtin_offsetof(struct apfs_inode_val, ai_mode) == 80,
+    "ai_mode sits at +80");
+
+/* Longest name fs_apfs_readdir reports. */
+#define	FS_APFS_NAME_MAX	255
+
+/*
+ * One directory entry as fs_apfs_readdir reports it.  Deliberately the same
+ * shape fs_fat_dirent has, so the Darwin readdir path can be pointed at
+ * either filesystem without changing its wire format.
+ */
+struct fs_apfs_dirent {
+	uint64_t	ade_ino;
+	uint64_t	ade_size;
+	uint8_t		ade_is_dir;
+	char		ade_name[FS_APFS_NAME_MAX + 1];
+};
+
 #define	FS_APFS_E_OK		0
 #define	FS_APFS_E_NOMOUNT	(-1)	/* no APFS container mounted    */
 #define	FS_APFS_E_IO		(-2)	/* block read failed            */
 #define	FS_APFS_E_NOMEM		(-3)	/* kmalloc failed               */
 #define	FS_APFS_E_INVAL		(-4)	/* not APFS / unsupported shape */
 #define	FS_APFS_E_CKSUM		(-5)	/* Fletcher-64 mismatch         */
+#define	FS_APFS_E_NOTFOUND	(-6)	/* name absent / not a dir      */
 
 /*
  * Probe the first ATA drive for an APFS container and adopt the newest valid
@@ -317,6 +417,25 @@ int	fs_apfs_ready(void);
  */
 int	fs_apfs_omap_lookup(uint64_t tree_bno, uint64_t oid, uint64_t xid,
 	    uint64_t *paddr_out);
+
+/*
+ * Resolve an absolute path to its object id, reporting whether it names a
+ * directory.  A leading '/' is optional and repeated separators are ignored;
+ * "" and "/" both name the root.  Returns FS_APFS_E_OK or a negative
+ * FS_APFS_E_* (NOTFOUND for a missing component, or for descending through
+ * something that is not a directory).
+ */
+int	fs_apfs_lookup(const char *path, uint64_t *oid_out, int *is_dir_out);
+
+/*
+ * Fill *out with the `index`-th entry of the directory named by `path`.
+ * Returns 1 when an entry was written, 0 at end-of-directory, or a negative
+ * FS_APFS_E_*.  Enumeration is stateless -- each call re-resolves and
+ * re-scans -- matching how fs_fat_readdir behaves and keeping no per-fd
+ * cursor in the kernel.
+ */
+int	fs_apfs_readdir(const char *path, uint32_t index,
+	    struct fs_apfs_dirent *out);
 
 /*
  * Read APFS block `bno` into `buf` (which must hold a whole block) and verify

@@ -41,8 +41,19 @@ static struct {
 	uint64_t	ac_num_files;		/* (m) */
 	uint64_t	ac_num_dirs;		/* (m) */
 	uint32_t	ac_xp_desc_blocks;	/* (m) */
+	bool		ac_drec_hashed;		/* (m) hashed dirent keys   */
 	bool		ac_mounted;		/* (m) */
 } g_apfs;
+
+static size_t
+str_len(const char *s)
+{
+	size_t	n;
+
+	for (n = 0; s[n] != '\0'; n++)
+		continue;
+	return (n);
+}
 
 uint64_t
 fs_apfs_fletcher64(const void *p, uint32_t len)
@@ -232,6 +243,24 @@ btree_entry_off(const struct btree_layout *bl, uint32_t i, uint32_t *koff,
 	}
 }
 
+/* As above, but also reports the lengths a variable-KV tree records. */
+static void
+btree_entry_loc(const struct btree_layout *bl, uint32_t i, uint32_t *koff,
+    uint32_t *klen, uint32_t *voff, uint32_t *vlen)
+{
+	const struct apfs_kvloc	*var;
+
+	btree_entry_off(bl, i, koff, voff);
+	if (bl->bl_fixed) {
+		*klen = 0;
+		*vlen = 0;
+		return;
+	}
+	var = (const struct apfs_kvloc *)bl->bl_toc;
+	*klen = var[i].k.nl_len;
+	*vlen = var[i].v.nl_len;
+}
+
 int
 fs_apfs_omap_lookup(uint64_t tree_bno, uint64_t oid, uint64_t xid,
     uint64_t *paddr_out)
@@ -353,6 +382,13 @@ mount_volume(void *scratch)
 
 	g_apfs.ac_num_files = sb->apfs_num_files;
 	g_apfs.ac_num_dirs  = sb->apfs_num_directories;
+	/*
+	 * A case- or normalization-insensitive volume hashes dirent names
+	 * into the key, which changes the key's shape (and its ordering).
+	 */
+	g_apfs.ac_drec_hashed = (sb->apfs_incompat &
+	    (APFS_INCOMPAT_CASE_INSENSITIVE |
+	    APFS_INCOMPAT_NORM_INSENSITIVE)) != 0;
 
 	/* The volume's omap oid is physical too; its root tree oid is not. */
 	rv = fs_apfs_read_block(sb->apfs_omap_oid, scratch);
@@ -376,6 +412,304 @@ mount_volume(void *scratch)
 		return (rv);
 	g_apfs.ac_vol_omap_tree = vol_omap_tree;
 	return (FS_APFS_E_OK);
+}
+
+/* ---- file-system tree ----------------------------------------------------- */
+
+/*
+ * Callback fired for every leaf record, in tree order.  Returning false
+ * stops the walk -- a lookup that has found its answer should not keep
+ * reading blocks.
+ */
+typedef bool (*apfs_rec_fn)(uint64_t oid, uint32_t type, const uint8_t *key,
+    uint32_t klen, const uint8_t *val, uint32_t vlen, void *arg);
+
+/*
+ * Walk the volume's file-system tree in order.
+ *
+ * Unlike the container's object map, this tree's interior nodes point at
+ * children by VIRTUAL oid, so every descent costs an object-map lookup --
+ * that indirection is the price copy-on-write charges for being able to
+ * rewrite a node without touching its parent.
+ *
+ * The walk visits everything rather than binary-searching, which is what
+ * lets this reader stay free of Apple's name hash (see fs_apfs.h).  For the
+ * directory sizes a Darwin binary here actually opens, whole-tree order is
+ * cheap; a real implementation would descend on the key instead.
+ */
+static bool
+btree_walk(uint64_t bno, apfs_rec_fn fn, void *arg, int depth, bool *stopped)
+{
+	struct btree_layout	 bl;
+	uint8_t			*node;
+	uint64_t		 child_oid;
+	uint64_t		 child_bno;
+	uint32_t		 koff;
+	uint32_t		 klen;
+	uint32_t		 voff;
+	uint32_t		 vlen;
+	uint32_t		 i;
+	bool			 ok;
+
+	if (depth > 8)			/* corrupt tree must not spin us */
+		return (false);
+	node = kmalloc(APFS_BLOCK_SIZE);
+	if (node == NULL)
+		return (false);
+	if (fs_apfs_read_block(bno, node) != FS_APFS_E_OK) {
+		kfree(node);
+		return (false);
+	}
+	btree_layout(node, &bl);
+
+	ok = true;
+	for (i = 0; i < bl.bl_nkeys && !*stopped; i++) {
+		btree_entry_loc(&bl, i, &koff, &klen, &voff, &vlen);
+		if ((bl.bl_flags & APFS_BTNODE_LEAF) != 0) {
+			const uint8_t	*k;
+			uint64_t	 raw;
+
+			k = bl.bl_keys + koff;
+			raw = *(const uint64_t *)k;
+			if (!fn(raw & APFS_J_OBJ_ID_MASK,
+			    (uint32_t)(raw >> APFS_J_OBJ_TYPE_SHIFT),
+			    k, klen, bl.bl_vals - voff, vlen, arg))
+				*stopped = true;
+			continue;
+		}
+		child_oid = *(const uint64_t *)(bl.bl_vals - voff);
+		if (fs_apfs_omap_lookup(g_apfs.ac_vol_omap_tree, child_oid,
+		    g_apfs.ac_xid, &child_bno) != FS_APFS_E_OK) {
+			ok = false;
+			break;
+		}
+		if (!btree_walk(child_bno, fn, arg, depth + 1, stopped)) {
+			ok = false;
+			break;
+		}
+	}
+	kfree(node);
+	return (ok);
+}
+
+/*
+ * Name inside a directory-record key.  The fixed part is the 8-byte record
+ * header plus either a 4-byte length-and-hash (hashed volumes) or a 2-byte
+ * length; the name follows, NUL-terminated, and the recorded length counts
+ * that NUL.
+ */
+static const char *
+drec_name(const uint8_t *key, uint32_t klen, uint32_t *len_out)
+{
+	uint32_t	n;
+
+	if (g_apfs.ac_drec_hashed) {
+		if (klen < 13)
+			return (NULL);
+		n = *(const uint32_t *)(key + 8) & APFS_DREC_LEN_MASK;
+		if (n == 0 || n > klen - 12)
+			return (NULL);
+		*len_out = n - 1;		/* drop the trailing NUL */
+		return ((const char *)key + 12);
+	}
+	if (klen < 11)
+		return (NULL);
+	n = *(const uint16_t *)(key + 8);
+	if (n == 0 || n > klen - 10)
+		return (NULL);
+	*len_out = n - 1;
+	return ((const char *)key + 10);
+}
+
+struct dirent_search {
+	const char	*ds_name;
+	size_t		 ds_namelen;
+	uint64_t	 ds_parent;
+	uint64_t	 ds_found;
+	bool		 ds_is_dir;
+};
+
+static bool
+dirent_match(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
+    const uint8_t *val, uint32_t vlen, void *arg)
+{
+	const struct apfs_drec_val	*dv;
+	struct dirent_search		*ds;
+	const char			*name;
+	uint32_t			 nlen;
+	size_t				 i;
+
+	ds = arg;
+	if (type != APFS_TYPE_DIR_REC || oid != ds->ds_parent)
+		return (true);
+	if (vlen < sizeof(*dv))
+		return (true);
+	name = drec_name(key, klen, &nlen);
+	if (name == NULL || nlen != ds->ds_namelen)
+		return (true);
+	for (i = 0; i < ds->ds_namelen; i++)
+		if (name[i] != ds->ds_name[i])
+			return (true);
+
+	dv = (const struct apfs_drec_val *)val;
+	ds->ds_found  = dv->dv_file_id;
+	ds->ds_is_dir = (dv->dv_flags & 0x0F) == APFS_DT_DIR;
+	return (false);				/* found: stop the walk */
+}
+
+int
+fs_apfs_lookup(const char *path, uint64_t *oid_out, int *is_dir_out)
+{
+	struct dirent_search	ds;
+	const char		*p;
+	const char		*comp;
+	uint64_t		 oid;
+	bool			 is_dir;
+	bool			 stopped;
+
+	if (!g_apfs.ac_mounted)
+		return (FS_APFS_E_NOMOUNT);
+
+	oid = APFS_ROOT_DIR_INO;
+	is_dir = true;
+	for (p = path; *p != '\0'; ) {
+		while (*p == '/')
+			p++;
+		if (*p == '\0')
+			break;
+		comp = p;
+		while (*p != '\0' && *p != '/')
+			p++;
+
+		if (!is_dir)			/* a file has no children */
+			return (FS_APFS_E_NOTFOUND);
+		ds.ds_name    = comp;
+		ds.ds_namelen = (size_t)(p - comp);
+		ds.ds_parent  = oid;
+		ds.ds_found   = 0;
+		ds.ds_is_dir  = false;
+		stopped = false;
+		if (!btree_walk(g_apfs.ac_root_tree_bno, dirent_match, &ds, 0,
+		    &stopped))
+			return (FS_APFS_E_IO);
+		if (ds.ds_found == 0)
+			return (FS_APFS_E_NOTFOUND);
+		oid    = ds.ds_found;
+		is_dir = ds.ds_is_dir;
+	}
+
+	*oid_out = oid;
+	if (is_dir_out != NULL)
+		*is_dir_out = is_dir ? 1 : 0;
+	return (FS_APFS_E_OK);
+}
+
+struct readdir_search {
+	struct fs_apfs_dirent	*rs_out;
+	uint64_t		 rs_dir;
+	uint32_t		 rs_want;
+	uint32_t		 rs_seen;
+	bool			 rs_hit;
+};
+
+static bool
+readdir_pick(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
+    const uint8_t *val, uint32_t vlen, void *arg)
+{
+	const struct apfs_drec_val	*dv;
+	struct readdir_search		*rs;
+	const char			*name;
+	uint32_t			 nlen;
+	uint32_t			 i;
+
+	rs = arg;
+	if (type != APFS_TYPE_DIR_REC || oid != rs->rs_dir)
+		return (true);
+	if (vlen < sizeof(*dv))
+		return (true);
+	name = drec_name(key, klen, &nlen);
+	if (name == NULL)
+		return (true);
+	if (rs->rs_seen++ != rs->rs_want)
+		return (true);
+
+	dv = (const struct apfs_drec_val *)val;
+	if (nlen > FS_APFS_NAME_MAX)
+		nlen = FS_APFS_NAME_MAX;
+	for (i = 0; i < nlen; i++)
+		rs->rs_out->ade_name[i] = name[i];
+	rs->rs_out->ade_name[nlen] = '\0';
+	rs->rs_out->ade_ino    = dv->dv_file_id;
+	rs->rs_out->ade_size   = 0;		/* filled in once extents land */
+	rs->rs_out->ade_is_dir = (dv->dv_flags & 0x0F) == APFS_DT_DIR;
+	rs->rs_hit = true;
+	return (false);
+}
+
+int
+fs_apfs_readdir(const char *path, uint32_t index, struct fs_apfs_dirent *out)
+{
+	struct readdir_search	rs;
+	uint64_t		oid;
+	int			is_dir;
+	int			rv;
+	bool			stopped;
+
+	if (!g_apfs.ac_mounted)
+		return (FS_APFS_E_NOMOUNT);
+	rv = fs_apfs_lookup(path, &oid, &is_dir);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	if (!is_dir)
+		return (FS_APFS_E_NOTFOUND);
+
+	rs.rs_out  = out;
+	rs.rs_dir  = oid;
+	rs.rs_want = index;
+	rs.rs_seen = 0;
+	rs.rs_hit  = false;
+	stopped = false;
+	if (!btree_walk(g_apfs.ac_root_tree_bno, readdir_pick, &rs, 0, &stopped))
+		return (FS_APFS_E_IO);
+	return (rs.rs_hit ? 1 : 0);
+}
+
+/*
+ * Mount-time listing.  Reading a container is only half the claim; walking
+ * out of it by name is the other half, so the banner shows the tree it
+ * actually resolved rather than asserting it could.
+ */
+static void
+list_dir(const char *path, int depth)
+{
+	struct fs_apfs_dirent	 de;
+	char			 child[256];
+	size_t			 base;
+	size_t			 i;
+	uint32_t		 idx;
+
+	for (idx = 0; idx < 64; idx++) {
+		if (fs_apfs_readdir(path, idx, &de) != 1)
+			return;
+		kprintf("apfs:   ");
+		for (i = 0; i < (size_t)depth * 2; i++)
+			kprintf(" ");
+		kprintf("%s%s\n", de.ade_name, de.ade_is_dir ? "/" : "");
+		if (!de.ade_is_dir || depth >= 2)
+			continue;
+
+		base = str_len(path);
+		if (base + 1 + str_len(de.ade_name) + 1 > sizeof(child))
+			continue;
+		for (i = 0; i < base; i++)
+			child[i] = path[i];
+		if (base > 0 && child[base - 1] != '/')
+			child[base++] = '/';
+		for (i = 0; de.ade_name[i] != '\0'; i++)
+			child[base + i] = de.ade_name[i];
+		child[base + i] = '\0';
+		list_dir(child, depth + 1);
+	}
 }
 
 void
@@ -448,9 +782,12 @@ fs_apfs_init(void)
 	}
 
 	g_apfs.ac_mounted = true;
-	kprintf("apfs: mounted -- fs B-tree root @%llu, volume omap @%llu\n",
+	kprintf("apfs: mounted -- fs B-tree root @%llu, volume omap @%llu, "
+	    "%s dirent keys\n",
 	    (unsigned long long)g_apfs.ac_root_tree_bno,
-	    (unsigned long long)g_apfs.ac_vol_omap_tree);
+	    (unsigned long long)g_apfs.ac_vol_omap_tree,
+	    g_apfs.ac_drec_hashed ? "hashed" : "plain");
+	list_dir("/", 0);
 
 out:
 	kfree(anchor);
