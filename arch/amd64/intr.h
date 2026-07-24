@@ -56,6 +56,14 @@ typedef void (*irq_handler_t)(struct trapframe *);
 void	intr_dispatch(struct trapframe *);
 void	irq_install(unsigned int irq, irq_handler_t);
 
+/*
+ * Resume ring 3 through a hand-built trapframe (isr.S).  Restores all 15
+ * GPRs and RFLAGS via IRETQ, so unlike a SYSRET it can return a context
+ * whose %rcx and %r11 must survive -- the asynchronous sigreturn path.
+ * Never returns, and abandons the kernel stack it was called on.
+ */
+void	trapframe_iretq(struct trapframe *) __attribute__((noreturn));
+
 static inline void
 intr_enable(void)
 {

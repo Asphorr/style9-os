@@ -11,7 +11,9 @@
 
 #include "darwin.h"
 #include "fs_fat.h"
+#include "gdt.h"
 #include "host.h"
+#include "intr.h"
 #include "kmem.h"
 #include "kprintf.h"
 #include "macho.h"
@@ -799,6 +801,20 @@ darwin_signal_deliver(struct task *t)
 }
 
 /*
+ * RFLAGS to resume ring 3 with: the arithmetic flags and DF as the sigframe
+ * left them, IF and the must-be-set bit 1 forced on, everything else dropped.
+ * The frame lives on the user's own stack, so sf_rflags is attacker-writable
+ * in the limit -- unmasked, a forged frame could hand ring 3 IOPL 3 (raw I/O
+ * ports plus CLI/STI) through either resume path.
+ */
+static uint64_t
+darwin_signal_rflags(uint64_t saved)
+{
+
+	return ((saved & DARWIN_SIGRETURN_RFLAGS_MASK) | 0x202ULL);
+}
+
+/*
  * Build the on-stack signal frame for a caught signal and reshape `f` so the
  * syscall-exit sysret enters the task's _sigtramp.  Returns 0 on success, -1
  * if the frame could not be written (no trampoline registered, or a bad user
@@ -806,7 +822,7 @@ darwin_signal_deliver(struct task *t)
  * f's user rsp:
  *
  *	[ 128-byte red zone -- preserved ]
- *	[ darwin_sigframe (48 B, 16-aligned) ]   <- ucontext + saved context
+ *	[ darwin_sigframe (64 B, 16-aligned) ]   <- ucontext + saved context
  *	[ 8-byte pad ]                            <- new rsp (%16 == 8 at entry)
  *
  * The exit asm reloads rdi/rsi/rdx/r10 from f->sf_arg0..3, so the trampoline
@@ -831,12 +847,15 @@ darwin_signal_setup_frame(struct syscall_frame *f, int signo, uint64_t handler,
 	frame.sf_rsp    = f->sf_user_rsp;
 	frame.sf_rflags = f->sf_user_rflags;
 	frame.sf_rax    = (uint64_t)rv;
+	frame.sf_mask   = (uint64_t)t->t_sig_mask;
+	frame.sf_pad    = 0;
 
 	base = (f->sf_user_rsp - 128) & ~(uint64_t)15;
 	fa   = base - sizeof(frame);
 	if (syscall_copyout((void *)fa, &frame, sizeof(frame)) != 0)
 		return (-1);
 
+	t->t_sig_mask |= darwin_sigbit(signo);		/* blocked in handler */
 	f->sf_user_rip = t->t_sig_tramp;
 	f->sf_user_rsp = fa - 8;			/* %16 == 8 at entry */
 	f->sf_arg0 = (uint64_t)signo;			/* rdi: signo        */
@@ -871,6 +890,164 @@ darwin_signal_deliver_syscall(struct syscall_frame *f, long rv)
 	}
 	darwin_zombie_record(t->t_id, t->t_darwin_ppid, signo & 0x7F);
 	thread_exit();
+	/* NOTREACHED */
+}
+
+/*
+ * The asynchronous twin of darwin_signal_setup_frame.  Same stack layout and
+ * the same trampoline entry protocol; what differs is how much has to be
+ * saved.  A signal taken at a syscall boundary can rely on the ABI -- the
+ * argument and scratch registers were already dead, and the FPU file is
+ * caller-saved across a call.  A signal taken from the IRQ path interrupted
+ * an arbitrary instruction, so every GPR and the x87/SSE file are live and
+ * all of it goes in the frame.
+ *
+ * The handler VA travels in %r10 here too, even though nothing forces it on
+ * this path -- matching the syscall flavour (where SYSCALL owns %rcx) lets
+ * one _sigtramp serve both.
+ */
+static int
+darwin_signal_setup_frame_trap(struct trapframe *tf, int signo,
+    uint64_t handler)
+{
+	struct darwin_sigframe_full	frame;
+	struct task			*t;
+	uint64_t			 base;
+	uint64_t			 fa;
+
+	t = current_thread->th_task;
+	if (t->t_sig_tramp == 0)
+		return (-1);
+
+	frame.sf_magic = DARWIN_SIGFRAME_MAGIC_FULL;
+	frame.sf_signo = (uint64_t)signo;
+	frame.sf_mask  = (uint64_t)t->t_sig_mask;
+	frame.sf_r15   = tf->tf_r15;
+	frame.sf_r14   = tf->tf_r14;
+	frame.sf_r13   = tf->tf_r13;
+	frame.sf_r12   = tf->tf_r12;
+	frame.sf_r11   = tf->tf_r11;
+	frame.sf_r10   = tf->tf_r10;
+	frame.sf_r9    = tf->tf_r9;
+	frame.sf_r8    = tf->tf_r8;
+	frame.sf_rdi   = tf->tf_rdi;
+	frame.sf_rsi   = tf->tf_rsi;
+	frame.sf_rbp   = tf->tf_rbp;
+	frame.sf_rbx   = tf->tf_rbx;
+	frame.sf_rdx   = tf->tf_rdx;
+	frame.sf_rcx   = tf->tf_rcx;
+	frame.sf_rax   = tf->tf_rax;
+	frame.sf_rip   = tf->tf_rip;
+	frame.sf_rsp   = tf->tf_rsp;
+	frame.sf_rflags = tf->tf_rflags;
+
+	/*
+	 * The interrupted thread's x87/SSE file is still live in the register
+	 * file -- the trap did not switch threads, and thread_switch_asm is
+	 * the only thing that spills th_fpu -- so FXSAVE here captures exactly
+	 * the state the handler is about to clobber.
+	 */
+	__asm__ __volatile__ ("fxsave (%0)" : : "r"(frame.sf_fpu) : "memory");
+
+	base = (tf->tf_rsp - 128) & ~(uint64_t)15;
+	fa   = base - sizeof(frame);
+	if (syscall_copyout((void *)fa, &frame, sizeof(frame)) != 0)
+		return (-1);
+
+	t->t_sig_mask |= darwin_sigbit(signo);		/* blocked in handler */
+	tf->tf_rip = t->t_sig_tramp;
+	tf->tf_rsp = fa - 8;				/* %16 == 8 at entry */
+	tf->tf_rdi = (uint64_t)signo;
+	tf->tf_rsi = 0;
+	tf->tf_rdx = fa;
+	tf->tf_r10 = handler;
+	return (0);
+}
+
+void
+darwin_signal_deliver_trap(struct trapframe *tf)
+{
+	struct task	*t;
+	uint64_t	 disp;
+	int		 signo;
+
+	t = current_thread->th_task;
+	disp = DARWIN_SIG_DFL;
+	signo = darwin_signal_next(t, &disp);
+	if (signo == 0)
+		return;
+	if (disp != DARWIN_SIG_DFL) {
+		__atomic_fetch_and(&t->t_sig_pending,
+		    ~((uint32_t)1 << signo), __ATOMIC_RELEASE);
+		if (darwin_signal_setup_frame_trap(tf, signo, disp) == 0)
+			return;
+	}
+	darwin_zombie_record(t->t_id, t->t_darwin_ppid, signo & 0x7F);
+	thread_exit();
+	/* NOTREACHED */
+}
+
+/*
+ * Resume from an SGFR2 frame.  Rebuilds the interrupted machine state as a
+ * trapframe and leaves through IRETQ, the one exit that can restore %rcx and
+ * %r11 -- SYSRET architecturally destroys both, which is why the async path
+ * cannot ride the ordinary syscall return the way the SGFR1 path does.
+ *
+ * Never returns: on a good frame it lands back in ring 3 where the signal
+ * struck, on a corrupt one it retires the task.
+ */
+static void
+darwin_sigreturn_full(uint64_t uctx)
+{
+	struct darwin_sigframe_full	frame;
+	struct trapframe		tf;
+	struct task			*t;
+
+	t = current_thread->th_task;
+	if (syscall_copyin(&frame, (const void *)uctx, sizeof(frame)) != 0 ||
+	    frame.sf_magic != DARWIN_SIGFRAME_MAGIC_FULL) {
+		kprintf("darwin: bad async sigreturn frame @0x%llx\n",
+		    (unsigned long long)uctx);
+		darwin_zombie_record(t->t_id, t->t_darwin_ppid, DARWIN_SIGKILL);
+		thread_exit();
+		/* NOTREACHED */
+	}
+
+	t->t_sig_mask = (uint32_t)frame.sf_mask;
+
+	tf.tf_r15 = frame.sf_r15;
+	tf.tf_r14 = frame.sf_r14;
+	tf.tf_r13 = frame.sf_r13;
+	tf.tf_r12 = frame.sf_r12;
+	tf.tf_r11 = frame.sf_r11;
+	tf.tf_r10 = frame.sf_r10;
+	tf.tf_r9  = frame.sf_r9;
+	tf.tf_r8  = frame.sf_r8;
+	tf.tf_rdi = frame.sf_rdi;
+	tf.tf_rsi = frame.sf_rsi;
+	tf.tf_rbp = frame.sf_rbp;
+	tf.tf_rbx = frame.sf_rbx;
+	tf.tf_rdx = frame.sf_rdx;
+	tf.tf_rcx = frame.sf_rcx;
+	tf.tf_rax = frame.sf_rax;
+
+	tf.tf_trapno = 0;
+	tf.tf_err    = 0;
+	tf.tf_rip    = frame.sf_rip;
+	tf.tf_cs     = GDT_UCODE | GDT_RPL3;
+	tf.tf_rflags = darwin_signal_rflags(frame.sf_rflags);
+	tf.tf_rsp    = frame.sf_rsp;
+	tf.tf_ss     = GDT_UDATA | GDT_RPL3;
+
+	/*
+	 * Reload the interrupted FPU file last: the kernel is built -mno-sse
+	 * and touches neither x87 nor XMM between here and the IRETQ, and a
+	 * context switch in that window would spill and reload the restored
+	 * state intact.
+	 */
+	__asm__ __volatile__ ("fxrstor (%0)" : : "r"(frame.sf_fpu) : "memory");
+
+	trapframe_iretq(&tf);
 	/* NOTREACHED */
 }
 
@@ -1392,6 +1569,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 	}
 	case DARWIN_SYS_kill: {
 		struct task	*target;
+		uint64_t	 disp;
 		long		 pid;
 		int		 sig;
 
@@ -1402,25 +1580,37 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		target = task_lookup_ref((uint64_t)pid);
 		if (target == NULL)
 			return (darwin_err(f, DARWIN_ESRCH));
-		if (sig != 0 && (darwin_sig_default_is_ignore(sig) ||
+		/*
+		 * The target's disposition decides the mechanism.  Reading it
+		 * unlocked is exact on this uniprocessor: sigaction(2) is the
+		 * only writer, it only ever writes its OWN task, and no thread
+		 * runs between our read and the post below (syscalls execute
+		 * with IF clear).
+		 */
+		disp = (sig > 0 && sig < DARWIN_NSIG)
+		    ? target->t_sig_handler[sig] : DARWIN_SIG_DFL;
+		if (sig != 0 && (disp != DARWIN_SIG_DFL ||
+		    darwin_sig_default_is_ignore(sig) ||
 		    target == current_thread->th_task)) {
 			/*
-			 * Post and let return-to-user delivery decide: a
-			 * default-ignore signal (SIGCHLD), or ANY self-signal.
-			 * A self-signal is applied at THIS kill syscall's own
-			 * exit -- so a caught SIGINT runs its handler and an
-			 * uncaught one terminates -- without the hard-kill path.
+			 * Post and let return-to-user delivery decide.  That
+			 * covers every signal the target does not simply die
+			 * from: one it catches (its handler runs at its next
+			 * return to ring 3 -- a timer IRQ is enough, it need
+			 * never syscall), one it ignores, a default-ignore
+			 * signal (SIGCHLD), and ANY self-signal, which is
+			 * applied at THIS kill syscall's own exit.
 			 */
 			darwin_signal_post(target, sig);
 		} else if (sig != 0) {
 			/*
-			 * Cross-task default-terminate.  There is no signal-wake
-			 * for another task's blocked thread yet, so kill still
-			 * hard-terminates it (a caught handler on the target is
-			 * bypassed -- a known gap).  Record the wait4 status
-			 * (termsig in the low bits -- a terminated task never
-			 * reaches its own exit(2), so this is the only writer)
-			 * and request async kill.
+			 * Cross-task default-terminate.  The target may be
+			 * blocked in a syscall and there is no signal-wake to
+			 * pull it out yet, so termination stays synchronous
+			 * here.  Record the wait4 status (termsig in the low
+			 * bits -- a terminated task never reaches its own
+			 * exit(2), so this is the only writer) and request the
+			 * async kill.
 			 */
 			kprintf("darwin: UNIX kill(%ld, %d) -> terminate\n",
 			    pid, sig);
@@ -1491,17 +1681,25 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 
 		/*
 		 * Restore the context saved at delivery.  _sigtramp passes the
-		 * ucontext (our darwin_sigframe) in arg0.  Reshape THIS frame so
-		 * the sysret lands back at the interrupted rip/rsp/rflags with
-		 * the original %rax -- sigreturn does not "return" normally.  A
-		 * bad pointer or wrong magic means a corrupt/forged frame; kill
-		 * the task rather than resume into nonsense.
+		 * ucontext in arg0; the magic at offset 0 says which flavour it
+		 * is.  An SGFR2 (asynchronous) frame carries a whole machine
+		 * state and can only be resumed by IRETQ, so it leaves through
+		 * darwin_sigreturn_full and never comes back here.  An SGFR1
+		 * frame reshapes THIS syscall frame so the sysret lands back at
+		 * the interrupted rip/rsp/rflags with the original %rax --
+		 * sigreturn does not "return" normally.  A bad pointer or an
+		 * unknown magic means a corrupt/forged frame; kill the task
+		 * rather than resume into nonsense.
+		 *
+		 * Reading 64 bytes is safe for either flavour: SGFR2 is the
+		 * larger struct and shares the magic's placement.
 		 */
 		t    = current_thread->th_task;
 		uctx = f->sf_arg0;
 		if (syscall_copyin(&frame, (const void *)uctx,
 		    sizeof(frame)) != 0 ||
-		    frame.sf_magic != DARWIN_SIGFRAME_MAGIC) {
+		    (frame.sf_magic != DARWIN_SIGFRAME_MAGIC &&
+		    frame.sf_magic != DARWIN_SIGFRAME_MAGIC_FULL)) {
 			kprintf("darwin: bad sigreturn frame @0x%llx\n",
 			    (unsigned long long)uctx);
 			darwin_zombie_record(t->t_id, t->t_darwin_ppid,
@@ -1509,9 +1707,14 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			thread_exit();
 			/* NOTREACHED */
 		}
+		if (frame.sf_magic == DARWIN_SIGFRAME_MAGIC_FULL) {
+			darwin_sigreturn_full(uctx);
+			/* NOTREACHED */
+		}
+		t->t_sig_mask     = (uint32_t)frame.sf_mask;
 		f->sf_user_rip    = frame.sf_rip;
 		f->sf_user_rsp    = frame.sf_rsp;
-		f->sf_user_rflags = frame.sf_rflags;
+		f->sf_user_rflags = darwin_signal_rflags(frame.sf_rflags);
 		return ((long)frame.sf_rax);		/* becomes user %rax */
 	}
 	case DARWIN_SYS_setitimer:

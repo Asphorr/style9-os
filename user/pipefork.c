@@ -13,7 +13,7 @@
  * depends on them.  Bound by our dyld against our libSystem, it imports the
  * same symbols a real binary would.
  *
- * Two scenes:
+ * Scenes:
  *	A. bare fork + wait4: the child _exits with a known code; the parent
  *	   must see exactly that code in the wait4 status.
  *	B. the full shell-redirection dance: pipe, fork, the child dup2s the
@@ -21,6 +21,12 @@
  *	   captures the pipe until EOF and reaps the child.  What flows
  *	   through the pipe is a REAL Apple binary's stdout crossing a task
  *	   boundary through a kernel pipe.
+ *	C. SIGPIPE at its two default dispositions: ignored, and terminating.
+ *	D. a CAUGHT SIGPIPE: the handler runs on the user stack and execution
+ *	   resumes at the interrupted instruction.
+ *	E. a caught SIGINT raised at a syscall boundary (self-kill).
+ *	F. a caught SIGINT delivered ASYNCHRONOUSLY, into a ring-3 compute
+ *	   loop that never enters the kernel, and resumed bit-exact.
  *
  * Freestanding (-fno-builtin, no SDK headers); entry is _entry (ld -e), no
  * crt; relinked low like dyldhello.
@@ -279,6 +285,108 @@ scene_sigint_handler(void)
 	signal(SIGINT, SIG_DFL);
 }
 
+static volatile int	spin_sig;
+
+static void
+on_sigint_spin(int signo)
+{
+
+	spin_sig = signo;
+}
+
+/*
+ * Sentinels parked in %rcx and %r11 across the spin loop.  Those two are the
+ * registers the SYSCALL instruction destroys, so a signal resumed by SYSRET
+ * structurally cannot bring them back; only the IRETQ return path can.
+ */
+#define	RCX_SENTINEL	0x1234567890ABCDEFUL
+#define	R11_SENTINEL	0x0FEDCBA987654321UL
+
+/*
+ * Bound on the spin so a failure to deliver ends the scene instead of hanging
+ * the boot.  Delivery needs one timer tick; this is many thousands of them.
+ */
+#define	SPIN_LIMIT	200000000UL
+
+/*
+ * Spin on a volatile flag, touching nothing but registers and one memory
+ * word -- no syscall, no library call, nothing that would enter the kernel
+ * voluntarily.  Returns 1 if both sentinels survived whatever broke the loop.
+ */
+static int
+spin_until_signal(unsigned long limit)
+{
+	register unsigned long	rcx __asm__("rcx");
+	register unsigned long	r11 __asm__("r11");
+
+	rcx = RCX_SENTINEL;
+	r11 = R11_SENTINEL;
+	__asm__ __volatile__ (
+	    "1:	cmpl	$0, %3		\n\t"
+	    "	jne	2f		\n\t"
+	    "	decq	%2		\n\t"
+	    "	jnz	1b		\n\t"
+	    "2:				\n\t"
+	    : "+r" (rcx), "+r" (r11), "+r" (limit)
+	    : "m" (spin_sig)
+	    : "cc");
+	return (rcx == RCX_SENTINEL && r11 == R11_SENTINEL);
+}
+
+/*
+ * Scene F: asynchronous delivery into a pure compute loop.  The child arms a
+ * SIGINT handler and then spins in ring 3 without ever entering the kernel;
+ * the parent, a separate task, kills it.  Only the timer IRQ brings the child
+ * in, so the handler can run at all only if the kernel delivers signals off
+ * the interrupt-return path -- and the resume has to be exact enough that the
+ * sentinels come back intact.  A pipe byte sequences the kill after the
+ * handler is armed, so the scene is deterministic rather than racy.
+ */
+static void
+scene_async_sigint(void)
+{
+	int	fds[2];
+	int	pid;
+	int	rpid;
+	int	status;
+	char	byte;
+
+	if (pipe(fds) != 0) {
+		check(0, "pipe for async sigint");
+		return;
+	}
+	pid = fork();
+	if (pid < 0) {
+		check(0, "fork for async sigint");
+		return;
+	}
+	if (pid == 0) {
+		close(fds[0]);
+		spin_sig = 0;
+		signal(SIGINT, (void *)on_sigint_spin);
+		byte = 'r';
+		(void)write(fds[1], &byte, 1);	/* handler is armed */
+		if (!spin_until_signal(SPIN_LIMIT))
+			_exit(46);		/* resumed with a wrong %rcx/%r11 */
+		if (spin_sig != SIGINT)
+			_exit(45);		/* loop ran out: never delivered  */
+		_exit(44);
+	}
+	close(fds[1]);
+	byte = 0;
+	(void)read(fds[0], &byte, 1);		/* wait for "armed" */
+	close(fds[0]);
+	kill(pid, SIGINT);
+
+	status = -1;
+	rpid = wait4(pid, &status, 0, NULL);
+	printf("[pipefork] async child status=0x%x (44=ok 45=undelivered "
+	    "46=bad context)\n", status);
+	check(rpid == pid, "wait4 reaps the spinning child");
+	check(status == (44 << 8),
+	    "SIGINT reached a handler inside a pure ring-3 compute loop");
+}
+
 int
 entry(void)
 {
@@ -289,6 +397,7 @@ entry(void)
 	scene_sigpipe();
 	scene_sigpipe_handler();
 	scene_sigint_handler();
+	scene_async_sigint();
 	if (failures == 0)
 		printf("[pipefork] ALL TESTS PASSED\n");
 	else

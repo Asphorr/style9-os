@@ -820,6 +820,7 @@ arch_darwin_fork(struct syscall_frame *f)
 	struct task		*child;
 	struct task		*parent;
 	struct thread		*th;
+	size_t			 si;
 	long			 pid;
 
 	parent = current_thread->th_task;
@@ -845,6 +846,17 @@ arch_darwin_fork(struct syscall_frame *f)
 	child->t_personality       = TASK_PERSONALITY_DARWIN;
 	child->t_darwin_ppid       = parent->t_id;
 	child->t_darwin_dylib_next = parent->t_darwin_dylib_next;
+
+	/*
+	 * A fork(2) child inherits its parent's signal dispositions and
+	 * blocked mask (POSIX).  The handler and trampoline VAs carry over
+	 * verbatim because the address-space copy below reproduces the text
+	 * they point at; execve, not fork, is what resets them to SIG_DFL.
+	 */
+	for (si = 0; si < DARWIN_NSIG; si++)
+		child->t_sig_handler[si] = parent->t_sig_handler[si];
+	child->t_sig_tramp = parent->t_sig_tramp;
+	child->t_sig_mask  = parent->t_sig_mask;
 
 	if (!vm_map_fork_copy(parent->t_map, parent->t_pmap,
 	    child->t_map, child->t_pmap)) {

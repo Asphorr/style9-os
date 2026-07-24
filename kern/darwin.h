@@ -313,11 +313,48 @@ struct syscall_frame;
 void	darwin_signal_deliver_syscall(struct syscall_frame *f, long rv);
 
 /*
+ * Phase-3 asynchronous delivery.  darwin_signal_deliver_trap is the IRQ- and
+ * fault-return variant: it delivers a caught signal to a thread that is not
+ * at a syscall boundary at all -- a pure ring-3 compute loop that a timer
+ * IRQ happens to interrupt.  Because the interrupted code was mid-expression
+ * rather than mid-ABI-call, the saved context has to be the WHOLE machine
+ * state (all 15 GPRs and the FPU file), and the resume has to be an IRETQ.
+ * Default-terminate and ignore behave exactly as darwin_signal_deliver.
+ */
+struct trapframe;
+void	darwin_signal_deliver_trap(struct trapframe *tf);
+
+/*
  * On-stack signal context the kernel writes at delivery and reads back at
  * sigreturn.  Private to the clean-room ABI (our _sigtramp is the only
  * producer of the sigreturn call), so the layout is ours to define.
+ *
+ * Two flavours, told apart by the magic at offset 0 -- how much state has to
+ * be saved depends on where the signal was taken:
+ *
+ *	SGFR1	taken at a syscall boundary.  The SysV/SYSCALL ABI already
+ *		declares the argument and scratch registers dead across the
+ *		call, so saving rip/rsp/rflags/rax is enough and the resume
+ *		can ride the ordinary SYSRET exit.
+ *	SGFR2	taken asynchronously from the IRQ path.  Nothing is dead:
+ *		every GPR and the FPU file must come back bit-exact, so the
+ *		frame carries all of it and sigreturn leaves via IRETQ.
+ *
+ * Both carry the signal mask in force at delivery: the kernel blocks the
+ * signal being handled for the duration of its handler (POSIX) and restores
+ * the saved mask at sigreturn.
  */
-#define	DARWIN_SIGFRAME_MAGIC	0x5347465231ULL		/* "SGFR1" */
+#define	DARWIN_SIGFRAME_MAGIC		0x5347465231ULL	/* "SGFR1" */
+#define	DARWIN_SIGFRAME_MAGIC_FULL	0x5347465232ULL	/* "SGFR2" */
+
+/*
+ * RFLAGS bits a sigreturn is allowed to restore: CF PF AF ZF SF DF OF.  The
+ * saved value comes back through the user's own stack, so it is attacker-
+ * controlled in the limit; masking keeps a forged frame from handing ring 3
+ * IOPL (I/O port access + CLI/STI), NT, or a single-step trap.  IF and the
+ * must-be-set bit 1 are OR'd back in unconditionally.
+ */
+#define	DARWIN_SIGRETURN_RFLAGS_MASK	0x00000CD5ULL
 
 struct darwin_sigframe {
 	uint64_t	sf_magic;
@@ -326,7 +363,41 @@ struct darwin_sigframe {
 	uint64_t	sf_rsp;
 	uint64_t	sf_rflags;
 	uint64_t	sf_rax;
+	uint64_t	sf_mask;
+	uint64_t	sf_pad;		/* size %16 == 0: keeps rsp aligned */
 };
+
+struct darwin_sigframe_full {
+	uint64_t	sf_magic;
+	uint64_t	sf_signo;
+	uint64_t	sf_mask;
+	uint64_t	sf_r15;
+	uint64_t	sf_r14;
+	uint64_t	sf_r13;
+	uint64_t	sf_r12;
+	uint64_t	sf_r11;
+	uint64_t	sf_r10;
+	uint64_t	sf_r9;
+	uint64_t	sf_r8;
+	uint64_t	sf_rdi;
+	uint64_t	sf_rsi;
+	uint64_t	sf_rbp;
+	uint64_t	sf_rbx;
+	uint64_t	sf_rdx;
+	uint64_t	sf_rcx;
+	uint64_t	sf_rax;
+	uint64_t	sf_rip;
+	uint64_t	sf_rsp;
+	uint64_t	sf_rflags;
+	uint8_t		sf_fpu[512] __attribute__((aligned(16)));
+};
+
+_Static_assert(sizeof(struct darwin_sigframe) % 16 == 0,
+    "sigframe must be a multiple of 16 to keep the user stack aligned");
+_Static_assert(sizeof(struct darwin_sigframe_full) % 16 == 0,
+    "full sigframe must be a multiple of 16 to keep the user stack aligned");
+_Static_assert(__builtin_offsetof(struct darwin_sigframe_full, sf_fpu) % 16 == 0,
+    "FXSAVE area must be 16-byte aligned or FXSAVE/FXRSTOR #GP");
 
 /*
  * Process-lifecycle arch hooks (arch/amd64/usermode.c).  arch_darwin_fork

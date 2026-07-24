@@ -136,6 +136,14 @@ isr_common:
 	movq	%rsp, %rdi			/* arg = struct trapframe * */
 	call	intr_dispatch
 
+	/*
+	 * Restore-and-resume tail.  Exposed as a symbol so trapframe_iretq
+	 * (below) can enter it with a trapframe the caller built by hand,
+	 * rather than duplicating the pop order that intr.h freezes.
+	 */
+	.globl	isr_return
+	.type	isr_return, @function
+isr_return:
 	popq	%r15
 	popq	%r14
 	popq	%r13
@@ -155,6 +163,32 @@ isr_common:
 	addq	$16, %rsp			/* discard trapno + err     */
 	iretq
 	.size	isr_common, . - isr_common
+
+/*
+ * trapframe_iretq(struct trapframe *tf) -- resume through a trapframe the
+ * caller assembled itself, instead of the one an IDT stub pushed.
+ *
+ * Signal return needs this.  A sigreturn(2) arrives as a SYSCALL, and the
+ * SYSRET path can only hand back the registers the syscall ABI already
+ * declares volatile -- %rcx and %r11 are architecturally destroyed by the
+ * SYSCALL instruction itself.  That is fine for a signal taken at a syscall
+ * boundary, where the ABI had written those registers off anyway, but a
+ * signal taken asynchronously (from the IRQ path, mid-computation) must be
+ * resumed EXACTLY: %rcx may be a `rep movs` counter, %r11 a live temporary.
+ * So the asynchronous flavour of sigreturn rebuilds the interrupted machine
+ * state as a trapframe and leaves through IRETQ, which restores all 15 GPRs
+ * plus RFLAGS with no register reserved by the calling convention.
+ *
+ * Switching %rsp to the caller's frame abandons the current kernel stack --
+ * deliberately: this never returns, and both entry paths (syscall_entry and
+ * an IDT stub) reload the stack from a known top on the next entry.
+ */
+	.globl	trapframe_iretq
+	.type	trapframe_iretq, @function
+trapframe_iretq:
+	movq	%rdi, %rsp			/* rsp = the caller's frame */
+	jmp	isr_return
+	.size	trapframe_iretq, . - trapframe_iretq
 
 /*
  * Vector-number -> stub-address table.  idt_init() reads this when

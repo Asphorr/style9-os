@@ -128,7 +128,7 @@ irq_install(unsigned int irq, irq_handler_t handler)
  * atomic load.
  */
 static inline void
-intr_check_async_kill_on_user_return(const struct trapframe *tf)
+intr_check_async_kill_on_user_return(struct trapframe *tf)
 {
 
 	if ((tf->tf_cs & 3) != 3)
@@ -140,15 +140,17 @@ intr_check_async_kill_on_user_return(const struct trapframe *tf)
 	if (task_kill_pending(current_thread->th_task))
 		thread_exit();
 	/*
-	 * Signal delivery for a compute loop that never syscalls: a
+	 * Signal delivery for a compute loop that never syscalls.  A
 	 * default-terminate signal (SIGINT/SIGTERM/SIGPIPE) posted while the
-	 * thread ran in ring 3 retires it here as this IRQ iretq's back to
-	 * user.  A caught signal is left pending for phase-2 on-stack
-	 * delivery.  Darwin-personality tasks only; native tasks have no
-	 * signal state.
+	 * thread ran in ring 3 retires it here rather than resuming user
+	 * code; a CAUGHT signal is delivered to its ring-3 handler on the
+	 * user stack, with tf carrying the interrupted state into the frame
+	 * and back out of it -- which is why tf is mutable here and why this
+	 * path saves the whole register file, unlike its syscall-exit twin.
+	 * Darwin-personality tasks only; native tasks have no signal state.
 	 */
 	if (current_thread->th_task->t_personality == TASK_PERSONALITY_DARWIN)
-		darwin_signal_deliver(current_thread->th_task);
+		darwin_signal_deliver_trap(tf);
 	/* NOTREACHED if terminated */
 }
 
