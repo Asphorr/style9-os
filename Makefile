@@ -149,6 +149,7 @@ OBJS	= \
 	$(OBJDIR)/dirlist_macho.o \
 	$(OBJDIR)/tree_macho.o \
 	$(OBJDIR)/guname_macho.o \
+	$(OBJDIR)/gcat_macho.o \
 	$(OBJDIR)/gfactor_macho.o \
 	$(OBJDIR)/genv_macho.o \
 	$(OBJDIR)/gtimeout_macho.o \
@@ -384,6 +385,15 @@ $(OBJDIR)/tree.macho: extern/tree.macho | $(OBJDIR)
 # prints what it is told, so our kernel's fabricated Darwin identity card makes
 # a genuine Apple binary report a Mac that does not exist.  Embedded like figlet.
 $(OBJDIR)/guname.macho: extern/guname.macho | $(OBJDIR)
+	cp $< $@
+
+# gcat: GNU coreutils 9.11's cat, a Homebrew bottle vendored in
+# extern/gcat.macho.  It is the smallest binary that reads a FILE rather than
+# metadata: open, fstat, a page-aligned read loop, write.  Pointed at the APFS
+# volume it prints bytes that came off real extents, through a real Apple
+# binary, with nothing in it aware of what filesystem answered.  Cost four new
+# libSystem symbols.  Embedded like figlet.
+$(OBJDIR)/gcat.macho: extern/gcat.macho | $(OBJDIR)
 	cp $< $@
 
 # gfactor: a FOURTH real Apple x86-64 macOS CLI binary (GNU coreutils 9.11's

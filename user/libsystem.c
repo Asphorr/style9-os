@@ -334,6 +334,51 @@ realloc(void *p, size_t n)
 	return (q);			/* arena free is a no-op: old block leaks */
 }
 
+/*
+ * The page size ring 3 sees.  A constant rather than a syscall: the kernel's
+ * host port reports the same 4096 (mach/host.c), and a program asking this
+ * wants a number to size a buffer with, not a fact about the machine.
+ */
+int
+getpagesize(void)
+{
+
+	return (4096);
+}
+
+/*
+ * posix_memalign: over-allocate and round up.  The subtlety is that realloc()
+ * above reads a block's usable size from the 16 bytes IN FRONT of the pointer
+ * it was given, so the header has to be re-stamped in front of the ALIGNED
+ * pointer, not left in front of the raw one -- otherwise a realloc of an
+ * aligned block would copy whatever happened to sit there.  Since the arena is
+ * 16-aligned and every size rounds to 16, any gap it opens is a multiple of
+ * 16, so the restamped header never reaches back into another block.
+ */
+int
+posix_memalign(void **out, size_t align, size_t size)
+{
+	unsigned char	*raw;
+	size_t		 addr;
+
+	/* Apple's contract: a power of two, and at least sizeof(void *). */
+	if (align < sizeof(void *) || (align & (align - 1)) != 0)
+		return (22);				/* EINVAL */
+	if (size == 0) {
+		*out = NULL;
+		return (0);
+	}
+	if (size > (size_t)-1 - align)
+		return (12);				/* ENOMEM */
+	raw = malloc(size + align);
+	if (raw == NULL)
+		return (12);				/* ENOMEM */
+	addr = ((size_t)raw + align - 1u) & ~(align - 1u);
+	*(size_t *)(void *)(addr - 16) = size;
+	*out = (void *)addr;
+	return (0);
+}
+
 /* ---- stdlib scraps ------------------------------------------------------ */
 
 int
@@ -1386,6 +1431,20 @@ fstat64(int fd, void *buf)
 }
 
 /*
+ * fstat$INODE64: the same call under the name a binary built against a modern
+ * deployment target imports.  Both spellings describe the identical 144-byte
+ * struct -- INODE64 was about widening ino_t, which this layout already is.
+ */
+int	fstat_inode64(int fd, void *buf) __asm__("_fstat$INODE64");
+
+int
+fstat_inode64(int fd, void *buf)
+{
+
+	return (fstat64(fd, buf));
+}
+
+/*
  * faccessat: existence (and on this FS, any-permission) probe.  dash tests
  * X_OK on PATH candidates; present == executable on a volume where
  * everything readable is runnable-or-openable.  Only AT_FDCWD-relative
@@ -2066,6 +2125,24 @@ __error(void)
 }
 
 /*
+ * ioctl: nothing here is a terminal in the sense a device ioctl means, so this
+ * fails rather than pretending.  That is safe by inspection, not by hope --
+ * gcat's only ioctl is FIONREAD (0x4004667f) on its input, and the code right
+ * after the call accepts ENOTSUP, ENOTTY or EINVAL and takes the ordinary
+ * read-loop path; any OTHER errno makes it abort with "cannot do ioctl on %s".
+ * So the stub must fail with one of those three, and ENOTTY is the true one.
+ */
+int
+ioctl(int fd, unsigned long request, ...)
+{
+
+	(void)fd;
+	(void)request;
+	g_errno = 25;					/* ENOTTY */
+	return (-1);
+}
+
+/*
  * MB_CUR_MAX on modern macOS expands to (___mb_cur_max()) -- a CALL, not the
  * legacy `int __mb_cur_max` data symbol we also export above.  C/US-ASCII
  * locale: one byte per character.
@@ -2427,26 +2504,50 @@ vsprintf(char *dst, const char *fmt, __builtin_va_list ap)
 }
 
 /*
- * getprogname(): the program's short name.  We run no libc startup to capture
- * argv[0] (our dyld jumps straight to LC_MAIN), so we return a fixed name.
- * guname reads this only for diagnostics, never on the path that prints the
- * uname line, so the value is cosmetic for the demo.
+ * set/getprogname(): the program's short name, the one every coreutils
+ * diagnostic prefixes itself with.  Our dyld calls setprogname with argv[0]
+ * before entering LC_MAIN, which is where a real system does it too -- Darwin
+ * has no crt0 doing this either; libSystem's own init takes it off the handoff
+ * stack.  Until then the name is a placeholder rather than a lie about which
+ * program is speaking.
  */
+static const char	*g_progname = "darwin";
+
+void
+setprogname(const char *name)
+{
+	const char	*p;
+
+	if (name == NULL)
+		return;
+	/* BSD semantics: store the last path component, not the whole path. */
+	for (p = name; *p != '\0'; p++)
+		if (*p == '/')
+			name = p + 1;
+	g_progname = name;
+}
+
 const char *
 getprogname(void)
 {
 
-	return ("darwin");
+	return (g_progname);
 }
 
-/* XSI strerror_r: we have no errno table, so report a single generic message. */
+/*
+ * XSI strerror_r.  There is a real errno table further down this file; this
+ * used to answer "Unknown error" to everything, which turned a program's
+ * perfectly good diagnostic into a shrug.
+ */
+char	*strerror(int errnum);
+
 int
 strerror_r(int errnum, char *buf, size_t buflen)
 {
-	const char	*m = "Unknown error";
+	const char	*m;
 	size_t		 i;
 
-	(void)errnum;
+	m = strerror(errnum);
 	if (buf == NULL || buflen == 0)
 		return (0);
 	for (i = 0; i + 1 < buflen && m[i] != '\0'; i++)

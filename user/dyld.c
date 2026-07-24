@@ -990,6 +990,7 @@ dyld_main(uint64_t *sp)
 	uint64_t			 base;
 	uint64_t			 entry;
 	uint64_t			 exit_addr;
+	uint64_t			 set_addr;
 	int				 argc;
 	int				 i;
 	int				 k;
@@ -1068,6 +1069,17 @@ dyld_main(uint64_t *sp)
 	 */
 	for (i = 0; i < ls.n; i++)
 		link_image(&ls.im[i], &ls);
+
+	/*
+	 * Tell the C library its own name before main runs.  On Darwin there is
+	 * no crt0 to do this -- libSystem's initialiser takes argv[0] off the
+	 * same handoff stack we are reading -- so doing it here is the faithful
+	 * place, not a shortcut.  Without it every diagnostic a program prints
+	 * is prefixed with the wrong program's name.
+	 */
+	set_addr = resolve_sym(&ls, &ls.im[0], 0xFE, "_setprogname");
+	if (set_addr != 0 && argc > 0)
+		((void (*)(const char *))(uintptr_t)set_addr)(argv[0]);
 
 	entry = main_mh + ls.im[0].entryoff;
 	d_puts("dyld: enter main @ ");

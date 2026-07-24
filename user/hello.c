@@ -1863,6 +1863,41 @@ demo_darwin_spawn(void)
 	}
 
 	/*
+	 * An EIGHTH real Apple binary: gcat (GNU coreutils' cat), placed here
+	 * because it finishes what figlet and tree started.  They read metadata
+	 * and one font; this reads a file's BYTES and puts them on the console,
+	 * so the whole chain -- extents off the disk, through the kernel, out of
+	 * an unmodified Apple binary -- is visible in one line of output.
+	 *
+	 * Both paths are passed on purpose: /etc/hello.txt exists on the APFS
+	 * image and /docs/readme.txt on the FAT one, so whichever disk is
+	 * attached, cat prints one file and reports the other missing.  That
+	 * second half is not noise -- it is cat reading our errno and choosing
+	 * its own message, which is the same interface the first half depends
+	 * on working silently.
+	 */
+	{
+		mach_port_name_t	gcat_tp;
+		char			*gcat_argv[3];
+
+		gcat_tp = MACH_PORT_NULL;
+		gcat_argv[0] = "gcat";
+		gcat_argv[1] = "/etc/hello.txt";
+		gcat_argv[2] = "/docs/readme.txt";
+		printf("  >>> spawning gcat -- a REAL Apple x86-64 macOS "
+		    "binary reading a file off the volume <<<\n");
+		child_id = spawn_args("gcat", 3, gcat_argv, &gcat_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('gcat') failed (rv=%ld)\n",
+			    child_id);
+			return (95);
+		}
+		for (i = 0; i < 512 && task_alive((uint64_t)child_id); i++)
+			(void)yield();
+		printf("  gcat retired after %d yields\n", i);
+	}
+
+	/*
 	 * A THIRD real Apple binary: guname (GNU coreutils' uname).  The
 	 * machine-identity trick -- it asks uname(2) what it is running on and
 	 * prints the answer, never validating it.  Our kernel hands back a

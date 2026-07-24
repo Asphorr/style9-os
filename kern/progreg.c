@@ -158,6 +158,16 @@ extern uint8_t	_binary_guname_macho_start[];
 extern uint8_t	_binary_guname_macho_end[];
 
 /*
+ * An EIGHTH REAL Apple binary: gcat (GNU coreutils' cat, a Homebrew bottle).
+ * The others read metadata or nothing at all; this one reads a file's BYTES --
+ * open, fstat, a page-aligned read loop, write.  Aimed at the APFS volume it
+ * is the end of the filesystem chain: extents off the disk, through the
+ * kernel, out of an unmodified Apple binary that cannot tell APFS from FAT.
+ */
+extern uint8_t	_binary_gcat_macho_start[];
+extern uint8_t	_binary_gcat_macho_end[];
+
+/*
  * A fourth REAL Apple binary: gfactor (GNU coreutils' factor, a Homebrew
  * bottle).  Unlike the libSystem-only binaries above, it also links libgmp --
  * the first program to drive a SECOND dependency, so our dyld maps the whole
@@ -304,6 +314,8 @@ progreg_init(void)
 	    _binary_tree_macho_start, _binary_tree_macho_end);
 	register_one("guname",
 	    _binary_guname_macho_start, _binary_guname_macho_end);
+	register_one("gcat",
+	    _binary_gcat_macho_start, _binary_gcat_macho_end);
 	register_one("gfactor",
 	    _binary_gfactor_macho_start, _binary_gfactor_macho_end);
 	register_one("pipefork",
