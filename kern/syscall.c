@@ -937,11 +937,11 @@ sys_vm_allocate(uint64_t size, uint32_t prot)
 /*
  * syscall_vm_deallocate: the task-parameterized core behind
  * SYS_VM_DEALLOCATE.  Release a range previously handed out by
- * syscall_vm_allocate in `t`'s map.  v1 requires the (va, size) pair to
- * mirror the allocate exactly -- the range must start at a known anonymous
- * vm_map_entry whose extent covers the request.  Partial deallocate and
- * ranges crossing entry boundaries are rejected via vm_map_release
- * returning false.  Returns 0 on success, negative SYS_E_* otherwise.
+ * syscall_vm_allocate in `t`'s map.  The pair need not mirror the allocate:
+ * part of one range, or a run covering several, is served by cutting the
+ * entries at the edges.  What vm_map_release still refuses is a range with a
+ * hole in it or one covering memory the task only borrows.  Returns 0 on
+ * success, negative SYS_E_* otherwise.
  */
 long
 syscall_vm_deallocate(struct task *t, uint64_t va, uint64_t size)

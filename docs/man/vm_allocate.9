@@ -66,17 +66,20 @@ frame is returned to the page allocator, and the matching
 .Em vm_map_entry
 is removed.
 .Pp
-In v1 the
+The
 .Pq Fa va , Fa bytes
-tuple must mirror a prior
-.Fn vm_allocate
-exactly --
-.Fa va
-must equal the entry's start and
-.Fa bytes
-must not exceed its extent.
-Partial deallocate and ranges that span more than one entry are
-rejected.
+tuple need not mirror a prior
+.Fn vm_allocate .
+Part of one range, or a run covering several, is released by cutting
+the
+.Em vm_map_entry
+at each edge of the request first, so a caller may give back exactly
+what it no longer wants.
+Two requests are still refused, and both mean the caller has lost track
+of what it owns rather than merely being specific: a range with an
+unmapped page anywhere inside it, and a range covering memory the task
+only borrows from the kernel image.
+Either refusal leaves the map untouched.
 .Pp
 .Fn vm_map_release
 is the kernel-internal primitive that both
@@ -129,17 +132,19 @@ Once
 .Fn pmap_enter
 returns the page is observable from ring 3 as zero-filled.
 .Pp
-The strict
-.Dq mirror an allocate
-constraint on
-.Fn vm_deallocate
-exists because
 .Fn vm_map_remove
-in v1 only removes vm_map_entries that lie fully inside the request.
-A future change will split entries at the requested edges so partial
-deallocate
-.Pq matching POSIX munmap
-becomes well-defined; until then call sites stay symmetric.
+only drops vm_map_entries lying fully inside the request, which is why
+a sub-range is served by first making its edges into entry boundaries.
+Cutting an entry copies its protection and flags to both halves and
+advances the upper half's offset into the backing object by the
+distance the cut moved it.
+That last part is the whole difficulty: an entry whose offset did not
+move is still well-formed, still faults pages in on demand, and serves
+the wrong part of the file, which no check short of comparing bytes
+will notice.
+The
+.Pa user/mmaptest.c
+probe compares them.
 .
 .Sh RETURN VALUES
 .Fn vm_allocate

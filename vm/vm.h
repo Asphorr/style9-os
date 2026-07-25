@@ -158,10 +158,11 @@ bool			 vm_map_enter_backed(struct vm_map *,
 			    struct vm_object *obj, uint64_t offset);
 
 /*
- * Remove every entry that lies fully inside [va, va+size).  Partial
- * overlaps are not supported in this commit (a future split-at-edges
- * pass will handle protect/unmap of sub-ranges).  Returns the number
- * of entries removed.
+ * Remove every entry that lies fully inside [va, va+size); one that merely
+ * overlaps is left alone.  That is not a limitation but a division of labour:
+ * making the edges of a request into entry boundaries is the caller's job
+ * (vm_map_release does it), and once done, "fully inside" describes exactly
+ * the entries meant.  Returns the number of entries removed.
  */
 size_t			 vm_map_remove(struct vm_map *,
 			    uint64_t va, uint64_t size);
@@ -235,18 +236,28 @@ void			 vm_map_release_anon(struct vm_map *,
 			    struct pmap *pm);
 
 /*
- * Tear down a single anonymous range previously installed by some
- * combination of vm_map_find_space + per-page pmap_enter + vm_map_enter.
- *
- * Strict semantics: (va, size) MUST name a single VME_F_ANON vm_map_entry
- * EXACTLY -- same start, same end.  Partial deallocate, ranges spanning
- * multiple entries, or ranges naming a non-anonymous entry all return false
- * with no side effect.  Used by SYS_VM_DEALLOCATE, by send_capture_ool's
+ * Tear down an anonymous range: unmap each present pmap leaf, drop the
+ * kernel's reference to the frame under it, and remove the entries that
+ * described it.  Used by SYS_VM_DEALLOCATE, by send_capture_ool's
  * deallocate-on-send hook, and by the Darwin personality's munmap.
  *
- * On success: each present pmap leaf is unmapped, the backing frame is
- * pmm_free_page'd, the matching vm_map_entry is dropped, and true is
- * returned.
+ * (va, size) need not match how the memory was obtained.  Part of an entry,
+ * or a run spanning several, is served by cutting the entries at the edges of
+ * the request first -- which is what munmap(2) means and what this refused to
+ * do until the map could cut.
+ *
+ * Two things are still refused, both because they mean the caller is confused
+ * rather than merely specific:
+ *
+ *	a hole -- some page of [va, va+size) is not mapped at all.  POSIX
+ *	  would have munmap shrug at this; naming memory you do not have is
+ *	  worth an error in a kernel this size.
+ *
+ *	a non-anonymous entry anywhere in the range.  Those frames are
+ *	  borrowed from the kernel image and shared with every other task
+ *	  running the same program; they are not this task's to hand back.
+ *
+ * Either refusal leaves the map exactly as it was.  Returns true on success.
  */
 bool			 vm_map_release(struct vm_map *,
 			    struct pmap *pm, uint64_t va, uint64_t size);
@@ -407,6 +418,14 @@ int			 vm_map_image(struct vm_map *map, struct pmap *pm,
  * used to be a fresh frame plus a 4 KiB copy, once per task.
  */
 void			 vm_image_stats(void);
+
+/*
+ * Release traffic, and how much of it needed an entry cut in two.  The split
+ * count is the mechanism; the "needing a cut" count is the outcome it
+ * changed.  Both are here because a live mechanism and a dead one look
+ * identical from one number.
+ */
+void			 vm_map_stats(void);
 
 /*
  * Outcomes of a fault.  Only VM_FAULT_OK means "resume the instruction";

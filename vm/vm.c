@@ -33,6 +33,7 @@
 #define	VM_ALIGN_UP(x)		(((x) + VM_PAGE_MASK) & ~VM_PAGE_MASK)
 
 static void	vm_print_entry(const struct vm_map_entry *);
+static bool	vm_map_clip_locked(struct vm_map *, uint64_t at);
 
 /* Fault counters.  Plain writes -- they are diagnostics, not state. */
 static uint64_t	vm_n_fault_zero;	/* pages zero-filled            */
@@ -49,6 +50,18 @@ static uint64_t	vm_n_image_borrowed;	/* program pages mapped in situ */
 static uint64_t	vm_n_image_copied;	/* ...allocated and filled      */
 static uint64_t	vm_n_payload_shared;	/* OOL pages shared with sender */
 static uint64_t	vm_n_payload_copied;	/* ...that had to be copied     */
+
+/*
+ * Cutting.  Two counters rather than one, because they answer different
+ * questions and only the pair is informative: vm_n_split says the mechanism
+ * ran at all, vm_n_rel_cut says it changed an outcome.  A release that needed
+ * no cut is one the map could always serve; a release that needed one is a
+ * request that used to come back refused.
+ */
+static uint64_t	vm_n_split;		/* entries cut in two             */
+static uint64_t	vm_n_rel_whole;		/* released without cutting       */
+static uint64_t	vm_n_rel_cut;		/* released only because we can   */
+static uint64_t	vm_n_rel_refuse;	/* hole, stray, or not ours       */
 
 /*
  * Drop one entry.  An entry owns a reference on its object, so releasing the
@@ -133,8 +146,10 @@ vm_map_release_anon(struct vm_map *map, struct pmap *pm)
 	/*
 	 * Same single-thread invariant as vm_map_destroy -- this is the
 	 * tail of task teardown, no mutators are racing us.  Anonymous
-	 * entries own their backing frames (no sharing in v1), so each
-	 * present leaf can be unmapped + freed unconditionally.
+	 * entries own their frames -- which since fork learned to share can
+	 * mean owning one of several references, so each present leaf is
+	 * unmapped and its frame released, and pmm decides whether that was
+	 * the last claim on it.
 	 */
 	for (e = map->vm_head; e != NULL; e = e->vme_next) {
 		if ((e->vme_flags & VME_F_ANON) == 0)
@@ -153,10 +168,12 @@ bool
 vm_map_release(struct vm_map *map, struct pmap *pm,
     uint64_t va, uint64_t size)
 {
-	struct vm_map_entry	*entry;
+	struct vm_map_entry	*e;
 	uint64_t		 end;
 	uint64_t		 pa;
 	uint64_t		 v;
+	uint64_t		 covered;
+	bool			 cut;
 
 	if (map == NULL || pm == NULL || size == 0)
 		return (false);
@@ -169,22 +186,60 @@ vm_map_release(struct vm_map *map, struct pmap *pm,
 	if (va < map->vm_lo || end > map->vm_hi)
 		return (false);
 
-	entry = vm_map_lookup(map, va);
-	if (entry == NULL)
-		return (false);
+	spin_lock(&map->vm_lock);
+
 	/*
-	 * Exactly one entry, exactly its extent.  A request for part of an
-	 * entry used to be accepted here, and it freed the frames under that
-	 * part while vm_map_remove -- which only drops entries lying wholly
-	 * inside the range -- left the entry in place still claiming it.  The
-	 * map would then promise memory that had been handed back to the
-	 * allocator.  Splitting an entry is the real answer; until there is
-	 * one, refuse.
+	 * Establish that the whole range is ours to take before touching any
+	 * of it.  Two separate questions, and the walk answers both:
+	 *
+	 *	Is it covered?  A hole is refused rather than skipped over.
+	 *	  POSIX would have munmap succeed on unmapped pages, but a
+	 *	  caller here naming an address it does not own has made a
+	 *	  mistake, and this kernel would rather say so.  Refusing also
+	 *	  keeps the answer to a stray munmap what it has always been.
+	 *
+	 *	Is every entry anonymous?  Checked per entry, because the flag
+	 *	  decides whether the frames beneath may be handed back.  A
+	 *	  borrowed image page belongs to the kernel and is shared by
+	 *	  every task running that program; returning one to the
+	 *	  allocator would not be merely wrong, it would be quiet.
 	 */
-	if (entry->vme_start != va || entry->vme_end != end)
+	covered = va;
+	cut     = false;
+	for (e = map->vm_head; e != NULL && covered < end; e = e->vme_next) {
+		if (e->vme_end <= covered)
+			continue;
+		if (e->vme_start > covered)
+			break;			/* a hole */
+		if ((e->vme_flags & VME_F_ANON) == 0)
+			break;			/* not ours to free */
+		if (e->vme_start < va || e->vme_end > end)
+			cut = true;		/* sticks out; needs cutting */
+		covered = e->vme_end;
+	}
+	if (covered < end) {
+		vm_n_rel_refuse++;
+		spin_unlock(&map->vm_lock);
 		return (false);
-	if ((entry->vme_flags & VME_F_ANON) == 0)
+	}
+
+	/*
+	 * Cut the edges, so every entry overlapping the request now lies
+	 * wholly inside it and vm_map_remove takes them all.  Failure here is
+	 * out of memory; it can leave the first cut made, and that is harmless
+	 * -- two entries describing what one described before is a different
+	 * shape for the same memory, not a wrong one.
+	 */
+	if (!vm_map_clip_locked(map, va) || !vm_map_clip_locked(map, end)) {
+		vm_n_rel_refuse++;
+		spin_unlock(&map->vm_lock);
 		return (false);
+	}
+	if (cut)
+		vm_n_rel_cut++;
+	else
+		vm_n_rel_whole++;
+	spin_unlock(&map->vm_lock);
 
 	for (v = va; v < end; v += VM_PAGE_SIZE) {
 		pa = pmap_extract(pm, v);
@@ -656,6 +711,19 @@ vm_image_stats(void)
 	    (unsigned long long)(vm_n_image_borrowed * VM_PAGE_SIZE / 1024));
 }
 
+void
+vm_map_stats(void)
+{
+
+	kprintf("vm: %llu ranges released -- %llu whole, %llu needing a cut "
+	    "(%llu entries split), %llu refused\n",
+	    (unsigned long long)(vm_n_rel_whole + vm_n_rel_cut),
+	    (unsigned long long)vm_n_rel_whole,
+	    (unsigned long long)vm_n_rel_cut,
+	    (unsigned long long)vm_n_split,
+	    (unsigned long long)vm_n_rel_refuse);
+}
+
 /*
  * Turn a promise into memory.
  *
@@ -1002,6 +1070,80 @@ vm_map_enter_backed(struct vm_map *map, uint64_t va, uint64_t size,
 	map->vm_count++;
 	spin_unlock(&map->vm_lock);
 	return (true);
+}
+
+/*
+ * CUTTING AN ENTRY IN TWO
+ *
+ * An entry says one thing about a whole range: one protection, one set of
+ * flags, one origin.  Any request that names part of a range therefore needs
+ * the map to be able to describe the two parts separately, and the only way
+ * to do that is with two entries where there was one.  Mach calls this
+ * vm_map_clip_start/clip_end; without it every caller that named a sub-range
+ * had to be refused, which is what three of them did.
+ *
+ * The delicate field is vme_offset.  An entry maps byte vme_offset of its
+ * object at vme_start, so a half that begins further along the range begins
+ * further into the object by exactly the same distance.  Getting that wrong
+ * breaks nothing visible: the map stays well-formed, the pages still fault in
+ * on demand, and they quietly hold the wrong part of the file.  It is the one
+ * line here worth testing on purpose.
+ *
+ * Caller holds vm_lock, and `at` must be page-aligned and lie strictly inside
+ * `e`.  Returns false only when there is no memory for the second entry, in
+ * which case nothing has changed.
+ */
+static bool
+vm_entry_split_locked(struct vm_map *map, struct vm_map_entry *e, uint64_t at)
+{
+	struct vm_map_entry	*ne;
+
+	KASSERT(e->vme_start < at && at < e->vme_end,
+	    "vm_entry_split_locked: the cut is not inside the entry");
+	KASSERT((at & VM_PAGE_MASK) == 0,
+	    "vm_entry_split_locked: the cut is not page-aligned");
+
+	ne = kmalloc(sizeof(*ne));
+	if (ne == NULL)
+		return (false);
+
+	ne->vme_start  = at;
+	ne->vme_end    = e->vme_end;
+	ne->vme_offset = e->vme_offset + (at - e->vme_start);
+	ne->vme_object = e->vme_object;
+	ne->vme_prot   = e->vme_prot;
+	ne->vme_flags  = e->vme_flags;
+	ne->vme_pad    = 0;
+
+	/*
+	 * Both halves name the object now, so both hold a reference on it:
+	 * entry_free drops one per entry, and an object that gained a second
+	 * namer without gaining a second reference would be freed under the
+	 * half that outlived the other.
+	 */
+	vm_object_ref(ne->vme_object);
+
+	ne->vme_next = e->vme_next;
+	e->vme_next  = ne;
+	e->vme_end   = at;
+	map->vm_count++;
+	vm_n_split++;
+	return (true);
+}
+
+/*
+ * Make `at` an entry boundary.  A no-op when it already is one, or when it
+ * falls in a hole -- there is nothing there to cut.  Caller holds vm_lock.
+ */
+static bool
+vm_map_clip_locked(struct vm_map *map, uint64_t at)
+{
+	struct vm_map_entry	*e;
+
+	e = vm_map_lookup(map, at);
+	if (e == NULL || e->vme_start == at)
+		return (true);
+	return (vm_entry_split_locked(map, e, at));
 }
 
 size_t

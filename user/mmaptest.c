@@ -27,7 +27,13 @@
  *	  in to need a page the first fault did not bring;
  *
  *	- the tail of the last page of a file mapping reads as zero, which is
- *	  the one promise mmap makes that a file cannot keep by itself.
+ *	  the one promise mmap makes that a file cannot keep by itself;
+ *
+ *	- unmapping a page out of the MIDDLE of a file mapping leaves the pages
+ *	  on either side of it mapped and still showing their own part of the
+ *	  file.  That is a question about the map's ability to cut an entry in
+ *	  two, and about the offset arithmetic in the cut, which nothing else
+ *	  here would notice going wrong.
  */
 
 typedef __UINT8_TYPE__		uint8_t;
@@ -320,22 +326,163 @@ test_refusals(void)
 		bad("munmap of a range nobody mapped succeeded");
 
 	/*
-	 * Half a mapping.  The kernel cannot split an entry, so this must be
-	 * refused outright -- freeing the frames and leaving the entry behind
-	 * would hand the page allocator memory the map still promises.
+	 * Half a mapping is now legal, so what is left to refuse is a range
+	 * with a hole in it: unmap the front page, then ask for both pages.
+	 * The second page is still there and the first is not, and this kernel
+	 * would rather say so than quietly do half the job.
 	 */
 	p = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE,
 	    -1, 0);
 	if (p == MAP_FAILED)
 		bad("mmap for the partial-munmap test failed");
 	else {
-		if (munmap(p, 4096) == 0)
-			bad("munmap of half a mapping succeeded");
-		if (munmap(p, 8192) != 0)
-			bad("munmap of the whole mapping failed");
+		if (munmap(p, 4096) != 0)
+			bad("munmap of half a mapping failed");
+		if (munmap(p, 8192) == 0)
+			bad("munmap across a hole succeeded");
+		if (munmap((char *)p + 4096, 4096) != 0)
+			bad("munmap of the surviving half failed");
 	}
-	printf("mmaptest: MAP_FIXED, zero length, stray and partial munmap "
-	    "refused\n");
+	printf("mmaptest: MAP_FIXED, zero length, stray munmap and munmap "
+	    "across a hole refused\n");
+}
+
+/*
+ * Cutting a file mapping in two.
+ *
+ * Unmapping a page out of the middle leaves two mappings where there was one,
+ * and the half ABOVE the cut is the interesting one: it begins further into
+ * the file by exactly the distance the cut moved, and a kernel that forgets to
+ * carry that offset across produces a mapping that looks perfectly healthy
+ * while showing the wrong part of the file.  Nothing but comparing bytes finds
+ * it, and only on a page that was never touched before the cut -- a page that
+ * had already faulted in holds the right bytes no matter what the entry says.
+ *
+ * So: map, touch nothing, cut, and only then look.
+ */
+static void
+test_cut(const char *path)
+{
+	uint8_t		*p;
+	uint8_t		 head[64];
+	uint8_t		 direct[64];
+	uint64_t	 size;
+	uint64_t	 span;
+	uint64_t	 above;
+	uint64_t	 below;
+	size_t		 i;
+	int		 fd;
+	int		 differs;
+	int		 before;
+
+	before = fail;
+	fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		bad("could not open the test file for the cut test");
+		return;
+	}
+	size = (uint64_t)lseek(fd, 0, 2);		/* SEEK_END */
+	span = size & ~(uint64_t)0xFFFu;		/* whole pages only */
+	if (span < 5u * 4096u) {
+		printf("mmaptest: test file too small to cut, skipped\n");
+		(void)close(fd);
+		return;
+	}
+
+	/* What page 0 holds -- which is what a lost offset would serve up. */
+	if (lseek(fd, 0, 0) != 0 ||
+	    read(fd, head, sizeof(head)) != (long)sizeof(head)) {
+		bad("could not read the head of the test file");
+		(void)close(fd);
+		return;
+	}
+
+	below = 1u * 4096u;
+	above = 3u * 4096u;
+
+	/* What page 3 holds, read straight from the file for comparison. */
+	if (lseek(fd, (long)above, 0) != (long)above ||
+	    read(fd, direct, sizeof(direct)) != (long)sizeof(direct)) {
+		bad("could not read page three of the test file");
+		(void)close(fd);
+		return;
+	}
+
+	/*
+	 * The comparison below can only catch a lost offset when the file
+	 * actually differs at the two places.  Say so if it does not, rather
+	 * than pass for a reason that has nothing to do with the kernel.
+	 */
+	differs = 0;
+	for (i = 0; i < sizeof(head); i++) {
+		if (head[i] != direct[i]) {
+			differs = 1;
+			break;
+		}
+	}
+	if (!differs) {
+		printf("mmaptest: the test file repeats itself; the cut test "
+		    "would prove nothing, skipped\n");
+		(void)close(fd);
+		return;
+	}
+
+	p = mmap(NULL, span, PROT_READ, MAP_PRIVATE, fd, 0);
+	if (p == MAP_FAILED) {
+		bad("mmap for the cut test returned MAP_FAILED");
+		(void)close(fd);
+		return;
+	}
+
+	/* Page 2, out of the middle.  Nothing in this mapping has faulted. */
+	if (munmap((char *)p + 2u * 4096u, 4096) != 0) {
+		bad("munmap of a page in the middle of a mapping failed");
+		(void)munmap(p, span);
+		(void)close(fd);
+		return;
+	}
+
+	/* The half above the cut, faulted here for the first time. */
+	for (i = 0; i < sizeof(direct); i++) {
+		if (p[above + i] != direct[i]) {
+			bad("the half above the cut is showing the wrong "
+			    "part of the file");
+			break;
+		}
+	}
+
+	/* The half below it, which never moved. */
+	if (lseek(fd, (long)below, 0) != (long)below ||
+	    read(fd, direct, sizeof(direct)) != (long)sizeof(direct))
+		bad("could not read page one of the test file");
+	else {
+		for (i = 0; i < sizeof(direct); i++) {
+			if (p[below + i] != direct[i]) {
+				bad("the half below the cut is wrong");
+				break;
+			}
+		}
+	}
+
+	/* The cut really took the middle out: there is nothing there now. */
+	if (munmap((char *)p + 2u * 4096u, 4096) == 0)
+		bad("munmap of the hole the cut left succeeded");
+
+	/* Each half is a mapping in its own right and goes on its own. */
+	if (munmap(p, 2u * 4096u) != 0)
+		bad("munmap of the half below the cut failed");
+	if (munmap((char *)p + above, span - above) != 0)
+		bad("munmap of the half above the cut failed");
+
+	(void)close(fd);
+	/*
+	 * Only claim it if it held.  A conclusion printed regardless of the
+	 * result is worse than no conclusion: the log then says the thing
+	 * worked two lines under the FAIL that says it did not.
+	 */
+	if (fail == before)
+		printf("mmaptest: cut a page out of the middle -- both halves "
+		    "still hold their own part of the file\n");
 }
 
 int
@@ -361,6 +508,7 @@ entry(void)
 	if (path != NULL) {
 		test_kernel_writes(path);
 		test_file(path);
+		test_cut(path);
 	} else
 		printf("mmaptest: no test file on this volume -- "
 		    "file mapping not checked\n");

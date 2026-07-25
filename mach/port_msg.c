@@ -698,10 +698,14 @@ send_capture_ool(struct port_space *from,
 	 * Honour the deallocate-on-send flag for ring-3 senders.  Skip
 	 * for kernel-internal senders (kernel_task / trusted-send) since
 	 * their `addr` is a kernel VA, not a managed user range.  Page-
-	 * round the size before the lookup so a sub-page OOL (e.g. 100
-	 * bytes out of a 4 KiB allocation) still matches the vm_map_entry
-	 * that vm_allocate created.  Best-effort: a non-matching range
-	 * silently leaves the sender's VM alone.
+	 * round the size: what the sender gives up is the pages its payload
+	 * occupies, and a 100-byte payload still costs it the page holding
+	 * those bytes.
+	 *
+	 * The range released is the one named, not the allocation it came
+	 * from -- vm_map cuts the entry when the payload is part of a larger
+	 * range, so a sender that hands over one page of eight keeps seven.
+	 * Until the map could cut, this quietly did nothing in that case.
 	 */
 	if (od->deallocate != 0 && !from_kernel) {
 		uint64_t aligned = ((uint64_t)size + 0xFFFull) & ~0xFFFull;

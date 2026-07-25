@@ -254,6 +254,7 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 		pmm_stats();
 		vm_image_stats();
 		vm_pages_stats();
+		vm_map_stats();
 		darwin_cons_stats();
 		if (fs_apfs_ready())
 			fs_apfs_stats();

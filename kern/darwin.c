@@ -2515,10 +2515,11 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		if (size == 0)
 			return (darwin_err(f, DARWIN_EINVAL));
 		/*
-		 * Whole mappings only.  Unmapping the middle of a range means
-		 * splitting an entry in two, which this vm_map cannot do yet;
-		 * refusing is honest, where succeeding without doing it would
-		 * leave the caller believing memory had been returned.
+		 * Any sub-range of a mapping, including its middle: vm_map
+		 * cuts the entries at the edges of the request.  What is still
+		 * refused is a range with a hole in it, which POSIX would let
+		 * pass but which here means the caller has lost track of what
+		 * it owns.
 		 */
 		if (!vm_map_release(t->t_map, t->t_pmap, va, size))
 			return (darwin_err(f, DARWIN_EINVAL));
