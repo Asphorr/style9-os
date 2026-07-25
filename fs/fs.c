@@ -321,6 +321,21 @@ pwrite_locked(struct fs_handle *h, uint64_t off, const uint8_t *buf,
 	rv = apfs_err(fs_apfs_touch(h->fh_ino, now_ns));
 
 	/*
+	 * And close the transaction, because stamping the file no longer
+	 * writes anything where it stood: the inode's node is copied, and so
+	 * is every object between it and the container superblock.  All of
+	 * that is reachable only from a checkpoint, so a write that returned
+	 * without one would have put its bytes on the disk and left the
+	 * modification time in memory.
+	 *
+	 * One checkpoint per write is not how a filesystem should batch, and
+	 * it is what "the bytes are down when this returns" costs until
+	 * something above here knows when it is finished.
+	 */
+	if (rv == FS_E_OK)
+		rv = apfs_err(fs_apfs_checkpoint());
+
+	/*
 	 * Metadata moved, so every handle in the system is now suspect --
 	 * including this one, whose generation is advanced with it so the
 	 * writer does not immediately re-read what it just changed.  Bumped
