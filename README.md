@@ -76,7 +76,7 @@ file moving between them changes no `#include` anywhere.
 | ata drv | `dev/ata_drv.c` | LBA28+LBA48 ATA PIO driver, exposed as `dev/disk0`, and the door the filesystems below come in through.  Every write ends in FLUSH CACHE, which is what lets a checkpoint rely on the order it wrote its blocks in |
 | block cache | `fs/bio.c` | 4 KiB buffers over `dev/disk0`.  A write goes to the device first and patches the resident page after, rather than invalidating the cache -- otherwise every write would re-read the tree it had just walked |
 | fs | `fs/fs.c`, `fs/fs.h` | the neutral layer, and the only door: one volume, one sleeping lock, handles that carry the backend's own name for a file's bytes plus a volume generation, so a length copied before somebody else changed it is noticed rather than trusted.  `fs_slurp / open / pread / pwrite / truncate / stat / readdir / sync` |
-| apfs | `fs/fs_apfs.c` (7.6 kloc), `fs/fs_txn.c` | a clean-room APFS **writer**, on a container `mkapfs` made.  Reads: checkpoint ring, object maps, the file-system B-tree, extents, extended fields.  Writes: Fletcher-64 forwards, an allocator over the chunk bitmaps, copy-on-write of every object from the edited leaf up to the container superblock, checkpoints (the superblock landing is the commit), free queues that hold a released block for as long as an older checkpoint still names it, records inserted and removed, nodes split, and files that grow and shrink.  Eight boot self-tests -- `apfs-write / alloc / spine / ckpt / data / trunc / grow / split` -- and `apfsck` from `apfsprogs` is the outside oracle: silent on every image this kernel has written |
+| apfs | `fs/fs_apfs.c` (8.6 kloc), `fs/fs_txn.c` | a clean-room APFS **writer**, on a container `mkapfs` made.  Reads: checkpoint ring, object maps, the file-system B-tree, extents, extended fields.  Writes: Fletcher-64 forwards, an allocator over the chunk bitmaps, copy-on-write of every object from the edited leaf up to the container superblock, checkpoints (the superblock landing is the commit), free queues that hold a released block for as long as an older checkpoint still names it, records inserted and removed, nodes split, files that grow and shrink, and files **created and unlinked** -- including the directory-entry hash, which is not in any published layout and was recovered from the names already on the volume.  Nine boot self-tests -- `apfs-write / alloc / spine / ckpt / data / trunc / grow / make / split` -- and `apfsck` from `apfsprogs` is the outside oracle: silent on every image this kernel has written |
 | fat | `fs/fs_fat.c` | FAT16/32 reader for the smoke-test image; writes answer `FS_E_ROFS`, which is a different answer from "that write was too ambitious" and means a different thing |
 | tty | `dev/tty.c` | VT-style ANSI CSI state machine over the VGA console: CUP/CUU-CUB/ED/EL/SGR, DECSTBM scrolling region, DECTCEM cursor visibility, DEC's deferred wrap (a line exactly 80 columns wide costs one row, not two), and a hardware CRTC cursor programmed once per write rather than once per byte.  Three boot selftests read the CRTC and the cell grid back rather than asking the driver what it believes |
 | user shell | `user/sh.c` | sh.elf, the ring-3 shell.  Apple/BSD-flavoured manpage TUI: NAME/SYSTEM/SEE ALSO sections, gray-on-black with bold-white labels, horizontal rule, and a status bar with uptime that lives above the scrolling region so no amount of output can carry it away.  Full line editor (arrows, Home/End, Delete, emacs control keys, 16 lines of history, Tab completion) and a less(1)-shaped pager for `man`.  Builtins: `help / echo / clear / about / ool / man / kill`.  Spawnable: any program in the registry, listed via `svc/progreg` |
@@ -371,18 +371,18 @@ The same kernel-side `mach_msg_send` / `mach_msg_recv_timed` that the
 14 stress tests exercise is what userspace calls -- the syscall layer
 just range-checks the user pointer and forwards.
 
-Next on the roadmap: files that can be **created and removed**, which is
-the last thing standing between the APFS writer and a volume programs
-could actually live on -- a name has to go into a directory, an inode
-number has to come from somewhere, and both directions of that have to
-survive `apfsck`.  Then a B-tree that can grow a level, so a root that is
-its own leaf stops being a ceiling.  Also open: real SMP.
+Next on the roadmap: a B-tree that can **grow a level**.  It is a real
+ceiling now rather than a theoretical one -- the test container's root
+holds eight children and has room for eight, so the split self-test
+reports the refusal and skips instead of splitting.  Also open: a create
+that splits and retries the way growing a file does, directories that can
+be made and removed, and real SMP.
 
 (SMAP user-pointer bracketing, the `vm_allocate` syscall, the whole XNU
 ladder through S4 -- a clean-room dyld and libSystem, under which
-unmodified Apple binaries run -- a filesystem on `dev/disk0`, and
-virtual-copy OOL semantics were all on this list once and have since
-landed.)
+unmodified Apple binaries run -- a filesystem on `dev/disk0`,
+virtual-copy OOL semantics, and files that can be created and removed
+were all on this list once and have since landed.)
 
 ## License
 
