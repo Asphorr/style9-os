@@ -504,6 +504,129 @@ scene_cow(void)
 	(void)close(to_parent[1]);
 }
 
+/*
+ * Scene H: a signal interrupts a wait.
+ *
+ * A read on a pipe nobody is writing to waits, and until this scene existed
+ * the only thing that could end that wait was data, end-of-file, or the task
+ * being killed outright.  A signal -- SIGINT, SIGTERM, anything a program
+ * would normally catch -- sat pending and did nothing.  Three of this
+ * personality's four waits were like that; the console read was the only one
+ * that asked.
+ *
+ * The child arms the sequence with a byte on a second pipe, so the parent is
+ * already inside the read before the kill is sent.  Then, and this is the part
+ * that matters for a test that lives in a boot, the child WRITES ANYWAY after
+ * a long ring-3 delay: a kernel that ignores the signal finishes the read and
+ * fails this check, instead of hanging the boot and telling nobody why.
+ */
+#define	EINTR_DELAY	60000000UL
+#define	EINTR_SIG	SIGINT
+#define	EINTR_ERRNO	4
+
+static volatile int	eintr_caught;
+
+static void
+on_sigint_eintr(int sig)
+{
+
+	eintr_caught = sig;
+}
+
+static void
+burn(unsigned long n)
+{
+	volatile unsigned long	i;
+
+	for (i = 0; i < n; i++)
+		continue;
+}
+
+static void
+scene_signal_interrupts_read(void)
+{
+	int	data[2];
+	int	sync[2];
+	int	pid;
+	int	rpid;
+	int	status;
+	char	byte;
+	long	n;
+
+	if (pipe(data) != 0) {
+		check(0, "pipe for the interrupted read");
+		return;
+	}
+	if (pipe(sync) != 0) {
+		check(0, "sync pipe for the interrupted read");
+		(void)close(data[0]);
+		(void)close(data[1]);
+		return;
+	}
+
+	eintr_caught = 0;
+	signal(EINTR_SIG, (void *)on_sigint_eintr);
+
+	pid = fork();
+	if (pid < 0) {
+		check(0, "fork for the interrupted read");
+		return;
+	}
+	if (pid == 0) {
+		(void)close(data[0]);
+		(void)close(sync[1]);
+		byte = 0;
+		(void)read(sync[0], &byte, 1);	/* parent is about to block */
+		kill(getppid(), EINTR_SIG);
+		/*
+		 * Long enough that a kernel which honours the signal answered
+		 * many times over; short enough that one which does not still
+		 * ends the scene with a verdict.
+		 */
+		burn(EINTR_DELAY);
+		byte = 'x';
+		(void)write(data[1], &byte, 1);
+		_exit(0);
+	}
+
+	(void)close(data[1]);
+	(void)close(sync[0]);
+	byte = 'g';
+	(void)write(sync[1], &byte, 1);
+
+	byte = 0;
+	n = read(data[0], &byte, 1);
+	printf("[pipefork] interrupted read: n=%ld errno=%d caught=%d\n",
+	    n, *__error(), eintr_caught);
+
+	/*
+	 * Delivery happens on the way out of the syscall, so by the time the
+	 * return value is readable here the handler has already run.  Both
+	 * halves are checked: the wait ended, AND it ended because of the
+	 * signal rather than because the byte turned up.
+	 */
+	check(n < 0, "a signal ends a read that nothing was going to satisfy");
+	if (n < 0) {
+		if (*__error() != EINTR_ERRNO)
+			printf("[pipefork] errno was %d, expected %d\n",
+			    *__error(), EINTR_ERRNO);
+		check(*__error() == EINTR_ERRNO, "and it ends it with EINTR");
+	} else
+		printf("[pipefork] read returned %ld ('%c') -- the signal was "
+		    "ignored and the write finished the wait\n", n, byte);
+	check(eintr_caught == EINTR_SIG, "the handler ran");
+
+	signal(EINTR_SIG, SIG_DFL);
+	status = -1;
+	rpid = wait4(pid, &status, 0, NULL);
+	printf("[pipefork] reap: rpid=%d (want %d) status=0x%x errno=%d\n",
+	    rpid, pid, status, *__error());
+	check(rpid == pid, "wait4 reaps the signalling child");
+
+	(void)close(data[0]);
+	(void)close(sync[1]);
+}
+
 int
 entry(void)
 {
@@ -516,6 +639,7 @@ entry(void)
 	scene_sigint_handler();
 	scene_async_sigint();
 	scene_cow();
+	scene_signal_interrupts_read();
 	if (failures == 0)
 		printf("[pipefork] ALL TESTS PASSED\n");
 	else

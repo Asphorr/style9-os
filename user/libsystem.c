@@ -116,6 +116,13 @@ getpid(void)
  * libSystem reads a BSD error) and fold a failure into the -1 the fd routines
  * below expect.  write/exit/getpid above ignore errors, so they use the
  * lighter dsys; the file calls need the error bit.
+ *
+ * The errno store is not decoration.  This used to throw the code away and
+ * return only -1, which is enough for a caller that wants to know THAT
+ * something failed and useless to one that must know WHAT: a read interrupted
+ * by a signal and a read on a closed descriptor were the same answer, so
+ * nothing could retry the first and give up on the second.  It surfaced the
+ * day a test asserted EINTR and got 0.
  */
 static long
 bsd_call(long nr, long a, long b, long c)
@@ -129,7 +136,11 @@ bsd_call(long nr, long a, long b, long c)
 	    : "=a"(ret), "=r"(cf)
 	    : "a"(nr), "D"(a), "S"(b), "d"(c)
 	    : "rcx", "r11", "memory");
-	return (cf ? -1 : ret);
+	if (cf) {
+		g_errno = (int)ret;
+		return (-1);
+	}
+	return (ret);
 }
 
 static int
@@ -3187,18 +3198,36 @@ getppid(void)
  * entered with rdi=signo, rsi=siginfo, rdx=ucontext, r10=handler and rsp
  * 16-aligned-plus-8 (as if called).  It calls the handler, then issues
  * sigreturn(ucontext) (SYS_sigreturn = 0x20000B8), which never returns.
- * ucontext is carried across the handler call in callee-saved rbx.
+ *
+ * THE UCONTEXT IS CARRIED ON THE STACK, NOT IN A CALLEE-SAVED REGISTER, and
+ * that is not a style choice.  A synchronous frame -- one built at a syscall's
+ * exit -- saves only rip, rsp, rflags and rax, because everything else is
+ * guaranteed by the calling convention: the interrupted point is a syscall
+ * return, and callee-saved registers hold what they held before the call.
+ * That guarantee is the trampoline's to keep.
+ *
+ * The earlier version kept the ucontext in rbx, having pushed the old value
+ * first.  The pop never happened: sigreturn does not return, so the push was
+ * a promise nothing could keep, and ring 3 resumed with the ucontext ADDRESS
+ * where its own variable used to be.  The symptom was a local turning into a
+ * plausible-looking stack pointer, and it took a test that let a signal
+ * interrupt a blocking read to see it -- every earlier signal test either
+ * kept nothing live across the call or came in on the asynchronous path,
+ * which saves the whole machine state and restores it through IRETQ.
+ *
+ * A push and a pop, on the other hand, cost the same and are kept by the
+ * ordinary rules: the value lives below the frame the kernel just wrote, the
+ * handler cannot see it, and no register the interrupted code owns is touched.
  */
 extern void	sig_tramp(void);
 
 __asm__(
 	".globl _sig_tramp\n"
 	"_sig_tramp:\n"
-	"\tpushq %rbx\n"
-	"\tmovq %rdx, %rbx\n"		/* ucontext -> callee-saved            */
+	"\tpushq %rdx\n"		/* ucontext; also realigns for the call */
 	"\tmovq %r10, %rax\n"		/* handler                             */
 	"\tcall *%rax\n"		/* handler(signo, siginfo, ucontext)   */
-	"\tmovq %rbx, %rdi\n"		/* ucontext -> sigreturn arg0          */
+	"\tpopq %rdi\n"			/* ucontext -> sigreturn arg0          */
 	"\tmovq $0x20000B8, %rax\n"	/* SYS_sigreturn (184), BSD class      */
 	"\tsyscall\n"
 	"\tud2\n"			/* sigreturn does not return           */

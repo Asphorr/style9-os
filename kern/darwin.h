@@ -362,6 +362,29 @@ void	darwin_zombie_record(unsigned long long pid, unsigned long long ppid,
  * only ever called for a TASK_PERSONALITY_DARWIN task.
  */
 void	darwin_signal_post(struct task *t, int signo);
+
+/*
+ * Has `t` a signal posted that will actually DO something?  The question every
+ * wait in this personality has to ask before it goes round again, asked
+ * through one function so the four places that wait cannot drift apart on the
+ * answer -- three of them used to ask only whether the task had been killed,
+ * which is a different and much narrower question.
+ *
+ * "Will do something" is the operative part, and posted-and-unblocked is not
+ * it.  A signal whose disposition is SIG_IGN, or whose default is to be
+ * ignored, is consumed on the way back to ring 3 and leaves no trace; a wait
+ * that ended for one would report EINTR for nothing at all.  SIGCHLD is
+ * default-ignore and arrives exactly when a parent sits in wait4, so counting
+ * it makes wait4 fail the moment its child dies -- which is what the first
+ * version of this did.
+ *
+ * A true answer delivers nothing.  It means the caller should stop waiting and
+ * return EINTR; delivery happens where it always has, on the way out.
+ *
+ * Safe to call only on the current thread's own task: t_sig_mask and
+ * t_sig_handler have a single writer and this reads them without a lock.
+ */
+bool	darwin_signal_pending(struct task *t);
 void	darwin_signal_deliver(struct task *t);
 
 /*

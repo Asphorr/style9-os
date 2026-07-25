@@ -379,7 +379,16 @@ darwin_pipe_read(struct syscall_frame *f, struct darwin_pipe *p,
 			return (darwin_ok(f, 0));	/* EOF */
 		}
 		spin_unlock(&p->p_lock);
-		if (task_kill_pending(current_thread->th_task))
+		/*
+		 * Two different reasons to stop waiting, and for a long time
+		 * only the first was asked about: the task has been killed, or
+		 * it has a signal posted that it is not blocking.  Without the
+		 * second, a reader blocked on a pipe nobody is writing to
+		 * ignores SIGINT and SIGTERM entirely -- the signal sits
+		 * pending, delivered only if the read happens to finish.
+		 */
+		if (task_kill_pending(current_thread->th_task) ||
+		    darwin_signal_pending(current_thread->th_task))
 			return (darwin_err(f, DARWIN_EINTR));
 		thread_yield();
 	}
@@ -437,7 +446,10 @@ darwin_pipe_write(struct syscall_frame *f, struct darwin_pipe *p,
 			space = DARWIN_PIPE_BUF - p->p_count;
 			if (space == 0) {
 				spin_unlock(&p->p_lock);
+				/* Same pair of reasons as the read side. */
 				if (task_kill_pending(
+				    current_thread->th_task) ||
+				    darwin_signal_pending(
 				    current_thread->th_task))
 					return (darwin_err(f, DARWIN_EINTR));
 				thread_yield();
@@ -949,8 +961,7 @@ darwin_cons_read(struct syscall_frame *f, void *ubuf, size_t n)
 		 * has to be tested before parking or a signal that arrived
 		 * while we were awake would be slept through.
 		 */
-		if ((current_thread->th_task->t_sig_pending &
-		    ~current_thread->th_task->t_sig_mask) != 0) {
+		if (darwin_signal_pending(current_thread->th_task)) {
 			spin_unlock(&darwin_cons_lock);
 			return (darwin_err(f, DARWIN_EINTR));
 		}
@@ -1289,6 +1300,52 @@ darwin_signal_post(struct task *t, int signo)
 	if (t == NULL || bit == 0)
 		return;
 	__atomic_fetch_or(&t->t_sig_pending, bit, __ATOMIC_RELEASE);
+}
+
+bool
+darwin_signal_pending(struct task *t)
+{
+	uint32_t	deliverable;
+	int		signo;
+
+	if (t == NULL)
+		return (false);
+	/*
+	 * One load of the pending set, not one per use: it is written from
+	 * another task's thread, and reading it twice could see two different
+	 * answers inside a single decision.  t_sig_mask is written only by the
+	 * owning task on its own thread, so a plain read of it is right here --
+	 * this is that thread.
+	 */
+	deliverable = __atomic_load_n(&t->t_sig_pending, __ATOMIC_ACQUIRE) &
+	    ~t->t_sig_mask;
+	if (deliverable == 0)
+		return (false);
+
+	/*
+	 * Posted and unblocked is not enough.  A signal whose disposition is
+	 * to do NOTHING must not end a wait: it will be consumed on the way
+	 * back to ring 3 and the caller would have returned EINTR for an event
+	 * that left no trace.
+	 *
+	 * SIGCHLD is the whole reason this matters and it is not a corner
+	 * case.  It is default-ignore, and it arrives precisely when a parent
+	 * is sitting in wait4 -- so a predicate that counted it made wait4
+	 * return EINTR the instant its child died, every time, instead of
+	 * reaping it.  That is not a hypothetical: it is what the first
+	 * version of this did, and pipefork caught it on the first boot.
+	 */
+	for (signo = 1; signo < DARWIN_NSIG; signo++) {
+		if ((deliverable & darwin_sigbit(signo)) == 0)
+			continue;
+		if (t->t_sig_handler[signo] == DARWIN_SIG_IGN)
+			continue;
+		if (t->t_sig_handler[signo] == DARWIN_SIG_DFL &&
+		    darwin_sig_default_is_ignore(signo))
+			continue;
+		return (true);		/* caught, or fatal -- either acts */
+	}
+	return (false);
 }
 
 /*
@@ -2084,7 +2141,15 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 				return (darwin_err(f, DARWIN_ECHILD));
 			if (options & DARWIN_WNOHANG)
 				return (darwin_ok(f, 0));
-			if (task_kill_pending(t))
+			/*
+			 * A parent waiting on a child that will not exit is
+			 * the wait most worth interrupting -- it is where a
+			 * shell spends its time, and where Ctrl-C has to
+			 * land.  SIGCHLD is in the deliverable set too, so a
+			 * caught SIGCHLD breaks the wait and the handler runs
+			 * before the loop is re-entered.
+			 */
+			if (task_kill_pending(t) || darwin_signal_pending(t))
 				return (darwin_err(f, DARWIN_EINTR));
 			thread_yield();
 		}
