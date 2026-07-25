@@ -128,6 +128,14 @@ static struct {
 	uint64_t	ac_bm_scanned;		/* (m) chunks bit-counted   */
 	uint64_t	ac_bm_wholly_free;	/* (m) chunks with no bitmap */
 	uint64_t	ac_bm_disagreed;	/* (m) chunks that did not  */
+	/*
+	 * What the chunk this kernel works in contributed to those two totals
+	 * when they were taken.  Subtract it and add what the bitmap in
+	 * memory says now, and the comparison is between three numbers from
+	 * the same instant again.
+	 */
+	uint64_t	ac_bm_chunk_free_at_mount;	/* (m) */
+	uint64_t	ac_bm_chunk_bits_at_mount;	/* (m) */
 
 	/*
 	 * The internal pool: the blocks that describe allocation, which
@@ -171,15 +179,9 @@ static uint64_t	g_n_recs;	/* leaf records handed to a callback */
  * read at mount, changed here, and written by fs_apfs_checkpoint.
  */
 static uint8_t	*g_sm;		/* the space manager        */
+static uint8_t	*g_fq[APFS_SFQ_COUNT];	/* its free-queue B-trees   */
 static uint8_t	*g_ipbm;	/* the internal pool bitmap */
-/*
- * Pool blocks this checkpoint has stopped referencing.  They are free in the
- * bitmap above -- that is what will be written -- but they must not be handed
- * out again until the checkpoint commits, because until then the LIVE
- * checkpoint still points at them and a fall back to it would find whatever
- * the reuse wrote there instead.  Cleared when the checkpoint lands.
- */
-static uint8_t	*g_ip_hold;
+
 
 /*
  * And the device's own allocation metadata, on the same terms: the chunk
@@ -189,7 +191,6 @@ static uint8_t	*g_ip_hold;
  */
 static uint8_t	*g_bm;		/* the chunk bitmap          */
 static uint8_t	*g_cib;		/* its chunk-info block      */
-static uint8_t	*g_hold;	/* released, not yet reusable */
 static bool	 g_bm_dirty;
 static uint64_t	 alloc_n_taken;	/* device blocks allocated */
 static uint64_t	 alloc_n_given;	/* ...and released         */
@@ -205,6 +206,9 @@ static int	alloc_select(uint64_t near_bno);
 static int	alloc_flush(uint64_t xid);
 static int	spine_update(uint64_t oid, uint64_t paddr, uint64_t xid,
 		    void *buf);
+static int	fq_insert(uint32_t q, uint64_t xid, uint64_t paddr,
+		    uint64_t count);
+static void	fq_release(uint32_t q, uint64_t upto_xid);
 
 /*
  * The transaction id a READ should ask about.
@@ -228,7 +232,6 @@ view_xid(void)
 }
 static uint64_t	 ip_n_alloc;	/* pool blocks taken    */
 static uint64_t	 ip_n_free;	/* pool blocks returned */
-static uint64_t	 ip_n_held;	/* ...and not yet reusable */
 static uint64_t	 cow_n_meta;	/* allocation metadata blocks moved */
 static uint64_t	 cow_n_spine;	/* spine objects copied            */
 
@@ -805,12 +808,9 @@ ip_load(void)
 	if (g_apfs.ac_sm_addr_offset + sizeof(uint64_t) > APFS_BLOCK_SIZE)
 		return (FS_APFS_E_INVAL);
 
-	g_ipbm    = kmalloc(APFS_BLOCK_SIZE);
-	g_ip_hold = kmalloc(APFS_BLOCK_SIZE);
-	if (g_ipbm == NULL || g_ip_hold == NULL)
+	g_ipbm = kmalloc(APFS_BLOCK_SIZE);
+	if (g_ipbm == NULL)
 		return (FS_APFS_E_NOMEM);
-	for (i = 0; i < APFS_BLOCK_SIZE; i++)
-		g_ip_hold[i] = 0;
 	/* Raw: a bitmap has no object header, so it has no checksum. */
 	if (read_block_raw(g_apfs.ac_ipbm_base + g_apfs.ac_ipbm_slot,
 	    g_ipbm) != FS_APFS_E_OK) {
@@ -847,19 +847,44 @@ ip_load(void)
 	 * And the device's bitmap, for the same reason: it changes many times
 	 * per checkpoint and is written once.
 	 */
-	g_bm   = kmalloc(APFS_BLOCK_SIZE);
-	g_cib  = kmalloc(APFS_BLOCK_SIZE);
-	g_hold = kmalloc(APFS_BLOCK_SIZE);
-	if (g_bm == NULL || g_cib == NULL || g_hold == NULL)
+	g_bm  = kmalloc(APFS_BLOCK_SIZE);
+	g_cib = kmalloc(APFS_BLOCK_SIZE);
+	if (g_bm == NULL || g_cib == NULL)
 		return (FS_APFS_E_NOMEM);
-	for (i = 0; i < APFS_BLOCK_SIZE; i++)
-		g_hold[i] = 0;
 	if (read_block_raw(g_apfs.ac_alloc_bitmap, g_bm) != FS_APFS_E_OK ||
 	    fs_apfs_read_block(g_apfs.ac_alloc_cib, g_cib) != FS_APFS_E_OK) {
 		kprintf("apfs: chunk bitmap %llu or chunk-info %llu would not "
 		    "read\n", (unsigned long long)g_apfs.ac_alloc_bitmap,
 		    (unsigned long long)g_apfs.ac_alloc_cib);
 		return (FS_APFS_E_IO);
+	}
+
+	/*
+	 * The free-queue trees.  Ephemeral like the space manager that names
+	 * them, so they are read once and written by the checkpoint writer.
+	 */
+	for (i = 0; i < APFS_SFQ_COUNT; i++) {
+		uint64_t	tree_oid;
+		uint64_t	tree_bno;
+
+		tree_oid = sm->sm_fq[i].sfq_tree_oid;
+		if (tree_oid == 0)
+			continue;
+		tree_bno = resolve_ephemeral(tree_oid);
+		if (tree_bno == 0) {
+			kprintf("apfs: free queue %u names tree oid %llu, "
+			    "which no checkpoint map places\n", (unsigned)i,
+			    (unsigned long long)tree_oid);
+			return (FS_APFS_E_INVAL);
+		}
+		g_fq[i] = kmalloc(APFS_BLOCK_SIZE);
+		if (g_fq[i] == NULL)
+			return (FS_APFS_E_NOMEM);
+		if (fs_apfs_read_block(tree_bno, g_fq[i]) != FS_APFS_E_OK) {
+			kprintf("apfs: free-queue tree at %llu unreadable\n",
+			    (unsigned long long)tree_bno);
+			return (FS_APFS_E_IO);
+		}
 	}
 
 	g_apfs.ac_ip_valid = true;
@@ -875,9 +900,9 @@ ip_load(void)
 }
 
 /*
- * Take a pool block, or 0 if the pool is full.  A block that this checkpoint
- * has released is not a candidate, however free the bitmap says it is: see
- * g_ip_hold.
+ * Take a pool block, or 0 if the pool is full.  A block that has been
+ * released but not yet let go by the free queue is still marked in use here,
+ * which is exactly how the queue keeps it out of reach.
  */
 static uint64_t
 ip_alloc(void)
@@ -889,22 +914,21 @@ ip_alloc(void)
 	for (i = 0; i < g_apfs.ac_ip_blocks; i++) {
 		if ((g_ipbm[i >> 3] & (uint8_t)(1u << (i & 7u))) != 0)
 			continue;
-		if ((g_ip_hold[i >> 3] & (uint8_t)(1u << (i & 7u))) != 0)
-			continue;
 		g_ipbm[i >> 3] |= (uint8_t)(1u << (i & 7u));
 		ip_n_alloc++;
 		return (g_apfs.ac_ip_base + i);
 	}
-	kprintf("apfs: the internal pool is full (%llu blocks, %llu held "
-	    "back for the live checkpoint)\n",
-	    (unsigned long long)g_apfs.ac_ip_blocks,
-	    (unsigned long long)ip_n_held);
+	kprintf("apfs: the internal pool is full (%llu blocks, %llu waiting in "
+	    "its free queue)\n", (unsigned long long)g_apfs.ac_ip_blocks,
+	    (unsigned long long)(g_sm != NULL ?
+	    sm_mem()->sm_fq[APFS_SFQ_IP].sfq_count : 0));
 	return (0);
 }
 
 /*
- * Give a pool block back: free in the bitmap that will be written, held
- * against reuse until that write commits.
+ * Give a pool block back -- which means putting it in the pool's free queue,
+ * not clearing its bit.  It stays marked in use, so nothing hands it out,
+ * until the transaction that released it is far enough behind.
  */
 static void
 ip_free(uint64_t bno)
@@ -923,10 +947,401 @@ ip_free(uint64_t bno)
 		    (unsigned long long)bno);
 		return;
 	}
-	g_ipbm[i >> 3]   &= (uint8_t)~(1u << (i & 7u));
-	g_ip_hold[i >> 3] |= (uint8_t)(1u << (i & 7u));
+	if (fq_insert(APFS_SFQ_IP, g_apfs.ac_xid + 1, bno, 1) != FS_APFS_E_OK)
+		kprintf("apfs: pool block %llu could not be queued -- it is "
+		    "leaked until the next mount\n", (unsigned long long)bno);
 	ip_n_free++;
-	ip_n_held++;
+}
+
+/*
+ * Blocks have become free again: move the two counters that say so.  The
+ * bits are the caller's business; this is the half that keeps the chunk-info
+ * and the space manager agreeing with them.
+ */
+static void
+alloc_count_free(uint64_t count)
+{
+	struct apfs_chunk_info_block	*cib;
+	struct apfs_spaceman		*sm;
+
+	if (g_cib == NULL || g_sm == NULL)
+		return;
+	cib = (struct apfs_chunk_info_block *)g_cib;
+	cib->cib_chunk_info[g_apfs.ac_alloc_slot].ci_free_count +=
+	    (uint32_t)count;
+	sm = sm_mem();
+	sm->sm_dev[APFS_SD_MAIN].sm_free_count += count;
+	g_apfs.ac_sm_free = sm->sm_dev[APFS_SD_MAIN].sm_free_count;
+}
+
+/*
+ * THE FREE QUEUES
+ *
+ * A block released by a copy is not free.  The checkpoint that is still live
+ * points at it, and so do the checkpoints behind that one -- the descriptor
+ * ring keeps them on purpose, and the whole claim of a ring is that an older
+ * checkpoint is still a filesystem.  Hand the block back at once and that
+ * claim quietly stops being true: the superblock is still there, still
+ * checksums, and leads to blocks something else has since written.
+ *
+ * That is not hypothetical.  Before this, a container this kernel had been
+ * writing for a while held twelve superblocks of which four were corpses:
+ *
+ *	xid 2   block 98304 is no longer an omap (type 0x03)
+ *	xid 5   the omap tree at 98323 no longer maps the volume
+ *
+ * So a release goes into a queue instead, keyed by the transaction that made
+ * it, and the block stays marked in use until that transaction is far enough
+ * behind for nobody to want it.  The format has a place for exactly this --
+ * two B-trees, one for the device and one for the internal pool, both named
+ * by the space manager and both ephemeral -- and the container arrives with
+ * entries already in them.
+ *
+ * Their shape was measured rather than assumed: fixed-size keys and values,
+ * key (xid, paddr) of 16 bytes, value a block count of 8 -- and an offset of
+ * 0xFFFF where a value would be, which means the count is one and no value is
+ * stored.  Both forms appear in the container as mkapfs leaves it.
+ */
+#define	APFS_FQ_GHOST		0xFFFFU		/* "no value; the count is 1" */
+#define	APFS_FQ_KEEP		4		/* checkpoints kept readable  */
+
+static uint64_t	 fq_n_queued;			/* blocks put in         */
+static uint64_t	 fq_n_released;			/* ...and let go again   */
+
+struct fq_node {
+	uint8_t		*fn_toc;
+	uint8_t		*fn_keys;
+	uint8_t		*fn_vals;	/* one past the last value byte */
+	uint32_t	 fn_nkeys;
+	uint32_t	 fn_toc_len;
+};
+
+static void
+fq_layout(uint8_t *node, struct fq_node *out)
+{
+	const struct apfs_btree_node_phys	*n;
+
+	n = (const struct apfs_btree_node_phys *)node;
+	out->fn_nkeys   = n->btn_nkeys;
+	out->fn_toc_len = n->btn_table_space.nl_len;
+	out->fn_toc     = node + APFS_BTNODE_HDR_SIZE +
+	    n->btn_table_space.nl_off;
+	out->fn_keys    = out->fn_toc + out->fn_toc_len;
+	out->fn_vals    = node + APFS_BLOCK_SIZE - APFS_BTREE_INFO_SIZE;
+}
+
+static void
+fq_entry(const struct fq_node *fn, uint32_t i, uint16_t *koff, uint16_t *voff)
+{
+	const uint16_t	*toc;
+
+	toc = (const uint16_t *)fn->fn_toc;
+	*koff = toc[i * 2];
+	*voff = toc[i * 2 + 1];
+}
+
+static void
+fq_key(const struct fq_node *fn, uint32_t i, uint64_t *xid, uint64_t *paddr)
+{
+	const struct apfs_spaceman_free_queue_key	*k;
+	uint16_t					 koff;
+	uint16_t					 voff;
+
+	fq_entry(fn, i, &koff, &voff);
+	k = (const struct apfs_spaceman_free_queue_key *)(fn->fn_keys + koff);
+	*xid   = k->sfqk_xid;
+	*paddr = k->sfqk_paddr;
+}
+
+static uint64_t
+fq_count_at(const struct fq_node *fn, uint32_t i)
+{
+	uint16_t	koff;
+	uint16_t	voff;
+
+	fq_entry(fn, i, &koff, &voff);
+	if (voff == APFS_FQ_GHOST)
+		return (1);
+	return (*(const uint64_t *)(fn->fn_vals - voff));
+}
+
+/*
+ * Give a removed key or value back to the node's free list.
+ *
+ * NOT OPTIONAL, though it looked it.  A node's key area is divided between
+ * the keys the table of contents points at and a chain of holes -- each hole
+ * holding, in its first four bytes, the offset of the next and its own length
+ * -- and the header carries the total.  A checker rebuilds both sides and
+ * compares: "B-tree: wrong free space total for key area" is what it says
+ * about space that is neither used nor listed, which is what dropping an
+ * entry without this leaves behind.
+ *
+ * A freed key is sixteen bytes and a freed value eight, so each is large
+ * enough to hold the four-byte header its own hole needs.  Value offsets are
+ * measured back from the end of the value area, which is the convention the
+ * table of contents already uses.
+ */
+static void
+fq_free_key(struct apfs_btree_node_phys *n, const struct fq_node *fn,
+    uint16_t koff)
+{
+	struct apfs_nloc	*hole;
+
+	hole = (struct apfs_nloc *)(fn->fn_keys + koff);
+	hole->nl_off = n->btn_key_free_list.nl_off;
+	hole->nl_len = (uint16_t)sizeof(struct apfs_spaceman_free_queue_key);
+	n->btn_key_free_list.nl_off = koff;
+	n->btn_key_free_list.nl_len = (uint16_t)(n->btn_key_free_list.nl_len +
+	    sizeof(struct apfs_spaceman_free_queue_key));
+}
+
+static void
+fq_free_val(struct apfs_btree_node_phys *n, const struct fq_node *fn,
+    uint16_t voff)
+{
+	struct apfs_nloc	*hole;
+
+	hole = (struct apfs_nloc *)(fn->fn_vals - voff);
+	hole->nl_off = n->btn_val_free_list.nl_off;
+	hole->nl_len = 8;
+	n->btn_val_free_list.nl_off = voff;
+	n->btn_val_free_list.nl_len =
+	    (uint16_t)(n->btn_val_free_list.nl_len + 8);
+}
+
+/*
+ * Put (xid, paddr, count) into queue `q`, keeping the table of contents in
+ * key order.  Space comes from the node's free span rather than from its free
+ * lists -- reusing a hole would mean finding one of the right size, and the
+ * span is what a node that has just been reset is all of.
+ */
+static int
+fq_insert(uint32_t q, uint64_t xid, uint64_t paddr, uint64_t count)
+{
+	struct apfs_btree_node_phys		*n;
+	struct apfs_spaceman_free_queue_key	*k;
+	struct apfs_spaceman			*sm;
+	struct fq_node				 fn;
+	uint16_t				*toc;
+	uint64_t				 exid;
+	uint64_t				 epaddr;
+	uint32_t				 need;
+	uint32_t				 pos;
+	uint32_t				 i;
+	uint16_t				 koff;
+	uint16_t				 voff;
+
+	if (q >= APFS_SFQ_COUNT || g_fq[q] == NULL || g_sm == NULL)
+		return (FS_APFS_E_INVAL);
+	n = (struct apfs_btree_node_phys *)g_fq[q];
+	fq_layout(g_fq[q], &fn);
+
+	need = (uint32_t)sizeof(*k) + (count > 1 ? 8u : 0u);
+	if ((uint32_t)(fn.fn_nkeys + 1) * 4u > fn.fn_toc_len ||
+	    n->btn_free_space.nl_len < need) {
+		/*
+		 * The queue is one node, so the history it can hold is
+		 * bounded, and this is where the bound bites.  Rather than
+		 * lose the block, give up the history: everything but the
+		 * newest transaction is let go early and the insert is tried
+		 * once more.  Loudly, because a container doing this
+		 * regularly has stopped keeping the promise the ring makes.
+		 */
+		kprintf("apfs: free queue %u is full (%u keys) -- releasing "
+		    "everything before xid %llu early\n", (unsigned)q,
+		    (unsigned)fn.fn_nkeys, (unsigned long long)xid);
+		fq_release(q, xid - 1);
+		fq_layout(g_fq[q], &fn);
+		if ((uint32_t)(fn.fn_nkeys + 1) * 4u > fn.fn_toc_len ||
+		    n->btn_free_space.nl_len < need) {
+			kprintf("apfs: free queue %u is still full -- block "
+			    "%llu is leaked until the next mount\n",
+			    (unsigned)q, (unsigned long long)paddr);
+			return (FS_APFS_E_NOALLOC);
+		}
+	}
+
+	/* Where the key belongs, in (xid, paddr) order. */
+	for (pos = 0; pos < fn.fn_nkeys; pos++) {
+		fq_key(&fn, pos, &exid, &epaddr);
+		if (exid > xid || (exid == xid && epaddr > paddr))
+			break;
+	}
+
+	koff = n->btn_free_space.nl_off;
+	n->btn_free_space.nl_off = (uint16_t)(koff + sizeof(*k));
+	n->btn_free_space.nl_len = (uint16_t)(n->btn_free_space.nl_len -
+	    sizeof(*k));
+	k = (struct apfs_spaceman_free_queue_key *)(fn.fn_keys + koff);
+	k->sfqk_xid   = xid;
+	k->sfqk_paddr = paddr;
+
+	if (count > 1) {
+		/*
+		 * Values grow down from the end of the node, so the next one
+		 * sits at the top of what is left of the free span.
+		 */
+		n->btn_free_space.nl_len =
+		    (uint16_t)(n->btn_free_space.nl_len - 8u);
+		voff = (uint16_t)(APFS_BLOCK_SIZE - APFS_BTREE_INFO_SIZE -
+		    (APFS_BTNODE_HDR_SIZE + n->btn_table_space.nl_off +
+		    fn.fn_toc_len + n->btn_free_space.nl_off +
+		    n->btn_free_space.nl_len));
+		*(uint64_t *)(fn.fn_vals - voff) = count;
+	} else
+		voff = APFS_FQ_GHOST;
+
+	toc = (uint16_t *)fn.fn_toc;
+	for (i = fn.fn_nkeys; i > pos; i--) {
+		toc[i * 2]     = toc[(i - 1) * 2];
+		toc[i * 2 + 1] = toc[(i - 1) * 2 + 1];
+	}
+	toc[pos * 2]     = koff;
+	toc[pos * 2 + 1] = voff;
+	n->btn_nkeys++;
+	*(uint64_t *)(g_fq[q] + APFS_BLOCK_SIZE - APFS_BTREE_INFO_SIZE +
+	    APFS_BTREE_INFO_KEYCOUNT) += 1;
+
+	sm = sm_mem();
+	sm->sm_fq[q].sfq_count += count;
+	if (sm->sm_fq[q].sfq_oldest_xid == 0 ||
+	    xid < sm->sm_fq[q].sfq_oldest_xid)
+		sm->sm_fq[q].sfq_oldest_xid = xid;
+	fq_n_queued += count;
+	return (FS_APFS_E_OK);
+}
+
+/*
+ * Let go of everything queued at `upto_xid` or earlier: clear the bits, move
+ * the counters, and drop the entries.
+ *
+ * This is the only place a block becomes free again, and the xid is what
+ * makes it safe -- by the time a transaction is APFS_FQ_KEEP checkpoints
+ * behind, no superblock still worth mounting refers to what it released.
+ */
+static void
+fq_release(uint32_t q, uint64_t upto_xid)
+{
+	struct apfs_btree_node_phys	*n;
+	struct apfs_spaceman		*sm;
+	struct fq_node			 fn;
+	uint16_t			*toc;
+	uint64_t			 oldest;
+	uint64_t			 xid;
+	uint64_t			 paddr;
+	uint64_t			 count;
+	uint64_t			 bit;
+	uint32_t			 i;
+	uint32_t			 j;
+	uint32_t			 kept;
+
+	if (q >= APFS_SFQ_COUNT || g_fq[q] == NULL || g_sm == NULL)
+		return;
+	n   = (struct apfs_btree_node_phys *)g_fq[q];
+	sm  = sm_mem();
+	fq_layout(g_fq[q], &fn);
+	toc = (uint16_t *)fn.fn_toc;
+
+	kept   = 0;
+	oldest = 0;
+	for (i = 0; i < fn.fn_nkeys; i++) {
+		uint16_t	koff;
+		uint16_t	voff;
+
+		fq_entry(&fn, i, &koff, &voff);
+		fq_key(&fn, i, &xid, &paddr);
+		count = fq_count_at(&fn, i);
+		if (xid > upto_xid) {
+			if (kept != i) {
+				toc[kept * 2]     = toc[i * 2];
+				toc[kept * 2 + 1] = toc[i * 2 + 1];
+			}
+			if (oldest == 0 || xid < oldest)
+				oldest = xid;
+			kept++;
+			continue;
+		}
+
+		if (q == APFS_SFQ_IP) {
+			for (j = 0; j < count; j++) {
+				if (paddr + j < g_apfs.ac_ip_base)
+					continue;
+				bit = paddr + j - g_apfs.ac_ip_base;
+				if (bit >= g_apfs.ac_ip_blocks)
+					continue;
+				g_ipbm[bit >> 3] &=
+				    (uint8_t)~(1u << (bit & 7u));
+			}
+		} else {
+			if (paddr < g_apfs.ac_alloc_base || paddr + count >
+			    g_apfs.ac_alloc_base + g_apfs.ac_alloc_blocks) {
+				kprintf("apfs: queued block %llu is outside "
+				    "the chunk -- left alone\n",
+				    (unsigned long long)paddr);
+				continue;
+			}
+			bit = paddr - g_apfs.ac_alloc_base;
+			for (j = 0; j < count; j++)
+				g_bm[(bit + j) >> 3] &=
+				    (uint8_t)~(1u << ((bit + j) & 7u));
+			alloc_count_free(count);
+			g_bm_dirty = true;
+		}
+		sm->sm_fq[q].sfq_count -= count;
+		fq_n_released += count;
+		fq_free_key(n, &fn, koff);
+		if (voff != APFS_FQ_GHOST)
+			fq_free_val(n, &fn, voff);
+	}
+
+	if (kept == fn.fn_nkeys)
+		return;
+	n->btn_nkeys = kept;
+	*(uint64_t *)(g_fq[q] + APFS_BLOCK_SIZE - APFS_BTREE_INFO_SIZE +
+	    APFS_BTREE_INFO_KEYCOUNT) = kept;
+	sm->sm_fq[q].sfq_oldest_xid = oldest;
+
+	/*
+	 * An empty queue gets its node back.  Key and value space is not
+	 * returned entry by entry, so without this the node would slowly fill
+	 * with holes; emptying is common enough that this is all the
+	 * housekeeping it needs.
+	 *
+	 * THE FREE LISTS HAVE TO GO WITH IT.  A node records its holes in two
+	 * chains threaded through the key and value areas -- a length in the
+	 * header and, at each hole, an offset to the next -- and a checker
+	 * walks them.  Widening the free span without emptying those chains
+	 * leaves them pointing into space that is now unallocated, so the walk
+	 * reads whatever is there as a hole header: "B-tree node: free key is
+	 * too small", which is what apfsck said the first time this ran.
+	 */
+	if (kept == 0) {
+		n->btn_free_space.nl_off = 0;
+		n->btn_free_space.nl_len = (uint16_t)(APFS_BLOCK_SIZE -
+		    APFS_BTREE_INFO_SIZE - APFS_BTNODE_HDR_SIZE -
+		    n->btn_table_space.nl_off - fn.fn_toc_len);
+		n->btn_key_free_list.nl_off = APFS_FQ_GHOST;
+		n->btn_key_free_list.nl_len = 0;
+		n->btn_val_free_list.nl_off = APFS_FQ_GHOST;
+		n->btn_val_free_list.nl_len = 0;
+	}
+}
+
+/* The in-memory copy of an ephemeral free-queue tree, or NULL. */
+static const uint8_t *
+fq_mem(uint64_t oid)
+{
+	const struct apfs_spaceman	*sm;
+	uint32_t			 i;
+
+	if (g_sm == NULL)
+		return (NULL);
+	sm = sm_mem();
+	for (i = 0; i < APFS_SFQ_COUNT; i++) {
+		if (g_fq[i] != NULL && sm->sm_fq[i].sfq_tree_oid == oid)
+			return (g_fq[i]);
+	}
+	return (NULL);
 }
 
 /*
@@ -2778,11 +3193,8 @@ alloc_bits(uint32_t first, uint32_t count, bool take)
 }
 
 /*
- * Take a run of `count` consecutive blocks, or refuse.
- *
- * Blocks this checkpoint has released are not candidates, however free the
- * bitmap says they are -- the same rule as the pool, for the same reason: the
- * live checkpoint still points at them.
+ * Take a run of `count` consecutive blocks, or refuse.  A block waiting in
+ * the free queue is still marked in use, so this cannot pick one up.
  */
 static int
 alloc_blocks(uint32_t count, uint64_t *first_out)
@@ -2796,8 +3208,7 @@ alloc_blocks(uint32_t count, uint64_t *first_out)
 
 	seen = 0;
 	for (i = 0; i < g_apfs.ac_alloc_blocks; i++) {
-		if ((g_bm[i >> 3] & (uint8_t)(1u << (i & 7u))) != 0 ||
-		    (g_hold[i >> 3] & (uint8_t)(1u << (i & 7u))) != 0) {
+		if ((g_bm[i >> 3] & (uint8_t)(1u << (i & 7u))) != 0) {
 			seen = 0;
 			continue;
 		}
@@ -2815,14 +3226,15 @@ alloc_blocks(uint32_t count, uint64_t *first_out)
 	return (FS_APFS_E_NOALLOC);
 }
 
-/* Give a run back, and hold it against reuse until the checkpoint lands. */
+/*
+ * Give a run back: into the device's free queue, keyed by the transaction
+ * doing the releasing.  The bits stay set and the counters do not move --
+ * the block is not free, it is spoken for by checkpoints that still name it,
+ * and fq_release is the only thing that ever makes it free again.
+ */
 static int
 free_blocks(uint64_t first, uint32_t count)
 {
-	uint64_t	bit;
-	uint32_t	i;
-	int		rv;
-
 	if (!g_apfs.ac_alloc_have || g_bm == NULL)
 		return (FS_APFS_E_INVAL);
 	if (first < g_apfs.ac_alloc_base ||
@@ -2832,15 +3244,8 @@ free_blocks(uint64_t first, uint32_t count)
 		    (unsigned)count);
 		return (FS_APFS_E_INVAL);
 	}
-
-	bit = first - g_apfs.ac_alloc_base;
-	rv = alloc_bits((uint32_t)bit, count, false);
-	if (rv != FS_APFS_E_OK)
-		return (rv);
-	for (i = 0; i < count; i++)
-		g_hold[(bit + i) >> 3] |= (uint8_t)(1u << ((bit + i) & 7u));
 	alloc_n_given += count;
-	return (FS_APFS_E_OK);
+	return (fq_insert(APFS_SFQ_MAIN, g_apfs.ac_xid + 1, first, count));
 }
 
 /*
@@ -2965,6 +3370,9 @@ alloc_select(uint64_t near_bno)
 		if (read_block_raw(g_apfs.ac_alloc_bitmap, g_bm) !=
 		    FS_APFS_E_OK)
 			return (FS_APFS_E_IO);
+		g_apfs.ac_bm_chunk_free_at_mount = ci->ci_free_count;
+		g_apfs.ac_bm_chunk_bits_at_mount = bitmap_free_count(g_bm,
+		    ci->ci_block_count);
 		kprintf("apfs: allocating in the chunk @%llu that holds the "
 		    "volume metadata -- %u free of %u\n",
 		    (unsigned long long)ci->ci_addr,
@@ -3211,6 +3619,35 @@ alloc_snap_eq(const struct alloc_snap *a, const struct alloc_snap *b)
 }
 
 /*
+ * Is every block of this run marked taken on the DISK right now?  1 yes,
+ * 0 no, negative if the bitmap would not read.
+ *
+ * Asked of specific blocks rather than of the free counts, because the counts
+ * move for reasons the caller does not control -- every checkpoint releases
+ * whatever the queues have finished holding -- while these eight bits mean
+ * exactly one thing.
+ */
+static int
+alloc_run_taken(uint64_t first, uint32_t count, void *bm_buf)
+{
+	const uint8_t	*bm;
+	uint64_t	 bit;
+	uint32_t	 i;
+
+	if (fs_apfs_read_block_raw(g_apfs.ac_alloc_bitmap, bm_buf) !=
+	    FS_APFS_E_OK)
+		return (-1);
+	bm  = (const uint8_t *)bm_buf;
+	bit = first - g_apfs.ac_alloc_base;
+	for (i = 0; i < count; i++) {
+		if ((bm[(bit + i) >> 3] & (uint8_t)(1u << ((bit + i) & 7u)))
+		    == 0)
+			return (0);
+	}
+	return (1);
+}
+
+/*
  * ALLOCATE, LOOK, PUT BACK.
  *
  * The rung this belongs to was going to be "an allocator that only allocates"
@@ -3247,7 +3684,6 @@ fs_apfs_alloc_selftest(void)
 {
 	struct alloc_snap	 base;
 	struct alloc_snap	 live;
-	struct alloc_snap	 now;
 	void			*cib_buf;
 	void			*sm_buf;
 	void			*bm_buf;
@@ -3256,8 +3692,10 @@ fs_apfs_alloc_selftest(void)
 	uint64_t		 old_bm;
 	uint64_t		 old_cib;
 	uint64_t		 old_sm;
-	uint64_t		 first;		/* a block number now */
+	uint64_t		 first;
 	uint32_t		 run;
+	uint32_t		 i;
+	int			 taken;
 
 	if (!g_apfs.ac_mounted || !g_apfs.ac_bm_valid || !g_apfs.ac_alloc_have) {
 		kprintf("apfs-alloc: no chunk to work in -- skipped\n");
@@ -3289,10 +3727,10 @@ fs_apfs_alloc_selftest(void)
 	}
 
 	/*
-	 * THE CLAIM THIS RUNG EXISTS TO MAKE.  The allocation is complete as
-	 * far as this kernel is concerned, and the checkpoint that is still
-	 * live must not be able to tell.  Asked of the blocks it names,
-	 * everything reads exactly as it did before.
+	 * THE FIRST CLAIM.  The allocation is complete as far as this kernel
+	 * is concerned, and the checkpoint that is still live must not be
+	 * able to tell.  Asked of the blocks it names, everything reads
+	 * exactly as it did before.
 	 */
 	if (alloc_snapshot(old_cib, old_bm, old_sm, cib_buf, sm_buf, bm_buf,
 	    &live) != FS_APFS_E_OK) {
@@ -3325,62 +3763,60 @@ fs_apfs_alloc_selftest(void)
 		    (unsigned long long)old_bm, (unsigned long long)old_cib);
 		goto out;
 	}
-	if (alloc_snapshot(new_cib, new_bm, g_apfs.ac_sm_paddr, cib_buf,
-	    sm_buf, bm_buf, &now) != FS_APFS_E_OK) {
-		kprintf("apfs-alloc: FAIL cannot re-read after the "
-		    "checkpoint\n");
+	taken = alloc_run_taken(first, run, bm_buf);
+	if (taken != 1) {
+		kprintf("apfs-alloc: FAIL the run at %llu is not marked taken "
+		    "after the checkpoint (%d)\n", (unsigned long long)first,
+		    taken);
 		goto out;
-	}
-	if (now.as_chunk_free != base.as_chunk_free - run ||
-	    now.as_dev_free != base.as_dev_free - run ||
-	    now.as_clear_bits != base.as_clear_bits - run) {
-		kprintf("apfs-alloc: FAIL after taking %u: chunk %u->%u, "
-		    "device %llu->%llu, clear bits %u->%u\n", (unsigned)run,
-		    (unsigned)base.as_chunk_free, (unsigned)now.as_chunk_free,
-		    (unsigned long long)base.as_dev_free,
-		    (unsigned long long)now.as_dev_free,
-		    (unsigned)base.as_clear_bits, (unsigned)now.as_clear_bits);
-		/* Fall through and put it back regardless. */
 	}
 
+	/*
+	 * THE SECOND CLAIM, and the one the free queue exists for.  Giving
+	 * the run back does NOT make it free: the checkpoints behind this one
+	 * still describe a container in which those blocks are in use, and
+	 * handing them out again would turn every one of those superblocks
+	 * into a lie.  So after the release, and after a checkpoint publishes
+	 * it, the bits are still set.
+	 */
 	if (free_blocks(first, run) != FS_APFS_E_OK ||
 	    fs_apfs_checkpoint() != FS_APFS_E_OK) {
-		kprintf("apfs-alloc: FAIL could not give the run back -- the "
-		    "container is left with %u blocks leaked\n", (unsigned)run);
+		kprintf("apfs-alloc: FAIL could not give the run back\n");
 		goto out;
 	}
-	if (alloc_snapshot(g_apfs.ac_alloc_cib, g_apfs.ac_alloc_bitmap,
-	    g_apfs.ac_sm_paddr, cib_buf, sm_buf, bm_buf, &now) !=
-	    FS_APFS_E_OK) {
-		kprintf("apfs-alloc: FAIL cannot re-read after giving back\n");
+	taken = alloc_run_taken(first, run, bm_buf);
+	if (taken != 1) {
+		kprintf("apfs-alloc: FAIL the run at %llu was freed the "
+		    "moment it was released (%d) -- the checkpoints behind "
+		    "this one now point at reusable blocks\n",
+		    (unsigned long long)first, taken);
 		goto out;
 	}
-	if (!alloc_snap_eq(&now, &base)) {
-		kprintf("apfs-alloc: FAIL not restored: chunk %u vs %u, "
-		    "device %llu vs %llu, clear bits %u vs %u\n",
-		    (unsigned)now.as_chunk_free, (unsigned)base.as_chunk_free,
-		    (unsigned long long)now.as_dev_free,
-		    (unsigned long long)base.as_dev_free,
-		    (unsigned)now.as_clear_bits, (unsigned)base.as_clear_bits);
+
+	/*
+	 * AND THE THIRD.  It does not stay held for ever either.  Once the
+	 * transaction that released it is APFS_FQ_KEEP checkpoints behind,
+	 * the queue lets go and the blocks are free again.
+	 */
+	for (i = 0; i <= APFS_FQ_KEEP; i++) {
+		if (fs_apfs_checkpoint() != FS_APFS_E_OK) {
+			kprintf("apfs-alloc: FAIL checkpoint %u of the wait "
+			    "was refused\n", (unsigned)i);
+			goto out;
+		}
+	}
+	taken = alloc_run_taken(first, run, bm_buf);
+	if (taken != 0) {
+		kprintf("apfs-alloc: FAIL the run at %llu is still held %u "
+		    "checkpoints later (%d)\n", (unsigned long long)first,
+		    (unsigned)(APFS_FQ_KEEP + 1), taken);
 		goto out;
 	}
 
 	kprintf("apfs-alloc: PASS -- took %u blocks at %llu, the live "
-	    "checkpoint saw nothing, a checkpoint published it (%u/%llu/%u "
-	    "free), gave them back, disk restored\n",
-	    (unsigned)run, (unsigned long long)(g_apfs.ac_alloc_base + first),
-	    (unsigned)(base.as_chunk_free - run),
-	    (unsigned long long)(base.as_dev_free - run),
-	    (unsigned)(base.as_clear_bits - run));
-	/*
-	 * The addresses are from the FIRST of the two allocations.  By the
-	 * end the pair has usually come back to where it started, because the
-	 * give-back is a second copy and the blocks the first one released
-	 * are free again by then -- which is exactly what the container's own
-	 * history does between checkpoints, ping-ponging its chunk-info block
-	 * between two pool blocks.  Printing the final pair would show no
-	 * movement at all and mean the opposite of what it looked like.
-	 */
+	    "checkpoint saw nothing, the release held them for %u "
+	    "checkpoints, then the queue let them go\n", (unsigned)run,
+	    (unsigned long long)first, (unsigned)APFS_FQ_KEEP);
 	kprintf("apfs-alloc: metadata moved -- bitmap %llu -> %llu, "
 	    "chunk-info %llu -> %llu, pool bitmap in ring slot %u\n",
 	    (unsigned long long)old_bm, (unsigned long long)new_bm,
@@ -3470,6 +3906,7 @@ fs_apfs_checkpoint(void)
 	uint8_t				*buf;
 	uint8_t				*map;
 	uint8_t				*sb;
+	const uint8_t			*src;
 	uint64_t			 xid;
 	uint32_t			 data_slot;
 	uint32_t			 ip_slot;
@@ -3588,6 +4025,15 @@ fs_apfs_checkpoint(void)
 	 * the space manager of step 1, which names what they landed in.
 	 */
 	if (g_apfs.ac_ip_valid) {
+		/*
+		 * What the queues have been holding, for anything old enough
+		 * that no checkpoint worth mounting still names it.  Before
+		 * the bitmap is written, because this is what changes it.
+		 */
+		if (xid > APFS_FQ_KEEP) {
+			fq_release(APFS_SFQ_MAIN, xid - APFS_FQ_KEEP);
+			fq_release(APFS_SFQ_IP, xid - APFS_FQ_KEEP);
+		}
 		rv = alloc_flush(xid);
 		if (rv != FS_APFS_E_OK) {
 			kprintf("apfs-ckpt: the allocation bitmap would not "
@@ -3618,6 +4064,10 @@ fs_apfs_checkpoint(void)
 		    g_apfs.ac_eph[i].e_oid == g_apfs.ac_spaceman_oid) {
 			for (b = 0; b < APFS_BLOCK_SIZE; b++)
 				buf[b] = g_sm[b];
+		} else if (fq_mem(g_apfs.ac_eph[i].e_oid) != NULL) {
+			src = fq_mem(g_apfs.ac_eph[i].e_oid);
+			for (b = 0; b < APFS_BLOCK_SIZE; b++)
+				buf[b] = src[b];
 		} else if (fs_apfs_read_block(g_apfs.ac_eph[i].e_paddr, buf) !=
 		    FS_APFS_E_OK) {
 			kprintf("apfs-ckpt: ephemeral oid %llu at %llu "
@@ -3732,14 +4182,8 @@ fs_apfs_checkpoint(void)
 	 * in the committed container points at them any more, and the only
 	 * checkpoint that did has just been superseded.
 	 */
-	if (g_apfs.ac_ip_valid) {
+	if (g_apfs.ac_ip_valid)
 		g_apfs.ac_ipbm_slot = ip_slot;
-		for (i = 0; i < APFS_BLOCK_SIZE; i++) {
-			g_ip_hold[i] = 0;
-			g_hold[i]    = 0;
-		}
-		ip_n_held = 0;
-	}
 
 	ckpt_n_written++;
 	rv = FS_APFS_E_OK;
@@ -4098,15 +4542,43 @@ fs_apfs_stats(void)
 	    (unsigned long long)g_apfs.ac_bm_scanned,
 	    (unsigned long long)(g_apfs.ac_bm_chunks -
 	    g_apfs.ac_bm_wholly_free - g_apfs.ac_bm_scanned));
-	kprintf("apfs: free blocks -- spaceman %llu, chunks %llu, clear bits "
-	    "%llu -- %s\n",
-	    (unsigned long long)g_apfs.ac_sm_free,
-	    (unsigned long long)g_apfs.ac_bm_free_said,
-	    (unsigned long long)g_apfs.ac_bm_free_counted,
-	    (g_apfs.ac_bm_disagreed == 0 &&
-	    g_apfs.ac_sm_free == g_apfs.ac_bm_free_said &&
-	    g_apfs.ac_bm_free_said == g_apfs.ac_bm_free_counted) ?
-	    "all three agree" : "THEY DISAGREE");
+	/*
+	 * The three numbers, and they must be read at the same INSTANT to
+	 * mean anything.  The walk's totals are from mount; the space
+	 * manager's count moves as blocks are taken and released.  Comparing
+	 * one against the other two says only that the boot did some work --
+	 * which it printed as a disagreement the first time a free queue let
+	 * go of blocks the container arrived with.  So when the bitmap and
+	 * the chunk-info are in memory, all three come from there.
+	 */
+	if (g_bm != NULL && g_cib != NULL) {
+		const struct apfs_chunk_info_block	*mcib;
+		uint64_t				 said;
+		uint64_t				 bits;
+
+		mcib = (const struct apfs_chunk_info_block *)g_cib;
+		said = g_apfs.ac_bm_free_said - g_apfs.ac_bm_chunk_free_at_mount
+		    + mcib->cib_chunk_info[g_apfs.ac_alloc_slot].ci_free_count;
+		bits = g_apfs.ac_bm_free_counted -
+		    g_apfs.ac_bm_chunk_bits_at_mount +
+		    bitmap_free_count(g_bm, g_apfs.ac_alloc_blocks);
+		kprintf("apfs: free blocks -- spaceman %llu, chunks %llu, "
+		    "clear bits %llu -- %s\n",
+		    (unsigned long long)g_apfs.ac_sm_free,
+		    (unsigned long long)said, (unsigned long long)bits,
+		    (g_apfs.ac_bm_disagreed == 0 &&
+		    g_apfs.ac_sm_free == said && said == bits) ?
+		    "all three agree" : "THEY DISAGREE");
+	} else
+		kprintf("apfs: free blocks -- spaceman %llu, chunks %llu, "
+		    "clear bits %llu -- %s\n",
+		    (unsigned long long)g_apfs.ac_sm_free,
+		    (unsigned long long)g_apfs.ac_bm_free_said,
+		    (unsigned long long)g_apfs.ac_bm_free_counted,
+		    (g_apfs.ac_bm_disagreed == 0 &&
+		    g_apfs.ac_sm_free == g_apfs.ac_bm_free_said &&
+		    g_apfs.ac_bm_free_said == g_apfs.ac_bm_free_counted) ?
+		    "all three agree" : "THEY DISAGREE");
 
 	/*
 	 * Two numbers, because one of them cannot show a checkpoint that was
@@ -4123,18 +4595,44 @@ fs_apfs_stats(void)
 		    (unsigned long long)g_apfs.ac_sb_bno);
 
 	/*
-	 * The pool, and what copy-on-write has cost it.  The last number is
-	 * the one to watch: blocks released but not yet reusable are the
-	 * distance between this and a free queue, and if it is ever large at
-	 * rest, something has stopped committing.
+	 * The pool and the spine, and what copy-on-write has cost them.
 	 */
 	if (g_apfs.ac_ip_valid)
-		kprintf("apfs: pool %llu+%llu -- %llu taken, %llu returned, "
-		    "%llu metadata blocks moved, %llu held back\n",
+		kprintf("apfs: pool %llu+%llu -- %llu taken, %llu returned; "
+		    "%llu metadata and %llu spine blocks moved; device %llu "
+		    "taken, %llu released\n",
 		    (unsigned long long)g_apfs.ac_ip_base,
 		    (unsigned long long)g_apfs.ac_ip_blocks,
 		    (unsigned long long)ip_n_alloc,
 		    (unsigned long long)ip_n_free,
 		    (unsigned long long)cow_n_meta,
-		    (unsigned long long)ip_n_held);
+		    (unsigned long long)cow_n_spine,
+		    (unsigned long long)alloc_n_taken,
+		    (unsigned long long)alloc_n_given);
+
+	/*
+	 * And the queues.  The number to watch is what is still waiting: it
+	 * is how many blocks this kernel is holding out of use so that the
+	 * checkpoints behind the live one stay true, and it should rise while
+	 * a boot works and fall as the checkpoints age out.
+	 */
+	/*
+	 * "Let go" can exceed "queued", and legitimately: a container arrives
+	 * with entries already in its queues, and this kernel releases those
+	 * too.  So what is still waiting is read from the queues themselves
+	 * rather than subtracted from two counters that started counting at
+	 * different times.
+	 */
+	if (g_sm != NULL && (fq_n_queued != 0 || fq_n_released != 0))
+		kprintf("apfs: free queues -- %llu blocks queued, %llu let go, "
+		    "%llu still waiting (pool %llu, device %llu; oldest xid "
+		    "%llu)\n", (unsigned long long)fq_n_queued,
+		    (unsigned long long)fq_n_released,
+		    (unsigned long long)(
+		    sm_mem()->sm_fq[APFS_SFQ_IP].sfq_count +
+		    sm_mem()->sm_fq[APFS_SFQ_MAIN].sfq_count),
+		    (unsigned long long)sm_mem()->sm_fq[APFS_SFQ_IP].sfq_count,
+		    (unsigned long long)sm_mem()->sm_fq[APFS_SFQ_MAIN].sfq_count,
+		    (unsigned long long)
+		    sm_mem()->sm_fq[APFS_SFQ_MAIN].sfq_oldest_xid);
 }

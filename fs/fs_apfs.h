@@ -407,6 +407,29 @@ struct apfs_omap_val {
 #define	APFS_BTNODE_HDR_SIZE		56
 #define	APFS_BTREE_INFO_SIZE		40
 
+/*
+ * Inside that trailing btree_info: flags, node size, key size, value size,
+ * longest key, longest value, then the two counts.  Only the key count is
+ * written here, and by offset rather than through a struct, because it is the
+ * one field a writer has to keep true and the rest are the tree's shape.
+ */
+#define	APFS_BTREE_INFO_KEYCOUNT	24
+
+/*
+ * A free-queue record: which transaction released the run, where it starts,
+ * and how many blocks it is.  The count is stored as an ordinary value --
+ * except when it is one, where the table of contents holds 0xFFFF in place of
+ * a value offset and no value is stored at all.  Both forms appear in a
+ * container as it comes from mkapfs.
+ */
+struct apfs_spaceman_free_queue_key {
+	uint64_t	sfqk_xid;
+	uint64_t	sfqk_paddr;
+};
+
+_Static_assert(sizeof(struct apfs_spaceman_free_queue_key) == 16,
+    "a free-queue key is 16 bytes -- measured, with a fixed-KV node");
+
 struct apfs_nloc {
 	uint16_t	nl_off;
 	uint16_t	nl_len;
