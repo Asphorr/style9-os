@@ -20,10 +20,21 @@
  * Wire protocol + state model live in mach/services.h alongside the
  * other kernel-side services.  Implementation in mach/launchd.c.
  *
- * Bring-up is one call: launchd_subsystem_init().  Invoked from
- * services_init after the other services so a debugger probe at
- * kmain wedge sees a fully-populated bootstrap registry.
+ * Bring-up is TWO calls, in this order, and the order is load-bearing:
+ *
+ *	launchd_subsystem_init()	from services_init
+ *	launchd_load_catalog()		from kmain, AFTER progreg_init
+ *
+ * The split exists because the boot catalog names programs by string and
+ * resolves them through the program registry, which services_init runs too
+ * early to see.  Materialising the catalog from the worker thread instead
+ * only appeared to fix that: it made the load wait for the scheduler rather
+ * than for progreg_init, and the two are not the same thing.  See the
+ * comment above launchd_load_catalog in mach/launchd.c.
+ *
+ * Calling it twice is harmless -- the second call returns immediately.
  */
 void	launchd_subsystem_init(void);
+void	launchd_load_catalog(void);
 
 #endif /* !_MACH_LAUNCHD_H_ */

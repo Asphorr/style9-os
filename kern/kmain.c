@@ -16,6 +16,7 @@
 #include "darwin.h"
 #include "host.h"
 #include "klog.h"
+#include "launchd.h"
 #include "progreg.h"
 #include "services.h"
 #include "vm.h"
@@ -194,6 +195,15 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	(void)smap_enable_runtime();
 
 	progreg_init();
+
+	/*
+	 * Only now can launchd resolve its boot catalog: every job in it names
+	 * a program by string, and the registry that turns a string into an
+	 * image is the one progreg_init just filled.  Ordering it here rather
+	 * than leaving launchd's worker thread to guess is the whole point --
+	 * see launchd_load_catalog in mach/launchd.c.
+	 */
+	launchd_load_catalog();
 
 	/*
 	 * Run hello.elf once before handing the console to sh.elf.  Its

@@ -840,16 +840,6 @@ launchd_worker(void *arg)
 
 	(void)arg;
 
-	/*
-	 * Materialise the boot catalog here, not in launchd_subsystem_init:
-	 * init runs inside services_init (kmain), BEFORE progreg_init has
-	 * populated the program registry and before the scheduler starts
-	 * dispatching user tasks.  By the time this worker thread is first
-	 * scheduled, kmain has passed progreg_init and spawned its first
-	 * ring-3 task, so progreg_spawn here resolves + runs safely.
-	 */
-	launchd_parse_catalog(s9launchd_catalog);
-
 	for (;;) {
 		rv = mach_msg_recv_block(kernel_space, s9launchd_death_name,
 		    &nh.hdr, sizeof(nh));
@@ -1091,8 +1081,46 @@ launchd_subsystem_init(void)
 	    (unsigned)s9launchd_death_name);
 
 	/*
-	 * The boot catalog is materialised by the worker thread itself (see
-	 * launchd_worker): progreg_init has not run yet at this point in
-	 * kmain, so spawning here would find an empty program registry.
+	 * The boot catalog is NOT materialised here: progreg_init has not run
+	 * yet at this point in kmain, so every job would resolve to an empty
+	 * program registry.  kmain calls launchd_load_catalog once it has.
 	 */
+}
+
+/*
+ * Materialise the boot catalog: parse it and start every runatload job.
+ *
+ * This must run after progreg_init, because the catalog names programs by
+ * string and progreg_spawn resolves them through the registry that
+ * progreg_init fills.  That requirement used to be met by loading the
+ * catalog from launchd_worker on the theory that a freshly started kernel
+ * thread would not be scheduled until kmain had moved on -- but a thread
+ * being runnable and a thread not running yet are different claims, and
+ * only the second one was needed.  kmain does real work between
+ * services_init and progreg_init, and a preemption anywhere in there let
+ * the worker win the race: progreg_find returned NULL, progreg_spawn
+ * returned SYS_E_INVAL, and the boot printed
+ *
+ *	launchd: catalog job 'com.style9.heartbeat' (heartbeatd) spawn failed rv=-3
+ *
+ * with the job parked in LAUNCHD_STATE_FAILED for the rest of the boot.
+ * Intermittently -- roughly one boot in three on this host, which is the
+ * worst frequency a bug can have, often enough to be real and rare enough
+ * to be dismissed as noise.
+ *
+ * So the ordering is a call site now instead of an assumption about the
+ * scheduler.  The worker thread keeps only the job it can actually do
+ * without help: waiting on the death port.
+ *
+ * Idempotent: a second call is a no-op rather than a second set of jobs.
+ */
+void
+launchd_load_catalog(void)
+{
+	static bool	loaded = false;
+
+	if (loaded)
+		return;
+	loaded = true;
+	launchd_parse_catalog(s9launchd_catalog);
 }
