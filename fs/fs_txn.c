@@ -59,8 +59,8 @@ release(struct fs_txn *t)
 	t->tx_n = 0;
 }
 
-int
-fs_txn_get(struct fs_txn *t, uint64_t bno, void **buf_out)
+static int
+txn_get(struct fs_txn *t, uint64_t bno, void **buf_out, bool raw)
 {
 	struct fs_txn_slot	*s;
 	unsigned		 i;
@@ -79,10 +79,21 @@ fs_txn_get(struct fs_txn *t, uint64_t bno, void **buf_out)
 	 * with a perfectly correct checksum over the wrong contents.
 	 */
 	for (i = 0; i < t->tx_n; i++) {
-		if (t->tx_slot[i].ts_bno == bno) {
-			*buf_out = t->tx_slot[i].ts_buf;
-			return (FS_TXN_E_OK);
+		if (t->tx_slot[i].ts_bno != bno)
+			continue;
+		/*
+		 * The same block cannot be both.  Whichever caller is wrong
+		 * about what this block is, the commit would write it under
+		 * one set of rules while the other believed the other.
+		 */
+		if (t->tx_slot[i].ts_raw != raw) {
+			t->tx_failed = true;
+			kprintf("fs_txn: block %llu fetched both raw and "
+			    "checked\n", (unsigned long long)bno);
+			return (FS_TXN_E_IO);
 		}
+		*buf_out = t->tx_slot[i].ts_buf;
+		return (FS_TXN_E_OK);
 	}
 
 	if (t->tx_n >= FS_TXN_MAX_BLOCKS) {
@@ -98,7 +109,8 @@ fs_txn_get(struct fs_txn *t, uint64_t bno, void **buf_out)
 		t->tx_failed = true;
 		return (FS_TXN_E_NOMEM);
 	}
-	rv = fs_apfs_read_block(bno, s->ts_buf);
+	rv = raw ? fs_apfs_read_block_raw(bno, s->ts_buf) :
+	    fs_apfs_read_block(bno, s->ts_buf);
 	if (rv != FS_APFS_E_OK) {
 		kfree(s->ts_buf);
 		s->ts_buf    = NULL;
@@ -107,10 +119,25 @@ fs_txn_get(struct fs_txn *t, uint64_t bno, void **buf_out)
 	}
 	s->ts_bno   = bno;
 	s->ts_dirty = false;
+	s->ts_raw   = raw;
 	t->tx_n++;
 
 	*buf_out = s->ts_buf;
 	return (FS_TXN_E_OK);
+}
+
+int
+fs_txn_get(struct fs_txn *t, uint64_t bno, void **buf_out)
+{
+
+	return (txn_get(t, bno, buf_out, false));
+}
+
+int
+fs_txn_get_raw(struct fs_txn *t, uint64_t bno, void **buf_out)
+{
+
+	return (txn_get(t, bno, buf_out, true));
 }
 
 void
@@ -150,8 +177,11 @@ fs_txn_commit(struct fs_txn *t)
 	for (i = 0; i < t->tx_n; i++) {
 		if (!t->tx_slot[i].ts_dirty)
 			continue;
-		if (fs_apfs_write_block(t->tx_slot[i].ts_bno,
-		    t->tx_slot[i].ts_buf) != FS_APFS_E_OK) {
+		if ((t->tx_slot[i].ts_raw ?
+		    fs_apfs_write_block_raw(t->tx_slot[i].ts_bno,
+		    t->tx_slot[i].ts_buf) :
+		    fs_apfs_write_block(t->tx_slot[i].ts_bno,
+		    t->tx_slot[i].ts_buf)) != FS_APFS_E_OK) {
 			/*
 			 * Past this point the volume is already partly
 			 * updated, and there is no undo: the older version of

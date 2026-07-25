@@ -146,6 +146,13 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	 * would not have been evidence.
 	 */
 	fs_write_selftest();
+	/*
+	 * And the other half of writing: the space accounting.  Takes a run of
+	 * free blocks, checks the disk agrees, and gives it back -- see
+	 * fs/fs_apfs.h for why it cannot honestly keep them.
+	 */
+	if (fs_apfs_ready())
+		fs_apfs_alloc_selftest();
 
 	/*
 	 * Register a demo service under the bootstrap port so ring-3

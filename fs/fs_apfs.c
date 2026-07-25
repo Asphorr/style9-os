@@ -102,6 +102,18 @@ static struct {
 	uint64_t	ac_bm_scanned;		/* (m) chunks bit-counted   */
 	uint64_t	ac_bm_wholly_free;	/* (m) chunks with no bitmap */
 	uint64_t	ac_bm_disagreed;	/* (m) chunks that did not  */
+
+	/*
+	 * A chunk the allocator can work in, chosen during the walk: one that
+	 * has a real bitmap (so the edit exercises the bitmap path rather than
+	 * the wholly-free shortcut) and room to spare.
+	 */
+	bool		ac_alloc_have;		/* (m) */
+	uint64_t	ac_alloc_cib;		/* (m) its chunk-info block  */
+	uint32_t	ac_alloc_slot;		/* (m) which chunk within it */
+	uint64_t	ac_alloc_bitmap;	/* (m) */
+	uint64_t	ac_alloc_base;		/* (m) first block of chunk  */
+	uint32_t	ac_alloc_blocks;	/* (m) */
 } g_apfs;
 
 /*
@@ -220,6 +232,20 @@ fs_apfs_write_block(uint64_t bno, void *buf)
 	o = (struct apfs_obj_phys *)buf;
 	o->o_cksum = fs_apfs_fletcher64((const uint8_t *)buf + 8,
 	    APFS_BLOCK_SIZE - 8);
+	return (write_block_raw(bno, buf));
+}
+
+int
+fs_apfs_read_block_raw(uint64_t bno, void *buf)
+{
+
+	return (read_block_raw(bno, buf));
+}
+
+int
+fs_apfs_write_block_raw(uint64_t bno, const void *buf)
+{
+
 	return (write_block_raw(bno, buf));
 }
 
@@ -678,6 +704,14 @@ verify_chunk_bitmaps(void *sm_buf, void *cib_buf, void *bm_buf)
 			counted = bitmap_free_count((const uint8_t *)bm_buf,
 			    ci->ci_block_count);
 			g_apfs.ac_bm_scanned++;
+			if (!g_apfs.ac_alloc_have && counted > 64) {
+				g_apfs.ac_alloc_have   = true;
+				g_apfs.ac_alloc_cib    = cib_addr;
+				g_apfs.ac_alloc_slot   = i;
+				g_apfs.ac_alloc_bitmap = ci->ci_bitmap_addr;
+				g_apfs.ac_alloc_base   = ci->ci_addr;
+				g_apfs.ac_alloc_blocks = ci->ci_block_count;
+			}
 			g_apfs.ac_bm_free_counted += counted;
 			if (counted != ci->ci_free_count) {
 				g_apfs.ac_bm_disagreed++;
@@ -2162,6 +2196,244 @@ fs_apfs_init(void)
 out:
 	kfree(anchor);
 	kfree(scratch);
+}
+
+/*
+ * Move `delta` blocks between the free and the used state, starting at bit
+ * `first` of the chosen chunk: set the bits when `take` is true, clear them
+ * when it is false, and move both counters the matching way.
+ *
+ * All three blocks in ONE transaction, and that is the point rather than an
+ * optimisation.  A bitmap that says a block is taken while the chunk-info
+ * still counts it free is a container apfsck rejects -- it says so in those
+ * words -- so the three edits are only ever correct together.  The bitmap
+ * goes through the raw path because it has no header to check or to seal.
+ *
+ * Returns 0, or a negative FS_APFS_E_*.
+ */
+static int
+alloc_apply(uint32_t first, uint32_t count, bool take)
+{
+	struct apfs_chunk_info_block	*cib;
+	struct apfs_chunk_info		*ci;
+	struct apfs_spaceman		*sm;
+	struct fs_txn			 t;
+	uint8_t				*bm;
+	void				*p;
+	uint32_t			 i;
+	uint32_t			 bit;
+
+	fs_txn_begin(&t);
+
+	if (fs_txn_get_raw(&t, g_apfs.ac_alloc_bitmap, &p) != FS_TXN_E_OK)
+		goto fail;
+	bm = (uint8_t *)p;
+	for (i = 0; i < count; i++) {
+		bit = first + i;
+		/*
+		 * Refuse to take a block already taken, or give back one that
+		 * was never held.  Either means the caller's idea of the chunk
+		 * and the chunk itself have diverged, and carrying on would
+		 * put the counters out of step with the bits.
+		 */
+		if (((bm[bit >> 3] & (uint8_t)(1u << (bit & 7u))) != 0) == take) {
+			kprintf("apfs: alloc: block %llu is already %s\n",
+			    (unsigned long long)(g_apfs.ac_alloc_base + bit),
+			    take ? "taken" : "free");
+			goto fail;
+		}
+		if (take)
+			bm[bit >> 3] |= (uint8_t)(1u << (bit & 7u));
+		else
+			bm[bit >> 3] &= (uint8_t)~(1u << (bit & 7u));
+	}
+	fs_txn_dirty(&t, g_apfs.ac_alloc_bitmap);
+
+	if (fs_txn_get(&t, g_apfs.ac_alloc_cib, &p) != FS_TXN_E_OK)
+		goto fail;
+	cib = (struct apfs_chunk_info_block *)p;
+	ci  = &cib->cib_chunk_info[g_apfs.ac_alloc_slot];
+	if (take) {
+		if (ci->ci_free_count < count)
+			goto fail;
+		ci->ci_free_count -= count;
+	} else
+		ci->ci_free_count += count;
+	fs_txn_dirty(&t, g_apfs.ac_alloc_cib);
+
+	if (fs_txn_get(&t, g_apfs.ac_sm_paddr, &p) != FS_TXN_E_OK)
+		goto fail;
+	sm = (struct apfs_spaceman *)p;
+	if (take) {
+		if (sm->sm_dev[APFS_SD_MAIN].sm_free_count < count)
+			goto fail;
+		sm->sm_dev[APFS_SD_MAIN].sm_free_count -= count;
+	} else
+		sm->sm_dev[APFS_SD_MAIN].sm_free_count += count;
+	fs_txn_dirty(&t, g_apfs.ac_sm_paddr);
+
+	if (fs_txn_commit(&t) != FS_TXN_E_OK)
+		return (FS_APFS_E_IO);
+	return (FS_APFS_E_OK);
+
+fail:
+	fs_txn_abort(&t);
+	return (FS_APFS_E_INVAL);
+}
+
+/* Read the three numbers back OFF THE DISK, not out of any cached idea. */
+static int
+alloc_readback(void *cib_buf, void *sm_buf, void *bm_buf, uint32_t *chunk_free,
+    uint64_t *dev_free, uint32_t *clear_bits)
+{
+	const struct apfs_chunk_info_block	*cib;
+	const struct apfs_spaceman		*sm;
+
+	if (fs_apfs_read_block(g_apfs.ac_alloc_cib, cib_buf) != FS_APFS_E_OK ||
+	    fs_apfs_read_block(g_apfs.ac_sm_paddr, sm_buf) != FS_APFS_E_OK ||
+	    fs_apfs_read_block_raw(g_apfs.ac_alloc_bitmap, bm_buf) !=
+	    FS_APFS_E_OK)
+		return (FS_APFS_E_IO);
+
+	cib = (const struct apfs_chunk_info_block *)cib_buf;
+	sm  = (const struct apfs_spaceman *)sm_buf;
+	*chunk_free = cib->cib_chunk_info[g_apfs.ac_alloc_slot].ci_free_count;
+	*dev_free   = sm->sm_dev[APFS_SD_MAIN].sm_free_count;
+	*clear_bits = bitmap_free_count((const uint8_t *)bm_buf,
+	    g_apfs.ac_alloc_blocks);
+	return (FS_APFS_E_OK);
+}
+
+/*
+ * ALLOCATE, LOOK, PUT BACK.
+ *
+ * The rung this belongs to was going to be "an allocator that only allocates"
+ * -- take blocks, never give any back, and so never need the free queues or a
+ * transaction id to key them by.  Trying it on the image first settled it: a
+ * container with a block marked in use that nothing references is not valid,
+ * and apfsck says so in one line.
+ *
+ *	Space manager: bad allocation bitmap.
+ *
+ * That is not a complaint about the edit.  Rewriting a metadata block
+ * resealed is invisible to apfsck, and a bitmap bit set with both counters
+ * moved to match passes the chunk-info check -- it is the NEXT check that
+ * fails, the one comparing the bitmap against the set of blocks something
+ * actually points at.  In this format an allocation is not a thing on its own;
+ * it is half of an operation whose other half is a reference, and the two are
+ * only valid together.
+ *
+ * So what can be proved without the other half is everything up to it: find a
+ * run, take it, see the disk agree, give it back, see the disk return to what
+ * it was.  The volume is briefly in the state apfsck rejects, which is honest
+ * -- it is exactly the state a half-finished allocation leaves -- and it does
+ * not outlive the call.
+ */
+void
+fs_apfs_alloc_selftest(void)
+{
+	void		*cib_buf;
+	void		*sm_buf;
+	void		*bm_buf;
+	uint64_t	 dev0;
+	uint64_t	 dev1;
+	uint32_t	 chunk0;
+	uint32_t	 chunk1;
+	uint32_t	 bits0;
+	uint32_t	 bits1;
+	uint32_t	 run;
+	uint32_t	 first;
+	uint32_t	 i;
+	uint32_t	 seen;
+
+	if (!g_apfs.ac_mounted || !g_apfs.ac_bm_valid || !g_apfs.ac_alloc_have) {
+		kprintf("apfs-alloc: no chunk to work in -- skipped\n");
+		return;
+	}
+
+	cib_buf = kmalloc(APFS_BLOCK_SIZE);
+	sm_buf  = kmalloc(APFS_BLOCK_SIZE);
+	bm_buf  = kmalloc(APFS_BLOCK_SIZE);
+	if (cib_buf == NULL || sm_buf == NULL || bm_buf == NULL) {
+		kprintf("apfs-alloc: no memory -- skipped\n");
+		goto out;
+	}
+
+	run = 8;
+	if (alloc_readback(cib_buf, sm_buf, bm_buf, &chunk0, &dev0, &bits0) !=
+	    FS_APFS_E_OK) {
+		kprintf("apfs-alloc: FAIL cannot read the chunk\n");
+		goto out;
+	}
+
+	/* First run of `run` consecutive free blocks in the chunk. */
+	first = g_apfs.ac_alloc_blocks;
+	seen  = 0;
+	for (i = 0; i < g_apfs.ac_alloc_blocks; i++) {
+		if ((((const uint8_t *)bm_buf)[i >> 3] &
+		    (uint8_t)(1u << (i & 7u))) != 0) {
+			seen = 0;
+			continue;
+		}
+		if (++seen == run) {
+			first = i + 1 - run;
+			break;
+		}
+	}
+	if (first >= g_apfs.ac_alloc_blocks) {
+		kprintf("apfs-alloc: no run of %u free blocks -- skipped\n",
+		    (unsigned)run);
+		goto out;
+	}
+
+	if (alloc_apply(first, run, true) != FS_APFS_E_OK) {
+		kprintf("apfs-alloc: FAIL could not take the run\n");
+		goto out;
+	}
+	if (alloc_readback(cib_buf, sm_buf, bm_buf, &chunk1, &dev1, &bits1) !=
+	    FS_APFS_E_OK) {
+		kprintf("apfs-alloc: FAIL cannot re-read after taking\n");
+		goto out;
+	}
+	if (chunk1 != chunk0 - run || dev1 != dev0 - run ||
+	    bits1 != bits0 - run) {
+		kprintf("apfs-alloc: FAIL after taking %u: chunk %u->%u, "
+		    "device %llu->%llu, clear bits %u->%u\n", (unsigned)run,
+		    (unsigned)chunk0, (unsigned)chunk1,
+		    (unsigned long long)dev0, (unsigned long long)dev1,
+		    (unsigned)bits0, (unsigned)bits1);
+		/* Fall through and put it back regardless. */
+	}
+
+	if (alloc_apply(first, run, false) != FS_APFS_E_OK) {
+		kprintf("apfs-alloc: FAIL could not give the run back -- the "
+		    "container is left with %u blocks leaked\n", (unsigned)run);
+		goto out;
+	}
+	if (alloc_readback(cib_buf, sm_buf, bm_buf, &chunk1, &dev1, &bits1) !=
+	    FS_APFS_E_OK) {
+		kprintf("apfs-alloc: FAIL cannot re-read after giving back\n");
+		goto out;
+	}
+	if (chunk1 != chunk0 || dev1 != dev0 || bits1 != bits0) {
+		kprintf("apfs-alloc: FAIL not restored: chunk %u vs %u, "
+		    "device %llu vs %llu, clear bits %u vs %u\n",
+		    (unsigned)chunk1, (unsigned)chunk0,
+		    (unsigned long long)dev1, (unsigned long long)dev0,
+		    (unsigned)bits1, (unsigned)bits0);
+		goto out;
+	}
+
+	kprintf("apfs-alloc: PASS -- took %u blocks at %llu, disk agreed "
+	    "(%u/%llu/%u free), gave them back, disk restored\n",
+	    (unsigned)run, (unsigned long long)(g_apfs.ac_alloc_base + first),
+	    (unsigned)(chunk0 - run), (unsigned long long)(dev0 - run),
+	    (unsigned)(bits0 - run));
+
+out:
+	kfree(cib_buf);
+	kfree(sm_buf);
+	kfree(bm_buf);
 }
 
 int

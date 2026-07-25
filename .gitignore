@@ -9,7 +9,13 @@ live.log
 
 # Serial log written by tools/run.ps1 (mirror of COM1 from the kernel
 # tty); the assistant tails this file instead of asking for screenshots.
-serial.log
+#
+# The glob, not just the default name: run.ps1 takes -LogFile, and a session
+# comparing two images or a good boot against a deliberately broken one names
+# them serial-apfs.log, serial-fat.log, serial-break.log and so on.  Those
+# escaped a rule that matched only "serial.log" and were committed by
+# `git add -A` three times before anyone noticed.
+serial*.log
 
 # Screendumps and other ad-hoc debug artefacts.
 *.png

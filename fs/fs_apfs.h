@@ -711,6 +711,19 @@ int	fs_apfs_ready(void);
 void	fs_apfs_stats(void);
 
 /*
+ * Take a run of free blocks, confirm the disk agrees, and give it back.
+ *
+ * Stops one step short of a real allocation on purpose, and the step it stops
+ * at was found by trying: a container holding a block marked in use that
+ * nothing references is not valid, and apfsck rejects it outright.  An
+ * allocation in this format is half an operation; the other half is whatever
+ * points at the block, and neither half is valid alone.  What this proves is
+ * the half that exists -- the search, the bitmap edit, both counters, the
+ * sealing, and that all of it survives a round trip through the drive.
+ */
+void	fs_apfs_alloc_selftest(void);
+
+/*
  * Translate a virtual object id to its block number through the object-map
  * B-tree rooted at `tree_bno`, taking the newest version no later than `xid`.
  * Returns FS_APFS_E_OK and stores the block in *paddr_out, or a negative
@@ -800,6 +813,20 @@ uint64_t	fs_apfs_fletcher64(const void *p, uint32_t len);
  * data through here would overwrite its first eight bytes with a checksum.
  */
 int	fs_apfs_write_block(uint64_t bno, void *buf);
+
+/*
+ * Read and write a block that has NO obj_phys header, so there is no checksum
+ * to verify on the way in and none to seal on the way out.
+ *
+ * File data is the obvious such block, but it is not the interesting one: an
+ * allocation bitmap is also nothing but bytes, and the eight where a metadata
+ * block keeps its Fletcher-64 are the allocation state of the chunk's first
+ * sixty-four blocks.  Reading one through the checked path rejects it and
+ * writing one through the sealed path destroys it, which is why the
+ * distinction is exported rather than kept private to the reader.
+ */
+int	fs_apfs_read_block_raw(uint64_t bno, void *buf);
+int	fs_apfs_write_block_raw(uint64_t bno, const void *buf);
 
 /* ---- writing ------------------------------------------------------- */
 

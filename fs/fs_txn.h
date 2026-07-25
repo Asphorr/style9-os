@@ -62,6 +62,11 @@ struct fs_txn_slot {
 	uint64_t	 ts_bno;
 	uint8_t		*ts_buf;	/* one block, kmalloc'd on first touch */
 	bool		 ts_dirty;
+	/*
+	 * This block carries no obj_phys, so it is neither verified on the way
+	 * in nor sealed on the way out.  See fs_txn_get_raw.
+	 */
+	bool		 ts_raw;
 };
 
 struct fs_txn {
@@ -91,6 +96,27 @@ void	fs_txn_begin(struct fs_txn *t);
  * half-built change.
  */
 int	fs_txn_get(struct fs_txn *t, uint64_t bno, void **buf_out);
+
+/*
+ * The same, for a block that has no obj_phys header: read it without checking
+ * a checksum it does not have, and write it back without sealing one over its
+ * contents.
+ *
+ * There is exactly one such block in an operation of this kind, and it is the
+ * reason the list at the top of this file names it first: an APFS allocation
+ * bitmap is bits and nothing else.  Its first eight bytes are the allocation
+ * state of sixty-four blocks, in the place where a metadata block keeps its
+ * Fletcher-64 -- so the ordinary path rejects every bitmap in the container on
+ * the way in, and would overwrite sixty-four blocks' worth of state on the way
+ * out.  The distinction is the one write_block_raw already draws for file
+ * data; this is the same line, drawn for a block that is neither data nor
+ * checksummed metadata.
+ *
+ * A block may be fetched raw or checked, never both: asking for it the other
+ * way after the first fetch poisons the transaction rather than quietly
+ * handing back a buffer that will be written under the wrong rules.
+ */
+int	fs_txn_get_raw(struct fs_txn *t, uint64_t bno, void **buf_out);
 
 /* Mark a block obtained above as changed.  Untouched blocks are not written. */
 void	fs_txn_dirty(struct fs_txn *t, uint64_t bno);
