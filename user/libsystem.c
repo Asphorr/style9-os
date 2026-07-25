@@ -1321,41 +1321,14 @@ getopt(int argc, char *const argv[], const char *optstring)
 /* ---- filesystem metadata: stat / readdir over the private backchannel --- */
 
 /*
- * "." names the root here, and that is a fact rather than a guess: this
- * system has one directory tree and no per-process working directory, which
- * is why getcwd(3) below answers "/" and chdir(3) succeeds without doing
- * anything.  The kernel has no cwd to consult, so a path that leans on one
- * has to be resolved on this side of the syscall -- and this is the only
- * place that knows the cwd is a fiction.
- *
- * Returns `path` untouched when nothing needs rewriting, so the common case
- * costs two comparisons and no copying.
+ * There used to be a path_abs() here, rewriting "." and "./x" into absolute
+ * paths before the syscall, and its own comment admitted why: the kernel had
+ * no working directory to consult, so "this is the only place that knows the
+ * cwd is a fiction."  It is gone because the fiction is.  The kernel resolves
+ * relative paths against the calling task's real working directory now, which
+ * is the only place that CAN resolve them correctly -- "../x" needs to know
+ * where you actually are, and this side never did.
  */
-#define	PATH_FIX_MAX	1024
-
-static const char *
-path_abs(const char *path, char *tmp, size_t cap)
-{
-	size_t	i;
-	size_t	j;
-
-	if (path == NULL)
-		return (path);
-	if (path[0] == '.' && path[1] == '\0')
-		return ("/");
-	if (path[0] != '.' || path[1] != '/')
-		return (path);
-
-	tmp[0] = '/';
-	j = 1;
-	for (i = 2; path[i] != '\0' && j + 1 < cap; i++) {
-		if (path[i] == '/' && tmp[j - 1] == '/')
-			continue;		/* ".//x" and "./x//y" */
-		tmp[j++] = path[i];
-	}
-	tmp[j] = '\0';
-	return (tmp);
-}
 
 /*
  * The kernel reports filesystem metadata in these small neutral structs (the
@@ -1397,9 +1370,7 @@ _Static_assert(sizeof(struct fs_statbuf) == 72, "must match kern/fs.h");
 static long
 s9_fs_stat(const char *path, struct fs_statbuf *sb)
 {
-	char	tmp[PATH_FIX_MAX];
 
-	path = path_abs(path, tmp, sizeof(tmp));
 	return (bsd_call(0x2A000002, (long)path, (long)sb, 0));
 }
 
@@ -1407,9 +1378,7 @@ s9_fs_stat(const char *path, struct fs_statbuf *sb)
 static long
 s9_fs_readdir(const char *path, uint32_t index, struct fs_dirent *out)
 {
-	char	tmp[PATH_FIX_MAX];
 
-	path = path_abs(path, tmp, sizeof(tmp));
 	return (bsd_call(0x2A000003, (long)path, (long)index, (long)out));
 }
 
@@ -1720,13 +1689,22 @@ dirfd(DIR *dp)
 	return (-1);
 }
 
+/*
+ * Joining a directory descriptor's path to a relative name is this side's
+ * job and stays here: a dirfd is a libSystem construct (dirfd_tab above), so
+ * the kernel has never heard of it.  Distinct from the working directory,
+ * which the kernel now owns -- AT_FDCWD below just hands the name straight
+ * through and lets it resolve there.
+ */
+#define	AT_PATH_MAX	1024
+
 int	fstatat_inode64(int fd, const char *name, void *buf, int flag)
 	    __asm__("_fstatat$INODE64");
 
 int
 fstatat_inode64(int fd, const char *name, void *buf, int flag)
 {
-	char		 joined[PATH_FIX_MAX];
+	char		 joined[AT_PATH_MAX];
 	const char	*dir;
 	size_t		 i;
 	size_t		 j;
@@ -3341,13 +3319,21 @@ _NSGetEnviron(void)
 	return (&environ);
 }
 
-/* No working directory to change on the read-only single-root FS. */
+/*
+ * The kernel has a working directory now, so these stop pretending.
+ *
+ * What they used to be is worth recording, because the shape of the lie is
+ * instructive: chdir(2) returned success without doing anything, getcwd(3)
+ * answered "/" whatever had happened, and a helper on this side of the
+ * syscall rewrote relative paths against that imaginary root.  Nothing ever
+ * reported an error, so a program that changed directory and then opened a
+ * relative name simply got a different file than it asked for.
+ */
 int
 chdir(const char *path)
 {
 
-	(void)path;
-	return (0);
+	return ((int)bsd_call_e(0x2000000 | 12, (long)path, 0, 0));
 }
 
 int
@@ -3617,21 +3603,47 @@ getpwnam(const char *name)
 	return (NULL);
 }
 
-/* The single root directory is every process's working directory. */
+/*
+ * getcwd(3) over __getcwd(2), which is how Darwin's own libc does it: the
+ * syscall fills a caller-supplied buffer or fails with ERANGE, and the
+ * allocating form is a courtesy this side adds.
+ */
+#define	GETCWD_MAX	256		/* matches DARWIN_PATH_MAX */
+
 char *
 getcwd(char *buf, size_t size)
 {
+	char	tmp[GETCWD_MAX];
+	size_t	n;
 
 	if (buf == NULL) {
-		buf = (char *)malloc(2);
+		/*
+		 * The POSIX extension: allocate one that fits.  Asking the
+		 * kernel into a local first means the allocation is sized to
+		 * the answer rather than to the maximum, and that a failure
+		 * costs no malloc at all.
+		 */
+		if (bsd_call_e(0x2000000 | 326, (long)tmp,
+		    (long)sizeof(tmp), 0) < 0)
+			return (NULL);
+		for (n = 0; tmp[n] != '\0'; n++)
+			continue;
+		if (size != 0 && size < n + 1) {
+			g_errno = 34;			/* ERANGE */
+			return (NULL);
+		}
+		buf = (char *)malloc(n + 1);
 		if (buf == NULL)
 			return (NULL);
-	} else if (size < 2) {
-		g_errno = 34;			/* ERANGE */
-		return (NULL);
+		for (n = 0; ; n++) {
+			buf[n] = tmp[n];
+			if (tmp[n] == '\0')
+				break;
+		}
+		return (buf);
 	}
-	buf[0] = '/';
-	buf[1] = '\0';
+	if (bsd_call_e(0x2000000 | 326, (long)buf, (long)size, 0) < 0)
+		return (NULL);
 	return (buf);
 }
 

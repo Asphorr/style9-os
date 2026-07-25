@@ -122,6 +122,13 @@ task_create(const char *name)
 	t->t_personality = TASK_PERSONALITY_STYLE9;
 	t->t_darwin_dylib_next = 0;
 	t->t_darwin_ppid = 0;
+	/*
+	 * A task starts at the root.  Set here rather than left zeroed: an
+	 * empty cwd is not a working directory, and every path resolution
+	 * would paste onto it and produce a path with no leading slash.
+	 */
+	t->t_darwin_cwd[0] = '/';
+	t->t_darwin_cwd[1] = '\0';
 	{
 		size_t	fi;
 

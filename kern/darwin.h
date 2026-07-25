@@ -66,6 +66,7 @@
 #define	DARWIN_SYS_open		5
 #define	DARWIN_SYS_close	6
 #define	DARWIN_SYS_wait4	7
+#define	DARWIN_SYS_chdir	12
 #define	DARWIN_SYS_getpid	20
 #define	DARWIN_SYS_kill		37
 #define	DARWIN_SYS_getppid	39
@@ -82,6 +83,12 @@
 #define	DARWIN_SYS_sigreturn	184
 #define	DARWIN_SYS_mmap		197
 #define	DARWIN_SYS_lseek	199
+/*
+ * getcwd(3) is not a syscall on Darwin; libc calls __getcwd(2), which fills a
+ * caller-supplied buffer with the absolute path or fails with ERANGE.  The
+ * number is Darwin's, not an invention.
+ */
+#define	DARWIN_SYS___getcwd	326
 
 /*
  * mmap(2)'s vocabulary, as <sys/mman.h> spells it on Darwin.  The protection
@@ -259,6 +266,9 @@ struct darwin_uname {
 #define	DARWIN_ESPIPE	29
 #define	DARWIN_EROFS	30
 #define	DARWIN_EPIPE	32
+#define	DARWIN_ERANGE	34
+#define	DARWIN_ENAMETOOLONG	63
+#define	DARWIN_ENOTDIR	20
 #define	DARWIN_ENOSYS	78
 
 /*

@@ -997,6 +997,93 @@ darwin_cons_stats(void)
 	    (unsigned long long)darwin_cons_n_script);
 }
 
+/* ---- the working directory ----------------------------------------------- */
+
+/*
+ * Resolve a user-supplied path against the calling task's working directory,
+ * producing an absolute, normalised path in `out`.
+ *
+ * Normalisation is not decoration.  A cwd that only ever gets longer is not a
+ * working directory -- `cd ..` has to work, and the only place that can
+ * happen is here, because the filesystem below resolves components literally
+ * and has no notion of a parent link.  So "." is dropped, ".." pops the last
+ * component (and does nothing at the root, exactly as a real Unix root
+ * behaves), and repeated slashes collapse.
+ *
+ * Returns 0, or a negative errno-ish for a path that will not fit.  Writing
+ * into `out` only on success would be tidier but costs a second buffer; every
+ * caller treats a failure as fatal to the syscall and never looks at `out`.
+ */
+static int
+darwin_path_resolve(const struct task *t, const char *in, char *out,
+    size_t cap)
+{
+	size_t	n;
+	size_t	i;
+
+	if (in == NULL || cap < 2)
+		return (-1);
+
+	n = 0;
+	if (in[0] != '/') {
+		/* Relative: start from the working directory. */
+		for (i = 0; t->t_darwin_cwd[i] != '\0'; i++) {
+			if (n + 1 >= cap)
+				return (-1);
+			out[n++] = t->t_darwin_cwd[i];
+		}
+	}
+	if (n == 0)
+		out[n++] = '/';
+
+	i = 0;
+	while (in[i] != '\0') {
+		size_t	start;
+		size_t	len;
+
+		while (in[i] == '/')
+			i++;
+		if (in[i] == '\0')
+			break;
+		start = i;
+		while (in[i] != '\0' && in[i] != '/')
+			i++;
+		len = i - start;
+
+		if (len == 1 && in[start] == '.')
+			continue;
+		if (len == 2 && in[start] == '.' && in[start + 1] == '.') {
+			/* Pop one component; at the root there is none. */
+			while (n > 1 && out[n - 1] != '/')
+				n--;
+			if (n > 1)
+				n--;		/* drop the separator too */
+			if (n == 0)
+				out[n++] = '/';
+			continue;
+		}
+		if (out[n - 1] != '/') {
+			if (n + 1 >= cap)
+				return (-1);
+			out[n++] = '/';
+		}
+		if (n + len >= cap)
+			return (-1);
+		for (start = i - len; start < i; start++)
+			out[n++] = in[start];
+	}
+
+	/*
+	 * A trailing separator is stripped so the result can be pasted onto
+	 * unconditionally, but the root is only a separator and keeping it is
+	 * the difference between "/" and the empty string.
+	 */
+	if (n > 1 && out[n - 1] == '/')
+		n--;
+	out[n] = '\0';
+	return (0);
+}
+
 void
 darwin_files_teardown(struct task *t)
 {
@@ -1678,6 +1765,66 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		/* arg1 is the timezone pointer; ignored, as everywhere else. */
 		return (darwin_ok(f, 0));
 	}
+	case DARWIN_SYS_chdir: {
+		char			 raw[DARWIN_PATH_MAX];
+		char			 want[DARWIN_PATH_MAX];
+		struct fs_statbuf	 sb;
+		struct task		*t;
+		size_t			 i;
+		long			 len;
+
+		t = current_thread->th_task;
+		len = syscall_copyin_str((const char *)f->sf_arg0, raw,
+		    sizeof(raw));
+		if (len < 0)
+			return (darwin_err(f, DARWIN_EFAULT));
+		if (darwin_path_resolve(t, raw, want, sizeof(want)) != 0)
+			return (darwin_err(f, DARWIN_ENAMETOOLONG));
+
+		/*
+		 * Checked before it is adopted, and checked for being a
+		 * DIRECTORY rather than merely existing.  A cwd that names a
+		 * regular file would make every later relative path resolve
+		 * under it and fail one component deeper, where the error has
+		 * nothing to do with the mistake that caused it.  The root is
+		 * accepted without asking the volume, since it is the one
+		 * directory that exists by construction.
+		 */
+		if (!(want[0] == '/' && want[1] == '\0')) {
+			if (fs_stat(want, &sb) != FS_E_OK)
+				return (darwin_err(f, DARWIN_ENOENT));
+			if (!FS_ISDIR(sb.fs_mode))
+				return (darwin_err(f, DARWIN_ENOTDIR));
+		}
+		for (i = 0; i < DARWIN_PATH_MAX; i++) {
+			t->t_darwin_cwd[i] = want[i];
+			if (want[i] == '\0')
+				break;
+		}
+		kprintf("darwin: UNIX chdir(\"%s\") -> %s\n", raw,
+		    t->t_darwin_cwd);
+		return (darwin_ok(f, 0));
+	}
+	case DARWIN_SYS___getcwd: {
+		struct task	*t;
+		size_t		 n;
+
+		t = current_thread->th_task;
+		for (n = 0; t->t_darwin_cwd[n] != '\0'; n++)
+			continue;
+		n++;				/* the NUL is part of it */
+		/*
+		 * ERANGE, not a truncated answer.  A caller handed a partial
+		 * path would open the wrong thing rather than fail, which is
+		 * exactly what getcwd(3) exists to prevent.
+		 */
+		if (f->sf_arg1 < n)
+			return (darwin_err(f, DARWIN_ERANGE));
+		if (syscall_copyout((void *)f->sf_arg0, t->t_darwin_cwd,
+		    n) != 0)
+			return (darwin_err(f, DARWIN_EFAULT));
+		return (darwin_ok(f, 0));
+	}
 	case DARWIN_SYS_getpid: {
 		uint64_t	id;
 
@@ -1701,7 +1848,8 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		return (darwin_ok(f, 0));
 	}
 	case DARWIN_SYS_open: {
-		char				 path[256];
+		char				 path[DARWIN_PATH_MAX];
+		char				 raw[DARWIN_PATH_MAX];
 		const struct progreg_entry	*pe;
 		struct fs_handle		 handle;
 		struct task			*t;
@@ -1713,12 +1861,15 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		int				 rv;
 		bool				 on_disk;
 
-		len = syscall_copyin_str((const char *)f->sf_arg0, path,
-		    sizeof(path));
+		len = syscall_copyin_str((const char *)f->sf_arg0, raw,
+		    sizeof(raw));
 		if (len < 0) {
 			kprintf("darwin: open: bad path pointer\n");
 			return (darwin_err(f, DARWIN_EFAULT));
 		}
+		if (darwin_path_resolve(current_thread->th_task, raw, path,
+		    sizeof(path)) != 0)
+			return (darwin_err(f, DARWIN_ENAMETOOLONG));
 
 		/*
 		 * Everything reachable here is read-only; say so instead of
@@ -2641,15 +2792,19 @@ darwin_bin_statbuf(struct fs_statbuf *sb, int is_dir)
 static long
 darwin_s9_fs_stat(struct syscall_frame *f)
 {
-	char				 path[256];
+	char				 path[DARWIN_PATH_MAX];
+	char				 raw[DARWIN_PATH_MAX];
 	struct fs_statbuf		 sb;
 	const struct progreg_entry	*pe;
 	long				 n;
 	int				 rv;
 
-	n = syscall_copyin_str((const char *)f->sf_arg0, path, sizeof(path));
+	n = syscall_copyin_str((const char *)f->sf_arg0, raw, sizeof(raw));
 	if (n < 0)
 		return (darwin_err(f, DARWIN_EFAULT));
+	if (darwin_path_resolve(current_thread->th_task, raw, path,
+	    sizeof(path)) != 0)
+		return (darwin_err(f, DARWIN_ENAMETOOLONG));
 
 	/*
 	 * /bin answers as the overlay it is (see fs_readdir below): the
@@ -2686,7 +2841,8 @@ darwin_s9_fs_stat(struct syscall_frame *f)
 static long
 darwin_s9_fs_readdir(struct syscall_frame *f)
 {
-	char				 path[256];
+	char				 path[DARWIN_PATH_MAX];
+	char				 raw[DARWIN_PATH_MAX];
 	struct fs_dirent		 de;
 	struct fs_statbuf		 sb;
 	const struct progreg_entry	*pe;
@@ -2696,9 +2852,12 @@ darwin_s9_fs_readdir(struct syscall_frame *f)
 	int				 i;
 	int				 rv;
 
-	n = syscall_copyin_str((const char *)f->sf_arg0, path, sizeof(path));
+	n = syscall_copyin_str((const char *)f->sf_arg0, raw, sizeof(raw));
 	if (n < 0)
 		return (darwin_err(f, DARWIN_EFAULT));
+	if (darwin_path_resolve(current_thread->th_task, raw, path,
+	    sizeof(path)) != 0)
+		return (darwin_err(f, DARWIN_ENAMETOOLONG));
 	index = (uint32_t)f->sf_arg1;
 
 	if (darwin_streq(path, DARWIN_BIN_DIR)) {

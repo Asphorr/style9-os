@@ -848,6 +848,15 @@ arch_darwin_fork(struct syscall_frame *f)
 	child->t_darwin_dylib_next = parent->t_darwin_dylib_next;
 
 	/*
+	 * The working directory is inherited, which is POSIX and is also the
+	 * only behaviour that makes a shell work: `cd /etc && ls` runs ls in a
+	 * forked child, and a child starting at the root would list the wrong
+	 * directory while looking entirely correct.
+	 */
+	for (si = 0; si < DARWIN_PATH_MAX; si++)
+		child->t_darwin_cwd[si] = parent->t_darwin_cwd[si];
+
+	/*
 	 * A fork(2) child inherits its parent's signal dispositions and
 	 * blocked mask (POSIX).  The handler and trampoline VAs carry over
 	 * verbatim because the address-space copy below reproduces the text

@@ -70,6 +70,15 @@ struct vm_map;
 #define	DARWIN_NOFILE	16
 
 /*
+ * How long a path this kernel will carry.  Darwin's PATH_MAX is 1024; this is
+ * the 256 every path buffer in kern/darwin.c already used, given a name so
+ * that the working directory below and the buffers it gets pasted into cannot
+ * drift apart.  It lives here rather than in darwin.h because struct task is
+ * what it sizes, exactly like DARWIN_NOFILE above.
+ */
+#define	DARWIN_PATH_MAX	256
+
+/*
  * Darwin signal sizing.  Signals are numbered 1..31 (Darwin's NSIG is 32);
  * the per-task disposition table t_sig_handler[] is indexed by that number.
  * A slot holds DARWIN_SIG_DFL (take the default action), DARWIN_SIG_IGN
@@ -213,6 +222,26 @@ struct task {
 	 * open is released on task teardown via darwin_files_teardown.
 	 */
 	struct darwin_ofile	 t_darwin_files[DARWIN_NOFILE];
+
+	/*
+	 * The working directory: absolute, normalised, no trailing slash
+	 * except at the root, always valid to paste a relative path onto.
+	 *
+	 * It lives here because that is what a working directory IS -- a
+	 * property of the process, inherited across fork and surviving
+	 * execve.  Until this existed the kernel had no such notion, and
+	 * libSystem covered for it: chdir(2) returned success without doing
+	 * anything, getcwd(3) always answered "/", and relative paths were
+	 * rewritten on the userspace side of the syscall by a function whose
+	 * own comment called the working directory a fiction.  A program that
+	 * changed directory and then opened a relative path got the wrong
+	 * file, quietly and correctly-looking.
+	 *
+	 * "/" at task_create; copied from the parent at fork.  Only this
+	 * task's own threads read or write it, so it carries no lock -- the
+	 * same reasoning t_darwin_dylib_next records.
+	 */
+	char			 t_darwin_cwd[DARWIN_PATH_MAX];
 };
 
 extern struct task		*kernel_task;
