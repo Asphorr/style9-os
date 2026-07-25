@@ -8,9 +8,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "clock.h"
 #include "fs.h"
 #include "fs_apfs.h"
 #include "fs_fat.h"
+#include "kprintf.h"
 
 /*
  * Picking a backend.  See fs.h for what this is and is not.
@@ -59,6 +61,7 @@ apfs_err(int rv)
 	case FS_APFS_E_NOTFOUND:	return (FS_E_NOTFOUND);
 	case FS_APFS_E_NOMEM:		return (FS_E_NOMEM);
 	case FS_APFS_E_TOOBIG:		return (FS_E_TOOBIG);
+	case FS_APFS_E_NOALLOC:		return (FS_E_NOALLOC);
 	default:			return (FS_E_IO);
 	}
 }
@@ -111,6 +114,7 @@ fs_open(const char *path, struct fs_handle *out)
 {
 	uint64_t	id;
 	uint64_t	size;
+	uint64_t	ino;
 	int		rv;
 
 	if (out == NULL)
@@ -118,12 +122,14 @@ fs_open(const char *path, struct fs_handle *out)
 	out->fh_kind = FS_HANDLE_NONE;
 	out->fh_id   = 0;
 	out->fh_size = 0;
+	out->fh_ino  = 0;
 
 	if (fs_apfs_ready()) {
-		rv = fs_apfs_open(path, &id, &size);
+		rv = fs_apfs_open(path, &id, &size, &ino);
 		if (rv != FS_APFS_E_OK)
 			return (apfs_err(rv));
 		out->fh_kind = FS_HANDLE_APFS;
+		out->fh_ino  = ino;
 	} else if (fs_fat_ready()) {
 		rv = fs_fat_open(path, &id, &size);
 		if (rv != FS_FAT_E_OK)
@@ -154,6 +160,37 @@ fs_pread(const struct fs_handle *h, uint64_t off, uint8_t *buf, uint32_t len,
 	default:
 		return (FS_E_NOMOUNT);
 	}
+}
+
+int
+fs_pwrite(const struct fs_handle *h, uint64_t off, const uint8_t *buf,
+    uint32_t len, uint32_t *out_put)
+{
+	uint64_t	now_ns;
+	int		rv;
+
+	if (h == NULL || out_put == NULL)
+		return (FS_E_NOTFOUND);
+	if (h->fh_kind != FS_HANDLE_APFS)
+		return (FS_E_ROFS);	/* FAT reads here; it does not write */
+
+	rv = apfs_err(fs_apfs_pwrite(h->fh_id, h->fh_size, off, buf, len,
+	    out_put));
+	if (rv != FS_E_OK)
+		return (rv);
+
+	/*
+	 * The bytes are down; stamp the file.  A failure to stamp is reported
+	 * even though the write itself succeeded, because the alternative is
+	 * to return success for a file whose recorded modification time is a
+	 * lie -- and a caller told "written" has no way to find out.
+	 *
+	 * clock_walltime_us is microseconds since the epoch and APFS records
+	 * nanoseconds, so the stamp lands on a microsecond boundary.  That is
+	 * the clock this machine has, not a rounding choice.
+	 */
+	now_ns = (uint64_t)clock_walltime_us() * 1000ULL;
+	return (apfs_err(fs_apfs_touch(h->fh_ino, now_ns)));
 }
 
 int
@@ -235,4 +272,177 @@ fs_readdir(const char *path, uint32_t index, struct fs_dirent *out)
 		return (1);
 	}
 	return (FS_E_NOMOUNT);
+}
+
+/* ---- write self-test ------------------------------------------------------ */
+
+/*
+ * The file this exercises.  It is the multi-extent one on the test image
+ * (4096 bytes in one extent, the rest in another), which matters: the probe
+ * offset below is chosen to straddle both the 4 KiB block boundary AND the
+ * boundary between those two extents, so one 12-byte write has to find two
+ * different physical runs and read-modify-write a partial block at each end.
+ * A writer that handled only the easy aligned case would pass a gentler test
+ * and corrupt this one.
+ */
+#define	SELFTEST_PATH	"/var/db/big.txt"
+#define	SELFTEST_OFF	4090		/* 6 bytes before the boundary */
+#define	SELFTEST_LEN	12		/* ...and 6 bytes past it      */
+#define	SELFTEST_CTX	32		/* window read back around it  */
+#define	SELFTEST_PAD	10		/* SELFTEST_OFF - window start */
+
+/*
+ * Left at offset 0 on purpose, and read on the next boot.  Reading back what
+ * we just wrote proves the write path is self-consistent; finding it after a
+ * power cycle proves it reached the platter, which is the only claim that
+ * actually matters and the only one a cache cannot fake.
+ */
+#define	SELFTEST_MARK	"style9 wrote this in place.\n"
+
+static int
+same(const uint8_t *a, const uint8_t *b, size_t n)
+{
+	size_t	i;
+
+	for (i = 0; i < n; i++)
+		if (a[i] != b[i])
+			return (0);
+	return (1);
+}
+
+void
+fs_write_selftest(void)
+{
+	struct fs_handle	h;
+	struct fs_statbuf	st0;
+	struct fs_statbuf	st1;
+	uint8_t			save[SELFTEST_CTX];
+	uint8_t			back[SELFTEST_CTX];
+	uint8_t			mark[sizeof(SELFTEST_MARK) - 1];
+	uint8_t			pat[SELFTEST_LEN];
+	const char		*marker = SELFTEST_MARK;
+	uint32_t		got;
+	uint32_t		put;
+	size_t			i;
+	int			rv;
+
+	if (!fs_apfs_ready())
+		return;			/* nothing here can be written */
+
+	rv = fs_open(SELFTEST_PATH, &h);
+	if (rv != FS_E_OK) {
+		kprintf("apfs-write: %s absent (rv=%d) -- self-test skipped\n",
+		    SELFTEST_PATH, rv);
+		return;
+	}
+	if (h.fh_size < SELFTEST_OFF + SELFTEST_CTX) {
+		kprintf("apfs-write: %s too small -- self-test skipped\n",
+		    SELFTEST_PATH);
+		return;
+	}
+
+	if (fs_stat(SELFTEST_PATH, &st0) != FS_E_OK) {
+		kprintf("apfs-write: FAIL cannot stat before\n");
+		return;
+	}
+
+	/*
+	 * A write that runs off the end must be refused outright.  Not
+	 * clamped: a short write reported as success is how a file ends up
+	 * half-updated with the caller told everything went in.
+	 */
+	rv = fs_pwrite(&h, h.fh_size - 4, (const uint8_t *)marker, 8, &put);
+	if (rv != FS_E_NOALLOC) {
+		kprintf("apfs-write: FAIL growth not refused (rv=%d)\n", rv);
+		return;
+	}
+
+	/* The window as it stands, so we can put it back and check neighbours. */
+	rv = fs_pread(&h, SELFTEST_OFF - SELFTEST_PAD, save, SELFTEST_CTX, &got);
+	if (rv != FS_E_OK || got != SELFTEST_CTX) {
+		kprintf("apfs-write: FAIL pre-read (rv=%d got=%u)\n", rv, got);
+		return;
+	}
+
+	for (i = 0; i < SELFTEST_LEN; i++)
+		pat[i] = (uint8_t)('A' + i);
+
+	rv = fs_pwrite(&h, SELFTEST_OFF, pat, SELFTEST_LEN, &put);
+	if (rv != FS_E_OK || put != SELFTEST_LEN) {
+		kprintf("apfs-write: FAIL write (rv=%d put=%u)\n", rv, put);
+		return;
+	}
+
+	rv = fs_pread(&h, SELFTEST_OFF - SELFTEST_PAD, back, SELFTEST_CTX, &got);
+	if (rv != FS_E_OK || got != SELFTEST_CTX) {
+		kprintf("apfs-write: FAIL read-back (rv=%d got=%u)\n", rv, got);
+		return;
+	}
+	if (!same(back + SELFTEST_PAD, pat, SELFTEST_LEN)) {
+		kprintf("apfs-write: FAIL written bytes differ\n");
+		return;
+	}
+	/*
+	 * The half of this that matters.  Both ends of the write land inside
+	 * a block that is mostly not ours, and the read-modify-write is what
+	 * keeps the rest of it.  Damage here would sit outside the range
+	 * anyone thinks to check, which is exactly why it is checked.
+	 */
+	if (!same(back, save, SELFTEST_PAD) ||
+	    !same(back + SELFTEST_PAD + SELFTEST_LEN,
+	    save + SELFTEST_PAD + SELFTEST_LEN,
+	    SELFTEST_CTX - SELFTEST_PAD - SELFTEST_LEN)) {
+		kprintf("apfs-write: FAIL neighbouring bytes clobbered\n");
+		return;
+	}
+
+	/* Put it back, and prove the restore too. */
+	rv = fs_pwrite(&h, SELFTEST_OFF, save + SELFTEST_PAD, SELFTEST_LEN,
+	    &put);
+	if (rv != FS_E_OK) {
+		kprintf("apfs-write: FAIL restore (rv=%d)\n", rv);
+		return;
+	}
+	rv = fs_pread(&h, SELFTEST_OFF - SELFTEST_PAD, back, SELFTEST_CTX, &got);
+	if (rv != FS_E_OK || !same(back, save, SELFTEST_CTX)) {
+		kprintf("apfs-write: FAIL restore did not restore\n");
+		return;
+	}
+
+	if (fs_stat(SELFTEST_PATH, &st1) != FS_E_OK) {
+		kprintf("apfs-write: FAIL cannot stat after\n");
+		return;
+	}
+	if (st1.fs_mtime_ns <= st0.fs_mtime_ns) {
+		kprintf("apfs-write: FAIL mtime did not move (%llu -> %llu)\n",
+		    (unsigned long long)st0.fs_mtime_ns,
+		    (unsigned long long)st1.fs_mtime_ns);
+		return;
+	}
+
+	/* The marker, and what it says about a previous boot. */
+	rv = fs_pread(&h, 0, mark, (uint32_t)sizeof(mark), &got);
+	if (rv != FS_E_OK || got != sizeof(mark)) {
+		kprintf("apfs-write: FAIL marker read (rv=%d)\n", rv);
+		return;
+	}
+	if (same(mark, (const uint8_t *)marker, sizeof(mark))) {
+		kprintf("apfs-write: PASS -- and the marker at %s:0 is still "
+		    "there from an earlier boot\n", SELFTEST_PATH);
+		return;
+	}
+	rv = fs_pwrite(&h, 0, (const uint8_t *)marker, (uint32_t)sizeof(mark),
+	    &put);
+	if (rv != FS_E_OK || put != sizeof(mark)) {
+		kprintf("apfs-write: FAIL marker write (rv=%d put=%u)\n", rv,
+		    put);
+		return;
+	}
+	rv = fs_pread(&h, 0, mark, (uint32_t)sizeof(mark), &got);
+	if (rv != FS_E_OK || !same(mark, (const uint8_t *)marker, sizeof(mark))) {
+		kprintf("apfs-write: FAIL marker read-back\n");
+		return;
+	}
+	kprintf("apfs-write: PASS -- marker written at %s:0; a reboot should "
+	    "find it\n", SELFTEST_PATH);
 }

@@ -9,6 +9,7 @@
 
 #include "ata_drv.h"
 #include "bio.h"
+#include "fs.h"
 #include "fs_apfs.h"
 #include "fs_fat.h"
 #include "bootstrap.h"
@@ -135,6 +136,14 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	 */
 	bio_stats();
 	ata_irq_stats();
+
+	/*
+	 * After the mount numbers are reported, so the cost of mounting stays
+	 * comparable across boots and the write test's own I/O does not muddy
+	 * it.  See fs/fs.h for what the test claims and why a read-back alone
+	 * would not have been evidence.
+	 */
+	fs_write_selftest();
 
 	/*
 	 * Register a demo service under the bootstrap port so ring-3

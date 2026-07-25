@@ -25,6 +25,16 @@ struct bio_buf {
 	unsigned	bb_drive;
 	bool		bb_valid;
 	bool		bb_busy;	/* claimed, fetch in progress    */
+	/*
+	 * Set when a write lands on this page while a fetch of it is in
+	 * flight.  The fetch may already have pulled the pre-write bytes off
+	 * the platter, so the buffer it is about to publish could be older
+	 * than the disk; the fetcher checks this on the way out and throws its
+	 * result away instead of caching a stale page.  Without it the window
+	 * is small, silent, and produces a cache that disagrees with a disk
+	 * nobody wrote to twice.
+	 */
+	bool		bb_stale;
 };
 
 /* (b) protected by bio_lock. */
@@ -39,6 +49,8 @@ static uint64_t		bio_n_req;	/* sector runs asked for         */
 static uint64_t		bio_n_hit;	/* pages served from cache       */
 static uint64_t		bio_n_miss;	/* pages fetched from the device */
 static uint64_t		bio_n_evict;	/* live pages thrown out         */
+static uint64_t		bio_n_write;	/* sector runs written           */
+static uint64_t		bio_n_patch;	/* resident pages a write fixed  */
 
 static void
 mem_copy(uint8_t *dst, const uint8_t *src, size_t n)
@@ -150,6 +162,7 @@ page_get(unsigned drive, uint64_t page, bool *retry)
 	 */
 	victim->bb_valid = false;
 	victim->bb_busy  = true;
+	victim->bb_stale = false;
 	victim->bb_page  = page;
 	victim->bb_drive = drive;
 
@@ -162,6 +175,18 @@ page_get(unsigned drive, uint64_t page, bool *retry)
 	if (rv != 0) {
 		/* Leave nothing behind claiming to hold this page. */
 		victim->bb_page = (uint64_t)-1;
+		return (NULL);
+	}
+	if (victim->bb_stale) {
+		/*
+		 * Someone wrote this page while the read was in flight, so what
+		 * came back may predate their bytes.  Drop it and make the
+		 * caller ask again -- the retry re-reads a disk that now holds
+		 * the write, which is the only version worth caching.
+		 */
+		victim->bb_stale = false;
+		victim->bb_page  = (uint64_t)-1;
+		*retry = true;
 		return (NULL);
 	}
 	victim->bb_stamp = ++bio_clock;
@@ -218,6 +243,71 @@ bio_read(unsigned drive, uint64_t lba, uint32_t nsec, void *buf)
 	return (0);
 }
 
+int
+bio_write(unsigned drive, uint64_t lba, uint32_t nsec, const void *buf)
+{
+	const uint8_t	*in;
+	uint64_t	 page;
+	uint32_t	 done;
+	uint32_t	 within;
+	uint32_t	 run;
+	size_t		 i;
+	int		 rv;
+
+	if (nsec == 0)
+		return (0);
+
+	/*
+	 * The device first, and with no lock held -- ata_kwrite sleeps waiting
+	 * for the disk interrupt, and in this kernel the preempt counter is
+	 * global, so blocking under bio_lock would park this thread where
+	 * nothing can wake it.  Same rule as the fetch in page_get, same
+	 * reason.
+	 */
+	rv = ata_kwrite(drive, lba, nsec, buf);
+	if (rv != 0)
+		return (rv);
+	if (!bio_ready)
+		return (0);
+
+	/*
+	 * Now make the cache agree.  Doing this second means a reader racing
+	 * the write sees either the old bytes or the new ones, never a page
+	 * this layer invented; doing it first would let a failed write leave
+	 * the cache holding bytes the disk never took.
+	 */
+	in = buf;
+	spin_lock(&bio_lock);
+	bio_n_write++;
+	for (done = 0; done < nsec; done += run) {
+		page   = (lba + done) / BIO_SECTORS_PER_PAGE;
+		within = (uint32_t)((lba + done) % BIO_SECTORS_PER_PAGE);
+		run    = BIO_SECTORS_PER_PAGE - within;
+		if (run > nsec - done)
+			run = nsec - done;
+
+		for (i = 0; i < BIO_NBUFS; i++) {
+			if (bio_bufs[i].bb_page != page ||
+			    bio_bufs[i].bb_drive != drive)
+				continue;
+			if (bio_bufs[i].bb_busy) {
+				bio_bufs[i].bb_stale = true;
+				break;
+			}
+			if (!bio_bufs[i].bb_valid)
+				break;
+			mem_copy(bio_bufs[i].bb_data +
+			    (size_t)within * BIO_SECTOR_BYTES,
+			    in + (size_t)done * BIO_SECTOR_BYTES,
+			    (size_t)run * BIO_SECTOR_BYTES);
+			bio_n_patch++;
+			break;
+		}
+	}
+	spin_unlock(&bio_lock);
+	return (0);
+}
+
 void
 bio_invalidate_drive(unsigned drive)
 {
@@ -235,7 +325,7 @@ bio_invalidate_drive(unsigned drive)
 void
 bio_stats(void)
 {
-	uint64_t	req, hit, miss, evict, total, pct;
+	uint64_t	req, hit, miss, evict, wr, patch, total, pct;
 	size_t		i, live;
 
 	if (!bio_ready) {
@@ -247,6 +337,8 @@ bio_stats(void)
 	hit   = bio_n_hit;
 	miss  = bio_n_miss;
 	evict = bio_n_evict;
+	wr    = bio_n_write;
+	patch = bio_n_patch;
 	live  = 0;
 	for (i = 0; i < BIO_NBUFS; i++)
 		if (bio_bufs[i].bb_valid)
@@ -261,4 +353,7 @@ bio_stats(void)
 	    (unsigned long long)hit, (unsigned long long)pct,
 	    (unsigned long long)miss, (unsigned long long)evict,
 	    (unsigned)live, (unsigned)BIO_NBUFS);
+	if (wr != 0)
+		kprintf("bio: %llu writes -- %llu resident pages patched\n",
+		    (unsigned long long)wr, (unsigned long long)patch);
 }

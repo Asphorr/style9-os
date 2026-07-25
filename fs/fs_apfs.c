@@ -130,6 +130,45 @@ read_block_raw(uint64_t bno, void *buf)
 	return (FS_APFS_E_OK);
 }
 
+/*
+ * Write one APFS block back with no checksum work.
+ *
+ * This is for FILE DATA, and the absence of a checksum is the format's doing,
+ * not a shortcut: only metadata blocks carry an obj_phys header, and a data
+ * block is 4096 bytes of file with nowhere to record a sum of them.  It is
+ * also why overwriting file bytes is the cheapest thing this writer does --
+ * there is nothing to reseal and nothing else that has to agree.
+ */
+static int
+write_block_raw(uint64_t bno, const void *buf)
+{
+
+	if (bio_write(0, bno * APFS_SECTORS_PER_BLOCK, APFS_SECTORS_PER_BLOCK,
+	    buf) != 0)
+		return (FS_APFS_E_IO);
+	return (FS_APFS_E_OK);
+}
+
+/*
+ * Write one METADATA block back, sealing it first.
+ *
+ * The Fletcher-64 runs forward here for the first time in this filesystem --
+ * every other caller compares it.  It covers the block from offset 8 to the
+ * end, so the result must be stored after it is computed and cannot be part
+ * of its own input; getting that backwards produces a block that fails its
+ * own checksum on the very next read, which is at least a loud failure.
+ */
+static int
+write_block_meta(uint64_t bno, void *buf)
+{
+	struct apfs_obj_phys	*o;
+
+	o = (struct apfs_obj_phys *)buf;
+	o->o_cksum = fs_apfs_fletcher64((const uint8_t *)buf + 8,
+	    APFS_BLOCK_SIZE - 8);
+	return (write_block_raw(bno, buf));
+}
+
 int
 fs_apfs_read_block(uint64_t bno, void *buf)
 {
@@ -454,9 +493,16 @@ mount_volume(void *scratch)
  * Callback fired for every leaf record, in tree order.  Returning false
  * stops the walk -- a lookup that has found its answer should not keep
  * reading blocks.
+ *
+ * `bno` is the leaf block the record was found in.  Readers ignore it; it is
+ * there for the writer, because a walker that can say what a record contains
+ * but never where it lives cannot support changing one.  Note that it is the
+ * block NUMBER and not a pointer into the node: the walk frees its buffer on
+ * the way out, so a mutation re-reads the block and patches its own copy
+ * rather than scribbling on one that is about to be dropped.
  */
 typedef bool (*apfs_rec_fn)(uint64_t oid, uint32_t type, const uint8_t *key,
-    uint32_t klen, const uint8_t *val, uint32_t vlen, void *arg);
+    uint32_t klen, const uint8_t *val, uint32_t vlen, uint64_t bno, void *arg);
 
 /*
  * Walk the volume's file-system tree in order.
@@ -511,7 +557,7 @@ btree_walk(uint64_t bno, apfs_rec_fn fn, void *arg, int depth, bool *stopped)
 			raw = *(const uint64_t *)k;
 			if (!fn(raw & APFS_J_OBJ_ID_MASK,
 			    (uint32_t)(raw >> APFS_J_OBJ_TYPE_SHIFT),
-			    k, klen, bl.bl_vals - voff, vlen, arg))
+			    k, klen, bl.bl_vals - voff, vlen, bno, arg))
 				*stopped = true;
 			continue;
 		}
@@ -569,7 +615,7 @@ struct dirent_search {
 
 static bool
 dirent_match(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
-    const uint8_t *val, uint32_t vlen, void *arg)
+    const uint8_t *val, uint32_t vlen, uint64_t bno, void *arg)
 {
 	const struct apfs_drec_val	*dv;
 	struct dirent_search		*ds;
@@ -577,6 +623,7 @@ dirent_match(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 	uint32_t			 nlen;
 	size_t				 i;
 
+	(void)bno;
 	ds = arg;
 	if (type != APFS_TYPE_DIR_REC || oid != ds->ds_parent)
 		return (true);
@@ -670,7 +717,7 @@ struct inode_info {
 
 static bool
 inode_pick(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
-    const uint8_t *val, uint32_t vlen, void *arg)
+    const uint8_t *val, uint32_t vlen, uint64_t bno, void *arg)
 {
 	const struct apfs_inode_val	*iv;
 	const struct apfs_xf_blob	*blob;
@@ -684,6 +731,7 @@ inode_pick(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 
 	(void)key;
 	(void)klen;
+	(void)bno;
 	ii = arg;
 	if (type != APFS_TYPE_INODE || oid != ii->ii_oid)
 		return (true);
@@ -822,7 +870,7 @@ struct extent_read {
 
 static bool
 extent_copy(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
-    const uint8_t *val, uint32_t vlen, void *arg)
+    const uint8_t *val, uint32_t vlen, uint64_t bno, void *arg)
 {
 	const struct apfs_file_extent_val	*fe;
 	struct extent_read			*er;
@@ -835,6 +883,7 @@ extent_copy(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 	uint64_t				 hi;
 	uint64_t				 n;
 
+	(void)bno;
 	er = arg;
 	if (type != APFS_TYPE_FILE_EXTENT || oid != er->er_id)
 		return (true);
@@ -983,14 +1032,16 @@ fs_apfs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size)
  * once per 4 KiB the pager asks for.
  */
 int
-fs_apfs_open(const char *path, uint64_t *id_out, uint64_t *size_out)
+fs_apfs_open(const char *path, uint64_t *id_out, uint64_t *size_out,
+    uint64_t *ino_out)
 {
 	struct inode_info	ii;
 	uint64_t		oid;
 	int			is_dir;
 	int			rv;
 
-	if (path == NULL || id_out == NULL || size_out == NULL)
+	if (path == NULL || id_out == NULL || size_out == NULL ||
+	    ino_out == NULL)
 		return (FS_APFS_E_IO);
 	if (!g_apfs.ac_mounted)
 		return (FS_APFS_E_NOMOUNT);
@@ -1006,6 +1057,7 @@ fs_apfs_open(const char *path, uint64_t *id_out, uint64_t *size_out)
 
 	*id_out   = ii.ii_private_id;
 	*size_out = ii.ii_size;
+	*ino_out  = oid;
 	return (FS_APFS_E_OK);
 }
 
@@ -1073,6 +1125,280 @@ fs_apfs_pread(uint64_t id, uint64_t size, uint64_t off, uint8_t *buf,
 	return (FS_APFS_E_OK);
 }
 
+/* ---- writing -------------------------------------------------------------- */
+
+/*
+ * The write side of extent_read, and deliberately its mirror image: the same
+ * window arithmetic decides which bytes of which block are in play, so the
+ * two cannot disagree about where a file's byte lives.  What differs is what
+ * happens to a block that is only partly wanted, and what happens to a hole.
+ */
+struct extent_write {
+	uint64_t	 ew_id;		/* the dstream this belongs to */
+	const uint8_t	*ew_buf;	/* holds file byte ew_lo       */
+	uint8_t		*ew_bounce;
+	uint64_t	 ew_size;	/* end of the file's content   */
+	uint64_t	 ew_lo;		/* window start, in file bytes */
+	uint64_t	 ew_hi;		/* window end,   in file bytes */
+	uint64_t	 ew_put;
+	int		 ew_rv;
+};
+
+static bool
+extent_write(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
+    const uint8_t *val, uint32_t vlen, uint64_t bno, void *arg)
+{
+	const struct apfs_file_extent_val	*fe;
+	struct extent_write			*ew;
+	uint64_t				 logical;
+	uint64_t				 len;
+	uint64_t				 phys;
+	uint64_t				 off;
+	uint64_t				 dst;
+	uint64_t				 lo;
+	uint64_t				 hi;
+	uint64_t				 n;
+
+	(void)bno;
+	ew = arg;
+	if (type != APFS_TYPE_FILE_EXTENT || oid != ew->ew_id)
+		return (true);
+	if (klen < 16 || vlen < sizeof(*fe))
+		return (true);
+
+	logical = *(const uint64_t *)(key + 8);
+	fe      = (const struct apfs_file_extent_val *)val;
+	len     = fe->fe_len_and_flags & APFS_FILE_EXTENT_LEN_MASK;
+	phys    = fe->fe_phys_block_num;
+
+	if (logical >= ew->ew_size)
+		return (true);
+	if (logical >= ew->ew_hi)		/* past the window: records sort */
+		return (false);			/* by (oid, logical), so stop    */
+	if (logical + len <= ew->ew_lo)
+		return (true);			/* entirely before the window    */
+
+	/*
+	 * A hole overlapping the write.  Reading one costs nothing because its
+	 * bytes are defined to be zero; writing one means finding it a block,
+	 * and finding a block is the allocator this rung does not have.  Say
+	 * so instead of dropping the bytes on the floor.
+	 */
+	if (phys == 0) {
+		ew->ew_rv = FS_APFS_E_NOALLOC;
+		return (false);
+	}
+
+	for (off = 0; off < len; off += APFS_BLOCK_SIZE) {
+		dst = logical + off;		/* file offset of this block */
+		if (dst >= ew->ew_size || dst >= ew->ew_hi)
+			break;
+		if (dst + APFS_BLOCK_SIZE <= ew->ew_lo)
+			continue;
+
+		lo = (dst < ew->ew_lo) ? ew->ew_lo : dst;
+		hi = dst + APFS_BLOCK_SIZE;
+		if (hi > ew->ew_size)
+			hi = ew->ew_size;
+		if (hi > ew->ew_hi)
+			hi = ew->ew_hi;
+		if (lo >= hi)
+			continue;
+		n = hi - lo;
+
+		if (n == APFS_BLOCK_SIZE) {
+			if (write_block_raw(phys + off / APFS_BLOCK_SIZE,
+			    ew->ew_buf + (lo - ew->ew_lo)) != FS_APFS_E_OK) {
+				ew->ew_rv = FS_APFS_E_IO;
+				return (false);
+			}
+		} else {
+			/*
+			 * Read-modify-write.  The bytes of this block that the
+			 * caller did not ask about are still the file's, and a
+			 * partial write that published a block of mostly-fresh
+			 * heap would destroy them -- the failure mode being
+			 * that the damage sits outside the range anyone thinks
+			 * to check.
+			 */
+			if (read_block_raw(phys + off / APFS_BLOCK_SIZE,
+			    ew->ew_bounce) != FS_APFS_E_OK) {
+				ew->ew_rv = FS_APFS_E_IO;
+				return (false);
+			}
+			mem_copy(ew->ew_bounce + (lo - dst),
+			    ew->ew_buf + (lo - ew->ew_lo), (size_t)n);
+			if (write_block_raw(phys + off / APFS_BLOCK_SIZE,
+			    ew->ew_bounce) != FS_APFS_E_OK) {
+				ew->ew_rv = FS_APFS_E_IO;
+				return (false);
+			}
+		}
+		ew->ew_put += n;
+	}
+	return (true);
+}
+
+int
+fs_apfs_pwrite(uint64_t id, uint64_t size, uint64_t off, const uint8_t *buf,
+    uint32_t len, uint32_t *out_put)
+{
+	struct extent_write	 ew;
+	uint8_t			*bounce;
+	bool			 stopped;
+
+	if (buf == NULL || out_put == NULL)
+		return (FS_APFS_E_IO);
+	if (!g_apfs.ac_mounted)
+		return (FS_APFS_E_NOMOUNT);
+
+	*out_put = 0;
+	if (len == 0)
+		return (FS_APFS_E_OK);
+
+	/*
+	 * Growth needs an allocator; refuse the whole write rather than do the
+	 * prefix that happens to fit.  A short write that reports success is
+	 * how a file ends up half-updated with nobody told.
+	 */
+	if (off >= size || off + (uint64_t)len > size)
+		return (FS_APFS_E_NOALLOC);
+
+	bounce = kmalloc(APFS_BLOCK_SIZE);
+	if (bounce == NULL)
+		return (FS_APFS_E_NOMEM);
+
+	ew.ew_id     = id;
+	ew.ew_buf    = buf;
+	ew.ew_bounce = bounce;
+	ew.ew_size   = size;
+	ew.ew_lo     = off;
+	ew.ew_hi     = off + (uint64_t)len;
+	ew.ew_put    = 0;
+	ew.ew_rv     = FS_APFS_E_OK;
+	stopped = false;
+	if (!btree_walk(g_apfs.ac_root_tree_bno, extent_write, &ew, 0, &stopped))
+		ew.ew_rv = FS_APFS_E_IO;
+	kfree(bounce);
+
+	if (ew.ew_rv != FS_APFS_E_OK)
+		return (ew.ew_rv);
+	/*
+	 * Coverage, checked rather than assumed.  A range no extent record
+	 * describes produces no callback at all -- the walk simply never
+	 * mentions it -- so an unbacked file would otherwise come back as a
+	 * flawless write of nothing.  Silence is not success.
+	 */
+	if (ew.ew_put != (uint64_t)len)
+		return (FS_APFS_E_NOALLOC);
+
+	*out_put = len;
+	return (FS_APFS_E_OK);
+}
+
+/*
+ * Where an inode record lives.  The locate pass records the block and stops;
+ * the patch re-reads it.  Splitting it that way keeps btree_walk read-only --
+ * it frees its node buffer on the way out, so anything written into that
+ * buffer would be discarded, and a walker that both reads and writes is a
+ * walker whose callbacks have to know which they are.
+ */
+struct inode_locate {
+	uint64_t	il_oid;
+	uint64_t	il_bno;
+	bool		il_found;
+};
+
+static bool
+inode_locate(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
+    const uint8_t *val, uint32_t vlen, uint64_t bno, void *arg)
+{
+	struct inode_locate	*il;
+
+	(void)key;
+	(void)klen;
+	(void)val;
+	(void)vlen;
+	il = arg;
+	if (type != APFS_TYPE_INODE || oid != il->il_oid)
+		return (true);
+	il->il_bno   = bno;
+	il->il_found = true;
+	return (false);
+}
+
+int
+fs_apfs_touch(uint64_t oid, uint64_t mtime_ns)
+{
+	struct btree_layout	 bl;
+	struct inode_locate	 il;
+	struct apfs_inode_val	*iv;
+	uint8_t			*node;
+	const uint8_t		*k;
+	uint64_t		 raw;
+	uint32_t		 koff, klen, voff, vlen;
+	uint32_t		 i;
+	int			 rv;
+	bool			 stopped;
+
+	if (!g_apfs.ac_mounted)
+		return (FS_APFS_E_NOMOUNT);
+
+	il.il_oid   = oid;
+	il.il_bno   = 0;
+	il.il_found = false;
+	stopped = false;
+	if (!btree_walk(g_apfs.ac_root_tree_bno, inode_locate, &il, 0, &stopped))
+		return (FS_APFS_E_IO);
+	if (!il.il_found)
+		return (FS_APFS_E_NOTFOUND);
+
+	node = kmalloc(APFS_BLOCK_SIZE);
+	if (node == NULL)
+		return (FS_APFS_E_NOMEM);
+	/*
+	 * Read it the checked way.  Writing over a block that already fails
+	 * its own checksum would turn someone else's corruption into ours, and
+	 * do it while producing a block that looks freshly correct.
+	 */
+	rv = fs_apfs_read_block(il.il_bno, node);
+	if (rv != FS_APFS_E_OK) {
+		kfree(node);
+		return (rv);
+	}
+
+	/*
+	 * Find the record again inside our own copy, using the same layout
+	 * code the reader uses.  Re-deriving the offset rather than carrying
+	 * one out of the walk is what keeps writer and reader from ever
+	 * disagreeing about where a value begins -- and the root-node case,
+	 * where 40 bytes of btree_info shift the value base, is exactly the
+	 * kind of detail two copies of that arithmetic would drift on.
+	 */
+	btree_layout(node, &bl);
+	rv = FS_APFS_E_NOTFOUND;
+	for (i = 0; i < bl.bl_nkeys; i++) {
+		btree_entry_loc(&bl, i, &koff, &klen, &voff, &vlen);
+		k = bl.bl_keys + koff;
+		raw = *(const uint64_t *)k;
+		if ((raw & APFS_J_OBJ_ID_MASK) != oid)
+			continue;
+		if ((uint32_t)(raw >> APFS_J_OBJ_TYPE_SHIFT) != APFS_TYPE_INODE)
+			continue;
+		if (vlen < sizeof(*iv)) {
+			rv = FS_APFS_E_INVAL;
+			break;
+		}
+		iv = (struct apfs_inode_val *)(bl.bl_vals - voff);
+		iv->ai_mod_time    = mtime_ns;
+		iv->ai_change_time = mtime_ns;
+		rv = write_block_meta(il.il_bno, node);
+		break;
+	}
+	kfree(node);
+	return (rv);
+}
+
 struct readdir_search {
 	struct fs_apfs_dirent	*rs_out;
 	uint64_t		 rs_dir;
@@ -1083,7 +1409,7 @@ struct readdir_search {
 
 static bool
 readdir_pick(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
-    const uint8_t *val, uint32_t vlen, void *arg)
+    const uint8_t *val, uint32_t vlen, uint64_t bno, void *arg)
 {
 	const struct apfs_drec_val	*dv;
 	struct readdir_search		*rs;
@@ -1091,6 +1417,7 @@ readdir_pick(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 	uint32_t			 nlen;
 	uint32_t			 i;
 
+	(void)bno;
 	rs = arg;
 	if (type != APFS_TYPE_DIR_REC || oid != rs->rs_dir)
 		return (true);

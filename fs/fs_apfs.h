@@ -495,6 +495,7 @@ struct fs_apfs_statbuf {
 #define	FS_APFS_E_CKSUM		(-5)	/* Fletcher-64 mismatch         */
 #define	FS_APFS_E_NOTFOUND	(-6)	/* name absent / not a dir      */
 #define	FS_APFS_E_TOOBIG	(-7)	/* file exceeds FS_APFS_MAX_FILE */
+#define	FS_APFS_E_NOALLOC	(-8)	/* would need a block allocator  */
 
 /*
  * Probe the first ATA drive for an APFS container and adopt the newest valid
@@ -559,11 +560,17 @@ int	fs_apfs_stat(const char *path, struct fs_apfs_statbuf *out);
 int	fs_apfs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size);
 
 /*
- * Resolve `path` to the dstream id its extents are keyed on and its byte
- * length -- the expensive half of reading, paid once instead of per call.
- * Directories are refused.  Returns FS_APFS_E_OK or a negative FS_APFS_E_*.
+ * Resolve `path` to the three things reading and writing it need: the dstream
+ * id its extents are keyed on, its byte length, and its inode object id.  The
+ * expensive half of reading, paid once instead of per call.  Directories are
+ * refused.  Returns FS_APFS_E_OK or a negative FS_APFS_E_*.
+ *
+ * The dstream id and the inode id are equal on a freshly written volume and
+ * diverge as soon as anything is hard-linked, so both are reported: one finds
+ * the bytes, the other finds the record that describes them.
  */
-int	fs_apfs_open(const char *path, uint64_t *id_out, uint64_t *size_out);
+int	fs_apfs_open(const char *path, uint64_t *id_out, uint64_t *size_out,
+	    uint64_t *ino_out);
 
 /*
  * Read at most `len` bytes of the resolved file (`id`, `size`) starting at
@@ -588,5 +595,64 @@ int	fs_apfs_read_block(uint64_t bno, void *buf);
  * pass block+8 / blocksize-8: the stored checksum is not part of its own sum.
  */
 uint64_t	fs_apfs_fletcher64(const void *p, uint32_t len);
+
+/* ---- writing ------------------------------------------------------- */
+
+/*
+ * WHAT THIS WRITER IS, AND WHAT IT DELIBERATELY IS NOT.
+ *
+ * APFS is a copy-on-write filesystem: Apple's implementation writes a changed
+ * metadata block to a NEW location, updates the object map to point at it,
+ * and publishes the result by writing a fresh checkpoint superblock with a
+ * higher transaction id.  Nothing is overwritten, so an interrupted write
+ * leaves the previous checkpoint intact and the volume mounts as it was.
+ *
+ * This writer does none of that.  It mutates IN PLACE: a changed block is
+ * written back where it already lived.  That forfeits exactly one property --
+ * crash safety, since a power loss mid-write leaves a block half-updated with
+ * no older version to fall back to -- and buys the absence of the two hardest
+ * pieces of APFS, the space manager (allocation bitmap chunks plus free-queue
+ * B-trees keyed by xid) and the recursive object-map rewrite that copy-on-
+ * write forces.  A volume this writer has touched is still a VALID APFS
+ * volume at rest: checksums are recomputed, the tree shape is untouched, and
+ * an independent implementation reads it back.  It is simply not a volume
+ * that was written the way Apple writes one.
+ *
+ * The consequence is a hard boundary, and the API states it rather than
+ * papering over it: nothing here can allocate a block.  A write may only land
+ * on blocks the file already owns.  Growing a file, filling a hole, creating
+ * a file, and adding a directory entry all need an allocator and all return
+ * FS_APFS_E_NOALLOC.  Overwriting bytes that are already there is the whole
+ * of what works, and it works completely.
+ */
+
+/*
+ * Overwrite `len` bytes of the resolved file (`id`, `size`) at file offset
+ * `off`, reporting the count written through *out_put.
+ *
+ * Refuses rather than truncates: a write that would extend the file past
+ * `size`, or that lands anywhere the file has no block (a hole, or a range no
+ * extent record covers), returns FS_APFS_E_NOALLOC having written nothing it
+ * cannot account for.  Coverage is verified by counting bytes actually
+ * written and comparing against the request -- an absent extent record is
+ * silence, not an error, and silence must not read as success.
+ *
+ * Partial blocks are read-modify-written, so the bytes around the request
+ * survive it.
+ */
+int	fs_apfs_pwrite(uint64_t id, uint64_t size, uint64_t off,
+	    const uint8_t *buf, uint32_t len, uint32_t *out_put);
+
+/*
+ * Stamp an inode's modification and change times, in nanoseconds since the
+ * Unix epoch, which is how APFS stores them.
+ *
+ * This is the first thing here to rewrite METADATA, and therefore the first
+ * to recompute a Fletcher-64 rather than merely check one: the B-tree leaf
+ * holding the record is re-read, patched, re-sealed and written back.  Note
+ * the transaction id is left alone -- bumping it would oblige us to publish a
+ * new checkpoint, which is the next rung and not this one.
+ */
+int	fs_apfs_touch(uint64_t oid, uint64_t mtime_ns);
 
 #endif /* !_SYS_FS_APFS_H_ */

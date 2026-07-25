@@ -44,7 +44,20 @@ void	ata_drv_init(void);
  */
 int	ata_kread(unsigned drive_idx, uint64_t lba, uint32_t count, void *buf);
 
-#endif /* !_SYS_ATA_DRV_H_ */
+/*
+ * The other direction, same contract.  WRITE SECTORS (EXT) followed by FLUSH
+ * CACHE, so a return of 0 means the drive has the bytes rather than merely
+ * having accepted them -- which is the difference that matters to a
+ * filesystem deciding whether its metadata is safe to point at.
+ *
+ * Callers go through bio_write (fs/bio.h) rather than here, because the block
+ * cache cannot see a write that goes around it and would keep serving what
+ * the disk no longer holds.
+ */
+int	ata_kwrite(unsigned drive_idx, uint64_t lba, uint32_t count,
+	    const void *buf);
 
 /* Interrupt accounting, for the boot banner. */
 void	ata_irq_stats(void);
+
+#endif /* !_SYS_ATA_DRV_H_ */

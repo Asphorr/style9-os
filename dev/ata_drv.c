@@ -871,6 +871,15 @@ ata_kread(unsigned drive_idx, uint64_t lba, uint32_t count, void *buf)
 	return (ata_read(&drives[drive_idx], lba, count, buf));
 }
 
+int
+ata_kwrite(unsigned drive_idx, uint64_t lba, uint32_t count, const void *buf)
+{
+
+	if (drive_idx >= ATA_NDRIVES_MAX || !drives[drive_idx].d_present)
+		return (MACH_E_DEAD);
+	return (ata_write(&drives[drive_idx], lba, count, buf));
+}
+
 /* ---- helpers ------------------------------------------------------- */
 
 static void

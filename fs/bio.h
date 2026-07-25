@@ -28,9 +28,10 @@
  * buffers, all allocated at init -- nothing here calls the heap on the I/O
  * path, and nothing grows without bound.
  *
- * It is a READ cache and says so: bio_invalidate_drive drops everything for a
- * device, and the write path calls it, because a cache that survives a write
- * it did not see is a cache that hands back a lie.
+ * Writes go through bio_write, which writes the device and then makes the
+ * cache agree.  A cache that survives a write it did not see is a cache that
+ * hands back a lie; bio_invalidate_drive remains for writers that go around
+ * this layer entirely (the Mach block-device protocol does).
  */
 
 /* Cached unit.  Matches the APFS block size, and 8 ATA sectors exactly. */
@@ -60,8 +61,25 @@ void	bio_init(void);
 int	bio_read(unsigned drive, uint64_t lba, uint32_t nsec, void *buf);
 
 /*
- * Forget everything cached for a device.  The write path must call this: this
- * layer never sees writes, so it cannot know which pages they invalidated.
+ * Write `nsec` sectors at `lba`, and leave the cache telling the truth about
+ * them.  Returns 0 on success, or the driver's positive error.
+ *
+ * Write-THROUGH, not write-back: the disk is updated first and the cache is
+ * reconciled after, so a page that is resident is patched with the bytes the
+ * disk now holds rather than dropped.  Dropping would be correct too, but a
+ * filesystem write walks metadata to find where to write, and throwing that
+ * metadata out of the cache on every write would make each one re-read the
+ * tree it just walked.
+ *
+ * There is no dirty state and nothing to flush: when this returns 0 the bytes
+ * are on the platter, because ata_kwrite issues FLUSH CACHE before it does.
+ */
+int	bio_write(unsigned drive, uint64_t lba, uint32_t nsec, const void *buf);
+
+/*
+ * Forget everything cached for a device.  For writers that bypass this layer
+ * -- the Mach block-device protocol talks to the driver directly -- since this
+ * layer cannot know which pages such a write invalidated.
  */
 void	bio_invalidate_drive(unsigned drive);
 

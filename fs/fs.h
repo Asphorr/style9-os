@@ -108,6 +108,8 @@ _Static_assert(sizeof(struct fs_statbuf) == 72,
 #define	FS_E_IO		(-3)	/* the disk or the tree lied  */
 #define	FS_E_NOMEM	(-4)	/* out of kernel heap         */
 #define	FS_E_TOOBIG	(-5)	/* file too large to slurp    */
+#define	FS_E_ROFS	(-6)	/* this volume cannot be written */
+#define	FS_E_NOALLOC	(-7)	/* the write would need a block allocator */
 
 /* Non-zero once some filesystem is mounted and can serve files. */
 int		fs_ready(void);
@@ -144,6 +146,15 @@ int		fs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size);
 struct fs_handle {
 	uint64_t	fh_id;		/* the backend's name for the bytes */
 	uint64_t	fh_size;
+	/*
+	 * The file's inode, which is NOT fh_id: on APFS the extents are keyed
+	 * on a dstream id while the metadata record is keyed on the object id,
+	 * and the two are equal only until something is hard-linked.  A write
+	 * needs both -- one to find the bytes, the other to stamp the time --
+	 * so the handle carries both.  Zero where the backend has no such
+	 * notion.
+	 */
+	uint64_t	fh_ino;
 	uint8_t		fh_kind;	/* FS_HANDLE_*                      */
 };
 
@@ -167,6 +178,24 @@ int		fs_open(const char *path, struct fs_handle *out);
 int		fs_pread(const struct fs_handle *h, uint64_t off, uint8_t *buf,
 		    uint32_t len, uint32_t *out_got);
 
+/*
+ * Overwrite `len` bytes of a resolved file at byte offset `off`, reporting the
+ * count written through *out_put, and stamp the file's modification time.
+ *
+ * Stamping is done here rather than left to the caller because "the bytes
+ * changed but the time did not" is not a state a filesystem should be able to
+ * produce by forgetting a call.
+ *
+ * What this cannot do is grow a file or fill a hole: both need a block
+ * allocator, which the APFS writer does not have (see fs/fs_apfs.h for why
+ * that boundary is where it is), and both return FS_E_NOALLOC having changed
+ * nothing.  A backend with no write support at all returns FS_E_ROFS, which
+ * is a different answer and means a different thing: not "this write was too
+ * ambitious" but "not on this volume".
+ */
+int		fs_pwrite(const struct fs_handle *h, uint64_t off,
+		    const uint8_t *buf, uint32_t len, uint32_t *out_put);
+
 /* Metadata for a path.  Returns FS_E_OK and fills *out, or a negative FS_E_*. */
 int		fs_stat(const char *path, struct fs_statbuf *out);
 
@@ -177,5 +206,20 @@ int		fs_stat(const char *path, struct fs_statbuf *out);
  */
 int		fs_readdir(const char *path, uint32_t index,
 		    struct fs_dirent *out);
+
+/*
+ * Prove the write path against the mounted volume, at boot, out loud.
+ *
+ * A write is the one operation that cannot be checked by reading back what it
+ * wrote: a cache that never reached the disk answers a read-back perfectly.
+ * So this checks the things a plausible-but-wrong writer would get wrong --
+ * that the bytes AROUND a partial-block write survived it, that a write which
+ * would need an allocator is refused rather than truncated, that the file's
+ * modification time moved -- and it leaves a marker behind, so the NEXT boot
+ * can report finding it and thereby prove the bytes outlived the machine.
+ *
+ * Silently skipped when no writable volume is mounted.
+ */
+void		fs_write_selftest(void);
 
 #endif /* !_SYS_FS_H_ */
