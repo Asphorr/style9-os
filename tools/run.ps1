@@ -57,7 +57,13 @@ $qemuArgs = @(
     '-serial',  "file:$logFwd"
 )
 if (-not $NoDisk -and (Test-Path $Disk)) {
-    $qemuArgs += @('-hda', $Disk)
+    # format=raw is stated rather than left to QEMU's probing, and the reason
+    # is specific: when QEMU guesses the format it protects block 0 against
+    # writes, on the theory that a guessed image might have a header there.
+    # An APFS container keeps its anchor superblock in block 0 and the kernel
+    # rewrites it at the end of every checkpoint, so under probing that write
+    # is the one QEMU is most likely to refuse.
+    $qemuArgs += @('-drive', "file=$Disk,format=raw,if=ide")
 }
 if ($MonitorPort -gt 0) {
     $qemuArgs += @('-monitor', "tcp:127.0.0.1:$MonitorPort,server,nowait")

@@ -243,6 +243,26 @@ int		fs_readdir(const char *path, uint32_t index,
 void		fs_write_selftest(void);
 
 /*
+ * Close the volume's current transaction, so that what has been written is
+ * written as of a point in time rather than gradually.
+ *
+ * On APFS this writes a checkpoint (see fs/fs_apfs.h); the container is the
+ * old one entire until the last block lands and the new one entire
+ * afterwards.  On FAT there is nothing to close -- every write there is
+ * already final the moment it reaches the platter -- so this succeeds without
+ * doing anything, which is the honest answer rather than a refusal.
+ *
+ * Returns FS_E_OK or a negative FS_E_*.
+ */
+int		fs_sync(void);
+
+/*
+ * Prove the checkpoint writer against the mounted container, at boot, out
+ * loud.  Silently does nothing when the volume is not APFS.
+ */
+void		fs_ckpt_selftest(void);
+
+/*
  * The volume generation, and what it has caught: how many handles were older
  * than the volume when used, and how many of those had a length that really
  * had moved.  The first number moving proves the check is alive; the second

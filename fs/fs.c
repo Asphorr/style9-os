@@ -454,6 +454,39 @@ fs_readdir(const char *path, uint32_t index, struct fs_dirent *out)
 	return (rv);
 }
 
+int
+fs_sync(void)
+{
+	int	rv;
+
+	mutex_lock(&fs_lock);
+	if (fs_apfs_ready())
+		rv = apfs_err(fs_apfs_checkpoint());
+	else if (fs_fat_ready())
+		rv = FS_E_OK;	/* FAT has no transaction to close */
+	else
+		rv = FS_E_NOMOUNT;
+	mutex_unlock(&fs_lock);
+	return (rv);
+}
+
+/*
+ * Under the same lock, because the test writes checkpoints: everything it
+ * checks is state fs_apfs_checkpoint moves, and a reader arriving between the
+ * write and the check would see a container the test has not finished
+ * describing.
+ */
+void
+fs_ckpt_selftest(void)
+{
+
+	if (!fs_apfs_ready())
+		return;
+	mutex_lock(&fs_lock);
+	fs_apfs_ckpt_selftest();
+	mutex_unlock(&fs_lock);
+}
+
 void
 fs_handle_stats(void)
 {

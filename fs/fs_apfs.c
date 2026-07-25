@@ -43,11 +43,13 @@
 
 /*
  * Mounted container state.  (m) = written once by fs_apfs_init before any
- * reader exists, read-only afterwards.
+ * reader exists, read-only afterwards.  (c) = the same, except that
+ * fs_apfs_checkpoint moves it on to the checkpoint it just wrote; it does so
+ * under the volume lock in fs.c, which every path that reads these holds.
  */
 static struct {
 	uint64_t	ac_block_count;		/* (m) */
-	uint64_t	ac_xid;			/* (m) newest checkpoint    */
+	uint64_t	ac_xid;			/* (c) newest checkpoint    */
 	uint64_t	ac_omap_oid;		/* (m) container object map */
 	uint64_t	ac_fs_oid;		/* (m) volume 0 superblock  */
 	uint64_t	ac_xp_desc_base;	/* (m) */
@@ -56,11 +58,28 @@ static struct {
 	uint64_t	ac_num_files;		/* (m) */
 	uint64_t	ac_num_dirs;		/* (m) */
 	uint32_t	ac_xp_desc_blocks;	/* (m) */
-	uint32_t	ac_xp_desc_index;	/* (m) this checkpoint's first */
-	uint32_t	ac_xp_desc_len;		/* (m) ...and how many         */
+	uint32_t	ac_xp_desc_index;	/* (c) this checkpoint's first */
+	uint32_t	ac_xp_desc_len;		/* (c) ...and how many         */
 	uint64_t	ac_spaceman_oid;	/* (m) ephemeral               */
 	bool		ac_drec_hashed;		/* (m) hashed dirent keys   */
 	bool		ac_mounted;		/* (m) */
+
+	/*
+	 * What writing the NEXT checkpoint needs, and nothing reading one
+	 * ever asked for: where the superblock we adopted came from, which
+	 * xid it said would follow it, and the two rings' free slots.  The
+	 * data ring is where ephemeral objects are re-emitted each time; the
+	 * reader never had to know it existed, because the checkpoint map
+	 * gave it their addresses directly.
+	 */
+	uint64_t	ac_sb_bno;		/* (c) block the sb came from  */
+	uint64_t	ac_next_xid;		/* (c) what it said comes next */
+	uint32_t	ac_xp_desc_next;	/* (c) first free desc slot    */
+	uint64_t	ac_xp_data_base;	/* (m) */
+	uint32_t	ac_xp_data_blocks;	/* (m) */
+	uint32_t	ac_xp_data_index;	/* (c) this checkpoint's first */
+	uint32_t	ac_xp_data_len;		/* (c) ...and how many         */
+	uint32_t	ac_xp_data_next;	/* (c) first free data slot    */
 
 	/*
 	 * The checkpoint's ephemeral objects, resolved.  A fixed table because
@@ -72,16 +91,18 @@ static struct {
 	 */
 	struct {
 		uint64_t	e_oid;
-		uint64_t	e_paddr;
+		uint64_t	e_paddr;	/* (c) moves every checkpoint */
+		uint64_t	e_fs_oid;
 		uint32_t	e_type;
 		uint32_t	e_subtype;
+		uint32_t	e_size;		/* bytes, as the map states  */
 	}		ac_eph[APFS_EPH_MAX];		/* (m) */
 	uint32_t	ac_eph_count;			/* (m) */
 	uint32_t	ac_eph_over;			/* (m) dropped for space */
 
 	/* What the space manager says, once it has been found and read. */
 	bool		ac_sm_valid;		/* (m) */
-	uint64_t	ac_sm_paddr;		/* (m) */
+	uint64_t	ac_sm_paddr;		/* (c) moves every checkpoint */
 	uint64_t	ac_sm_free;		/* (m) blocks free on device 0 */
 	uint64_t	ac_sm_chunks;		/* (m) */
 	uint32_t	ac_sm_blocks_per_chunk;	/* (m) */
@@ -333,6 +354,21 @@ adopt_newest_checkpoint(const struct apfs_nx_superblock *anchor, void *scratch)
 		g_apfs.ac_xp_desc_index = nx->nx_xp_desc_index;
 		g_apfs.ac_xp_desc_len   = nx->nx_xp_desc_len;
 		g_apfs.ac_spaceman_oid  = nx->nx_spaceman_oid;
+
+		/*
+		 * And what only a writer needs.  ac_sb_bno matters most: a
+		 * checkpoint is built by copying the superblock that closed
+		 * the last one, and copying it from the anchor instead would
+		 * carry some earlier checkpoint's ring indices forward.
+		 */
+		g_apfs.ac_sb_bno         = base + i;
+		g_apfs.ac_next_xid       = nx->nx_next_xid;
+		g_apfs.ac_xp_desc_next   = nx->nx_xp_desc_next;
+		g_apfs.ac_xp_data_base   = nx->nx_xp_data_base;
+		g_apfs.ac_xp_data_blocks = nx->nx_xp_data_blocks;
+		g_apfs.ac_xp_data_index  = nx->nx_xp_data_index;
+		g_apfs.ac_xp_data_len    = nx->nx_xp_data_len;
+		g_apfs.ac_xp_data_next   = nx->nx_xp_data_next;
 	}
 	kprintf("apfs: checkpoint ring @%llu (%u blocks): %u superblock(s)\n",
 	    (unsigned long long)base, (unsigned)blocks, (unsigned)found);
@@ -405,8 +441,10 @@ read_checkpoint_maps(void *scratch)
 			n = g_apfs.ac_eph_count++;
 			g_apfs.ac_eph[n].e_oid     = m->cpm_oid;
 			g_apfs.ac_eph[n].e_paddr   = m->cpm_paddr;
+			g_apfs.ac_eph[n].e_fs_oid  = m->cpm_fs_oid;
 			g_apfs.ac_eph[n].e_type    = m->cpm_type;
 			g_apfs.ac_eph[n].e_subtype = m->cpm_subtype;
+			g_apfs.ac_eph[n].e_size    = m->cpm_size;
 		}
 	}
 
@@ -2436,6 +2474,502 @@ out:
 	kfree(bm_buf);
 }
 
+/*
+ * WRITING A CHECKPOINT
+ *
+ * Everything above this line changes the container by writing a block back
+ * where it came from.  That is legal only while the container stays in the
+ * checkpoint it booted in: a block's contents and its transaction id are one
+ * statement, and rewriting the first without the second is a lie the format
+ * cannot catch.  It also has no crash story -- there is no instant before
+ * which the change had not happened and after which it had.
+ *
+ * A checkpoint is that instant.  It is built entirely out of blocks nobody
+ * is reading:
+ *
+ *	1. the ephemeral objects, copied into the next free slots of the data
+ *	   ring, each carrying the new xid;
+ *	2. a checkpoint map naming where they landed, into the next free slot
+ *	   of the descriptor ring;
+ *	3. a superblock after it, whose landing IS the commit -- before that
+ *	   write the container is the old checkpoint entire, after it the new
+ *	   one entire, and there is no third state;
+ *	4. block zero, a copy of that superblock.
+ *
+ * Step 4 is not bookkeeping.  A container whose block zero names an older
+ * checkpoint than the ring holds is one apfsck calls "not unmounted cleanly"
+ * -- measured on a real container, not assumed: a checkpoint written without
+ * it is accepted in every other respect, and adding the copy is exactly what
+ * silences the complaint.  A crash between 3 and 4 leaves that state on
+ * purpose: consistent, mountable at the new xid, and honestly marked as
+ * having been interrupted.
+ *
+ * ORDERING IS NOT ASSUMED EITHER.  It is a property of the path these writes
+ * take: bio_write reaches the device before it touches the cache (fs/bio.c),
+ * and ata_kwrite ends every write with FLUSH CACHE (dev/ata_drv.c).  Each
+ * block here is therefore on the platter before the next one starts, and the
+ * order written below is the order the disk sees.  That is also why this does
+ * not go through fs_txn: a transaction is a SET of blocks with no order among
+ * them, and here the order is the whole meaning.
+ *
+ * WHAT THIS DELIBERATELY DOES NOT DO is change anything in the object trees.
+ * The checkpoint it writes says what the last one said, one xid later.  That
+ * is the point: the skeleton can be proven alone -- the container advances,
+ * the previous checkpoint stays intact and mountable, apfsck accepts both --
+ * before anything is hung on it.  Copy-on-write of metadata is the next rung,
+ * and it needs this one to have somewhere to put the top of its chain.
+ */
+
+static uint64_t	ckpt_n_written;		/* checkpoints committed */
+static uint64_t	ckpt_n_refused;		/* asked for and declined */
+
+/*
+ * Is slot `s` part of the run of `len` slots starting at `start` in a ring of
+ * `blocks`?  Used to refuse writing a checkpoint over the one currently being
+ * read -- which a ring makes possible after enough of them, and which nothing
+ * later would catch, because the result checksums perfectly.
+ */
+static bool
+slot_in_run(uint32_t s, uint32_t start, uint32_t len, uint32_t blocks)
+{
+	uint32_t	k;
+
+	for (k = 0; k < len; k++) {
+		if ((start + k) % blocks == s)
+			return (true);
+	}
+	return (false);
+}
+
+int
+fs_apfs_checkpoint(void)
+{
+	struct apfs_checkpoint_map_phys	*cpm;
+	struct apfs_nx_superblock	*nx;
+	struct apfs_obj_phys		*o;
+	uint64_t			 moved[APFS_EPH_MAX];
+	uint8_t				*buf;
+	uint8_t				*map;
+	uint8_t				*sb;
+	uint64_t			 xid;
+	uint32_t			 data_slot;
+	uint32_t			 map_slot;
+	uint32_t			 sb_slot;
+	uint32_t			 i;
+	int				 rv;
+
+	if (!g_apfs.ac_mounted)
+		return (FS_APFS_E_NOMOUNT);
+
+	/*
+	 * A checkpoint that does not re-emit the ephemeral objects is a
+	 * checkpoint whose space manager is whatever the previous one left --
+	 * and the previous one's slots are the next to be reused.  So a table
+	 * that is empty, or that is known to be missing entries, is a reason
+	 * to refuse rather than to write three quarters of a checkpoint.
+	 */
+	if (g_apfs.ac_eph_count == 0 || g_apfs.ac_eph_over != 0) {
+		kprintf("apfs-ckpt: refusing -- %u ephemeral objects known, "
+		    "%u dropped for space\n", (unsigned)g_apfs.ac_eph_count,
+		    (unsigned)g_apfs.ac_eph_over);
+		ckpt_n_refused++;
+		return (FS_APFS_E_INVAL);
+	}
+	if (g_apfs.ac_xp_data_blocks == 0 ||
+	    g_apfs.ac_eph_count > g_apfs.ac_xp_data_blocks ||
+	    g_apfs.ac_xp_desc_blocks < 2) {
+		kprintf("apfs-ckpt: refusing -- rings too small (%u desc, "
+		    "%u data, %u objects)\n", (unsigned)g_apfs.ac_xp_desc_blocks,
+		    (unsigned)g_apfs.ac_xp_data_blocks,
+		    (unsigned)g_apfs.ac_eph_count);
+		ckpt_n_refused++;
+		return (FS_APFS_E_INVAL);
+	}
+
+	map_slot = g_apfs.ac_xp_desc_next % g_apfs.ac_xp_desc_blocks;
+	sb_slot  = (map_slot + 1) % g_apfs.ac_xp_desc_blocks;
+	if (slot_in_run(map_slot, g_apfs.ac_xp_desc_index,
+	    g_apfs.ac_xp_desc_len, g_apfs.ac_xp_desc_blocks) ||
+	    slot_in_run(sb_slot, g_apfs.ac_xp_desc_index,
+	    g_apfs.ac_xp_desc_len, g_apfs.ac_xp_desc_blocks)) {
+		kprintf("apfs-ckpt: refusing -- the descriptor ring has come "
+		    "round onto the live checkpoint (slots %u,%u vs %u+%u)\n",
+		    (unsigned)map_slot, (unsigned)sb_slot,
+		    (unsigned)g_apfs.ac_xp_desc_index,
+		    (unsigned)g_apfs.ac_xp_desc_len);
+		ckpt_n_refused++;
+		return (FS_APFS_E_INVAL);
+	}
+	for (i = 0; i < g_apfs.ac_eph_count; i++) {
+		data_slot = (g_apfs.ac_xp_data_next + i) %
+		    g_apfs.ac_xp_data_blocks;
+		if (!slot_in_run(data_slot, g_apfs.ac_xp_data_index,
+		    g_apfs.ac_xp_data_len, g_apfs.ac_xp_data_blocks))
+			continue;
+		kprintf("apfs-ckpt: refusing -- the data ring has come round "
+		    "onto the live checkpoint (slot %u)\n",
+		    (unsigned)data_slot);
+		ckpt_n_refused++;
+		return (FS_APFS_E_INVAL);
+	}
+
+	/*
+	 * The xid to write.  The superblock states what it expects to follow
+	 * it, and that should be one past its own; the two are derived
+	 * differently, so a disagreement means one of the two readings is
+	 * wrong and is worth saying out loud even though the answer taken is
+	 * the same either way.
+	 */
+	xid = g_apfs.ac_xid + 1;
+	if (g_apfs.ac_next_xid != 0 && g_apfs.ac_next_xid != xid)
+		kprintf("apfs-ckpt: WARNING superblock expects xid %llu next, "
+		    "this is %llu\n", (unsigned long long)g_apfs.ac_next_xid,
+		    (unsigned long long)xid);
+
+	buf = kmalloc(APFS_BLOCK_SIZE);
+	map = kmalloc(APFS_BLOCK_SIZE);
+	sb  = kmalloc(APFS_BLOCK_SIZE);
+	if (buf == NULL || map == NULL || sb == NULL) {
+		rv = FS_APFS_E_NOMEM;
+		goto out;
+	}
+
+	/*
+	 * The superblock is read FIRST, before anything is written: it is the
+	 * one block whose contents this depends on, and finding it changed
+	 * under us -- or unreadable -- has to stop the checkpoint while the
+	 * disk is still untouched.
+	 */
+	if (fs_apfs_read_block(g_apfs.ac_sb_bno, sb) != FS_APFS_E_OK) {
+		kprintf("apfs-ckpt: superblock at %llu unreadable\n",
+		    (unsigned long long)g_apfs.ac_sb_bno);
+		rv = FS_APFS_E_IO;
+		goto out;
+	}
+	nx = (struct apfs_nx_superblock *)sb;
+	if (nx->nx_o.o_xid != g_apfs.ac_xid || nx->nx_magic != APFS_NX_MAGIC) {
+		kprintf("apfs-ckpt: block %llu is no longer the checkpoint we "
+		    "adopted (xid %llu, wanted %llu)\n",
+		    (unsigned long long)g_apfs.ac_sb_bno,
+		    (unsigned long long)nx->nx_o.o_xid,
+		    (unsigned long long)g_apfs.ac_xid);
+		rv = FS_APFS_E_INVAL;
+		goto out;
+	}
+
+	/* 1. the ephemeral objects, into fresh data-ring slots */
+	for (i = 0; i < g_apfs.ac_eph_count; i++) {
+		if (g_apfs.ac_eph[i].e_size != APFS_BLOCK_SIZE) {
+			kprintf("apfs-ckpt: ephemeral oid %llu is %u bytes -- "
+			    "only single-block objects are handled\n",
+			    (unsigned long long)g_apfs.ac_eph[i].e_oid,
+			    (unsigned)g_apfs.ac_eph[i].e_size);
+			rv = FS_APFS_E_INVAL;
+			goto out;
+		}
+		if (fs_apfs_read_block(g_apfs.ac_eph[i].e_paddr, buf) !=
+		    FS_APFS_E_OK) {
+			kprintf("apfs-ckpt: ephemeral oid %llu at %llu "
+			    "unreadable\n",
+			    (unsigned long long)g_apfs.ac_eph[i].e_oid,
+			    (unsigned long long)g_apfs.ac_eph[i].e_paddr);
+			rv = FS_APFS_E_IO;
+			goto out;
+		}
+		o = (struct apfs_obj_phys *)buf;
+		o->o_xid = xid;
+		data_slot = (g_apfs.ac_xp_data_next + i) %
+		    g_apfs.ac_xp_data_blocks;
+		moved[i] = g_apfs.ac_xp_data_base + data_slot;
+		if (fs_apfs_write_block(moved[i], buf) != FS_APFS_E_OK) {
+			kprintf("apfs-ckpt: ephemeral oid %llu would not "
+			    "write to %llu\n",
+			    (unsigned long long)g_apfs.ac_eph[i].e_oid,
+			    (unsigned long long)moved[i]);
+			rv = FS_APFS_E_IO;
+			goto out;
+		}
+	}
+
+	/*
+	 * 2. the map.  Its oid is its own block number: it is a physical
+	 * object, and for those the two are the same number by definition.
+	 */
+	for (i = 0; i < APFS_BLOCK_SIZE; i++)
+		map[i] = 0;
+	cpm = (struct apfs_checkpoint_map_phys *)map;
+	cpm->cpm_o.o_oid     = g_apfs.ac_xp_desc_base + map_slot;
+	cpm->cpm_o.o_xid     = xid;
+	cpm->cpm_o.o_type    = APFS_OBJ_PHYSICAL | APFS_OBJ_CHECKPOINT_MAP;
+	cpm->cpm_o.o_subtype = 0;
+	cpm->cpm_flags       = APFS_CPM_LAST;
+	cpm->cpm_count       = g_apfs.ac_eph_count;
+	for (i = 0; i < g_apfs.ac_eph_count; i++) {
+		cpm->cpm_map[i].cpm_type    = g_apfs.ac_eph[i].e_type;
+		cpm->cpm_map[i].cpm_subtype = g_apfs.ac_eph[i].e_subtype;
+		cpm->cpm_map[i].cpm_size    = g_apfs.ac_eph[i].e_size;
+		cpm->cpm_map[i].cpm_pad     = 0;
+		cpm->cpm_map[i].cpm_fs_oid  = g_apfs.ac_eph[i].e_fs_oid;
+		cpm->cpm_map[i].cpm_oid     = g_apfs.ac_eph[i].e_oid;
+		cpm->cpm_map[i].cpm_paddr   = moved[i];
+	}
+	if (fs_apfs_write_block(g_apfs.ac_xp_desc_base + map_slot, map) !=
+	    FS_APFS_E_OK) {
+		kprintf("apfs-ckpt: checkpoint map would not write to %llu\n",
+		    (unsigned long long)(g_apfs.ac_xp_desc_base + map_slot));
+		rv = FS_APFS_E_IO;
+		goto out;
+	}
+
+	/* 3. the superblock.  Everything above it is already on the platter. */
+	nx->nx_o.o_oid       = APFS_OBJ_NX_SUPERBLOCK;
+	nx->nx_o.o_xid       = xid;
+	nx->nx_next_xid      = xid + 1;
+	nx->nx_xp_desc_index = map_slot;
+	nx->nx_xp_desc_len   = 2;
+	nx->nx_xp_desc_next  = (sb_slot + 1) % g_apfs.ac_xp_desc_blocks;
+	nx->nx_xp_data_index = g_apfs.ac_xp_data_next %
+	    g_apfs.ac_xp_data_blocks;
+	nx->nx_xp_data_len   = g_apfs.ac_eph_count;
+	nx->nx_xp_data_next  = (g_apfs.ac_xp_data_next +
+	    g_apfs.ac_eph_count) % g_apfs.ac_xp_data_blocks;
+	if (fs_apfs_write_block(g_apfs.ac_xp_desc_base + sb_slot, sb) !=
+	    FS_APFS_E_OK) {
+		kprintf("apfs-ckpt: superblock would not write to %llu -- the "
+		    "container is still the previous checkpoint\n",
+		    (unsigned long long)(g_apfs.ac_xp_desc_base + sb_slot));
+		rv = FS_APFS_E_IO;
+		goto out;
+	}
+
+	/*
+	 * 4. block zero.  Past this point the checkpoint has happened
+	 * whatever else fails, so a failure here is reported and not
+	 * propagated: the container is the new checkpoint either way, and the
+	 * only difference is whether the next fsck calls it cleanly unmounted.
+	 */
+	if (fs_apfs_write_block(0, sb) != FS_APFS_E_OK)
+		kprintf("apfs-ckpt: xid %llu is committed, but block zero "
+		    "still names %llu -- fsck will call this unclean\n",
+		    (unsigned long long)xid,
+		    (unsigned long long)g_apfs.ac_xid);
+
+	/* And the container this kernel believes in moves with it. */
+	g_apfs.ac_xid           = xid;
+	g_apfs.ac_next_xid      = xid + 1;
+	g_apfs.ac_sb_bno        = g_apfs.ac_xp_desc_base + sb_slot;
+	g_apfs.ac_xp_desc_index = map_slot;
+	g_apfs.ac_xp_desc_len   = 2;
+	g_apfs.ac_xp_desc_next  = (sb_slot + 1) % g_apfs.ac_xp_desc_blocks;
+	g_apfs.ac_xp_data_index = nx->nx_xp_data_index;
+	g_apfs.ac_xp_data_len   = g_apfs.ac_eph_count;
+	g_apfs.ac_xp_data_next  = nx->nx_xp_data_next;
+	for (i = 0; i < g_apfs.ac_eph_count; i++)
+		g_apfs.ac_eph[i].e_paddr = moved[i];
+	/*
+	 * The space manager moved with the rest, and alloc_apply writes to it
+	 * by address.  Leaving this stale would send the next allocation into
+	 * the previous checkpoint's copy -- a block the next checkpoint is
+	 * free to overwrite.
+	 */
+	if (g_apfs.ac_sm_valid)
+		g_apfs.ac_sm_paddr = resolve_ephemeral(g_apfs.ac_spaceman_oid);
+
+	ckpt_n_written++;
+	rv = FS_APFS_E_OK;
+out:
+	if (rv != FS_APFS_E_OK)
+		ckpt_n_refused++;
+	kfree(buf);
+	kfree(map);
+	kfree(sb);
+	return (rv);
+}
+
+/*
+ * Read the disk back and ask it the four questions a checkpoint claims to
+ * have settled.  Every one of them is asked of the platter rather than of
+ * g_apfs: the whole failure mode worth catching here is a kernel that
+ * believes it wrote a checkpoint.
+ */
+static int
+ckpt_verify(uint64_t want_xid, uint64_t prev_sb, uint64_t prev_xid,
+    void *scratch)
+{
+	const struct apfs_checkpoint_map_phys	*cpm;
+	const struct apfs_nx_superblock		*nx;
+	const struct apfs_obj_phys		*o;
+	uint64_t				 newest;
+	uint32_t				 i;
+
+	/* One: block zero, which is where a fresh mount starts. */
+	if (read_block_raw(0, scratch) != FS_APFS_E_OK ||
+	    !block_is_nxsb(scratch)) {
+		kprintf("apfs-ckpt: block zero is not a superblock\n");
+		return (FS_APFS_E_IO);
+	}
+	nx = (const struct apfs_nx_superblock *)scratch;
+	if (nx->nx_o.o_xid != want_xid) {
+		kprintf("apfs-ckpt: block zero says xid %llu, wanted %llu\n",
+		    (unsigned long long)nx->nx_o.o_xid,
+		    (unsigned long long)want_xid);
+		return (FS_APFS_E_INVAL);
+	}
+
+	/* Two: the newest superblock in the ring is the one just written. */
+	newest = 0;
+	for (i = 0; i < g_apfs.ac_xp_desc_blocks; i++) {
+		if (read_block_raw(g_apfs.ac_xp_desc_base + i, scratch) !=
+		    FS_APFS_E_OK)
+			return (FS_APFS_E_IO);
+		if (!block_is_nxsb(scratch))
+			continue;
+		nx = (const struct apfs_nx_superblock *)scratch;
+		if (nx->nx_o.o_xid > newest)
+			newest = nx->nx_o.o_xid;
+	}
+	if (newest != want_xid) {
+		kprintf("apfs-ckpt: newest superblock in the ring is xid %llu, "
+		    "wanted %llu\n", (unsigned long long)newest,
+		    (unsigned long long)want_xid);
+		return (FS_APFS_E_INVAL);
+	}
+
+	/*
+	 * Three: the checkpoint this one replaced is untouched.  This is the
+	 * property the whole scheme rests on -- a container that lost its
+	 * previous checkpoint has no state to fall back to, and would look
+	 * perfectly healthy right up to the crash that needed it.
+	 */
+	if (read_block_raw(prev_sb, scratch) != FS_APFS_E_OK ||
+	    !block_is_nxsb(scratch)) {
+		kprintf("apfs-ckpt: the previous superblock at %llu no longer "
+		    "reads\n", (unsigned long long)prev_sb);
+		return (FS_APFS_E_INVAL);
+	}
+	nx = (const struct apfs_nx_superblock *)scratch;
+	if (nx->nx_o.o_xid != prev_xid) {
+		kprintf("apfs-ckpt: the previous superblock at %llu now says "
+		    "xid %llu, was %llu\n", (unsigned long long)prev_sb,
+		    (unsigned long long)nx->nx_o.o_xid,
+		    (unsigned long long)prev_xid);
+		return (FS_APFS_E_INVAL);
+	}
+
+	/*
+	 * Four: the map on disk names the objects we think it does, and each
+	 * one is where it says and carries the new xid.  Read from the block
+	 * rather than from ac_eph[], so that a map written wrong cannot be
+	 * confirmed by the table it was written from.
+	 */
+	if (fs_apfs_read_block(g_apfs.ac_xp_desc_base + g_apfs.ac_xp_desc_index,
+	    scratch) != FS_APFS_E_OK) {
+		kprintf("apfs-ckpt: the new checkpoint map does not read\n");
+		return (FS_APFS_E_IO);
+	}
+	cpm = (const struct apfs_checkpoint_map_phys *)scratch;
+	if ((cpm->cpm_o.o_type & APFS_OBJ_TYPE_MASK) !=
+	    APFS_OBJ_CHECKPOINT_MAP || cpm->cpm_o.o_xid != want_xid ||
+	    cpm->cpm_count != g_apfs.ac_eph_count) {
+		kprintf("apfs-ckpt: the new map is type 0x%x xid %llu with %u "
+		    "entries, wanted a map at xid %llu with %u\n",
+		    (unsigned)(cpm->cpm_o.o_type & APFS_OBJ_TYPE_MASK),
+		    (unsigned long long)cpm->cpm_o.o_xid,
+		    (unsigned)cpm->cpm_count, (unsigned long long)want_xid,
+		    (unsigned)g_apfs.ac_eph_count);
+		return (FS_APFS_E_INVAL);
+	}
+	for (i = 0; i < cpm->cpm_count; i++) {
+		if (cpm->cpm_map[i].cpm_oid != g_apfs.ac_eph[i].e_oid ||
+		    cpm->cpm_map[i].cpm_paddr != g_apfs.ac_eph[i].e_paddr) {
+			kprintf("apfs-ckpt: map entry %u says oid %llu at "
+			    "%llu, we recorded oid %llu at %llu\n",
+			    (unsigned)i,
+			    (unsigned long long)cpm->cpm_map[i].cpm_oid,
+			    (unsigned long long)cpm->cpm_map[i].cpm_paddr,
+			    (unsigned long long)g_apfs.ac_eph[i].e_oid,
+			    (unsigned long long)g_apfs.ac_eph[i].e_paddr);
+			return (FS_APFS_E_INVAL);
+		}
+	}
+	for (i = 0; i < g_apfs.ac_eph_count; i++) {
+		if (fs_apfs_read_block(g_apfs.ac_eph[i].e_paddr, scratch) !=
+		    FS_APFS_E_OK) {
+			kprintf("apfs-ckpt: ephemeral oid %llu at %llu does "
+			    "not read back\n",
+			    (unsigned long long)g_apfs.ac_eph[i].e_oid,
+			    (unsigned long long)g_apfs.ac_eph[i].e_paddr);
+			return (FS_APFS_E_IO);
+		}
+		o = (const struct apfs_obj_phys *)scratch;
+		if (o->o_oid != g_apfs.ac_eph[i].e_oid ||
+		    o->o_xid != want_xid) {
+			kprintf("apfs-ckpt: block %llu holds oid %llu xid "
+			    "%llu, the map calls it oid %llu at xid %llu\n",
+			    (unsigned long long)g_apfs.ac_eph[i].e_paddr,
+			    (unsigned long long)o->o_oid,
+			    (unsigned long long)o->o_xid,
+			    (unsigned long long)g_apfs.ac_eph[i].e_oid,
+			    (unsigned long long)want_xid);
+			return (FS_APFS_E_INVAL);
+		}
+	}
+	return (FS_APFS_E_OK);
+}
+
+/*
+ * Write two checkpoints and check the disk after each.
+ *
+ * Two, not one, because the second is the only thing that tests the state
+ * this kernel keeps ABOUT the checkpoint it wrote.  A writer that commits
+ * perfectly and then forgets to move its ring cursors passes once and then
+ * writes its second checkpoint over its first -- and the result would still
+ * checksum, still mount, and still be wrong.
+ */
+void
+fs_apfs_ckpt_selftest(void)
+{
+	void		*scratch;
+	uint64_t	 first_xid;
+	uint64_t	 prev_sb;
+	uint64_t	 prev_xid;
+	uint32_t	 pass;
+
+	if (!g_apfs.ac_mounted) {
+		kprintf("apfs-ckpt: no container -- skipped\n");
+		return;
+	}
+	scratch = kmalloc(APFS_BLOCK_SIZE);
+	if (scratch == NULL) {
+		kprintf("apfs-ckpt: no memory -- skipped\n");
+		return;
+	}
+
+	first_xid = g_apfs.ac_xid;
+	for (pass = 0; pass < 2; pass++) {
+		prev_sb  = g_apfs.ac_sb_bno;
+		prev_xid = g_apfs.ac_xid;
+		if (fs_apfs_checkpoint() != FS_APFS_E_OK) {
+			kprintf("apfs-ckpt: FAIL checkpoint %u was refused\n",
+			    (unsigned)(pass + 1));
+			goto out;
+		}
+		if (ckpt_verify(prev_xid + 1, prev_sb, prev_xid, scratch) !=
+		    FS_APFS_E_OK) {
+			kprintf("apfs-ckpt: FAIL after checkpoint %u\n",
+			    (unsigned)(pass + 1));
+			goto out;
+		}
+	}
+
+	kprintf("apfs-ckpt: PASS -- xid %llu -> %llu, %u ephemeral objects "
+	    "re-emitted each time, block zero follows, xid %llu still reads\n",
+	    (unsigned long long)first_xid, (unsigned long long)g_apfs.ac_xid,
+	    (unsigned)g_apfs.ac_eph_count, (unsigned long long)first_xid);
+out:
+	kfree(scratch);
+}
+
 int
 fs_apfs_ready(void)
 {
@@ -2514,4 +3048,18 @@ fs_apfs_stats(void)
 	    g_apfs.ac_sm_free == g_apfs.ac_bm_free_said &&
 	    g_apfs.ac_bm_free_said == g_apfs.ac_bm_free_counted) ?
 	    "all three agree" : "THEY DISAGREE");
+
+	/*
+	 * Two numbers, because one of them cannot show a checkpoint that was
+	 * never attempted.  A boot that writes none is a boot where nothing
+	 * asked for one; a boot that refuses them says so here rather than in
+	 * a line that scrolled past an hour ago.
+	 */
+	if (ckpt_n_written != 0 || ckpt_n_refused != 0)
+		kprintf("apfs: %llu checkpoint(s) written, %llu refused -- now "
+		    "at xid %llu, superblock in block %llu\n",
+		    (unsigned long long)ckpt_n_written,
+		    (unsigned long long)ckpt_n_refused,
+		    (unsigned long long)g_apfs.ac_xid,
+		    (unsigned long long)g_apfs.ac_sb_bno);
 }

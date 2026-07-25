@@ -724,6 +724,40 @@ void	fs_apfs_stats(void);
 void	fs_apfs_alloc_selftest(void);
 
 /*
+ * Close the container's current transaction: write a checkpoint.
+ *
+ * Re-emits the checkpoint's ephemeral objects into the next free slots of the
+ * data ring, writes a checkpoint map naming where they landed, and closes the
+ * whole thing with a superblock carrying the next transaction id.  The
+ * superblock's landing is the commit: before it the container is the previous
+ * checkpoint entire, after it the new one entire.  Block zero is then made a
+ * copy of that superblock, which is what makes the difference between a
+ * container fsck calls clean and one it calls interrupted.
+ *
+ * What it does NOT do yet is change any object tree, so the checkpoint it
+ * writes says what the previous one said, one xid later.  That is the whole
+ * scope for now: the mechanism has to be provable on its own before
+ * copy-on-write can hang the top of its chain off it.
+ *
+ * Returns FS_APFS_E_OK, or a negative FS_APFS_E_* with nothing written -- the
+ * one exception being a failure to update block zero, which is reported and
+ * not propagated, because by then the checkpoint has happened.
+ *
+ * The caller must hold the volume lock: this moves state the readers use.
+ */
+int	fs_apfs_checkpoint(void);
+
+/*
+ * Write two checkpoints and interrogate the disk after each: block zero moved,
+ * the ring's newest superblock is the one just written, the checkpoint it
+ * replaced still reads and still says its own xid, and every object the new
+ * map names is where it says at the new xid.  Two, because a writer that
+ * commits correctly but forgets to advance its own cursors passes the first
+ * and overwrites it with the second.
+ */
+void	fs_apfs_ckpt_selftest(void);
+
+/*
  * Translate a virtual object id to its block number through the object-map
  * B-tree rooted at `tree_bno`, taking the newest version no later than `xid`.
  * Returns FS_APFS_E_OK and stores the block in *paddr_out, or a negative

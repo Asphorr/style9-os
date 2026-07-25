@@ -153,6 +153,13 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	 */
 	if (fs_apfs_ready())
 		fs_apfs_alloc_selftest();
+	/*
+	 * And the mechanism that will one day make both of those durable as a
+	 * unit: a checkpoint.  Runs last of the three because it moves the
+	 * container to a new transaction id, and the two tests above are
+	 * easier to read against the one it booted in.
+	 */
+	fs_ckpt_selftest();
 
 	/*
 	 * Register a demo service under the bootstrap port so ring-3
