@@ -552,6 +552,7 @@ _Static_assert(__builtin_offsetof(struct apfs_superblock, apfs_volname) == 704,
 #define	APFS_J_OBJ_ID_MASK	0x0FFFFFFFFFFFFFFFULL
 #define	APFS_J_OBJ_TYPE_SHIFT	60
 
+#define	APFS_TYPE_EXTENT	2	/* physical extent, in the ref tree */
 #define	APFS_TYPE_INODE		3
 #define	APFS_TYPE_XATTR		4
 #define	APFS_TYPE_DSTREAM_ID	6
@@ -690,6 +691,35 @@ struct apfs_file_extent_val {
 _Static_assert(sizeof(struct apfs_file_extent_val) == 24,
     "a file-extent record is 24 bytes");
 
+/*
+ * Physical extent, in the volume's EXTENT REFERENCE tree -- the other tree
+ * that names a file's blocks, and the reason moving a file's bytes is not a
+ * one-tree edit.  The file-system tree answers "where are this file's bytes";
+ * this one answers the reverse, "who owns this run and how many references
+ * does it have", which is what makes a block shared between clones countable.
+ *
+ * The KEY is the run's first block, so relocating a run changes the key and
+ * therefore where the record sorts -- unlike a file extent, whose key is the
+ * offset within the file and does not move at all.
+ *
+ * pe_len_and_kind packs the length in blocks into the low 60 bits and the kind
+ * into the top 4.  Note "in BLOCKS": the file extent above counts BYTES, and
+ * the two describing the same run in different units is exactly the sort of
+ * thing that reads as correct and is not.
+ */
+#define	APFS_PEXT_LEN_MASK	0x0FFFFFFFFFFFFFFFULL
+#define	APFS_PEXT_KIND_SHIFT	60
+#define	APFS_PEXT_KIND_NEW	1
+
+struct apfs_phys_ext_val {
+	uint64_t	pe_len_and_kind;
+	uint64_t	pe_owning_obj_id;
+	int32_t		pe_refcnt;
+} __attribute__((packed));
+
+_Static_assert(sizeof(struct apfs_phys_ext_val) == 20,
+    "a physical-extent record is 20 bytes");
+
 /* Longest name fs_apfs_readdir reports. */
 #define	FS_APFS_NAME_MAX	255
 
@@ -811,6 +841,14 @@ int	fs_apfs_checkpoint(void);
  * and overwrites it with the second.
  */
 void	fs_apfs_ckpt_selftest(void);
+
+/*
+ * Write to a file and prove the bytes MOVED: the run the live checkpoint still
+ * names has to read exactly as it did, while the new run carries the write.
+ * Restores what it found.  The path is passed in so that the one file the
+ * write tests use is named in one place.
+ */
+void	fs_apfs_data_selftest(const char *path);
 
 /*
  * Translate a virtual object id to its block number through the object-map

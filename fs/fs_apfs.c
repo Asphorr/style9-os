@@ -59,6 +59,7 @@ static struct {
 	uint64_t	ac_vol_sb_bno;		/* (c) volume superblock    */
 	uint64_t	ac_vol_omap_bno;	/* (c) volume omap object   */
 	uint64_t	ac_root_tree_oid;	/* (m) its VIRTUAL oid      */
+	uint64_t	ac_extref_bno;		/* (c) extent reference tree */
 	uint64_t	ac_num_files;		/* (m) */
 	uint64_t	ac_num_dirs;		/* (m) */
 	uint32_t	ac_xp_desc_blocks;	/* (m) */
@@ -251,6 +252,8 @@ static int	alloc_flush(uint64_t xid);
 static struct alloc_chunk *chunk_for(uint64_t bno);
 static int	spine_update(uint64_t oid, uint64_t paddr, uint64_t xid,
 		    void *buf);
+static int	extref_move(uint64_t old_start, uint64_t new_start,
+		    uint64_t blocks, uint64_t xid, void *buf);
 static int	fq_insert(uint32_t q, uint64_t xid, uint64_t paddr,
 		    uint64_t count);
 static void	fq_release(uint32_t q, uint64_t upto_xid);
@@ -279,6 +282,7 @@ static uint64_t	 ip_n_alloc;	/* pool blocks taken    */
 static uint64_t	 ip_n_free;	/* pool blocks returned */
 static uint64_t	 cow_n_meta;	/* allocation metadata blocks moved */
 static uint64_t	 cow_n_spine;	/* spine objects copied            */
+static uint64_t	 cow_n_data;	/* file blocks moved by a write    */
 
 static size_t
 str_len(const char *s)
@@ -1896,6 +1900,11 @@ mount_volume(void *scratch)
 	g_apfs.ac_vol_sb_bno     = apsb_bno;
 	g_apfs.ac_vol_omap_bno   = sb->apfs_omap_oid;
 	g_apfs.ac_root_tree_oid  = sb->apfs_root_tree_oid;
+	/*
+	 * And the other tree that names a file's blocks.  PHYSICAL, so its oid
+	 * is already the block it lives in and no map is asked.
+	 */
+	g_apfs.ac_extref_bno     = sb->apfs_extentref_tree_oid;
 	return (FS_APFS_E_OK);
 }
 
@@ -2540,40 +2549,71 @@ fs_apfs_pread(uint64_t id, uint64_t size, uint64_t off, uint8_t *buf,
 /* ---- writing -------------------------------------------------------------- */
 
 /*
- * The write side of extent_read, and deliberately its mirror image: the same
- * window arithmetic decides which bytes of which block are in play, so the
- * two cannot disagree about where a file's byte lives.  What differs is what
- * happens to a block that is only partly wanted, and what happens to a hole.
+ * WRITING A FILE'S BYTES, WHICH MEANS MOVING THEM
+ *
+ * Until this rung a write went straight onto the block the extent record
+ * named, and the checkpoint machinery around it was half a promise.  The ring
+ * of old superblocks was intact -- copy-on-write, the spine and the free
+ * queues saw to that -- and every one of them pointed at a file whose contents
+ * had since been overwritten underneath it.  Measured on the container rather
+ * than argued about; the leaf describing /var/db/big.txt moves from checkpoint
+ * to checkpoint and the block holding its bytes does not:
+ *
+ *	xid 3   leaf 98320   extent (logical 0, 155648 bytes) at block 5970
+ *	xid 5   leaf 98310   extent (logical 0, 155648 bytes) at block 5970
+ *	...
+ *	xid 17  leaf 98337   extent (logical 0, 155648 bytes) at block 5970
+ *
+ *	distinct leaf blocks across the ring: 5
+ *	distinct data blocks across the ring: 1
+ *
+ * So a write now takes fresh blocks, copies into them, and moves the record --
+ * and the run it moves is THE WHOLE EXTENT, not the part written.  That is the
+ * expensive choice and it is deliberate.  Writing twelve bytes into a
+ * thirty-eight block extent ought to relocate one block and leave the extent
+ * split in three, which is two more records than there were; a record has to
+ * be inserted, a node with no room has to split, and that is the rung after
+ * this one.  Moving the run whole keeps every count identical -- one file
+ * extent in and one out, one physical extent in and one out -- so nothing
+ * inserts, nothing splits, and no tree changes shape.  The cost is honest and
+ * it is the file's size: this container's write self-test moves 152 KiB to
+ * change twelve bytes.
+ *
+ * Two trees name those blocks and both have to be told.  The file-system tree
+ * says where the file's bytes are; the extent reference tree says who owns the
+ * run -- see extref_move, which is where the interesting half of that lives.
  */
-struct extent_write {
-	uint64_t	 ew_id;		/* the dstream this belongs to */
-	const uint8_t	*ew_buf;	/* holds file byte ew_lo       */
-	uint8_t		*ew_bounce;
-	uint64_t	 ew_size;	/* end of the file's content   */
-	uint64_t	 ew_lo;		/* window start, in file bytes */
-	uint64_t	 ew_hi;		/* window end,   in file bytes */
-	uint64_t	 ew_put;
-	int		 ew_rv;
+
+/* How many extents one write may move before it is refused as unbounded. */
+#define	APFS_WRITE_EXTENTS_MAX	8
+
+/*
+ * The extent record covering one file offset, and the leaf holding it.  A
+ * locate pass, exactly like inode_locate below and for the same reason:
+ * btree_walk frees its node buffer on the way out, so the patch has to re-read
+ * the block it was told about.
+ */
+struct extent_locate {
+	uint64_t	el_id;		/* the dstream being written   */
+	uint64_t	el_want;	/* the file offset to cover    */
+	uint64_t	el_logical;	/* what was found: its start   */
+	uint64_t	el_len;		/* ...its length, in BYTES     */
+	uint64_t	el_phys;	/* ...and its first block      */
+	uint64_t	el_bno;		/* the leaf the record is in   */
+	bool		el_found;
 };
 
 static bool
-extent_write(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
+extent_locate(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
     const uint8_t *val, uint32_t vlen, uint64_t bno, void *arg)
 {
 	const struct apfs_file_extent_val	*fe;
-	struct extent_write			*ew;
+	struct extent_locate			*el;
 	uint64_t				 logical;
 	uint64_t				 len;
-	uint64_t				 phys;
-	uint64_t				 off;
-	uint64_t				 dst;
-	uint64_t				 lo;
-	uint64_t				 hi;
-	uint64_t				 n;
 
-	(void)bno;
-	ew = arg;
-	if (type != APFS_TYPE_FILE_EXTENT || oid != ew->ew_id)
+	el = arg;
+	if (type != APFS_TYPE_FILE_EXTENT || oid != el->el_id)
 		return (true);
 	if (klen < 16 || vlen < sizeof(*fe))
 		return (true);
@@ -2581,131 +2621,287 @@ extent_write(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 	logical = *(const uint64_t *)(key + 8);
 	fe      = (const struct apfs_file_extent_val *)val;
 	len     = fe->fe_len_and_flags & APFS_FILE_EXTENT_LEN_MASK;
-	phys    = fe->fe_phys_block_num;
-
-	if (logical >= ew->ew_size)
+	if (el->el_want < logical || el->el_want >= logical + len)
 		return (true);
-	if (logical >= ew->ew_hi)		/* past the window: records sort */
-		return (false);			/* by (oid, logical), so stop    */
-	if (logical + len <= ew->ew_lo)
-		return (true);			/* entirely before the window    */
+
+	el->el_logical = logical;
+	el->el_len     = len;
+	el->el_phys    = fe->fe_phys_block_num;
+	el->el_bno     = bno;
+	el->el_found   = true;
+	return (false);
+}
+
+/* Where the run covering file offset `off` starts, or 0 if it is a hole. */
+static int
+extent_at(uint64_t id, uint64_t off, uint64_t *phys_out)
+{
+	struct extent_locate	el;
+	bool			stopped;
+
+	el.el_id    = id;
+	el.el_want  = off;
+	el.el_found = false;
+	stopped = false;
+	if (!btree_walk(g_apfs.ac_root_tree_bno, extent_locate, &el, 0,
+	    &stopped))
+		return (FS_APFS_E_IO);
+	if (!el.el_found)
+		return (FS_APFS_E_NOTFOUND);
+	*phys_out = el.el_phys;
+	return (FS_APFS_E_OK);
+}
+
+/*
+ * Move the run this extent describes, putting the caller's bytes in as the
+ * copy goes past them, and leave *pos at the first file byte beyond it.
+ *
+ * The copy is what makes the partial blocks at either end correct for free.
+ * Every block of the old run is read whole and written whole; the window only
+ * decides which of its bytes are replaced on the way.  There is no
+ * read-modify-write special case because there is nothing special about it --
+ * the bytes of a block that the caller did not ask about are the file's, and
+ * the copy carries them across because it carries everything across.
+ */
+static int
+extent_relocate(const struct extent_locate *el, const uint8_t *buf,
+    uint64_t wlo, uint64_t whi, uint8_t *bounce, uint8_t *node, uint64_t *pos)
+{
+	struct apfs_file_extent_val	*fe;
+	struct apfs_obj_phys		*o;
+	struct btree_layout		 bl;
+	const uint8_t			*k;
+	uint64_t			 blocks;
+	uint64_t			 first;
+	uint64_t			 leaf_oid;
+	uint64_t			 new_leaf;
+	uint64_t			 raw;
+	uint64_t			 xid;
+	uint64_t			 b;
+	uint64_t			 dst;
+	uint64_t			 lo;
+	uint64_t			 hi;
+	uint32_t			 koff, klen, voff, vlen;
+	uint32_t			 i;
+	int				 rv;
+
+	blocks = (el->el_len + APFS_BLOCK_SIZE - 1) / APFS_BLOCK_SIZE;
+	if (blocks == 0 || blocks > 0xFFFFFFFFULL)
+		return (FS_APFS_E_INVAL);
+	xid = g_apfs.ac_xid + 1;
 
 	/*
-	 * A hole overlapping the write.  Reading one costs nothing because its
-	 * bytes are defined to be zero; writing one means finding it a block,
-	 * and finding a block is the allocator this rung does not have.  Say
-	 * so instead of dropping the bytes on the floor.
+	 * Near the run it replaces.  Not a preference: the release below has
+	 * to clear bits in the old run's chunk, so a copy that lands in that
+	 * same chunk is a copy this transaction can finish.
 	 */
-	if (phys == 0) {
-		ew->ew_rv = FS_APFS_E_NOALLOC;
-		return (false);
+	rv = alloc_blocks((uint32_t)blocks, el->el_phys, &first);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+
+	for (b = 0; b < blocks; b++) {
+		rv = read_block_raw(el->el_phys + b, bounce);
+		if (rv != FS_APFS_E_OK)
+			goto give_back;
+		dst = el->el_logical + b * APFS_BLOCK_SIZE;
+		lo  = (dst > wlo) ? dst : wlo;
+		hi  = dst + APFS_BLOCK_SIZE;
+		if (hi > whi)
+			hi = whi;
+		if (lo < hi)
+			mem_copy(bounce + (lo - dst), buf + (lo - wlo),
+			    (size_t)(hi - lo));
+		rv = write_block_raw(first + b, bounce);
+		if (rv != FS_APFS_E_OK)
+			goto give_back;
 	}
 
-	for (off = 0; off < len; off += APFS_BLOCK_SIZE) {
-		dst = logical + off;		/* file offset of this block */
-		if (dst >= ew->ew_size || dst >= ew->ew_hi)
-			break;
-		if (dst + APFS_BLOCK_SIZE <= ew->ew_lo)
+	/*
+	 * The record, found again inside our own copy of the leaf with the
+	 * same layout code the reader uses.  Keyed by (object, offset in the
+	 * file), neither of which this changes -- only the block number in the
+	 * value does, so the record stays exactly where it is in the node.
+	 */
+	rv = fs_apfs_read_block(el->el_bno, node);
+	if (rv != FS_APFS_E_OK)
+		goto give_back;
+	btree_layout(node, &bl);
+	rv = FS_APFS_E_NOTFOUND;
+	for (i = 0; i < bl.bl_nkeys; i++) {
+		btree_entry_loc(&bl, i, &koff, &klen, &voff, &vlen);
+		if (klen < 16 || vlen < sizeof(*fe))
 			continue;
-
-		lo = (dst < ew->ew_lo) ? ew->ew_lo : dst;
-		hi = dst + APFS_BLOCK_SIZE;
-		if (hi > ew->ew_size)
-			hi = ew->ew_size;
-		if (hi > ew->ew_hi)
-			hi = ew->ew_hi;
-		if (lo >= hi)
+		k   = bl.bl_keys + koff;
+		raw = *(const uint64_t *)k;
+		if ((raw & APFS_J_OBJ_ID_MASK) != el->el_id)
 			continue;
-		n = hi - lo;
-
-		if (n == APFS_BLOCK_SIZE) {
-			if (write_block_raw(phys + off / APFS_BLOCK_SIZE,
-			    ew->ew_buf + (lo - ew->ew_lo)) != FS_APFS_E_OK) {
-				ew->ew_rv = FS_APFS_E_IO;
-				return (false);
-			}
-		} else {
-			/*
-			 * Read-modify-write.  The bytes of this block that the
-			 * caller did not ask about are still the file's, and a
-			 * partial write that published a block of mostly-fresh
-			 * heap would destroy them -- the failure mode being
-			 * that the damage sits outside the range anyone thinks
-			 * to check.
-			 */
-			if (read_block_raw(phys + off / APFS_BLOCK_SIZE,
-			    ew->ew_bounce) != FS_APFS_E_OK) {
-				ew->ew_rv = FS_APFS_E_IO;
-				return (false);
-			}
-			mem_copy(ew->ew_bounce + (lo - dst),
-			    ew->ew_buf + (lo - ew->ew_lo), (size_t)n);
-			if (write_block_raw(phys + off / APFS_BLOCK_SIZE,
-			    ew->ew_bounce) != FS_APFS_E_OK) {
-				ew->ew_rv = FS_APFS_E_IO;
-				return (false);
-			}
-		}
-		ew->ew_put += n;
+		if ((uint32_t)(raw >> APFS_J_OBJ_TYPE_SHIFT) !=
+		    APFS_TYPE_FILE_EXTENT)
+			continue;
+		if (*(const uint64_t *)(k + 8) != el->el_logical)
+			continue;
+		fe = (struct apfs_file_extent_val *)(bl.bl_vals - voff);
+		fe->fe_phys_block_num = first;
+		rv = FS_APFS_E_OK;
+		break;
 	}
-	return (true);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs: the extent at file offset %llu vanished from "
+		    "leaf %llu between finding it and patching it\n",
+		    (unsigned long long)el->el_logical,
+		    (unsigned long long)el->el_bno);
+		goto give_back;
+	}
+
+	/* The leaf is virtual: it keeps its oid and only its address moves. */
+	o        = (struct apfs_obj_phys *)node;
+	leaf_oid = o->o_oid;
+	rv = alloc_blocks(1, el->el_bno, &new_leaf);
+	if (rv != FS_APFS_E_OK)
+		goto give_back;
+	o->o_xid = xid;
+	rv = fs_apfs_write_block(new_leaf, node);
+	if (rv != FS_APFS_E_OK) {
+		(void)free_blocks(new_leaf, 1);
+		goto give_back;
+	}
+	rv = free_blocks(el->el_bno, 1);
+	if (rv != FS_APFS_E_OK)
+		goto give_back;
+	cow_n_spine++;
+
+	/*
+	 * Past this point nothing can be given back quietly: the leaf has
+	 * moved, and a failure leaves a transaction that must not be written.
+	 * Both remaining steps say so and refuse the checkpoint rather than
+	 * publish half of one.
+	 */
+	rv = extref_move(el->el_phys, first, blocks, xid, node);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs: the file's bytes moved to %llu but the extent "
+		    "reference tree did not follow (%d) -- this checkpoint "
+		    "must not be written\n", (unsigned long long)first, rv);
+		return (rv);
+	}
+	rv = spine_update(leaf_oid, new_leaf, xid, node);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs: the extent leaf moved to %llu but the spine did "
+		    "not follow (%d) -- this checkpoint must not be written\n",
+		    (unsigned long long)new_leaf, rv);
+		return (rv);
+	}
+	if (leaf_oid == g_apfs.ac_root_tree_oid)
+		g_apfs.ac_root_tree_bno = new_leaf;
+
+	rv = free_blocks(el->el_phys, (uint32_t)blocks);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs: the old run at %llu (%llu blocks) could not be "
+		    "released (%d)\n", (unsigned long long)el->el_phys,
+		    (unsigned long long)blocks, rv);
+		return (rv);
+	}
+	cow_n_data += blocks;
+	*pos = el->el_logical + el->el_len;
+	return (FS_APFS_E_OK);
+
+give_back:
+	(void)free_blocks(first, (uint32_t)blocks);
+	return (rv);
 }
 
 int
 fs_apfs_pwrite(uint64_t id, uint64_t size, uint64_t off, const uint8_t *buf,
     uint32_t len, uint32_t *out_put)
 {
-	struct extent_write	 ew;
+	struct extent_locate	 el;
 	uint8_t			*bounce;
+	uint8_t			*node;
+	uint64_t		 pos;
+	uint64_t		 end;
+	uint32_t		 moved;
+	int			 rv;
 	bool			 stopped;
 
 	if (buf == NULL || out_put == NULL)
 		return (FS_APFS_E_IO);
 	if (!g_apfs.ac_mounted)
 		return (FS_APFS_E_NOMOUNT);
+	if (!g_apfs.ac_ip_valid || g_apfs.ac_ctr_omap_tree == 0)
+		return (FS_APFS_E_NOALLOC);
 
 	*out_put = 0;
 	if (len == 0)
 		return (FS_APFS_E_OK);
 
 	/*
-	 * Growth needs an allocator; refuse the whole write rather than do the
-	 * prefix that happens to fit.  A short write that reports success is
-	 * how a file ends up half-updated with nobody told.
+	 * Growth needs a record inserted, not just moved; refuse the whole
+	 * write rather than do the prefix that happens to fit.  A short write
+	 * that reports success is how a file ends up half-updated with nobody
+	 * told.
 	 */
 	if (off >= size || off + (uint64_t)len > size)
 		return (FS_APFS_E_NOALLOC);
 
 	bounce = kmalloc(APFS_BLOCK_SIZE);
-	if (bounce == NULL)
+	node   = kmalloc(APFS_BLOCK_SIZE);
+	if (bounce == NULL || node == NULL) {
+		kfree(bounce);
+		kfree(node);
 		return (FS_APFS_E_NOMEM);
+	}
 
-	ew.ew_id     = id;
-	ew.ew_buf    = buf;
-	ew.ew_bounce = bounce;
-	ew.ew_size   = size;
-	ew.ew_lo     = off;
-	ew.ew_hi     = off + (uint64_t)len;
-	ew.ew_put    = 0;
-	ew.ew_rv     = FS_APFS_E_OK;
-	stopped = false;
-	if (!btree_walk(g_apfs.ac_root_tree_bno, extent_write, &ew, 0, &stopped))
-		ew.ew_rv = FS_APFS_E_IO;
-	kfree(bounce);
-
-	if (ew.ew_rv != FS_APFS_E_OK)
-		return (ew.ew_rv);
-	/*
-	 * Coverage, checked rather than assumed.  A range no extent record
-	 * describes produces no callback at all -- the walk simply never
-	 * mentions it -- so an unbacked file would otherwise come back as a
-	 * flawless write of nothing.  Silence is not success.
-	 */
-	if (ew.ew_put != (uint64_t)len)
-		return (FS_APFS_E_NOALLOC);
+	pos = off;
+	end = off + (uint64_t)len;
+	rv  = FS_APFS_E_OK;
+	for (moved = 0; pos < end; moved++) {
+		if (moved >= APFS_WRITE_EXTENTS_MAX) {
+			kprintf("apfs: a write of %u bytes at %llu spans more "
+			    "than %u extents -- refused\n", (unsigned)len,
+			    (unsigned long long)off,
+			    (unsigned)APFS_WRITE_EXTENTS_MAX);
+			rv = FS_APFS_E_NOALLOC;
+			goto out;
+		}
+		el.el_id    = id;
+		el.el_want  = pos;
+		el.el_found = false;
+		stopped = false;
+		if (!btree_walk(g_apfs.ac_root_tree_bno, extent_locate, &el, 0,
+		    &stopped)) {
+			rv = FS_APFS_E_IO;
+			goto out;
+		}
+		/*
+		 * Coverage, checked rather than assumed.  A range no extent
+		 * record describes is not an error the walk reports -- it
+		 * simply never mentions those bytes -- so an unbacked file
+		 * would otherwise come back as a flawless write of nothing.
+		 * Silence is not success.
+		 */
+		if (!el.el_found) {
+			rv = FS_APFS_E_NOALLOC;
+			goto out;
+		}
+		/*
+		 * A hole overlapping the write.  Reading one costs nothing
+		 * because its bytes are defined to be zero; writing one means
+		 * finding it a run and giving the file a record it does not
+		 * have, which is the insert this rung does not do.
+		 */
+		if (el.el_phys == 0) {
+			rv = FS_APFS_E_NOALLOC;
+			goto out;
+		}
+		rv = extent_relocate(&el, buf, off, end, bounce, node, &pos);
+		if (rv != FS_APFS_E_OK)
+			goto out;
+	}
 
 	*out_put = len;
-	return (FS_APFS_E_OK);
+out:
+	kfree(bounce);
+	kfree(node);
+	return (rv);
 }
 
 /*
@@ -3653,6 +3849,122 @@ omap_replace_cow(uint64_t node_bno, uint64_t oid, uint64_t xid, uint64_t paddr,
 }
 
 /*
+ * A run of blocks has moved: tell the OTHER tree that names it.
+ *
+ * The file-system tree answers "where are this file's bytes"; the extent
+ * reference tree answers the reverse -- who owns this run, and how many
+ * references it has -- which is what lets a block be shared between clones and
+ * counted.  Both describe the same run, and apfsck checks one against the
+ * other, so a file whose bytes move without this is a file the checker finds.
+ *
+ * The record's KEY is the run's first block, which is what makes this
+ * different from patching a file extent: the key changes, so the record sorts
+ * somewhere else.  Nothing is inserted or removed for all that -- the count is
+ * the same and so are the sizes, so the key and value keep the bytes they
+ * already occupy and only their entry in the table of contents moves.  That is
+ * deliberate: a B-tree insert has to find room and a node with none has to
+ * split, which is the rung after this one.
+ */
+static int
+extref_move(uint64_t old_start, uint64_t new_start, uint64_t blocks,
+    uint64_t xid, void *buf)
+{
+	struct apfs_btree_node_phys	*n;
+	struct apfs_phys_ext_val	*pv;
+	struct btree_layout		 bl;
+	struct apfs_kvloc		*kv;
+	struct apfs_kvloc		 save;
+	uint8_t				*node;
+	uint64_t			 raw;
+	uint64_t			 new_bno;
+	uint32_t			 koff, klen, voff, vlen;
+	uint32_t			 i;
+	uint32_t			 pos;
+	int				 rv;
+
+	if (g_apfs.ac_extref_bno == 0)
+		return (FS_APFS_E_NOTFOUND);
+	rv = fs_apfs_read_block(g_apfs.ac_extref_bno, buf);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	node = buf;
+	n    = (struct apfs_btree_node_phys *)node;
+	btree_layout(node, &bl);
+	if (bl.bl_level != 0) {
+		kprintf("apfs: the extent reference tree at %llu has grown to "
+		    "level %u -- this writer only knows a single node\n",
+		    (unsigned long long)g_apfs.ac_extref_bno,
+		    (unsigned)bl.bl_level);
+		return (FS_APFS_E_INVAL);
+	}
+	if (bl.bl_fixed || bl.bl_nkeys == 0)
+		return (FS_APFS_E_INVAL);
+
+	for (i = 0; i < bl.bl_nkeys; i++) {
+		btree_entry_loc(&bl, i, &koff, &klen, &voff, &vlen);
+		raw = *(const uint64_t *)(bl.bl_keys + koff);
+		if ((raw >> APFS_J_OBJ_TYPE_SHIFT) != APFS_TYPE_EXTENT)
+			continue;
+		if ((raw & APFS_J_OBJ_ID_MASK) != old_start)
+			continue;
+		if (vlen < sizeof(*pv))
+			return (FS_APFS_E_INVAL);
+		break;
+	}
+	if (i == bl.bl_nkeys) {
+		kprintf("apfs: no physical extent record starts at %llu -- the "
+		    "run being moved is not the whole of one\n",
+		    (unsigned long long)old_start);
+		return (FS_APFS_E_NOTFOUND);
+	}
+
+	/*
+	 * Length in BLOCKS here, in bytes in the file extent.  Checked rather
+	 * than trusted: a run relocated as a whole must be exactly one record,
+	 * and moving a record that describes a different span would leave the
+	 * two trees each internally consistent and disagreeing with each other.
+	 */
+	pv = (struct apfs_phys_ext_val *)(bl.bl_vals - voff);
+	if ((pv->pe_len_and_kind & APFS_PEXT_LEN_MASK) != blocks) {
+		kprintf("apfs: the extent at %llu is %llu blocks here and %llu "
+		    "in the file -- not moving it\n",
+		    (unsigned long long)old_start,
+		    (unsigned long long)(pv->pe_len_and_kind &
+		    APFS_PEXT_LEN_MASK), (unsigned long long)blocks);
+		return (FS_APFS_E_INVAL);
+	}
+
+	*(uint64_t *)(bl.bl_keys + koff) = new_start |
+	    ((uint64_t)APFS_TYPE_EXTENT << APFS_J_OBJ_TYPE_SHIFT);
+
+	/* Lift the entry out, find where the new key sorts, put it back. */
+	kv   = (struct apfs_kvloc *)(node + APFS_BTNODE_HDR_SIZE +
+	    n->btn_table_space.nl_off);
+	save = kv[i];
+	for (pos = i; pos + 1 < bl.bl_nkeys; pos++)
+		kv[pos] = kv[pos + 1];
+	for (pos = 0; pos + 1 < bl.bl_nkeys; pos++) {
+		raw = *(const uint64_t *)(bl.bl_keys + kv[pos].k.nl_off);
+		if ((raw & APFS_J_OBJ_ID_MASK) > new_start)
+			break;
+	}
+	for (i = bl.bl_nkeys - 1; i > pos; i--)
+		kv[i] = kv[i - 1];
+	kv[pos] = save;
+
+	rv = cow_physical(g_apfs.ac_extref_bno, xid, buf, &new_bno);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	/*
+	 * PHYSICAL, so nothing resolves an oid to find it: the volume
+	 * superblock names its block outright, and spine_update writes this
+	 * number in when it copies that superblock.
+	 */
+	g_apfs.ac_extref_bno = new_bno;
+	return (FS_APFS_E_OK);
+}
+
+/*
  * A virtual object has moved to `paddr`.  Make that the answer everything
  * from here to the container superblock gives.
  *
@@ -3701,6 +4013,15 @@ spine_update(uint64_t oid, uint64_t paddr, uint64_t xid, void *buf)
 		return (rv);
 	vsb = (struct apfs_superblock *)buf;
 	vsb->apfs_omap_oid = new_vol_omap;
+	/*
+	 * The extent reference tree is named from here too, and it moves for
+	 * its own reasons -- a file's bytes changing address -- which have
+	 * nothing to do with the object map.  Writing it unconditionally is
+	 * what keeps the two from having to know about each other: whoever
+	 * moved it left the new address in ac_extref_bno, and if nobody did,
+	 * this writes back what is already there.
+	 */
+	vsb->apfs_extentref_tree_oid = g_apfs.ac_extref_bno;
 	rv = alloc_blocks(1, 0, &bno);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
@@ -4075,6 +4396,154 @@ out:
 	kfree(cib_buf);
 	kfree(sm_buf);
 	kfree(bm_buf);
+}
+
+/*
+ * A WRITE MOVES THE BYTES, AND THE CHECKPOINT BEHIND IT KEEPS ITS OWN
+ *
+ * The claim in one sentence: after a write, the block the live checkpoint
+ * still names holds exactly what it held.  Everything the last several rungs
+ * built is worth nothing to a file's contents unless that is true -- an intact
+ * ring of superblocks leading to bytes that have since been overwritten is a
+ * ring of superblocks that lies.
+ *
+ * Asked of the block rather than of the file, and read RAW, because the point
+ * is what is on the platter at an address nothing in this kernel is pointing
+ * at any more.  A reader that followed the current records would be shown the
+ * new copy and would agree with itself all the way to being wrong.
+ */
+#define	APFS_DATA_PATTERN	"style9 relocated these bytes."
+
+void
+fs_apfs_data_selftest(const char *path)
+{
+	uint8_t		*block;
+	uint8_t		 before[32];
+	uint8_t		 after[32];
+	const char	*pat = APFS_DATA_PATTERN;
+	uint64_t	 id;
+	uint64_t	 size;
+	uint64_t	 ino;
+	uint64_t	 old_phys;
+	uint64_t	 new_phys;
+	uint32_t	 put;
+	uint32_t	 n;
+	uint32_t	 i;
+	int		 rv;
+
+	if (!g_apfs.ac_mounted || !g_apfs.ac_ip_valid) {
+		kprintf("apfs-data: nothing writable -- skipped\n");
+		return;
+	}
+	if (fs_apfs_open(path, &id, &size, &ino) != FS_APFS_E_OK) {
+		kprintf("apfs-data: %s absent -- skipped\n", path);
+		return;
+	}
+	n = (uint32_t)str_len(pat);
+	if (size < sizeof(before) || n > sizeof(before)) {
+		kprintf("apfs-data: %s too small -- skipped\n", path);
+		return;
+	}
+
+	block = kmalloc(APFS_BLOCK_SIZE);
+	if (block == NULL) {
+		kprintf("apfs-data: no memory -- skipped\n");
+		return;
+	}
+
+	if (extent_at(id, 0, &old_phys) != FS_APFS_E_OK || old_phys == 0) {
+		kprintf("apfs-data: FAIL no extent describes byte 0\n");
+		goto out;
+	}
+	if (fs_apfs_read_block_raw(old_phys, block) != FS_APFS_E_OK) {
+		kprintf("apfs-data: FAIL block %llu will not read\n",
+		    (unsigned long long)old_phys);
+		goto out;
+	}
+	for (i = 0; i < sizeof(before); i++)
+		before[i] = block[i];
+
+	rv = fs_apfs_pwrite(id, size, 0, (const uint8_t *)pat, n, &put);
+	if (rv != FS_APFS_E_OK || put != n) {
+		kprintf("apfs-data: FAIL the write was refused (%d, %u of "
+		    "%u)\n", rv, (unsigned)put, (unsigned)n);
+		goto out;
+	}
+	if (fs_apfs_checkpoint() != FS_APFS_E_OK) {
+		kprintf("apfs-data: FAIL the checkpoint was refused -- the "
+		    "write is lost, which is the correct outcome\n");
+		goto out;
+	}
+
+	/*
+	 * THE FIRST CLAIM.  The bytes are somewhere else now.  A write that
+	 * landed back on the same block passes every read-back check in this
+	 * kernel and fails this one, which is the whole rung.
+	 */
+	if (extent_at(id, 0, &new_phys) != FS_APFS_E_OK) {
+		kprintf("apfs-data: FAIL the extent is gone after the write\n");
+		goto out;
+	}
+	if (new_phys == old_phys) {
+		kprintf("apfs-data: FAIL the file's bytes were written in "
+		    "place at %llu -- every checkpoint behind this one now "
+		    "describes contents it never had\n",
+		    (unsigned long long)old_phys);
+		goto out;
+	}
+
+	/* THE SECOND.  The new block really did receive the write. */
+	if (fs_apfs_read_block_raw(new_phys, block) != FS_APFS_E_OK) {
+		kprintf("apfs-data: FAIL block %llu will not read\n",
+		    (unsigned long long)new_phys);
+		goto out;
+	}
+	for (i = 0; i < n; i++) {
+		if (block[i] == (uint8_t)pat[i])
+			continue;
+		kprintf("apfs-data: FAIL byte %u of the new block at %llu is "
+		    "0x%02x, wanted 0x%02x\n", (unsigned)i,
+		    (unsigned long long)new_phys, (unsigned)block[i],
+		    (unsigned)(uint8_t)pat[i]);
+		goto out;
+	}
+
+	/*
+	 * THE THIRD, and the one the rung exists for.  The old block is the
+	 * one every checkpoint written before this still names, and it has to
+	 * read as it did -- not merely "as something valid", but byte for byte
+	 * what was there before the write.
+	 */
+	if (fs_apfs_read_block_raw(old_phys, block) != FS_APFS_E_OK) {
+		kprintf("apfs-data: FAIL block %llu will not read back\n",
+		    (unsigned long long)old_phys);
+		goto out;
+	}
+	for (i = 0; i < sizeof(before); i++)
+		after[i] = block[i];
+	for (i = 0; i < sizeof(before); i++) {
+		if (after[i] == before[i])
+			continue;
+		kprintf("apfs-data: FAIL byte %u of the block the live "
+		    "checkpoint names (%llu) changed from 0x%02x to 0x%02x\n",
+		    (unsigned)i, (unsigned long long)old_phys,
+		    (unsigned)before[i], (unsigned)after[i]);
+		goto out;
+	}
+
+	/* Put the file back, which relocates it once more. */
+	rv = fs_apfs_pwrite(id, size, 0, before, sizeof(before), &put);
+	if (rv != FS_APFS_E_OK || fs_apfs_checkpoint() != FS_APFS_E_OK) {
+		kprintf("apfs-data: FAIL the restore did not land (%d)\n", rv);
+		goto out;
+	}
+
+	kprintf("apfs-data: PASS -- %s moved %llu -> %llu, the new run has "
+	    "the write, and the run the live checkpoint still names is "
+	    "unchanged\n", path, (unsigned long long)old_phys,
+	    (unsigned long long)new_phys);
+out:
+	kfree(block);
 }
 
 /*
@@ -4853,16 +5322,19 @@ fs_apfs_stats(void)
 	 */
 	if (g_apfs.ac_ip_valid)
 		kprintf("apfs: pool %llu+%llu -- %llu taken, %llu returned; "
-		    "%llu metadata and %llu spine blocks moved; device %llu "
-		    "taken, %llu released\n",
+		    "%llu metadata, %llu spine and %llu file blocks moved; "
+		    "device %llu taken, %llu released; %llu chunk bitmap(s) "
+		    "held\n",
 		    (unsigned long long)g_apfs.ac_ip_base,
 		    (unsigned long long)g_apfs.ac_ip_blocks,
 		    (unsigned long long)ip_n_alloc,
 		    (unsigned long long)ip_n_free,
 		    (unsigned long long)cow_n_meta,
 		    (unsigned long long)cow_n_spine,
+		    (unsigned long long)cow_n_data,
 		    (unsigned long long)alloc_n_taken,
-		    (unsigned long long)alloc_n_given);
+		    (unsigned long long)alloc_n_given,
+		    (unsigned long long)chunk_n_admit);
 
 	/*
 	 * And the queues.  The number to watch is what is still waiting: it

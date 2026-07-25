@@ -537,7 +537,12 @@ fs_handle_stats(void)
  * power cycle proves it reached the platter, which is the only claim that
  * actually matters and the only one a cache cannot fake.
  */
-#define	SELFTEST_MARK	"style9 wrote this in place.\n"
+/*
+ * The text used to read "style9 wrote this in place", which was true and is
+ * the thing the write path stopped doing: bytes are copied to fresh blocks
+ * now, so that the checkpoint behind this one keeps the contents it described.
+ */
+#define	SELFTEST_MARK	"style9 moved these bytes to write them.\n"
 
 static int
 same(const uint8_t *a, const uint8_t *b, size_t n)
@@ -722,3 +727,16 @@ fs_write_selftest(void)
 	kprintf("apfs-write: PASS -- marker written at %s:0; a reboot should "
 	    "find it\n", SELFTEST_PATH);
 }
+
+/* As above, and about the same file every other write test uses. */
+void
+fs_data_selftest(void)
+{
+
+	if (!fs_apfs_ready())
+		return;
+	mutex_lock(&fs_lock);
+	fs_apfs_data_selftest(SELFTEST_PATH);
+	mutex_unlock(&fs_lock);
+}
+

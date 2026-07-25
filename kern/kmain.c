@@ -162,6 +162,13 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	fs_ckpt_selftest();
 
 	/*
+	 * And what all of it is for: a write that leaves the checkpoint behind
+	 * it describing the bytes it actually had.  Last, because it is the
+	 * only one of these that moves a file's contents.
+	 */
+	fs_data_selftest();
+
+	/*
 	 * Register a demo service under the bootstrap port so ring-3
 	 * code has something to look up.  MACH_PORT_TASK_SELF=1 in
 	 * kernel_space resolves to kernel_task's task_self port; we

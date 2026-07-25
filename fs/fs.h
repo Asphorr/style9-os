@@ -263,6 +263,13 @@ int		fs_sync(void);
 void		fs_ckpt_selftest(void);
 
 /*
+ * Prove that writing a file MOVES its bytes: the run the live checkpoint still
+ * names must read as it did.  Silently does nothing when the volume is not
+ * APFS.
+ */
+void		fs_data_selftest(void);
+
+/*
  * The volume generation, and what it has caught: how many handles were older
  * than the volume when used, and how many of those had a length that really
  * had moved.  The first number moving proves the check is alive; the second
