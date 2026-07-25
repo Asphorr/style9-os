@@ -73,7 +73,11 @@ file moving between them changes no `#include` anywhere.
 | dev/NAME | `dev/dev_subsystem.c` | generic driver protocol -- each driver registers a control port under `dev/<short>`; ops `DEV_OP_INFO` (kind + flags) and `DEV_OP_OPEN_STREAM` (returns a stream port via MOVE_RECEIVE).  Ring-3 client wrapper is `dev_open_stream(name)` in libstyle9 |
 | kbd drv | `dev/kbd_drv.c` | bridges the PS/2 IRQ ring to a stream port; sh.elf opens `dev/kbd` and recv's keypresses one at a time |
 | uart drv | `dev/uart_drv.c` | COM1 RX IRQ to a stream port via the same `dev/uart` protocol |
-| ata drv | `dev/ata_drv.c` | LBA28+LBA48 ATA PIO driver, exposed as `dev/disk0` -- block device handle, no filesystem yet |
+| ata drv | `dev/ata_drv.c` | LBA28+LBA48 ATA PIO driver, exposed as `dev/disk0`, and the door the filesystems below come in through.  Every write ends in FLUSH CACHE, which is what lets a checkpoint rely on the order it wrote its blocks in |
+| block cache | `fs/bio.c` | 4 KiB buffers over `dev/disk0`.  A write goes to the device first and patches the resident page after, rather than invalidating the cache -- otherwise every write would re-read the tree it had just walked |
+| fs | `fs/fs.c`, `fs/fs.h` | the neutral layer, and the only door: one volume, one sleeping lock, handles that carry the backend's own name for a file's bytes plus a volume generation, so a length copied before somebody else changed it is noticed rather than trusted.  `fs_slurp / open / pread / pwrite / truncate / stat / readdir / sync` |
+| apfs | `fs/fs_apfs.c` (7.6 kloc), `fs/fs_txn.c` | a clean-room APFS **writer**, on a container `mkapfs` made.  Reads: checkpoint ring, object maps, the file-system B-tree, extents, extended fields.  Writes: Fletcher-64 forwards, an allocator over the chunk bitmaps, copy-on-write of every object from the edited leaf up to the container superblock, checkpoints (the superblock landing is the commit), free queues that hold a released block for as long as an older checkpoint still names it, records inserted and removed, nodes split, and files that grow and shrink.  Eight boot self-tests -- `apfs-write / alloc / spine / ckpt / data / trunc / grow / split` -- and `apfsck` from `apfsprogs` is the outside oracle: silent on every image this kernel has written |
+| fat | `fs/fs_fat.c` | FAT16/32 reader for the smoke-test image; writes answer `FS_E_ROFS`, which is a different answer from "that write was too ambitious" and means a different thing |
 | tty | `dev/tty.c` | VT-style ANSI CSI state machine over the VGA console: CUP/CUU-CUB/ED/EL/SGR, DECSTBM scrolling region, DECTCEM cursor visibility, DEC's deferred wrap (a line exactly 80 columns wide costs one row, not two), and a hardware CRTC cursor programmed once per write rather than once per byte.  Three boot selftests read the CRTC and the cell grid back rather than asking the driver what it believes |
 | user shell | `user/sh.c` | sh.elf, the ring-3 shell.  Apple/BSD-flavoured manpage TUI: NAME/SYSTEM/SEE ALSO sections, gray-on-black with bold-white labels, horizontal rule, and a status bar with uptime that lives above the scrolling region so no amount of output can carry it away.  Full line editor (arrows, Home/End, Delete, emacs control keys, 16 lines of history, Tab completion) and a less(1)-shaped pager for `man`.  Builtins: `help / echo / clear / about / ool / man / kill`.  Spawnable: any program in the registry, listed via `svc/progreg` |
 | user demos | `user/hello.c`, `user/clock.c`, `user/tasks.c` | ring-3 exercises: port self-send + round-trip, recv_timed, task_self RPC, bootstrap_lookup chain, OOL round-trip via svc/echool, clock service consumer, task list service consumer |
@@ -297,9 +301,13 @@ Loosely Mach-shape rather than BSD-shape:
   16 bytes; `MACH_MSGH_BITS_COMPLEX`).  Descriptor area is variable-
   stride -- byte 0 of every descriptor is the type tag, the walker
   dispatches on it and advances by the descriptor's size.  Port
-  descriptors carry capabilities; OOL descriptors carry bulk memory
-  copied into freshly-allocated frames in the receiver's pmap (physical
-  copy in v1; virtual copy / COW deferred).
+  descriptors carry capabilities; OOL descriptors carry bulk memory,
+  and carrying it is a page-table operation rather than a copy -- the
+  sender's frames are write-protected and handed over, the receiver
+  maps them read-only under an entry that says writable, and only a
+  receiver that actually writes takes the copy-on-write fault.  There
+  was a staging buffer here once, which cost two copies of every
+  payload for a middle step neither party looked at.
 - Port descriptors in messages translate names between the sender's
   `port_space` and the receiver's, transferring capabilities.  The
   same code path serves single-space (kernel ↔ kernel) and multi-space
@@ -363,12 +371,18 @@ The same kernel-side `mach_msg_send` / `mach_msg_recv_timed` that the
 14 stress tests exercise is what userspace calls -- the syscall layer
 just range-checks the user pointer and forwards.
 
-Next on the roadmap: the XNU binary-compatibility ladder above continues
-with S4 -- a minimal libSystem + dyld, where unmodified Apple binaries run.
-Also open: a filesystem on `dev/disk0` so programs can live on disk instead
-of being embedded; virtual-copy (COW) OOL semantics; real SMP.  (SMAP
-user-pointer bracketing, the `vm_allocate` syscall, and the S1-S3 rungs of
-the XNU ladder, once on this list, have since landed.)
+Next on the roadmap: files that can be **created and removed**, which is
+the last thing standing between the APFS writer and a volume programs
+could actually live on -- a name has to go into a directory, an inode
+number has to come from somewhere, and both directions of that have to
+survive `apfsck`.  Then a B-tree that can grow a level, so a root that is
+its own leaf stops being a ceiling.  Also open: real SMP.
+
+(SMAP user-pointer bracketing, the `vm_allocate` syscall, the whole XNU
+ladder through S4 -- a clean-room dyld and libSystem, under which
+unmodified Apple binaries run -- a filesystem on `dev/disk0`, and
+virtual-copy OOL semantics were all on this list once and have since
+landed.)
 
 ## License
 
