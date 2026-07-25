@@ -62,6 +62,9 @@ extern uint8_t	_binary_launchctl_elf_end[];
 extern uint8_t	_binary_loopchild_elf_start[];
 extern uint8_t	_binary_loopchild_elf_end[];
 
+extern uint8_t	_binary_oolchild_elf_start[];
+extern uint8_t	_binary_oolchild_elf_end[];
+
 extern uint8_t	_binary_selfkill_elf_start[];
 extern uint8_t	_binary_selfkill_elf_end[];
 
@@ -315,6 +318,8 @@ progreg_init(void)
 	    _binary_launchctl_elf_start, _binary_launchctl_elf_end);
 	register_one("loopchild",
 	    _binary_loopchild_elf_start, _binary_loopchild_elf_end);
+	register_one("oolchild",
+	    _binary_oolchild_elf_start, _binary_oolchild_elf_end);
 	register_one("selfkill",
 	    _binary_selfkill_elf_start, _binary_selfkill_elf_end);
 	register_one("top",

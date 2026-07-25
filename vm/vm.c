@@ -15,6 +15,7 @@
 #include "panic.h"
 #include "pmap.h"
 #include "pmm.h"
+#include "smap.h"
 #include "spinlock.h"
 #include "vm.h"
 #include "vm_object.h"
@@ -46,6 +47,8 @@ static uint64_t	vm_n_cow_steal;		/* ...that found no other owner */
 static uint64_t	vm_n_cow_race;		/* ...that lost to another one  */
 static uint64_t	vm_n_image_borrowed;	/* program pages mapped in situ */
 static uint64_t	vm_n_image_copied;	/* ...allocated and filled      */
+static uint64_t	vm_n_payload_shared;	/* OOL pages shared with sender */
+static uint64_t	vm_n_payload_copied;	/* ...that had to be copied     */
 
 /*
  * Drop one entry.  An entry owns a reference on its object, so releasing the
@@ -315,6 +318,226 @@ vm_map_fork_share(struct vm_map *src, struct pmap *src_pm,
 		}
 	}
 	return (true);
+}
+
+/* ---- payloads of pages, carried between address spaces ------------------ */
+
+/*
+ * Fill one freshly allocated frame with the slice of a payload that belongs
+ * in it, zeroing whatever the payload does not reach.  `src` may be a user
+ * address, which is why the caller must hold no lock: touching a page the
+ * sender has not faulted in yet takes a fault, and that fault wants the map
+ * lock this would otherwise be holding.
+ */
+static uint64_t
+page_from_bytes(const uint8_t *src, uint64_t off, uint64_t size, bool user)
+{
+	uint8_t		*kva;
+	uint64_t	 pa;
+	uint64_t	 have;
+	size_t		 i;
+
+	pa = pmm_alloc_page();
+	if (pa == PA_INVALID)
+		return (PA_INVALID);
+	kva = (uint8_t *)pmm_kva_from_pa(pa);
+
+	have = size - off;
+	if (have > VM_PAGE_SIZE)
+		have = VM_PAGE_SIZE;
+
+	if (user)
+		smap_user_access_begin();
+	for (i = 0; i < have; i++)
+		kva[i] = src[off + i];
+	if (user)
+		smap_user_access_end();
+	for (i = (size_t)have; i < VM_PAGE_SIZE; i++)
+		kva[i] = 0;
+
+	return (pa);
+}
+
+size_t
+vm_pages_capture_kernel(const void *src, uint64_t size, uint64_t *pa_out,
+    size_t max_pages)
+{
+	size_t	i, npages;
+
+	if (src == NULL || pa_out == NULL || size == 0)
+		return (0);
+	npages = (size_t)(VM_ALIGN_UP(size) >> VM_PAGE_SHIFT);
+	if (npages > max_pages)
+		return (0);
+
+	for (i = 0; i < npages; i++) {
+		pa_out[i] = page_from_bytes((const uint8_t *)src,
+		    (uint64_t)i * VM_PAGE_SIZE, size, false);
+		if (pa_out[i] == PA_INVALID) {
+			vm_pages_release(pa_out, i);
+			return (0);
+		}
+		vm_n_payload_copied++;
+	}
+	return (npages);
+}
+
+size_t
+vm_pages_capture_user(struct vm_map *map, struct pmap *pm, uint64_t addr,
+    uint64_t size, uint64_t *pa_out, size_t max_pages)
+{
+	struct vm_map_entry	*e;
+	uint64_t		 va;
+	size_t			 i, npages, taken;
+
+	if (map == NULL || pm == NULL || pa_out == NULL || size == 0)
+		return (0);
+	npages = (size_t)(VM_ALIGN_UP(size) >> VM_PAGE_SHIFT);
+	if (npages > max_pages)
+		return (0);
+
+	for (i = 0; i < npages; i++)
+		pa_out[i] = PA_INVALID;
+
+	/*
+	 * First pass, under the lock: claim every page that can be shared.
+	 * Nothing here can fault -- it reads page tables, not memory -- which
+	 * is what makes it safe to do with the map lock held, and the copies
+	 * that cannot be avoided are deliberately left to the second pass.
+	 */
+	taken = 0;
+	if ((addr & VM_PAGE_MASK) == 0) {
+		spin_lock(&map->vm_lock);
+		e = vm_map_lookup(map, addr);
+		/*
+		 * One anonymous entry has to cover the whole payload.  A range
+		 * that spans entries would need each one marked, and a range
+		 * over borrowed frames must not be reference-counted at all
+		 * (vm/pmm.h) -- neither is worth the code for a case that only
+		 * arises when a sender points at something other than a buffer
+		 * it allocated.  Both simply fall through to copying.
+		 */
+		if (e != NULL && (e->vme_flags & VME_F_ANON) != 0 &&
+		    e->vme_end >= addr + (uint64_t)npages * VM_PAGE_SIZE) {
+			for (i = 0; i < npages; i++) {
+				uint64_t	pa;
+
+				/* Partial last page: never shared. */
+				if ((uint64_t)(i + 1) * VM_PAGE_SIZE > size)
+					break;
+				va = addr + (uint64_t)i * VM_PAGE_SIZE;
+				pa = pmap_extract(pm, va);
+				if (pa == PA_INVALID)
+					continue;	/* not faulted in yet */
+				pmm_page_ref(pa);
+				/*
+				 * The sender keeps reading it and stops being
+				 * able to write it.  A range that was already
+				 * read-only needs neither.
+				 */
+				if ((e->vme_prot & VM_PROT_WRITE) != 0 &&
+				    !pmap_enter(pm, va, pa, (uint8_t)
+				    (e->vme_prot & ~VM_PROT_WRITE))) {
+					pmm_free_page(pa);
+					continue;
+				}
+				pa_out[i] = pa;
+				taken++;
+			}
+			if (taken != 0 && (e->vme_prot & VM_PROT_WRITE) != 0)
+				e->vme_flags |= VME_F_COW;
+		}
+		spin_unlock(&map->vm_lock);
+	}
+	vm_n_payload_shared += taken;
+
+	/* Second pass, nothing held: everything sharing could not take. */
+	for (i = 0; i < npages; i++) {
+		if (pa_out[i] != PA_INVALID)
+			continue;
+		pa_out[i] = page_from_bytes((const uint8_t *)(uintptr_t)addr,
+		    (uint64_t)i * VM_PAGE_SIZE, size, true);
+		if (pa_out[i] == PA_INVALID) {
+			vm_pages_release(pa_out, npages);
+			return (0);
+		}
+		vm_n_payload_copied++;
+	}
+	return (npages);
+}
+
+bool
+vm_pages_install(struct vm_map *map, struct pmap *pm, const uint64_t *pas,
+    size_t npages, uint64_t *va_out)
+{
+	uint64_t	 landing;
+	uint64_t	 span;
+	size_t		 i;
+
+	if (map == NULL || pm == NULL || pas == NULL || npages == 0 ||
+	    va_out == NULL)
+		return (false);
+
+	span = (uint64_t)npages * VM_PAGE_SIZE;
+	if (!vm_map_find_space(map, span, &landing))
+		return (false);
+
+	/*
+	 * The entry says writable, the hardware says not.  That gap is the
+	 * mechanism: a receiver that only reads goes on sharing the sender's
+	 * frames, and one that writes takes a fault and gets its own page.
+	 */
+	if (!vm_map_enter(map, landing, span,
+	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_USER,
+	    VME_F_ANON | VME_F_COW))
+		return (false);
+
+	for (i = 0; i < npages; i++) {
+		if (pmap_enter(pm, landing + (uint64_t)i * VM_PAGE_SIZE,
+		    pas[i], VM_PROT_READ | VM_PROT_USER))
+			continue;
+		/*
+		 * Undo the mappings but NOT the frames: they still belong to
+		 * whoever captured them, who will release them when it learns
+		 * this failed.  Freeing here as well is the double-free this
+		 * split of ownership exists to prevent.
+		 */
+		while (i-- > 0)
+			(void)pmap_remove(pm,
+			    landing + (uint64_t)i * VM_PAGE_SIZE);
+		(void)vm_map_remove(map, landing, span);
+		return (false);
+	}
+
+	*va_out = landing;
+	return (true);
+}
+
+void
+vm_pages_release(const uint64_t *pas, size_t npages)
+{
+	size_t	i;
+
+	if (pas == NULL)
+		return;
+	for (i = 0; i < npages; i++)
+		if (pas[i] != PA_INVALID)
+			pmm_free_page(pas[i]);
+}
+
+void
+vm_pages_stats(void)
+{
+	uint64_t	total;
+
+	total = vm_n_payload_shared + vm_n_payload_copied;
+	if (total == 0)
+		return;
+	kprintf("vm: %llu message payload pages -- %llu shared with the "
+	    "sender, %llu copied\n",
+	    (unsigned long long)total,
+	    (unsigned long long)vm_n_payload_shared,
+	    (unsigned long long)vm_n_payload_copied);
 }
 
 /* See vm.h for what this decides and why both loaders share it. */

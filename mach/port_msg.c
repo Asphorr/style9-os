@@ -50,6 +50,8 @@
 
 /* ---- message-queue helpers ----------------------------------------- */
 
+static void	pd_ool_drop(struct port_pending_desc *pd);
+
 static int
 msg_validate(const struct mach_msg_header *h)
 {
@@ -247,12 +249,35 @@ free_pending_descs(struct port_pending_desc *descs, size_t n)
 		    descs[i].pd_port != NULL) {
 			port_deref(descs[i].pd_port,
 			    descs[i].pd_disposition);
-		} else if (descs[i].pd_type == MACH_MSG_OOL_DESCRIPTOR &&
-		    descs[i].pd_ool_buf != NULL) {
-			kfree(descs[i].pd_ool_buf);
+		} else if (descs[i].pd_type == MACH_MSG_OOL_DESCRIPTOR) {
+			pd_ool_drop(&descs[i]);
 		}
 	}
 	kfree(descs);
+}
+
+/*
+ * Give up an in-flight OOL payload.  Every exit that is not delivery ends
+ * here: a message destroyed on a full queue, a send that fails after some of
+ * its descriptors were captured, a port torn down with mail still in it.
+ *
+ * The frames are the message's while it is in flight, so releasing them is
+ * releasing a reference -- a page shared with its sender goes on existing,
+ * a page copied for the message does not.  Delivery is the one path that
+ * must NOT come here: it hands the same frames to the receiver instead, and
+ * dropping them as well would take back what was just given.
+ */
+static void
+pd_ool_drop(struct port_pending_desc *pd)
+{
+
+	if (pd->pd_ool_pages == NULL)
+		return;
+	vm_pages_release(pd->pd_ool_pages, pd->pd_ool_npages);
+	kfree(pd->pd_ool_pages);
+	pd->pd_ool_pages  = NULL;
+	pd->pd_ool_npages = 0;
+	pd->pd_ool_size   = 0;
 }
 
 /* ---- notifications --------------------------------------------------- */
@@ -355,7 +380,8 @@ port_exception_post(struct port *port, uint32_t trapno, uint32_t err,
 		descs[0].pd_type        = MACH_MSG_PORT_DESCRIPTOR;
 		descs[0].pd_disposition = MACH_PORT_RIGHT_SEND;
 		descs[0].pd_port        = reply_port;
-		descs[0].pd_ool_buf     = NULL;
+		descs[0].pd_ool_pages   = NULL;
+		descs[0].pd_ool_npages  = 0;
 		descs[0].pd_ool_size    = 0;
 		port_ref(reply_port, MACH_PORT_RIGHT_SEND);
 		local_disp = MACH_MSG_TYPE_MAKE_SEND;
@@ -413,9 +439,10 @@ send_xlate_desc(struct port_space *from, mach_port_name_t name,
 	struct port	*p;
 	uint8_t		 rights;
 
-	pd->pd_type     = MACH_MSG_PORT_DESCRIPTOR;
-	pd->pd_ool_buf  = NULL;
-	pd->pd_ool_size = 0;
+	pd->pd_type       = MACH_MSG_PORT_DESCRIPTOR;
+	pd->pd_ool_pages  = NULL;
+	pd->pd_ool_npages = 0;
+	pd->pd_ool_size   = 0;
 
 	switch (disposition) {
 	case MACH_MSG_TYPE_MOVE_RECEIVE:
@@ -541,13 +568,21 @@ desc_step(const uint8_t *buf, size_t off, size_t cap, uint8_t *type_out)
 
 /*
  * send_capture_ool: on send, validate the OOL descriptor's sender VA
- * range, kmalloc a staging buffer the size of the payload, and copy
- * the bytes in.  The sender's pmap is current (sender is the calling
- * task), so reading from the user VA is a direct dereference.
+ * range and take the payload's FRAMES away with it.  The sender's pmap is
+ * current (sender is the calling task), so vm_pages_capture_user can read
+ * its page tables directly and share what it can rather than copying.
  *
- * v1 normalises everything to MACH_MSG_PHYSICAL_COPY -- virtual-copy
- * descriptors get upgraded to physical at capture time so the recv
- * path only sees one shape.
+ * There is no staging buffer any more.  There used to be, and it made every
+ * transfer cost two copies of the payload -- into a kmalloc'd buffer here,
+ * out of it into the receiver's fresh frames on the other side -- for a
+ * middle step neither party ever looked at.  Delivery is now a page-table
+ * operation, and even a payload that must be copied is copied once.
+ *
+ * Which pages get shared and which get copied is vm/vm.h's decision, not
+ * this file's.  What matters here is the consequence: a shared page is
+ * write-protected in the sender before this returns, so the receiver is
+ * promised the bytes as they were at the instant of the send even if the
+ * sender scribbles on its buffer immediately afterwards.
  *
  * Per-descriptor `deallocate` IS honoured for ring-3 senders:
  * post-copy, if the sender set deallocate=1 AND the source range
@@ -559,8 +594,8 @@ desc_step(const uint8_t *buf, size_t off, size_t cap, uint8_t *type_out)
  * Kernel and trusted-send senders skip the hook (their addresses
  * are kernel-VA; nothing to vm_map_release).
  *
- * On success the pd carries an owned kmalloc'd buffer that the
- * receive path (or any cleanup path) is responsible for freeing.
+ * On success the pd owns the payload's frames; the receive path takes them
+ * over, and every other exit hands them back through pd_ool_drop.
  */
 static int
 send_capture_ool(struct port_space *from,
@@ -568,18 +603,21 @@ send_capture_ool(struct port_space *from,
     struct port_pending_desc *pd)
 {
 	struct task	*sender;
-	uint8_t		*staging;
+	uint64_t	*pages;
+	size_t		 npages;
+	size_t		 got;
 	uint32_t	 size;
 	uint64_t	 addr;
-	uint32_t	 i;
+	bool		 from_kernel;
 
 	(void)from;	/* sender == current task; from isn't needed */
 
-	pd->pd_type     = MACH_MSG_OOL_DESCRIPTOR;
-	pd->pd_port     = NULL;
-	pd->pd_ool_buf  = NULL;
-	pd->pd_ool_size = 0;
-	pd->pd_ool_copy = MACH_MSG_PHYSICAL_COPY;
+	pd->pd_type       = MACH_MSG_OOL_DESCRIPTOR;
+	pd->pd_port       = NULL;
+	pd->pd_ool_pages  = NULL;
+	pd->pd_ool_npages = 0;
+	pd->pd_ool_size   = 0;
+	pd->pd_ool_copy   = MACH_MSG_PHYSICAL_COPY;
 
 	size = od->size;
 	addr = od->address;
@@ -618,8 +656,10 @@ send_capture_ool(struct port_space *from,
 	 * senders.
 	 */
 	sender = current_thread != NULL ? current_thread->th_task : NULL;
-	if (sender != NULL && sender != kernel_task && sender->t_map != NULL &&
-	    !(current_thread != NULL && current_thread->th_trusted_send)) {
+	from_kernel = (sender == NULL || sender == kernel_task ||
+	    sender->t_map == NULL ||
+	    (current_thread != NULL && current_thread->th_trusted_send));
+	if (!from_kernel) {
 		uint64_t end = addr + size;
 		if (end < addr)
 			return (MACH_E_INVAL);	/* wraparound */
@@ -628,25 +668,31 @@ send_capture_ool(struct port_space *from,
 			return (MACH_E_INVAL);
 	}
 
-	staging = kmalloc((size_t)size);
-	if (staging == NULL)
+	npages = (size_t)((((uint64_t)size + 0xFFFull) & ~0xFFFull) >> 12);
+	pages  = kmalloc(npages * sizeof(uint64_t));
+	if (pages == NULL)
 		return (MACH_E_NOMEM);
 
 	/*
-	 * Sender's pmap is current; direct byte-by-byte copy.  Bracketed
-	 * for SMAP so the kernel can read the U=1 source page once
-	 * CR4.SMAP is enabled.
+	 * A kernel sender's `addr` is a kernel VA in no task's map, so there
+	 * are no page tables to consult and nothing to write-protect: those
+	 * payloads are copied, which is also what keeps a service's .rodata
+	 * from turning into a receiver's writable page.
 	 */
-	{
-		const uint8_t *src = (const uint8_t *)(uintptr_t)addr;
-		smap_user_access_begin();
-		for (i = 0; i < size; i++)
-			staging[i] = src[i];
-		smap_user_access_end();
+	if (from_kernel)
+		got = vm_pages_capture_kernel((const void *)(uintptr_t)addr,
+		    size, pages, npages);
+	else
+		got = vm_pages_capture_user(sender->t_map, sender->t_pmap,
+		    addr, size, pages, npages);
+	if (got != npages) {
+		kfree(pages);
+		return (MACH_E_NOMEM);
 	}
 
-	pd->pd_ool_buf  = staging;
-	pd->pd_ool_size = size;
+	pd->pd_ool_pages  = pages;
+	pd->pd_ool_npages = npages;
+	pd->pd_ool_size   = size;
 
 	/*
 	 * Honour the deallocate-on-send flag for ring-3 senders.  Skip
@@ -657,8 +703,7 @@ send_capture_ool(struct port_space *from,
 	 * that vm_allocate created.  Best-effort: a non-matching range
 	 * silently leaves the sender's VM alone.
 	 */
-	if (od->deallocate != 0 && sender != NULL && sender != kernel_task &&
-	    !(current_thread != NULL && current_thread->th_trusted_send)) {
+	if (od->deallocate != 0 && !from_kernel) {
 		uint64_t aligned = ((uint64_t)size + 0xFFFull) & ~0xFFFull;
 		(void)vm_map_release(sender->t_map, sender->t_pmap,
 		    addr, aligned);
@@ -778,21 +823,19 @@ recv_rollback_ool(struct task *to, uint64_t landing_va,
 }
 
 /*
- * recv_install_ool: on recv, take the captured staging buffer for an
- * OOL descriptor and materialise it in the receiver's address space.
+ * recv_install_ool: on recv, land the payload's frames in the receiver's
+ * address space and tell it where they went.
  *
- *	1. find_space picks a fresh VA in the receiver's vm_map
- *	2. for each page: pmm_alloc a frame, copy the matching slice
- *	   of staging into it, pmap_enter at the landing VA
- *	3. vm_map_enter records the new range so it survives across
- *	   subsequent vm_map walks (and so a future vm_deallocate can
- *	   find + tear it down)
- *	4. patch the receiver-visible OOL descriptor: address is now
- *	   the new VA, type/size remain as the sender sent them
- *	5. free the staging buffer -- the receiver owns the data now
+ * All the work is vm_pages_install's: it finds a free range, records it, and
+ * maps the frames read-only under an entry that says writable, so a receiver
+ * that only reads keeps sharing whatever the sender shared and one that
+ * writes takes a copy-on-write fault.  Nothing is copied here at all.
  *
- * Rolls back via recv_rollback_ool on any per-step failure so a
- * partial install can never leak frames or a vm_map entry.
+ * The ownership handover is the delicate part.  On success the frames belong
+ * to the receiver's map and the descriptor must forget them without
+ * releasing them -- dropping a reference here would take back the pages just
+ * handed over.  On failure nothing was installed, the descriptor still owns
+ * them, and the caller's cleanup path does the releasing.
  */
 static int
 recv_install_ool(struct port_space *to_space,
@@ -801,10 +844,7 @@ recv_install_ool(struct port_space *to_space,
 {
 	struct task	*to;
 	uint64_t	 landing_va = 0;
-	uint64_t	 aligned;
-	size_t		 npages, i;
 	uint32_t	 size;
-	uint8_t		*staging;
 
 	(void)to_space;
 	to   = current_thread != NULL ? current_thread->th_task : NULL;
@@ -823,60 +863,20 @@ recv_install_ool(struct port_space *to_space,
 
 	if (to == NULL || to->t_map == NULL || to->t_pmap == NULL)
 		return (MACH_E_INVAL);
-
-	staging = (uint8_t *)pd->pd_ool_buf;
-	if (staging == NULL)
+	if (pd->pd_ool_pages == NULL)
 		return (MACH_E_INVAL);
 
-	aligned = ((uint64_t)size + PAGE_SIZE - 1u) & ~(uint64_t)PAGE_MASK;
-	npages  = (size_t)(aligned >> PAGE_SHIFT);
-
-	if (!vm_map_find_space(to->t_map, aligned, &landing_va))
+	if (!vm_pages_install(to->t_map, to->t_pmap, pd->pd_ool_pages,
+	    pd->pd_ool_npages, &landing_va))
 		return (MACH_E_NOMEM);
-
-	for (i = 0; i < npages; i++) {
-		uint64_t	 va = landing_va + (uint64_t)i * PAGE_SIZE;
-		uint64_t	 pa;
-		uint8_t		*kva;
-		size_t		 chunk, offset;
-		size_t		 j;
-
-		pa = pmm_alloc_page();
-		if (pa == PA_INVALID) {
-			recv_rollback_ool(to, landing_va, i, 0);
-			return (MACH_E_NOMEM);
-		}
-
-		kva    = (uint8_t *)pmm_kva_from_pa(pa);
-		offset = i * PAGE_SIZE;
-		chunk  = PAGE_SIZE;
-		if (offset + chunk > (size_t)size)
-			chunk = (size_t)size - offset;
-		for (j = 0; j < chunk; j++)
-			kva[j] = staging[offset + j];
-		for (j = chunk; j < PAGE_SIZE; j++)
-			kva[j] = 0;
-
-		if (!pmap_enter(to->t_pmap, va, pa,
-		    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_USER)) {
-			pmm_free_page(pa);
-			recv_rollback_ool(to, landing_va, i, 0);
-			return (MACH_E_NOMEM);
-		}
-	}
-
-	if (!vm_map_enter(to->t_map, landing_va, aligned,
-	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_USER, VME_F_ANON)) {
-		recv_rollback_ool(to, landing_va, npages, 0);
-		return (MACH_E_NOMEM);
-	}
 
 	od_in_buf->address = landing_va;
 
-	/* Receiver owns the pages now; staging is no longer needed. */
-	kfree(pd->pd_ool_buf);
-	pd->pd_ool_buf  = NULL;
-	pd->pd_ool_size = 0;
+	/* Handed over.  Forget them without releasing them. */
+	kfree(pd->pd_ool_pages);
+	pd->pd_ool_pages  = NULL;
+	pd->pd_ool_npages = 0;
+	pd->pd_ool_size   = 0;
 	return (MACH_MSG_OK);
 }
 
@@ -1359,9 +1359,9 @@ fail:
  *		     unmap the range, free the frames, drop the vm_map
  *		     entry.
  *
- * After undoing the install side, walk the remaining descs[] to
- * release ports we never delivered + free OOL staging that's still
- * sitting in pd_ool_buf.
+ * After undoing the install side, walk the remaining descs[] to release
+ * ports we never delivered and give back OOL payloads still owned by their
+ * descriptors.
  */
 static void
 recv_rollback_installed(struct port_space *to, struct port_msg *m,
@@ -1411,9 +1411,8 @@ recv_rollback_installed(struct port_space *to, struct port_msg *m,
 		    m->m_descs[i].pd_port != NULL) {
 			port_deref(m->m_descs[i].pd_port,
 			    m->m_descs[i].pd_disposition);
-		} else if (m->m_descs[i].pd_type == MACH_MSG_OOL_DESCRIPTOR &&
-		    m->m_descs[i].pd_ool_buf != NULL) {
-			kfree(m->m_descs[i].pd_ool_buf);
+		} else if (m->m_descs[i].pd_type == MACH_MSG_OOL_DESCRIPTOR) {
+			pd_ool_drop(&m->m_descs[i]);
 		}
 	}
 }

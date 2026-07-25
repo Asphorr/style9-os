@@ -727,6 +727,121 @@ demo_spawn_inject(void)
 }
 
 /*
+ * demo_ool_from_child: receive a bulk payload sent by ANOTHER RING-3 TASK.
+ *
+ * Every other OOL exercise here talks to a kernel service, and those never
+ * take the path this one does: a special-port destination is dispatched in
+ * the sender's own context, so the kernel never has to move the bytes at
+ * all.  Only a message queued between two user tasks makes it hand the
+ * receiver the sender's frames -- which is what this checks, and what
+ * nothing checked before.
+ *
+ * Two things are verified, and the second is the one worth having:
+ *
+ *	the payload arrived intact -- checked against the pattern computed
+ *	  here, not against a checksum the child sent, so both halves must be
+ *	  independently right;
+ *
+ *	the payload is what the child had AT SEND TIME.  oolchild overwrites
+ *	  its whole buffer the instant the send returns.  If the kernel shared
+ *	  those frames without taking the child's write access away, this
+ *	  reads 0xA5 all through and fails.
+ *
+ * Then it writes to the received range, which must not be visible to anyone
+ * else either -- that is the receiving half of the same mechanism.
+ */
+#define	OOLCHILD_PAGES	3
+#define	OOLCHILD_BYTES	(OOLCHILD_PAGES * 4096u)
+#define	OOLCHILD_TAG	0x00010CA1u
+
+static int
+demo_ool_from_child(void)
+{
+	struct {
+		struct mach_msg_header		hdr;
+		struct mach_msg_body		body;
+		struct mach_msg_ool_descriptor	ool;
+	}			rx;
+	const uint8_t		*got;
+	mach_port_name_t	 work;
+	long			 child_id;
+	unsigned		 i;
+	int			 rv;
+
+	work = mach_port_allocate(MACH_PORT_RIGHT_RECEIVE |
+	    MACH_PORT_RIGHT_SEND);
+	if (work == MACH_PORT_NULL) {
+		printf("  port_allocate(ool work) failed\n");
+		return (80);
+	}
+
+	child_id = spawn_with_port("oolchild", work);
+	if (child_id < 0) {
+		printf("  spawn_with_port('oolchild') failed (rv=%ld)\n",
+		    child_id);
+		(void)mach_port_deallocate(work);
+		return (81);
+	}
+
+	rv = mach_msg_recv_timed(work, &rx.hdr, sizeof(rx), 2000);
+	if (rv != MACH_MSG_OK) {
+		printf("  oolchild payload recv failed (rv=%d)\n", rv);
+		(void)mach_port_deallocate(work);
+		return (82);
+	}
+	if (rx.hdr.msgh_id != OOLCHILD_TAG) {
+		printf("  oolchild tag mismatch: 0x%x\n",
+		    (unsigned)rx.hdr.msgh_id);
+		(void)mach_port_deallocate(work);
+		return (83);
+	}
+	if ((rx.hdr.msgh_bits & MACH_MSGH_BITS_COMPLEX) == 0 ||
+	    rx.body.msgh_descriptor_count != 1 ||
+	    rx.ool.type != MACH_MSG_OOL_DESCRIPTOR ||
+	    rx.ool.size != OOLCHILD_BYTES || rx.ool.address == 0) {
+		printf("  oolchild descriptor malformed\n");
+		(void)mach_port_deallocate(work);
+		return (84);
+	}
+
+	got = (const uint8_t *)(uintptr_t)rx.ool.address;
+	for (i = 0; i < OOLCHILD_BYTES; i++) {
+		if (got[i] == (uint8_t)((i * 31u + 7u) & 0xFFu))
+			continue;
+		printf("  oolchild payload WRONG at %u: 0x%x (0xa5 means the "
+		    "child's post-send writes reached us)\n",
+		    i, (unsigned)got[i]);
+		(void)mach_port_deallocate(work);
+		return (85);
+	}
+
+	/*
+	 * Write into the landed range.  It is mapped writable but its page
+	 * table entries are not, so every page here takes a copy-on-write
+	 * fault and becomes ours -- the receiving half of the same trade.
+	 */
+	{
+		uint8_t	*mine = (uint8_t *)(uintptr_t)rx.ool.address;
+
+		for (i = 0; i < OOLCHILD_BYTES; i++)
+			mine[i] = (uint8_t)(i & 0xFFu);
+		for (i = 0; i < OOLCHILD_BYTES; i++) {
+			if (mine[i] == (uint8_t)(i & 0xFFu))
+				continue;
+			printf("  received range did not keep our write at %u\n",
+			    i);
+			(void)mach_port_deallocate(work);
+			return (86);
+		}
+	}
+
+	printf("  OOL %u bytes from a ring-3 child: intact at send time, "
+	    "writable after: OK\n", OOLCHILD_BYTES);
+	(void)mach_port_deallocate(work);
+	return (0);
+}
+
+/*
  * Exception port end-to-end.  Allocate a watcher port, spawn the
  * dedicated `excchild' program with that port at MACH_PORT_PARENT.
  * `excchild' installs the parent slot as its task's exception port,
@@ -2376,6 +2491,10 @@ main(void)
 		return (rv);
 
 	rv = demo_spawn_inject();
+	if (rv != 0)
+		return (rv);
+
+	rv = demo_ool_from_child();
 	if (rv != 0)
 		return (rv);
 

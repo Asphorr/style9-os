@@ -118,18 +118,30 @@ struct port_notify_node {
  *
  *	MACH_MSG_PORT_DESCRIPTOR	pd_port + pd_disposition carry the
  *					kernel ref taken at send time.
- *	MACH_MSG_OOL_DESCRIPTOR		pd_ool_buf + pd_ool_size carry the
- *					staging copy of the sender's bytes,
- *					kfree'd in cleanup paths.
+ *	MACH_MSG_OOL_DESCRIPTOR		pd_ool_pages + pd_ool_npages carry
+ *					the payload's FRAMES, owned by the
+ *					message until it is delivered or
+ *					destroyed.
+ *
+ * An in-flight OOL payload used to be a kmalloc'd copy of the sender's bytes,
+ * which meant every transfer paid for two: once into the staging buffer on
+ * send, once out of it into the receiver's fresh frames on recv.  It is now
+ * the frames themselves, captured at send time -- shared with the sender
+ * where that is legal, copied where it is not (vm/vm.h) -- so delivery is a
+ * page-table operation and the second copy is gone along with the buffer.
+ *
+ * Whoever holds the array owns the frames.  Delivery hands them to the
+ * receiver; every other exit releases them.
  */
 struct port_pending_desc {
 	uint8_t		 pd_type;
 	uint8_t		 pd_disposition;	/* PORT */
-	uint8_t		 pd_ool_copy;		/* OOL: MACH_MSG_PHYSICAL_COPY */
+	uint8_t		 pd_ool_copy;		/* OOL: MACH_MSG_*_COPY       */
 	uint8_t		 pd_pad;
-	uint32_t	 pd_ool_size;		/* OOL: bytes in pd_ool_buf  */
+	uint32_t	 pd_ool_size;		/* OOL: payload bytes         */
 	struct port	*pd_port;		/* PORT                       */
-	void		*pd_ool_buf;		/* OOL: kmalloc'd staging buf */
+	uint64_t	*pd_ool_pages;		/* OOL: owned frames          */
+	size_t		 pd_ool_npages;		/* OOL: entries above         */
 };
 
 struct port_msg {

@@ -286,6 +286,68 @@ bool			 vm_map_fork_share(struct vm_map *src,
 			    struct pmap *dst_pm);
 
 /*
+ * CARRYING A PAYLOAD OF PAGES BETWEEN ADDRESS SPACES
+ *
+ * A Mach message can carry bulk data out of line: the sender names a range of
+ * its own memory, and the receiver finds that data mapped somewhere in its
+ * own.  What has to happen in between is a question about frames, not about
+ * messages, so it lives here and mach/ moves nothing but an array of physical
+ * addresses.
+ *
+ * The captured pages are OWNED BY THE MESSAGE while it is in flight.  That is
+ * the whole contract: whoever holds the array is responsible for either
+ * installing it into a receiver, which transfers the ownership, or releasing
+ * it, which ends it.  A message that is destroyed undelivered releases; one
+ * that is delivered does not.
+ *
+ * Capture from a user range shares rather than copies wherever it legally
+ * can.  A page qualifies when the payload's page boundaries coincide with the
+ * sender's -- which needs the sender's address to be page-aligned -- and the
+ * page lies wholly inside the payload.  That second condition is what keeps a
+ * partial last page out: sharing it would hand the receiver whatever the
+ * sender happens to keep in the bytes past the end of its own buffer.  Those
+ * pages, and every page of an unaligned payload, are copied instead, so a
+ * captured array is uniform and the receiver cannot tell which is which.
+ *
+ * Sharing a page means write-protecting it in the SENDER too, and marking the
+ * sender's range copy-on-write.  The receiver is promised the bytes as they
+ * were at the instant of the send, and a sender that could still write to the
+ * frame would be editing a message already posted.
+ */
+size_t			 vm_pages_capture_user(struct vm_map *map,
+			    struct pmap *pm, uint64_t addr, uint64_t size,
+			    uint64_t *pa_out, size_t max_pages);
+
+/*
+ * The same, for a payload the kernel itself is sending out of its own memory
+ * -- a rendered man page, a service reply.  Always copies: kernel addresses
+ * are not in any task's map, there is nothing to write-protect, and the
+ * source is usually .rodata that must not become a task's writable page.
+ */
+size_t			 vm_pages_capture_kernel(const void *src,
+			    uint64_t size, uint64_t *pa_out,
+			    size_t max_pages);
+
+/*
+ * Land a captured payload in `map` at a fresh address, returning it.  The
+ * range is mapped writable but its page-table entries are installed
+ * read-only, so a receiver that only reads keeps sharing the sender's frames
+ * and one that writes takes a copy-on-write fault and gets its own.
+ *
+ * On success the pages belong to the receiver and the caller must not release
+ * them.  On failure nothing is installed and the caller still owns them.
+ */
+bool			 vm_pages_install(struct vm_map *map, struct pmap *pm,
+			    const uint64_t *pas, size_t npages,
+			    uint64_t *va_out);
+
+/* Give up a captured payload that will never be delivered. */
+void			 vm_pages_release(const uint64_t *pas, size_t npages);
+
+/* How many payload pages were shared with their sender, and how many copied. */
+void			 vm_pages_stats(void);
+
+/*
  * Outcomes of vm_map_image.  Two failures rather than one because the
  * loaders above distinguish them: out of memory is a machine that is full,
  * a mapping failure is an image asking for something impossible.
