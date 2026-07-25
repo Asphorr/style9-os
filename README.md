@@ -181,23 +181,27 @@ svc/echool) so headless boots validate the userspace surface too.
 
 After the boot pass + the `hello.elf` ring-3 smoke run, you land in
 sh.elf -- a ring-3 shell in an Apple/BSD-flavoured manpage TUI.  The
-status row and the rule under it sit above a DECSTBM scrolling region,
-so they stay where they are while everything below them scrolls:
+title bar and the rule under it sit above a DECSTBM scrolling region,
+so they stay where they are while everything below them scrolls, and
+the rest is drawn with the CP437 line glyphs the VGA font already has:
 
 ```
- style9-os(9)                                                          00:00:04
- ──────────────────────────────────────────────────────────────────────────────
+ style9-os(9)                                                 4 tasks   0:00:39
+────────────────────────────────────────────────────────────────────────────────
 
-  NAME           style9-os -- BSD-flavoured x86_64 kernel with Mach IPC
-
-  SYSTEM         arch     x86_64
-                 ram      4072 / 130944 KiB
-                 tasks    4 live
-                 shell    sh.elf
-
-  SEE ALSO       style(9), help(1)
-
- ──────────────────────────────────────────────────────────────────────────────
+  ┌── style9-os(9) ──────────────────────────────────────────────────────────┐
+  │                                                                          │
+  │   NAME       style9-os -- BSD-flavoured x86_64 kernel                    │
+  │              with Mach IPC                                               │
+  │                                                                          │
+  │   SYSTEM     arch     x86_64                                             │
+  │              memory   ▓░░░░░░░░░░░░░░░░░░░  4 / 127 MiB                  │
+  │              tasks    4 live, 8 threads                                  │
+  │              programs 39 in the registry                                 │
+  │                                                                          │
+  │   SEE ALSO   style(9), help(1)                                           │
+  │                                                                          │
+  └──────────────────────────────────────────────────────────────────────────┘
 
 $
 ```
@@ -225,6 +229,12 @@ Delete, `^A ^B ^E ^F ^D ^K ^U ^W ^L`, insertion anywhere in the line,
 sixteen entries of history on Up/Down, and Tab completion across the
 builtins and the registry.  A line longer than the screen scrolls
 sideways instead of wrapping.
+
+`help` and `man` are drawn as panels -- a frame with the title inlaid in
+its top edge, and for the pager the position and key legend inlaid in the
+bottom one.  In the program list a cyan name is a Mach-O that comes up
+under the clean-room dyld and a gray one is not; the kernel decides which
+by the image’s own first four bytes, the same sniff the loader makes.
 
 The legacy `kern/shell.c` stays in the tree as a fallback for the case
 where sh.elf fails to spawn -- it has the full ddb-style introspection
