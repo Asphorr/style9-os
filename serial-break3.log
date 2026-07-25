@@ -33,9 +33,9 @@ sched: cooperative round-robin, idle id=2
   [ok] kbd (IRQ1 unmasked)
   [ok] interrupts enabled
 pit: 100 Hz requested, 100 Hz programmed (divisor=11931)
-tsc: 3601865760 Hz (~3601 MHz) over 25 PIT ticks (900466440 cycles)
+tsc: 3591626976 Hz (~3591 MHz) over 25 PIT ticks (897906744 cycles)
 clock: 100 Hz tick, TSC anchor calibrated
-clock: RTC 2026-07-25 12:17:59 UTC (epoch 1784981879)
+clock: RTC 2026-07-25 12:15:50 UTC (epoch 1784981750)
   [ok] clock
 
 memory subsystem smoke test...
@@ -67,7 +67,7 @@ stress_mem: 10000 iterations, 256 tracking slots
 stress_mem: 3477 alloc, 3477 free (delta=0)
 stress_mem: pmm used 804 -> 840 (peak 863)
 stress_mem: kmem cached 6 -> 42 pages
-stress_mem: conserved (pmm-cached) 798 -> 798, elapsed 45704 us
+stress_mem: conserved (pmm-cached) 798 -> 798, elapsed 40889 us
 stress_mem: 0 pattern corruptions
 stress_mem: PASS
 
@@ -78,34 +78,34 @@ stress_mem_boundary: conserved 798 -> 798, 0 corruptions
 stress_mem_boundary: PASS
 
 [3/15] stress timer 2s
-stress_timer: 2 s, hz=100, tsc_hz=3601865760
-stress_timer: 200 ticks elapsed, 7201072855 cycles measured
-stress_timer: expected 7203731520 cycles, drift 2658665 cycles (TSC behind)
-stress_timer: drift 369 ppm, 331715 kmem ops during run
+stress_timer: 2 s, hz=100, tsc_hz=3591626976
+stress_timer: 200 ticks elapsed, 7203279459 cycles measured
+stress_timer: expected 7183253952 cycles, drift 20025507 cycles (TSC ahead)
+stress_timer: drift 2787 ppm, 343022 kmem ops during run
 stress_timer: PASS
 
 [4/15] stress port 1000
 stress_port: 1000 rounds
 stress_port: kernel_space inuse 2 -> 2
 stress_port: pmm used 840 -> 840, cached 42 -> 42
-stress_port: conserved 798 -> 798, elapsed 33600 us
+stress_port: conserved 798 -> 798, elapsed 22026 us
 stress_port: PASS
 
 [5/15] stress thread 200
 stress_thread: 200 rounds (RPC over blocking recv)
-stress_thread: 10557 us, 402 context switches, 1 PIT ticks
+stress_thread: 5861 us, 402 context switches, 0 PIT ticks
 stress_thread: ports 2 -> 2, pmm 840 -> 840, cached 42 -> 42
 stress_thread: conserved 798 -> 798
 stress_thread: PASS
 
 [6/15] stress preempt 4 workers, 1 s
 stress_preempt: 4 workers, 1000 ms wall window
-stress_preempt: 998229 us elapsed, ctx switches 20, preempts 20
-  worker  0 counter 62475858
-  worker  1 counter 59273304
-  worker  2 counter 62936076
-  worker  3 counter 60960486
-stress_preempt: total 245645724, min 59273304, max 62936076, ratio max/min = 1
+stress_preempt: 995099 us elapsed, ctx switches 20, preempts 20
+  worker  0 counter 56789431
+  worker  1 counter 56928495
+  worker  2 counter 54223090
+  worker  3 counter 56379992
+stress_preempt: total 224321008, min 54223090, max 56928495, ratio max/min = 1
 stress_preempt: PASS
 
 [7/15] stress sendonce 500
@@ -189,17 +189,35 @@ mouse_drv: stream_port=5 thread=119
 mouse_drv: self-test event btn=L dx=5 dy=-3 (feed->ring->thread->port OK)
 dev: registered dev/uart -> kernel name 8
 uart_drv: stream_port=7 thread=120
-ata: disk0 = QEMU HARDDISK (LBA28=32768, LBA48=32768, ext=yes)
+ata: disk0 = QEMU HARDDISK (LBA28=1048576, LBA48=1048576, ext=yes)
 dev: registered dev/disk0 -> kernel name 9
 ata: channel 0 IRQ14 -- interrupt-driven (1 seen at probe)
-ata: channel 1 IRQ15 -- interrupt-driven (1 seen at probe)
+ata: channel 1 IRQ15 -- interrupt-driven (2 seen at probe)
 bio: 64 x 4096 B block cache (256 KiB)
-fs_fat: mounted FAT16 on disk0 -- 32768 sectors, 8167 clusters (spc=4), root@68 data@100
-fs_fat: self-test -- standard.flf found (28335 bytes, cluster 2)
-apfs: no container on disk0 (magic 0x00000000 != NXSB)
-bio: 3 requests, 3 page lookups -- 1 hit (33%), 2 read from disk, 0 evicted, 2/64 buffers live
-ata: channel 0 -- 17 interrupts, 15 blocking waits
-ata: channel 1 -- 1 interrupts, 0 blocking waits
+fs_fat: not a FAT12/16 volume (bps=0 spc=0 nfat=4 fatsz=0 root=0) -- FS unavailable
+apfs: container 131072 blocks x 4096 B (512 MiB), feat=0x0 incompat=0x2
+apfs: checkpoint ring @1 (64 blocks): 4 superblock(s)
+apfs: container xid 4, omap oid 98304, volume oid 1026
+apfs: checkpoint xid 4 -- 1 map block(s), 4 ephemeral object(s)
+apfs: WARNING chunk @0 says 26676 free, its bitmap has 6092 clear bits
+apfs: WARNING chunk @98304 says 32753 free, its bitmap has 15 clear bits
+apfs: volume "style9" @98306 -- 12 files, 12 dirs
+apfs: mounted -- fs B-tree root @98309, volume omap @98308, hashed dirent keys
+apfs:   usr/
+apfs:     local/
+apfs:       Cellar/
+apfs:   bin/
+apfs:     echo  35208 bytes
+apfs:   etc/
+apfs:     hello.txt  36 bytes
+apfs:   var/
+apfs:     db/
+apfs:       big.txt  155648 bytes
+apfs: read "/bin/echo" -- 35208 bytes, byte sum 0x00232898
+bio: 232 requests, 232 page lookups -- 146 hit (62%), 86 read from disk, 22 evicted, 64/64 buffers live
+ata: channel 0 -- 689 interrupts, 685 blocking waits
+ata: channel 1 -- 2 interrupts, 0 blocking waits
+apfs-write: PASS -- and the marker at /var/db/big.txt:0 is still there from an earlier boot
 svc: clock -> kernel name 10
 svc: stats -> kernel name 11
 svc: tasks -> kernel name 12
@@ -208,10 +226,10 @@ svc: man -> kernel name 14
 svc: launchd -> kernel name 15
 launchd: keep_alive worker up (death port=16)
 host: host -> kernel name 17 (page_size=4096)
-[4010 INF klog] ring + service up
-[4010 INF boot] stress pass complete
-[4020 INF boot] drivers + services up
-[4020 DBG boot] entering shell
+[4560 INF klog] ring + service up
+[4570 INF boot] stress pass complete
+[4570 INF boot] drivers + services up
+[4570 DBG boot] entering shell
 syscall: enabled, entry=0x0000000000102a2a
 smap: not supported by this CPU
 progreg: 39 programs registered
@@ -334,13 +352,13 @@ launchctl: connected to 'launchd' (port=0x4)
     com.style9.ondemand      heartbeatd   stopped      0
   load 'com.style9.echod' (program=echod) -> running task_id=15 taskport=0x5
   armed DEAD_NAME on taskport=0x5 (notify=0x3)
+usermode: spawn 'echod' entry=0x40000000 (image=16056 bytes), rsp=0x4000fff0 argc=0
+echod: serving 'echo' (svc=0x3, kill-to-stop)
   after-load -- 3 services loaded:
     label                    program      state        task_id
     com.style9.heartbeat     heartbeatd   running      4
     com.style9.ondemand      heartbeatd   stopped      0
     com.style9.echod         echod        running      15
-usermode: spawn 'echod' entry=0x40000000 (image=16056 bytes), rsp=0x4000fff0 argc=0
-echod: serving 'echo' (svc=0x3, kill-to-stop)
   poke 'echo' x 3 rounds: ok
   after-poke -- 3 services loaded:
     label                    program      state        task_id
@@ -365,6 +383,7 @@ launchctl v2 STOP/START demo:
   stop 'com.style9.spinner' -> stopped (was task_id=16)
   after stop -- 3 services loaded:
     label                    program      state        task_id
+usermode: spawn 'loopchild' entry=0x40000000 (image=16144 bytes), rsp=0x4000fff0 argc=0
     com.style9.heartbeat     heartbeatd   running      4
     com.style9.ondemand      heartbeatd   stopped      0
     com.style9.spinner       loopchild    stopped      0
@@ -375,12 +394,11 @@ launchctl v2 STOP/START demo:
     com.style9.ondemand      heartbeatd   stopped      0
     com.style9.spinner       loopchild    running      17
   unload 'com.style9.spinner' -> ok (was running, task_id=17)
-usermode: spawn 'loopchild' entry=0x40000000 (image=16144 bytes), rsp=0x4000fff0 argc=0
-usermode: spawn 'loopchild' entry=0x40000000 (image=16144 bytes), rsp=0x4000fff0 argc=0
 
 launchctl keep_alive demo:
   load 'com.style9.guardian' (program=loopchild) -> running task_id=18 taskport=0x6
   guardian task_id=18; simulating crash via task_kill(taskport=0x6)
+usermode: spawn 'loopchild' entry=0x40000000 (image=16144 bytes), rsp=0x4000fff0 argc=0
 usermode: spawn 'loopchild' entry=0x40000000 (image=16144 bytes), rsp=0x4000fff0 argc=0
 launchd: keep_alive respawned 'loopchild' -> task 19
 usermode: spawn 'loopchild' entry=0x40000000 (image=16144 bytes), rsp=0x4000fff0 argc=0
@@ -540,30 +558,11 @@ dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070000000
 dyld: enter main @ 0x0000000050000490
 dirlist: walking the volume via opendir/readdir + stat
 darwin: UNIX mmap(256 KiB, prot=3, anon) -> 0x40000000
-    standard.flf
-    big.flf
-    small.flf
-    mini.flf
-    slant.flf
-    banner.flf
-    shadow.flf
-    script.flf
-    term.flf
-    fonts/
-      ./
-      ../
-      slant.flf
-      banner.flf
-      script.flf
-      extra/
-        ./
-        ../
-        mini.flf
-    docs/
-      ./
-      ../
-      readme.txt
+    usr/
+      local/
+        Cellar/
     bin/
+      echo
       hello
       clock
       tasks
@@ -603,10 +602,15 @@ darwin: UNIX mmap(256 KiB, prot=3, anon) -> 0x40000000
       gtimeout
       dash
       demo.sh
-dirlist: stat(/fonts) -> mode=040755 size=0 ino=84
+    etc/
+      hello.txt
+    var/
+      db/
+        big.txt
+dirlist: stat(/usr) -> mode=040755 size=0 ino=20
 dirlist: done
 darwin: UNIX exit(0)
-  dirlist (opendir/readdir probe) retired after 29 yields
+  dirlist (opendir/readdir probe) retired after 4 yields
   >>> host port: mach_host_self + host_page_size + host_info <<<
   host: page_size=4096 cpus=1/1 mem=127MiB free=123MiB cpu_type=0x1000007 sub=3
   >>> task port: task_vm_allocate + write + task_vm_deallocate <<<
@@ -628,7 +632,7 @@ darwin: UNIX open('/usr/local/Cellar/figlet/2.2.5/share/figlet/fonts/standard.fl
 |_| |_|_|
          
 darwin: UNIX exit(0)
-  figlet retired after 66 yields
+  figlet retired after 58 yields
   >>> spawning tree -- a REAL Apple x86-64 macOS binary <<<
 usermode: spawn 'tree' entry=0x600003c0 (image=73472 bytes), rsp=0x4fffffc0 argc=2
 dyld: link main_mh=0x0000000050000000
@@ -637,8 +641,6 @@ dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070000000
 dyld: enter main @ 0x0000000050005b64
 darwin: UNIX mmap(256 KiB, prot=3, anon) -> 0x40000000
 /
-|-- banner.flf
-|-- big.flf
 |-- bin
 |   |-- argecho
 |   |-- clock
@@ -650,6 +652,7 @@ darwin: UNIX mmap(256 KiB, prot=3, anon) -> 0x40000000
 |   |-- dirlist
 |   |-- dyldbig
 |   |-- dyldhello
+|   |-- echo
 |   |-- echod
 |   |-- excchild
 |   |-- excchild_resume
@@ -679,37 +682,44 @@ darwin: UNIX mmap(256 KiB, prot=3, anon) -> 0x40000000
 |   |-- top
 |   |-- tree
 |   `-- vmmap
-|-- docs
-|   `-- readme.txt
-|-- fonts
-|   |-- banner.flf
-|   |-- extra
-|   |   `-- mini.flf
-|   |-- script.flf
-|   `-- slant.flf
-|-- mini.flf
-|-- script.flf
-|-- shadow.flf
-|-- slant.flf
-|-- small.flf
-|-- standard.flf
-`-- term.flf
+|-- etc
+|   `-- hello.txt
+|-- usr
+|   `-- local
+|       `-- Cellar
+|           `-- figlet
+|               `-- 2.2.5
+|                   `-- share
+|                       `-- figlet
+|                           `-- fonts
+|                               |-- banner.flf
+|                               |-- big.flf
+|                               |-- mini.flf
+|                               |-- script.flf
+|                               |-- shadow.flf
+|                               |-- slant.flf
+|                               |-- small.flf
+|                               |-- standard.flf
+|                               `-- term.flf
+`-- var
+    `-- db
+        `-- big.txt
 
-5 directories, 53 files
+13 directories, 51 files
 darwin: UNIX exit(0)
-  tree retired after 4 yields
+  tree retired after 5 yields
   >>> spawning gcat -- a REAL Apple x86-64 macOS binary reading a file off the volume <<<
 usermode: spawn 'gcat' entry=0x600003c0 (image=47176 bytes), rsp=0x4fffff90 argc=3
 dyld: link main_mh=0x0000000050000000
 darwin: s9 map_image '/usr/lib/libSystem.B.dylib' -> base=0x70000000 span=0xf000
 dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070000000
 dyld: enter main @ 0x0000000050001350
-gcat: /etc/hello.txt: No such file or directory
-darwin: UNIX open('/docs/readme.txt') -> fd=3 (51 bytes, on the volume)
+darwin: UNIX open('/etc/hello.txt') -> fd=3 (36 bytes, on the volume)
 darwin: UNIX mmap(264 KiB, prot=3, anon) -> 0x40000000
-style9 FAT volume -- a real hierarchy for tree(1).
+style9-os reads a real APFS volume.
+gcat: /docs/readme.txt: No such file or directory
 darwin: UNIX exit(1)
-  gcat retired after 1 yields
+  gcat retired after 10 yields
   >>> spawning gls -l -- a REAL Apple x86-64 macOS binary printing what the inodes say <<<
 usermode: spawn 'gls' entry=0x600003c0 (image=165000 bytes), rsp=0x4fffffa0 argc=4
 dyld: link main_mh=0x0000000050000000
@@ -718,61 +728,54 @@ dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070000000
 dyld: enter main @ 0x0000000050001260
 darwin: UNIX mmap(256 KiB, prot=3, anon) -> 0x40000000
 /:
-total 164
--rw-r--r-- 1 0 0 31897 May 30 17:36 banner.flf
--rw-r--r-- 1 0 0 26384 May 30 17:36 big.flf
-dr-xr-xr-x 1 0 0     0 Jul 25 12:17 bin
-drwxr-xr-x 1 0 0     0 May 30 17:36 docs
-drwxr-xr-x 1 0 0     0 May 30 17:36 fonts
--rw-r--r-- 1 0 0  9102 May 30 17:36 mini.flf
--rw-r--r-- 1 0 0 15371 May 30 17:36 script.flf
--rw-r--r-- 1 0 0 13365 May 30 17:36 shadow.flf
--rw-r--r-- 1 0 0 15520 May 30 17:36 slant.flf
--rw-r--r-- 1 0 0 12235 May 30 17:36 small.flf
--rw-r--r-- 1 0 0 28335 May 30 17:36 standard.flf
--rw-r--r-- 1 0 0  9697 May 30 17:36 term.flf
+total 0
+dr-xr-xr-x 1 0 0 0 Jul 25 12:15 bin
+drwxr-xr-x 1 0 0 0 Jul 24 19:54 etc
+drwxr-xr-x 1 0 0 0 Jul 24 19:54 usr
+drwxr-xr-x 1 0 0 0 Jul 24 19:54 var
 
 /bin:
-total 0
--r-xr-xr-x 1 0 0  15904 Jul 25 12:17 argecho
--r-xr-xr-x 1 0 0  15968 Jul 25 12:17 clock
--r-xr-xr-x 1 0 0  15920 Jul 25 12:17 crasher
--r-xr-xr-x 1 0 0    702 Jul 25 12:17 darwinhello
--r-xr-xr-x 1 0 0    844 Jul 25 12:17 darwinmsg
--r-xr-xr-x 1 0 0 116744 Jul 25 12:17 dash
--r-xr-xr-x 1 0 0   1093 Jul 25 12:17 demo.sh
--r-xr-xr-x 1 0 0  12992 Jul 25 12:17 dirlist
--r-xr-xr-x 1 0 0  12624 Jul 25 12:17 dyldbig
--r-xr-xr-x 1 0 0  12624 Jul 25 12:17 dyldhello
--r-xr-xr-x 1 0 0  16056 Jul 25 12:17 echod
--r-xr-xr-x 1 0 0  15864 Jul 25 12:17 excchild
--r-xr-xr-x 1 0 0  15872 Jul 25 12:17 excchild_resume
--r-xr-xr-x 1 0 0  15864 Jul 25 12:17 excchild_thr
--r-xr-xr-x 1 0 0  15864 Jul 25 12:17 excchild_ud
--r-xr-xr-x 1 0 0  72032 Jul 25 12:17 figlet
--r-xr-xr-x 1 0 0  47176 Jul 25 12:17 gcat
--r-xr-xr-x 1 0 0  52280 Jul 25 12:17 genv
--r-xr-xr-x 1 0 0  69144 Jul 25 12:17 gfactor
--r-xr-xr-x 1 0 0 165000 Jul 25 12:17 gls
--r-xr-xr-x 1 0 0  47384 Jul 25 12:17 gtimeout
--r-xr-xr-x 1 0 0  41304 Jul 25 12:17 guname
--r-xr-xr-x 1 0 0  15968 Jul 25 12:17 heartbeatd
--r-xr-xr-x 1 0 0  40600 Jul 25 12:17 hello
--r-xr-xr-x 1 0 0  21968 Jul 25 12:17 launchctl
--r-xr-xr-x 1 0 0  16144 Jul 25 12:17 loopchild
--r-xr-xr-x 1 0 0  16512 Jul 25 12:17 lsmp
--r-xr-xr-x 1 0 0   7394 Jul 25 12:17 machotest
--r-xr-xr-x 1 0 0  23778 Jul 25 12:17 machotest_fat
--r-xr-xr-x 1 0 0  17104 Jul 25 12:17 mmaptest
--r-xr-xr-x 1 0 0  15936 Jul 25 12:17 oolchild
--r-xr-xr-x 1 0 0  17608 Jul 25 12:17 pipefork
--r-xr-xr-x 1 0 0  15984 Jul 25 12:17 selfkill
--r-xr-xr-x 1 0 0  22792 Jul 25 12:17 sh
--r-xr-xr-x 1 0 0  16016 Jul 25 12:17 tasks
--r-xr-xr-x 1 0 0  12760 Jul 25 12:17 timeprobe
--r-xr-xr-x 1 0 0  16136 Jul 25 12:17 top
--r-xr-xr-x 1 0 0  73472 Jul 25 12:17 tree
--r-xr-xr-x 1 0 0  16296 Jul 25 12:17 vmmap
+total 36
+-r-xr-xr-x 1 0 0  15904 Jul 25 12:15 argecho
+-r-xr-xr-x 1 0 0  15968 Jul 25 12:15 clock
+-r-xr-xr-x 1 0 0  15920 Jul 25 12:15 crasher
+-r-xr-xr-x 1 0 0    702 Jul 25 12:15 darwinhello
+-r-xr-xr-x 1 0 0    844 Jul 25 12:15 darwinmsg
+-r-xr-xr-x 1 0 0 116744 Jul 25 12:15 dash
+-r-xr-xr-x 1 0 0   1093 Jul 25 12:15 demo.sh
+-r-xr-xr-x 1 0 0  12992 Jul 25 12:15 dirlist
+-r-xr-xr-x 1 0 0  12624 Jul 25 12:15 dyldbig
+-r-xr-xr-x 1 0 0  12624 Jul 25 12:15 dyldhello
+-rwxr-xr-x 1 0 0  35208 Jul 24 19:54 echo
+-r-xr-xr-x 1 0 0  16056 Jul 25 12:15 echod
+-r-xr-xr-x 1 0 0  15864 Jul 25 12:15 excchild
+-r-xr-xr-x 1 0 0  15872 Jul 25 12:15 excchild_resume
+-r-xr-xr-x 1 0 0  15864 Jul 25 12:15 excchild_thr
+-r-xr-xr-x 1 0 0  15864 Jul 25 12:15 excchild_ud
+-r-xr-xr-x 1 0 0  72032 Jul 25 12:15 figlet
+-r-xr-xr-x 1 0 0  47176 Jul 25 12:15 gcat
+-r-xr-xr-x 1 0 0  52280 Jul 25 12:15 genv
+-r-xr-xr-x 1 0 0  69144 Jul 25 12:15 gfactor
+-r-xr-xr-x 1 0 0 165000 Jul 25 12:15 gls
+-r-xr-xr-x 1 0 0  47384 Jul 25 12:15 gtimeout
+-r-xr-xr-x 1 0 0  41304 Jul 25 12:15 guname
+-r-xr-xr-x 1 0 0  15968 Jul 25 12:15 heartbeatd
+-r-xr-xr-x 1 0 0  40600 Jul 25 12:15 hello
+-r-xr-xr-x 1 0 0  21968 Jul 25 12:15 launchctl
+-r-xr-xr-x 1 0 0  16144 Jul 25 12:15 loopchild
+-r-xr-xr-x 1 0 0  16512 Jul 25 12:15 lsmp
+-r-xr-xr-x 1 0 0   7394 Jul 25 12:15 machotest
+-r-xr-xr-x 1 0 0  23778 Jul 25 12:15 machotest_fat
+-r-xr-xr-x 1 0 0  17104 Jul 25 12:15 mmaptest
+-r-xr-xr-x 1 0 0  15936 Jul 25 12:15 oolchild
+-r-xr-xr-x 1 0 0  17608 Jul 25 12:15 pipefork
+-r-xr-xr-x 1 0 0  15984 Jul 25 12:15 selfkill
+-r-xr-xr-x 1 0 0  22792 Jul 25 12:15 sh
+-r-xr-xr-x 1 0 0  16016 Jul 25 12:15 tasks
+-r-xr-xr-x 1 0 0  12760 Jul 25 12:15 timeprobe
+-r-xr-xr-x 1 0 0  16136 Jul 25 12:15 top
+-r-xr-xr-x 1 0 0  73472 Jul 25 12:15 tree
+-r-xr-xr-x 1 0 0  16296 Jul 25 12:15 vmmap
 darwin: UNIX exit(0)
   gls retired after 4 yields
   >>> spawning timeprobe -- wall-clock probe (gettimeofday / clock_gettime / time) <<<
@@ -781,8 +784,8 @@ dyld: link main_mh=0x0000000050000000
 darwin: s9 map_image '/usr/lib/libSystem.B.dylib' -> base=0x70000000 span=0xf000
 dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070000000
 dyld: enter main @ 0x0000000050000490
-timeprobe: 2026-07-25T12:18:33Z (epoch 1784981913.189384)
-timeprobe: advanced 100132 us across a busy loop
+timeprobe: 2026-07-25T12:16:23Z (epoch 1784981783.456810)
+timeprobe: advanced 96596 us across a busy loop
 timeprobe: all checks passed
 darwin: UNIX exit(0)
   timeprobe retired after 2 yields
@@ -792,7 +795,7 @@ dyld: link main_mh=0x0000000050000000
 darwin: s9 map_image '/usr/lib/libSystem.B.dylib' -> base=0x70000000 span=0xf000
 dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070000000
 dyld: enter main @ 0x0000000050000580
-darwin: UNIX open('/STANDARD.FLF') -> fd=3 (28335 bytes, on the volume)
+darwin: UNIX open('/var/db/big.txt') -> fd=3 (155648 bytes, on the volume)
 darwin: UNIX mmap(64 KiB, prot=3, anon) -> 0x40000000
 mmaptest: anonymous 64 KiB -- zeroed, writable, returned
 darwin: UNIX mmap(65536 KiB, prot=3, anon) -> 0x40010000
@@ -800,19 +803,19 @@ mmaptest: 64 MiB reserved, 3 pages touched, released
 darwin: UNIX mmap(8 KiB, prot=3, anon) -> 0x44010000
 mmaptest: MAP_FIXED, zero length, stray munmap and munmap across a hole refused
 darwin: UNIX mmap(32 KiB, prot=3, anon) -> 0x44012000
-darwin: UNIX open('/STANDARD.FLF') -> fd=3 (28335 bytes, on the volume)
+darwin: UNIX open('/var/db/big.txt') -> fd=3 (155648 bytes, on the volume)
 mmaptest: read(2) filled a page the program never touched
-darwin: UNIX open('/STANDARD.FLF') -> fd=3 (28335 bytes, on the volume)
-darwin: UNIX mmap(32 KiB, prot=1, /STANDARD.FLF) -> 0x4401a000
-mmaptest: mapped /STANDARD.FLF (28335 bytes) at 0x4401a000
-mmaptest: byte 14080 matches through a second fault
-mmaptest: 4433 bytes past EOF read as zero
-darwin: UNIX open('/STANDARD.FLF') -> fd=3 (28335 bytes, on the volume)
-darwin: UNIX mmap(24 KiB, prot=1, /STANDARD.FLF) -> 0x44022000
+darwin: UNIX open('/var/db/big.txt') -> fd=3 (155648 bytes, on the volume)
+darwin: UNIX mmap(156 KiB, prot=1, /var/db/big.txt) -> 0x4401a000
+mmaptest: mapped /var/db/big.txt (155648 bytes) at 0x4401a000
+mmaptest: byte 77824 matches through a second fault
+mmaptest: 4096 bytes past EOF read as zero
+darwin: UNIX open('/var/db/big.txt') -> fd=3 (155648 bytes, on the volume)
+darwin: UNIX mmap(152 KiB, prot=1, /var/db/big.txt) -> 0x44041000
 mmaptest: cut a page out of the middle -- both halves still hold their own part of the file
 mmaptest: all checks passed
 darwin: UNIX exit(0)
-  mmaptest retired after 2 yields
+  mmaptest retired after 27 yields
   >>> spawning guname -- a REAL Apple x86-64 macOS binary (machine-identity trick) <<<
 usermode: spawn 'guname' entry=0x600003c0 (image=41304 bytes), rsp=0x4fffffb0 argc=2
 dyld: link main_mh=0x0000000050000000
@@ -844,7 +847,7 @@ dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070074000
 dyld: enter main @ 0x0000000050001abc
 600851475143: 71 839 1471 6857
 darwin: UNIX exit(0)
-  gfactor[1] retired after 2 yields
+  gfactor[1] retired after 1 yields
   >>> gfactor 340282366920938463463374607431768211456 <<<
 usermode: spawn 'gfactor' entry=0x600003c0 (image=69144 bytes), rsp=0x4fffff90 argc=2
 dyld: link main_mh=0x0000000050000000
@@ -856,7 +859,7 @@ dyld: enter main @ 0x0000000050001abc
 darwin: UNIX mmap(256 KiB, prot=3, anon) -> 0x40000000
 340282366920938463463374607431768211456: 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2
 darwin: UNIX exit(0)
-  gfactor[2] retired after 1 yields
+  gfactor[2] retired after 2 yields
   >>> pipefork: fork/execve/wait4/pipe/dup2 probe <<<
 usermode: spawn 'pipefork' entry=0x600003c0 (image=17608 bytes), rsp=0x4fffffd0 argc=0
 dyld: link main_mh=0x0000000050000000
@@ -916,7 +919,7 @@ darwin: UNIX wait4 -> pid 51 status 0x0
 [pipefork] ok: the parent's writes stayed out of the child
 [pipefork] ALL TESTS PASSED
 darwin: UNIX exit(0)
-  pipefork retired after 7 yields
+  pipefork retired after 8 yields
   >>> genv /bin/gfactor 42 -- a REAL Apple binary exec(2)ing another <<<
 usermode: spawn 'genv' entry=0x600003c0 (image=52280 bytes), rsp=0x4fffffa0 argc=3
 dyld: link main_mh=0x0000000050000000
@@ -933,7 +936,7 @@ dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070074000
 dyld: enter main @ 0x0000000050001abc
 42: 2 3 7
 darwin: UNIX exit(0)
-  genv retired after 1 yields
+  genv retired after 2 yields
   >>> gtimeout 10 /bin/gfactor 42 -- a REAL Apple binary fork+exec+waiting another <<<
 usermode: spawn 'gtimeout' entry=0x600003c0 (image=47384 bytes), rsp=0x4fffff90 argc=4
 dyld: link main_mh=0x0000000050000000
@@ -953,7 +956,7 @@ dyld: enter main @ 0x0000000050001abc
 darwin: UNIX exit(0)
 darwin: UNIX wait4 -> pid 54 status 0x0
 darwin: UNIX exit(0)
-  gtimeout retired after 2 yields
+  gtimeout retired after 3 yields
   >>> dash -c 'echo ...' -- a REAL Apple shell, builtin only <<<
 usermode: spawn 'dash' entry=0x600003c0 (image=116744 bytes), rsp=0x4fffff90 argc=3
 dyld: link main_mh=0x0000000050000000
@@ -966,7 +969,7 @@ darwin: UNIX getpid() -> 55
 darwin: UNIX mmap(256 KiB, prot=3, anon) -> 0x40000000
 hello from a real shell on style9
 darwin: UNIX exit(0)
-  dash[builtin] retired after 1 yields
+  dash[builtin] retired after 2 yields
   >>> dash -c 'echo 600851475143 | gfactor' -- a shell pipeline <<<
 usermode: spawn 'dash' entry=0x600003c0 (image=116744 bytes), rsp=0x4fffff90 argc=3
 dyld: link main_mh=0x0000000050000000
@@ -987,14 +990,14 @@ darwin: s9 map_image '@@HOMEBREW_PREFIX@@/opt/gmp/lib/libgmp.10.dylib' -> base=0
 dyld: mapped @@HOMEBREW_PREFIX@@/opt/gmp/lib/libgmp.10.dylib @ 0x0000000070000000
 darwin: s9 map_image '/usr/lib/libSystem.B.dylib' -> base=0x70074000 span=0xf000
 dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070074000
+darwin: UNIX wait4 -> pid 57 status 0x0
 dyld: enter main @ 0x0000000050001abc
 darwin: UNIX mmap(256 KiB, prot=3, anon) -> 0x40000000
 600851475143: 71 839 1471 6857
-darwin: UNIX wait4 -> pid 57 status 0x0
 darwin: UNIX exit(0)
 darwin: UNIX wait4 -> pid 58 status 0x0
 darwin: UNIX exit(0)
-  dash[pipeline] retired after 3 yields
+  dash[pipeline] retired after 4 yields
   >>> dash /bin/demo.sh -- a shell SCRIPT from the synthetic /bin <<<
 usermode: spawn 'dash' entry=0x600003c0 (image=116744 bytes), rsp=0x4fffffb0 argc=2
 dyld: link main_mh=0x0000000050000000
@@ -1036,12 +1039,12 @@ darwin: UNIX fork() -> child 62
 darwin: UNIX exit(0)
 darwin: UNIX wait4 -> pid 62 status 0x0
 [demo.sh] cwd starts at: /
-/bin/demo.sh: 16: cd: can't cd to /var/db
+darwin: UNIX chdir("/var/db") -> /var/db
 darwin: UNIX pipe() -> r=3 w=4
 darwin: UNIX fork() -> child 63
 darwin: UNIX exit(0)
 darwin: UNIX wait4 -> pid 63 status 0x0
-[demo.sh] after cd /var/db: /
+[demo.sh] after cd /var/db: /var/db
 darwin: UNIX fork() -> child 64
 darwin: UNIX execve('/bin/gls') argc=3
 dyld: link main_mh=0x0000000050000000
@@ -1049,9 +1052,9 @@ darwin: s9 map_image '/usr/lib/libSystem.B.dylib' -> base=0x70000000 span=0xf000
 dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070000000
 dyld: enter main @ 0x0000000050001260
 darwin: UNIX mmap(256 KiB, prot=3, anon) -> 0x40000000
-gls: cannot access 'big.txt'
-darwin: UNIX exit(2)
-darwin: UNIX wait4 -> pid 64 status 0x200
+-rw-r--r-- 1 0 0 155648 Jul 25 12:15 big.txt
+darwin: UNIX exit(0)
+darwin: UNIX wait4 -> pid 64 status 0x0
 darwin: UNIX fork() -> child 65
 darwin: UNIX execve('/bin/gls') argc=3
 dyld: link main_mh=0x0000000050000000
@@ -1059,15 +1062,15 @@ darwin: s9 map_image '/usr/lib/libSystem.B.dylib' -> base=0x70000000 span=0xf000
 dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070000000
 dyld: enter main @ 0x0000000050001260
 darwin: UNIX mmap(256 KiB, prot=3, anon) -> 0x40000000
-gls: cannot access '../db/big.txt'
-darwin: UNIX exit(2)
-darwin: UNIX wait4 -> pid 65 status 0x200
-darwin: UNIX chdir("/") -> /
+-rw-r--r-- 1 0 0 155648 Jul 25 12:15 ../db/big.txt
+darwin: UNIX exit(0)
+darwin: UNIX wait4 -> pid 65 status 0x0
+darwin: UNIX chdir("/var") -> /var
 darwin: UNIX pipe() -> r=3 w=4
 darwin: UNIX fork() -> child 66
 darwin: UNIX exit(0)
 darwin: UNIX wait4 -> pid 66 status 0x0
-[demo.sh] after cd ..: /
+[demo.sh] after cd ..: /var
 darwin: UNIX chdir("/") -> /
 darwin: UNIX pipe() -> r=3 w=4
 darwin: UNIX fork() -> child 67
@@ -1076,7 +1079,7 @@ darwin: UNIX wait4 -> pid 67 status 0x0
 [demo.sh] back at: /
 [demo.sh] done
 darwin: UNIX exit(0)
-  dash[script] retired after 9 yields
+  dash[script] retired after 14 yields
   >>> dash -i  -- a REAL Apple shell, INTERACTIVE over a scripted console feed <<<
 usermode: spawn 'dash' entry=0x600003c0 (image=116744 bytes), rsp=0x4fffffc0 argc=2
 dyld: link main_mh=0x0000000050000000
@@ -1128,22 +1131,30 @@ captured: 600851475143: 71 839 1471 6857
 # exit
 darwin: UNIX exit(0)
 cons: 105 reads, 0 waits -- 0 keys typed, 105 scripted
-  dash[interactive] retired after 5 yields
+  dash[interactive] retired after 7 yields
 hello.elf: all demos passed
 [user thread exited, code=0]
-vm: 105 faults filled -- 99 zero, 6 from a file, 0 raced, 1 refused
-vm: pager spent 1649 us over 6 pages (274 us each, worst 1402)
-vm: fork shared 2222 pages, 91 later copied on write, 90 reclaimed by their last owner, 0 raced
+vm: 114 faults filled -- 108 zero, 6 from a file, 0 raced, 1 refused
+vm: pager spent 2754 us over 6 pages (459 us each, worst 2092)
+vm: fork shared 2219 pages, 90 later copied on write, 87 reclaimed by their last owner, 0 raced
 pmm: 32736 pages managed, 985 used (3940 KiB), 31751 free (127004 KiB)
-pmm: 0 frames shared now, 1489 extra owners taken, 4461 frames released by their last owner
+pmm: 0 frames shared now, 1486 extra owners taken, 15420 frames released by their last owner
 vm: 2599 program pages -- 2124 borrowed from the kernel image, 475 copied (8496 KiB saved)
 vm: 111 message payload pages -- 3 shared with the sender, 108 copied
 vm: 12 ranges released -- 10 whole, 2 needing a cut (3 entries split), 4 refused
 cons: 105 reads, 0 waits -- 0 keys typed, 105 scripted
-mutex: 1198 acquisitions, 600 had to sleep
-bio: 565 requests, 565 page lookups -- 552 hit (97%), 13 read from disk, 0 evicted, 13/64 buffers live
-ata: channel 0 -- 105 interrupts, 103 blocking waits
-ata: channel 1 -- 1 interrupts, 0 blocking waits
+apfs: 1455 tree walks -- 3451 nodes read, 42287 records visited (2 nodes, 29 records each)
+apfs: space @78 -- 124965 of 131072 blocks free, 4 chunks of 32768, 1 chunk-info block(s)
+apfs: free queues -- ip 2 blk (xid 4), main 6 blk (xid 4), tier2 0 blk; internal pool 15 blk @21016
+apfs: 4 chunks over 131072 blocks -- 2 wholly free, 2 bit-counted, 0 taken on trust
+apfs: free blocks -- spaceman 124965, chunks 124965, clear bits 71643 -- THEY DISAGREE
+fs_txn: 3 commits (3 metadata blocks), 0 aborted
+fs: volume generation 4 -- 1 stale handle(s) refreshed, 0 had actually changed length
+mutex: 1317 acquisitions, 600 had to sleep
+bio: 5575 requests, 5575 page lookups -- 5476 hit (98%), 99 read from disk, 35 evicted, 64/64 buffers live
+bio: 9 writes -- 9 resident pages patched
+ata: channel 0 -- 866 interrupts, 789 blocking waits
+ata: channel 1 -- 2 interrupts, 0 blocking waits
 kmem stats:
   bucket  0     16 B  inuse=0 free=0 alloc=0
   bucket  1     32 B  inuse=0 free=128 alloc=128
@@ -1169,7 +1180,7 @@ usermode: spawn 'sh' entry=0x40000000 (image=22792 bytes), rsp=0x4000fff0 argc=0
 
 [1;30m ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ 
 [0m
-[s[1;1H[0;37m style9-os(9)                                                          00:00:36 
+[s[1;1H[0;37m style9-os(9)                                                          00:00:39 
 [1;30m ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ 
 [0m[u
 [1;37m$ [0m

@@ -86,10 +86,22 @@ static struct {
 	uint64_t	ac_sm_chunks;		/* (m) */
 	uint32_t	ac_sm_blocks_per_chunk;	/* (m) */
 	uint32_t	ac_sm_cib_count;	/* (m) */
+	uint32_t	ac_sm_cab_count;	/* (m) */
+	uint32_t	ac_sm_addr_offset;	/* (m) into the spaceman block */
 	uint64_t	ac_sm_ip_base;		/* (m) internal pool           */
 	uint64_t	ac_sm_ip_blocks;	/* (m) */
 	uint64_t	ac_sm_fq_count[APFS_SFQ_COUNT];	  /* (m) */
 	uint64_t	ac_sm_fq_oldest[APFS_SFQ_COUNT];  /* (m) */
+
+	/* What the chunk walk found, and whether it agreed with the above. */
+	bool		ac_bm_valid;		/* (m) */
+	uint64_t	ac_bm_chunks;		/* (m) chunks described     */
+	uint64_t	ac_bm_blocks;		/* (m) blocks they cover    */
+	uint64_t	ac_bm_free_said;	/* (m) sum of ci_free_count */
+	uint64_t	ac_bm_free_counted;	/* (m) clear bits counted   */
+	uint64_t	ac_bm_scanned;		/* (m) chunks bit-counted   */
+	uint64_t	ac_bm_wholly_free;	/* (m) chunks with no bitmap */
+	uint64_t	ac_bm_disagreed;	/* (m) chunks that did not  */
 } g_apfs;
 
 /*
@@ -464,6 +476,8 @@ read_spaceman(void *scratch)
 	g_apfs.ac_sm_free            = sm->sm_dev[APFS_SD_MAIN].sm_free_count;
 	g_apfs.ac_sm_chunks          = sm->sm_dev[APFS_SD_MAIN].sm_chunk_count;
 	g_apfs.ac_sm_cib_count       = sm->sm_dev[APFS_SD_MAIN].sm_cib_count;
+	g_apfs.ac_sm_cab_count       = sm->sm_dev[APFS_SD_MAIN].sm_cab_count;
+	g_apfs.ac_sm_addr_offset     = sm->sm_dev[APFS_SD_MAIN].sm_addr_offset;
 	g_apfs.ac_sm_blocks_per_chunk = sm->sm_blocks_per_chunk;
 	g_apfs.ac_sm_ip_base         = sm->sm_ip_base;
 	g_apfs.ac_sm_ip_blocks       = sm->sm_ip_block_count;
@@ -511,6 +525,180 @@ read_spaceman(void *scratch)
 			    (unsigned)i,
 			    (unsigned long long)sm->sm_fq[i].sfq_tree_oid);
 	}
+	return (FS_APFS_E_OK);
+}
+
+/* Blocks reported free by one chunk's bitmap: the CLEAR bits in it. */
+static uint32_t
+bitmap_free_count(const uint8_t *bm, uint32_t blocks)
+{
+	uint32_t	free;
+	uint32_t	i;
+
+	free = 0;
+	for (i = 0; i < blocks; i++) {
+		if ((bm[i >> 3] & (uint8_t)(1u << (i & 7u))) == 0)
+			free++;
+	}
+	return (free);
+}
+
+/*
+ * Walk the chunk-info blocks and, for as many chunks as the budget allows,
+ * count the bits.
+ *
+ * There are two costs here and they scale differently, which is why they are
+ * separated.  Reading the chunk-info blocks is cheap and bounded by the
+ * container's size divided by four million blocks -- a terabyte is sixty-five
+ * of them -- so the totals they record are always checked.  Counting bits
+ * means one block read per chunk, which for that same terabyte is eight
+ * thousand reads at mount time, so it stops after APFS_BM_SCAN_MAX chunks and
+ * SAYS how many it did not look at.  A verification that quietly examined a
+ * fraction and reported success would be worse than none.
+ *
+ * The check itself is three numbers that come from three places: the space
+ * manager's free count, the sum of the per-chunk counts recorded in the
+ * chunk-info blocks, and the number of clear bits actually in the bitmaps.
+ * Any pair agreeing while the third differs says exactly where the reader is
+ * wrong.
+ */
+#define	APFS_BM_SCAN_MAX	64
+
+static int
+verify_chunk_bitmaps(void *sm_buf, void *cib_buf, void *bm_buf)
+{
+	const struct apfs_chunk_info_block	*cib;
+	const struct apfs_chunk_info		*ci;
+	const uint8_t				*p;
+	uint64_t				 cib_addr;
+	uint32_t				 count;
+	uint32_t				 counted;
+	uint32_t				 c;
+	uint32_t				 i;
+
+	g_apfs.ac_bm_valid = false;
+	if (!g_apfs.ac_sm_valid)
+		return (FS_APFS_E_INVAL);
+	/*
+	 * A container large enough to need chunk-info ADDRESS blocks has one
+	 * more level between the space manager and the chunks.  Nothing here
+	 * produces one, and guessing at a level this code has never seen read
+	 * would be worse than declining.
+	 */
+	if (g_apfs.ac_sm_cab_count != 0) {
+		kprintf("apfs: %u chunk-info address block(s) -- bitmap check "
+		    "not implemented for that layout\n",
+		    (unsigned)g_apfs.ac_sm_cab_count);
+		return (FS_APFS_E_INVAL);
+	}
+	if (g_apfs.ac_sm_addr_offset + g_apfs.ac_sm_cib_count * 8u >
+	    APFS_BLOCK_SIZE) {
+		kprintf("apfs: %u cib addresses at +%u run past the space "
+		    "manager's block\n", (unsigned)g_apfs.ac_sm_cib_count,
+		    (unsigned)g_apfs.ac_sm_addr_offset);
+		return (FS_APFS_E_INVAL);
+	}
+
+	/* The cib addresses live inside the space manager's own block. */
+	if (fs_apfs_read_block(g_apfs.ac_sm_paddr, sm_buf) != FS_APFS_E_OK) {
+		kprintf("apfs: space manager block %llu unreadable on the "
+		    "second pass\n", (unsigned long long)g_apfs.ac_sm_paddr);
+		return (FS_APFS_E_IO);
+	}
+	p = (const uint8_t *)sm_buf + g_apfs.ac_sm_addr_offset;
+
+	for (c = 0; c < g_apfs.ac_sm_cib_count; c++) {
+		mem_copy((uint8_t *)&cib_addr, p + c * 8, 8);
+		if (fs_apfs_read_block(cib_addr, cib_buf) != FS_APFS_E_OK) {
+			kprintf("apfs: chunk-info block %llu unreadable or "
+			    "fails its checksum\n",
+			    (unsigned long long)cib_addr);
+			return (FS_APFS_E_IO);
+		}
+		cib = (const struct apfs_chunk_info_block *)cib_buf;
+		if ((cib->cib_o.o_type & APFS_OBJ_TYPE_MASK) !=
+		    APFS_OBJ_SPACEMAN_CIB) {
+			kprintf("apfs: block %llu is not a chunk-info block "
+			    "(type 0x%x)\n", (unsigned long long)cib_addr,
+			    (unsigned)cib->cib_o.o_type);
+			return (FS_APFS_E_INVAL);
+		}
+		count = cib->cib_chunk_info_count;
+		if (count > APFS_CI_MAX_PER_CIB)
+			count = APFS_CI_MAX_PER_CIB;
+
+		for (i = 0; i < count; i++) {
+			ci = &cib->cib_chunk_info[i];
+			g_apfs.ac_bm_chunks++;
+			g_apfs.ac_bm_blocks    += ci->ci_block_count;
+			g_apfs.ac_bm_free_said += ci->ci_free_count;
+
+			if (ci->ci_bitmap_addr == 0) {
+				/*
+				 * No bitmap at all.  The chunk is wholly free,
+				 * and a chunk claiming otherwise without one
+				 * is a reader that has the convention
+				 * backwards.
+				 */
+				g_apfs.ac_bm_wholly_free++;
+				g_apfs.ac_bm_free_counted += ci->ci_block_count;
+				if (ci->ci_free_count != ci->ci_block_count)
+					g_apfs.ac_bm_disagreed++;
+				continue;
+			}
+			if (g_apfs.ac_bm_scanned >= APFS_BM_SCAN_MAX) {
+				/* Budget spent; its free count is taken on
+				 * trust, and the summary says so. */
+				g_apfs.ac_bm_free_counted += ci->ci_free_count;
+				continue;
+			}
+			if (ci->ci_block_count > APFS_BLOCK_SIZE * 8u) {
+				kprintf("apfs: chunk @%llu claims %u blocks, "
+				    "more than a bitmap block holds\n",
+				    (unsigned long long)ci->ci_addr,
+				    (unsigned)ci->ci_block_count);
+				return (FS_APFS_E_INVAL);
+			}
+			/*
+			 * Read RAW.  A bitmap block is bits and nothing else:
+			 * no obj_phys, so no checksum, so its first eight
+			 * bytes are the allocation state of the chunk's first
+			 * sixty-four blocks and not a Fletcher-64.  Reading it
+			 * through the checked reader rejects every bitmap in
+			 * the container -- which is exactly what it did, and
+			 * silently, until this walk started saying why it
+			 * stopped.
+			 */
+			if (read_block_raw(ci->ci_bitmap_addr, bm_buf) !=
+			    FS_APFS_E_OK) {
+				kprintf("apfs: bitmap block %llu unreadable\n",
+				    (unsigned long long)ci->ci_bitmap_addr);
+				return (FS_APFS_E_IO);
+			}
+			counted = bitmap_free_count((const uint8_t *)bm_buf,
+			    ci->ci_block_count);
+			g_apfs.ac_bm_scanned++;
+			g_apfs.ac_bm_free_counted += counted;
+			if (counted != ci->ci_free_count) {
+				g_apfs.ac_bm_disagreed++;
+				kprintf("apfs: WARNING chunk @%llu says %u "
+				    "free, its bitmap has %u clear bits\n",
+				    (unsigned long long)ci->ci_addr,
+				    (unsigned)ci->ci_free_count,
+				    (unsigned)counted);
+			}
+		}
+	}
+
+	g_apfs.ac_bm_valid = true;
+	if (g_apfs.ac_bm_free_said != g_apfs.ac_sm_free)
+		kprintf("apfs: WARNING chunks total %llu free, space manager "
+		    "says %llu\n", (unsigned long long)g_apfs.ac_bm_free_said,
+		    (unsigned long long)g_apfs.ac_sm_free);
+	if (g_apfs.ac_bm_blocks != g_apfs.ac_block_count)
+		kprintf("apfs: WARNING chunks cover %llu blocks, container has "
+		    "%llu\n", (unsigned long long)g_apfs.ac_bm_blocks,
+		    (unsigned long long)g_apfs.ac_block_count);
 	return (FS_APFS_E_OK);
 }
 
@@ -1926,9 +2114,28 @@ fs_apfs_init(void)
 	 * touches lives there -- so a container whose checkpoint maps cannot be
 	 * read still mounts, and only the accounting goes unanswered.
 	 */
-	if (read_checkpoint_maps(scratch) == FS_APFS_E_OK)
-		(void)read_spaceman(scratch);
-	else
+	if (read_checkpoint_maps(scratch) == FS_APFS_E_OK) {
+		if (read_spaceman(scratch) == FS_APFS_E_OK) {
+			/*
+			 * The chunk walk needs three blocks live at once --
+			 * the space manager, a chunk-info block and a bitmap
+			 * -- so it borrows two more for the length of the
+			 * walk rather than keeping them for the mount.
+			 */
+			void	*cib_buf;
+			void	*bm_buf;
+
+			cib_buf = kmalloc(APFS_BLOCK_SIZE);
+			bm_buf  = kmalloc(APFS_BLOCK_SIZE);
+			if (cib_buf != NULL && bm_buf != NULL)
+				(void)verify_chunk_bitmaps(scratch, cib_buf,
+				    bm_buf);
+			else
+				kprintf("apfs: no memory for the chunk walk\n");
+			kfree(cib_buf);
+			kfree(bm_buf);
+		}
+	} else
 		kprintf("apfs: no readable checkpoint map -- space accounting "
 		    "unavailable\n");
 
@@ -2007,4 +2214,32 @@ fs_apfs_stats(void)
 	    (unsigned long long)g_apfs.ac_sm_fq_count[APFS_SFQ_TIER2],
 	    (unsigned long long)g_apfs.ac_sm_ip_blocks,
 	    (unsigned long long)g_apfs.ac_sm_ip_base);
+
+	if (!g_apfs.ac_bm_valid) {
+		kprintf("apfs: allocation bitmaps not checked\n");
+		return;
+	}
+	/*
+	 * Three numbers from three places.  They are printed together, and the
+	 * count of chunks NOT bit-counted is printed with them, because a
+	 * verification that does not say how much of the disk it looked at is
+	 * not a verification.
+	 */
+	kprintf("apfs: %llu chunks over %llu blocks -- %llu wholly free, "
+	    "%llu bit-counted, %llu taken on trust\n",
+	    (unsigned long long)g_apfs.ac_bm_chunks,
+	    (unsigned long long)g_apfs.ac_bm_blocks,
+	    (unsigned long long)g_apfs.ac_bm_wholly_free,
+	    (unsigned long long)g_apfs.ac_bm_scanned,
+	    (unsigned long long)(g_apfs.ac_bm_chunks -
+	    g_apfs.ac_bm_wholly_free - g_apfs.ac_bm_scanned));
+	kprintf("apfs: free blocks -- spaceman %llu, chunks %llu, clear bits "
+	    "%llu -- %s\n",
+	    (unsigned long long)g_apfs.ac_sm_free,
+	    (unsigned long long)g_apfs.ac_bm_free_said,
+	    (unsigned long long)g_apfs.ac_bm_free_counted,
+	    (g_apfs.ac_bm_disagreed == 0 &&
+	    g_apfs.ac_sm_free == g_apfs.ac_bm_free_said &&
+	    g_apfs.ac_bm_free_said == g_apfs.ac_bm_free_counted) ?
+	    "all three agree" : "THEY DISAGREE");
 }

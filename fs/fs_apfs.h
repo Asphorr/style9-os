@@ -69,6 +69,8 @@
 #define	APFS_OBJ_BTREE_ROOT	0x00000002U
 #define	APFS_OBJ_BTREE_NODE	0x00000003U
 #define	APFS_OBJ_SPACEMAN	0x00000005U
+#define	APFS_OBJ_SPACEMAN_CIB	0x00000007U	/* chunk-info block   */
+#define	APFS_OBJ_SPACEMAN_CAB	0x00000008U	/* chunk-info address */
 #define	APFS_OBJ_OMAP		0x0000000BU
 #define	APFS_OBJ_CHECKPOINT_MAP	0x0000000CU
 #define	APFS_OBJ_FS		0x0000000DU	/* volume superblock */
@@ -271,6 +273,55 @@ _Static_assert(__builtin_offsetof(struct apfs_spaceman, sm_ip_bm_base) == 168,
     "sm_ip_bm_base sits at +168");
 _Static_assert(__builtin_offsetof(struct apfs_spaceman, sm_fq) == 200,
     "sm_fq[] starts at +200");
+
+/*
+ * WHERE THE BITMAPS ACTUALLY ARE
+ *
+ * sm_dev[].sm_addr_offset is an offset INTO THE SPACE MANAGER'S OWN BLOCK, at
+ * an array of block numbers.  With no chunk-info address blocks those are the
+ * chunk-info blocks themselves; with them there is one more level of
+ * indirection, which a container this size never reaches.
+ *
+ * Each chunk-info block describes up to sm_chunks_per_cib chunks, and each
+ * chunk names the single block holding its allocation bitmap -- one bit per
+ * block, and with 32768 blocks to a chunk that bitmap is exactly one 4 KiB
+ * block, which is what the whole geometry is arranged to make true.
+ *
+ * Two conventions here are measured rather than assumed, because both are the
+ * kind of thing that is equally plausible either way round:
+ *
+ *	A CLEAR bit means the block is free; a set bit means it is in use.
+ *
+ *	ci_bitmap_addr == 0 means the chunk has no bitmap because every block
+ *	  in it is free.  A fresh container is mostly these.
+ *
+ * The bitmaps and the chunk-info blocks live in the space manager's internal
+ * pool (sm_ip_base), and they have to: the blocks that record what is
+ * allocated cannot themselves be tracked by the records they hold.
+ */
+struct apfs_chunk_info {
+	uint64_t	ci_xid;		/* transaction that last changed it */
+	uint64_t	ci_addr;	/* first block of the chunk         */
+	uint32_t	ci_block_count;
+	uint32_t	ci_free_count;
+	uint64_t	ci_bitmap_addr;	/* 0 = wholly free, no bitmap       */
+};
+
+_Static_assert(sizeof(struct apfs_chunk_info) == 32,
+    "a chunk_info is 32 bytes on disk");
+
+struct apfs_chunk_info_block {
+	struct apfs_obj_phys	cib_o;
+	uint32_t		cib_index;
+	uint32_t		cib_chunk_info_count;
+	struct apfs_chunk_info	cib_chunk_info[];
+};
+
+_Static_assert(__builtin_offsetof(struct apfs_chunk_info_block,
+    cib_chunk_info) == 40, "chunk_info[] starts at +40");
+
+/* Ceiling from the block size: (4096-40)/32. */
+#define	APFS_CI_MAX_PER_CIB	((APFS_BLOCK_SIZE - 40) / 32)
 
 /*
  * Object map.  A PHYSICAL oid is already a block number, but a VIRTUAL one
