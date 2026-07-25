@@ -256,6 +256,33 @@ struct apfs_spaceman {
 	uint64_t			sm_fs_reserve_block_count;
 	uint64_t			sm_fs_reserve_alloc_count;
 	struct apfs_spaceman_free_queue	sm_fq[APFS_SFQ_COUNT];
+
+	/*
+	 * THE INTERNAL POOL'S OWN BOOKKEEPING
+	 *
+	 * The pool at sm_ip_base holds the blocks that describe allocation --
+	 * the chunk bitmaps and the chunk-info blocks -- because those cannot
+	 * live in the space they themselves account for.  Which pool blocks
+	 * are in use is a bitmap like any other, except that it must be
+	 * copied rather than overwritten for the same reason everything else
+	 * must: a checkpoint that has not committed yet is still readable.
+	 *
+	 * So there is a RING of them, sm_ip_bm_block_count slots long, at
+	 * sm_ip_bm_base.  One slot is live; the free ones are a linked list
+	 * threaded through the u16 table at sm_ip_bm_free_next_offset, from
+	 * sm_ip_bm_free_head to sm_ip_bm_free_tail, with 0xFFFF for the end.
+	 * A checkpoint takes the head, writes its bitmap there, and returns
+	 * the slot it replaced to the tail -- so the ring is a FIFO and the
+	 * previous checkpoints' bitmaps survive for as long as it is deep.
+	 *
+	 * The two small tables say which slot is live and which xid it
+	 * belongs to.  All three offsets are byte offsets into this block.
+	 */
+	uint16_t			sm_ip_bm_free_head;
+	uint16_t			sm_ip_bm_free_tail;
+	uint32_t			sm_ip_bm_xid_offset;
+	uint32_t			sm_ip_bitmap_offset;
+	uint32_t			sm_ip_bm_free_next_offset;
 };
 
 /*
@@ -271,6 +298,11 @@ _Static_assert(__builtin_offsetof(struct apfs_spaceman, sm_flags) == 144,
     "sm_flags sits at +144");
 _Static_assert(__builtin_offsetof(struct apfs_spaceman, sm_ip_bm_base) == 168,
     "sm_ip_bm_base sits at +168");
+_Static_assert(__builtin_offsetof(struct apfs_spaceman, sm_ip_bm_free_head)
+    == 320, "sm_ip_bm_free_head sits at +320 -- measured on a real spaceman, "
+    "where head=4 tail=2 while ring slot 3 was live");
+_Static_assert(__builtin_offsetof(struct apfs_spaceman, sm_ip_bm_xid_offset)
+    == 324, "sm_ip_bm_xid_offset sits at +324");
 _Static_assert(__builtin_offsetof(struct apfs_spaceman, sm_fq) == 200,
     "sm_fq[] starts at +200");
 
