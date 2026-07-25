@@ -226,6 +226,7 @@ vm_map_fork_share(struct vm_map *src, struct pmap *src_pm,
 	uint64_t		 va;
 	uint8_t			 flags;
 	uint8_t			 shared_prot;
+	bool			 owned;
 	bool			 writable;
 
 	if (src == NULL || src_pm == NULL || dst == NULL || dst_pm == NULL)
@@ -277,6 +278,16 @@ vm_map_fork_share(struct vm_map *src, struct pmap *src_pm,
 		}
 		e->vme_flags = flags;
 
+		/*
+		 * Frames under a borrowed range -- a program image mapped
+		 * straight out of the kernel -- are not the allocator's to
+		 * count.  They were never handed out, nothing will ever hand
+		 * them back, and asking pmm to record one more owner of a
+		 * frame it does not consider allocated is a bug it will say so
+		 * about.  The child gets the same mapping and that is all.
+		 */
+		owned = (e->vme_flags & VME_F_ANON) != 0;
+
 		for (va = e->vme_start; va < e->vme_end; va += VM_PAGE_SIZE) {
 			pa = pmap_extract(src_pm, va);
 			if (pa == PA_INVALID)
@@ -288,9 +299,11 @@ vm_map_fork_share(struct vm_map *src, struct pmap *src_pm,
 			 * still believes has one owner, and any teardown inside
 			 * that window would hand a live page back.
 			 */
-			pmm_page_ref(pa);
+			if (owned)
+				pmm_page_ref(pa);
 			if (!pmap_enter(dst_pm, va, pa, shared_prot)) {
-				pmm_free_page(pa);
+				if (owned)
+					pmm_free_page(pa);
 				return (false);
 			}
 			if (writable &&
@@ -378,6 +391,15 @@ vm_fault(struct vm_map *map, struct pmap *pm, uint64_t va, bool write)
 			vm_n_fault_fail++;
 			return (VM_FAULT_PROT);
 		}
+		/*
+		 * Only a writable range is ever marked copy-on-write, and only
+		 * an owned range is ever writable -- a borrowed one is a
+		 * read-only window onto the kernel's own memory.  Stated here
+		 * because the two paths below would otherwise quietly hand a
+		 * kernel-image frame to pmm_free_page.
+		 */
+		KASSERT((e->vme_flags & VME_F_ANON) != 0,
+		    "copy-on-write on a range whose frames are borrowed");
 		prot = e->vme_prot;
 
 		/*

@@ -35,6 +35,15 @@ static int		load_segment(struct task *target, const uint8_t *image,
 static uint32_t		be32(uint32_t v);
 
 /*
+ * Pages the loader handed out, split by where they came from.  Diagnostics,
+ * so plain writes -- but the ratio between them is the only thing that says
+ * whether the build is still aligning the blobs, and a build change that
+ * silently turns sharing off would otherwise be invisible.
+ */
+static uint64_t		macho_n_borrowed;	/* mapped from the image  */
+static uint64_t		macho_n_copied;		/* allocated and filled   */
+
+/*
  * Load a Mach-O image already resident in kernel memory into `target`.
  * A fat/universal archive is dispatched to the slice picker; a thin
  * image goes straight to the segment mapper.  Returns the entry RIP in
@@ -304,6 +313,22 @@ load_thin(struct task *target, const uint8_t *image, size_t image_size,
 	return (MACHO_E_NOENTRY);
 }
 
+void
+macho_stats(void)
+{
+	uint64_t	total;
+
+	total = macho_n_borrowed + macho_n_copied;
+	if (total == 0)
+		return;
+	kprintf("macho: %llu program pages -- %llu borrowed from the image, "
+	    "%llu copied (%llu KiB saved)\n",
+	    (unsigned long long)total,
+	    (unsigned long long)macho_n_borrowed,
+	    (unsigned long long)macho_n_copied,
+	    (unsigned long long)(macho_n_borrowed * PAGE_SIZE / 1024));
+}
+
 /*
  * Bring one LC_SEGMENT_64 into the target task's address space.  A
  * structural twin of elf.c's load_segment().  `bias` is added to the
@@ -319,6 +344,40 @@ load_thin(struct task *target, const uint8_t *image, size_t image_size,
  *	  via the kernel-VA alias of the underlying frame (works even when
  *	  the segment is not user-writable -- the alias is RW through the
  *	  boot identity map, the user leaf keeps its initprot).
+ *
+ * BORROWING INSTEAD OF COPYING
+ *
+ * That last step is the expensive one and most of it is unnecessary.  These
+ * images are not files being read off a disk: they are part of the kernel
+ * image, already resident, at a known physical address.  Allocating a frame
+ * and copying blob bytes into it produces a second copy of something that was
+ * never going to change -- and it produces one PER TASK, which is how thirty
+ * tasks came to hold thirty private copies of the same libSystem.
+ *
+ * So a page that is read-only, wholly covered by file bytes, and lands on a
+ * page boundary of the image is not copied at all.  Its page-table entry
+ * points straight at the blob's own frame, and the task reads the kernel's
+ * only copy.  Three conditions, each load-bearing:
+ *
+ *	read-only    -- a writable page must be private, or one task's store
+ *	  would rewrite the image every other task is running.  initprot
+ *	  decides, which conveniently also keeps __DATA_CONST out: dyld writes
+ *	  its fixups there, so it is mapped writable and stays copied.
+ *
+ *	wholly file-backed -- a page that runs past filesize has a zero-fill
+ *	  tail, and the blob frame holds whatever the linker put next in the
+ *	  kernel image rather than zeroes.  Those pages stay private, which
+ *	  also means nothing past the end of the image is ever exposed.
+ *
+ *	page-aligned -- the frame can only be mapped whole, so the image's
+ *	  physical address and the segment's virtual address must agree modulo
+ *	  the page size.  The build aligns the blobs to make this true; if it
+ *	  ever stops being true this quietly falls back to copying, which is
+ *	  why the counters below report both.
+ *
+ * The borrowed range gets a vm_map_entry WITHOUT VME_F_ANON -- the frames
+ * under it are not owned, and teardown must not hand the kernel's own memory
+ * to the page allocator.  That is exactly what the flag has always meant.
  */
 static int
 load_segment(struct task *target, const uint8_t *image, size_t image_size,
@@ -326,6 +385,8 @@ load_segment(struct task *target, const uint8_t *image, size_t image_size,
 {
 	uint64_t	va, va_start, va_end;
 	uint64_t	seg_va;
+	uint64_t	img_pa;
+	uint64_t	borrow_start, borrow_end;
 	uint64_t	pa;
 	uint64_t	src_off;
 	uint64_t	remaining;
@@ -358,7 +419,32 @@ load_segment(struct task *target, const uint8_t *image, size_t image_size,
 	va_end   = (seg_va + sg->vmsize + PAGE_MASK) &
 	    ~(uint64_t)PAGE_MASK;
 
+	/*
+	 * The half-open range of pages that can point at the image itself.
+	 * Empty unless all three conditions in the comment above hold.
+	 */
+	img_pa       = pmm_pa_from_kva(image) + sg->fileoff;
+	borrow_start = va_start;
+	borrow_end   = va_start;
+	if ((prot & VM_PROT_WRITE) == 0 &&
+	    ((img_pa ^ seg_va) & PAGE_MASK) == 0) {
+		borrow_start = (seg_va + PAGE_MASK) & ~(uint64_t)PAGE_MASK;
+		borrow_end   = (seg_va + sg->filesize) & ~(uint64_t)PAGE_MASK;
+		if (borrow_end <= borrow_start) {
+			borrow_start = va_start;
+			borrow_end   = va_start;
+		}
+	}
+
 	for (va = va_start; va < va_end; va += PAGE_SIZE) {
+		if (va >= borrow_start && va < borrow_end) {
+			if (!pmap_enter(target->t_pmap, va,
+			    img_pa + (va - seg_va), prot))
+				return (MACHO_E_MAP);
+			macho_n_borrowed++;
+			continue;
+		}
+
 		pa = pmm_alloc_page();
 		if (pa == PA_INVALID)
 			return (MACHO_E_NOMEM);
@@ -369,9 +455,28 @@ load_segment(struct task *target, const uint8_t *image, size_t image_size,
 
 		if (!pmap_enter(target->t_pmap, va, pa, prot))
 			return (MACHO_E_MAP);
+		macho_n_copied++;
 	}
 
-	if (!vm_map_enter(target->t_map, va_start, va_end - va_start,
+	/*
+	 * One entry per ownership regime.  Splitting here rather than marking
+	 * a mixed entry VME_F_ANON is the whole point: teardown reads that
+	 * flag and frees every present frame underneath, and half of these
+	 * frames belong to the kernel image.
+	 */
+	if (borrow_end > borrow_start) {
+		if (borrow_start > va_start &&
+		    !vm_map_enter(target->t_map, va_start,
+		    borrow_start - va_start, (uint8_t)prot, VME_F_ANON))
+			return (MACHO_E_MAP);
+		if (!vm_map_enter(target->t_map, borrow_start,
+		    borrow_end - borrow_start, (uint8_t)prot, 0))
+			return (MACHO_E_MAP);
+		if (va_end > borrow_end &&
+		    !vm_map_enter(target->t_map, borrow_end,
+		    va_end - borrow_end, (uint8_t)prot, VME_F_ANON))
+			return (MACHO_E_MAP);
+	} else if (!vm_map_enter(target->t_map, va_start, va_end - va_start,
 	    (uint8_t)prot, VME_F_ANON))
 		return (MACHO_E_MAP);
 
@@ -385,7 +490,16 @@ load_segment(struct task *target, const uint8_t *image, size_t image_size,
 		if (chunk > remaining)
 			chunk = remaining;
 
-		pa = pmap_extract(target->t_pmap, cur_va & ~(uint64_t)PAGE_MASK);
+		/* Borrowed pages already hold these bytes -- they ARE them. */
+		va = cur_va & ~(uint64_t)PAGE_MASK;
+		if (va >= borrow_start && va < borrow_end) {
+			src_off   += chunk;
+			cur_va    += chunk;
+			remaining -= chunk;
+			continue;
+		}
+
+		pa = pmap_extract(target->t_pmap, va);
 		if (pa == PA_INVALID)
 			return (MACHO_E_MAP);
 		kva = (uint8_t *)pmm_kva_from_pa(pa & ~(uint64_t)PAGE_MASK);

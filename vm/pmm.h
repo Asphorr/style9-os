@@ -119,4 +119,20 @@ pmm_kva_from_pa(uint64_t pa)
 	return ((void *)(uintptr_t)pa);
 }
 
+/*
+ * pmm_pa_from_kva: the same identity, read the other way.  Its one caller
+ * today is the Mach-O loader, which needs the physical address of a program
+ * image that is part of the kernel image so it can map those very frames into
+ * a task instead of copying them.  It exists as a named function for the same
+ * reason its mirror does: on the day a higher-half direct map arrives, an
+ * open-coded cast is a silent wrong answer and this is a compile error away
+ * from being corrected.
+ */
+static inline uint64_t
+pmm_pa_from_kva(const void *kva)
+{
+
+	return ((uint64_t)(uintptr_t)kva);
+}
+
 #endif /* !_SYS_PMM_H_ */

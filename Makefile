@@ -551,6 +551,7 @@ $(OBJDIR)/libedit.3.dylib: $(OBJDIR)/libedit.dwn.o
 $(OBJDIR)/libSystem_dylib.o: $(OBJDIR)/libSystem.B.dylib
 	cd $(OBJDIR) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386	\
 	    --rename-section .data=.rodata.libSystem_dylib		\
+	    --set-section-alignment .data=4096	\
 	    libSystem.B.dylib libSystem_dylib.o
 
 # libgmp embedded the same way: objcopy derives the kernel symbols
@@ -558,6 +559,7 @@ $(OBJDIR)/libSystem_dylib.o: $(OBJDIR)/libSystem.B.dylib
 $(OBJDIR)/libgmp_dylib.o: $(OBJDIR)/libgmp.10.dylib
 	cd $(OBJDIR) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386	\
 	    --rename-section .data=.rodata.libgmp_dylib			\
+	    --set-section-alignment .data=4096		\
 	    libgmp.10.dylib libgmp_dylib.o
 
 # libedit embedded the same way: objcopy derives the kernel symbols
@@ -565,13 +567,24 @@ $(OBJDIR)/libgmp_dylib.o: $(OBJDIR)/libgmp.10.dylib
 $(OBJDIR)/libedit_dylib.o: $(OBJDIR)/libedit.3.dylib
 	cd $(OBJDIR) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386	\
 	    --rename-section .data=.rodata.libedit_dylib		\
+	    --set-section-alignment .data=4096		\
 	    libedit.3.dylib libedit_dylib.o
 
 # Wrap a .macho into a kernel-linkable object exposing
 # _binary_<name>_macho_start / _end.  Mirror of the %_elf.o rule.
+#
+# --set-section-alignment is what lets the loader stop copying these bytes.
+# A Mach-O segment is page-aligned in the address space it asks for and
+# page-aligned in the file, so if the blob itself starts on a page boundary
+# in the kernel image, every whole page of a read-only segment lands exactly
+# on a frame -- and kern/macho.c maps that frame into the task instead of
+# allocating a new one and copying into it, once per task.  Drop the flag and
+# nothing breaks: the alignment test fails and the loader copies as it used
+# to, which the "borrowed / copied" counters at boot will report.
 $(OBJDIR)/%_macho.o: $(OBJDIR)/%.macho
 	cd $(OBJDIR) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386	\
 	    --rename-section .data=.rodata.$*_macho			\
+	    --set-section-alignment .data=4096		\
 	    $*.macho $*_macho.o
 
 # ---- man pages -----------------------------------------------------------
