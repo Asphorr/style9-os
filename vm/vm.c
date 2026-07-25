@@ -40,6 +40,10 @@ static uint64_t	vm_n_fault_race;	/* someone else got there first */
 static uint64_t	vm_n_fault_fail;	/* refused or could not fill    */
 static uint64_t	vm_us_pager;		/* microseconds inside the pager */
 static uint64_t	vm_us_pager_max;	/* worst single page            */
+static uint64_t	vm_n_fork_shared;	/* pages fork shared, not copied */
+static uint64_t	vm_n_cow_copy;		/* write faults that copied     */
+static uint64_t	vm_n_cow_steal;		/* ...that found no other owner */
+static uint64_t	vm_n_cow_race;		/* ...that lost to another one  */
 
 /*
  * Drop one entry.  An entry owns a reference on its object, so releasing the
@@ -214,16 +218,15 @@ vm_map_reset(struct vm_map *map)
 }
 
 bool
-vm_map_fork_copy(struct vm_map *src, struct pmap *src_pm,
+vm_map_fork_share(struct vm_map *src, struct pmap *src_pm,
     struct vm_map *dst, struct pmap *dst_pm)
 {
 	struct vm_map_entry	*e;
-	uint64_t		*dk;
-	uint64_t		*sk;
-	uint64_t		 npa;
 	uint64_t		 pa;
 	uint64_t		 va;
-	size_t			 i;
+	uint8_t			 flags;
+	uint8_t			 shared_prot;
+	bool			 writable;
 
 	if (src == NULL || src_pm == NULL || dst == NULL || dst_pm == NULL)
 		return (false);
@@ -232,39 +235,68 @@ vm_map_fork_copy(struct vm_map *src, struct pmap *src_pm,
 	 * No lock on src: the parent's only thread is parked in the fork
 	 * syscall, so no mutator can race the walk (the same invariant
 	 * vm_map_release_anon documents).  dst belongs to a task that has
-	 * not run yet.
+	 * not run yet.  That same quiescence is what lets the loop below
+	 * rewrite the parent's own flags and page tables underneath it.
 	 *
-	 * The copy is eager: every present leaf gets its own frame in the
-	 * child.  Holes inside an entry (PA_INVALID) are preserved as
-	 * holes, mirroring exactly what the parent had faulted in -- which
-	 * for an eagerly loaded segment means "everything", and for a lazy
-	 * mapping means only the pages the parent actually touched.  The
-	 * child inherits the entry's pager along with its range, so a page
-	 * neither of them has touched yet still knows where to come from.
+	 * Holes inside an entry (PA_INVALID) stay holes, mirroring exactly
+	 * what the parent had faulted in -- which for an eagerly loaded
+	 * segment means "everything", and for a lazy mapping means only the
+	 * pages the parent actually touched.  The child inherits the entry's
+	 * pager along with its range, so a page neither of them has touched
+	 * yet still knows where to come from.
 	 */
 	for (e = src->vm_head; e != NULL; e = e->vme_next) {
+		writable = (e->vme_prot & VM_PROT_WRITE) != 0;
+
+		/*
+		 * A writable range becomes copy-on-write in BOTH maps.  Marking
+		 * only the child would be the classic half-fix: the parent
+		 * would keep a writable page table entry over a frame the child
+		 * can see, and its next store would be delivered to both of
+		 * them without ever faulting.  Which of the two writes first is
+		 * not knowable here, so neither is allowed to.
+		 *
+		 * A read-only range needs none of this.  It is shared outright
+		 * and stays shared; a store into it was already a violation
+		 * before fork and still is, so there is nothing for a fault to
+		 * usefully do.
+		 */
+		flags = e->vme_flags;
+		shared_prot = e->vme_prot;
+		if (writable) {
+			flags |= VME_F_COW;
+			shared_prot = (uint8_t)(e->vme_prot & ~VM_PROT_WRITE);
+		}
+
 		vm_object_ref(e->vme_object);
 		if (!vm_map_enter_backed(dst, e->vme_start,
-		    e->vme_end - e->vme_start, e->vme_prot, e->vme_flags,
+		    e->vme_end - e->vme_start, e->vme_prot, flags,
 		    e->vme_object, e->vme_offset)) {
 			vm_object_deref(e->vme_object);
 			return (false);
 		}
+		e->vme_flags = flags;
+
 		for (va = e->vme_start; va < e->vme_end; va += VM_PAGE_SIZE) {
 			pa = pmap_extract(src_pm, va);
 			if (pa == PA_INVALID)
 				continue;
-			npa = pmm_alloc_page();
-			if (npa == PA_INVALID)
-				return (false);
-			sk = (uint64_t *)pmm_kva_from_pa(pa);
-			dk = (uint64_t *)pmm_kva_from_pa(npa);
-			for (i = 0; i < VM_PAGE_SIZE / sizeof(uint64_t); i++)
-				dk[i] = sk[i];
-			if (!pmap_enter(dst_pm, va, npa, e->vme_prot)) {
-				pmm_free_page(npa);
+			/*
+			 * Order matters: take the reference BEFORE installing
+			 * the second mapping.  The reverse would leave a window
+			 * where two page tables reach a frame the allocator
+			 * still believes has one owner, and any teardown inside
+			 * that window would hand a live page back.
+			 */
+			pmm_page_ref(pa);
+			if (!pmap_enter(dst_pm, va, pa, shared_prot)) {
+				pmm_free_page(pa);
 				return (false);
 			}
+			if (writable &&
+			    !pmap_enter(src_pm, va, pa, shared_prot))
+				return (false);
+			vm_n_fork_shared++;
 		}
 	}
 	return (true);
@@ -295,6 +327,7 @@ vm_fault(struct vm_map *map, struct pmap *pm, uint64_t va, bool write)
 	uint8_t			*kva;
 	uint64_t		 page;
 	uint64_t		 off;
+	uint64_t		 old;
 	uint64_t		 pa;
 	uint8_t			 prot;
 	size_t			 i;
@@ -305,7 +338,7 @@ vm_fault(struct vm_map *map, struct pmap *pm, uint64_t va, bool write)
 
 	spin_lock(&map->vm_lock);
 	e = vm_map_lookup(map, page);
-	if (e == NULL || (e->vme_flags & VME_F_LAZY) == 0) {
+	if (e == NULL) {
 		spin_unlock(&map->vm_lock);
 		vm_n_fault_fail++;
 		return (VM_FAULT_NOMAP);
@@ -314,12 +347,114 @@ vm_fault(struct vm_map *map, struct pmap *pm, uint64_t va, bool write)
 	 * A range mapped PROT_NONE is a reservation, not memory.  Filling it
 	 * would install a leaf the faulting thread still cannot touch, and the
 	 * same instruction would fault again forever.
+	 *
+	 * This asks vme_prot, which is what the range PERMITS.  What the page
+	 * tables currently GRANT can be less -- that is how copy-on-write is
+	 * arranged -- so the two have to be consulted for different questions,
+	 * and this one is "was the access legal at all".
 	 */
 	if ((e->vme_prot & (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXEC)) == 0 ||
 	    (write && (e->vme_prot & VM_PROT_WRITE) == 0)) {
 		spin_unlock(&map->vm_lock);
 		vm_n_fault_fail++;
 		return (VM_FAULT_PROT);
+	}
+
+	/*
+	 * Something is already mapped here, so this was a protection fault and
+	 * not a missing page.  The legal access check above has already passed,
+	 * which leaves exactly one way to get here: a store to a page whose
+	 * write bit fork cleared.  Give the writer a page of its own.
+	 *
+	 * Note this happens BEFORE the VME_F_LAZY test below.  A lazily
+	 * populated range is not the only kind that can be shared -- the
+	 * loader populates a program's data segment eagerly, and that segment
+	 * is precisely what a forked child writes to first.
+	 */
+	old = pmap_extract(pm, page);
+	if (old != PA_INVALID) {
+		if (!write || (e->vme_flags & VME_F_COW) == 0) {
+			spin_unlock(&map->vm_lock);
+			vm_n_fault_fail++;
+			return (VM_FAULT_PROT);
+		}
+		prot = e->vme_prot;
+
+		/*
+		 * Nobody else holds this frame any more -- the other sharers
+		 * have written their own copies, or simply died.  Copying it
+		 * would produce a page identical to the one already here, so
+		 * the whole fault is just a stale write bit to hand back.
+		 */
+		if (pmm_page_refs(old) == 1) {
+			if (!pmap_enter(pm, page, old, prot)) {
+				spin_unlock(&map->vm_lock);
+				vm_n_fault_fail++;
+				return (VM_FAULT_NOMEM);
+			}
+			vm_n_cow_steal++;
+			spin_unlock(&map->vm_lock);
+			return (VM_FAULT_OK);
+		}
+
+		/*
+		 * Shared for real.  Allocate and copy with the lock down, the
+		 * same discipline the pager path below follows and for a
+		 * weaker reason -- this cannot sleep -- but the window has to
+		 * be re-checked either way, because another thread of this
+		 * same task can be faulting the very same page.
+		 */
+		spin_unlock(&map->vm_lock);
+		pa = pmm_alloc_page();
+		if (pa == PA_INVALID) {
+			vm_n_fault_fail++;
+			return (VM_FAULT_NOMEM);
+		}
+		{
+			const uint64_t	*sk = (const uint64_t *)
+			    pmm_kva_from_pa(old);
+			uint64_t	*dk = (uint64_t *)pmm_kva_from_pa(pa);
+
+			for (i = 0; i < VM_PAGE_SIZE / sizeof(uint64_t); i++)
+				dk[i] = sk[i];
+		}
+
+		spin_lock(&map->vm_lock);
+		e = vm_map_lookup(map, page);
+		if (e == NULL || pmap_extract(pm, page) != old) {
+			/*
+			 * Somebody else resolved it while we copied, or the
+			 * range went away.  Either way the copy is worthless
+			 * and the instruction can simply be retried: it will
+			 * either succeed against the winner's page or take a
+			 * fresh fault against nothing.
+			 */
+			spin_unlock(&map->vm_lock);
+			pmm_free_page(pa);
+			vm_n_cow_race++;
+			return (VM_FAULT_OK);
+		}
+		if (!pmap_enter(pm, page, pa, e->vme_prot)) {
+			spin_unlock(&map->vm_lock);
+			pmm_free_page(pa);
+			vm_n_fault_fail++;
+			return (VM_FAULT_NOMEM);
+		}
+		spin_unlock(&map->vm_lock);
+		/*
+		 * Last: this map no longer holds the original.  Dropped after
+		 * the new leaf is installed, so there is no instant at which
+		 * this task's page table points at a frame it has released.
+		 */
+		pmm_free_page(old);
+		vm_n_cow_copy++;
+		return (VM_FAULT_OK);
+	}
+
+	if ((e->vme_flags & VME_F_LAZY) == 0) {
+		spin_unlock(&map->vm_lock);
+		vm_n_fault_fail++;
+		return (VM_FAULT_NOMAP);
 	}
 	obj = e->vme_object;
 	off = e->vme_offset + (page - e->vme_start);
@@ -405,6 +540,20 @@ vm_fault_stats(void)
 		    (unsigned long long)vm_n_fault_file,
 		    (unsigned long long)(vm_us_pager / vm_n_fault_file),
 		    (unsigned long long)vm_us_pager_max);
+	/*
+	 * The two numbers that say whether copy-on-write is worth having.
+	 * `shared` is what fork did not copy; `copied` is what a write made it
+	 * pay for afterwards.  The gap between them is the win, and it is only
+	 * a win because most pages a forked child inherits are never written
+	 * -- a program that touched all of its memory would simply pay the
+	 * same cost one fault at a time.
+	 */
+	kprintf("vm: fork shared %llu pages, %llu later copied on write, "
+	    "%llu reclaimed by their last owner, %llu raced\n",
+	    (unsigned long long)vm_n_fork_shared,
+	    (unsigned long long)vm_n_cow_copy,
+	    (unsigned long long)vm_n_cow_steal,
+	    (unsigned long long)vm_n_cow_race);
 }
 
 /*

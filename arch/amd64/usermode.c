@@ -806,7 +806,7 @@ darwin_fork_child_launcher(void *arg)
 
 /*
  * arch_darwin_fork: the fork(2) engine.  Clones the calling Darwin
- * task -- eager address-space copy (vm_map_fork_copy), open-file table
+ * task -- copy-on-write address space (vm_map_fork_share), open-file table
  * clone (darwin_files_fork_copy), dylib bump pointer, parentage -- and
  * starts a thread that enters ring 3 at the parent's saved user rip/rsp
  * with %rax = 0.  Returns the child's pid (its task id), or a negative
@@ -867,7 +867,7 @@ arch_darwin_fork(struct syscall_frame *f)
 	child->t_sig_tramp = parent->t_sig_tramp;
 	child->t_sig_mask  = parent->t_sig_mask;
 
-	if (!vm_map_fork_copy(parent->t_map, parent->t_pmap,
+	if (!vm_map_fork_share(parent->t_map, parent->t_pmap,
 	    child->t_map, child->t_pmap)) {
 		task_deref(child);
 		kfree(fa);

@@ -244,6 +244,14 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 		 * for memory they have not touched.
 		 */
 		vm_fault_stats();
+		/*
+		 * Frames, after the demos rather than at mount time.  The
+		 * sharing counters are the ones worth reading here: at boot
+		 * they are necessarily zero because nothing has forked yet,
+		 * so the line printed during pmm_init can only ever say the
+		 * mechanism is idle.
+		 */
+		pmm_stats();
 		darwin_cons_stats();
 		if (fs_apfs_ready())
 			fs_apfs_stats();

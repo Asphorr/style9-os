@@ -435,9 +435,15 @@ fault_fill(const struct trapframe *tf)
 		return (false);
 	/*
 	 * A protection violation means the page IS there and the access was
-	 * not allowed -- a real fault, never a missing mapping.
+	 * not allowed.  That used to be the end of it -- a real fault, never
+	 * a missing mapping -- and copy-on-write is what made the sentence
+	 * incomplete: a store to a shared page is a protection violation
+	 * deliberately arranged by the kernel, and answering it is the whole
+	 * mechanism.  So a violation is still fatal unless it was a write, in
+	 * which case vm_fault decides.  Reads and instruction fetches that
+	 * land here are as fatal as they ever were.
 	 */
-	if ((tf->tf_err & 0x1) != 0)
+	if ((tf->tf_err & 0x1) != 0 && (tf->tf_err & 0x2) == 0)
 		return (false);
 	if (current_thread == NULL)
 		return (false);

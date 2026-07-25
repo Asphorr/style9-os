@@ -387,6 +387,123 @@ scene_async_sigint(void)
 	    "SIGINT reached a handler inside a pure ring-3 compute loop");
 }
 
+/*
+ * Scene G: copy-on-write isolation.
+ *
+ * fork(2) no longer copies the parent's pages; it hands the child the same
+ * frames with the write bit cleared, and the ONLY thing between that and two
+ * processes quietly sharing one variable is the kernel's write fault.  So the
+ * thing to test is not that fork works -- every scene above already needs
+ * that -- but that a write on either side stays on that side.
+ *
+ * Three things make this a real test rather than a shape of one:
+ *
+ *	- The buffer spans several pages.  A one-page version passes even if
+ *	  the fault handler resolves the wrong page, which is the mistake most
+ *	  worth catching.
+ *
+ *	- It is filled BEFORE the fork, so every page of it is genuinely
+ *	  present and genuinely shared at that moment.  A buffer first touched
+ *	  afterwards would be faulted in privately and prove nothing.
+ *
+ *	- The PARENT writes first, and the order is the whole point.  The
+ *	  half-fix worth catching is a kernel that clears the write bit only
+ *	  in the child and leaves the parent's page table writable over the
+ *	  shared frame.  Let the child write first and that bug hides: the
+ *	  child faults, takes its private copy, and the parent's later store
+ *	  has nothing left to corrupt.  So the parent overwrites its whole
+ *	  buffer while the child is still blocked and still sharing every
+ *	  page of it, and the child then checks that it saw none of it.
+ *
+ *	- Both directions are checked, with two pipes as the clock: neither
+ *	  process looks at its buffer until the other has certainly written.
+ */
+#define	COW_PAGES	3
+#define	COW_BYTES	(COW_PAGES * 4096)
+
+static char	cow_buf[COW_BYTES];
+
+static void
+cow_fill(int v)
+{
+	int	i;
+
+	for (i = 0; i < COW_BYTES; i++)
+		cow_buf[i] = (char)(v + (i & 0x0F));
+}
+
+static int
+cow_intact(int v)
+{
+	int	i;
+
+	for (i = 0; i < COW_BYTES; i++)
+		if (cow_buf[i] != (char)(v + (i & 0x0F)))
+			return (0);
+	return (1);
+}
+
+static void
+scene_cow(void)
+{
+	char	tok[1];
+	int	to_child[2];
+	int	to_parent[2];
+	int	pid;
+	int	rpid;
+	int	status;
+
+	if (pipe(to_child) != 0 || pipe(to_parent) != 0) {
+		check(0, "pipes for the copy-on-write scene");
+		return;
+	}
+
+	cow_fill('A');
+
+	pid = fork();
+	if (pid < 0) {
+		check(0, "fork for the copy-on-write scene");
+		return;
+	}
+	if (pid == 0) {
+		int	unseen;
+		int	own;
+
+		/*
+		 * Touch nothing until the parent says it has rewritten its
+		 * whole buffer.  Every page here is still shared at this
+		 * instant, which is exactly the state the check needs.
+		 */
+		(void)read(to_child[0], tok, 1);
+		unseen = cow_intact('A');
+
+		cow_fill('B');
+		own = cow_intact('B');
+		(void)write(to_parent[1], "b", 1);
+		_exit((unseen && own) ? 0 : 1);
+	}
+
+	/*
+	 * Parent: overwrite everything before the child has had a chance to
+	 * fault a single page of it, then let the child look.
+	 */
+	cow_fill('C');
+	(void)write(to_child[1], "c", 1);
+
+	(void)read(to_parent[0], tok, 1);
+	check(cow_intact('C'), "the child's writes stayed out of the parent");
+
+	status = -1;
+	rpid = wait4(pid, &status, 0, NULL);
+	check(rpid == pid, "wait4 reaps the copy-on-write child");
+	check(status == 0, "the parent's writes stayed out of the child");
+
+	(void)close(to_child[0]);
+	(void)close(to_child[1]);
+	(void)close(to_parent[0]);
+	(void)close(to_parent[1]);
+}
+
 int
 entry(void)
 {
@@ -398,6 +515,7 @@ entry(void)
 	scene_sigpipe_handler();
 	scene_sigint_handler();
 	scene_async_sigint();
+	scene_cow();
 	if (failures == 0)
 		printf("[pipefork] ALL TESTS PASSED\n");
 	else

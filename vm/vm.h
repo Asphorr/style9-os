@@ -52,15 +52,29 @@ struct vm_object;	/* kern/vm_object.h -- what the pages are made of */
 struct task;
 
 /*
- * What an entry says about its pages.  The two questions are separate and
- * this is the vocabulary for both:
+ * What an entry says about its pages.  The three questions are separate and
+ * this is the vocabulary for all of them:
  *
- *	VME_F_ANON  -- the frames under this range belong to this entry.
- *	  Nothing else references them, so teardown frees them.  True of
- *	  every mapping here, including a private file mapping: its frames
- *	  are private copies of the file's bytes, which is what MAP_PRIVATE
- *	  means.  What the initial content was is a separate question,
- *	  answered by vme_object (NULL = zeroes, otherwise a file).
+ *	VME_F_ANON  -- the frames under this range are owned, not borrowed.
+ *	  Teardown drops the entry's reference to each of them, which returns
+ *	  a frame to the allocator only if nobody else still holds one (see
+ *	  vm/pmm.h).  True of every mapping here, including a private file
+ *	  mapping: its frames hold that file's bytes but belong to the task,
+ *	  which is what MAP_PRIVATE means.  What the initial content was is a
+ *	  separate question, answered by vme_object (NULL = zeroes).
+ *
+ *	VME_F_COW   -- pages in this range may be shared with another map, and
+ *	  the page-table entries under it have had their write bit cleared to
+ *	  make sure a store cannot go unnoticed.  This is the only flag that
+ *	  makes a *protection* fault fixable rather than fatal: vm_fault
+ *	  responds by giving the writer a private copy, or, if it turns out to
+ *	  be the last owner, simply by handing the write bit back.
+ *
+ *	  The flag says "may be shared", never "is shared".  It stays set on
+ *	  ranges whose pages have all since been copied or whose sharers have
+ *	  all died, and that is harmless: the count in pmm is the authority on
+ *	  how many owners a given frame has, and the flag only decides whether
+ *	  it is worth asking.
  *
  *	VME_F_LAZY  -- the range is promised but not populated.  There are no
  *	  page-table leaves under it yet; the first touch of each page takes
@@ -70,7 +84,7 @@ struct task;
  *	  vm_fault refuses to fill an entry that does not carry it.
  */
 #define	VME_F_ANON		0x01	/* anonymous (pmm) backing       */
-#define	VME_F_COW		0x02	/* future: copy-on-write share   */
+#define	VME_F_COW		0x02	/* may be shared; copy on write  */
 #define	VME_F_LAZY		0x04	/* populate on first touch       */
 
 struct vm_map_entry {
@@ -79,7 +93,13 @@ struct vm_map_entry {
 	uint64_t		 vme_offset;	/* (m) into vme_object */
 	struct vm_object	*vme_object;	/* (m) NULL until vm_object lands */
 	uint8_t			 vme_prot;	/* (c) VM_PROT_*       */
-	uint8_t			 vme_flags;	/* (c) VME_F_*         */
+	/*
+	 * (m) VME_F_*.  Was const-after-create until fork learned to share:
+	 * turning a range into a copy-on-write one is a change to an entry
+	 * that already exists, in the PARENT's map, and it happens while the
+	 * parent sits quiescent inside the fork syscall.
+	 */
+	uint8_t			 vme_flags;
 	uint16_t		 vme_pad;
 	struct vm_map_entry	*vme_next;	/* (m)                 */
 };
@@ -242,17 +262,26 @@ bool			 vm_map_release(struct vm_map *,
 void			 vm_map_reset(struct vm_map *map);
 
 /*
- * Duplicate `src`'s address space into `dst` -- the fork(2) engine.
- * Every entry is re-entered in dst's map with identical range, prot,
- * and flags; every present 4 KiB leaf in src_pm is copied into a fresh
- * frame mapped at the same VA in dst_pm with the entry's prot.  Eager
- * copy, no COW in v1.  Returns false on allocation failure with dst
- * partially populated -- the caller derefs the child task, whose normal
- * teardown (vm_map_release_anon + vm_map_destroy) reclaims the partial
- * copy.  Caller guarantees src is quiescent (its one thread is parked
- * in the fork syscall).
+ * Duplicate `src`'s address space into `dst` -- the fork(2) engine.  Every
+ * entry is re-entered in dst's map with identical range, prot and flags, and
+ * every present 4 KiB leaf in src_pm becomes a leaf at the same VA in dst_pm
+ * pointing at the SAME frame, with one more owner recorded against it.
+ *
+ * Nothing is copied here.  A writable range has the write bit cleared in both
+ * page tables -- the parent's as much as the child's, because "who writes
+ * first" is not known and the one that does must be the one that faults --
+ * and both entries are marked VME_F_COW so vm_fault knows the fault is a
+ * request for a private copy rather than a violation.  A read-only range
+ * needs none of that: it is shared outright and its frames simply have two
+ * owners until one of the maps goes away.
+ *
+ * Returns false on allocation failure with dst partially populated -- the
+ * caller derefs the child task, whose normal teardown (vm_map_release_anon +
+ * vm_map_destroy) drops the references taken so far.  Caller guarantees src
+ * is quiescent (its one thread is parked in the fork syscall), which is what
+ * makes it safe both to walk src's entries unlocked and to change their flags.
  */
-bool			 vm_map_fork_copy(struct vm_map *src,
+bool			 vm_map_fork_share(struct vm_map *src,
 			    struct pmap *src_pm, struct vm_map *dst,
 			    struct pmap *dst_pm);
 
@@ -268,13 +297,23 @@ bool			 vm_map_fork_copy(struct vm_map *src,
 #define	VM_FAULT_NOMEM		4	/* out of frames                */
 
 /*
- * Populate the page containing `va` in `map`/`pm`.  Called from the #PF
- * handler for a ring-3 not-present fault, and it is the only thing that
- * turns a VME_F_LAZY promise into memory: an anonymous range gets a zeroed
- * frame, a file-backed range gets a frame holding that file's bytes.
+ * Resolve the fault on the page containing `va` in `map`/`pm`.  Called from
+ * the #PF handler, and it answers two different faults:
  *
- * `write` is the fault's access type, so a store to a read-only range is
- * refused here rather than papered over with a writable page.
+ *	nothing mapped -- turn a VME_F_LAZY promise into memory.  An
+ *	  anonymous range gets a zeroed frame, a file-backed range gets a
+ *	  frame holding that file's bytes.
+ *
+ *	mapped, but written to without the write bit -- on a VME_F_COW range
+ *	  this is the copy-on-write fault: the writer gets a private copy of
+ *	  the frame, or the original outright if it turns out to be the only
+ *	  owner left.
+ *
+ * `write` is the fault's access type, so a store to a range that is not
+ * writable at all is refused here rather than papered over with a writable
+ * page.  vme_prot is what the range PERMITS; the page tables under it may
+ * grant less while copy-on-write is pending, and that difference is exactly
+ * what makes the second fault above possible.
  *
  * MUST be called with no locks held: filling a file-backed page reads the
  * disk, and that sleeps.
