@@ -12,6 +12,7 @@
 #include "fs.h"
 #include "fs_apfs.h"
 #include "fs_fat.h"
+#include "kmem.h"
 #include "kprintf.h"
 #include "mutex.h"
 
@@ -754,33 +755,43 @@ fs_write_selftest(void)
 }
 
 /*
- * A FILE GETS LONGER, AND STAYS LONGER
+ * A FILE GETS LONGER, STAYS LONGER, AND FILLS A NODE DOING IT
  *
- * Once, and then never again: the file this uses starts at a whole number of
- * blocks, and the test appends a tail that is not, so the very fact that its
- * length is no longer block-aligned says an earlier boot already did it.  That
- * is what makes this safe to run at every boot with nothing to undo -- there
- * is no truncate yet, so a test that grew the file each time would grow it
- * without bound and fill the leaf it inserts into.
+ * Three claims, and the third is why this appends more than once.  A file
+ * extent record costs 48 bytes of the leaf it lands in and this container's
+ * leaf had room for four, so a test that appended once would leave the
+ * interesting case -- a node with no room -- permanently untested.  A block
+ * per append reaches it in five.
  *
- * The second boot is the interesting one.  It does not write at all; it checks
- * that the length and the bytes an earlier boot appended are still there,
- * which is a claim about the platter rather than about this kernel's memory.
+ * A block per append and not a byte: the length is always rounded up to a
+ * block by the allocation behind it, so a whole block is the smallest append
+ * guaranteed to need a new run, and a new run is what needs a new record.
+ *
+ * Bounded by the FILE rather than by a counter this kernel would have to keep:
+ * the loop stops once the file is at least SELFTEST_GROW_TO bytes, so a later
+ * boot finds it long enough already and checks instead of writing.  That
+ * matters because there is no truncate yet -- a test that grew the file every
+ * boot would grow it without end.
  */
-#define	GROW_TAIL	"appended by style9"
+#define	SELFTEST_GROW_TO	(155648u + 6u * 4096u)
+#define	GROW_CHUNK		4096u
 
 void
 fs_grow_selftest(void)
 {
-	struct fs_handle	h;
-	uint8_t			back[64];
-	const char		*tail = GROW_TAIL;
-	uint64_t		was;
-	uint32_t		n;
-	uint32_t		got;
-	uint32_t		put;
-	size_t			i;
-	int			rv;
+	struct fs_handle	 h;
+	struct fs_statbuf	 st;
+	uint8_t			*chunk;
+	uint8_t			*back;
+	uint64_t		 was;
+	uint64_t		 splits;
+	uint64_t		 merges;
+	uint64_t		 at;
+	uint32_t		 rounds;
+	uint32_t		 got;
+	uint32_t		 put;
+	uint32_t		 i;
+	int			 rv;
 
 	if (!fs_apfs_ready())
 		return;
@@ -788,92 +799,145 @@ fs_grow_selftest(void)
 		kprintf("apfs-grow: %s absent -- skipped\n", SELFTEST_PATH);
 		return;
 	}
-	n = 0;
-	while (tail[n] != '\0')
-		n++;
-	if (n > sizeof(back)) {
-		kprintf("apfs-grow: tail too long -- skipped\n");
-		return;
+	chunk = kmalloc(GROW_CHUNK);
+	back  = kmalloc(GROW_CHUNK);
+	if (chunk == NULL || back == NULL) {
+		kprintf("apfs-grow: no memory -- skipped\n");
+		goto out;
+	}
+	for (i = 0; i < GROW_CHUNK; i++)
+		chunk[i] = (uint8_t)('a' + (i % 26));
+
+	was    = h.fh_size;
+	splits = fs_apfs_splits();
+	merges = fs_apfs_merges();
+	rounds = 0;
+
+	while (h.fh_size < SELFTEST_GROW_TO) {
+		at = h.fh_size;
+		rv = fs_pwrite(&h, at, chunk, GROW_CHUNK, &put);
+		if (rv != FS_E_OK || put != GROW_CHUNK) {
+			kprintf("apfs-grow: FAIL round %u at %llu would not "
+			    "grow (rv=%d put=%u)\n", (unsigned)rounds,
+			    (unsigned long long)at, rv, (unsigned)put);
+			goto out;
+		}
+		if (h.fh_size != at + put) {
+			kprintf("apfs-grow: FAIL the handle says %llu after "
+			    "writing %u at %llu\n",
+			    (unsigned long long)h.fh_size, (unsigned)put,
+			    (unsigned long long)at);
+			goto out;
+		}
+		/*
+		 * Read back through the file, not out of what was written: the
+		 * bytes have been through an allocation, a zeroing, a record
+		 * insert and a checkpoint since.
+		 */
+		rv = fs_pread(&h, at, back, put, &got);
+		if (rv != FS_E_OK || got != put) {
+			kprintf("apfs-grow: FAIL round %u cannot be read back "
+			    "(rv=%d got=%u)\n", (unsigned)rounds, rv, got);
+			goto out;
+		}
+		for (i = 0; i < put; i++) {
+			if (back[i] == chunk[i])
+				continue;
+			kprintf("apfs-grow: FAIL round %u byte %u is 0x%02x, "
+			    "wanted 0x%02x\n", (unsigned)rounds, (unsigned)i,
+			    (unsigned)back[i], (unsigned)chunk[i]);
+			goto out;
+		}
+		if (++rounds > 32) {
+			kprintf("apfs-grow: FAIL %u rounds and still short of "
+			    "%u bytes\n", (unsigned)rounds,
+			    (unsigned)SELFTEST_GROW_TO);
+			goto out;
+		}
 	}
 
-	if (h.fh_size % 4096 != 0) {
+	if (rounds == 0) {
 		/*
-		 * An earlier boot grew it.  Everything worth checking is on the
-		 * disk already: the length survived, and so did the bytes.
+		 * An earlier boot did the growing, so what is worth checking
+		 * is on the platter: the length survived, and the tail still
+		 * reads as what was appended.
 		 */
-		rv = fs_pread(&h, h.fh_size - n, back, n, &got);
-		if (rv != FS_E_OK || got != n) {
+		rv = fs_pread(&h, h.fh_size - GROW_CHUNK, back, GROW_CHUNK,
+		    &got);
+		if (rv != FS_E_OK || got != GROW_CHUNK) {
 			kprintf("apfs-grow: FAIL cannot read the tail "
 			    "(rv=%d got=%u)\n", rv, got);
-			return;
+			goto out;
 		}
-		for (i = 0; i < n; i++) {
-			if (back[i] == (uint8_t)tail[i])
+		for (i = 0; i < GROW_CHUNK; i++) {
+			if (back[i] == chunk[i])
 				continue;
-			kprintf("apfs-grow: FAIL byte %u of the tail is 0x%02x, "
-			    "wanted 0x%02x -- what an earlier boot appended "
-			    "did not survive\n", (unsigned)i,
-			    (unsigned)back[i], (unsigned)(uint8_t)tail[i]);
-			return;
+			kprintf("apfs-grow: FAIL byte %u of the tail is "
+			    "0x%02x, wanted 0x%02x -- what an earlier boot "
+			    "appended did not survive\n", (unsigned)i,
+			    (unsigned)back[i], (unsigned)chunk[i]);
+			goto out;
 		}
-		kprintf("apfs-grow: PASS -- %s is %llu bytes and the %u bytes "
-		    "an earlier boot appended are still there\n",
-		    SELFTEST_PATH, (unsigned long long)h.fh_size,
-		    (unsigned)n);
-		return;
+		kprintf("apfs-grow: PASS -- %s is %llu bytes from an earlier "
+		    "boot and its last block still reads what was appended\n",
+		    SELFTEST_PATH, (unsigned long long)h.fh_size);
+		goto out;
 	}
 
-	was = h.fh_size;
-	rv  = fs_pwrite(&h, was, (const uint8_t *)tail, n, &put);
-	if (rv != FS_E_OK || put != n) {
-		kprintf("apfs-grow: FAIL the file would not grow (rv=%d "
-		    "put=%u)\n", rv, put);
-		return;
+	if (fs_stat(SELFTEST_PATH, &st) != FS_E_OK) {
+		kprintf("apfs-grow: FAIL cannot stat after growing\n");
+		goto out;
 	}
-	if (h.fh_size != was + n) {
-		kprintf("apfs-grow: FAIL the handle says %llu bytes, wanted "
-		    "%llu\n", (unsigned long long)h.fh_size,
-		    (unsigned long long)(was + n));
-		return;
+	if (st.fs_size != h.fh_size) {
+		kprintf("apfs-grow: FAIL the volume says %llu bytes and the "
+		    "handle says %llu -- the length did not reach the inode "
+		    "record\n", (unsigned long long)st.fs_size,
+		    (unsigned long long)h.fh_size);
+		goto out;
 	}
 
-	/* What the volume says, not what the handle remembers. */
-	{
-		struct fs_statbuf	st;
-
-		if (fs_stat(SELFTEST_PATH, &st) != FS_E_OK) {
-			kprintf("apfs-grow: FAIL cannot stat after growing\n");
-			return;
-		}
-		if (st.fs_size != was + n) {
-			kprintf("apfs-grow: FAIL the volume says %llu bytes "
-			    "after growing to %llu -- the length did not "
-			    "reach the inode record\n",
-			    (unsigned long long)st.fs_size,
-			    (unsigned long long)(was + n));
-			return;
-		}
+	/*
+	 * THE THIRD CLAIM, and it is not the one this test was written with.
+	 * The plan was that six appends would fill a leaf and force a split;
+	 * what the boot showed instead was six appends and no split at all,
+	 * because the allocator kept handing back the blocks immediately after
+	 * the file's last run and two runs that touch are ONE run.  That is the
+	 * better answer -- a record per appended block, in each of two trees,
+	 * is how the extent reference tree filled at sixteen -- so the claim
+	 * became the one the code actually makes.
+	 *
+	 * The split still has to be proved, and is, by asking for one outright:
+	 * see fs_apfs_split_selftest.
+	 */
+	splits = fs_apfs_merges() - merges;
+	if (splits != rounds) {
+		kprintf("apfs-grow: FAIL %u appends lengthened %llu runs -- "
+		    "the rest were given records of their own, and blocks that "
+		    "touch should never need one\n", (unsigned)rounds,
+		    (unsigned long long)splits);
+		goto out;
 	}
 
-	rv = fs_pread(&h, was, back, n, &got);
-	if (rv != FS_E_OK || got != n) {
-		kprintf("apfs-grow: FAIL cannot read back what was appended "
-		    "(rv=%d got=%u)\n", rv, got);
+	kprintf("apfs-grow: PASS -- %s grew %llu -> %llu bytes over %u "
+	    "appends, every one of them lengthening the run already there "
+	    "rather than adding a record, and a reboot should still find "
+	    "it\n", SELFTEST_PATH, (unsigned long long)was,
+	    (unsigned long long)h.fh_size, (unsigned)rounds);
+out:
+	kfree(chunk);
+	kfree(back);
+}
+
+/* As above, and about a node that is asked to run out of room. */
+void
+fs_split_selftest(void)
+{
+
+	if (!fs_apfs_ready())
 		return;
-	}
-	for (i = 0; i < n; i++) {
-		if (back[i] == (uint8_t)tail[i])
-			continue;
-		kprintf("apfs-grow: FAIL byte %u of the new tail is 0x%02x, "
-		    "wanted 0x%02x\n", (unsigned)i, (unsigned)back[i],
-		    (unsigned)(uint8_t)tail[i]);
-		return;
-	}
-
-	kprintf("apfs-grow: PASS -- %s grew %llu -> %llu bytes, the new "
-	    "extent carries the appended text, and a reboot should still "
-	    "find it\n", SELFTEST_PATH, (unsigned long long)was,
-	    (unsigned long long)h.fh_size);
+	mutex_lock(&fs_lock);
+	fs_apfs_split_selftest();
+	mutex_unlock(&fs_lock);
 }
 
 /* As above, and about the same file every other write test uses. */

@@ -278,6 +278,12 @@ void		fs_data_selftest(void);
 void		fs_grow_selftest(void);
 
 /*
+ * Prove that a B-tree node can be split without losing a record.  Silently
+ * does nothing when the volume is not APFS.
+ */
+void		fs_split_selftest(void);
+
+/*
  * The volume generation, and what it has caught: how many handles were older
  * than the volume when used, and how many of those had a length that really
  * had moved.  The first number moving proves the check is alive; the second

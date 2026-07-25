@@ -81,6 +81,7 @@ static struct {
 	 */
 	uint64_t	ac_sb_bno;		/* (c) block the sb came from  */
 	uint64_t	ac_next_xid;		/* (c) what it said comes next */
+	uint64_t	ac_next_oid;		/* (c) fresh virtual object ids */
 	uint32_t	ac_xp_desc_next;	/* (c) first free desc slot    */
 	uint64_t	ac_xp_data_base;	/* (m) */
 	uint32_t	ac_xp_data_blocks;	/* (m) */
@@ -254,7 +255,8 @@ static struct alloc_chunk *chunk_for(uint64_t bno);
 static int	spine_update(uint64_t oid, uint64_t paddr, uint64_t xid,
 		    void *buf);
 static int	spine_update_n(const uint64_t *oids, const uint64_t *paddrs,
-		    uint32_t n, uint64_t xid, void *buf);
+		    uint32_t n, uint64_t ins_oid, uint64_t ins_paddr,
+		    uint64_t xid, void *buf);
 static int	cow_physical(uint64_t old_bno, uint64_t xid, void *buf,
 		    uint64_t *new_bno);
 static int	extref_move(uint64_t old_start, uint64_t new_start,
@@ -288,6 +290,8 @@ static uint64_t	 ip_n_free;	/* pool blocks returned */
 static uint64_t	 cow_n_meta;	/* allocation metadata blocks moved */
 static uint64_t	 cow_n_spine;	/* spine objects copied            */
 static uint64_t	 cow_n_data;	/* file blocks moved by a write    */
+static uint64_t	 split_n;	/* nodes split in two              */
+static uint64_t	 merge_n;	/* appends that lengthened a run   */
 
 static size_t
 str_len(const char *s)
@@ -505,6 +509,7 @@ adopt_newest_checkpoint(const struct apfs_nx_superblock *anchor, void *scratch)
 		 */
 		g_apfs.ac_sb_bno         = base + i;
 		g_apfs.ac_next_xid       = nx->nx_next_xid;
+		g_apfs.ac_next_oid       = nx->nx_next_oid;
 		g_apfs.ac_xp_desc_next   = nx->nx_xp_desc_next;
 		g_apfs.ac_xp_data_base   = nx->nx_xp_data_base;
 		g_apfs.ac_xp_data_blocks = nx->nx_xp_data_blocks;
@@ -3125,6 +3130,37 @@ jkey_cmp(const uint8_t *a, uint32_t alen, const uint8_t *b, uint32_t blen)
 		lb = *(const uint64_t *)(b + 8);
 		if (la != lb)
 			return (la < lb ? -1 : 1);
+		return (0);
+	}
+	/*
+	 * Directory entries, because a node's separator can be one and getting
+	 * two of them the wrong way round would put a record in the wrong half
+	 * of a split.  Hashed volumes sort by the word holding the name's
+	 * length and hash and then by the name; plain ones by the name alone.
+	 * Which of the two this volume is was settled at mount.
+	 */
+	if (ta == APFS_TYPE_DIR_REC) {
+		uint32_t	ha, hb;
+		uint32_t	off;
+		uint32_t	n;
+		uint32_t	i;
+
+		off = g_apfs.ac_drec_hashed ? 12u : 10u;
+		if (alen < off || blen < off)
+			return (0);
+		if (g_apfs.ac_drec_hashed) {
+			ha = *(const uint32_t *)(a + 8);
+			hb = *(const uint32_t *)(b + 8);
+			if (ha != hb)
+				return (ha < hb ? -1 : 1);
+		}
+		n = (alen - off < blen - off) ? alen - off : blen - off;
+		for (i = 0; i < n; i++) {
+			if (a[off + i] != b[off + i])
+				return (a[off + i] < b[off + i] ? -1 : 1);
+		}
+		if (alen != blen)
+			return (alen < blen ? -1 : 1);
 	}
 	return (0);
 }
@@ -3271,6 +3307,57 @@ extref_insert(uint64_t start, uint64_t blocks, uint64_t owner, uint64_t xid,
 }
 
 /*
+ * A run has grown at its end: say so in the extent reference tree, instead of
+ * giving it a second record for blocks that touch the first.
+ *
+ * This is what keeps appending from being quadratic in records.  Its node is
+ * its own root and holds sixteen entries, so four appends filled it -- the
+ * fifth said "no room in its table of contents", which is true and is not the
+ * problem.  Two runs that touch, with one owner between them, ARE one run; the
+ * format says so by giving the record a length, and writing two records for
+ * them is the thing that should never have been asked of the tree.
+ */
+static int
+extref_extend(uint64_t start, uint64_t extra, uint64_t xid, void *buf)
+{
+	struct apfs_phys_ext_val	*pv;
+	struct btree_layout		 bl;
+	uint8_t				*node;
+	uint64_t			 raw;
+	uint64_t			 new_bno;
+	uint32_t			 koff, klen, voff, vlen;
+	uint32_t			 i;
+	int				 rv;
+
+	rv = fs_apfs_read_block(g_apfs.ac_extref_bno, buf);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	node = buf;
+	btree_layout(node, &bl);
+	if (bl.bl_level != 0 || bl.bl_fixed)
+		return (FS_APFS_E_INVAL);
+
+	for (i = 0; i < bl.bl_nkeys; i++) {
+		btree_entry_loc(&bl, i, &koff, &klen, &voff, &vlen);
+		raw = *(const uint64_t *)(bl.bl_keys + koff);
+		if ((raw >> APFS_J_OBJ_TYPE_SHIFT) != APFS_TYPE_EXTENT)
+			continue;
+		if ((raw & APFS_J_OBJ_ID_MASK) != start)
+			continue;
+		if (vlen < sizeof(*pv))
+			return (FS_APFS_E_INVAL);
+		pv = (struct apfs_phys_ext_val *)(bl.bl_vals - voff);
+		pv->pe_len_and_kind += extra;
+		rv = cow_physical(g_apfs.ac_extref_bno, xid, buf, &new_bno);
+		if (rv != FS_APFS_E_OK)
+			return (rv);
+		g_apfs.ac_extref_bno = new_bno;
+		return (FS_APFS_E_OK);
+	}
+	return (FS_APFS_E_NOTFOUND);
+}
+
+/*
  * Which leaf a key belongs in: the last one holding a key no greater than it.
  *
  * A walk in tree order is enough to answer that, and it is the same walk every
@@ -3305,6 +3392,393 @@ leaf_find(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 	return (true);
 }
 
+/* ---- splitting ------------------------------------------------------------ */
+
+/*
+ * A NODE RUNS OUT OF ROOM
+ *
+ * Every insert so far has been able to refuse, and the refusal was honest
+ * while nothing depended on it.  It cannot stay: four appends fill this
+ * container's extent leaf, and a filesystem that stops working after four
+ * appends is not one.
+ *
+ * A split is the first operation here that makes a NEW object rather than
+ * moving one, and that is the part measurement had to settle.  Three counters
+ * had to be found before any of it could be written, and two of them are
+ * traps:
+ *
+ *	nx_next_oid      1126  the CONTAINER's, and the source of a fresh
+ *	                       virtual object id
+ *	apfs_next_obj_id   40  the VOLUME's, which numbers inodes -- a
+ *	                       different namespace, and already far behind
+ *	                       the tree's own nodes at 1125
+ *	bt_node_count       3  in the root's footer, and one more after this;
+ *	                       bt_key_count does NOT move, because the same
+ *	                       records are still there
+ *
+ * The new half is a virtual object, so writing it does not make it reachable:
+ * the volume's object map has to gain an ENTRY, which is an insert into a
+ * fixed-size-KV tree, and the parent has to gain a separator, which is an
+ * insert into a variable one.  Both had room, measured before the code -- the
+ * object map has 109 spare entries in its table of contents and the root six.
+ * A parent with none would have to split in turn and the tree would gain a
+ * level; that is refused out loud, and it is the honest edge of this rung.
+ */
+
+/* Would a record of this size go into this node as it stands? */
+static bool
+leaf_has_room(const uint8_t *node, uint32_t klen, uint32_t vlen)
+{
+	const struct apfs_btree_node_phys	*n;
+	struct btree_layout			 bl;
+	uint32_t				 entry;
+
+	n = (const struct apfs_btree_node_phys *)node;
+	btree_layout(node, &bl);
+	entry = bl.bl_fixed ? (uint32_t)sizeof(struct apfs_kvoff) :
+	    (uint32_t)sizeof(struct apfs_kvloc);
+	if ((uint32_t)(bl.bl_nkeys + 1) * entry > n->btn_table_space.nl_len)
+		return (false);
+	return (klen + vlen <= n->btn_free_space.nl_len);
+}
+
+/*
+ * The same insert, for a node whose keys and values are all one size.  The
+ * object map is such a tree, and a split needs an entry in it -- so this and
+ * leaf_insert are the same arithmetic told apart by four bytes of table entry
+ * against eight, which is the whole of the difference between the two node
+ * layouts this format has.
+ */
+static int
+leaf_insert_fixed(uint8_t *node, uint32_t pos, const void *key, uint32_t klen,
+    const void *val, uint32_t vlen)
+{
+	struct apfs_btree_node_phys	*n;
+	struct btree_layout		 bl;
+	struct apfs_kvoff		*kv;
+	uint8_t				*keys;
+	uint32_t			 koff;
+	uint32_t			 voff;
+	uint32_t			 vbase;
+	uint32_t			 i;
+
+	n = (struct apfs_btree_node_phys *)node;
+	btree_layout(node, &bl);
+	if (!bl.bl_fixed || pos > bl.bl_nkeys)
+		return (FS_APFS_E_INVAL);
+	if (!leaf_has_room(node, klen, vlen)) {
+		kprintf("apfs: the object map node holds %u entries and has no "
+		    "room for another -- splitting one is a different rung\n",
+		    (unsigned)bl.bl_nkeys);
+		return (FS_APFS_E_NOALLOC);
+	}
+
+	keys = node + APFS_BTNODE_HDR_SIZE + n->btn_table_space.nl_off +
+	    n->btn_table_space.nl_len;
+	koff = n->btn_free_space.nl_off;
+	mem_copy(keys + koff, key, klen);
+	n->btn_free_space.nl_off = (uint16_t)(koff + klen);
+	n->btn_free_space.nl_len = (uint16_t)(n->btn_free_space.nl_len - klen);
+
+	n->btn_free_space.nl_len = (uint16_t)(n->btn_free_space.nl_len - vlen);
+	vbase = APFS_BLOCK_SIZE -
+	    (((n->btn_flags & APFS_BTNODE_ROOT) != 0) ?
+	    APFS_BTREE_INFO_SIZE : 0);
+	voff = vbase - (APFS_BTNODE_HDR_SIZE + n->btn_table_space.nl_off +
+	    n->btn_table_space.nl_len + n->btn_free_space.nl_off +
+	    n->btn_free_space.nl_len);
+	mem_copy((uint8_t *)bl.bl_vals - voff, val, vlen);
+
+	kv = (struct apfs_kvoff *)(node + APFS_BTNODE_HDR_SIZE +
+	    n->btn_table_space.nl_off);
+	for (i = bl.bl_nkeys; i > pos; i--)
+		kv[i] = kv[i - 1];
+	kv[pos].k = (uint16_t)koff;
+	kv[pos].v = (uint16_t)voff;
+	n->btn_nkeys++;
+	return (FS_APFS_E_OK);
+}
+
+/*
+ * Build a node holding records [from, to) of another, laid out afresh.
+ *
+ * Rebuilding rather than moving bytes about is the point.  A node's key area
+ * accumulates holes as records come and go, and half of one copied verbatim
+ * would carry a free-list chain describing space that is no longer in it.
+ * Re-inserting each record produces a layout correct by construction, through
+ * the same insert every other writer here goes through.
+ */
+static int
+node_rebuild(const uint8_t *src, uint32_t from, uint32_t to, uint8_t *dst)
+{
+	const struct apfs_btree_node_phys	*s;
+	struct apfs_btree_node_phys		*d;
+	struct btree_layout			 bl;
+	uint32_t				 koff, klen, voff, vlen;
+	uint32_t				 i;
+	int					 rv;
+
+	s = (const struct apfs_btree_node_phys *)src;
+	btree_layout(src, &bl);
+	if (bl.bl_fixed || to > bl.bl_nkeys || from > to)
+		return (FS_APFS_E_INVAL);
+
+	mem_zero(dst, APFS_BLOCK_SIZE);
+	d  = (struct apfs_btree_node_phys *)dst;
+	*d = *s;
+	d->btn_nkeys              = 0;
+	d->btn_table_space.nl_off = 0;
+	d->btn_table_space.nl_len = s->btn_table_space.nl_len;
+	d->btn_free_space.nl_off  = 0;
+	d->btn_free_space.nl_len  = (uint16_t)(APFS_BLOCK_SIZE -
+	    APFS_BTNODE_HDR_SIZE - d->btn_table_space.nl_len -
+	    (((d->btn_flags & APFS_BTNODE_ROOT) != 0) ?
+	    APFS_BTREE_INFO_SIZE : 0));
+	/*
+	 * No holes, and the chains have to SAY so.  0xFFFF is the format's
+	 * "no such offset"; a zero would name the first byte of the key area
+	 * as a hole, and a checker walking the chain would read a live record
+	 * as a hole header -- which is the mistake the free queues made once
+	 * already ("B-tree node: free key is too small").
+	 */
+	d->btn_key_free_list.nl_off = APFS_BTOFF_INVALID;
+	d->btn_key_free_list.nl_len = 0;
+	d->btn_val_free_list.nl_off = APFS_BTOFF_INVALID;
+	d->btn_val_free_list.nl_len = 0;
+	if ((d->btn_flags & APFS_BTNODE_ROOT) != 0)
+		mem_copy(dst + APFS_BLOCK_SIZE - APFS_BTREE_INFO_SIZE,
+		    src + APFS_BLOCK_SIZE - APFS_BTREE_INFO_SIZE,
+		    APFS_BTREE_INFO_SIZE);
+
+	for (i = from; i < to; i++) {
+		btree_entry_loc(&bl, i, &koff, &klen, &voff, &vlen);
+		rv = leaf_insert(dst, i - from, bl.bl_keys + koff, klen,
+		    bl.bl_vals - voff, vlen);
+		if (rv != FS_APFS_E_OK)
+			return (rv);
+	}
+	return (FS_APFS_E_OK);
+}
+
+/*
+ * Split the leaf at `bno` in two and tell everything that has to know.
+ *
+ * Five objects move together and none of them is reachable until the
+ * checkpoint commits: the lower half (keeping the oid it had), the upper half
+ * (a brand new object), the parent that gains a separator and a node in its
+ * count, the volume's object map that gains an entry, and the spine above all
+ * of it.
+ */
+static int
+leaf_split(uint64_t bno, uint64_t xid, uint8_t *scratch)
+{
+	struct apfs_obj_phys		*o;
+	struct btree_layout		 bl;
+	struct btree_layout		 rl;
+	uint8_t				*lo;
+	uint8_t				*hi;
+	uint8_t				*sep;
+	uint64_t			 oids[2];
+	uint64_t			 paddrs[2];
+	uint64_t			 lo_bno;
+	uint64_t			 hi_bno;
+	uint64_t			 lo_oid;
+	uint64_t			 hi_oid;
+	uint64_t			 root_bno;
+	uint64_t			 new_root;
+	uint64_t			*nodes;
+	uint32_t			 half;
+	uint32_t			 nkeys;
+	uint32_t			 koff, klen, voff, vlen;
+	uint32_t			 seplen;
+	uint32_t			 pos;
+	int				 rv;
+
+	lo  = kmalloc(APFS_BLOCK_SIZE);
+	hi  = kmalloc(APFS_BLOCK_SIZE);
+	sep = kmalloc(APFS_BLOCK_SIZE);
+	if (lo == NULL || hi == NULL || sep == NULL) {
+		rv = FS_APFS_E_NOMEM;
+		goto out;
+	}
+
+	rv = fs_apfs_read_block(bno, scratch);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	btree_layout(scratch, &bl);
+	if ((bl.bl_flags & APFS_BTNODE_ROOT) != 0) {
+		kprintf("apfs: the node at %llu is the tree's root -- giving "
+		    "the tree another level is a different rung\n",
+		    (unsigned long long)bno);
+		rv = FS_APFS_E_NOALLOC;
+		goto out;
+	}
+	nkeys = bl.bl_nkeys;
+	if (nkeys < 2) {
+		rv = FS_APFS_E_INVAL;
+		goto out;
+	}
+	half   = nkeys / 2;
+	lo_oid = ((const struct apfs_obj_phys *)scratch)->o_oid;
+
+	rv = node_rebuild(scratch, 0, half, lo);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	rv = node_rebuild(scratch, half, nkeys, hi);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+
+	/*
+	 * The separator, taken out of the upper half's own first key and kept
+	 * aside: the parent is read into the same scratch buffer the node came
+	 * from, so a pointer into that buffer would be reading the parent by
+	 * the time it is used.
+	 */
+	btree_layout(hi, &bl);
+	btree_entry_loc(&bl, 0, &koff, &klen, &voff, &vlen);
+	if (klen == 0 || klen > APFS_BLOCK_SIZE) {
+		rv = FS_APFS_E_INVAL;
+		goto out;
+	}
+	seplen = klen;
+	mem_copy(sep, bl.bl_keys + koff, seplen);
+
+	hi_oid = g_apfs.ac_next_oid;
+	if (hi_oid == 0) {
+		rv = FS_APFS_E_INVAL;
+		goto out;
+	}
+	rv = alloc_blocks(1, bno, &lo_bno);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	rv = alloc_blocks(1, bno, &hi_bno);
+	if (rv != FS_APFS_E_OK) {
+		(void)free_blocks(lo_bno, 1);
+		goto out;
+	}
+
+	o = (struct apfs_obj_phys *)lo;
+	o->o_oid = lo_oid;	/* virtual: the oid is a name, and it keeps it */
+	o->o_xid = xid;
+	o = (struct apfs_obj_phys *)hi;
+	o->o_oid = hi_oid;
+	o->o_xid = xid;
+	rv = fs_apfs_write_block(lo_bno, lo);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_write_block(hi_bno, hi);
+	if (rv != FS_APFS_E_OK) {
+		(void)free_blocks(lo_bno, 1);
+		(void)free_blocks(hi_bno, 1);
+		goto out;
+	}
+	rv = free_blocks(bno, 1);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	cow_n_spine += 2;
+
+	/*
+	 * The parent gains the separator.  Its records are (a child's first
+	 * key) -> (that child's oid), so the value is eight bytes whatever the
+	 * key length happens to be.
+	 */
+	root_bno = g_apfs.ac_root_tree_bno;
+	rv = fs_apfs_read_block(root_bno, scratch);
+	if (rv != FS_APFS_E_OK)
+		goto broken;
+	btree_layout(scratch, &rl);
+	if (rl.bl_level != 1) {
+		kprintf("apfs: the tree is %u levels deep and this split only "
+		    "knows a leaf directly under the root\n",
+		    (unsigned)(rl.bl_level + 1));
+		rv = FS_APFS_E_NOALLOC;
+		goto broken;
+	}
+	for (pos = 0; pos < rl.bl_nkeys; pos++) {
+		btree_entry_loc(&rl, pos, &koff, &klen, &voff, &vlen);
+		if (jkey_cmp(rl.bl_keys + koff, klen, sep, seplen) > 0)
+			break;
+	}
+	rv = leaf_insert(scratch, pos, sep, seplen, &hi_oid,
+	    (uint32_t)sizeof(hi_oid));
+	if (rv != FS_APFS_E_OK)
+		goto broken;
+	/*
+	 * One more node in the tree.  The RECORD count does not move: the same
+	 * records are still there, in two nodes instead of one.
+	 */
+	nodes = (uint64_t *)(scratch + APFS_BLOCK_SIZE - APFS_BTREE_INFO_SIZE +
+	    APFS_BTREE_INFO_NODECOUNT);
+	*nodes += 1;
+
+	o = (struct apfs_obj_phys *)scratch;
+	oids[0] = o->o_oid;
+	rv = alloc_blocks(1, root_bno, &new_root);
+	if (rv != FS_APFS_E_OK)
+		goto broken;
+	o->o_xid = xid;
+	rv = fs_apfs_write_block(new_root, scratch);
+	if (rv != FS_APFS_E_OK) {
+		(void)free_blocks(new_root, 1);
+		goto broken;
+	}
+	rv = free_blocks(root_bno, 1);
+	if (rv != FS_APFS_E_OK)
+		goto broken;
+	cow_n_spine++;
+	paddrs[0] = new_root;
+	oids[1]   = lo_oid;
+	paddrs[1] = lo_bno;
+
+	/*
+	 * The object map learns where all three are: the root and the lower
+	 * half by replacement, the upper half by insertion, all inside one
+	 * copy of its node.
+	 */
+	/*
+	 * One more block belongs to this volume: two nodes were written where
+	 * one was freed.  The count is the volume's own claim about itself and
+	 * apfsck recomputes it, so a split that forgets produces the same
+	 * "Volume superblock: bad block count" that growing a file did -- what
+	 * it counts is blocks, not what is in them, and the fixture's own
+	 * arithmetic says so: 91 extent blocks, 3 tree nodes, 2 for the object
+	 * map, 1 for the extent reference tree and 1 for the volume superblock
+	 * itself add up to the 98 it stores.
+	 *
+	 * BEFORE the spine, and this is the second time that ordering has bitten
+	 * in this file: the superblock carrying the count is copied by
+	 * spine_update, so a count raised afterwards belongs to no transaction
+	 * at all and is lost at the next mount.
+	 */
+	g_apfs.ac_fs_alloc_count += 1;
+
+	rv = spine_update_n(oids, paddrs, 2, hi_oid, hi_bno, xid, scratch);
+	if (rv != FS_APFS_E_OK)
+		goto broken;
+
+	g_apfs.ac_root_tree_bno = new_root;
+	g_apfs.ac_next_oid      = hi_oid + 1;
+	split_n++;
+	kprintf("apfs: leaf %llu split -- %u records stay as oid %llu at %llu, "
+	    "%u move to a new oid %llu at %llu\n", (unsigned long long)bno,
+	    (unsigned)half, (unsigned long long)lo_oid,
+	    (unsigned long long)lo_bno, (unsigned)(nkeys - half),
+	    (unsigned long long)hi_oid, (unsigned long long)hi_bno);
+	rv = FS_APFS_E_OK;
+out:
+	kfree(lo);
+	kfree(hi);
+	kfree(sep);
+	return (rv);
+
+broken:
+	kprintf("apfs: splitting the leaf at %llu failed part way (%d) -- this "
+	    "checkpoint must not be written\n", (unsigned long long)bno, rv);
+	kfree(lo);
+	kfree(hi);
+	kfree(sep);
+	return (rv);
+}
+
 /*
  * Make a file longer.
  *
@@ -3317,8 +3791,8 @@ leaf_find(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
  * the file that had it last left there, and handing that to a reader as the
  * tail of their file is a disclosure, not a bug in the arithmetic.
  */
-int
-fs_apfs_grow(uint64_t ino, uint64_t id, uint64_t new_size)
+static int
+grow_once(uint64_t ino, uint64_t id, uint64_t new_size, uint64_t *full_leaf)
 {
 	struct apfs_file_extent_val	 fe;
 	struct apfs_dstream		*ds;
@@ -3353,6 +3827,8 @@ fs_apfs_grow(uint64_t ino, uint64_t id, uint64_t new_size)
 	uint32_t			 i;
 	int				 rv;
 	bool				 stopped;
+	bool				 merge;
+	struct extent_locate		 last;
 
 	if (!g_apfs.ac_mounted)
 		return (FS_APFS_E_NOMOUNT);
@@ -3376,16 +3852,49 @@ fs_apfs_grow(uint64_t ino, uint64_t id, uint64_t new_size)
 	 * extends, which keeps the release of the whole thing reachable later
 	 * and keeps a growing file from scattering across the container.
 	 */
+	merge          = false;
+	last.el_found  = false;
 	if (new_size > alloced) {
 		blocks = (new_size - alloced + APFS_BLOCK_SIZE - 1) /
 		    APFS_BLOCK_SIZE;
 		near = 0;
-		if (alloced > 0 && extent_at(id, alloced - 1, &near) !=
-		    FS_APFS_E_OK)
-			near = 0;
+		if (alloced > 0) {
+			last.el_id    = id;
+			last.el_want  = alloced - 1;
+			last.el_found = false;
+			stopped = false;
+			if (!btree_walk(g_apfs.ac_root_tree_bno, extent_locate,
+			    &last, 0, &stopped)) {
+				rv = FS_APFS_E_IO;
+				goto out;
+			}
+			/*
+			 * The block just PAST the run, not its start: what
+			 * this wants is to continue it, and alloc_blocks
+			 * takes the hint literally when what is there is
+			 * free.
+			 */
+			if (last.el_found && last.el_phys != 0)
+				near = last.el_phys +
+				    last.el_len / APFS_BLOCK_SIZE;
+		}
 		rv = alloc_blocks((uint32_t)blocks, near, &first);
 		if (rv != FS_APFS_E_OK)
 			goto out;
+
+		/*
+		 * TWO RUNS THAT TOUCH ARE ONE RUN.  If the allocator handed
+		 * back the blocks immediately after the file's last extent --
+		 * which, asked to stay near them, it usually does -- then
+		 * lengthening that extent says the same thing as adding a
+		 * record and costs nothing.  Appending block by block would
+		 * otherwise spend a record per block in each of two trees, and
+		 * the extent reference tree is one node: it filled after four.
+		 */
+		if (last.el_found && last.el_phys != 0 &&
+		    last.el_logical + last.el_len == alloced &&
+		    last.el_phys + last.el_len / APFS_BLOCK_SIZE == first)
+			merge = true;
 
 		zero = kmalloc(APFS_BLOCK_SIZE);
 		if (zero == NULL) {
@@ -3445,7 +3954,7 @@ fs_apfs_grow(uint64_t ino, uint64_t id, uint64_t new_size)
 	lf.lf_first = 0;
 	lf.lf_any   = false;
 	stopped = false;
-	if (blocks != 0) {
+	if (blocks != 0 && !merge) {
 		if (!btree_walk(g_apfs.ac_root_tree_bno, leaf_find, &lf, 0,
 		    &stopped)) {
 			rv = FS_APFS_E_IO;
@@ -3468,7 +3977,56 @@ fs_apfs_grow(uint64_t ino, uint64_t id, uint64_t new_size)
 	if (rv != FS_APFS_E_OK)
 		goto give_back;
 
-	if (blocks != 0) {
+	/*
+	 * Room, asked before anything is changed.  Saying which leaf was full
+	 * rather than merely that one was is what lets the caller split it and
+	 * come back: after a split the record may belong in either half, so
+	 * everything above has to be worked out again from scratch.
+	 */
+	if (blocks != 0 && !merge && !leaf_has_room(node,
+	    (uint32_t)sizeof(key), (uint32_t)sizeof(fe))) {
+		*full_leaf = ino_leaf;
+		rv = FS_APFS_E_NOALLOC;
+		goto give_back;
+	}
+
+	if (blocks != 0 && merge) {
+		/*
+		 * Lengthen the record that is already there.  Its key does not
+		 * move -- it is keyed on where the run starts in the file, and
+		 * that is unchanged -- so this is the same shape of edit as
+		 * stamping a modification time.
+		 */
+		btree_layout(node, &bl);
+		rv = FS_APFS_E_NOTFOUND;
+		for (pos = 0; pos < bl.bl_nkeys; pos++) {
+			struct apfs_file_extent_val	*ex;
+
+			btree_entry_loc(&bl, pos, &koff, &klen, &voff, &vlen);
+			if (klen < 16 || vlen < sizeof(*ex))
+				continue;
+			k   = bl.bl_keys + koff;
+			raw = *(const uint64_t *)k;
+			if ((raw & APFS_J_OBJ_ID_MASK) != (id &
+			    APFS_J_OBJ_ID_MASK))
+				continue;
+			if ((uint32_t)(raw >> APFS_J_OBJ_TYPE_SHIFT) !=
+			    APFS_TYPE_FILE_EXTENT)
+				continue;
+			if (*(const uint64_t *)(k + 8) != last.el_logical)
+				continue;
+			ex = (struct apfs_file_extent_val *)(bl.bl_vals - voff);
+			ex->fe_len_and_flags += blocks * APFS_BLOCK_SIZE;
+			rv = FS_APFS_E_OK;
+			break;
+		}
+		if (rv != FS_APFS_E_OK) {
+			kprintf("apfs: the extent at file offset %llu is gone "
+			    "-- cannot lengthen it\n",
+			    (unsigned long long)last.el_logical);
+			goto give_back;
+		}
+	} else if (blocks != 0) {
 		btree_layout(node, &bl);
 		for (pos = 0; pos < bl.bl_nkeys; pos++) {
 			btree_entry_loc(&bl, pos, &koff, &klen, &voff, &vlen);
@@ -3551,7 +4109,7 @@ fs_apfs_grow(uint64_t ino, uint64_t id, uint64_t new_size)
 	nmoved    = 1;
 
 	root_bno = g_apfs.ac_root_tree_bno;
-	if (blocks != 0 && oids[0] != g_apfs.ac_root_tree_oid) {
+	if (blocks != 0 && !merge && oids[0] != g_apfs.ac_root_tree_oid) {
 		rv = fs_apfs_read_block(root_bno, node);
 		if (rv != FS_APFS_E_OK)
 			goto broken;
@@ -3574,7 +4132,7 @@ fs_apfs_grow(uint64_t ino, uint64_t id, uint64_t new_size)
 		paddrs[1] = new_root;
 		nmoved    = 2;
 		g_apfs.ac_root_tree_bno = new_root;
-	} else if (blocks != 0) {
+	} else if (blocks != 0 && !merge) {
 		/* One node that is both root and leaf: already counted above. */
 		rv = fs_apfs_read_block(new_leaf, node);
 		if (rv != FS_APFS_E_OK)
@@ -3586,7 +4144,19 @@ fs_apfs_grow(uint64_t ino, uint64_t id, uint64_t new_size)
 		g_apfs.ac_root_tree_bno = new_leaf;
 	}
 
-	if (blocks != 0) {
+	if (blocks != 0 && merge) {
+		merge_n++;
+		rv = extref_extend(last.el_phys, blocks, xid, node);
+		if (rv != FS_APFS_E_OK) {
+			kprintf("apfs: the run at %llu grew but the extent "
+			    "reference tree still calls it %llu blocks "
+			    "(%d)\n",
+			    (unsigned long long)last.el_phys,
+			    (unsigned long long)(last.el_len / APFS_BLOCK_SIZE),
+			    rv);
+			goto broken;
+		}
+	} else if (blocks != 0) {
 		rv = extref_insert(first, blocks, ino, xid, node);
 		if (rv != FS_APFS_E_OK) {
 			kprintf("apfs: the file grew but the extent reference "
@@ -3604,7 +4174,7 @@ fs_apfs_grow(uint64_t ino, uint64_t id, uint64_t new_size)
 	 */
 	g_apfs.ac_fs_alloc_count += blocks;
 
-	rv = spine_update_n(oids, paddrs, nmoved, xid, node);
+	rv = spine_update_n(oids, paddrs, nmoved, 0, 0, xid, node);
 	if (rv != FS_APFS_E_OK)
 		goto broken;
 	if (oids[0] == g_apfs.ac_root_tree_oid)
@@ -3625,6 +4195,43 @@ broken:
 	    (unsigned long long)ino, rv);
 	kfree(node);
 	return (rv);
+}
+
+/*
+ * And the same, with one retry behind a split.
+ *
+ * Split first and grow afterwards, rather than splitting halfway through: a
+ * split moves the leaf, the root and the object map, so every address the
+ * grow had worked out is stale the moment it happens.  Starting over is a
+ * wasted allocation and a re-walk, once, against a page of state to unpick.
+ *
+ * Once and not in a loop.  A single record cannot need two splits to fit, so
+ * a second refusal means something other than a full node -- and a writer that
+ * kept splitting in the hope it would help would turn that into a tree full of
+ * half-empty nodes rather than an error message.
+ */
+int
+fs_apfs_grow(uint64_t ino, uint64_t id, uint64_t new_size)
+{
+	uint8_t		*scratch;
+	uint64_t	 full;
+	int		 rv;
+
+	full = 0;
+	rv = grow_once(ino, id, new_size, &full);
+	if (rv != FS_APFS_E_NOALLOC || full == 0)
+		return (rv);
+
+	scratch = kmalloc(APFS_BLOCK_SIZE);
+	if (scratch == NULL)
+		return (FS_APFS_E_NOMEM);
+	rv = leaf_split(full, g_apfs.ac_xid + 1, scratch);
+	kfree(scratch);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+
+	full = 0;
+	return (grow_once(ino, id, new_size, &full));
 }
 
 int
@@ -4149,6 +4756,22 @@ alloc_bits(struct alloc_chunk *ch, uint32_t first, uint32_t count, bool take)
 	return (FS_APFS_E_OK);
 }
 
+/* Are these `count` blocks of this chunk all free right now? */
+static bool
+chunk_run_free(const struct alloc_chunk *ch, uint32_t first, uint32_t count)
+{
+	uint32_t	i;
+
+	if ((uint64_t)first + count > ch->ch_blocks)
+		return (false);
+	for (i = 0; i < count; i++) {
+		if ((ch->ch_bm[(first + i) >> 3] &
+		    (uint8_t)(1u << ((first + i) & 7u))) != 0)
+			return (false);
+	}
+	return (true);
+}
+
 /* A run of `count` free blocks in this one chunk, taken, or E_NOALLOC. */
 static int
 alloc_run_in(struct alloc_chunk *ch, uint32_t count, uint64_t *first_out)
@@ -4197,6 +4820,24 @@ alloc_blocks(uint32_t count, uint64_t near, uint64_t *first_out)
 
 	ch = (near != 0) ? chunk_for(near) : NULL;
 	if (ch != NULL) {
+		/*
+		 * EXACTLY there first, when exactly there is free.  A caller
+		 * naming a block usually wants the run to continue from it,
+		 * and first-fit gave it to them only four times in six -- the
+		 * metadata copies of the same transaction kept taking the
+		 * block in between.  Landing on it is the difference between
+		 * lengthening a record and adding one.
+		 */
+		if (near >= ch->ch_base && chunk_run_free(ch,
+		    (uint32_t)(near - ch->ch_base), count)) {
+			rv = alloc_bits(ch, (uint32_t)(near - ch->ch_base),
+			    count, true);
+			if (rv == FS_APFS_E_OK) {
+				*first_out = near;
+				alloc_n_taken += count;
+				return (FS_APFS_E_OK);
+			}
+		}
 		rv = alloc_run_in(ch, count, first_out);
 		if (rv != FS_APFS_E_NOALLOC)
 			return (rv);
@@ -4390,8 +5031,8 @@ cow_physical(uint64_t old_bno, uint64_t xid, void *buf, uint64_t *new_bno)
  */
 static int
 omap_replace_cow(uint64_t node_bno, const uint64_t *oids,
-    const uint64_t *paddrs, uint32_t n, uint64_t xid, void *buf,
-    uint64_t *new_node)
+    const uint64_t *paddrs, uint32_t n, uint64_t ins_oid,
+    uint64_t ins_paddr, uint64_t xid, void *buf, uint64_t *new_node)
 {
 	struct btree_layout	 bl;
 	struct apfs_omap_key	*k;
@@ -4439,6 +5080,37 @@ omap_replace_cow(uint64_t node_bno, const uint64_t *oids,
 		kprintf("apfs: object map at %llu answered for %u of %u oids\n",
 		    (unsigned long long)node_bno, (unsigned)done, (unsigned)n);
 		return (FS_APFS_E_NOTFOUND);
+	}
+
+	/*
+	 * And a wholly NEW object, when one has just been made.  A split is
+	 * the only thing that does this: the upper half is an object nothing
+	 * has ever heard of, and writing its block does not make it
+	 * reachable -- this entry does.
+	 */
+	if (ins_oid != 0) {
+		struct apfs_omap_key	 ik;
+		struct apfs_omap_val	 iv;
+		uint64_t		*count;
+
+		for (i = 0; i < bl.bl_nkeys; i++) {
+			btree_entry_off(&bl, i, &koff, &voff);
+			k = (struct apfs_omap_key *)(bl.bl_keys + koff);
+			if (k->ok_oid > ins_oid)
+				break;
+		}
+		ik.ok_oid   = ins_oid;
+		ik.ok_xid   = xid;
+		iv.ov_flags = 0;
+		iv.ov_size  = APFS_BLOCK_SIZE;
+		iv.ov_paddr = ins_paddr;
+		rv = leaf_insert_fixed(buf, i, &ik, (uint32_t)sizeof(ik), &iv,
+		    (uint32_t)sizeof(iv));
+		if (rv != FS_APFS_E_OK)
+			return (rv);
+		count = (uint64_t *)((uint8_t *)buf + APFS_BLOCK_SIZE -
+		    APFS_BTREE_INFO_SIZE + APFS_BTREE_INFO_KEYCOUNT);
+		*count += 1;
 	}
 	return (cow_physical(node_bno, xid, buf, new_node));
 }
@@ -4570,7 +5242,7 @@ extref_move(uint64_t old_start, uint64_t new_start, uint64_t blocks,
  */
 static int
 spine_update_n(const uint64_t *oids, const uint64_t *paddrs, uint32_t n,
-    uint64_t xid, void *buf)
+    uint64_t ins_oid, uint64_t ins_paddr, uint64_t xid, void *buf)
 {
 	struct apfs_omap_phys		*om;
 	struct apfs_superblock		*vsb;
@@ -4585,8 +5257,8 @@ spine_update_n(const uint64_t *oids, const uint64_t *paddrs, uint32_t n,
 	int				 rv;
 
 	/* 1. the volume's object map: those oids now live at those addresses */
-	rv = omap_replace_cow(g_apfs.ac_vol_omap_tree, oids, paddrs, n, xid,
-	    buf, &new_vol_tree);
+	rv = omap_replace_cow(g_apfs.ac_vol_omap_tree, oids, paddrs, n,
+	    ins_oid, ins_paddr, xid, buf, &new_vol_tree);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
 
@@ -4639,7 +5311,7 @@ spine_update_n(const uint64_t *oids, const uint64_t *paddrs, uint32_t n,
 	/* 4. the container's object map: the volume superblock has moved */
 	fs_oid = g_apfs.ac_fs_oid;
 	rv = omap_replace_cow(g_apfs.ac_ctr_omap_tree, &fs_oid, &new_vsb, 1,
-	    xid, buf, &new_ctr_tree);
+	    0, 0, xid, buf, &new_ctr_tree);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
 
@@ -4673,7 +5345,7 @@ static int
 spine_update(uint64_t oid, uint64_t paddr, uint64_t xid, void *buf)
 {
 
-	return (spine_update_n(&oid, &paddr, 1, xid, buf));
+	return (spine_update_n(&oid, &paddr, 1, 0, 0, xid, buf));
 }
 
 /*
@@ -5153,6 +5825,225 @@ out:
 	kfree(block);
 }
 
+/* Every record, and the biggest non-root leaf seen holding them. */
+struct leaf_probe {
+	uint64_t	lp_bno;		/* the leaf the last record was in */
+	uint64_t	lp_count;	/* records seen so far             */
+	uint64_t	lp_best;	/* a leaf worth splitting          */
+	uint32_t	lp_here;	/* records seen in lp_bno          */
+	uint32_t	lp_most;
+};
+
+static bool
+leaf_probe(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
+    const uint8_t *val, uint32_t vlen, uint64_t bno, void *arg)
+{
+	struct leaf_probe	*lp;
+
+	(void)oid;
+	(void)type;
+	(void)key;
+	(void)klen;
+	(void)val;
+	(void)vlen;
+	lp = arg;
+	lp->lp_count++;
+	if (bno != lp->lp_bno) {
+		lp->lp_bno  = bno;
+		lp->lp_here = 0;
+	}
+	lp->lp_here++;
+	if (lp->lp_here > lp->lp_most) {
+		lp->lp_most = lp->lp_here;
+		lp->lp_best = bno;
+	}
+	return (true);
+}
+
+/*
+ * A NODE SPLITS AND NOTHING IS LOST
+ *
+ * The organic route to this stopped being organic.  Appending was meant to
+ * fill a leaf four records at a time, and then extents that touch started
+ * being merged instead -- which is right, and which means a sequential writer
+ * never fills anything.  So the split is asked for directly.
+ *
+ * Two things are checked, and finding out that one was not enough is what
+ * this comment is for.  Counting the records through the ordinary walk proves
+ * none was lost or duplicated -- but a WALK CANNOT SEE A WRONG SEPARATOR.  It
+ * visits every child of the index in turn whatever the keys say, so the count
+ * comes out right, the file still reads, and the tree is quietly out of order.
+ * Written with a separator taken from the wrong half on purpose, this test
+ * passed; apfsck did not:
+ *
+ *	B-tree: keys are out of order.
+ *
+ * So the index is checked here as well, by the invariant a split has to keep:
+ * the key the parent stores for a child is that child's own first key.  That
+ * is a claim this kernel can make about itself, rather than one it has to send
+ * a container away to have checked.
+ */
+void
+fs_apfs_split_selftest(void)
+{
+	struct fs_apfs_statbuf	 st;
+	struct leaf_probe	 lp;
+	uint8_t			*scratch;
+	uint64_t		 before;
+	uint64_t		 victim;
+	uint64_t		 after;
+	uint64_t		 splits;
+	bool			 stopped;
+
+	if (!g_apfs.ac_mounted || !g_apfs.ac_ip_valid) {
+		kprintf("apfs-split: nothing writable -- skipped\n");
+		return;
+	}
+
+	lp.lp_bno   = 0;
+	lp.lp_count = 0;
+	lp.lp_best  = 0;
+	lp.lp_here  = 0;
+	lp.lp_most  = 0;
+	stopped = false;
+	if (!btree_walk(g_apfs.ac_root_tree_bno, leaf_probe, &lp, 0,
+	    &stopped)) {
+		kprintf("apfs-split: FAIL the tree will not walk\n");
+		return;
+	}
+	before = lp.lp_count;
+	if (lp.lp_best == 0 || lp.lp_best == g_apfs.ac_root_tree_bno) {
+		kprintf("apfs-split: the tree is one node deep -- skipped\n");
+		return;
+	}
+
+	victim  = lp.lp_best;
+	splits  = split_n;
+	scratch = kmalloc(APFS_BLOCK_SIZE);
+	if (scratch == NULL) {
+		kprintf("apfs-split: no memory -- skipped\n");
+		return;
+	}
+	if (leaf_split(victim, g_apfs.ac_xid + 1, scratch) !=
+	    FS_APFS_E_OK) {
+		kprintf("apfs-split: FAIL the leaf at %llu would not split\n",
+		    (unsigned long long)victim);
+		kfree(scratch);
+		return;
+	}
+	kfree(scratch);
+	if (split_n != splits + 1) {
+		kprintf("apfs-split: FAIL the split was not counted\n");
+		return;
+	}
+	if (fs_apfs_checkpoint() != FS_APFS_E_OK) {
+		kprintf("apfs-split: FAIL the checkpoint was refused -- the "
+		    "split is lost, which is the correct outcome\n");
+		return;
+	}
+
+	lp.lp_bno   = 0;
+	lp.lp_count = 0;
+	lp.lp_best  = 0;
+	lp.lp_here  = 0;
+	lp.lp_most  = 0;
+	stopped = false;
+	if (!btree_walk(g_apfs.ac_root_tree_bno, leaf_probe, &lp, 0,
+	    &stopped)) {
+		kprintf("apfs-split: FAIL the tree will not walk after the "
+		    "split -- a separator or a child oid is wrong\n");
+		return;
+	}
+	after = lp.lp_count;
+	if (after != before) {
+		kprintf("apfs-split: FAIL %llu records before the split and "
+		    "%llu after -- the halves do not add up\n",
+		    (unsigned long long)before, (unsigned long long)after);
+		return;
+	}
+
+	/*
+	 * Every separator against the child it names.  This is the half the
+	 * walk is blind to, and the half a wrong split shows up in.
+	 */
+	{
+		struct btree_layout	 rl;
+		struct btree_layout	 cl;
+		uint8_t			*root;
+		uint8_t			*child;
+		uint64_t		 oid;
+		uint64_t		 bno;
+		uint32_t		 koff, klen, voff, vlen;
+		uint32_t		 ckoff, cklen, cvoff, cvlen;
+		uint32_t		 i;
+		int			 bad;
+
+		root  = kmalloc(APFS_BLOCK_SIZE);
+		child = kmalloc(APFS_BLOCK_SIZE);
+		if (root == NULL || child == NULL) {
+			kprintf("apfs-split: FAIL no memory to check the "
+			    "index\n");
+			kfree(root);
+			kfree(child);
+			return;
+		}
+		bad = 0;
+		if (fs_apfs_read_block(g_apfs.ac_root_tree_bno, root) !=
+		    FS_APFS_E_OK)
+			bad = 1;
+		else {
+			btree_layout(root, &rl);
+			for (i = 0; !bad && rl.bl_level > 0 &&
+			    i < rl.bl_nkeys; i++) {
+				btree_entry_loc(&rl, i, &koff, &klen, &voff,
+				    &vlen);
+				oid = *(const uint64_t *)(rl.bl_vals - voff);
+				if (fs_apfs_omap_lookup(g_apfs.ac_vol_omap_tree,
+				    oid, view_xid(), &bno) != FS_APFS_E_OK ||
+				    fs_apfs_read_block(bno, child) !=
+				    FS_APFS_E_OK) {
+					kprintf("apfs-split: FAIL the index "
+					    "names child oid %llu, which the "
+					    "object map cannot place\n",
+					    (unsigned long long)oid);
+					bad = 1;
+					break;
+				}
+				btree_layout(child, &cl);
+				btree_entry_loc(&cl, 0, &ckoff, &cklen, &cvoff,
+				    &cvlen);
+				if (jkey_cmp(rl.bl_keys + koff, klen,
+				    cl.bl_keys + ckoff, cklen) != 0) {
+					kprintf("apfs-split: FAIL the index "
+					    "says child %u starts at one key "
+					    "and the child at %llu starts at "
+					    "another -- the separator is from "
+					    "the wrong node\n", (unsigned)i,
+					    (unsigned long long)bno);
+					bad = 1;
+				}
+			}
+		}
+		kfree(root);
+		kfree(child);
+		if (bad)
+			return;
+	}
+
+	/* And a file, because a count can be right while a lookup is not. */
+	if (fs_apfs_stat("/var/db/big.txt", &st) != FS_APFS_E_OK) {
+		kprintf("apfs-split: FAIL /var/db/big.txt cannot be found "
+		    "through the split tree\n");
+		return;
+	}
+
+	kprintf("apfs-split: PASS -- leaf %llu split in two, %llu records "
+	    "before and after, every separator matching the child it names, "
+	    "and /var/db/big.txt still resolves to %llu bytes\n",
+	    (unsigned long long)victim, (unsigned long long)before,
+	    (unsigned long long)st.afs_size);
+}
+
 /*
  * WRITING A CHECKPOINT
  *
@@ -5450,6 +6341,14 @@ fs_apfs_checkpoint(void)
 	nx->nx_o.o_oid       = APFS_OBJ_NX_SUPERBLOCK;
 	nx->nx_o.o_xid       = xid;
 	nx->nx_next_xid      = xid + 1;
+	/*
+	 * Where the next virtual object id comes from.  A node that SPLITS
+	 * needs one for its new half, and the counter is the container's
+	 * rather than the volume's -- apfs_next_obj_id numbers inodes, which
+	 * is a different namespace entirely and was 40 here while the tree's
+	 * own nodes were already at 1125.
+	 */
+	nx->nx_next_oid      = g_apfs.ac_next_oid;
 	/*
 	 * The one pointer a copy-on-write of anything in the volume ends at.
 	 * Every object between an inode and here has been copied by now, and
@@ -5795,6 +6694,20 @@ fs_apfs_ckpt_selftest(void)
 	    (unsigned)g_apfs.ac_eph_count, (unsigned long long)first_xid);
 out:
 	kfree(scratch);
+}
+
+uint64_t
+fs_apfs_splits(void)
+{
+
+	return (split_n);
+}
+
+uint64_t
+fs_apfs_merges(void)
+{
+
+	return (merge_n);
 }
 
 int

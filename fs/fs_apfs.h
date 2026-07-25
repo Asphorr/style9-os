@@ -409,11 +409,25 @@ struct apfs_omap_val {
 
 /*
  * Inside that trailing btree_info: flags, node size, key size, value size,
- * longest key, longest value, then the two counts.  Only the key count is
- * written here, and by offset rather than through a struct, because it is the
- * one field a writer has to keep true and the rest are the tree's shape.
+ * longest key, longest value, then the two counts.  Two of those are written
+ * here, by offset rather than through a struct, because they are the fields a
+ * writer has to keep true and the rest are the tree's shape.
+ *
+ * Which of the two moves says what happened.  An INSERT adds a record, so the
+ * key count moves and the node count does not; a SPLIT adds a node holding
+ * records that were already counted, so the node count moves and the key
+ * count does not.  Getting that backwards is not a rounding error -- apfsck
+ * answers "Catalog: wrong key count in info footer" either way.
  */
 #define	APFS_BTREE_INFO_KEYCOUNT	24
+#define	APFS_BTREE_INFO_NODECOUNT	32
+
+/*
+ * "No such offset", in a node's free-list heads.  A zero would name the first
+ * byte of the key area, which a checker walking the chain reads as a hole
+ * header sitting on top of a live record.
+ */
+#define	APFS_BTOFF_INVALID		0xFFFFU
 
 /*
  * A free-queue record: which transaction released the run, where it starts,
@@ -859,6 +873,28 @@ void	fs_apfs_data_selftest(const char *path);
  * here.  Returns FS_APFS_E_OK or a negative FS_APFS_E_*.
  */
 int	fs_apfs_grow(uint64_t ino, uint64_t id, uint64_t new_size);
+
+/*
+ * How many B-tree nodes this kernel has split since it booted.  Exposed so a
+ * test can insist that a node really did run out of room and grow rather than
+ * the insert quietly having had space all along.
+ */
+uint64_t fs_apfs_splits(void);
+
+/*
+ * And how many appends lengthened a run that was already there instead of
+ * giving the file another one.  Two runs that touch are one run; a test that
+ * cannot see the difference cannot tell a filesystem that coalesces from one
+ * that is quietly spending a record per block.
+ */
+uint64_t fs_apfs_merges(void);
+
+/*
+ * Split a leaf on purpose and prove nothing was lost: the same records, in the
+ * same order, reachable through the index afterwards.  Asked for directly
+ * because a sequential writer no longer fills a node -- it coalesces instead.
+ */
+void	fs_apfs_split_selftest(void);
 
 /*
  * Translate a virtual object id to its block number through the object-map

@@ -172,6 +172,13 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	fs_grow_selftest();
 
 	/*
+	 * Last of all, the one operation nothing else reaches any more: a node
+	 * that runs out of room.  Appending stopped filling one once runs that
+	 * touch began to be merged, so this asks for a split outright.
+	 */
+	fs_split_selftest();
+
+	/*
 	 * Register a demo service under the bootstrap port so ring-3
 	 * code has something to look up.  MACH_PORT_TASK_SELF=1 in
 	 * kernel_space resolves to kernel_task's task_self port; we
