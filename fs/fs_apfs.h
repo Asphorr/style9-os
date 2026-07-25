@@ -68,8 +68,14 @@
 #define	APFS_OBJ_NX_SUPERBLOCK	0x00000001U
 #define	APFS_OBJ_BTREE_ROOT	0x00000002U
 #define	APFS_OBJ_BTREE_NODE	0x00000003U
+#define	APFS_OBJ_SPACEMAN	0x00000005U
 #define	APFS_OBJ_OMAP		0x0000000BU
+#define	APFS_OBJ_CHECKPOINT_MAP	0x0000000CU
 #define	APFS_OBJ_FS		0x0000000DU	/* volume superblock */
+#define	APFS_OBJ_NX_REAPER	0x00000011U
+
+/* o_subtype of a B-tree that is one of the space manager's free queues. */
+#define	APFS_OBJ_SPACEMAN_FREE_QUEUE	0x00000009U
 
 /*
  * Header every metadata block begins with.  o_cksum covers the block from
@@ -128,6 +134,143 @@ _Static_assert(__builtin_offsetof(struct apfs_nx_superblock, nx_omap_oid)
     == 160, "nx_omap_oid sits at +160");
 _Static_assert(__builtin_offsetof(struct apfs_nx_superblock, nx_fs_oid)
     == 184, "nx_fs_oid[] starts at +184");
+_Static_assert(__builtin_offsetof(struct apfs_nx_superblock, nx_spaceman_oid)
+    == 152, "nx_spaceman_oid sits at +152");
+
+/*
+ * THE EPHEMERAL OBJECTS, AND WHY THEY NEED A MAP OF THEIR OWN
+ *
+ * A physical oid is a block number and a virtual one is a question for the
+ * object map, but an EPHEMERAL oid is neither.  Those objects live in memory
+ * while the container is mounted and are written to the checkpoint data area
+ * only when a checkpoint commits, so their block number is a property of the
+ * checkpoint rather than of the object.  The checkpoint says where they went
+ * in checkpoint-map blocks, which sit in the descriptor ring immediately
+ * before the superblock that closes the same checkpoint.
+ *
+ * That is why a reader that only wants files can skip them -- nothing an open
+ * or a read ever touches is ephemeral -- and why anything that wants to know
+ * about SPACE cannot.  The space manager is ephemeral, and it is the only
+ * thing that knows which blocks are free.
+ */
+struct apfs_checkpoint_mapping {
+	uint32_t	cpm_type;
+	uint32_t	cpm_subtype;
+	uint32_t	cpm_size;	/* bytes; one block in every case seen */
+	uint32_t	cpm_pad;
+	uint64_t	cpm_fs_oid;
+	uint64_t	cpm_oid;
+	uint64_t	cpm_paddr;
+};
+
+_Static_assert(sizeof(struct apfs_checkpoint_mapping) == 40,
+    "a checkpoint mapping is 40 bytes on disk");
+
+/* CHECKPOINT_MAP_LAST: this block is the last map of its checkpoint. */
+#define	APFS_CPM_LAST		0x00000001U
+
+struct apfs_checkpoint_map_phys {
+	struct apfs_obj_phys		cpm_o;
+	uint32_t			cpm_flags;
+	uint32_t			cpm_count;
+	struct apfs_checkpoint_mapping	cpm_map[];
+};
+
+_Static_assert(__builtin_offsetof(struct apfs_checkpoint_map_phys, cpm_map)
+    == 40, "the mappings start at +40");
+
+/* Ceiling on mappings in one block, from the block size.  (4096-40)/40. */
+#define	APFS_CPM_MAX_PER_BLOCK	((APFS_BLOCK_SIZE - 40) / 40)
+
+/*
+ * THE SPACE MANAGER
+ *
+ * Two devices (main and tier2; only main is ever non-empty here), each divided
+ * into chunks of sm_blocks_per_chunk blocks.  One chunk's allocation bitmap is
+ * exactly one block -- 32768 bits for 32768 blocks -- which is the arithmetic
+ * the whole layout is built around.
+ *
+ * The free queues are the asymmetry that makes this filesystem harder to write
+ * than to read.  Allocating is an edit to a bitmap; freeing is an INSERT into
+ * one of these B-trees, keyed by the transaction that did the freeing, and the
+ * blocks do not become available again until that transaction is old enough.
+ * A writer that does not maintain xid has nothing honest to put in that key.
+ */
+struct apfs_spaceman_device {
+	uint64_t	sm_block_count;
+	uint64_t	sm_chunk_count;
+	uint32_t	sm_cib_count;	/* chunk-info blocks  */
+	uint32_t	sm_cab_count;	/* chunk-info address blocks */
+	uint64_t	sm_free_count;
+	uint32_t	sm_addr_offset;	/* into this struct's own block */
+	uint32_t	sm_reserved;
+	uint64_t	sm_reserved2;
+};
+
+_Static_assert(sizeof(struct apfs_spaceman_device) == 48,
+    "a spaceman device record is 48 bytes on disk");
+
+struct apfs_spaceman_free_queue {
+	uint64_t	sfq_count;		/* blocks queued for release */
+	uint64_t	sfq_tree_oid;		/* the B-tree holding them   */
+	uint64_t	sfq_oldest_xid;		/* nothing older is queued   */
+	uint16_t	sfq_tree_node_limit;
+	uint16_t	sfq_pad16;
+	uint32_t	sfq_pad32;
+	uint64_t	sfq_reserved;
+};
+
+_Static_assert(sizeof(struct apfs_spaceman_free_queue) == 40,
+    "a free-queue record is 40 bytes on disk");
+
+#define	APFS_SD_MAIN		0
+#define	APFS_SD_TIER2		1
+#define	APFS_SD_COUNT		2
+
+#define	APFS_SFQ_IP		0	/* internal pool */
+#define	APFS_SFQ_MAIN		1
+#define	APFS_SFQ_TIER2		2
+#define	APFS_SFQ_COUNT		3
+
+/*
+ * Only as far as the free queues -- everything past them is internal-pool
+ * ring bookkeeping this kernel has no use for yet.  The struct is read out of
+ * a block, so a short definition reads a prefix; it must never be written.
+ */
+struct apfs_spaceman {
+	struct apfs_obj_phys		sm_o;
+	uint32_t			sm_block_size;
+	uint32_t			sm_blocks_per_chunk;
+	uint32_t			sm_chunks_per_cib;
+	uint32_t			sm_cibs_per_cab;
+	struct apfs_spaceman_device	sm_dev[APFS_SD_COUNT];
+	uint32_t			sm_flags;
+	uint32_t			sm_ip_bm_tx_multiplier;
+	uint64_t			sm_ip_block_count;
+	uint32_t			sm_ip_bm_size_in_blocks;
+	uint32_t			sm_ip_bm_block_count;
+	uint64_t			sm_ip_bm_base;
+	uint64_t			sm_ip_base;
+	uint64_t			sm_fs_reserve_block_count;
+	uint64_t			sm_fs_reserve_alloc_count;
+	struct apfs_spaceman_free_queue	sm_fq[APFS_SFQ_COUNT];
+};
+
+/*
+ * Pinned against a real container rather than against the published layout:
+ * every one of these was read out of obj/style9.apfs before it was written
+ * here, and the two free-queue tree oids the struct reports are the same two
+ * oids the checkpoint map lists as free-queue B-trees, which is the check
+ * that the offsets are right rather than merely plausible.
+ */
+_Static_assert(__builtin_offsetof(struct apfs_spaceman, sm_dev) == 48,
+    "sm_dev[] starts at +48");
+_Static_assert(__builtin_offsetof(struct apfs_spaceman, sm_flags) == 144,
+    "sm_flags sits at +144");
+_Static_assert(__builtin_offsetof(struct apfs_spaceman, sm_ip_bm_base) == 168,
+    "sm_ip_bm_base sits at +168");
+_Static_assert(__builtin_offsetof(struct apfs_spaceman, sm_fq) == 200,
+    "sm_fq[] starts at +200");
 
 /*
  * Object map.  A PHYSICAL oid is already a block number, but a VIRTUAL one

@@ -33,6 +33,15 @@
 #define	APFS_SECTORS_PER_BLOCK	(APFS_BLOCK_SIZE / ATA_SECTOR_BYTES)
 
 /*
+ * How many ephemeral objects one checkpoint may name before this reader stops
+ * recording them.  A container holds the reaper, the space manager and one
+ * B-tree per free queue, plus a handful per mounted volume; 32 is far above
+ * anything a single-volume container produces and is bounded storage in a
+ * struct that lives for the life of the mount.
+ */
+#define	APFS_EPH_MAX		32
+
+/*
  * Mounted container state.  (m) = written once by fs_apfs_init before any
  * reader exists, read-only afterwards.
  */
@@ -47,8 +56,40 @@ static struct {
 	uint64_t	ac_num_files;		/* (m) */
 	uint64_t	ac_num_dirs;		/* (m) */
 	uint32_t	ac_xp_desc_blocks;	/* (m) */
+	uint32_t	ac_xp_desc_index;	/* (m) this checkpoint's first */
+	uint32_t	ac_xp_desc_len;		/* (m) ...and how many         */
+	uint64_t	ac_spaceman_oid;	/* (m) ephemeral               */
 	bool		ac_drec_hashed;		/* (m) hashed dirent keys   */
 	bool		ac_mounted;		/* (m) */
+
+	/*
+	 * The checkpoint's ephemeral objects, resolved.  A fixed table because
+	 * the count is a property of the container's shape rather than of its
+	 * size: four here (reaper, space manager, two free-queue trees), and it
+	 * grows only with the number of mounted volumes.  ac_eph_over records
+	 * what did not fit, so a container that outgrows this says so instead
+	 * of quietly answering half the questions.
+	 */
+	struct {
+		uint64_t	e_oid;
+		uint64_t	e_paddr;
+		uint32_t	e_type;
+		uint32_t	e_subtype;
+	}		ac_eph[APFS_EPH_MAX];		/* (m) */
+	uint32_t	ac_eph_count;			/* (m) */
+	uint32_t	ac_eph_over;			/* (m) dropped for space */
+
+	/* What the space manager says, once it has been found and read. */
+	bool		ac_sm_valid;		/* (m) */
+	uint64_t	ac_sm_paddr;		/* (m) */
+	uint64_t	ac_sm_free;		/* (m) blocks free on device 0 */
+	uint64_t	ac_sm_chunks;		/* (m) */
+	uint32_t	ac_sm_blocks_per_chunk;	/* (m) */
+	uint32_t	ac_sm_cib_count;	/* (m) */
+	uint64_t	ac_sm_ip_base;		/* (m) internal pool           */
+	uint64_t	ac_sm_ip_blocks;	/* (m) */
+	uint64_t	ac_sm_fq_count[APFS_SFQ_COUNT];	  /* (m) */
+	uint64_t	ac_sm_fq_oldest[APFS_SFQ_COUNT];  /* (m) */
 } g_apfs;
 
 /*
@@ -244,6 +285,16 @@ adopt_newest_checkpoint(const struct apfs_nx_superblock *anchor, void *scratch)
 		g_apfs.ac_omap_oid    = nx->nx_omap_oid;
 		g_apfs.ac_fs_oid      = nx->nx_fs_oid[0];
 		g_apfs.ac_block_count = nx->nx_block_count;
+		/*
+		 * Where this checkpoint's own descriptor blocks are, and the
+		 * one ephemeral oid worth chasing.  Taken from the superblock
+		 * that WON, not from the anchor at block 0: the anchor is a
+		 * copy of some earlier checkpoint and its indices point at that
+		 * one's blocks.
+		 */
+		g_apfs.ac_xp_desc_index = nx->nx_xp_desc_index;
+		g_apfs.ac_xp_desc_len   = nx->nx_xp_desc_len;
+		g_apfs.ac_spaceman_oid  = nx->nx_spaceman_oid;
 	}
 	kprintf("apfs: checkpoint ring @%llu (%u blocks): %u superblock(s)\n",
 	    (unsigned long long)base, (unsigned)blocks, (unsigned)found);
@@ -251,6 +302,215 @@ adopt_newest_checkpoint(const struct apfs_nx_superblock *anchor, void *scratch)
 		return (FS_APFS_E_INVAL);
 	g_apfs.ac_xp_desc_base   = base;
 	g_apfs.ac_xp_desc_blocks = blocks;
+	return (FS_APFS_E_OK);
+}
+
+/*
+ * Read the adopted checkpoint's own descriptor blocks and record every
+ * ephemeral object they place.
+ *
+ * The ring holds one checkpoint after another; nx_xp_desc_index and
+ * nx_xp_desc_len name the run belonging to THIS one, and the run wraps.  Its
+ * last block is the superblock that closes the checkpoint -- which is how a
+ * reader knows the checkpoint was completed -- and the blocks before it are
+ * checkpoint maps.  So a slot that is not a map is not an error; it is either
+ * that superblock or a slot from a neighbouring checkpoint, and both are
+ * simply skipped.
+ *
+ * Nothing is resolved here beyond recording oid -> block.  Reading the objects
+ * themselves is a separate question, and every one of them is optional.
+ */
+static int
+read_checkpoint_maps(void *scratch)
+{
+	const struct apfs_checkpoint_map_phys	*cpm;
+	const struct apfs_checkpoint_mapping	*m;
+	uint32_t				 slot;
+	uint32_t				 count;
+	uint32_t				 maps;
+	uint32_t				 i;
+	uint32_t				 k;
+	uint32_t				 n;
+
+	g_apfs.ac_eph_count = 0;
+	g_apfs.ac_eph_over  = 0;
+	maps = 0;
+
+	if (g_apfs.ac_xp_desc_len == 0 ||
+	    g_apfs.ac_xp_desc_len > g_apfs.ac_xp_desc_blocks)
+		return (FS_APFS_E_INVAL);
+
+	for (k = 0; k < g_apfs.ac_xp_desc_len; k++) {
+		slot = (g_apfs.ac_xp_desc_index + k) % g_apfs.ac_xp_desc_blocks;
+		/*
+		 * Checksum-checked: a torn checkpoint map would otherwise send
+		 * every later question to a block number out of nowhere.
+		 */
+		if (fs_apfs_read_block(g_apfs.ac_xp_desc_base + slot,
+		    scratch) != FS_APFS_E_OK)
+			continue;
+		cpm = (const struct apfs_checkpoint_map_phys *)scratch;
+		if ((cpm->cpm_o.o_type & APFS_OBJ_TYPE_MASK) !=
+		    APFS_OBJ_CHECKPOINT_MAP)
+			continue;
+		count = cpm->cpm_count;
+		if (count > APFS_CPM_MAX_PER_BLOCK)
+			count = APFS_CPM_MAX_PER_BLOCK;
+		maps++;
+
+		for (i = 0; i < count; i++) {
+			m = &cpm->cpm_map[i];
+			if (g_apfs.ac_eph_count >= APFS_EPH_MAX) {
+				g_apfs.ac_eph_over++;
+				continue;
+			}
+			n = g_apfs.ac_eph_count++;
+			g_apfs.ac_eph[n].e_oid     = m->cpm_oid;
+			g_apfs.ac_eph[n].e_paddr   = m->cpm_paddr;
+			g_apfs.ac_eph[n].e_type    = m->cpm_type;
+			g_apfs.ac_eph[n].e_subtype = m->cpm_subtype;
+		}
+	}
+
+	kprintf("apfs: checkpoint xid %llu -- %u map block(s), %u ephemeral "
+	    "object(s)%s\n", (unsigned long long)g_apfs.ac_xid,
+	    (unsigned)maps, (unsigned)g_apfs.ac_eph_count,
+	    (g_apfs.ac_eph_over != 0) ? " (TABLE FULL, some dropped)" : "");
+	return (maps != 0 ? FS_APFS_E_OK : FS_APFS_E_INVAL);
+}
+
+/* Where a checkpoint put an ephemeral object, or 0 if it named none. */
+static uint64_t
+resolve_ephemeral(uint64_t oid)
+{
+	uint32_t	i;
+
+	for (i = 0; i < g_apfs.ac_eph_count; i++) {
+		if (g_apfs.ac_eph[i].e_oid == oid)
+			return (g_apfs.ac_eph[i].e_paddr);
+	}
+	return (0);
+}
+
+/*
+ * Did the checkpoint map call `oid` a free-queue B-tree?  Used to check the
+ * space manager against a list built from an entirely different block.
+ */
+static bool
+ephemeral_is_free_queue(uint64_t oid)
+{
+	uint32_t	i;
+
+	for (i = 0; i < g_apfs.ac_eph_count; i++) {
+		if (g_apfs.ac_eph[i].e_oid != oid)
+			continue;
+		return ((g_apfs.ac_eph[i].e_type & APFS_OBJ_TYPE_MASK) ==
+		    APFS_OBJ_BTREE_ROOT &&
+		    g_apfs.ac_eph[i].e_subtype == APFS_OBJ_SPACEMAN_FREE_QUEUE);
+	}
+	return (false);
+}
+
+/*
+ * Find and read the space manager.  Read-only, and deliberately so: what this
+ * establishes is that the kernel can SEE the container's accounting, which is
+ * the thing every later question about allocation has to start from.
+ *
+ * The free-queue lines are the ones worth reading.  Blocks a transaction gives
+ * up do not return to the bitmap when it commits -- they go into one of these
+ * trees keyed by that transaction's xid, and come back only once no reader can
+ * still be looking at the old state.  A count above zero here means the
+ * container is holding space that is neither in use nor available, which is
+ * exactly the bookkeeping an allocator would have to join.
+ */
+static int
+read_spaceman(void *scratch)
+{
+	const struct apfs_spaceman	*sm;
+	uint64_t			 paddr;
+	uint32_t			 i;
+
+	g_apfs.ac_sm_valid = false;
+	if (g_apfs.ac_spaceman_oid == 0)
+		return (FS_APFS_E_INVAL);
+
+	paddr = resolve_ephemeral(g_apfs.ac_spaceman_oid);
+	if (paddr == 0) {
+		kprintf("apfs: spaceman oid %llu is in no checkpoint map\n",
+		    (unsigned long long)g_apfs.ac_spaceman_oid);
+		return (FS_APFS_E_INVAL);
+	}
+	if (fs_apfs_read_block(paddr, scratch) != FS_APFS_E_OK)
+		return (FS_APFS_E_IO);
+
+	sm = (const struct apfs_spaceman *)scratch;
+	if ((sm->sm_o.o_type & APFS_OBJ_TYPE_MASK) != APFS_OBJ_SPACEMAN) {
+		kprintf("apfs: block %llu is not a spaceman (type 0x%x)\n",
+		    (unsigned long long)paddr, (unsigned)sm->sm_o.o_type);
+		return (FS_APFS_E_INVAL);
+	}
+	/*
+	 * The container agreed with itself about its block size once already,
+	 * at block 0.  If the space manager disagrees, one of the two is being
+	 * read at the wrong offset and nothing below can be trusted.
+	 */
+	if (sm->sm_block_size != APFS_BLOCK_SIZE) {
+		kprintf("apfs: spaceman block size %u != %u -- refusing\n",
+		    (unsigned)sm->sm_block_size, APFS_BLOCK_SIZE);
+		return (FS_APFS_E_INVAL);
+	}
+
+	g_apfs.ac_sm_paddr           = paddr;
+	g_apfs.ac_sm_free            = sm->sm_dev[APFS_SD_MAIN].sm_free_count;
+	g_apfs.ac_sm_chunks          = sm->sm_dev[APFS_SD_MAIN].sm_chunk_count;
+	g_apfs.ac_sm_cib_count       = sm->sm_dev[APFS_SD_MAIN].sm_cib_count;
+	g_apfs.ac_sm_blocks_per_chunk = sm->sm_blocks_per_chunk;
+	g_apfs.ac_sm_ip_base         = sm->sm_ip_base;
+	g_apfs.ac_sm_ip_blocks       = sm->sm_ip_block_count;
+	for (i = 0; i < APFS_SFQ_COUNT; i++) {
+		g_apfs.ac_sm_fq_count[i]  = sm->sm_fq[i].sfq_count;
+		g_apfs.ac_sm_fq_oldest[i] = sm->sm_fq[i].sfq_oldest_xid;
+	}
+	g_apfs.ac_sm_valid = true;
+
+	/*
+	 * THREE CROSS-CHECKS, AND WHY THEY ARE NOT DECORATION
+	 *
+	 * Every field above was read at an offset taken from the published
+	 * layout.  A layout that is remembered slightly wrong produces numbers
+	 * that look entirely reasonable -- a plausible free count, a plausible
+	 * chunk size -- and nothing about the block itself says otherwise.  So
+	 * the block is made to agree with things that were read from OTHER
+	 * blocks, by other code, at offsets already known to be right.
+	 *
+	 * The strongest of the three is the last.  The checkpoint map named
+	 * some B-trees as free queues, and the space manager, sixty bytes into
+	 * a different block, names the same oids.  Nothing but a correct
+	 * sm_fq offset makes those two lists match.
+	 */
+	if (sm->sm_dev[APFS_SD_MAIN].sm_block_count != g_apfs.ac_block_count)
+		kprintf("apfs: WARNING spaceman says %llu blocks, superblock "
+		    "says %llu\n",
+		    (unsigned long long)sm->sm_dev[APFS_SD_MAIN].sm_block_count,
+		    (unsigned long long)g_apfs.ac_block_count);
+
+	if (g_apfs.ac_sm_blocks_per_chunk == 0 ||
+	    g_apfs.ac_sm_chunks * (uint64_t)g_apfs.ac_sm_blocks_per_chunk <
+	    g_apfs.ac_block_count)
+		kprintf("apfs: WARNING %llu chunks of %u do not cover %llu "
+		    "blocks\n", (unsigned long long)g_apfs.ac_sm_chunks,
+		    (unsigned)g_apfs.ac_sm_blocks_per_chunk,
+		    (unsigned long long)g_apfs.ac_block_count);
+
+	for (i = 0; i < APFS_SFQ_COUNT; i++) {
+		if (sm->sm_fq[i].sfq_tree_oid == 0)
+			continue;
+		if (!ephemeral_is_free_queue(sm->sm_fq[i].sfq_tree_oid))
+			kprintf("apfs: WARNING free queue %u names tree oid "
+			    "%llu, which the checkpoint map does not\n",
+			    (unsigned)i,
+			    (unsigned long long)sm->sm_fq[i].sfq_tree_oid);
+	}
 	return (FS_APFS_E_OK);
 }
 
@@ -1661,6 +1921,17 @@ fs_apfs_init(void)
 	    (unsigned long long)g_apfs.ac_omap_oid,
 	    (unsigned long long)g_apfs.ac_fs_oid);
 
+	/*
+	 * The ephemeral layer.  Not required to mount -- nothing a file read
+	 * touches lives there -- so a container whose checkpoint maps cannot be
+	 * read still mounts, and only the accounting goes unanswered.
+	 */
+	if (read_checkpoint_maps(scratch) == FS_APFS_E_OK)
+		(void)read_spaceman(scratch);
+	else
+		kprintf("apfs: no readable checkpoint map -- space accounting "
+		    "unavailable\n");
+
 	rv = mount_volume(scratch);
 	if (rv != FS_APFS_E_OK) {
 		kprintf("apfs: volume 0 unreadable (%d) -- APFS unavailable\n",
@@ -1708,4 +1979,32 @@ fs_apfs_stats(void)
 	    (unsigned long long)g_n_recs,
 	    (unsigned long long)(g_n_walks ? g_n_nodes / g_n_walks : 0),
 	    (unsigned long long)(g_n_walks ? g_n_recs / g_n_walks : 0));
+
+	if (!g_apfs.ac_sm_valid) {
+		kprintf("apfs: space manager not read\n");
+		return;
+	}
+	kprintf("apfs: space @%llu -- %llu of %llu blocks free, %llu chunks of "
+	    "%u, %u chunk-info block(s)\n",
+	    (unsigned long long)g_apfs.ac_sm_paddr,
+	    (unsigned long long)g_apfs.ac_sm_free,
+	    (unsigned long long)g_apfs.ac_block_count,
+	    (unsigned long long)g_apfs.ac_sm_chunks,
+	    (unsigned)g_apfs.ac_sm_blocks_per_chunk,
+	    (unsigned)g_apfs.ac_sm_cib_count);
+	/*
+	 * Blocks that are neither in use nor available: given up by some
+	 * transaction and waiting on its age.  This is the half of allocation
+	 * that a bitmap alone cannot express, and the reason freeing here is a
+	 * B-tree insert rather than clearing a bit.
+	 */
+	kprintf("apfs: free queues -- ip %llu blk (xid %llu), main %llu blk "
+	    "(xid %llu), tier2 %llu blk; internal pool %llu blk @%llu\n",
+	    (unsigned long long)g_apfs.ac_sm_fq_count[APFS_SFQ_IP],
+	    (unsigned long long)g_apfs.ac_sm_fq_oldest[APFS_SFQ_IP],
+	    (unsigned long long)g_apfs.ac_sm_fq_count[APFS_SFQ_MAIN],
+	    (unsigned long long)g_apfs.ac_sm_fq_oldest[APFS_SFQ_MAIN],
+	    (unsigned long long)g_apfs.ac_sm_fq_count[APFS_SFQ_TIER2],
+	    (unsigned long long)g_apfs.ac_sm_ip_blocks,
+	    (unsigned long long)g_apfs.ac_sm_ip_base);
 }

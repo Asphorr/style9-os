@@ -33,9 +33,9 @@ sched: cooperative round-robin, idle id=2
   [ok] kbd (IRQ1 unmasked)
   [ok] interrupts enabled
 pit: 100 Hz requested, 100 Hz programmed (divisor=11931)
-tsc: 3605446336 Hz (~3605 MHz) over 25 PIT ticks (901361584 cycles)
+tsc: 3591027368 Hz (~3591 MHz) over 25 PIT ticks (897756842 cycles)
 clock: 100 Hz tick, TSC anchor calibrated
-clock: RTC 2026-07-25 12:04:22 UTC (epoch 1784981062)
+clock: RTC 2026-07-25 12:02:47 UTC (epoch 1784980967)
   [ok] clock
 
 memory subsystem smoke test...
@@ -67,7 +67,7 @@ stress_mem: 10000 iterations, 256 tracking slots
 stress_mem: 3477 alloc, 3477 free (delta=0)
 stress_mem: pmm used 804 -> 840 (peak 863)
 stress_mem: kmem cached 6 -> 42 pages
-stress_mem: conserved (pmm-cached) 798 -> 798, elapsed 48201 us
+stress_mem: conserved (pmm-cached) 798 -> 798, elapsed 49245 us
 stress_mem: 0 pattern corruptions
 stress_mem: PASS
 
@@ -78,34 +78,34 @@ stress_mem_boundary: conserved 798 -> 798, 0 corruptions
 stress_mem_boundary: PASS
 
 [3/15] stress timer 2s
-stress_timer: 2 s, hz=100, tsc_hz=3605446336
-stress_timer: 200 ticks elapsed, 7202259841 cycles measured
-stress_timer: expected 7210892672 cycles, drift 8632831 cycles (TSC behind)
-stress_timer: drift 1197 ppm, 325033 kmem ops during run
+stress_timer: 2 s, hz=100, tsc_hz=3591027368
+stress_timer: 200 ticks elapsed, 7202723119 cycles measured
+stress_timer: expected 7182054736 cycles, drift 20668383 cycles (TSC ahead)
+stress_timer: drift 2877 ppm, 328884 kmem ops during run
 stress_timer: PASS
 
 [4/15] stress port 1000
 stress_port: 1000 rounds
 stress_port: kernel_space inuse 2 -> 2
 stress_port: pmm used 840 -> 840, cached 42 -> 42
-stress_port: conserved 798 -> 798, elapsed 18860 us
+stress_port: conserved 798 -> 798, elapsed 18315 us
 stress_port: PASS
 
 [5/15] stress thread 200
 stress_thread: 200 rounds (RPC over blocking recv)
-stress_thread: 8102 us, 402 context switches, 1 PIT ticks
+stress_thread: 7318 us, 402 context switches, 1 PIT ticks
 stress_thread: ports 2 -> 2, pmm 840 -> 840, cached 42 -> 42
 stress_thread: conserved 798 -> 798
 stress_thread: PASS
 
 [6/15] stress preempt 4 workers, 1 s
 stress_preempt: 4 workers, 1000 ms wall window
-stress_preempt: 991643 us elapsed, ctx switches 20, preempts 20
-  worker  0 counter 62615861
-  worker  1 counter 65419569
-  worker  2 counter 62282344
-  worker  3 counter 63389967
-stress_preempt: total 253707741, min 62282344, max 65419569, ratio max/min = 1
+stress_preempt: 993048 us elapsed, ctx switches 20, preempts 20
+  worker  0 counter 58634643
+  worker  1 counter 58913051
+  worker  2 counter 57595673
+  worker  3 counter 57245395
+stress_preempt: total 232388762, min 57245395, max 58913051, ratio max/min = 1
 stress_preempt: PASS
 
 [7/15] stress sendonce 500
@@ -199,6 +199,8 @@ apfs: container 131072 blocks x 4096 B (512 MiB), feat=0x0 incompat=0x2
 apfs: checkpoint ring @1 (64 blocks): 4 superblock(s)
 apfs: container xid 4, omap oid 98304, volume oid 1026
 apfs: checkpoint xid 4 -- 1 map block(s), 4 ephemeral object(s)
+apfs: WARNING free queue 0 names tree oid 4, which the checkpoint map does not
+apfs: WARNING free queue 1 names tree oid 4, which the checkpoint map does not
 apfs: volume "style9" @98306 -- 12 files, 12 dirs
 apfs: mounted -- fs B-tree root @98309, volume omap @98308, hashed dirent keys
 apfs:   usr/
@@ -224,17 +226,17 @@ svc: man -> kernel name 14
 svc: launchd -> kernel name 15
 launchd: keep_alive worker up (death port=16)
 host: host -> kernel name 17 (page_size=4096)
-[4100 INF klog] ring + service up
-[4100 INF boot] stress pass complete
-[4110 INF boot] drivers + services up
-[4110 DBG boot] entering shell
+[4920 INF klog] ring + service up
+[4940 INF boot] stress pass complete
+[4950 INF boot] drivers + services up
+[4960 DBG boot] entering shell
 syscall: enabled, entry=0x0000000000102a2a
 smap: not supported by this CPU
 progreg: 39 programs registered
-launchd: catalog loaded 'com.style9.heartbeat' (heartbeatd) -> task 4 [keepalive]
-launchd: catalog registered 'com.style9.ondemand' (heartbeatd) [stopped]
-usermode: spawn 'heartbeatd' entry=0x40000000 (image=15968 bytes), rsp=0x4000fff0 argc=0
+launchd: catalog loaded 'com.style9.heartbeat' (heartbeatd) -> task 4 [keepaliveusermode: spawn 'heartbeatd' entry=0x40000000 (image=15968 bytes), rsp=0x4000fff0 argc=0
 heartbeatd: up, parking on idle port 0x3 (kill-to-stop)
+]
+launchd: catalog registered 'com.style9.ondemand' (heartbeatd) [stopped]
 usermode: spawn 'hello' entry=0x40000000 (image=40600 bytes), rsp=0x4000fff0 argc=0
 hello from hello.elf (libstyle9, ring 3)
   allocated port = 0x3
@@ -354,9 +356,9 @@ launchctl: connected to 'launchd' (port=0x4)
     label                    program      state        task_id
     com.style9.heartbeat     heartbeatd   running      4
     com.style9.ondemand      heartbeatd   stopped      0
+    com.style9.echod         echod        running      15
 usermode: spawn 'echod' entry=0x40000000 (image=16056 bytes), rsp=0x4000fff0 argc=0
 echod: serving 'echo' (svc=0x3, kill-to-stop)
-    com.style9.echod         echod        running      15
   poke 'echo' x 3 rounds: ok
   after-poke -- 3 services loaded:
     label                    program      state        task_id
@@ -384,24 +386,27 @@ launchctl v2 STOP/START demo:
     com.style9.heartbeat     heartbeatd   running      4
     com.style9.ondemand      heartbeatd   stopped      0
     com.style9.spinner       loopchild    stopped      0
-usermode: spawn 'loopchild' entry=0x40000000 (image=16144 bytes), rsp=0x4000fff0 argc=0
   start 'com.style9.spinner' -> running (task_id=17)
   after start -- 3 services loaded:
     label                    program      state        task_id
     com.style9.heartbeat     heartbeatd   running      4
     com.style9.ondemand      heartbeatd   stopped      0
     com.style9.spinner       loopchild    running      17
+usermode: spawn 'loopchild' entry=0x40000000 (image=16144 bytes), rsp=0x4000fff0 argc=0
+usermode: spawn 'loopchild' entry=0x40000000 (image=16144 bytes), rsp=0x4000fff0 argc=0
+loopchild: about to publish task-self port at 'loopchild.tport'
+loopchild: registered 'loopchild.tport' under bootstrap
+loopchild: entering syscall-free compute loop
   unload 'com.style9.spinner' -> ok (was running, task_id=17)
 
 launchctl keep_alive demo:
   load 'com.style9.guardian' (program=loopchild) -> running task_id=18 taskport=0x6
   guardian task_id=18; simulating crash via task_kill(taskport=0x6)
 usermode: spawn 'loopchild' entry=0x40000000 (image=16144 bytes), rsp=0x4000fff0 argc=0
-usermode: spawn 'loopchild' entry=0x40000000 (image=16144 bytes), rsp=0x4000fff0 argc=0
 launchd: keep_alive respawned 'loopchild' -> task 19
 usermode: spawn 'loopchild' entry=0x40000000 (image=16144 bytes), rsp=0x4000fff0 argc=0
 loopchild: about to publish task-self port at 'loopchild.tport'
-loopchild: registered 'loopchild.tport' under bootstrap
+loopchild: bootstrap_register rv=1 (continuing, parent must hold taskport)
 loopchild: entering syscall-free compute loop
   after crash (expect running, NEW task_id) -- 3 services loaded:
     label                    program      state        task_id
@@ -608,7 +613,7 @@ darwin: UNIX mmap(256 KiB, prot=3, anon) -> 0x40000000
 dirlist: stat(/usr) -> mode=040755 size=0 ino=20
 dirlist: done
 darwin: UNIX exit(0)
-  dirlist (opendir/readdir probe) retired after 4 yields
+  dirlist (opendir/readdir probe) retired after 5 yields
   >>> host port: mach_host_self + host_page_size + host_info <<<
   host: page_size=4096 cpus=1/1 mem=127MiB free=123MiB cpu_type=0x1000007 sub=3
   >>> task port: task_vm_allocate + write + task_vm_deallocate <<<
@@ -630,7 +635,7 @@ darwin: UNIX open('/usr/local/Cellar/figlet/2.2.5/share/figlet/fonts/standard.fl
 |_| |_|_|
          
 darwin: UNIX exit(0)
-  figlet retired after 67 yields
+  figlet retired after 58 yields
   >>> spawning tree -- a REAL Apple x86-64 macOS binary <<<
 usermode: spawn 'tree' entry=0x600003c0 (image=73472 bytes), rsp=0x4fffffc0 argc=2
 dyld: link main_mh=0x0000000050000000
@@ -717,7 +722,7 @@ darwin: UNIX mmap(264 KiB, prot=3, anon) -> 0x40000000
 style9-os reads a real APFS volume.
 gcat: /docs/readme.txt: No such file or directory
 darwin: UNIX exit(1)
-  gcat retired after 10 yields
+  gcat retired after 19 yields
   >>> spawning gls -l -- a REAL Apple x86-64 macOS binary printing what the inodes say <<<
 usermode: spawn 'gls' entry=0x600003c0 (image=165000 bytes), rsp=0x4fffffa0 argc=4
 dyld: link main_mh=0x0000000050000000
@@ -727,53 +732,53 @@ dyld: enter main @ 0x0000000050001260
 darwin: UNIX mmap(256 KiB, prot=3, anon) -> 0x40000000
 /:
 total 0
-dr-xr-xr-x 1 0 0 0 Jul 25 12:04 bin
+dr-xr-xr-x 1 0 0 0 Jul 25 12:02 bin
 drwxr-xr-x 1 0 0 0 Jul 24 19:54 etc
 drwxr-xr-x 1 0 0 0 Jul 24 19:54 usr
 drwxr-xr-x 1 0 0 0 Jul 24 19:54 var
 
 /bin:
 total 36
--r-xr-xr-x 1 0 0  15904 Jul 25 12:04 argecho
--r-xr-xr-x 1 0 0  15968 Jul 25 12:04 clock
--r-xr-xr-x 1 0 0  15920 Jul 25 12:04 crasher
--r-xr-xr-x 1 0 0    702 Jul 25 12:04 darwinhello
--r-xr-xr-x 1 0 0    844 Jul 25 12:04 darwinmsg
--r-xr-xr-x 1 0 0 116744 Jul 25 12:04 dash
--r-xr-xr-x 1 0 0   1093 Jul 25 12:04 demo.sh
--r-xr-xr-x 1 0 0  12992 Jul 25 12:04 dirlist
--r-xr-xr-x 1 0 0  12624 Jul 25 12:04 dyldbig
--r-xr-xr-x 1 0 0  12624 Jul 25 12:04 dyldhello
+-r-xr-xr-x 1 0 0  15904 Jul 25 12:02 argecho
+-r-xr-xr-x 1 0 0  15968 Jul 25 12:02 clock
+-r-xr-xr-x 1 0 0  15920 Jul 25 12:02 crasher
+-r-xr-xr-x 1 0 0    702 Jul 25 12:02 darwinhello
+-r-xr-xr-x 1 0 0    844 Jul 25 12:02 darwinmsg
+-r-xr-xr-x 1 0 0 116744 Jul 25 12:02 dash
+-r-xr-xr-x 1 0 0   1093 Jul 25 12:02 demo.sh
+-r-xr-xr-x 1 0 0  12992 Jul 25 12:02 dirlist
+-r-xr-xr-x 1 0 0  12624 Jul 25 12:02 dyldbig
+-r-xr-xr-x 1 0 0  12624 Jul 25 12:02 dyldhello
 -rwxr-xr-x 1 0 0  35208 Jul 24 19:54 echo
--r-xr-xr-x 1 0 0  16056 Jul 25 12:04 echod
--r-xr-xr-x 1 0 0  15864 Jul 25 12:04 excchild
--r-xr-xr-x 1 0 0  15872 Jul 25 12:04 excchild_resume
--r-xr-xr-x 1 0 0  15864 Jul 25 12:04 excchild_thr
--r-xr-xr-x 1 0 0  15864 Jul 25 12:04 excchild_ud
--r-xr-xr-x 1 0 0  72032 Jul 25 12:04 figlet
--r-xr-xr-x 1 0 0  47176 Jul 25 12:04 gcat
--r-xr-xr-x 1 0 0  52280 Jul 25 12:04 genv
--r-xr-xr-x 1 0 0  69144 Jul 25 12:04 gfactor
--r-xr-xr-x 1 0 0 165000 Jul 25 12:04 gls
--r-xr-xr-x 1 0 0  47384 Jul 25 12:04 gtimeout
--r-xr-xr-x 1 0 0  41304 Jul 25 12:04 guname
--r-xr-xr-x 1 0 0  15968 Jul 25 12:04 heartbeatd
--r-xr-xr-x 1 0 0  40600 Jul 25 12:04 hello
--r-xr-xr-x 1 0 0  21968 Jul 25 12:04 launchctl
--r-xr-xr-x 1 0 0  16144 Jul 25 12:04 loopchild
--r-xr-xr-x 1 0 0  16512 Jul 25 12:04 lsmp
--r-xr-xr-x 1 0 0   7394 Jul 25 12:04 machotest
--r-xr-xr-x 1 0 0  23778 Jul 25 12:04 machotest_fat
--r-xr-xr-x 1 0 0  17104 Jul 25 12:04 mmaptest
--r-xr-xr-x 1 0 0  15936 Jul 25 12:04 oolchild
--r-xr-xr-x 1 0 0  17608 Jul 25 12:04 pipefork
--r-xr-xr-x 1 0 0  15984 Jul 25 12:04 selfkill
--r-xr-xr-x 1 0 0  22792 Jul 25 12:04 sh
--r-xr-xr-x 1 0 0  16016 Jul 25 12:04 tasks
--r-xr-xr-x 1 0 0  12760 Jul 25 12:04 timeprobe
--r-xr-xr-x 1 0 0  16136 Jul 25 12:04 top
--r-xr-xr-x 1 0 0  73472 Jul 25 12:04 tree
--r-xr-xr-x 1 0 0  16296 Jul 25 12:04 vmmap
+-r-xr-xr-x 1 0 0  16056 Jul 25 12:02 echod
+-r-xr-xr-x 1 0 0  15864 Jul 25 12:02 excchild
+-r-xr-xr-x 1 0 0  15872 Jul 25 12:02 excchild_resume
+-r-xr-xr-x 1 0 0  15864 Jul 25 12:02 excchild_thr
+-r-xr-xr-x 1 0 0  15864 Jul 25 12:02 excchild_ud
+-r-xr-xr-x 1 0 0  72032 Jul 25 12:02 figlet
+-r-xr-xr-x 1 0 0  47176 Jul 25 12:02 gcat
+-r-xr-xr-x 1 0 0  52280 Jul 25 12:02 genv
+-r-xr-xr-x 1 0 0  69144 Jul 25 12:02 gfactor
+-r-xr-xr-x 1 0 0 165000 Jul 25 12:02 gls
+-r-xr-xr-x 1 0 0  47384 Jul 25 12:02 gtimeout
+-r-xr-xr-x 1 0 0  41304 Jul 25 12:02 guname
+-r-xr-xr-x 1 0 0  15968 Jul 25 12:02 heartbeatd
+-r-xr-xr-x 1 0 0  40600 Jul 25 12:02 hello
+-r-xr-xr-x 1 0 0  21968 Jul 25 12:02 launchctl
+-r-xr-xr-x 1 0 0  16144 Jul 25 12:02 loopchild
+-r-xr-xr-x 1 0 0  16512 Jul 25 12:02 lsmp
+-r-xr-xr-x 1 0 0   7394 Jul 25 12:02 machotest
+-r-xr-xr-x 1 0 0  23778 Jul 25 12:02 machotest_fat
+-r-xr-xr-x 1 0 0  17104 Jul 25 12:02 mmaptest
+-r-xr-xr-x 1 0 0  15936 Jul 25 12:02 oolchild
+-r-xr-xr-x 1 0 0  17608 Jul 25 12:02 pipefork
+-r-xr-xr-x 1 0 0  15984 Jul 25 12:02 selfkill
+-r-xr-xr-x 1 0 0  22792 Jul 25 12:02 sh
+-r-xr-xr-x 1 0 0  16016 Jul 25 12:02 tasks
+-r-xr-xr-x 1 0 0  12760 Jul 25 12:02 timeprobe
+-r-xr-xr-x 1 0 0  16136 Jul 25 12:02 top
+-r-xr-xr-x 1 0 0  73472 Jul 25 12:02 tree
+-r-xr-xr-x 1 0 0  16296 Jul 25 12:02 vmmap
 darwin: UNIX exit(0)
   gls retired after 4 yields
   >>> spawning timeprobe -- wall-clock probe (gettimeofday / clock_gettime / time) <<<
@@ -782,8 +787,8 @@ dyld: link main_mh=0x0000000050000000
 darwin: s9 map_image '/usr/lib/libSystem.B.dylib' -> base=0x70000000 span=0xf000
 dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070000000
 dyld: enter main @ 0x0000000050000490
-timeprobe: 2026-07-25T12:04:55Z (epoch 1784981095.854882)
-timeprobe: advanced 98224 us across a busy loop
+timeprobe: 2026-07-25T12:03:21Z (epoch 1784981001.289717)
+timeprobe: advanced 101369 us across a busy loop
 timeprobe: all checks passed
 darwin: UNIX exit(0)
   timeprobe retired after 2 yields
@@ -857,7 +862,7 @@ dyld: enter main @ 0x0000000050001abc
 darwin: UNIX mmap(256 KiB, prot=3, anon) -> 0x40000000
 340282366920938463463374607431768211456: 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2
 darwin: UNIX exit(0)
-  gfactor[2] retired after 2 yields
+  gfactor[2] retired after 1 yields
   >>> pipefork: fork/execve/wait4/pipe/dup2 probe <<<
 usermode: spawn 'pipefork' entry=0x600003c0 (image=17608 bytes), rsp=0x4fffffd0 argc=0
 dyld: link main_mh=0x0000000050000000
@@ -954,7 +959,7 @@ dyld: enter main @ 0x0000000050001abc
 darwin: UNIX exit(0)
 darwin: UNIX wait4 -> pid 54 status 0x0
 darwin: UNIX exit(0)
-  gtimeout retired after 2 yields
+  gtimeout retired after 3 yields
   >>> dash -c 'echo ...' -- a REAL Apple shell, builtin only <<<
 usermode: spawn 'dash' entry=0x600003c0 (image=116744 bytes), rsp=0x4fffff90 argc=3
 dyld: link main_mh=0x0000000050000000
@@ -1050,7 +1055,7 @@ darwin: s9 map_image '/usr/lib/libSystem.B.dylib' -> base=0x70000000 span=0xf000
 dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070000000
 dyld: enter main @ 0x0000000050001260
 darwin: UNIX mmap(256 KiB, prot=3, anon) -> 0x40000000
--rw-r--r-- 1 0 0 155648 Jul 25 12:04 big.txt
+-rw-r--r-- 1 0 0 155648 Jul 25 12:02 big.txt
 darwin: UNIX exit(0)
 darwin: UNIX wait4 -> pid 64 status 0x0
 darwin: UNIX fork() -> child 65
@@ -1060,7 +1065,7 @@ darwin: s9 map_image '/usr/lib/libSystem.B.dylib' -> base=0x70000000 span=0xf000
 dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070000000
 dyld: enter main @ 0x0000000050001260
 darwin: UNIX mmap(256 KiB, prot=3, anon) -> 0x40000000
--rw-r--r-- 1 0 0 155648 Jul 25 12:04 ../db/big.txt
+-rw-r--r-- 1 0 0 155648 Jul 25 12:02 ../db/big.txt
 darwin: UNIX exit(0)
 darwin: UNIX wait4 -> pid 65 status 0x0
 darwin: UNIX chdir("/var") -> /var
@@ -1117,10 +1122,10 @@ dyld: link main_mh=0x0000000050000000
 darwin: s9 map_image '@@HOMEBREW_PREFIX@@/opt/gmp/lib/libgmp.10.dylib' -> base=0x70000000 span=0x74000
 dyld: mapped @@HOMEBREW_PREFIX@@/opt/gmp/lib/libgmp.10.dylib @ 0x0000000070000000
 darwin: s9 map_image '/usr/lib/libSystem.B.dylib' -> base=0x70074000 span=0xf000
+darwin: UNIX wait4 -> pid 71 status 0x0
 dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070074000
 dyld: enter main @ 0x0000000050001abc
 darwin: UNIX mmap(256 KiB, prot=3, anon) -> 0x40000000
-darwin: UNIX wait4 -> pid 71 status 0x0
 darwin: UNIX exit(0)
 darwin: UNIX wait4 -> pid 72 status 0x0
 darwin: UNIX exit(0)
@@ -1129,21 +1134,21 @@ captured: 600851475143: 71 839 1471 6857
 # exit
 darwin: UNIX exit(0)
 cons: 105 reads, 0 waits -- 0 keys typed, 105 scripted
-  dash[interactive] retired after 5 yields
+  dash[interactive] retired after 6 yields
 hello.elf: all demos passed
 [user thread exited, code=0]
 vm: 114 faults filled -- 108 zero, 6 from a file, 0 raced, 1 refused
-vm: pager spent 3676 us over 6 pages (612 us each, worst 2718)
-vm: fork shared 2219 pages, 90 later copied on write, 87 reclaimed by their last owner, 0 raced
+vm: pager spent 2533 us over 6 pages (422 us each, worst 1975)
+vm: fork shared 2219 pages, 89 later copied on write, 87 reclaimed by their last owner, 0 raced
 pmm: 32736 pages managed, 985 used (3940 KiB), 31751 free (127004 KiB)
-pmm: 0 frames shared now, 1486 extra owners taken, 15416 frames released by their last owner
+pmm: 0 frames shared now, 1486 extra owners taken, 15415 frames released by their last owner
 vm: 2599 program pages -- 2124 borrowed from the kernel image, 475 copied (8496 KiB saved)
 vm: 111 message payload pages -- 3 shared with the sender, 108 copied
 vm: 12 ranges released -- 10 whole, 2 needing a cut (3 entries split), 4 refused
 cons: 105 reads, 0 waits -- 0 keys typed, 105 scripted
 apfs: 1455 tree walks -- 3451 nodes read, 42287 records visited (2 nodes, 29 records each)
 apfs: space @78 -- 124965 of 131072 blocks free, 4 chunks of 32768, 1 chunk-info block(s)
-apfs: free queues -- ip 2 blk (xid 4), main 6 blk (xid 4), tier2 0 blk; internal pool 15 blk @21016
+apfs: free queues -- ip 1028 blk (xid 1), main 1029 blk (xid 29), tier2 0 blk; internal pool 15 blk @21016
 fs_txn: 3 commits (3 metadata blocks), 0 aborted
 fs: volume generation 4 -- 1 stale handle(s) refreshed, 0 had actually changed length
 mutex: 1317 acquisitions, 600 had to sleep
@@ -1176,7 +1181,7 @@ usermode: spawn 'sh' entry=0x40000000 (image=22792 bytes), rsp=0x4000fff0 argc=0
 
 [1;30m ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ 
 [0m
-[s[1;1H[0;37m style9-os(9)                                                          00:00:37 
+[s[1;1H[0;37m style9-os(9)                                                          00:00:39 
 [1;30m ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ 
 [0m[u
 [1;37m$ [0m

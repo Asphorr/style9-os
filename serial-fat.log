@@ -2,8 +2,8 @@ style9-os: kernel up
 ----------------------------------------
   boot magic      : 0x00000000  (PVH)
   boot info ptr   : 0x00001580
-  kernel range    : 0x0000000000100000 .. 0x0000000000305f20
-  kernel size     : 2121504 bytes
+  kernel range    : 0x0000000000100000 .. 0x00000000003072a0
+  kernel size     : 2126496 bytes
 
 bringing CPU tables online...
   [ok] gdt
@@ -20,8 +20,8 @@ memory map (6 entries, max_pa=0x100000000):
   [ 5] 0x00000000fffc0000 .. 0x0000000100000000  reserved (256 KiB)
   total RAM (any type): 131008 KiB
   usable RAM:           130559 KiB
-pmm: bitmap at 0x306000 (4096 bytes) + 65472 bytes of owner counts, 32736 managed pages, 31945 free
-pmap: kernel CR3 = 0x2f5000 (PML4 at 0x00000000002f5000), CR0.WP on
+pmm: bitmap at 0x308000 (4096 bytes) + 65472 bytes of owner counts, 32736 managed pages, 31943 free
+pmap: kernel CR3 = 0x2f6000 (PML4 at 0x00000000002f6000), CR0.WP on
 kmem: 8 buckets, sizes 16..2048 bytes
 port: kernel_space id=1, cap=16, qmax=1024, max_msg=4096
 bootstrap: ready, capacity=16 services
@@ -33,20 +33,20 @@ sched: cooperative round-robin, idle id=2
   [ok] kbd (IRQ1 unmasked)
   [ok] interrupts enabled
 pit: 100 Hz requested, 100 Hz programmed (divisor=11931)
-tsc: 3610646796 Hz (~3610 MHz) over 25 PIT ticks (902661699 cycles)
+tsc: 4327435964 Hz (~4327 MHz) over 25 PIT ticks (1081858991 cycles)
 clock: 100 Hz tick, TSC anchor calibrated
-clock: RTC 2026-07-25 11:49:16 UTC (epoch 1784980156)
+clock: RTC 2026-07-25 12:05:30 UTC (epoch 1784981130)
   [ok] clock
 
 memory subsystem smoke test...
-  kmalloc(16)   = 0x0000000000321ff0
-  kmalloc(256)  = 0x0000000000318c10
-  kmalloc(2000) = 0x000000000031a010
-  kmalloc(8192) = 0x0000000000322010
-  pmm_alloc_page = 0x322000
-pmm: 32736 pages managed, 802 used (3208 KiB), 31934 free (127736 KiB)
+  kmalloc(16)   = 0x0000000000323ff0
+  kmalloc(256)  = 0x000000000031ac10
+  kmalloc(2000) = 0x000000000031c010
+  kmalloc(8192) = 0x0000000000324010
+  pmm_alloc_page = 0x324000
+pmm: 32736 pages managed, 804 used (3216 KiB), 31932 free (127728 KiB)
 pmm: 0 frames shared now, 0 extra owners taken, 6 frames released by their last owner
-pmap: 0 leaf mappings, 0 intermediate tables, kernel CR3 = 0x2f5000
+pmap: 0 leaf mappings, 0 intermediate tables, kernel CR3 = 0x2f6000
 kmem stats:
   bucket  0     16 B  inuse=0 free=0 alloc=0
   bucket  1     32 B  inuse=0 free=128 alloc=128
@@ -65,52 +65,52 @@ kmem stats:
 [1/15] stress mem 10000
 stress_mem: 10000 iterations, 256 tracking slots
 stress_mem: 3477 alloc, 3477 free (delta=0)
-stress_mem: pmm used 802 -> 838 (peak 861)
+stress_mem: pmm used 804 -> 840 (peak 863)
 stress_mem: kmem cached 6 -> 42 pages
-stress_mem: conserved (pmm-cached) 796 -> 796, elapsed 41119 us
+stress_mem: conserved (pmm-cached) 798 -> 798, elapsed 34617 us
 stress_mem: 0 pattern corruptions
 stress_mem: PASS
 
 [2/15] stress mem boundary
 stress_mem_boundary: 39 sizes
-stress_mem_boundary: pmm used 838 -> 838, cached 42 -> 42
-stress_mem_boundary: conserved 796 -> 796, 0 corruptions
+stress_mem_boundary: pmm used 840 -> 840, cached 42 -> 42
+stress_mem_boundary: conserved 798 -> 798, 0 corruptions
 stress_mem_boundary: PASS
 
 [3/15] stress timer 2s
-stress_timer: 2 s, hz=100, tsc_hz=3610646796
-stress_timer: 200 ticks elapsed, 7347414186 cycles measured
-stress_timer: expected 7221293592 cycles, drift 126120594 cycles (TSC ahead)
-stress_timer: drift 17465 ppm, 389039 kmem ops during run
+stress_timer: 2 s, hz=100, tsc_hz=4327435964
+stress_timer: 200 ticks elapsed, 7200175541 cycles measured
+stress_timer: expected 8654871928 cycles, drift 1454696387 cycles (TSC behind)
+stress_timer: drift 168078 ppm, 350471 kmem ops during run
 stress_timer: PASS
 
 [4/15] stress port 1000
 stress_port: 1000 rounds
 stress_port: kernel_space inuse 2 -> 2
-stress_port: pmm used 838 -> 838, cached 42 -> 42
-stress_port: conserved 796 -> 796, elapsed 16172 us
+stress_port: pmm used 840 -> 840, cached 42 -> 42
+stress_port: conserved 798 -> 798, elapsed 15759 us
 stress_port: PASS
 
 [5/15] stress thread 200
 stress_thread: 200 rounds (RPC over blocking recv)
-stress_thread: 5647 us, 402 context switches, 1 PIT ticks
-stress_thread: ports 2 -> 2, pmm 838 -> 838, cached 42 -> 42
-stress_thread: conserved 796 -> 796
+stress_thread: 4817 us, 402 context switches, 1 PIT ticks
+stress_thread: ports 2 -> 2, pmm 840 -> 840, cached 42 -> 42
+stress_thread: conserved 798 -> 798
 stress_thread: PASS
 
 [6/15] stress preempt 4 workers, 1 s
 stress_preempt: 4 workers, 1000 ms wall window
-stress_preempt: 997594 us elapsed, ctx switches 20, preempts 20
-  worker  0 counter 63784182
-  worker  1 counter 62505102
-  worker  2 counter 65276048
-  worker  3 counter 68350624
-stress_preempt: total 259915956, min 62505102, max 68350624, ratio max/min = 1
+stress_preempt: 823665 us elapsed, ctx switches 20, preempts 20
+  worker  0 counter 67613414
+  worker  1 counter 66423309
+  worker  2 counter 65437597
+  worker  3 counter 65059113
+stress_preempt: total 264533433, min 65059113, max 67613414, ratio max/min = 1
 stress_preempt: PASS
 
 [7/15] stress sendonce 500
 stress_sendonce: 500 rounds (MAKE_SEND_ONCE / MOVE_SEND_ONCE)
-stress_sendonce: ports 2 -> 2, conserved 796 -> 796
+stress_sendonce: ports 2 -> 2, conserved 798 -> 798
 stress_sendonce: PASS
 
 [8/15] stress portset 4 members x 100
@@ -120,39 +120,39 @@ stress_portset: server saw 400 total
   member 1: 100 msgs (expected 100)
   member 2: 100 msgs (expected 100)
   member 3: 100 msgs (expected 100)
-stress_portset: ports 2 -> 2, conserved 796 -> 796
+stress_portset: ports 2 -> 2, conserved 798 -> 798
 stress_portset: PASS
 
 [9/15] stress intertask 200 (parent <-> worker task)
 stress_intertask: 200 rounds across 2 tasks
 stress_intertask: kernel names 2 -> 2, worker names 2 -> 2
-stress_intertask: conserved 796 -> 796
+stress_intertask: conserved 798 -> 798
 stress_intertask: PASS
 
 [10/15] stress moverecv 200
 stress_moverecv: 200 rounds (transfer RECV right in flight)
-stress_moverecv: names 2 -> 2, conserved 796 -> 796
+stress_moverecv: names 2 -> 2, conserved 798 -> 798
 stress_moverecv: PASS
 
 [11/15] stress nosenders 100
 stress_nosenders: 100 rounds (last sender drops, recv must wake with DEAD)
-stress_nosenders: names 2 -> 2, conserved 796 -> 796
+stress_nosenders: names 2 -> 2, conserved 798 -> 798
 stress_nosenders: PASS
 
 [12/15] stress sendblock 2000
 stress_sendblock: 2000 rounds (producer blocks on full queue, slow consumer)
-stress_sendblock: names 2 -> 2, conserved 796 -> 796
+stress_sendblock: names 2 -> 2, conserved 798 -> 798
 stress_sendblock: PASS
 
 [13/15] stress rpc 200
 stress_rpc: 200 rounds + 1 timeout probe
 stress_rpc: timeout probe slept 50 ms
-stress_rpc: names 2 -> 2, conserved 796 -> 796
+stress_rpc: names 2 -> 2, conserved 798 -> 798
 stress_rpc: PASS
 
 [14/15] stress ool 4 (parent <-> worker OOL transfer)
 stress_ool: 4 rounds x 8 sizes, max payload 65535 bytes
-stress_ool: kernel inuse 2 -> 2, conserved 796 -> 796
+stress_ool: kernel inuse 2 -> 2, conserved 798 -> 798
 stress_ool: PASS
 
 [15/15] stress mutex 4 workers x 200 (sleeping lock)
@@ -178,7 +178,7 @@ stress_mutex: PASS
   stress mutex 4x200   : PASS (rv=0)
 stress_sendonce_notify: PASS (MACH_NOTIFY_SEND_ONCE on unused destroy)
   sendonce-notify      : PASS (rv=0)
-stress_deadname_multi: names 2 -> 2, conserved 796 -> 796
+stress_deadname_multi: names 2 -> 2, conserved 798 -> 798
 stress_deadname_multi: PASS (multi-registrant DEAD_NAME + name flip)
   deadname-multi       : PASS (rv=0)
 dev: registered dev/kbd -> kernel name 4
@@ -192,14 +192,14 @@ uart_drv: stream_port=7 thread=120
 ata: disk0 = QEMU HARDDISK (LBA28=32768, LBA48=32768, ext=yes)
 dev: registered dev/disk0 -> kernel name 9
 ata: channel 0 IRQ14 -- interrupt-driven (1 seen at probe)
-ata: channel 1 IRQ15 -- interrupt-driven (1 seen at probe)
+ata: channel 1 IRQ15 -- interrupt-driven (2 seen at probe)
 bio: 64 x 4096 B block cache (256 KiB)
 fs_fat: mounted FAT16 on disk0 -- 32768 sectors, 8167 clusters (spc=4), root@68 data@100
 fs_fat: self-test -- standard.flf found (28335 bytes, cluster 2)
 apfs: no container on disk0 (magic 0x00000000 != NXSB)
 bio: 3 requests, 3 page lookups -- 1 hit (33%), 2 read from disk, 0 evicted, 2/64 buffers live
 ata: channel 0 -- 17 interrupts, 16 blocking waits
-ata: channel 1 -- 1 interrupts, 0 blocking waits
+ata: channel 1 -- 2 interrupts, 0 blocking waits
 svc: clock -> kernel name 10
 svc: stats -> kernel name 11
 svc: tasks -> kernel name 12
@@ -208,17 +208,17 @@ svc: man -> kernel name 14
 svc: launchd -> kernel name 15
 launchd: keep_alive worker up (death port=16)
 host: host -> kernel name 17 (page_size=4096)
-[3870 INF klog] ring + service up
-[3870 INF boot] stress pass complete
-[3880 INF boot] drivers + services up
-[3880 DBG boot] entering shell
+[3980 INF klog] ring + service up
+[3990 INF boot] stress pass complete
+[3990 INF boot] drivers + services up
+[3990 DBG boot] entering shell
 syscall: enabled, entry=0x0000000000102a2a
 smap: not supported by this CPU
 progreg: 39 programs registered
-launchd: catalog loaded 'com.style9.heartbeat' (heartbeatd) -> task 4 [keepalive]
-launchd: catalog registered 'com.style9.ondemand' (heartbeatd) [stopped]
-usermode: spawn 'heartbeatd' entry=0x40000000 (image=15968 bytes), rsp=0x4000fff0 argc=0
+launchd: catalog loaded 'com.style9.heartbeat' (heartbeatd) -> task 4 [keepaliveusermode: spawn 'heartbeatd' entry=0x40000000 (image=15968 bytes), rsp=0x4000fff0 argc=0
 heartbeatd: up, parking on idle port 0x3 (kill-to-stop)
+]
+launchd: catalog registered 'com.style9.ondemand' (heartbeatd) [stopped]
 usermode: spawn 'hello' entry=0x40000000 (image=40600 bytes), rsp=0x4000fff0 argc=0
 hello from hello.elf (libstyle9, ring 3)
   allocated port = 0x3
@@ -249,7 +249,7 @@ usermode: spawn 'excchild' entry=0x40000000 (image=15864 bytes), rsp=0x4000fff0 
 *** user fault: #PF page fault (vec 14, err=0x7)
   cr2 = 0x0 (faulting VA)
   err: protection-violation | write | user-mode
-  rip=0x0000000040001968 <__bss_end+0x3fcffa48>
+  rip=0x0000000040001968 <__bss_end+0x3fcfe6c8>
   rsp=0x4000ffe0  rbp=0x0
   rax=0x0  rdi=0x3  rsi=0x4000fff8  rdx=0x0
 code @rip: 89 04 25 00 00 00 00 0f 0b 0f 1f 80 00 00 00 00
@@ -260,7 +260,7 @@ user thread retired by kernel
 usermode: spawn 'excchild_ud' entry=0x40000000 (image=15864 bytes), rsp=0x4000fff0 argc=0, parent port injected
 
 *** user fault: #UD invalid opcode (vec 6, err=0x0)
-  rip=0x000000004000196b <__bss_end+0x3fcffa4b>
+  rip=0x000000004000196b <__bss_end+0x3fcfe6cb>
   rsp=0x4000ffe0  rbp=0x0
   rax=0x0  rdi=0x2  rsi=0x3  rdx=0x0
 code @rip: 0f 0b 48 83 c4 08 c3 b8 01 00 00 00 eb f4 00 00
@@ -271,7 +271,7 @@ user thread retired by kernel
 usermode: spawn 'excchild_thr' entry=0x40000000 (image=15864 bytes), rsp=0x4000fff0 argc=0, parent port injected
 
 *** user fault: #UD invalid opcode (vec 6, err=0x0)
-  rip=0x000000004000198a <__bss_end+0x3fcffa6a>
+  rip=0x000000004000198a <__bss_end+0x3fcfe6ea>
   rsp=0x4000ffe0  rbp=0x0
   rax=0x0  rdi=0x2  rsi=0x3  rdx=0x0
 code @rip: 0f 0b eb e4 b8 02 00 00 00 eb dd 00 00 00 00 00
@@ -282,7 +282,7 @@ user thread retired by kernel
 usermode: spawn 'excchild_resume' entry=0x40000000 (image=15872 bytes), rsp=0x4000fff0 argc=0, parent port injected
 
 *** user fault: #UD invalid opcode (vec 6, err=0x0)
-  rip=0x0000000040001973 <__bss_end+0x3fcffa53>
+  rip=0x0000000040001973 <__bss_end+0x3fcfe6d3>
   rsp=0x4000ffc0  rbp=0x0
   rax=0x0  rdi=0x10002  rsi=0x3  rdx=0x0
 code @rip: 0f 0b 48 b8 13 00 00 00 18 00 00 00 48 8d 7c 24
@@ -364,6 +364,7 @@ launchctl v2 STOP/START demo:
     com.style9.spinner       loopchild    running      16
   stop 'com.style9.spinner' -> stopped (was task_id=16)
   after stop -- 3 services loaded:
+usermode: spawn 'loopchild' entry=0x40000000 (image=16144 bytes), rsp=0x4000fff0 argc=0
     label                    program      state        task_id
     com.style9.heartbeat     heartbeatd   running      4
     com.style9.ondemand      heartbeatd   stopped      0
@@ -371,13 +372,12 @@ launchctl v2 STOP/START demo:
   start 'com.style9.spinner' -> running (task_id=17)
   after start -- 3 services loaded:
     label                    program      state        task_id
-usermode: spawn 'loopchild' entry=0x40000000 (image=16144 bytes), rsp=0x4000fff0 argc=0
+    com.style9.heartbeat     heartbeatd   running      4
+    com.style9.ondemand      heartbeatd   stopped      0
 usermode: spawn 'loopchild' entry=0x40000000 (image=16144 bytes), rsp=0x4000fff0 argc=0
 loopchild: about to publish task-self port at 'loopchild.tport'
 loopchild: registered 'loopchild.tport' under bootstrap
 loopchild: entering syscall-free compute loop
-    com.style9.heartbeat     heartbeatd   running      4
-    com.style9.ondemand      heartbeatd   stopped      0
     com.style9.spinner       loopchild    running      17
   unload 'com.style9.spinner' -> ok (was running, task_id=17)
 
@@ -700,7 +700,7 @@ darwin: UNIX mmap(256 KiB, prot=3, anon) -> 0x40000000
 
 5 directories, 53 files
 darwin: UNIX exit(0)
-  tree retired after 4 yields
+  tree retired after 3 yields
   >>> spawning gcat -- a REAL Apple x86-64 macOS binary reading a file off the volume <<<
 usermode: spawn 'gcat' entry=0x600003c0 (image=47176 bytes), rsp=0x4fffff90 argc=3
 dyld: link main_mh=0x0000000050000000
@@ -724,7 +724,7 @@ darwin: UNIX mmap(256 KiB, prot=3, anon) -> 0x40000000
 total 164
 -rw-r--r-- 1 0 0 31897 May 30 17:36 banner.flf
 -rw-r--r-- 1 0 0 26384 May 30 17:36 big.flf
-dr-xr-xr-x 1 0 0     0 Jul 25 11:49 bin
+dr-xr-xr-x 1 0 0     0 Jul 25 12:05 bin
 drwxr-xr-x 1 0 0     0 May 30 17:36 docs
 drwxr-xr-x 1 0 0     0 May 30 17:36 fonts
 -rw-r--r-- 1 0 0  9102 May 30 17:36 mini.flf
@@ -737,55 +737,55 @@ drwxr-xr-x 1 0 0     0 May 30 17:36 fonts
 
 /bin:
 total 0
--r-xr-xr-x 1 0 0  15904 Jul 25 11:49 argecho
--r-xr-xr-x 1 0 0  15968 Jul 25 11:49 clock
--r-xr-xr-x 1 0 0  15920 Jul 25 11:49 crasher
--r-xr-xr-x 1 0 0    702 Jul 25 11:49 darwinhello
--r-xr-xr-x 1 0 0    844 Jul 25 11:49 darwinmsg
--r-xr-xr-x 1 0 0 116744 Jul 25 11:49 dash
--r-xr-xr-x 1 0 0   1093 Jul 25 11:49 demo.sh
--r-xr-xr-x 1 0 0  12992 Jul 25 11:49 dirlist
--r-xr-xr-x 1 0 0  12624 Jul 25 11:49 dyldbig
--r-xr-xr-x 1 0 0  12624 Jul 25 11:49 dyldhello
--r-xr-xr-x 1 0 0  16056 Jul 25 11:49 echod
--r-xr-xr-x 1 0 0  15864 Jul 25 11:49 excchild
--r-xr-xr-x 1 0 0  15872 Jul 25 11:49 excchild_resume
--r-xr-xr-x 1 0 0  15864 Jul 25 11:49 excchild_thr
--r-xr-xr-x 1 0 0  15864 Jul 25 11:49 excchild_ud
--r-xr-xr-x 1 0 0  72032 Jul 25 11:49 figlet
--r-xr-xr-x 1 0 0  47176 Jul 25 11:49 gcat
--r-xr-xr-x 1 0 0  52280 Jul 25 11:49 genv
--r-xr-xr-x 1 0 0  69144 Jul 25 11:49 gfactor
--r-xr-xr-x 1 0 0 165000 Jul 25 11:49 gls
--r-xr-xr-x 1 0 0  47384 Jul 25 11:49 gtimeout
--r-xr-xr-x 1 0 0  41304 Jul 25 11:49 guname
--r-xr-xr-x 1 0 0  15968 Jul 25 11:49 heartbeatd
--r-xr-xr-x 1 0 0  40600 Jul 25 11:49 hello
--r-xr-xr-x 1 0 0  21968 Jul 25 11:49 launchctl
--r-xr-xr-x 1 0 0  16144 Jul 25 11:49 loopchild
--r-xr-xr-x 1 0 0  16512 Jul 25 11:49 lsmp
--r-xr-xr-x 1 0 0   7394 Jul 25 11:49 machotest
--r-xr-xr-x 1 0 0  23778 Jul 25 11:49 machotest_fat
--r-xr-xr-x 1 0 0  17104 Jul 25 11:49 mmaptest
--r-xr-xr-x 1 0 0  15936 Jul 25 11:49 oolchild
--r-xr-xr-x 1 0 0  17608 Jul 25 11:49 pipefork
--r-xr-xr-x 1 0 0  15984 Jul 25 11:49 selfkill
--r-xr-xr-x 1 0 0  22792 Jul 25 11:49 sh
--r-xr-xr-x 1 0 0  16016 Jul 25 11:49 tasks
--r-xr-xr-x 1 0 0  12760 Jul 25 11:49 timeprobe
--r-xr-xr-x 1 0 0  16136 Jul 25 11:49 top
--r-xr-xr-x 1 0 0  73472 Jul 25 11:49 tree
--r-xr-xr-x 1 0 0  16296 Jul 25 11:49 vmmap
+-r-xr-xr-x 1 0 0  15904 Jul 25 12:05 argecho
+-r-xr-xr-x 1 0 0  15968 Jul 25 12:05 clock
+-r-xr-xr-x 1 0 0  15920 Jul 25 12:05 crasher
+-r-xr-xr-x 1 0 0    702 Jul 25 12:05 darwinhello
+-r-xr-xr-x 1 0 0    844 Jul 25 12:05 darwinmsg
+-r-xr-xr-x 1 0 0 116744 Jul 25 12:05 dash
+-r-xr-xr-x 1 0 0   1093 Jul 25 12:05 demo.sh
+-r-xr-xr-x 1 0 0  12992 Jul 25 12:05 dirlist
+-r-xr-xr-x 1 0 0  12624 Jul 25 12:05 dyldbig
+-r-xr-xr-x 1 0 0  12624 Jul 25 12:05 dyldhello
+-r-xr-xr-x 1 0 0  16056 Jul 25 12:05 echod
+-r-xr-xr-x 1 0 0  15864 Jul 25 12:05 excchild
+-r-xr-xr-x 1 0 0  15872 Jul 25 12:05 excchild_resume
+-r-xr-xr-x 1 0 0  15864 Jul 25 12:05 excchild_thr
+-r-xr-xr-x 1 0 0  15864 Jul 25 12:05 excchild_ud
+-r-xr-xr-x 1 0 0  72032 Jul 25 12:05 figlet
+-r-xr-xr-x 1 0 0  47176 Jul 25 12:05 gcat
+-r-xr-xr-x 1 0 0  52280 Jul 25 12:05 genv
+-r-xr-xr-x 1 0 0  69144 Jul 25 12:05 gfactor
+-r-xr-xr-x 1 0 0 165000 Jul 25 12:05 gls
+-r-xr-xr-x 1 0 0  47384 Jul 25 12:05 gtimeout
+-r-xr-xr-x 1 0 0  41304 Jul 25 12:05 guname
+-r-xr-xr-x 1 0 0  15968 Jul 25 12:05 heartbeatd
+-r-xr-xr-x 1 0 0  40600 Jul 25 12:05 hello
+-r-xr-xr-x 1 0 0  21968 Jul 25 12:05 launchctl
+-r-xr-xr-x 1 0 0  16144 Jul 25 12:05 loopchild
+-r-xr-xr-x 1 0 0  16512 Jul 25 12:05 lsmp
+-r-xr-xr-x 1 0 0   7394 Jul 25 12:05 machotest
+-r-xr-xr-x 1 0 0  23778 Jul 25 12:05 machotest_fat
+-r-xr-xr-x 1 0 0  17104 Jul 25 12:05 mmaptest
+-r-xr-xr-x 1 0 0  15936 Jul 25 12:05 oolchild
+-r-xr-xr-x 1 0 0  17608 Jul 25 12:05 pipefork
+-r-xr-xr-x 1 0 0  15984 Jul 25 12:05 selfkill
+-r-xr-xr-x 1 0 0  22792 Jul 25 12:05 sh
+-r-xr-xr-x 1 0 0  16016 Jul 25 12:05 tasks
+-r-xr-xr-x 1 0 0  12760 Jul 25 12:05 timeprobe
+-r-xr-xr-x 1 0 0  16136 Jul 25 12:05 top
+-r-xr-xr-x 1 0 0  73472 Jul 25 12:05 tree
+-r-xr-xr-x 1 0 0  16296 Jul 25 12:05 vmmap
 darwin: UNIX exit(0)
-  gls retired after 3 yields
+  gls retired after 6 yields
   >>> spawning timeprobe -- wall-clock probe (gettimeofday / clock_gettime / time) <<<
 usermode: spawn 'timeprobe' entry=0x600003c0 (image=12760 bytes), rsp=0x4fffffd0 argc=0
 dyld: link main_mh=0x0000000050000000
 darwin: s9 map_image '/usr/lib/libSystem.B.dylib' -> base=0x70000000 span=0xf000
 dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070000000
 dyld: enter main @ 0x0000000050000490
-timeprobe: 2026-07-25T11:49:49Z (epoch 1784980189.079848)
-timeprobe: advanced 105120 us across a busy loop
+timeprobe: 2026-07-25T12:05:59Z (epoch 1784981159.778012)
+timeprobe: advanced 81358 us across a busy loop
 timeprobe: all checks passed
 darwin: UNIX exit(0)
   timeprobe retired after 2 yields
@@ -836,7 +836,7 @@ dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070074000
 dyld: enter main @ 0x0000000050001abc
 42: 2 3 7
 darwin: UNIX exit(0)
-  gfactor[0] retired after 1 yields
+  gfactor[0] retired after 2 yields
   >>> gfactor 600851475143 <<<
 usermode: spawn 'gfactor' entry=0x600003c0 (image=69144 bytes), rsp=0x4fffffb0 argc=2
 dyld: link main_mh=0x0000000050000000
@@ -1131,13 +1131,13 @@ captured: 600851475143: 71 839 1471 6857
 # exit
 darwin: UNIX exit(0)
 cons: 105 reads, 0 waits -- 0 keys typed, 105 scripted
-  dash[interactive] retired after 6 yields
+  dash[interactive] retired after 5 yields
 hello.elf: all demos passed
 [user thread exited, code=0]
 vm: 105 faults filled -- 99 zero, 6 from a file, 0 raced, 1 refused
-vm: pager spent 1197 us over 6 pages (199 us each, worst 963)
+vm: pager spent 1183 us over 6 pages (197 us each, worst 930)
 vm: fork shared 2222 pages, 91 later copied on write, 90 reclaimed by their last owner, 0 raced
-pmm: 32736 pages managed, 983 used (3932 KiB), 31753 free (127012 KiB)
+pmm: 32736 pages managed, 985 used (3940 KiB), 31751 free (127004 KiB)
 pmm: 0 frames shared now, 1489 extra owners taken, 4461 frames released by their last owner
 vm: 2599 program pages -- 2124 borrowed from the kernel image, 475 copied (8496 KiB saved)
 vm: 111 message payload pages -- 3 shared with the sender, 108 copied
@@ -1146,7 +1146,7 @@ cons: 105 reads, 0 waits -- 0 keys typed, 105 scripted
 mutex: 1198 acquisitions, 600 had to sleep
 bio: 565 requests, 565 page lookups -- 552 hit (97%), 13 read from disk, 0 evicted, 13/64 buffers live
 ata: channel 0 -- 105 interrupts, 104 blocking waits
-ata: channel 1 -- 1 interrupts, 0 blocking waits
+ata: channel 1 -- 2 interrupts, 0 blocking waits
 kmem stats:
   bucket  0     16 B  inuse=0 free=0 alloc=0
   bucket  1     32 B  inuse=0 free=128 alloc=128
@@ -1164,7 +1164,7 @@ usermode: spawn 'sh' entry=0x40000000 (image=22792 bytes), rsp=0x4000fff0 argc=0
 [1;37m  NAME           [0;37mstyle9-os -- BSD-flavoured x86_64 kernel with Mach IPC
 
 [1;37m  SYSTEM         [0;37march     x86_64
-                 ram      4020 / 130944 KiB
+                 ram      4028 / 130944 KiB
                  tasks    4 live
                  shell    sh.elf
 
