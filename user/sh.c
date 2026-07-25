@@ -152,6 +152,16 @@ static mach_port_name_t		fg_taskport;
 #define	ESC_SHOW_CUR	"\x1b[?25h"
 
 /*
+ * The title bar's own colours: a dark-gray field with white text on it,
+ * and a quieter foreground for the counters that share the row.  These
+ * are the bright-background SGR codes, which did nothing at all until
+ * the tty stopped spending the high background bit on blink -- a bar
+ * with a background is the first thing that fix makes possible.
+ */
+#define	ESC_BAR		"\x1b[100;97m"
+#define	ESC_BAR_DIM	"\x1b[100;37m"
+
+/*
  * The chrome, and the two rows it owns.
  *
  * Rows one and two are the status line and the rule under it; rows
@@ -407,45 +417,325 @@ fetch_stats(struct svc_stats_reply *out)
 /* ---- TUI surface ------------------------------------------------- */
 
 /*
- * paint_hr: emit a full-width horizontal rule at the cursor's current
- * row.  Uses CP437 0xC4 single-line glyph (─); the VGA text-mode font
- * has it natively at that codepoint, and our tty state machine passes
- * non-ESC bytes straight through.  Built as a single 80-byte buffer +
- * trailing newline so it's one write() not eighty putchar()s.
+ * Box drawing.
+ *
+ * The VGA text font has the CP437 line-drawing glyphs natively, and the
+ * tty passes every byte at or above 0x20 straight through to the cell
+ * grid -- so a frame costs exactly what the same number of letters
+ * would.  This is the whole reason a text console can look built rather
+ * than typed, and paint_hr has been quietly using one of these glyphs
+ * (0xC4) since it was written without the rest ever being named.
+ *
+ * These are byte constants, not characters: the console is CP437 and
+ * nothing in this shell is UTF-8.
  */
-static void
-paint_hr(void)
-{
-	char	line[81];
-	int	i;
+#define	BOX_H		'\xc4'		/* horizontal            */
+#define	BOX_V		'\xb3'		/* vertical              */
+#define	BOX_TL		'\xda'		/* top left corner       */
+#define	BOX_TR		'\xbf'		/* top right corner      */
+#define	BOX_BL		'\xc0'		/* bottom left corner    */
+#define	BOX_BR		'\xd9'		/* bottom right corner   */
+#define	BOX_LT		'\xc3'		/* left tee              */
+#define	BOX_RT		'\xb4'		/* right tee             */
+#define	SHADE_LIGHT	'\xb0'
+#define	SHADE_MED	'\xb1'
+#define	SHADE_DARK	'\xb2'
+#define	BLOCK_FULL	'\xdb'
 
-	line[0]  = ' ';
-	for (i = 1; i < 79; i++)
-		line[i] = (char)0xc4;
-	line[79] = ' ';
-	line[80] = '\n';
-	(void)write(line, 81);
+/*
+ * A panel is a frame two columns in from each margin: columns 3..78 of
+ * an eighty-column screen, seventy-six wide including both borders.
+ * Every row is built into one buffer and emitted with a single write,
+ * which is one syscall, one tty batch and one programming of the
+ * hardware cursor -- the same reason paint_hr was written that way.
+ */
+/*
+ * The console is eighty columns and says so in dev/tty.h; there is no
+ * window-size ioctl to ask, and inventing one to tell the shell a
+ * constant would be ceremony.  When a resizable terminal exists this
+ * becomes a query.
+ */
+#define	SH_COLS		80
+
+#define	PANEL_LEFT	2
+#define	PANEL_W		76
+
+/*
+ * Geometry is a setting rather than a constant because the pager wants
+ * the whole screen while the splash and the help list want an inset
+ * card.  One panel is drawn at a time -- this shell has one thread and
+ * no concurrent output -- so two variables are the whole of it.
+ */
+static size_t	panel_left = PANEL_LEFT;
+static size_t	panel_width = PANEL_W;
+
+static size_t
+panel_inner(void)
+{
+
+	return (panel_width - 2);
+}
+
+static void
+panel_set(size_t left, size_t width)
+{
+
+	panel_left  = left;
+	panel_width = width;
+}
+
+/* Buffer builders, defined with the prompt they were written for. */
+static size_t	sh_append(char *, size_t, size_t, const char *);
+static size_t	sh_append_uint(char *, size_t, size_t, unsigned);
+
+static size_t
+sh_pad(char *dst, size_t off, size_t cap, char ch, size_t n)
+{
+
+	while (n-- > 0 && off + 1 < cap)
+		dst[off++] = ch;
+	return (off);
 }
 
 /*
- * paint_status_bar: lift the cursor to (1,1) and paint the two-row
- * header -- app-name + right-aligned uptime on row 1, a thin horizontal
- * rule on row 2.  No reverse-video bar; the chrome here is meant to
- * read as quiet typography rather than a 1990s curses banner.
+ * The visible width of a string, which is not its length: the panel
+ * rows carry SGR sequences and a frame that counted those would come
+ * out ragged by exactly the number of escape bytes in it.
+ */
+static size_t
+sh_visible(const char *s)
+{
+	size_t	n;
+
+	n = 0;
+	while (*s != '\0') {
+		if (*s == 0x1b) {
+			while (*s != '\0' && *s != 'm')
+				s++;
+			if (*s != '\0')
+				s++;
+			continue;
+		}
+		s++;
+		n++;
+	}
+	return (n);
+}
+
+/*
+ * One framed row.  `body` may carry colour; the padding is computed
+ * from its visible width, so the right border lands in column 78 no
+ * matter how much of the row is escape bytes.
+ */
+static void
+panel_row(const char *body)
+{
+	char	out[512];
+	size_t	off;
+	size_t	vis;
+
+	off = 0;
+	off = sh_pad(out, off, sizeof(out), ' ', panel_left);
+	off = sh_append(out, off, sizeof(out), ESC_FG_DGRAY);
+	if (off + 1 < sizeof(out))
+		out[off++] = BOX_V;
+	off = sh_append(out, off, sizeof(out), ESC_RESET);
+
+	/*
+	 * Copy the body a column at a time so it can be CLIPPED at the
+	 * right border: the pager hands whole manual-page lines to this,
+	 * and a line one column too long would push the border out and
+	 * wrap the frame.  Escape sequences pass through without counting
+	 * -- they are the reason a length is not a width.
+	 */
+	vis = 0;
+	while (*body != '\0' && vis < panel_inner()) {
+		if (*body == 0x1b) {
+			while (*body != '\0' && *body != 'm') {
+				if (off + 1 < sizeof(out))
+					out[off++] = *body;
+				body++;
+			}
+			if (*body != '\0') {
+				if (off + 1 < sizeof(out))
+					out[off++] = *body;
+				body++;
+			}
+			continue;
+		}
+		if (*body == '\t') {
+			/*
+			 * Expand rather than pass through.  A tab is one
+			 * byte and up to eight columns, so a width counted
+			 * in bytes-minus-escapes is still wrong for text
+			 * that contains one -- which manual pages do, and
+			 * which pushed the pager's right border off the
+			 * end of the row and wrapped the frame.  Expanded
+			 * here, the stops are the panel's own and the tty
+			 * never sees a tab at all.
+			 */
+			size_t	stop;
+
+			stop = (vis + 8) & ~(size_t)7;
+			if (stop > panel_inner())
+				stop = panel_inner();
+			while (vis < stop) {
+				if (off + 1 < sizeof(out))
+					out[off++] = ' ';
+				vis++;
+			}
+			body++;
+			continue;
+		}
+		/*
+		 * Any other control byte becomes a space.  A stray carriage
+		 * return in the text would otherwise return the cursor to
+		 * column zero and paint the rest of the line over the left
+		 * border -- a frame has to survive its contents.
+		 */
+		if (off + 1 < sizeof(out))
+			out[off++] = (*body >= 0 && *body < 0x20) ? ' ' : *body;
+		body++;
+		vis++;
+	}
+
+	off = sh_pad(out, off, sizeof(out), ' ', panel_inner() - vis);
+	off = sh_append(out, off, sizeof(out), ESC_FG_DGRAY);
+	if (off + 1 < sizeof(out))
+		out[off++] = BOX_V;
+	off = sh_append(out, off, sizeof(out), ESC_RESET);
+	if (off + 1 < sizeof(out))
+		out[off++] = '\n';
+	(void)write(out, off);
+}
+
+/*
+ * An edge of the frame.  `title` inlays into the top edge the way a
+ * grouping box does; NULL gives a plain edge.  `left` and `right` pick
+ * which corners, so this one function draws the top, the bottom and
+ * the separator between sections.
+ */
+static void
+panel_edge(char left, char right, const char *title)
+{
+	char	out[512];
+	size_t	off;
+	size_t	used;
+
+	off = 0;
+	off = sh_pad(out, off, sizeof(out), ' ', panel_left);
+	off = sh_append(out, off, sizeof(out), ESC_FG_DGRAY);
+	if (off + 1 < sizeof(out))
+		out[off++] = left;
+
+	used = 0;
+	if (title != NULL) {
+		off = sh_pad(out, off, sizeof(out), BOX_H, 2);
+		if (off + 1 < sizeof(out))
+			out[off++] = ' ';
+		off = sh_append(out, off, sizeof(out), ESC_FG_WHITE);
+		off = sh_append(out, off, sizeof(out), title);
+		off = sh_append(out, off, sizeof(out), ESC_FG_DGRAY);
+		if (off + 1 < sizeof(out))
+			out[off++] = ' ';
+		used = 4 + sh_visible(title);
+		if (used > panel_inner())
+			used = panel_inner();
+	}
+	off = sh_pad(out, off, sizeof(out), BOX_H, panel_inner() - used);
+	if (off + 1 < sizeof(out))
+		out[off++] = right;
+	off = sh_append(out, off, sizeof(out), ESC_RESET);
+	if (off + 1 < sizeof(out))
+		out[off++] = '\n';
+	(void)write(out, off);
+}
+
+static void
+panel_top(const char *title)
+{
+
+	panel_edge(BOX_TL, BOX_TR, title);
+}
+
+static void
+panel_sep(void)
+{
+
+	panel_edge(BOX_LT, BOX_RT, NULL);
+}
+
+static void
+panel_bottom(void)
+{
+
+	panel_edge(BOX_BL, BOX_BR, NULL);
+}
+
+/*
+ * A bottom edge with something written in it.  A pager's position and
+ * key legend belong on the frame rather than on a row of their own:
+ * the frame is already there, and a row spent on chrome is a row not
+ * spent on the page.
+ */
+static void
+panel_bottom_captioned(const char *caption)
+{
+
+	panel_edge(BOX_BL, BOX_BR, caption);
+}
+
+/*
+ * A proportion, drawn.  Shaded blocks rather than a solid bar so a
+ * gauge that is nearly empty still reads as a gauge and not as an
+ * accident -- the light shade is the track, the dark shade is the fill.
+ */
+static size_t
+sh_gauge(char *dst, size_t off, size_t cap, uint64_t used, uint64_t total,
+    size_t width)
+{
+	size_t	filled;
+
+	filled = total == 0 ? 0 : (size_t)((used * width) / total);
+	if (filled > width)
+		filled = width;
+	if (filled == 0 && used > 0)
+		filled = 1;	/* "some" must not draw as "none" */
+
+	off = sh_append(dst, off, cap, ESC_FG_WHITE);
+	off = sh_pad(dst, off, cap, SHADE_DARK, filled);
+	off = sh_append(dst, off, cap, ESC_FG_DGRAY);
+	off = sh_pad(dst, off, cap, SHADE_LIGHT, width - filled);
+	off = sh_append(dst, off, cap, ESC_RESET);
+	return (off);
+}
+
+/*
+ * paint_status_bar: the two rows above the scrolling region.
  *
- * The rows are outside the scrolling region, so this is a refresh of
- * the clock rather than a rescue of a bar that has been carried away.
- * The cursor is hidden across the trip: it is programmed once per
- * write, and without this the underline is seen jumping to the top of
- * the screen and back on every prompt.
+ * Row one is a title bar with a background of its own rather than a
+ * line of text that happens to be at the top -- which it could not be
+ * until the console stopped spending the high background bit on blink,
+ * since every dark background above black was a blinking one.  Row two
+ * is a thin rule that separates the bar from the work below it.
+ *
+ * The rows never scroll, so this is a refresh of the clock rather than
+ * a rescue of a bar that has been carried away.  The cursor is hidden
+ * across the trip: it is programmed for real now, and without this it
+ * is seen jumping to the top of the screen and back on every prompt.
  */
 static void
 paint_status_bar(void)
 {
 	struct svc_clock_reply	ck;
+	struct svc_stats_reply	st;
+	char			out[256];
+	size_t			off;
+	size_t			vis;
 	uint64_t		s, m, h;
 
 	(void)fetch_clock(&ck);
+	(void)fetch_stats(&st);
 	s = ck.cr_uptime_ms / 1000ull;
 	h = s / 3600ull;
 	s = s - h * 3600ull;
@@ -455,48 +745,75 @@ paint_status_bar(void)
 	puts(ESC_HIDE_CUR);
 	puts(ESC_SAVE_CUR);
 	puts(ESC_HOME);
-	puts(ESC_FG_GRAY);
+
 	/*
-	 * 80 columns total: 1sp + "style9-os(9)" (12) + 57sp + uptime
-	 * (8) + 1sp + nl + 1.  "%58s" right-aligns the 8-char uptime to
-	 * column 79, leaving column 80 as a trailing space.
+	 * Left: the name, in white on the bar.  Right: task count and
+	 * uptime, in the bar's quieter foreground.  The padding between
+	 * them is computed from the visible width so the clock ends in
+	 * column 79 whatever the counts happen to be.
 	 */
+	off = 0;
+	off = sh_append(out, off, sizeof(out), ESC_BAR);
+	off = sh_append(out, off, sizeof(out), " style9-os(9)");
+	vis = 13;
+
+	off = sh_append(out, off, sizeof(out), ESC_BAR_DIM);
 	{
-		char	tbuf[16];
-		tbuf[0] = (char)('0' + ((unsigned)(h / 10) % 10));
-		tbuf[1] = (char)('0' + ((unsigned)h % 10));
-		tbuf[2] = ':';
-		tbuf[3] = (char)('0' + ((unsigned)(m / 10) % 10));
-		tbuf[4] = (char)('0' + ((unsigned)m % 10));
-		tbuf[5] = ':';
-		tbuf[6] = (char)('0' + ((unsigned)(s / 10) % 10));
-		tbuf[7] = (char)('0' + ((unsigned)s % 10));
-		tbuf[8] = '\0';
-		printf(" style9-os(9)%66s \n", tbuf);
+		char	right[48];
+		size_t	r;
+
+		r = 0;
+		r = sh_append_uint(right, r, sizeof(right),
+		    (unsigned)st.sr_task_count);
+		r = sh_append(right, r, sizeof(right), " tasks   ");
+		r = sh_append_uint(right, r, sizeof(right), (unsigned)h);
+		right[r++] = ':';
+		right[r++] = (char)('0' + ((unsigned)(m / 10) % 10));
+		right[r++] = (char)('0' + ((unsigned)m % 10));
+		right[r++] = ':';
+		right[r++] = (char)('0' + ((unsigned)(s / 10) % 10));
+		right[r++] = (char)('0' + ((unsigned)s % 10));
+		right[r]   = '\0';
+
+		off = sh_pad(out, off, sizeof(out), ' ',
+		    79 - vis - sh_visible(right));
+		off = sh_append(out, off, sizeof(out), right);
 	}
-	puts(ESC_FG_DGRAY);
-	paint_hr();
-	puts(ESC_RESET);
+	off = sh_pad(out, off, sizeof(out), ' ', 1);
+	off = sh_append(out, off, sizeof(out), ESC_RESET);
+	if (off + 1 < sizeof(out))
+		out[off++] = '\n';
+	(void)write(out, off);
+
+	off = 0;
+	off = sh_append(out, off, sizeof(out), ESC_FG_DGRAY);
+	off = sh_pad(out, off, sizeof(out), BOX_H, 80);
+	off = sh_append(out, off, sizeof(out), ESC_RESET);
+	(void)write(out, off);
+
 	puts(ESC_REST_CUR);
 	puts(ESC_SHOW_CUR);
 }
 
 /*
- * paint_splash: a quiet manpage-style welcome.  No ASCII '9' glyph;
- * the section-9 reference lives in the title and in 'SEE ALSO' --
- * the typography itself is the logo.  Lots of vertical whitespace
- * so the eye can rest between sections; left margin two columns,
- * label gutter at column three, content gutter at column eighteen.
+ * paint_splash: a manpage-shaped welcome, in a frame.
+ *
+ * It used to be loose text with a rule under it, which read as a page
+ * that had lost its edges; a box says the same thing and says where it
+ * stops.  The section-9 reference lives in the frame's inlaid title
+ * now, which is what a title is for.
  *
  * Colour usage:
- *	white-bold	section headers (NAME, SYSTEM, SEE ALSO)
- *	gray		body text + value columns
- *	dark gray	horizontal rules
+ *	white		section labels and the frame's title
+ *	gray		body text and value columns
+ *	dark gray	the frame itself, and the empty half of the gauge
  */
 static void
 paint_splash(void)
 {
 	struct svc_stats_reply	st;
+	char			row[256];
+	size_t			off;
 	uint64_t		used_kib;
 	uint64_t		total_kib;
 
@@ -504,38 +821,91 @@ paint_splash(void)
 	used_kib  = st.sr_pmm_used_pages * 4ull;
 	total_kib = st.sr_pmm_total_pages * 4ull;
 
-	/*
-	 * One blank row under the rule for air.  It used to be two, plus a
-	 * third the terminal ate by wrapping the eighty-column status line
-	 * into a row of its own -- which is what put the rule on top of
-	 * the NAME section and made this splash a section shorter than it
-	 * reads here.
-	 */
-	puts("\n");
+	panel_top("style9-os(9)");
+	panel_row("");
 
-	puts(ESC_FG_WHITE); puts("  NAME           ");
-	puts(ESC_FG_GRAY);  puts("style9-os -- BSD-flavoured x86_64 "
-	    "kernel with Mach IPC\n");
-	puts("\n");
+	off = 0;
+	off = sh_append(row, off, sizeof(row), "   ");
+	off = sh_append(row, off, sizeof(row), ESC_FG_WHITE);
+	off = sh_append(row, off, sizeof(row), "NAME       ");
+	off = sh_append(row, off, sizeof(row), ESC_FG_GRAY);
+	off = sh_append(row, off, sizeof(row),
+	    "style9-os -- BSD-flavoured x86_64 kernel");
+	off = sh_append(row, off, sizeof(row), ESC_RESET);
+	row[off] = '\0';
+	panel_row(row);
 
-	puts(ESC_FG_WHITE); puts("  SYSTEM         ");
-	puts(ESC_FG_GRAY);  puts("arch     x86_64\n");
-	printf("                 ram      %llu / %llu KiB\n",
-	    (unsigned long long)used_kib,
-	    (unsigned long long)total_kib);
-	printf("                 tasks    %llu live\n",
-	    (unsigned long long)st.sr_task_count);
-	puts("                 shell    sh.elf\n");
-	puts("\n");
+	off = 0;
+	off = sh_append(row, off, sizeof(row), "              ");
+	off = sh_append(row, off, sizeof(row), ESC_FG_GRAY);
+	off = sh_append(row, off, sizeof(row), "with Mach IPC");
+	off = sh_append(row, off, sizeof(row), ESC_RESET);
+	row[off] = '\0';
+	panel_row(row);
+	panel_row("");
 
-	puts(ESC_FG_WHITE); puts("  SEE ALSO       ");
-	puts(ESC_FG_GRAY);  puts("style(9), help(1)\n");
-	puts("\n");
+	off = 0;
+	off = sh_append(row, off, sizeof(row), "   ");
+	off = sh_append(row, off, sizeof(row), ESC_FG_WHITE);
+	off = sh_append(row, off, sizeof(row), "SYSTEM     ");
+	off = sh_append(row, off, sizeof(row), ESC_FG_GRAY);
+	off = sh_append(row, off, sizeof(row), "arch     x86_64");
+	off = sh_append(row, off, sizeof(row), ESC_RESET);
+	row[off] = '\0';
+	panel_row(row);
 
-	puts(ESC_FG_DGRAY);
-	paint_hr();
-	puts(ESC_RESET);
-	puts("\n");
+	off = 0;
+	off = sh_append(row, off, sizeof(row), "              ");
+	off = sh_append(row, off, sizeof(row), ESC_FG_GRAY);
+	off = sh_append(row, off, sizeof(row), "memory   ");
+	off = sh_gauge(row, off, sizeof(row), used_kib, total_kib, 20);
+	off = sh_append(row, off, sizeof(row), ESC_FG_GRAY);
+	off = sh_append(row, off, sizeof(row), "  ");
+	off = sh_append_uint(row, off, sizeof(row), (unsigned)(used_kib / 1024));
+	off = sh_append(row, off, sizeof(row), " / ");
+	off = sh_append_uint(row, off, sizeof(row),
+	    (unsigned)(total_kib / 1024));
+	off = sh_append(row, off, sizeof(row), " MiB");
+	off = sh_append(row, off, sizeof(row), ESC_RESET);
+	row[off] = '\0';
+	panel_row(row);
+
+	off = 0;
+	off = sh_append(row, off, sizeof(row), "              ");
+	off = sh_append(row, off, sizeof(row), ESC_FG_GRAY);
+	off = sh_append(row, off, sizeof(row), "tasks    ");
+	off = sh_append_uint(row, off, sizeof(row),
+	    (unsigned)st.sr_task_count);
+	off = sh_append(row, off, sizeof(row), " live, ");
+	off = sh_append_uint(row, off, sizeof(row),
+	    (unsigned)st.sr_thread_count);
+	off = sh_append(row, off, sizeof(row), " threads");
+	off = sh_append(row, off, sizeof(row), ESC_RESET);
+	row[off] = '\0';
+	panel_row(row);
+
+	off = 0;
+	off = sh_append(row, off, sizeof(row), "              ");
+	off = sh_append(row, off, sizeof(row), ESC_FG_GRAY);
+	off = sh_append(row, off, sizeof(row), "programs ");
+	off = sh_append_uint(row, off, sizeof(row), sh_progs_total);
+	off = sh_append(row, off, sizeof(row), " in the registry");
+	off = sh_append(row, off, sizeof(row), ESC_RESET);
+	row[off] = '\0';
+	panel_row(row);
+	panel_row("");
+
+	off = 0;
+	off = sh_append(row, off, sizeof(row), "   ");
+	off = sh_append(row, off, sizeof(row), ESC_FG_WHITE);
+	off = sh_append(row, off, sizeof(row), "SEE ALSO   ");
+	off = sh_append(row, off, sizeof(row), ESC_FG_GRAY);
+	off = sh_append(row, off, sizeof(row), "style(9), help(1)");
+	off = sh_append(row, off, sizeof(row), ESC_RESET);
+	row[off] = '\0';
+	panel_row(row);
+	panel_row("");
+	panel_bottom();
 }
 
 /* ---- the prompt, as bytes and as a width -------------------------- */
@@ -681,65 +1051,84 @@ static const struct sh_builtin sh_builtins[] = {
 };
 
 /*
- * builtin_help: terse "two-column form" -- command on the left, one-
- * line description on the right.  No section headers; spawnables get
- * wrapped rows below, the way a tab-completion listing reads.
- * Bold-white commands, gray descriptions.
+ * builtin_help: the command list, framed.
+ *
+ * Two sections in one panel with a tee between them -- the words this
+ * shell implements above, the programs it can spawn below.  The spawn
+ * list is thirty-nine names now and wraps into a grid; the panel is
+ * what keeps that grid from reading as spilled text.
  */
 static void
 builtin_help(void)
 {
 	const char	*name;
+	char		 row[256];
+	size_t		 off;
 	size_t		 col;
-	size_t		 w;
 	uint32_t	 i;
 
+	panel_top("help(1)");
 	for (i = 0; sh_builtins[i].b_name != NULL; i++) {
-		puts(ESC_FG_WHITE);
-		printf("  %-8s ", sh_builtins[i].b_name);
-		puts(ESC_FG_GRAY);
-		puts(sh_builtins[i].b_help);
-		puts("\n");
+		off = 0;
+		off = sh_append(row, off, sizeof(row), "   ");
+		off = sh_append(row, off, sizeof(row), ESC_FG_WHITE);
+		off = sh_append(row, off, sizeof(row), sh_builtins[i].b_name);
+		off = sh_pad(row, off, sizeof(row), ' ',
+		    9 - sh_visible(sh_builtins[i].b_name));
+		off = sh_append(row, off, sizeof(row), ESC_FG_GRAY);
+		off = sh_append(row, off, sizeof(row), sh_builtins[i].b_help);
+		off = sh_append(row, off, sizeof(row), ESC_RESET);
+		row[off] = '\0';
+		panel_row(row);
 	}
 
-	puts("\n");
-	puts(ESC_FG_WHITE); puts("  spawn    ");
-	puts(ESC_FG_GRAY);
+	panel_sep();
+
 	if (sh_progs_n == 0) {
-		puts("(the progreg service did not answer)\n");
-		puts(ESC_RESET);
+		panel_row("   the progreg service did not answer");
+		panel_bottom();
 		return;
 	}
 
-	/*
-	 * Thirty-eight names do not fit on the one row the four hard-coded
-	 * ones used to, so they wrap into the same gutter.  Widest name in
-	 * the registry is "excchild_resume"; the column is sixteen so a
-	 * name never touches its neighbour.
-	 */
 	col = 0;
+	off = 0;
 	for (i = 0; i < sh_progs_n; i++) {
 		name = prog_at(i);
 		if (name == NULL)
 			break;
-		if (col == 4) {
-			puts("\n           ");
+		if (col == 0) {
+			off = sh_append(row, off, sizeof(row), "   ");
+			off = sh_append(row, off, sizeof(row), ESC_FG_GRAY);
+		}
+		off = sh_append(row, off, sizeof(row), name);
+		off = sh_pad(row, off, sizeof(row), ' ',
+		    17 - sh_visible(name));
+		if (++col == 4) {
+			off = sh_append(row, off, sizeof(row), ESC_RESET);
+			row[off] = '\0';
+			panel_row(row);
 			col = 0;
+			off = 0;
 		}
-		puts(name);
-		for (w = 0; name[w] != '\0'; w++)
-			continue;
-		while (w < 16) {
-			putchar(' ');
-			w++;
-		}
-		col++;
 	}
-	puts("\n");
-	if (sh_progs_total > sh_progs_n)
-		printf("           (%u more the reply had no room for)\n",
-		    (unsigned)(sh_progs_total - sh_progs_n));
-	puts(ESC_RESET);
+	if (col != 0) {
+		off = sh_append(row, off, sizeof(row), ESC_RESET);
+		row[off] = '\0';
+		panel_row(row);
+	}
+	if (sh_progs_total > sh_progs_n) {
+		off = 0;
+		off = sh_append(row, off, sizeof(row), "   ");
+		off = sh_append(row, off, sizeof(row), ESC_FG_RED);
+		off = sh_append_uint(row, off, sizeof(row),
+		    sh_progs_total - sh_progs_n);
+		off = sh_append(row, off, sizeof(row),
+		    " more the reply had no room for");
+		off = sh_append(row, off, sizeof(row), ESC_RESET);
+		row[off] = '\0';
+		panel_row(row);
+	}
+	panel_bottom();
 }
 
 static void
@@ -957,30 +1346,60 @@ static void
 pager_repaint(const char *text, size_t total_lines, size_t top,
     const char *title)
 {
+	char	row[512];
+	char	caption[128];
 	size_t	end;
+	size_t	off;
 	size_t	i;
+	size_t	n;
 
 	puts(ESC_CLR_SCR);
+	panel_set(0, SH_COLS);
+	panel_top(title);
 
 	end = top + PAGER_SCREEN_ROWS;
 	if (end > total_lines)
 		end = total_lines;
 
+	/*
+	 * Copy each line into a NUL-terminated buffer rather than writing
+	 * it straight out: the frame's right border has to follow it, and
+	 * panel_row is what knows where that is and how to clip a line
+	 * that would have reached it.
+	 */
 	for (i = top; i < end; i++) {
-		(void)write(text + pager_line_off[i], pager_line_len[i]);
-		putchar('\n');
+		n = pager_line_len[i];
+		if (n > sizeof(row) - 1)
+			n = sizeof(row) - 1;
+		for (off = 0; off < n; off++)
+			row[off] = text[pager_line_off[i] + off];
+		row[n] = '\0';
+		panel_row(row);
 	}
 	for (i = end - top; i < PAGER_SCREEN_ROWS; i++)
-		putchar('\n');
+		panel_row("");
 
-	puts("\x1b[7m");	/* inverse video for the status bar */
-	printf(" %s  %llu-%llu/%llu  "
-	    "[Space/b page  j/k line  g/G top/bot  q quit] ",
-	    title,
-	    (unsigned long long)(top + 1),
-	    (unsigned long long)end,
-	    (unsigned long long)total_lines);
-	puts(ESC_RESET);
+	/*
+	 * Position and keys go IN the bottom edge.  They used to be a row
+	 * of reverse video below the text -- which never rendered, since
+	 * the tty had no case for SGR 7 -- and a row spent on chrome is a
+	 * row not spent on the page.
+	 */
+	off = 0;
+	off = sh_append_uint(caption, off, sizeof(caption),
+	    (unsigned)(top + 1));
+	off = sh_append(caption, off, sizeof(caption), "-");
+	off = sh_append_uint(caption, off, sizeof(caption), (unsigned)end);
+	off = sh_append(caption, off, sizeof(caption), "/");
+	off = sh_append_uint(caption, off, sizeof(caption),
+	    (unsigned)total_lines);
+	off = sh_append(caption, off, sizeof(caption), ESC_FG_GRAY);
+	off = sh_append(caption, off, sizeof(caption),
+	    "   space/b page   j/k line   g/G ends   q quit");
+	caption[off] = '\0';
+	panel_bottom_captioned(caption);
+
+	panel_set(PANEL_LEFT, PANEL_W);
 }
 
 static void
@@ -1424,14 +1843,6 @@ struct sh_line {
 	size_t	l_len;
 	size_t	l_pos;
 };
-
-/*
- * The console is eighty columns and says so in dev/tty.h; there is no
- * window-size ioctl to ask, and inventing one to tell the shell a
- * constant would be ceremony.  When a resizable terminal exists this
- * becomes a query.
- */
-#define	SH_COLS		80
 
 /*
  * History.  A plain array, oldest first, that shifts when it fills --
