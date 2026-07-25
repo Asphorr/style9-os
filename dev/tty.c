@@ -87,9 +87,35 @@ static uint16_t		tty_row;
 static uint8_t		tty_attr;
 static uint8_t		tty_attr_default;
 
+/*
+ * The last column is a place to be, not a place to fall off.
+ *
+ * This blitter used to advance the column after every printable byte
+ * and then wrap if the column had reached eighty -- so a line exactly
+ * eighty columns wide left the cursor already on the next row, and the
+ * newline that followed it advanced a SECOND time.  One blank row per
+ * full-width line, silently.
+ *
+ * That is not a rounding error in a hobby console; it is why the
+ * shell's own splash was missing its NAME section.  sh.elf paints an
+ * eighty-column status line and then an eighty-column rule, expecting
+ * them on rows one and two; they landed on rows one and three, and the
+ * rule wiped the text that had been drawn there.
+ *
+ * Every real terminal defers the wrap instead: a character written to
+ * the last column leaves the cursor IN the last column and arms a flag,
+ * and only the next printable character actually moves to the next row.
+ * Anything that positions the cursor -- carriage return, newline,
+ * backspace, tab, any CSI -- disarms it without wrapping.  That is the
+ * whole of DEC's "last column flag", and it is what makes a full-width
+ * line cost one row.
+ */
+static bool		tty_wrap_pending;
+
 static uint16_t	tty_saved_col;
 static uint16_t	tty_saved_row;
 static uint8_t	tty_saved_attr;
+static bool	tty_saved_wrap;
 static bool	tty_have_saved;
 
 static enum tty_state	csi_state;
@@ -162,6 +188,7 @@ tty_init(void)
 	tty_saved_col    = 0;
 	tty_saved_row    = 0;
 	tty_saved_attr   = tty_attr_default;
+	tty_saved_wrap   = false;
 	tty_have_saved   = false;
 	csi_state        = TTY_S_GROUND;
 	tty_csi_reset();
@@ -186,6 +213,7 @@ tty_clear(void)
 
 	tty_col = 0;
 	tty_row = 0;
+	tty_wrap_pending = false;
 	tty_cursor_sync();
 }
 
@@ -502,32 +530,58 @@ tty_ground_put(char ch)
 
 	switch (ch) {
 	case '\n':
+		tty_wrap_pending = false;
 		tty_col = 0;
 		tty_row++;
 		break;
 	case '\r':
+		tty_wrap_pending = false;
 		tty_col = 0;
 		break;
 	case '\t':
+		/*
+		 * A tab never wraps -- it stops at the last column, the way
+		 * every VT does.  Landing there arms the wrap the same as
+		 * printing there would, so the next character starts the
+		 * next row.
+		 */
 		tty_col = (uint16_t)((tty_col + 8) & ~7u);
+		if (tty_col >= TTY_COLS) {
+			tty_col = TTY_COLS - 1;
+			tty_wrap_pending = true;
+		} else {
+			tty_wrap_pending = false;
+		}
 		break;
 	case '\b':
+		tty_wrap_pending = false;
 		if (tty_col > 0)
 			tty_col--;
 		tty_putcell(tty_col, tty_row, ' ');
 		break;
 	default:
 		if ((unsigned char)ch >= 0x20) {
+			/*
+			 * The wrap owed from the previous character is paid
+			 * here, immediately before this one is placed --
+			 * which is the entire point of deferring it.
+			 */
+			if (tty_wrap_pending) {
+				tty_wrap_pending = false;
+				tty_col = 0;
+				tty_row++;
+				if (tty_row >= TTY_ROWS)
+					tty_scroll();
+			}
 			tty_putcell(tty_col, tty_row, ch);
-			tty_col++;
+			if (tty_col + 1 >= TTY_COLS)
+				tty_wrap_pending = true;
+			else
+				tty_col++;
 		}
 		break;
 	}
 
-	if (tty_col >= TTY_COLS) {
-		tty_col = 0;
-		tty_row++;
-	}
 	if (tty_row >= TTY_ROWS)
 		tty_scroll();
 }
@@ -613,6 +667,29 @@ tty_csi_dispatch(char final)
 	if (csi_private)
 		return;
 
+	/*
+	 * Anything that positions the cursor or erases under it disarms
+	 * the deferred wrap -- the character that owed it is no longer the
+	 * last thing written.  SGR and save-cursor are deliberately absent
+	 * from this list: neither moves the cursor, so a colour change
+	 * between the eightieth character and the eighty-first must not
+	 * turn the wrap into an overwrite of the last column.
+	 */
+	switch (final) {
+	case 'H':
+	case 'f':
+	case 'A':
+	case 'B':
+	case 'C':
+	case 'D':
+	case 'J':
+	case 'K':
+		tty_wrap_pending = false;
+		break;
+	default:
+		break;
+	}
+
 	switch (final) {
 	case 'H':
 	case 'f':
@@ -693,13 +770,21 @@ tty_csi_dispatch(char final)
 		tty_saved_col  = tty_col;
 		tty_saved_row  = tty_row;
 		tty_saved_attr = tty_attr;
+		tty_saved_wrap = tty_wrap_pending;
 		tty_have_saved = true;
 		return;
 	case 'u':
+		/*
+		 * The armed wrap is part of the cursor's position, not a
+		 * side effect of it -- restoring to the last column of a
+		 * full row must restore whether the next character belongs
+		 * there or on the row below.
+		 */
 		if (tty_have_saved) {
-			tty_col  = tty_saved_col;
-			tty_row  = tty_saved_row;
-			tty_attr = tty_saved_attr;
+			tty_col          = tty_saved_col;
+			tty_row          = tty_saved_row;
+			tty_attr         = tty_saved_attr;
+			tty_wrap_pending = tty_saved_wrap;
 		}
 		return;
 
@@ -721,7 +806,7 @@ tty_csi_dispatch(char final)
  * precisely the bug this exists to catch.
  */
 static bool
-tty_cursor_is(uint16_t want, const char *what)
+tty_cursor_is(const char *who, uint16_t want, const char *what)
 {
 	uint16_t	got;
 
@@ -729,9 +814,9 @@ tty_cursor_is(uint16_t want, const char *what)
 	if (got == want)
 		return (true);
 	tty_clear();
-	kprintf("tty-cursor: FAIL %s -- the CRTC holds cell %u (row %u col %u),"
+	kprintf("%s: FAIL %s -- the CRTC holds cell %u (row %u col %u),"
 	    " the text is at cell %u (row %u col %u)\n",
-	    what,
+	    who, what,
 	    (unsigned)got, (unsigned)(got / TTY_COLS), (unsigned)(got % TTY_COLS),
 	    (unsigned)want,
 	    (unsigned)(want / TTY_COLS), (unsigned)(want % TTY_COLS));
@@ -750,7 +835,8 @@ tty_selftest(void)
 	 *    follow it, nothing else here can be trusted either.
 	 */
 	tty_puts("\x1b[8;13H");
-	if (!tty_cursor_is(7 * TTY_COLS + 12, "after CUP to row 8 column 13"))
+	if (!tty_cursor_is("tty-cursor", 7 * TTY_COLS + 12,
+	    "after CUP to row 8 column 13"))
 		return;
 
 	/*
@@ -759,12 +845,13 @@ tty_selftest(void)
 	 *    at a shell prompt looks like.
 	 */
 	tty_puts("style");
-	if (!tty_cursor_is(7 * TTY_COLS + 17, "after five printable bytes"))
+	if (!tty_cursor_is("tty-cursor", 7 * TTY_COLS + 17,
+	    "after five printable bytes"))
 		return;
 
 	/* 3. A newline returns to column zero of the next row. */
 	tty_putc('\n');
-	if (!tty_cursor_is(8 * TTY_COLS, "after a newline"))
+	if (!tty_cursor_is("tty-cursor", 8 * TTY_COLS, "after a newline"))
 		return;
 
 	/*
@@ -774,10 +861,12 @@ tty_selftest(void)
 	 *    genuinely separate way to get this wrong.
 	 */
 	tty_puts("\x1b[25;1H");
-	if (!tty_cursor_is((TTY_ROWS - 1) * TTY_COLS, "after CUP to the last row"))
+	if (!tty_cursor_is("tty-cursor", (TTY_ROWS - 1) * TTY_COLS,
+	    "after CUP to the last row"))
 		return;
 	tty_putc('\n');
-	if (!tty_cursor_is((TTY_ROWS - 1) * TTY_COLS, "after scrolling"))
+	if (!tty_cursor_is("tty-cursor", (TTY_ROWS - 1) * TTY_COLS,
+	    "after scrolling"))
 		return;
 
 	/*
@@ -790,7 +879,8 @@ tty_selftest(void)
 	pokes_before = tty_cursor_pokes;
 	tty_puts("\x1b[12;34Hbatched output.");
 	pokes_spent = tty_cursor_pokes - pokes_before;
-	if (!tty_cursor_is(11 * TTY_COLS + 33 + 15, "after a batched write"))
+	if (!tty_cursor_is("tty-cursor", 11 * TTY_COLS + 33 + 15,
+	    "after a batched write"))
 		return;
 	if (pokes_spent != 1) {
 		tty_clear();
@@ -817,13 +907,128 @@ tty_selftest(void)
 
 	/* 7. And clearing the screen brings it home. */
 	tty_clear();
-	if (!tty_cursor_is(0, "after clearing the screen"))
+	if (!tty_cursor_is("tty-cursor", 0, "after clearing the screen"))
 		return;
 
 	kprintf("tty-cursor: PASS -- the CRTC followed the text through "
 	    "positioning, typing, a newline, a scroll and a clear; a 23-byte "
 	    "write cost one programming and a move to where it already was "
 	    "cost none\n");
+}
+
+/*
+ * Read a cell back off the screen.  The wrap test needs to know WHERE a
+ * character landed, which the cursor position alone cannot say: a
+ * blitter that wrapped early and one that wrapped late can leave the
+ * cursor in the same place having written to different rows.
+ */
+static char
+tty_glyph_at(uint16_t row, uint16_t col)
+{
+
+	return ((char)(VGA_BASE[(size_t)row * TTY_COLS + col] & 0xFFu));
+}
+
+static void
+tty_fill_row(uint16_t row, uint16_t n, char ch)
+{
+	uint16_t	i;
+
+	kprintf("\x1b[%u;1H", (unsigned)(row + 1));
+	tty_batch_begin();
+	for (i = 0; i < n; i++)
+		tty_putc(ch);
+	tty_batch_end();
+}
+
+void
+tty_wrap_selftest(void)
+{
+	uint16_t	want;
+
+	/*
+	 * 1. Eighty characters fill a row and leave the cursor ON it.
+	 *
+	 *    The old blitter advanced the column past the eightieth
+	 *    character and wrapped there and then, so the cursor was
+	 *    already on the next row with nothing written to it.  That is
+	 *    the bug: the row had been spent before anything asked for it.
+	 */
+	tty_fill_row(5, TTY_COLS, 'x');
+	want = 5 * TTY_COLS + (TTY_COLS - 1);
+	if (!tty_cursor_is("tty-wrap", want, "after filling a row exactly"))
+		return;
+
+	/*
+	 * 2. And the newline after it costs ONE row, not two.  This is the
+	 *    check the shell's splash was failing: an eighty-column status
+	 *    line plus a newline landed two rows down, so the rule that
+	 *    followed wiped the text a row below where it belonged.
+	 */
+	tty_putc('\n');
+	if (!tty_cursor_is("tty-wrap", 6 * TTY_COLS,
+	    "after the newline that follows it"))
+		return;
+
+	/*
+	 * 3. The eighty-first character does wrap -- deferring it must not
+	 *    mean losing it.  Check the glyph, not the cursor: a blitter
+	 *    that overwrote column eighty instead of wrapping would leave
+	 *    the cursor in a defensible place having eaten a character.
+	 */
+	tty_fill_row(8, TTY_COLS, 'y');
+	tty_puts("Z");
+	if (tty_glyph_at(8, TTY_COLS - 1) != 'y') {
+		tty_clear();
+		kprintf("tty-wrap: FAIL the eighty-first character overwrote "
+		    "the eightieth instead of wrapping\n");
+		return;
+	}
+	if (tty_glyph_at(9, 0) != 'Z') {
+		tty_clear();
+		kprintf("tty-wrap: FAIL the eighty-first character did not "
+		    "land on the next row (found '%c' there)\n",
+		    tty_glyph_at(9, 0));
+		return;
+	}
+	if (!tty_cursor_is("tty-wrap", 9 * TTY_COLS + 1,
+	    "after the character that wrapped"))
+		return;
+
+	/*
+	 * 4. A carriage return disarms the wrap rather than paying it: the
+	 *    next character belongs at column one of the SAME row.  This
+	 *    is what a shell does when it repaints a line it has just
+	 *    filled to the margin.
+	 */
+	tty_fill_row(11, TTY_COLS, 'w');
+	tty_puts("\rW");
+	if (tty_glyph_at(11, 0) != 'W' || tty_glyph_at(12, 0) == 'W') {
+		tty_clear();
+		kprintf("tty-wrap: FAIL a carriage return after a full row "
+		    "did not cancel the pending wrap\n");
+		return;
+	}
+
+	/*
+	 * 5. And filling the bottom row does not scroll by itself -- the
+	 *    screen moves when the next character needs somewhere to go,
+	 *    not a character earlier.  Getting this wrong loses the last
+	 *    line of any output that happens to be exactly full width.
+	 */
+	tty_fill_row(TTY_ROWS - 1, TTY_COLS, 'b');
+	if (tty_glyph_at(TTY_ROWS - 1, 0) != 'b') {
+		tty_clear();
+		kprintf("tty-wrap: FAIL filling the bottom row scrolled the "
+		    "screen before anything needed the next one\n");
+		return;
+	}
+
+	tty_clear();
+	kprintf("tty-wrap: PASS -- a full row leaves the cursor in the last "
+	    "column, the newline after it costs one row, the character after "
+	    "it wraps without being lost, a carriage return cancels the wrap, "
+	    "and a full bottom row does not scroll on its own\n");
 }
 
 void

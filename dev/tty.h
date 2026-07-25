@@ -84,4 +84,11 @@ void	tty_stats(void);
  */
 void	tty_selftest(void);
 
+/*
+ * And that a line exactly TTY_COLS wide costs one row rather than two.
+ * Same scribble-and-clear discipline as tty_selftest, and runs beside
+ * it for the same reason.
+ */
+void	tty_wrap_selftest(void);
+
 #endif /* !_SYS_TTY_H_ */

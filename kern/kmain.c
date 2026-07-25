@@ -89,6 +89,7 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	 * cursor that was not following it.
 	 */
 	tty_selftest();
+	tty_wrap_selftest();
 	kmain_banner(mb_magic, mb_info);
 
 	tty_puts("\nbringing CPU tables online...\n");
