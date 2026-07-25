@@ -164,6 +164,116 @@ read_byte(void)
 	return ((int)(unsigned char)hdr.msgh_id);
 }
 
+/* ---- keys, not bytes ---------------------------------------------- */
+
+/*
+ * A keypress, decoded.
+ *
+ * dev/kbd.c has been turning Up into the three bytes "\x1b[A" since it
+ * was written, and the pager below has had a state machine to take them
+ * apart for just as long.  The line editor did not: it dropped the
+ * escape as unprintable and then typed the '[' and the 'A' into the
+ * command line, so pressing Up at the prompt inserted "[A".  The decoder
+ * existed; it was just in the wrong place, doing it for one of the two
+ * things that reads the keyboard.
+ *
+ * So it lives here now and both of them use it.  A key that this
+ * terminal does not produce comes back as SH_K_UNKNOWN rather than as
+ * its bytes -- an unrecognised sequence must not degrade into typing
+ * itself, which is the whole bug.
+ *
+ * A lone Escape is indistinguishable from the start of a sequence
+ * without a timer, so read_key blocks after one until the next byte
+ * arrives, exactly as the pager's own machine used to.  Every consumer
+ * here reaches Escape through a key that follows it.
+ */
+enum sh_key {
+	SH_K_CHAR = 0,		/* an ordinary byte, in kp_ch */
+	SH_K_UP,
+	SH_K_DOWN,
+	SH_K_LEFT,
+	SH_K_RIGHT,
+	SH_K_HOME,
+	SH_K_END,
+	SH_K_DELETE,
+	SH_K_INSERT,
+	SH_K_PGUP,
+	SH_K_PGDN,
+	SH_K_ESC,		/* Escape, followed by something not a CSI */
+	SH_K_UNKNOWN,		/* a well-formed sequence we have no name for */
+	SH_K_EOF,		/* the keyboard stream died */
+};
+
+struct sh_keypress {
+	enum sh_key	kp_key;
+	char		kp_ch;
+};
+
+static void
+read_key(struct sh_keypress *out)
+{
+	int	c;
+	int	arg;
+
+	out->kp_key = SH_K_EOF;
+	out->kp_ch  = 0;
+
+	c = read_byte();
+	if (c < 0)
+		return;
+	if (c != 0x1b) {
+		out->kp_key = SH_K_CHAR;
+		out->kp_ch  = (char)c;
+		return;
+	}
+
+	c = read_byte();
+	if (c < 0)
+		return;
+	if (c != '[') {
+		out->kp_key = SH_K_ESC;
+		return;
+	}
+
+	/*
+	 * Parameters, then a final byte.  Only the first parameter is
+	 * kept: every sequence this keyboard emits has at most one, and a
+	 * consumer that needed more would be parsing a terminal reply
+	 * rather than a keypress.
+	 */
+	arg = 0;
+	for (;;) {
+		c = read_byte();
+		if (c < 0)
+			return;
+		if (c >= '0' && c <= '9') {
+			arg = arg * 10 + (c - '0');
+			continue;
+		}
+		break;
+	}
+
+	out->kp_key = SH_K_UNKNOWN;
+	switch (c) {
+	case 'A': out->kp_key = SH_K_UP;     break;
+	case 'B': out->kp_key = SH_K_DOWN;   break;
+	case 'C': out->kp_key = SH_K_RIGHT;  break;
+	case 'D': out->kp_key = SH_K_LEFT;   break;
+	case 'H': out->kp_key = SH_K_HOME;   break;
+	case 'F': out->kp_key = SH_K_END;    break;
+	case '~':
+		switch (arg) {
+		case 1: case 7: out->kp_key = SH_K_HOME;   break;
+		case 2:         out->kp_key = SH_K_INSERT; break;
+		case 3:         out->kp_key = SH_K_DELETE; break;
+		case 4: case 8: out->kp_key = SH_K_END;    break;
+		case 5:         out->kp_key = SH_K_PGUP;   break;
+		case 6:         out->kp_key = SH_K_PGDN;   break;
+		}
+		break;
+	}
+}
+
 /* ---- service-query helpers --------------------------------------- */
 
 /*
@@ -362,44 +472,88 @@ paint_splash(void)
 	puts("\n");
 }
 
-/* ---- echo helpers ------------------------------------------------- */
-
-static void
-echo_char(char c)
-{
-
-	putchar(c);
-}
-
-static void
-echo_backspace(void)
-{
-
-	/* \b moves cursor left, ' ' wipes the glyph, \b moves left again. */
-	puts("\b \b");
-}
+/* ---- the prompt, as bytes and as a width -------------------------- */
 
 /*
- * prompt: repaint the persistent status bar, then emit the prompt at
- * the cursor's current row.  On success the prompt is a plain bold-
- * white '$ '; on failure we prepend a subdued 'err N ' in light-red
- * (no brackets, no shouting) and then the same plain '$ '.  Closer to
- * how a modern shell surfaces $? than to a permanent status indicator.
+ * The prompt has to be two things at once now.
+ *
+ * It is a string to emit -- with the SGR sequences that colour it --
+ * and it is a number of columns, because the line editor repaints the
+ * whole line on every keystroke and then has to put the cursor back at
+ * a column it can only work out by counting.  The escape sequences are
+ * in the first and not in the second, which is exactly the distinction
+ * that gets lost when a prompt is just printed.
+ *
+ * On success it is a plain bold-white '$ '; on failure a subdued 'err N'
+ * in light red comes first (no brackets, no shouting) -- closer to how a
+ * modern shell surfaces $? than to a permanent status indicator.
  */
-static void
-prompt(void)
+#define	SH_PROMPT_MAX	64
+
+static char	sh_prompt[SH_PROMPT_MAX];
+static size_t	sh_prompt_cols;
+
+static size_t
+sh_append(char *dst, size_t off, size_t cap, const char *s)
 {
 
-	paint_status_bar();
-	puts("\n");
+	while (*s != '\0' && off + 1 < cap)
+		dst[off++] = *s++;
+	return (off);
+}
+
+static size_t
+sh_append_uint(char *dst, size_t off, size_t cap, unsigned v)
+{
+	char	tmp[12];
+	int	n;
+
+	n = 0;
+	if (v == 0)
+		tmp[n++] = '0';
+	while (v > 0 && n < (int)sizeof(tmp)) {
+		tmp[n++] = (char)('0' + (v % 10u));
+		v /= 10u;
+	}
+	while (n > 0 && off + 1 < cap)
+		dst[off++] = tmp[--n];
+	return (off);
+}
+
+static void
+prompt_build(void)
+{
+	size_t	off;
+	int	v;
+	int	digits;
+
+	off = 0;
+	sh_prompt_cols = 0;
 
 	if (last_status != 0) {
-		puts(ESC_FG_RED);
-		printf("err %d  ", last_status);
+		off = sh_append(sh_prompt, off, sizeof(sh_prompt), ESC_FG_RED);
+		off = sh_append(sh_prompt, off, sizeof(sh_prompt), "err ");
+		sh_prompt_cols += 4;
+		v = last_status;
+		if (v < 0) {
+			off = sh_append(sh_prompt, off, sizeof(sh_prompt), "-");
+			sh_prompt_cols++;
+			v = -v;
+		}
+		for (digits = 1; v >= 10; digits++)
+			v /= 10;
+		v = last_status < 0 ? -last_status : last_status;
+		off = sh_append_uint(sh_prompt, off, sizeof(sh_prompt),
+		    (unsigned)v);
+		sh_prompt_cols += (size_t)digits;
+		off = sh_append(sh_prompt, off, sizeof(sh_prompt), "  ");
+		sh_prompt_cols += 2;
 	}
-	puts(ESC_FG_WHITE);
-	puts("$ ");
-	puts(ESC_RESET);
+	off = sh_append(sh_prompt, off, sizeof(sh_prompt), ESC_FG_WHITE);
+	off = sh_append(sh_prompt, off, sizeof(sh_prompt), "$ ");
+	sh_prompt_cols += 2;
+	off = sh_append(sh_prompt, off, sizeof(sh_prompt), ESC_RESET);
+	sh_prompt[off] = '\0';
 }
 
 /* ---- argv tokenizer (in-place) ----------------------------------- */
@@ -648,8 +802,10 @@ builtin_about(void)
  *
  * Line metadata is cached up front: an array of (offset, length) tuples
  * per source line.  Capped at PAGER_MAX_LINES so a runaway input never
- * scribbles past the static buffers.  port.9 rendered is ~300 lines;
- * 4096 leaves ten-fold headroom.
+ * scribbles past the static buffers.  The longest page in docs/man is
+ * port.9 at 561 lines -- the comment here used to say ~300, which was
+ * wrong and would have made the cap look roomier than it is -- so 4096
+ * is a little over seven times the worst case.
  */
 
 #define	PAGER_MAX_LINES		4096
@@ -716,16 +872,16 @@ pager_repaint(const char *text, size_t total_lines, size_t top,
 static void
 pager_show(const char *text, size_t len, const char *title)
 {
-	size_t	max_top;
-	size_t	top;
-	size_t	total_lines;
-	int	act;
-	int	c;
-	int	csi_arg;
-	int	state;	/* 0 = normal, 1 = saw ESC, 2 = inside CSI */
+	struct sh_keypress	kp;
+	size_t			max_top;
+	size_t			top;
+	size_t			total_lines;
+	int			act;
+	int			quit;
 
 	if (text == NULL || len == 0)
 		return;
+	quit = 0;
 
 	total_lines = pager_index_lines(text, len);
 	if (total_lines == 0)
@@ -744,78 +900,74 @@ pager_show(const char *text, size_t len, const char *title)
 	max_top = total_lines > PAGER_SCREEN_ROWS ?
 	    total_lines - PAGER_SCREEN_ROWS : 0;
 	top      = 0;
-	state    = 0;
-	csi_arg  = 0;
 
 	pager_repaint(text, total_lines, top, title);
 
-	for (;;) {
-		c = read_byte();
-		if (c < 0)
+	while (!quit) {
+		read_key(&kp);
+		if (kp.kp_key == SH_K_EOF || kp.kp_key == SH_K_ESC)
 			break;
 
-		act = 0;
-
-		if (state == 0) {
-			if (c == 0x1b) {
-				state = 1;
-				continue;
-			}
-			if (c == 'q')
+		act = 1;
+		switch (kp.kp_key) {
+		case SH_K_DOWN:
+			top++;
+			break;
+		case SH_K_UP:
+			if (top > 0)
+				top--;
+			break;
+		case SH_K_PGDN:
+			top += PAGER_SCREEN_ROWS;
+			break;
+		case SH_K_PGUP:
+			top = top >= PAGER_SCREEN_ROWS ?
+			    top - PAGER_SCREEN_ROWS : 0;
+			break;
+		case SH_K_HOME:
+			top = 0;
+			break;
+		case SH_K_END:
+			top = max_top;
+			break;
+		case SH_K_CHAR:
+			switch (kp.kp_ch) {
+			case 'q':
+				quit = 1;
+				act  = 0;
 				break;
-			if (c == ' ' || c == 0x06) {
+			case ' ':
+			case 0x06:	/* ^F */
 				top += PAGER_SCREEN_ROWS;
-				act = 1;
-			} else if (c == 'b' || c == 0x02) {
+				break;
+			case 'b':
+			case 0x02:	/* ^B */
 				top = top >= PAGER_SCREEN_ROWS ?
 				    top - PAGER_SCREEN_ROWS : 0;
-				act = 1;
-			} else if (c == 'j' || c == '\n' || c == '\r') {
+				break;
+			case 'j':
+			case '\n':
+			case '\r':
 				top++;
-				act = 1;
-			} else if (c == 'k') {
+				break;
+			case 'k':
 				if (top > 0)
 					top--;
-				act = 1;
-			} else if (c == 'g') {
+				break;
+			case 'g':
 				top = 0;
-				act = 1;
-			} else if (c == 'G') {
-				top = max_top;
-				act = 1;
-			}
-		} else if (state == 1) {
-			if (c == '[') {
-				state   = 2;
-				csi_arg = 0;
-				continue;
-			}
-			/* bare ESC followed by anything (incl. ESC) quits */
-			if (c == 0x1b)
 				break;
-			state = 0;
-			continue;
-		} else {
-			if (c >= '0' && c <= '9') {
-				csi_arg = csi_arg * 10 + (c - '0');
-				continue;
+			case 'G':
+				top = max_top;
+				break;
+			default:
+				act = 0;
+				break;
 			}
-			state = 0;
-			if (c == 'A') {
-				if (top > 0)
-					top--;
-				act = 1;
-			} else if (c == 'B') {
-				top++;
-				act = 1;
-			} else if (c == '~' && csi_arg == 5) {
-				top = top >= PAGER_SCREEN_ROWS ?
-				    top - PAGER_SCREEN_ROWS : 0;
-				act = 1;
-			} else if (c == '~' && csi_arg == 6) {
-				top += PAGER_SCREEN_ROWS;
-				act = 1;
-			}
+			break;
+		default:
+			act = 0;
+			break;
 		}
 
 		if (act) {
@@ -1136,70 +1288,373 @@ dispatch(int argc, char *argv[])
 
 /* ---- line editor ------------------------------------------------- */
 
+/*
+ * The line being typed, and where in it the cursor is.
+ *
+ * The old editor had only a length: characters went on the end,
+ * backspace took one off the end, and there was nowhere else to be.
+ * Every editing key the keyboard sends -- and it has been sending all
+ * of them -- either did nothing or typed its own escape sequence into
+ * the buffer.
+ *
+ * With a position, editing is ordinary insert-and-delete at a point,
+ * and the only real work is drawing: the line is repainted whole on
+ * every keystroke rather than patched incrementally, which is what
+ * makes an insert in the middle cost the same code as an append.  One
+ * write(2) per keystroke, and the terminal programs its cursor once for
+ * it -- so the repaint is cheaper than the character-at-a-time echo it
+ * replaces, which cost one write per byte.
+ */
+struct sh_line {
+	char	l_buf[SH_LINE_MAX];
+	size_t	l_len;
+	size_t	l_pos;
+};
+
+/*
+ * The console is eighty columns and says so in dev/tty.h; there is no
+ * window-size ioctl to ask, and inventing one to tell the shell a
+ * constant would be ceremony.  When a resizable terminal exists this
+ * becomes a query.
+ */
+#define	SH_COLS		80
+
+/*
+ * History.  A plain array, oldest first, that shifts when it fills --
+ * sixteen entries is more than a session of this shell holds and the
+ * shift costs a memmove of something nobody is waiting on.
+ */
+#define	SH_HIST_MAX	16
+
+static char	sh_hist[SH_HIST_MAX][SH_LINE_MAX];
+static int	sh_hist_n;
+
+static void
+line_clear(struct sh_line *ln)
+{
+
+	ln->l_len = 0;
+	ln->l_pos = 0;
+	ln->l_buf[0] = '\0';
+}
+
+static void
+line_set(struct sh_line *ln, const char *s)
+{
+	size_t	i;
+
+	for (i = 0; i + 1 < SH_LINE_MAX && s[i] != '\0'; i++)
+		ln->l_buf[i] = s[i];
+	ln->l_buf[i] = '\0';
+	ln->l_len = i;
+	ln->l_pos = i;
+}
+
+/*
+ * Repaint the line.
+ *
+ * The window slides so the cursor is always on screen: a line longer
+ * than the terminal scrolls sideways rather than wrapping, because a
+ * wrapped line cannot be repainted from a single carriage return and
+ * every edit would leave the rows below it wrong.  This is the same
+ * trick every one-line editor uses, and it is why the buffer may be
+ * 256 bytes on an 80-column screen without the two numbers having to
+ * agree.
+ */
+static void
+line_refresh(struct sh_line *ln)
+{
+	char	out[SH_LINE_MAX + 64];
+	size_t	off;
+	size_t	start;
+	size_t	shown;
+	size_t	at;
+	size_t	i;
+
+	start = 0;
+	shown = ln->l_len;
+	at    = ln->l_pos;
+
+	while (sh_prompt_cols + at >= SH_COLS) {
+		start++;
+		shown--;
+		at--;
+	}
+	while (sh_prompt_cols + shown > SH_COLS)
+		shown--;
+
+	off = 0;
+	out[off++] = '\r';
+	off = sh_append(out, off, sizeof(out), sh_prompt);
+	for (i = 0; i < shown && off + 1 < sizeof(out); i++)
+		out[off++] = ln->l_buf[start + i];
+	off = sh_append(out, off, sizeof(out), "\x1b[K");
+	if (off + 1 < sizeof(out))
+		out[off++] = '\r';
+	if (sh_prompt_cols + at > 0) {
+		off = sh_append(out, off, sizeof(out), "\x1b[");
+		off = sh_append_uint(out, off, sizeof(out),
+		    (unsigned)(sh_prompt_cols + at));
+		if (off + 1 < sizeof(out))
+			out[off++] = 'C';
+	}
+	(void)write(out, off);
+}
+
+/*
+ * A fresh prompt: refresh the chrome, leave a blank row, then draw an
+ * empty line.  The prompt is emitted BY line_refresh rather than
+ * printed here, so there is exactly one piece of code that knows where
+ * the text of a line begins.
+ */
+static void
+prompt(void)
+{
+	struct sh_line	empty;
+
+	paint_status_bar();
+	puts("\n");
+	prompt_build();
+	line_clear(&empty);
+	line_refresh(&empty);
+}
+
+static void
+line_insert(struct sh_line *ln, char c)
+{
+	size_t	i;
+
+	if (ln->l_len + 1 >= SH_LINE_MAX)
+		return;
+	for (i = ln->l_len; i > ln->l_pos; i--)
+		ln->l_buf[i] = ln->l_buf[i - 1];
+	ln->l_buf[ln->l_pos] = c;
+	ln->l_len++;
+	ln->l_pos++;
+	ln->l_buf[ln->l_len] = '\0';
+}
+
+/* Remove the character AT the cursor -- Delete, and Ctrl-D mid-line. */
+static void
+line_delete(struct sh_line *ln)
+{
+	size_t	i;
+
+	if (ln->l_pos >= ln->l_len)
+		return;
+	for (i = ln->l_pos; i + 1 <= ln->l_len; i++)
+		ln->l_buf[i] = ln->l_buf[i + 1];
+	ln->l_len--;
+}
+
+/* Remove the character BEFORE the cursor -- Backspace. */
+static void
+line_erase(struct sh_line *ln)
+{
+
+	if (ln->l_pos == 0)
+		return;
+	ln->l_pos--;
+	line_delete(ln);
+}
+
+/* Ctrl-W: back over any blanks, then back over the word behind them. */
+static void
+line_erase_word(struct sh_line *ln)
+{
+
+	while (ln->l_pos > 0 && is_blank(ln->l_buf[ln->l_pos - 1]))
+		line_erase(ln);
+	while (ln->l_pos > 0 && !is_blank(ln->l_buf[ln->l_pos - 1]))
+		line_erase(ln);
+}
+
+static void
+hist_add(const char *s)
+{
+	int	i;
+
+	if (s[0] == '\0')
+		return;
+	if (sh_hist_n > 0 && streq(sh_hist[sh_hist_n - 1], s))
+		return;	/* the same command twice is one thing to recall */
+
+	if (sh_hist_n == SH_HIST_MAX) {
+		for (i = 0; i + 1 < SH_HIST_MAX; i++) {
+			size_t	j;
+
+			for (j = 0; j < SH_LINE_MAX; j++)
+				sh_hist[i][j] = sh_hist[i + 1][j];
+		}
+		sh_hist_n--;
+	}
+	for (i = 0; i + 1 < (int)SH_LINE_MAX && s[i] != '\0'; i++)
+		sh_hist[sh_hist_n][i] = s[i];
+	sh_hist[sh_hist_n][i] = '\0';
+	sh_hist_n++;
+}
+
 static void
 repl(void)
 {
-	char	*argv[SH_ARGC_MAX];
-	char	 line[SH_LINE_MAX];
-	size_t	 len;
-	int	 argc;
-	int	 c;
+	struct sh_keypress	kp;
+	struct sh_line		ln;
+	char			 pending[SH_LINE_MAX];
+	char			*argv[SH_ARGC_MAX];
+	int			 argc;
+	int			 browse;	/* -1 = editing the live line */
 
-	len = 0;
+	line_clear(&ln);
+	browse = -1;
+	pending[0] = '\0';
 	prompt();
 
 	for (;;) {
-		c = read_byte();
-		if (c < 0) {
+		read_key(&kp);
+
+		switch (kp.kp_key) {
+		case SH_K_EOF:
 			puts(ESC_FG_RED);
 			puts("sh: read failed, exiting\n");
 			puts(ESC_RESET);
 			return;
-		}
 
-		if (c == '\r' || c == '\n') {
-			putchar('\n');
-			line[len] = '\0';
-			argc = split_argv(line, argv, SH_ARGC_MAX);
-			if (argc > 0)
-				last_status = dispatch(argc, argv);
-			len = 0;
-			prompt();
-			continue;
-		}
+		case SH_K_LEFT:
+			if (ln.l_pos > 0)
+				ln.l_pos--;
+			break;
+		case SH_K_RIGHT:
+			if (ln.l_pos < ln.l_len)
+				ln.l_pos++;
+			break;
+		case SH_K_HOME:
+			ln.l_pos = 0;
+			break;
+		case SH_K_END:
+			ln.l_pos = ln.l_len;
+			break;
+		case SH_K_DELETE:
+			line_delete(&ln);
+			break;
 
-		if (c == 0x08 || c == 0x7F) {
-			if (len > 0) {
-				len--;
-				echo_backspace();
+		case SH_K_UP:
+			/*
+			 * Stepping off the live line saves it, so walking
+			 * back down to the bottom returns what was being
+			 * typed rather than an empty prompt.
+			 */
+			if (browse + 1 < sh_hist_n) {
+				if (browse < 0) {
+					size_t	i;
+
+					for (i = 0; i <= ln.l_len; i++)
+						pending[i] = ln.l_buf[i];
+				}
+				browse++;
+				line_set(&ln, sh_hist[sh_hist_n - 1 - browse]);
 			}
-			continue;
+			break;
+		case SH_K_DOWN:
+			if (browse >= 0) {
+				browse--;
+				if (browse < 0)
+					line_set(&ln, pending);
+				else
+					line_set(&ln,
+					    sh_hist[sh_hist_n - 1 - browse]);
+			}
+			break;
+
+		case SH_K_CHAR:
+			switch (kp.kp_ch) {
+			case '\r':
+			case '\n':
+				puts("\n");
+				ln.l_buf[ln.l_len] = '\0';
+				hist_add(ln.l_buf);
+				argc = split_argv(ln.l_buf, argv,
+				    SH_ARGC_MAX);
+				if (argc > 0)
+					last_status = dispatch(argc, argv);
+				line_clear(&ln);
+				browse = -1;
+				pending[0] = '\0';
+				prompt();
+				continue;
+
+			case 0x08:	/* Backspace */
+			case 0x7F:
+				line_erase(&ln);
+				break;
+
+			case 0x01:	/* ^A */
+				ln.l_pos = 0;
+				break;
+			case 0x05:	/* ^E */
+				ln.l_pos = ln.l_len;
+				break;
+			case 0x02:	/* ^B */
+				if (ln.l_pos > 0)
+					ln.l_pos--;
+				break;
+			case 0x06:	/* ^F */
+				if (ln.l_pos < ln.l_len)
+					ln.l_pos++;
+				break;
+			case 0x04:	/* ^D -- delete, never exit */
+				line_delete(&ln);
+				break;
+			case 0x0B:	/* ^K -- kill to end of line */
+				ln.l_len = ln.l_pos;
+				ln.l_buf[ln.l_len] = '\0';
+				break;
+			case 0x15:	/* ^U -- kill to start of line */
+				while (ln.l_pos > 0)
+					line_erase(&ln);
+				break;
+			case 0x17:	/* ^W -- kill the word behind */
+				line_erase_word(&ln);
+				break;
+			case 0x0C:	/* ^L -- clear and start again */
+				builtin_clear();
+				prompt();
+				continue;
+
+			/*
+			 * Ctrl-C at the prompt with no foreground job:
+			 * abandon the line and reprint.  wait_child's ^C
+			 * path cannot be reached in this window, since
+			 * dispatch has not been called yet.
+			 */
+			case 0x03:
+				puts(ESC_FG_RED);
+				puts("^C\n");
+				puts(ESC_RESET);
+				line_clear(&ln);
+				browse = -1;
+				pending[0] = '\0';
+				prompt();
+				continue;
+
+			default:
+				if ((unsigned char)kp.kp_ch >= 0x20 &&
+				    (unsigned char)kp.kp_ch <= 0x7E)
+					line_insert(&ln, kp.kp_ch);
+				break;
+			}
+			break;
+
+		default:
+			/*
+			 * A key with no meaning here -- Insert, a page
+			 * key, an escape.  Dropped, and pointedly NOT
+			 * echoed: typing its bytes into the command line
+			 * is the bug this editor was written to fix.
+			 */
+			break;
 		}
 
-		/*
-		 * Ctrl-C at the prompt with no foreground job: abandon
-		 * the current line + reprint.  Standard interactive-shell
-		 * behavior; we never reach wait_child's ^C path in this
-		 * window since dispatch hasn't been called yet.
-		 */
-		if (c == 0x03) {
-			puts(ESC_FG_RED);
-			puts("^C\n");
-			puts(ESC_RESET);
-			len = 0;
-			prompt();
-			continue;
-		}
-
-		/* drop non-printables; tabs/CSI are not yet plumbed */
-		if (c < 0x20 || c > 0x7E)
-			continue;
-
-		if (len + 1 >= SH_LINE_MAX)
-			continue;	/* full -- backspace and retry */
-
-		line[len++] = (char)c;
-		echo_char((char)c);
+		line_refresh(&ln);
 	}
 }
 

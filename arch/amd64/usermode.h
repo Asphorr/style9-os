@@ -27,7 +27,32 @@
  */
 
 #define	USER_CODE_VA	0x40000000ULL	/* just past the 1 GiB boot map */
-#define	USER_STACK_VA	0x4000F000ULL	/* high in the first user page run */
+
+/*
+ * The initial user stack, and the ceiling it puts over a program's
+ * image.
+ *
+ * This was 0x4000F000, which left a native program sixty kilobytes for
+ * text, rodata, data and bss together -- and nothing said so.  sh.elf
+ * grew into it: its .bss ended 432 bytes past the stack page, the
+ * loader's vm_map_enter for the stack found the range already taken,
+ * and the boot died in
+ *
+ *	*** kernel panic: usermode_elf_launcher: setup_image sh rv=-4
+ *
+ * which names neither the section that overflowed nor the address it
+ * ran into.  The shell had been within 3.5 KiB of that cliff for some
+ * time with no warning anywhere.
+ *
+ * A ring-3 stack address is just a number, so the ceiling is now
+ * sixteen megabytes rather than sixty kilobytes -- still inside the
+ * user window [0x40000000, 0x80000000) and still far below the Darwin
+ * main image at 0x50000000 and the stack that grows down from it.
+ * user/user.ld asserts the image ends below this, so the next program
+ * to outgrow it gets a link error naming the number instead of a panic
+ * in the middle of boot.
+ */
+#define	USER_STACK_VA	0x40FFF000ULL
 #define	USER_STACK_TOP	(USER_STACK_VA + 0x1000ULL)
 
 /*

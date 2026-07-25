@@ -43,5 +43,23 @@ SECTIONS {
 		*(COMMON)
 	}
 
+	/*
+	 * The initial user stack sits at USER_STACK_VA (arch/amd64/usermode.h)
+	 * and the loader maps it after the image, so an image whose .bss runs
+	 * past that address collides with its own stack.  When that happened
+	 * the symptom was
+	 *
+	 *	*** kernel panic: usermode_elf_launcher: setup_image sh rv=-4
+	 *
+	 * midway through boot, naming neither the section that overflowed nor
+	 * the address it hit.  Here it is a link error that names both.
+	 *
+	 * The constant is duplicated from the header because a linker script
+	 * cannot include one; it is checked by this assert firing, which is
+	 * the only way it can be wrong and go unnoticed.
+	 */
+	ASSERT(. <= 0x40FFF000,
+	    "user image overruns the initial stack at USER_STACK_VA 0x40FFF000 -- shrink it or move the stack (arch/amd64/usermode.h)")
+
 	/DISCARD/ : { *(.note.*) *(.comment) *(.eh_frame) }
 }
