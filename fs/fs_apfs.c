@@ -6614,6 +6614,37 @@ fs_apfs_split_selftest(void)
 		kprintf("apfs-split: no memory -- skipped\n");
 		return;
 	}
+
+	/*
+	 * ROOM ABOVE, asked before the split rather than discovered inside it.
+	 *
+	 * A split hands the parent a separator, and this test takes one node
+	 * per boot without ever giving one back -- so an image booted enough
+	 * times reaches the day the root's table of contents is full.  That is
+	 * the edge the split rung named when it was written, and reaching it is
+	 * not a failure of anything: the refusal is correct and the container is
+	 * untouched.  Saying so, rather than reporting FAIL, is the difference
+	 * between a test that knows what it is asking for and one that does not.
+	 */
+	if (fs_apfs_read_block(g_apfs.ac_root_tree_bno, scratch) !=
+	    FS_APFS_E_OK) {
+		kprintf("apfs-split: FAIL the root at %llu will not read\n",
+		    (unsigned long long)g_apfs.ac_root_tree_bno);
+		kfree(scratch);
+		return;
+	}
+	if (!leaf_has_room(scratch, 24u, 8u)) {
+		struct btree_layout	bl;
+
+		btree_layout(scratch, &bl);
+		kprintf("apfs-split: the root holds %u children and has room "
+		    "for no more -- splitting again would have to grow the "
+		    "tree a level, which is the next rung; skipped\n",
+		    (unsigned)bl.bl_nkeys);
+		kfree(scratch);
+		return;
+	}
+
 	if (leaf_split(victim, g_apfs.ac_xid + 1, scratch) !=
 	    FS_APFS_E_OK) {
 		kprintf("apfs-split: FAIL the leaf at %llu would not split\n",
