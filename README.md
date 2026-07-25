@@ -74,8 +74,8 @@ file moving between them changes no `#include` anywhere.
 | kbd drv | `dev/kbd_drv.c` | bridges the PS/2 IRQ ring to a stream port; sh.elf opens `dev/kbd` and recv's keypresses one at a time |
 | uart drv | `dev/uart_drv.c` | COM1 RX IRQ to a stream port via the same `dev/uart` protocol |
 | ata drv | `dev/ata_drv.c` | LBA28+LBA48 ATA PIO driver, exposed as `dev/disk0` -- block device handle, no filesystem yet |
-| tty | `dev/tty.c` | VT-style ANSI CSI state machine over the VGA console; sh.elf drives the manpage TUI through it |
-| user shell | `user/sh.c` | sh.elf, the ring-3 shell.  Apple/BSD-flavoured manpage TUI: NAME/SYSTEM/SEE ALSO sections, gray-on-black with bold-white labels, horizontal rule, fixed status bar with uptime.  Builtins: `help / echo / clear / about / ool`.  Spawnable: any registered user program |
+| tty | `dev/tty.c` | VT-style ANSI CSI state machine over the VGA console: CUP/CUU-CUB/ED/EL/SGR, DECSTBM scrolling region, DECTCEM cursor visibility, DEC's deferred wrap (a line exactly 80 columns wide costs one row, not two), and a hardware CRTC cursor programmed once per write rather than once per byte.  Three boot selftests read the CRTC and the cell grid back rather than asking the driver what it believes |
+| user shell | `user/sh.c` | sh.elf, the ring-3 shell.  Apple/BSD-flavoured manpage TUI: NAME/SYSTEM/SEE ALSO sections, gray-on-black with bold-white labels, horizontal rule, and a status bar with uptime that lives above the scrolling region so no amount of output can carry it away.  Full line editor (arrows, Home/End, Delete, emacs control keys, 16 lines of history, Tab completion) and a less(1)-shaped pager for `man`.  Builtins: `help / echo / clear / about / ool / man / kill`.  Spawnable: any program in the registry, listed via `svc/progreg` |
 | user demos | `user/hello.c`, `user/clock.c`, `user/tasks.c` | ring-3 exercises: port self-send + round-trip, recv_timed, task_self RPC, bootstrap_lookup chain, OOL round-trip via svc/echool, clock service consumer, task list service consumer |
 | legacy shell | `kern/shell.c`, `kern/cmds.c` | kernel-side interactive shell kept as fallback if sh.elf fails to spawn; same commands surface for ddb-style introspection |
 
@@ -180,37 +180,51 @@ svc/echool) so headless boots validate the userspace surface too.
 ## Shell
 
 After the boot pass + the `hello.elf` ring-3 smoke run, you land in
-sh.elf -- a ring-3 shell in an Apple/BSD-flavoured manpage TUI:
+sh.elf -- a ring-3 shell in an Apple/BSD-flavoured manpage TUI.  The
+status row and the rule under it sit above a DECSTBM scrolling region,
+so they stay where they are while everything below them scrolls:
 
 ```
+ style9-os(9)                                                          00:00:04
+ ──────────────────────────────────────────────────────────────────────────────
+
   NAME           style9-os -- BSD-flavoured x86_64 kernel with Mach IPC
 
   SYSTEM         arch     x86_64
-                 ram      1704 / 130944 KiB
-                 tasks    2 live
+                 ram      4072 / 130944 KiB
+                 tasks    4 live
                  shell    sh.elf
 
   SEE ALSO       style(9), help(1)
+
  ──────────────────────────────────────────────────────────────────────────────
- style9-os(9)                                                          00:00:04
- ──────────────────────────────────────────────────────────────────────────────
+
 $
 ```
 
 Builtins:
 
 ```
-help                    list commands + spawnable programs
+help                    list commands + every program in the registry
 echo                    print arguments
 clear                   erase + repaint splash
 about                   version banner + live counters
 ool                     OOL Mach IPC round-trip via svc/echool
+man                     render a docs/man page through the built-in pager
+kill                    terminate a child of this shell by task_id
 ```
 
-Anything else is a `SYS_SPAWN` -- registered programs `hello`, `clock`,
-`tasks` are reachable by name.  `clock` and `tasks` themselves are ring-3
-consumers of `svc/clock` and `svc/tasks` (registered kernel services
-reachable via `bootstrap_lookup`).
+Anything else is a `SYS_SPAWN`.  `help` gets its list from `svc/progreg`
+rather than a hard-coded array, so a program added to `kern/progreg.c`
+appears without the shell being touched.  `clock` and `tasks` themselves
+are ring-3 consumers of `svc/clock` and `svc/tasks` (registered kernel
+services reachable via `bootstrap_lookup`).
+
+Line editing is whatever the keyboard already sends: arrows, Home, End,
+Delete, `^A ^B ^E ^F ^D ^K ^U ^W ^L`, insertion anywhere in the line,
+sixteen entries of history on Up/Down, and Tab completion across the
+builtins and the registry.  A line longer than the screen scrolls
+sideways instead of wrapping.
 
 The legacy `kern/shell.c` stays in the tree as a fallback for the case
 where sh.elf fails to spawn -- it has the full ddb-style introspection
