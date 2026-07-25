@@ -177,6 +177,20 @@ _start:
 
 	movl	%cr0, %eax
 	orl	$0x80000000, %eax		/* CR0.PG */
+	orl	$0x00010000, %eax		/* CR0.WP -- ring 0 obeys the */
+						/* read-only bit too.  Off at */
+						/* reset, and while it is off */
+						/* a read-only page is only   */
+						/* read-only to ring 3: any   */
+						/* kernel store through that  */
+						/* same VA lands silently.    */
+						/* Nothing above can build a  */
+						/* shared page it protects by */
+						/* clearing W -- copy-on-write*/
+						/* first of all -- until the  */
+						/* hardware enforces it for   */
+						/* the side that does the     */
+						/* copying.                   */
 	movl	%eax, %cr0
 
 	lgdt	boot_gdtr

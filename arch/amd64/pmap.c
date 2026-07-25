@@ -46,6 +46,13 @@
 #define	PTE_PA_MASK		((uint64_t)0x000FFFFFFFFFF000)
 
 /*
+ * Write-protect: when set, a supervisor-mode store to a page whose PTE has
+ * RW clear takes a #PF instead of succeeding.  Clear at reset; boot.S turns
+ * it on beside CR0.PG.
+ */
+#define	CR0_WP			((uint64_t)1 << 16)
+
+/*
  * Per-pmap state.  Lock key:
  *	(c) const after pmap_create / pmap_bootstrap
  *	(p) protected by pm_lock
@@ -111,6 +118,7 @@ pt_idx(uint64_t va)
 void
 pmap_bootstrap(void)
 {
+	uint64_t	cr0;
 	uint64_t	cr3;
 
 	__asm__ __volatile__ ("mov %%cr3, %0" : "=r"(cr3));
@@ -120,7 +128,19 @@ pmap_bootstrap(void)
 	kernel_pmap->pm_intermediates = 0;
 	kernel_pmap->pm_leafs         = 0;
 
-	kprintf("pmap: kernel CR3 = 0x%llx (PML4 at %p)\n",
+	/*
+	 * boot.S sets CR0.WP, and everything this file promises about a
+	 * read-only mapping depends on it: with WP clear the read-only bit
+	 * binds ring 3 only, and a kernel store through the same VA goes
+	 * through without a fault.  Assert it here rather than trust the
+	 * assembly, because the failure mode is not a crash -- it is a write
+	 * that quietly lands in a page somebody else is also using.
+	 */
+	__asm__ __volatile__ ("mov %%cr0, %0" : "=r"(cr0));
+	KASSERT((cr0 & CR0_WP) != 0,
+	    "pmap_bootstrap: CR0.WP is clear -- ring 0 ignores read-only");
+
+	kprintf("pmap: kernel CR3 = 0x%llx (PML4 at %p), CR0.WP on\n",
 	    (unsigned long long)kernel_pmap->pm_pml4_pa,
 	    (void *)kernel_pmap->pm_pml4);
 }
