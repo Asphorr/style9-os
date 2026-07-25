@@ -12,6 +12,7 @@
 #include "ata_drv.h"
 #include "bio.h"
 #include "fs_apfs.h"
+#include "fs_txn.h"
 #include "kmem.h"
 #include "kprintf.h"
 
@@ -158,8 +159,8 @@ write_block_raw(uint64_t bno, const void *buf)
  * of its own input; getting that backwards produces a block that fails its
  * own checksum on the very next read, which is at least a loud failure.
  */
-static int
-write_block_meta(uint64_t bno, void *buf)
+int
+fs_apfs_write_block(uint64_t bno, void *buf)
 {
 	struct apfs_obj_phys	*o;
 
@@ -1332,6 +1333,7 @@ fs_apfs_touch(uint64_t oid, uint64_t mtime_ns)
 {
 	struct btree_layout	 bl;
 	struct inode_locate	 il;
+	struct fs_txn		 txn;
 	struct apfs_inode_val	*iv;
 	uint8_t			*node;
 	const uint8_t		*k;
@@ -1353,18 +1355,18 @@ fs_apfs_touch(uint64_t oid, uint64_t mtime_ns)
 	if (!il.il_found)
 		return (FS_APFS_E_NOTFOUND);
 
-	node = kmalloc(APFS_BLOCK_SIZE);
-	if (node == NULL)
-		return (FS_APFS_E_NOMEM);
 	/*
-	 * Read it the checked way.  Writing over a block that already fails
-	 * its own checksum would turn someone else's corruption into ours, and
-	 * do it while producing a block that looks freshly correct.
+	 * Through a transaction, though this one changes a single block.  The
+	 * point is that the read-verify, the sealing and the write stop being
+	 * three things this function remembers to do in the right order and
+	 * become one thing it asks for -- which is what the multi-block
+	 * operations of the next rung need, and what this one can prove works
+	 * while the stakes are one inode timestamp.
 	 */
-	rv = fs_apfs_read_block(il.il_bno, node);
-	if (rv != FS_APFS_E_OK) {
-		kfree(node);
-		return (rv);
+	fs_txn_begin(&txn);
+	if (fs_txn_get(&txn, il.il_bno, (void **)&node) != FS_TXN_E_OK) {
+		fs_txn_abort(&txn);
+		return (FS_APFS_E_IO);
 	}
 
 	/*
@@ -1392,11 +1394,17 @@ fs_apfs_touch(uint64_t oid, uint64_t mtime_ns)
 		iv = (struct apfs_inode_val *)(bl.bl_vals - voff);
 		iv->ai_mod_time    = mtime_ns;
 		iv->ai_change_time = mtime_ns;
-		rv = write_block_meta(il.il_bno, node);
+		fs_txn_dirty(&txn, il.il_bno);
+		rv = FS_APFS_E_OK;
 		break;
 	}
-	kfree(node);
-	return (rv);
+	if (rv != FS_APFS_E_OK) {
+		fs_txn_abort(&txn);	/* nothing was written */
+		return (rv);
+	}
+	if (fs_txn_commit(&txn) != FS_TXN_E_OK)
+		return (FS_APFS_E_IO);
+	return (FS_APFS_E_OK);
 }
 
 struct readdir_search {

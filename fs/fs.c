@@ -13,6 +13,34 @@
 #include "fs_apfs.h"
 #include "fs_fat.h"
 #include "kprintf.h"
+#include "mutex.h"
+
+/*
+ * One lock for the volume, and it lives here rather than in either backend.
+ *
+ * This is the only door: every caller outside fs/ reaches a filesystem
+ * through the functions below, so a lock here covers both backends and any
+ * later one, and lets each backend stay written as straight-line code.
+ *
+ * Until writing existed there was nothing to serialise.  The APFS reader
+ * fills its volume state at mount and never touches it again -- the struct
+ * says so, every field marked (m) -- so concurrent readers shared only
+ * immutable data and the block cache, which has always had its own lock.
+ * Writing ends that: two writers can now target the same block, and a reader
+ * can now observe a block mid-write, since a 4 KiB APFS block is eight ATA
+ * sectors and the drive is under no obligation to make them appear at once.
+ *
+ * It is a mutex and not a spinlock because every one of these calls reaches
+ * the disk, and reaching the disk sleeps.  See kern/mutex.h for why that
+ * distinction is not optional in this kernel.
+ *
+ * Held for the whole of an operation, including a slurp that may read
+ * megabytes.  That is a deliberate choice of correctness over concurrency
+ * while there is one disk and one lock: the alternative is per-file or
+ * per-range locking, which is worth building when there is evidence of
+ * contention rather than in anticipation of it.
+ */
+static struct mutex	fs_lock = MUTEX_INIT("fs");
 
 /*
  * Picking a backend.  See fs.h for what this is and is not.
@@ -98,8 +126,15 @@ fs_kind(void)
 	return ("none");
 }
 
-int
-fs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size)
+/*
+ * Each operation is written once, as a _locked body, and wrapped.  Wrapping
+ * rather than sprinkling lock/unlock through the bodies is what keeps an
+ * early return from leaking the lock -- several of these have four or five
+ * exits, and the one that forgets is the one nobody finds.
+ */
+
+static int
+slurp_locked(const char *path, uint8_t **out_buf, uint32_t *out_size)
 {
 
 	if (fs_apfs_ready())
@@ -110,7 +145,18 @@ fs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size)
 }
 
 int
-fs_open(const char *path, struct fs_handle *out)
+fs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size)
+{
+	int	rv;
+
+	mutex_lock(&fs_lock);
+	rv = slurp_locked(path, out_buf, out_size);
+	mutex_unlock(&fs_lock);
+	return (rv);
+}
+
+static int
+open_locked(const char *path, struct fs_handle *out)
 {
 	uint64_t	id;
 	uint64_t	size;
@@ -144,8 +190,19 @@ fs_open(const char *path, struct fs_handle *out)
 }
 
 int
-fs_pread(const struct fs_handle *h, uint64_t off, uint8_t *buf, uint32_t len,
-    uint32_t *out_got)
+fs_open(const char *path, struct fs_handle *out)
+{
+	int	rv;
+
+	mutex_lock(&fs_lock);
+	rv = open_locked(path, out);
+	mutex_unlock(&fs_lock);
+	return (rv);
+}
+
+static int
+pread_locked(const struct fs_handle *h, uint64_t off, uint8_t *buf,
+    uint32_t len, uint32_t *out_got)
 {
 
 	if (h == NULL || out_got == NULL)
@@ -163,7 +220,19 @@ fs_pread(const struct fs_handle *h, uint64_t off, uint8_t *buf, uint32_t len,
 }
 
 int
-fs_pwrite(const struct fs_handle *h, uint64_t off, const uint8_t *buf,
+fs_pread(const struct fs_handle *h, uint64_t off, uint8_t *buf, uint32_t len,
+    uint32_t *out_got)
+{
+	int	rv;
+
+	mutex_lock(&fs_lock);
+	rv = pread_locked(h, off, buf, len, out_got);
+	mutex_unlock(&fs_lock);
+	return (rv);
+}
+
+static int
+pwrite_locked(const struct fs_handle *h, uint64_t off, const uint8_t *buf,
     uint32_t len, uint32_t *out_put)
 {
 	uint64_t	now_ns;
@@ -194,7 +263,25 @@ fs_pwrite(const struct fs_handle *h, uint64_t off, const uint8_t *buf,
 }
 
 int
-fs_stat(const char *path, struct fs_statbuf *out)
+fs_pwrite(const struct fs_handle *h, uint64_t off, const uint8_t *buf,
+    uint32_t len, uint32_t *out_put)
+{
+	int	rv;
+
+	/*
+	 * One acquisition covers the bytes AND the timestamp.  They are two
+	 * disk updates describing one event, and a reader that got between
+	 * them would see a file whose contents had changed and whose recorded
+	 * modification time had not.
+	 */
+	mutex_lock(&fs_lock);
+	rv = pwrite_locked(h, off, buf, len, out_put);
+	mutex_unlock(&fs_lock);
+	return (rv);
+}
+
+static int
+stat_locked(const char *path, struct fs_statbuf *out)
 {
 	struct fs_apfs_statbuf	asb;
 	struct fs_fat_statbuf	fsb;
@@ -245,7 +332,18 @@ fs_stat(const char *path, struct fs_statbuf *out)
 }
 
 int
-fs_readdir(const char *path, uint32_t index, struct fs_dirent *out)
+fs_stat(const char *path, struct fs_statbuf *out)
+{
+	int	rv;
+
+	mutex_lock(&fs_lock);
+	rv = stat_locked(path, out);
+	mutex_unlock(&fs_lock);
+	return (rv);
+}
+
+static int
+readdir_locked(const char *path, uint32_t index, struct fs_dirent *out)
 {
 	struct fs_apfs_dirent	ade;
 	struct fs_fat_dirent	fde;
@@ -272,6 +370,17 @@ fs_readdir(const char *path, uint32_t index, struct fs_dirent *out)
 		return (1);
 	}
 	return (FS_E_NOMOUNT);
+}
+
+int
+fs_readdir(const char *path, uint32_t index, struct fs_dirent *out)
+{
+	int	rv;
+
+	mutex_lock(&fs_lock);
+	rv = readdir_locked(path, index, out);
+	mutex_unlock(&fs_lock);
+	return (rv);
 }
 
 /* ---- write self-test ------------------------------------------------------ */

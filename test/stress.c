@@ -12,6 +12,7 @@
 #include "clock.h"
 #include "kmem.h"
 #include "kprintf.h"
+#include "mutex.h"
 #include "pit.h"
 #include "pmm.h"
 #include "port.h"
@@ -3194,5 +3195,146 @@ stop_server:
 	}
 
 	kprintf("stress_ool: PASS\n");
+	return (0);
+}
+
+/* ---- mutex: mutual exclusion, and the sleep path under contention -------- */
+
+/*
+ * A lock whose waiters have never had to sleep is a lock whose sleep path has
+ * never run, and kern/mutex.c is exactly that until something makes threads
+ * collide.  So this makes them collide on purpose.
+ *
+ * The counter is incremented NON-atomically through a read, a yield and a
+ * write.  Without the mutex that is a textbook lost update and the final
+ * total comes out low; with it, the yield in the middle guarantees the holder
+ * is descheduled while still holding the lock, which is the situation a
+ * spinlock could not survive here and the only reason this primitive exists.
+ * Contention is therefore not hoped for -- it is arranged.
+ */
+static struct mutex		mtx_test_lock = MUTEX_INIT("stress-mutex");
+static volatile unsigned long	mtx_test_counter;
+static volatile unsigned	mtx_test_live;
+static volatile unsigned	mtx_test_maxheld;	/* must never exceed 1 */
+static volatile unsigned	mtx_test_inside;
+static unsigned			mtx_test_rounds;
+
+static void
+mutex_worker(void *arg)
+{
+	unsigned long	seen;
+	unsigned	i;
+
+	(void)arg;
+	for (i = 0; i < mtx_test_rounds; i++) {
+		mutex_lock(&mtx_test_lock);
+
+		/*
+		 * Two independent checks of the same claim.  The occupancy
+		 * count catches two threads inside at once even if the
+		 * arithmetic happens to come out right; the read-yield-write
+		 * catches a lost update even if they never overlap visibly.
+		 */
+		mtx_test_inside++;
+		if (mtx_test_inside > mtx_test_maxheld)
+			mtx_test_maxheld = mtx_test_inside;
+
+		seen = mtx_test_counter;
+		thread_yield();
+		mtx_test_counter = seen + 1;
+
+		mtx_test_inside--;
+		mutex_unlock(&mtx_test_lock);
+	}
+	mtx_test_live--;
+	thread_exit();
+}
+
+int
+stress_mutex(unsigned int n_workers, unsigned int rounds)
+{
+	struct thread	*th;
+	unsigned long	 want;
+	uint64_t	 slept0;
+	uint64_t	 slept;
+	unsigned int	 i;
+	unsigned int	 spins;
+
+	if (n_workers == 0)
+		n_workers = 2;
+	if (n_workers > 8)
+		n_workers = 8;
+	if (rounds == 0)
+		rounds = 1;
+	if (rounds > 10000u)
+		rounds = 10000u;
+
+	kprintf("stress_mutex: %u workers x %u rounds, yielding inside the "
+	    "critical section\n", n_workers, rounds);
+
+	mutex_init(&mtx_test_lock, "stress-mutex");
+	mtx_test_counter = 0;
+	mtx_test_maxheld = 0;
+	mtx_test_inside  = 0;
+	mtx_test_rounds  = rounds;
+	mtx_test_live    = n_workers;
+	slept0           = mutex_blocks();
+
+	for (i = 0; i < n_workers; i++) {
+		th = thread_create(kernel_task, mutex_worker, NULL,
+		    "mutex-worker");
+		if (th == NULL) {
+			kprintf("stress_mutex: thread_create #%u failed\n", i);
+			return (2);
+		}
+		thread_start(th);
+	}
+
+	/*
+	 * Wait by yielding rather than by holding anything.  The bound is
+	 * generous but finite: a mutex bug here shows up as workers that never
+	 * finish, and that must be reported as a failure rather than hang the
+	 * boot.
+	 */
+	spins = 0;
+	while (mtx_test_live != 0 && spins < 20000000u) {
+		thread_yield();
+		spins++;
+	}
+	if (mtx_test_live != 0) {
+		kprintf("stress_mutex: FAIL %u worker(s) never finished -- "
+		    "a waiter was not woken\n", mtx_test_live);
+		return (3);
+	}
+	sched_reap_zombies();
+
+	want  = (unsigned long)n_workers * rounds;
+	slept = mutex_blocks() - slept0;
+	kprintf("stress_mutex: counter %lu (want %lu), max threads inside: %u, "
+	    "%llu acquisitions had to sleep\n", mtx_test_counter, want,
+	    mtx_test_maxheld, (unsigned long long)slept);
+
+	/*
+	 * Zero sleeps would mean the workers never actually overlapped, and a
+	 * correct-looking counter would then be saying nothing about the park
+	 * and wake paths -- which are the only parts of this lock that a
+	 * spinlock could not have provided.
+	 */
+	if (slept == 0) {
+		kprintf("stress_mutex: FAIL never contended -- the sleep path "
+		    "was not exercised, so this proves nothing\n");
+		return (6);
+	}
+	if (mtx_test_maxheld > 1) {
+		kprintf("stress_mutex: FAIL %u threads were inside at once\n",
+		    mtx_test_maxheld);
+		return (4);
+	}
+	if (mtx_test_counter != want) {
+		kprintf("stress_mutex: FAIL lost %lu update(s)\n",
+		    want - mtx_test_counter);
+		return (5);
+	}
+	kprintf("stress_mutex: PASS\n");
 	return (0);
 }

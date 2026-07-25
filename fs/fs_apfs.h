@@ -596,6 +596,17 @@ int	fs_apfs_read_block(uint64_t bno, void *buf);
  */
 uint64_t	fs_apfs_fletcher64(const void *p, uint32_t len);
 
+/*
+ * Write a METADATA block back, sealing it first: the Fletcher-64 is computed
+ * over the block from offset 8 and stored in the header, so the result cannot
+ * be part of its own input.  Exposed because fs/fs_txn.c writes the blocks a
+ * transaction collected and sealing is not knowledge worth having twice.
+ *
+ * Not for file data, which carries no header and needs no seal -- writing
+ * data through here would overwrite its first eight bytes with a checksum.
+ */
+int	fs_apfs_write_block(uint64_t bno, void *buf);
+
 /* ---- writing ------------------------------------------------------- */
 
 /*

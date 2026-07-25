@@ -12,6 +12,7 @@
 #include "fs.h"
 #include "fs_apfs.h"
 #include "fs_fat.h"
+#include "fs_txn.h"
 #include "bootstrap.h"
 #include "clock.h"
 #include "darwin.h"
@@ -30,6 +31,7 @@
 #include "kmem.h"
 #include "kprintf.h"
 #include "memmap.h"
+#include "mutex.h"
 #include "mouse.h"
 #include "mouse_drv.h"
 #include "panic.h"
@@ -245,6 +247,8 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 		darwin_cons_stats();
 		if (fs_apfs_ready())
 			fs_apfs_stats();
+		fs_txn_stats();
+		mutex_stats();
 		bio_stats();
 		ata_irq_stats();
 		kmem_stats();
@@ -314,47 +318,50 @@ kmain_run_tests(void)
 	tty_puts("\n--- boot-time stress pass ---\n");
 	tty_set_attr(TTY_ATTR(TTY_LIGHT_GRAY, TTY_BLACK));
 
-	tty_puts("\n[1/14] stress mem 10000\n");
+	tty_puts("\n[1/15] stress mem 10000\n");
 	rv_mem = stress_mem(10000);
 
-	tty_puts("\n[2/14] stress mem boundary\n");
+	tty_puts("\n[2/15] stress mem boundary\n");
 	rv_boundary = stress_mem_boundary();
 
-	tty_puts("\n[3/14] stress timer 2s\n");
+	tty_puts("\n[3/15] stress timer 2s\n");
 	rv_timer = stress_timer(2);
 
-	tty_puts("\n[4/14] stress port 1000\n");
+	tty_puts("\n[4/15] stress port 1000\n");
 	int rv_port = stress_port(1000);
 
-	tty_puts("\n[5/14] stress thread 200\n");
+	tty_puts("\n[5/15] stress thread 200\n");
 	int rv_thread = stress_thread(200);
 
-	tty_puts("\n[6/14] stress preempt 4 workers, 1 s\n");
+	tty_puts("\n[6/15] stress preempt 4 workers, 1 s\n");
 	int rv_preempt = stress_preempt(4, 1000);
 
-	tty_puts("\n[7/14] stress sendonce 500\n");
+	tty_puts("\n[7/15] stress sendonce 500\n");
 	int rv_sendonce = stress_sendonce(500);
 
-	tty_puts("\n[8/14] stress portset 4 members x 100\n");
+	tty_puts("\n[8/15] stress portset 4 members x 100\n");
 	int rv_portset = stress_portset(4, 100);
 
-	tty_puts("\n[9/14] stress intertask 200 (parent <-> worker task)\n");
+	tty_puts("\n[9/15] stress intertask 200 (parent <-> worker task)\n");
 	int rv_intertask = stress_intertask(200);
 
-	tty_puts("\n[10/14] stress moverecv 200\n");
+	tty_puts("\n[10/15] stress moverecv 200\n");
 	int rv_moverecv = stress_moverecv(200);
 
-	tty_puts("\n[11/14] stress nosenders 100\n");
+	tty_puts("\n[11/15] stress nosenders 100\n");
 	int rv_nosenders = stress_nosenders(100);
 
-	tty_puts("\n[12/14] stress sendblock 2000\n");
+	tty_puts("\n[12/15] stress sendblock 2000\n");
 	int rv_sendblock = stress_sendblock(2000);
 
-	tty_puts("\n[13/14] stress rpc 200\n");
+	tty_puts("\n[13/15] stress rpc 200\n");
 	int rv_rpc = stress_rpc(200);
 
-	tty_puts("\n[14/14] stress ool 4 (parent <-> worker OOL transfer)\n");
+	tty_puts("\n[14/15] stress ool 4 (parent <-> worker OOL transfer)\n");
 	int rv_ool = stress_ool(4);
+
+	tty_puts("\n[15/15] stress mutex 4 workers x 200 (sleeping lock)\n");
+	int rv_mutex = stress_mutex(4, 200);
 
 	tty_set_attr(TTY_ATTR(TTY_YELLOW, TTY_BLACK));
 	tty_puts("\n--- stress pass summary ---\n");
@@ -387,6 +394,8 @@ kmain_run_tests(void)
 	    rv_rpc == 0 ? "PASS" : "FAIL", rv_rpc);
 	kprintf("  stress ool 4         : %s (rv=%d)\n",
 	    rv_ool == 0 ? "PASS" : "FAIL", rv_ool);
+	kprintf("  stress mutex 4x200   : %s (rv=%d)\n",
+	    rv_mutex == 0 ? "PASS" : "FAIL", rv_mutex);
 
 	int rv_so_notify = stress_sendonce_notify();
 	kprintf("  sendonce-notify      : %s (rv=%d)\n",

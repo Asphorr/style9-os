@@ -111,6 +111,7 @@ OBJS	= \
 	$(OBJDIR)/panic.o	\
 	$(OBJDIR)/ddb.o		\
 	$(OBJDIR)/spinlock.o	\
+	$(OBJDIR)/mutex.o	\
 	$(OBJDIR)/witness.o	\
 	$(OBJDIR)/memmap.o	\
 	$(OBJDIR)/pmm.o		\
@@ -150,6 +151,7 @@ OBJS	= \
 	$(OBJDIR)/bio.o		\
 	$(OBJDIR)/fs_fat.o	\
 	$(OBJDIR)/fs_apfs.o	\
+	$(OBJDIR)/fs_txn.o	\
 	$(OBJDIR)/fs.o		\
 	$(OBJDIR)/progreg.o	\
 	$(OBJDIR)/hello_elf.o	\

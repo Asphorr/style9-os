@@ -40,6 +40,14 @@ int	stress_timer(unsigned int seconds);
 int	stress_port(unsigned int rounds);
 int	stress_thread(unsigned int rounds);
 int	stress_preempt(unsigned int n_workers, unsigned int sleep_ms);
+
+/*
+ * Mutual exclusion under real contention: N kernel threads increment a shared
+ * counter non-atomically, yielding while holding the lock so the holder is
+ * descheduled mid-critical-section.  Fails on a lost update, on two threads
+ * being inside at once, or on a worker that is never woken.
+ */
+int	stress_mutex(unsigned int n_workers, unsigned int rounds);
 int	stress_sendonce(unsigned int rounds);
 int	stress_sendonce_notify(void);
 int	stress_deadname_multi(void);
