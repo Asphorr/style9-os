@@ -49,18 +49,45 @@
 #define	SH_ARGC_MAX	8
 
 /*
- * Hard-coded program list.  Mirrors the registrations in
- * kern/progreg.c.  Phase 3 replaces this with a Mach "progreg" service
- * the way "tasks" works today; until then keep the list in sync by
- * hand when adding a user program.
+ * What can be spawned, asked rather than remembered.
+ *
+ * This was a hand-written array of four names -- hello, clock, tasks,
+ * sh -- with a comment promising that phase 3 would replace it with a
+ * Mach "progreg" service the way "tasks" works, and a request to keep
+ * the list in sync by hand until then.  Nobody did, for thirty-four
+ * programs.  `help` was not merely incomplete; it was confidently
+ * listing a system four programs wide.
+ *
+ * So it is the service now, fetched once at startup into a packed
+ * NUL-separated blob and indexed in place.  Adding a program to
+ * kern/progreg.c is all it takes for the shell to know about it, which
+ * is what the comment always said should happen.
  */
-static const char *known_progs[] = {
-	"hello",
-	"clock",
-	"tasks",
-	"sh",
-	NULL,
-};
+static char	sh_progs[SVC_PROGREG_BYTES];
+static uint32_t	sh_progs_n;	/* names packed into sh_progs      */
+static uint32_t	sh_progs_total;	/* names the registry actually has */
+
+/*
+ * The idx'th packed name, or NULL past the end.  Walking from the front
+ * every time is O(n) per lookup and n is under forty; an index array
+ * would cost more BSS than the blob it indexed.
+ */
+static const char *
+prog_at(uint32_t idx)
+{
+	const char	*p;
+	uint32_t	 i;
+
+	p = sh_progs;
+	for (i = 0; i < idx; i++) {
+		while (*p != '\0')
+			p++;
+		p++;
+		if (p >= sh_progs + sizeof(sh_progs))
+			return (NULL);
+	}
+	return (i < sh_progs_n ? p : NULL);
+}
 
 /*
  * Cached service ports.  Looked up once at startup; the splash and
@@ -308,6 +335,45 @@ fetch_clock(struct svc_clock_reply *out)
 		return (-1);
 	*out = reply.body;
 	return (0);
+}
+
+/*
+ * fetch_progs: one RPC into the progreg service, at startup.  The reply
+ * is nearly 800 bytes, so it lands in a static rather than on the one
+ * page of stack a ring-3 task gets.
+ */
+static void
+fetch_progs(void)
+{
+	struct mach_msg_header	req;
+	static struct {
+		struct mach_msg_header		hdr;
+		struct svc_progreg_reply	body;
+	} reply;
+	mach_port_name_t	svc;
+	uint32_t		i;
+	int			rv;
+
+	svc = bootstrap_lookup(SVC_PROGREG_NAME);
+	if (svc == MACH_PORT_NULL)
+		return;
+
+	req.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	req.msgh_size    = sizeof(req);
+	req.msgh_remote  = svc;
+	req.msgh_local   = MACH_PORT_NULL;
+	req.msgh_voucher = 0;
+	req.msgh_id      = PROGREG_OP_LIST;
+
+	rv = mach_msg_rpc(&req, &reply.hdr, sizeof(reply), 1000);
+	(void)mach_port_deallocate(svc);
+	if (rv != MACH_MSG_OK)
+		return;
+
+	for (i = 0; i < SVC_PROGREG_BYTES; i++)
+		sh_progs[i] = reply.body.pr_names[i];
+	sh_progs_n     = reply.body.pr_count;
+	sh_progs_total = reply.body.pr_total;
 }
 
 static int
@@ -591,40 +657,88 @@ split_argv(char *line, char *argv[], int max)
 /* ---- builtins ----------------------------------------------------- */
 
 /*
+ * The builtins, as data.
+ *
+ * They were a run of hand-paired puts() calls, which was fine while
+ * nothing else needed to know their names.  Tab completion does: a
+ * shell that completes the thirty-eight programs but not the eight
+ * words it implements itself would be a strange thing to use.
+ */
+struct sh_builtin {
+	const char	*b_name;
+	const char	*b_help;
+};
+
+static const struct sh_builtin sh_builtins[] = {
+	{ "help",  "show this list" },
+	{ "echo",  "print arguments" },
+	{ "clear", "clear screen and repaint the splash" },
+	{ "about", "version banner + live counters" },
+	{ "ool",   "OOL Mach IPC round-trip via svc/echool" },
+	{ "man",   "show a manual page (try: man port)" },
+	{ "kill",  "kill <task_id> -- terminate a child of this shell" },
+	{ NULL,    NULL },
+};
+
+/*
  * builtin_help: terse "two-column form" -- command on the left, one-
  * line description on the right.  No section headers; spawnables get
- * one inline row separated by two spaces, the way a tab-completion
- * preview reads.  Bold-white commands, gray descriptions.
+ * wrapped rows below, the way a tab-completion listing reads.
+ * Bold-white commands, gray descriptions.
  */
 static void
 builtin_help(void)
 {
-	size_t	i;
+	const char	*name;
+	size_t		 col;
+	size_t		 w;
+	uint32_t	 i;
 
-	puts(ESC_FG_WHITE); puts("  help     ");
-	puts(ESC_FG_GRAY);  puts("show this list\n");
-	puts(ESC_FG_WHITE); puts("  echo     ");
-	puts(ESC_FG_GRAY);  puts("print arguments\n");
-	puts(ESC_FG_WHITE); puts("  clear    ");
-	puts(ESC_FG_GRAY);  puts("clear screen and repaint the splash\n");
-	puts(ESC_FG_WHITE); puts("  about    ");
-	puts(ESC_FG_GRAY);  puts("version banner + live counters\n");
-	puts(ESC_FG_WHITE); puts("  ool      ");
-	puts(ESC_FG_GRAY);  puts("OOL Mach IPC round-trip via svc/echool\n");
-	puts(ESC_FG_WHITE); puts("  man      ");
-	puts(ESC_FG_GRAY);  puts("show a manual page (try: man port)\n");
-	puts(ESC_FG_WHITE); puts("  kill     ");
-	puts(ESC_FG_GRAY);  puts("kill <task_id> -- terminate a child of this shell\n");
+	for (i = 0; sh_builtins[i].b_name != NULL; i++) {
+		puts(ESC_FG_WHITE);
+		printf("  %-8s ", sh_builtins[i].b_name);
+		puts(ESC_FG_GRAY);
+		puts(sh_builtins[i].b_help);
+		puts("\n");
+	}
 
 	puts("\n");
 	puts(ESC_FG_WHITE); puts("  spawn    ");
 	puts(ESC_FG_GRAY);
-	for (i = 0; known_progs[i] != NULL; i++) {
-		if (i > 0)
-			puts("    ");
-		puts(known_progs[i]);
+	if (sh_progs_n == 0) {
+		puts("(the progreg service did not answer)\n");
+		puts(ESC_RESET);
+		return;
+	}
+
+	/*
+	 * Thirty-eight names do not fit on the one row the four hard-coded
+	 * ones used to, so they wrap into the same gutter.  Widest name in
+	 * the registry is "excchild_resume"; the column is sixteen so a
+	 * name never touches its neighbour.
+	 */
+	col = 0;
+	for (i = 0; i < sh_progs_n; i++) {
+		name = prog_at(i);
+		if (name == NULL)
+			break;
+		if (col == 4) {
+			puts("\n           ");
+			col = 0;
+		}
+		puts(name);
+		for (w = 0; name[w] != '\0'; w++)
+			continue;
+		while (w < 16) {
+			putchar(' ');
+			w++;
+		}
+		col++;
 	}
 	puts("\n");
+	if (sh_progs_total > sh_progs_n)
+		printf("           (%u more the reply had no room for)\n",
+		    (unsigned)(sh_progs_total - sh_progs_n));
 	puts(ESC_RESET);
 }
 
@@ -1469,6 +1583,132 @@ line_erase_word(struct sh_line *ln)
 		line_erase(ln);
 }
 
+/* ---- completion --------------------------------------------------- */
+
+/*
+ * Complete the first word of the line against the builtins and the
+ * program registry.
+ *
+ * Only the first word: everything after it is an argument, and this
+ * shell has no filesystem paths to complete them against yet -- when it
+ * does, that is a second candidate source rather than a different
+ * mechanism.  A word that is already a whole name still completes, and
+ * gains its trailing space, which is what makes Tab safe to lean on.
+ *
+ * The rule is the usual one.  One candidate: finish it.  Several:
+ * extend as far as they agree, and if that adds nothing, show them --
+ * a Tab that appears to do nothing is worse than one that lists.
+ */
+static const char *
+complete_candidate(uint32_t idx)
+{
+	uint32_t	n;
+
+	for (n = 0; sh_builtins[n].b_name != NULL; n++)
+		continue;
+	if (idx < n)
+		return (sh_builtins[idx].b_name);
+	return (prog_at(idx - n));
+}
+
+static int
+complete_prefix_match(const char *cand, const char *pfx, size_t pfx_len)
+{
+	size_t	i;
+
+	for (i = 0; i < pfx_len; i++) {
+		if (cand[i] == '\0' || cand[i] != pfx[i])
+			return (0);
+	}
+	return (1);
+}
+
+static void
+line_complete(struct sh_line *ln)
+{
+	const char	*cand;
+	const char	*first;
+	size_t		 pfx_len;
+	size_t		 agree;
+	uint32_t	 i;
+	uint32_t	 nmatch;
+	uint32_t	 nbuiltin;
+
+	/*
+	 * The word under the cursor is the first word only when nothing
+	 * before the cursor is blank.  Anywhere else, Tab has nothing to
+	 * say and does nothing -- deliberately, rather than completing a
+	 * command name into an argument position.
+	 */
+	for (pfx_len = 0; pfx_len < ln->l_pos; pfx_len++) {
+		if (is_blank(ln->l_buf[pfx_len]))
+			return;
+	}
+
+	for (nbuiltin = 0; sh_builtins[nbuiltin].b_name != NULL; nbuiltin++)
+		continue;
+
+	first  = NULL;
+	nmatch = 0;
+	agree  = 0;
+	for (i = 0; i < nbuiltin + sh_progs_n; i++) {
+		cand = complete_candidate(i);
+		if (cand == NULL)
+			break;
+		if (!complete_prefix_match(cand, ln->l_buf, pfx_len))
+			continue;
+		nmatch++;
+		if (first == NULL) {
+			first = cand;
+			while (first[agree] != '\0')
+				agree++;
+			continue;
+		}
+		while (agree > pfx_len &&
+		    !complete_prefix_match(cand, first, agree))
+			agree--;
+	}
+
+	if (nmatch == 0)
+		return;
+
+	if (agree > pfx_len) {
+		ln->l_pos = pfx_len;
+		while (pfx_len < agree)
+			line_insert(ln, first[pfx_len++]);
+		if (nmatch == 1)
+			line_insert(ln, ' ');
+		return;
+	}
+
+	/*
+	 * The prefix is already as long as the candidates agree, so
+	 * extending it silently is not an option.  Show them, then let
+	 * the caller redraw the prompt beneath.
+	 */
+	puts("\n");
+	puts(ESC_FG_GRAY);
+	for (i = 0; i < nbuiltin + sh_progs_n; i++) {
+		size_t	w;
+
+		cand = complete_candidate(i);
+		if (cand == NULL)
+			break;
+		if (!complete_prefix_match(cand, ln->l_buf, pfx_len))
+			continue;
+		puts(cand);
+		for (w = 0; cand[w] != '\0'; w++)
+			continue;
+		while (w < 16) {
+			putchar(' ');
+			w++;
+		}
+	}
+	puts("\n");
+	puts(ESC_RESET);
+	prompt_build();
+}
+
 static void
 hist_add(const char *s)
 {
@@ -1615,6 +1855,9 @@ repl(void)
 			case 0x17:	/* ^W -- kill the word behind */
 				line_erase_word(&ln);
 				break;
+			case '\t':
+				line_complete(&ln);
+				break;
 			case 0x0C:	/* ^L -- clear and start again */
 				builtin_clear();
 				prompt();
@@ -1669,6 +1912,7 @@ main(void)
 	}
 	g_clock_port = bootstrap_lookup(SVC_CLOCK_NAME);
 	g_stats_port = bootstrap_lookup(SVC_STATS_NAME);
+	fetch_progs();
 
 	/*
 	 * Claim the screen: erase it, hand rows three to twenty-five to

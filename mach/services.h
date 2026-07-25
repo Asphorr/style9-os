@@ -92,6 +92,42 @@ _Static_assert(sizeof(struct svc_tasks_reply) ==
     8 + SVC_TASKS_MAX * sizeof(struct svc_tasks_entry),
     "svc_tasks_reply layout pinned");
 
+/* ---- "progreg" service ---- */
+/*
+ * What can be spawned.
+ *
+ * kern/progreg.h has said since it was written that its snapshot call
+ * exists so the shell can answer "what can I spawn?", and nothing ever
+ * called it: sh.elf carried a hand-written list of four names while the
+ * registry held thirty-eight, and `help` had been quietly wrong for
+ * thirty-four programs.  This is the seam that was missing.
+ *
+ * The names come back PACKED -- NUL-separated in one byte array rather
+ * than in fixed-width slots.  Fixed slots would have been simpler and
+ * would also have made this reply 968 bytes against the 1024-byte
+ * ceiling in svc_reply_inline, leaving room for exactly two more
+ * programs before the service started failing at runtime instead of at
+ * build time.  Packed, thirty-eight names cost about 350 bytes.
+ *
+ * pr_count is what fits, pr_total is what exists.  They differ only if
+ * the registry outgrows the blob, and then the caller can say so rather
+ * than print a shorter list that looks complete -- which is the exact
+ * failure being fixed here.
+ */
+#define	SVC_PROGREG_NAME	"progreg"
+#define	PROGREG_OP_LIST		1
+#define	SVC_PROGREG_BYTES	768
+
+/* WIRE FORMAT.  ABI-stable. */
+struct svc_progreg_reply {
+	uint32_t	pr_count;	/* names packed into pr_names   */
+	uint32_t	pr_total;	/* names the registry holds     */
+	char		pr_names[SVC_PROGREG_BYTES];
+};
+
+_Static_assert(sizeof(struct svc_progreg_reply) == 8 + SVC_PROGREG_BYTES,
+    "svc_progreg_reply layout pinned");
+
 /* ---- "man" service ---- */
 /*
  * Manual-page registry.  Holds a small static table of embedded

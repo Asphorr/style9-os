@@ -16,6 +16,7 @@
 #include "panic.h"
 #include "pmm.h"
 #include "port.h"
+#include "progreg.h"
 #include "sched.h"
 #include "services.h"
 #include "smap.h"
@@ -171,6 +172,51 @@ svc_tasks_dispatch(const struct mach_msg_header *req, struct port_space *from)
 			    j++)
 				r.tr_entries[i].te_name[j] = t->t_name[j];
 		}
+	}
+
+	return (svc_reply_inline(req, from, &r, sizeof(r)));
+}
+
+/* ---- "progreg" service ------------------------------------------------ */
+
+static int
+svc_progreg_dispatch(const struct mach_msg_header *req,
+    struct port_space *from)
+{
+	struct svc_progreg_reply	 r;
+	const struct progreg_entry	*e;
+	size_t				 i, j, off;
+
+	if (req->msgh_id != PROGREG_OP_LIST)
+		return (MACH_E_INVAL);
+
+	for (i = 0; i < sizeof(r); i++)
+		((uint8_t *)&r)[i] = 0;
+
+	off = 0;
+	for (i = 0; ; i++) {
+		size_t	need;
+
+		e = progreg_at(i);
+		if (e == NULL)
+			break;
+		r.pr_total++;
+
+		/*
+		 * Stop packing when the next name plus its terminator would
+		 * not fit, but keep counting -- pr_total is the answer to
+		 * "how many are there", and it stays true even when
+		 * pr_count cannot.
+		 */
+		for (need = 0; e->pr_name[need] != '\0'; need++)
+			continue;
+		if (off + need + 1 > SVC_PROGREG_BYTES)
+			continue;
+
+		for (j = 0; j < need; j++)
+			r.pr_names[off++] = e->pr_name[j];
+		r.pr_names[off++] = '\0';
+		r.pr_count++;
 	}
 
 	return (svc_reply_inline(req, from, &r, sizeof(r)));
@@ -467,6 +513,7 @@ static struct port	*svc_stats_port;	/* (c) */
 static struct port	*svc_tasks_port;	/* (c) */
 static struct port	*svc_echool_port;	/* (c) */
 static struct port	*svc_man_port;		/* (c) */
+static struct port	*svc_progreg_port;	/* (c) */
 
 /*
  * Each service is a kernel-owned PORT_SPECIAL_SERVICE port (the
@@ -505,5 +552,7 @@ services_init(void)
 	svc_tasks_port  = svc_register(SVC_TASKS_NAME,  svc_tasks_dispatch);
 	svc_echool_port = svc_register(SVC_ECHOOL_NAME, svc_echool_dispatch);
 	svc_man_port    = svc_register(SVC_MAN_NAME,    svc_man_dispatch);
+	svc_progreg_port = svc_register(SVC_PROGREG_NAME,
+	    svc_progreg_dispatch);
 	launchd_subsystem_init();
 }

@@ -779,6 +779,31 @@ _Static_assert(sizeof(struct svc_tasks_reply) ==
     8 + SVC_TASKS_MAX * sizeof(struct svc_tasks_entry),
     "svc_tasks_reply layout pinned");
 
+/*
+ * "progreg" -- what can be spawned.
+ *
+ * The names arrive PACKED, NUL-separated in one byte array, because
+ * fixed-width slots for the registry's forty entries would have put the
+ * reply within two programs of the 1024-byte inline-reply ceiling.
+ * pr_count is how many fit; pr_total is how many exist.  A caller that
+ * sees them differ should say so rather than print a short list that
+ * looks complete.
+ *
+ * WIRE FORMAT.  Mirrors mach/services.h.
+ */
+#define	SVC_PROGREG_NAME	"progreg"
+#define	PROGREG_OP_LIST		1
+#define	SVC_PROGREG_BYTES	768
+
+struct svc_progreg_reply {
+	uint32_t	pr_count;
+	uint32_t	pr_total;
+	char		pr_names[SVC_PROGREG_BYTES];
+};
+
+_Static_assert(sizeof(struct svc_progreg_reply) == 8 + SVC_PROGREG_BYTES,
+    "svc_progreg_reply layout pinned");
+
 #define	SVC_ECHOOL_NAME		"echool"
 #define	ECHOOL_OP_CHECKSUM	1
 
