@@ -121,6 +121,27 @@ static mach_port_name_t		fg_taskport;
 #define	ESC_SAVE_CUR	"\x1b[s"
 #define	ESC_REST_CUR	"\x1b[u"
 #define	ESC_HOME	"\x1b[1;1H"
+#define	ESC_HIDE_CUR	"\x1b[?25l"
+#define	ESC_SHOW_CUR	"\x1b[?25h"
+
+/*
+ * The chrome, and the two rows it owns.
+ *
+ * Rows one and two are the status line and the rule under it; rows
+ * three to twenty-five are where everything else happens.  The shell
+ * says so once, with DECSTBM, and the terminal keeps the promise from
+ * then on -- output that reaches the bottom of the screen scrolls the
+ * region and leaves the header where it is.
+ *
+ * Before this, the bar was repainted at every prompt and scrolled off
+ * the top by the first command that filled the screen, leaving its rule
+ * behind as a stray line in the middle of the session.  Repainting more
+ * often could never have fixed that: between two prompts a foreground
+ * job is free to print, and the bar has to survive it.
+ */
+#define	ESC_REGION_BODY	"\x1b[3;25r"
+#define	ESC_REGION_ALL	"\x1b[r"
+#define	ESC_BODY_HOME	"\x1b[3;1H"
 
 /* ---- single-byte read from the kbd stream port ------------------- */
 
@@ -231,14 +252,16 @@ paint_hr(void)
 }
 
 /*
- * paint_status_bar: lift the cursor to (1,1) and paint a two-row
- * header -- app-name + right-aligned uptime on row 0, a thin horizontal
- * rule on row 1.  No reverse-video bar; the chrome here is meant to
+ * paint_status_bar: lift the cursor to (1,1) and paint the two-row
+ * header -- app-name + right-aligned uptime on row 1, a thin horizontal
+ * rule on row 2.  No reverse-video bar; the chrome here is meant to
  * read as quiet typography rather than a 1990s curses banner.
  *
- * Both rows are repainted on every prompt so they survive scrolling:
- * since QEMU's VGA scroll moves rows up and row 0 drops off the top,
- * the next paint sees an empty top row to overwrite cleanly.
+ * The rows are outside the scrolling region, so this is a refresh of
+ * the clock rather than a rescue of a bar that has been carried away.
+ * The cursor is hidden across the trip: it is programmed once per
+ * write, and without this the underline is seen jumping to the top of
+ * the screen and back on every prompt.
  */
 static void
 paint_status_bar(void)
@@ -253,6 +276,7 @@ paint_status_bar(void)
 	m = s / 60ull;
 	s = s - m * 60ull;
 
+	puts(ESC_HIDE_CUR);
 	puts(ESC_SAVE_CUR);
 	puts(ESC_HOME);
 	puts(ESC_FG_GRAY);
@@ -278,6 +302,7 @@ paint_status_bar(void)
 	paint_hr();
 	puts(ESC_RESET);
 	puts(ESC_REST_CUR);
+	puts(ESC_SHOW_CUR);
 }
 
 /*
@@ -303,8 +328,14 @@ paint_splash(void)
 	used_kib  = st.sr_pmm_used_pages * 4ull;
 	total_kib = st.sr_pmm_total_pages * 4ull;
 
-	/* Two blank rows after the status header for breathing room. */
-	puts("\n\n");
+	/*
+	 * One blank row under the rule for air.  It used to be two, plus a
+	 * third the terminal ate by wrapping the eighty-column status line
+	 * into a row of its own -- which is what put the rule on top of
+	 * the NAME section and made this splash a section shorter than it
+	 * reads here.
+	 */
+	puts("\n");
 
 	puts(ESC_FG_WHITE); puts("  NAME           ");
 	puts(ESC_FG_GRAY);  puts("style9-os -- BSD-flavoured x86_64 "
@@ -466,7 +497,14 @@ static void
 builtin_clear(void)
 {
 
+	/*
+	 * ED 2 homes the cursor to the top-left of the SCREEN, which is
+	 * inside the chrome.  Step back into the region explicitly rather
+	 * than trusting the erase to know about it -- the region is a
+	 * property of scrolling, not of addressing.
+	 */
 	puts(ESC_CLR_SCR);
+	puts(ESC_BODY_HOME);
 	paint_splash();
 }
 
@@ -693,6 +731,16 @@ pager_show(const char *text, size_t len, const char *title)
 	if (total_lines == 0)
 		return;
 
+	/*
+	 * The pager owns the whole screen while it runs, so it takes the
+	 * scrolling region back and hides the cursor -- a manual page has
+	 * no use for the shell's status bar, and an underline parked
+	 * wherever the last line ended is just a distraction on a page
+	 * that is repainted whole.  Both are handed back on the way out.
+	 */
+	puts(ESC_REGION_ALL);
+	puts(ESC_HIDE_CUR);
+
 	max_top = total_lines > PAGER_SCREEN_ROWS ?
 	    total_lines - PAGER_SCREEN_ROWS : 0;
 	top      = 0;
@@ -777,7 +825,10 @@ pager_show(const char *text, size_t len, const char *title)
 		}
 	}
 
+	puts(ESC_SHOW_CUR);
 	puts(ESC_CLR_SCR);
+	puts(ESC_REGION_BODY);
+	puts(ESC_BODY_HOME);
 }
 
 /*
@@ -1164,7 +1215,16 @@ main(void)
 	g_clock_port = bootstrap_lookup(SVC_CLOCK_NAME);
 	g_stats_port = bootstrap_lookup(SVC_STATS_NAME);
 
+	/*
+	 * Claim the screen: erase it, hand rows three to twenty-five to
+	 * the scrolling region, and start writing inside it.  Everything
+	 * after this line -- the splash, every prompt, every program this
+	 * shell spawns -- lives in the region, and the two rows above it
+	 * belong to paint_status_bar alone.
+	 */
 	puts(ESC_CLR_SCR);
+	puts(ESC_REGION_BODY);
+	puts(ESC_BODY_HOME);
 	paint_splash();
 	repl();
 

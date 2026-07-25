@@ -91,4 +91,11 @@ void	tty_selftest(void);
  */
 void	tty_wrap_selftest(void);
 
+/*
+ * And that rows above the top margin stay put while the rows below
+ * them scroll -- the property a status bar is built on.  Also checks
+ * that hiding the cursor reaches the hardware.
+ */
+void	tty_region_selftest(void);
+
 #endif /* !_SYS_TTY_H_ */

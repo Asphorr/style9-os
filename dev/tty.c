@@ -42,8 +42,10 @@
  */
 #define	VGA_CRTC_INDEX		0x3D4
 #define	VGA_CRTC_DATA		0x3D5
+#define	VGA_CRTC_CURSOR_START	10	/* bit 5 turns the cursor off */
 #define	VGA_CRTC_CURSOR_HI	14
 #define	VGA_CRTC_CURSOR_LO	15
+#define	VGA_CURSOR_DISABLE	0x20u
 
 /*
  * ANSI/VT CSI state machine.
@@ -69,10 +71,17 @@
  *	J	ED  -- erase in display: 0=>EOS, 1=>start->cur, 2=screen
  *	K	EL  -- erase in line:    same parameter scheme
  *	m	SGR -- 0/30..37/40..47/90..97/100..107 (+ 1, 22)
+ *	r	DECSTBM -- top and bottom margins of the scrolling region
  *	s / u	save / restore cursor
+ *	?25 h/l	DECTCEM -- show / hide the cursor
  *
  * Unknown finals drop silently rather than erroring out: a future TUI
  * speaking richer sequences must extend this table, but won't crash.
+ *
+ * DECOM (origin mode) is deliberately absent: CUP addresses the screen,
+ * not the scrolling region, which is the mode every program here
+ * assumes and the one a program that cares can no longer be surprised
+ * by, since asking for the other is a DEC-private sequence that drops.
  */
 #define	TTY_CSI_MAX_PARAMS	8
 
@@ -111,6 +120,33 @@ static uint8_t		tty_attr_default;
  * line cost one row.
  */
 static bool		tty_wrap_pending;
+
+/*
+ * The rows that scroll, and the rows that do not.
+ *
+ * Everything on this console scrolled together, which meant a status
+ * bar was a lie the moment anything printed: sh.elf painted one at row
+ * zero on every prompt, and the first command whose output reached the
+ * bottom of the screen carried the bar off the top and left its rule
+ * behind as debris.  Repainting harder does not fix that -- the bar has
+ * to survive until the next prompt, and between prompts a foreground
+ * job is free to print.
+ *
+ * DECSTBM is the answer terminals settled on decades ago: a top and a
+ * bottom margin, and only the rows between them move.  A program paints
+ * its chrome above the top margin once and then forgets about it.
+ * Inclusive, zero-based, and the whole screen until someone says
+ * otherwise.
+ */
+static uint16_t		tty_scroll_top;
+static uint16_t		tty_scroll_bot;
+
+/*
+ * Whether the underline is drawn at all.  A full-screen program hides
+ * it across a repaint so the cursor is not seen sweeping the screen on
+ * the way to where it belongs; DECTCEM is how it asks.
+ */
+static bool		tty_cursor_visible;
 
 static uint16_t	tty_saved_col;
 static uint16_t	tty_saved_row;
@@ -167,7 +203,9 @@ static uint64_t		tty_chars;		/* (p) */
 static void	tty_putcell(uint16_t, uint16_t, char);
 static void	tty_cursor_sync(void);
 static void	tty_cursor_program(uint16_t);
+static void	tty_cursor_show(bool);
 static void	tty_scroll(void);
+static void	tty_linefeed(void);
 static uint16_t	tty_cell(char);
 static void	tty_putc_vga(char);
 static void	tty_ground_put(char);
@@ -190,8 +228,17 @@ tty_init(void)
 	tty_saved_attr   = tty_attr_default;
 	tty_saved_wrap   = false;
 	tty_have_saved   = false;
+	tty_scroll_top   = 0;
+	tty_scroll_bot   = TTY_ROWS - 1;
 	csi_state        = TTY_S_GROUND;
 	tty_csi_reset();
+	/*
+	 * Whatever the firmware left the cursor register saying, this
+	 * driver's opinion is "visible" -- so force the write rather than
+	 * let the cached flag agree with a state nobody set.
+	 */
+	tty_cursor_visible = false;
+	tty_cursor_show(true);
 	/*
 	 * Force the first sync: 0xFFFF is not a cell any 80x25 screen has,
 	 * so tty_clear's move to the home position cannot be mistaken for
@@ -352,6 +399,34 @@ tty_batch_end(void)
 		    tty_col));
 	if (locked)
 		spin_unlock(&tty_lock);
+}
+
+/*
+ * Draw the underline, or stop drawing it.
+ *
+ * The scan-line-start register holds the top row of the cursor glyph in
+ * its low bits and the disable bit at 0x20, so this is a read-modify-
+ * write rather than a store: clobbering the shape while turning the
+ * cursor back on would leave a cursor that is visible and the wrong
+ * height, which looks like a different bug entirely.
+ */
+static void
+tty_cursor_show(bool on)
+{
+	uint8_t	v;
+
+	if (on == tty_cursor_visible)
+		return;
+	tty_cursor_visible = on;
+
+	outb(VGA_CRTC_INDEX, VGA_CRTC_CURSOR_START);
+	v = inb(VGA_CRTC_DATA);
+	if (on)
+		v = (uint8_t)(v & (uint8_t)~VGA_CURSOR_DISABLE);
+	else
+		v = (uint8_t)(v | VGA_CURSOR_DISABLE);
+	outb(VGA_CRTC_INDEX, VGA_CRTC_CURSOR_START);
+	outb(VGA_CRTC_DATA, v);
 }
 
 /*
@@ -532,7 +607,7 @@ tty_ground_put(char ch)
 	case '\n':
 		tty_wrap_pending = false;
 		tty_col = 0;
-		tty_row++;
+		tty_linefeed();
 		break;
 	case '\r':
 		tty_wrap_pending = false;
@@ -569,9 +644,7 @@ tty_ground_put(char ch)
 			if (tty_wrap_pending) {
 				tty_wrap_pending = false;
 				tty_col = 0;
-				tty_row++;
-				if (tty_row >= TTY_ROWS)
-					tty_scroll();
+				tty_linefeed();
 			}
 			tty_putcell(tty_col, tty_row, ch);
 			if (tty_col + 1 >= TTY_COLS)
@@ -581,9 +654,6 @@ tty_ground_put(char ch)
 		}
 		break;
 	}
-
-	if (tty_row >= TTY_ROWS)
-		tty_scroll();
 }
 
 /* ---- CSI final-byte handlers ----------------------------------------- */
@@ -654,18 +724,23 @@ tty_csi_dispatch(char final)
 {
 	uint16_t	n;
 	uint16_t	row, col;
+	uint16_t	margin_top, margin_bot;
 	size_t		cur_off;
 	size_t		row_lo;
 	size_t		row_hi;
 
 	/*
-	 * Refuse DEC private sequences for now -- we don't implement any
-	 * (no DECCKM / DECTCEM cursor visibility, no application keypad).
-	 * Drop quietly so xterm-style apps that probe with "ESC [ ? 25 h"
-	 * don't get their probe bytes blitted as garbage cells.
+	 * DEC private sequences.  Only DECTCEM is answered; the rest drop
+	 * quietly, so an xterm-style program probing for application
+	 * keypad or bracketed paste gets no reply rather than its probe
+	 * bytes blitted across the screen as garbage cells.
 	 */
-	if (csi_private)
+	if (csi_private) {
+		if ((final == 'h' || final == 'l') && csi_nparam == 1 &&
+		    csi_params[0] == 25)
+			tty_cursor_show(final == 'h');
 		return;
+	}
 
 	/*
 	 * Anything that positions the cursor or erases under it disarms
@@ -764,6 +839,33 @@ tty_csi_dispatch(char final)
 
 	case 'm':
 		csi_apply_sgr();
+		return;
+
+	case 'r':
+		/*
+		 * DECSTBM.  One-based and inclusive on the wire; a region
+		 * that would be empty or inverted is treated as "no region"
+		 * rather than honoured into a screen that cannot scroll,
+		 * which is what a VT does with the same input and what keeps
+		 * a typo in a program from wedging the console.
+		 *
+		 * The cursor goes home to the top-left of the SCREEN, not of
+		 * the region -- origin mode is not implemented, so a caller
+		 * that wants to be inside its region says so with a CUP.
+		 */
+		margin_top = csi_param_or(0, 1);
+		margin_bot = csi_param_or(1, TTY_ROWS);
+		if (margin_bot > TTY_ROWS)
+			margin_bot = TTY_ROWS;
+		if (margin_top < 1 || margin_top >= margin_bot) {
+			margin_top = 1;
+			margin_bot = TTY_ROWS;
+		}
+		tty_scroll_top   = (uint16_t)(margin_top - 1);
+		tty_scroll_bot   = (uint16_t)(margin_bot - 1);
+		tty_row          = 0;
+		tty_col          = 0;
+		tty_wrap_pending = false;
 		return;
 
 	case 's':
@@ -1031,6 +1133,128 @@ tty_wrap_selftest(void)
 	    "and a full bottom row does not scroll on its own\n");
 }
 
+/*
+ * Push the screen up by `n` rows from inside the region, the way a
+ * command's output does: sit on the last row and emit newlines.
+ */
+static void
+tty_push(uint16_t n)
+{
+	uint16_t	i;
+
+	kprintf("\x1b[%u;1H", (unsigned)TTY_ROWS);
+	tty_batch_begin();
+	for (i = 0; i < n; i++)
+		tty_putc('\n');
+	tty_batch_end();
+}
+
+void
+tty_region_selftest(void)
+{
+	uint8_t	reg;
+
+	/*
+	 * 1. A header above the top margin survives a screenful of
+	 *    scrolling.
+	 *
+	 *    This is the claim that matters, and it is the exact shape of
+	 *    the bug that started this: sh.elf painted a status bar on row
+	 *    zero, and the first command whose output reached the bottom
+	 *    of the screen carried the bar off the top.  Thirty newlines
+	 *    is more than a screenful, so a console that scrolls
+	 *    everything cannot possibly still have the header.
+	 */
+	tty_clear();
+	tty_fill_row(0, 4, 'H');
+	tty_puts("\x1b[3;25r");
+	tty_push(TTY_ROWS + 5);
+	if (tty_glyph_at(0, 0) != 'H' || tty_glyph_at(0, 3) != 'H') {
+		tty_puts("\x1b[r");
+		tty_clear();
+		kprintf("tty-region: FAIL the header above the top margin was "
+		    "scrolled away\n");
+		return;
+	}
+
+	/*
+	 * 2. And the region really did scroll -- a header that survives
+	 *    because nothing moved at all would pass the check above and
+	 *    mean the opposite of what it claims.
+	 */
+	tty_puts("\x1b[3;1Hmark");
+	tty_push(3);
+	if (tty_glyph_at(2, 0) == 'm') {
+		tty_puts("\x1b[r");
+		tty_clear();
+		kprintf("tty-region: FAIL nothing scrolled inside the region "
+		    "either -- the header survived a console that had "
+		    "stopped moving\n");
+		return;
+	}
+
+	/*
+	 * 3. Row two -- the last row above the margin -- is untouched too,
+	 *    so the frozen area is the whole area asked for and not just
+	 *    its first row.
+	 */
+	tty_fill_row(1, 4, 'G');
+	tty_push(TTY_ROWS + 5);
+	if (tty_glyph_at(1, 0) != 'G') {
+		tty_puts("\x1b[r");
+		tty_clear();
+		kprintf("tty-region: FAIL only the first frozen row was "
+		    "actually frozen\n");
+		return;
+	}
+
+	/*
+	 * 4. Giving the region back makes the top rows ordinary again.  A
+	 *    console that froze rows and could not thaw them would be a
+	 *    worse bargain than one that never froze any.
+	 */
+	tty_puts("\x1b[r");
+	tty_push(TTY_ROWS + 5);
+	if (tty_glyph_at(0, 0) == 'H') {
+		tty_clear();
+		kprintf("tty-region: FAIL the top rows stayed frozen after "
+		    "the region was reset\n");
+		return;
+	}
+
+	/*
+	 * 5. DECTCEM reaches the hardware.  Read the cursor-start register
+	 *    back and look at the disable bit -- asking the driver whether
+	 *    it thinks the cursor is hidden would pass with the port write
+	 *    missing entirely.
+	 */
+	tty_puts("\x1b[?25l");
+	outb(VGA_CRTC_INDEX, VGA_CRTC_CURSOR_START);
+	reg = inb(VGA_CRTC_DATA);
+	if ((reg & VGA_CURSOR_DISABLE) == 0) {
+		tty_puts("\x1b[?25h");
+		tty_clear();
+		kprintf("tty-region: FAIL hiding the cursor left the CRTC "
+		    "disable bit clear (register 10 = 0x%x)\n", (unsigned)reg);
+		return;
+	}
+	tty_puts("\x1b[?25h");
+	outb(VGA_CRTC_INDEX, VGA_CRTC_CURSOR_START);
+	reg = inb(VGA_CRTC_DATA);
+	if ((reg & VGA_CURSOR_DISABLE) != 0) {
+		tty_clear();
+		kprintf("tty-region: FAIL showing the cursor again left it "
+		    "disabled (register 10 = 0x%x)\n", (unsigned)reg);
+		return;
+	}
+
+	tty_clear();
+	kprintf("tty-region: PASS -- rows above the top margin survived two "
+	    "screenfuls of scrolling while the region underneath moved, "
+	    "resetting the margins thawed them, and DECTCEM reached the "
+	    "CRTC disable bit\n");
+}
+
 void
 tty_puts(const char *s)
 {
@@ -1067,17 +1291,41 @@ tty_scroll(void)
 	uint16_t	blank;
 	size_t		i, top, bot;
 
-	top = 0;
-	bot = (size_t)(TTY_ROWS - 1) * TTY_COLS;
+	/*
+	 * Only the rows between the margins move.  With the margins at
+	 * their defaults that is the whole screen, so this is the same
+	 * scroll it always was -- until a program asks for a header.
+	 */
+	top = (size_t)tty_scroll_top * TTY_COLS;
+	bot = (size_t)tty_scroll_bot * TTY_COLS;
 
 	for (i = top; i < bot; i++)
 		VGA_BASE[i] = VGA_BASE[i + TTY_COLS];
 
 	blank = tty_cell(' ');
-	for (i = bot; i < VGA_CELLS; i++)
+	for (i = bot; i < bot + TTY_COLS; i++)
 		VGA_BASE[i] = blank;
 
-	tty_row = TTY_ROWS - 1;
+	tty_row = tty_scroll_bot;
+}
+
+/*
+ * Move down one row, scrolling only if the cursor is standing on the
+ * bottom margin.
+ *
+ * A cursor below the region -- which can happen, since CUP addresses
+ * the screen rather than the region -- walks down to the last row and
+ * stops there.  That is what a VT does, and it means a program that
+ * paints outside the region cannot scroll the region by accident.
+ */
+static void
+tty_linefeed(void)
+{
+
+	if (tty_row == tty_scroll_bot)
+		tty_scroll();
+	else if (tty_row + 1 < TTY_ROWS)
+		tty_row++;
 }
 
 static uint16_t
