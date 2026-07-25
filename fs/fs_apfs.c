@@ -292,6 +292,8 @@ static uint64_t	 cow_n_spine;	/* spine objects copied            */
 static uint64_t	 cow_n_data;	/* file blocks moved by a write    */
 static uint64_t	 split_n;	/* nodes split in two              */
 static uint64_t	 merge_n;	/* appends that lengthened a run   */
+static uint64_t	 short_n;	/* records shortened by a truncate */
+static uint64_t	 drop_n;	/* ...and records taken out of it  */
 
 static size_t
 str_len(const char *s)
@@ -3286,6 +3288,78 @@ leaf_insert(uint8_t *node, uint32_t pos, const void *key, uint32_t klen,
 }
 
 /*
+ * Take a record OUT of a variable-KV node.
+ *
+ * Its bytes do not go back to the free span.  That span is one stretch in the
+ * middle of the node, with the keys growing up into it and the values growing
+ * down; a record removed from anywhere but the very edge leaves a hole that is
+ * not next to it.  What the format keeps instead is a CHAIN -- the hole holds
+ * an nloc naming the next hole and its own length, and the node header holds
+ * the head of the chain and the total it comes to.
+ *
+ * That total is checked, which is how this was settled before it was written:
+ * deleting a record on a copy of the image without threading its bytes onto
+ * the chain makes apfsck answer "B-tree: wrong free space total for key area",
+ * and threading them on makes it silent.  The value side is the same chain
+ * measured backwards from the end of the node, exactly as the values are.
+ *
+ * The room this returns is not room a later insert can use: leaf_insert takes
+ * from the free span and only from there.  A node that has had records deleted
+ * therefore fills sooner than its free byte count suggests, which is the
+ * simple half of the format and the half a tree this young can afford.
+ */
+static int
+leaf_delete(uint8_t *node, uint32_t pos)
+{
+	struct apfs_btree_node_phys	*n;
+	struct btree_layout		 bl;
+	struct apfs_kvloc		*kv;
+	struct apfs_nloc		*hole;
+	uint32_t			 koff, klen, voff, vlen;
+	uint32_t			 i;
+
+	n = (struct apfs_btree_node_phys *)node;
+	btree_layout(node, &bl);
+	if (bl.bl_fixed || pos >= bl.bl_nkeys)
+		return (FS_APFS_E_INVAL);
+	btree_entry_loc(&bl, pos, &koff, &klen, &voff, &vlen);
+
+	/*
+	 * A hole has to be big enough to say where the next one is.  Nothing
+	 * this kernel deletes is that small -- its shortest key is eight bytes
+	 * and its shortest value four -- but a hole that cannot hold its own
+	 * link would corrupt the chain instead of extending it.
+	 */
+	if (klen < sizeof(*hole) || vlen < sizeof(*hole)) {
+		kprintf("apfs: a %u-byte key and %u-byte value cannot be put "
+		    "on a free list whose links are %u bytes\n",
+		    (unsigned)klen, (unsigned)vlen, (unsigned)sizeof(*hole));
+		return (FS_APFS_E_INVAL);
+	}
+
+	hole = (struct apfs_nloc *)((uint8_t *)bl.bl_keys + koff);
+	hole->nl_off = n->btn_key_free_list.nl_off;
+	hole->nl_len = (uint16_t)klen;
+	n->btn_key_free_list.nl_off = (uint16_t)koff;
+	n->btn_key_free_list.nl_len =
+	    (uint16_t)(n->btn_key_free_list.nl_len + klen);
+
+	hole = (struct apfs_nloc *)((uint8_t *)bl.bl_vals - voff);
+	hole->nl_off = n->btn_val_free_list.nl_off;
+	hole->nl_len = (uint16_t)vlen;
+	n->btn_val_free_list.nl_off = (uint16_t)voff;
+	n->btn_val_free_list.nl_len =
+	    (uint16_t)(n->btn_val_free_list.nl_len + vlen);
+
+	kv = (struct apfs_kvloc *)(node + APFS_BTNODE_HDR_SIZE +
+	    n->btn_table_space.nl_off);
+	for (i = pos; i + 1 < bl.bl_nkeys; i++)
+		kv[i] = kv[i + 1];
+	n->btn_nkeys--;
+	return (FS_APFS_E_OK);
+}
+
+/*
  * How many records a tree holds is written ONCE, in the btree_info at the end
  * of its root node -- not in the leaf the record went into.  So an insert into
  * a leaf moves two nodes, and the root is the second.
@@ -3394,6 +3468,81 @@ extref_extend(uint64_t start, uint64_t extra, uint64_t xid, void *buf)
 			return (FS_APFS_E_INVAL);
 		pv = (struct apfs_phys_ext_val *)(bl.bl_vals - voff);
 		pv->pe_len_and_kind += extra;
+		rv = cow_physical(g_apfs.ac_extref_bno, xid, buf, &new_bno);
+		if (rv != FS_APFS_E_OK)
+			return (rv);
+		g_apfs.ac_extref_bno = new_bno;
+		return (FS_APFS_E_OK);
+	}
+	return (FS_APFS_E_NOTFOUND);
+}
+
+/*
+ * A run has lost blocks off its END, or lost all of them: say so in the extent
+ * reference tree.
+ *
+ * The key is where the run STARTS, and a truncation only ever moves its end,
+ * so a shortened record does not re-sort and the edit is a length in place --
+ * the same shape, and the same reason, as extref_extend.
+ *
+ * Leaving it out is not a leak nobody notices.  apfsck recomputes what the
+ * volume owns from exactly these records, and a copy of the image whose file
+ * extent had been shortened but whose reference had not drew "Physical extent
+ * record: bad reference count" -- measured, before this existed.
+ *
+ * A run somebody else also names is refused rather than quietly de-referenced.
+ * Nothing in this kernel makes one yet; a clone would, and the difference
+ * between shortening a run and dropping one reference to it is the whole of
+ * what a clone is.
+ */
+static int
+extref_shrink(uint64_t start, uint64_t keep, uint64_t xid, void *buf,
+    bool *dropped)
+{
+	struct apfs_phys_ext_val	*pv;
+	struct btree_layout		 bl;
+	uint8_t				*node;
+	uint64_t			 raw;
+	uint64_t			 new_bno;
+	uint32_t			 koff, klen, voff, vlen;
+	uint32_t			 i;
+	int				 rv;
+
+	*dropped = false;
+	rv = fs_apfs_read_block(g_apfs.ac_extref_bno, buf);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	node = buf;
+	btree_layout(node, &bl);
+	if (bl.bl_level != 0 || bl.bl_fixed)
+		return (FS_APFS_E_INVAL);
+
+	for (i = 0; i < bl.bl_nkeys; i++) {
+		btree_entry_loc(&bl, i, &koff, &klen, &voff, &vlen);
+		raw = *(const uint64_t *)(bl.bl_keys + koff);
+		if ((raw >> APFS_J_OBJ_TYPE_SHIFT) != APFS_TYPE_EXTENT)
+			continue;
+		if ((raw & APFS_J_OBJ_ID_MASK) != start)
+			continue;
+		if (vlen < sizeof(*pv))
+			return (FS_APFS_E_INVAL);
+		pv = (struct apfs_phys_ext_val *)(bl.bl_vals - voff);
+		if (pv->pe_refcnt != 1) {
+			kprintf("apfs: the run at %llu is named %d times -- "
+			    "shortening a shared run is a different rung\n",
+			    (unsigned long long)start, (int)pv->pe_refcnt);
+			return (FS_APFS_E_NOALLOC);
+		}
+		if (keep == 0) {
+			rv = leaf_delete(node, i);
+			if (rv != FS_APFS_E_OK)
+				return (rv);
+			tree_count_add(node, -1);
+			*dropped = true;
+		} else
+			pv->pe_len_and_kind =
+			    (pv->pe_len_and_kind & ~APFS_PEXT_LEN_MASK) | keep;
+
 		rv = cow_physical(g_apfs.ac_extref_bno, xid, buf, &new_bno);
 		if (rv != FS_APFS_E_OK)
 			return (rv);
@@ -4278,6 +4427,430 @@ fs_apfs_grow(uint64_t ino, uint64_t id, uint64_t new_size)
 
 	full = 0;
 	return (grow_once(ino, id, new_size, &full));
+}
+
+/*
+ * The records a truncation has to touch: every one whose run reaches past
+ * where the file is about to end.
+ *
+ * Bounded, because the collecting happens inside a tree walk and the walk's
+ * callback has nowhere to allocate from.  A file with more runs than this past
+ * its new end is refused out loud rather than shortened halfway.
+ */
+#define	APFS_TRUNC_MAX	8
+
+struct extent_cut {
+	uint64_t	ec_id;			/* the dstream being cut  */
+	uint64_t	ec_keep;		/* bytes of run to retain */
+	uint64_t	ec_logical[APFS_TRUNC_MAX];
+	uint64_t	ec_len[APFS_TRUNC_MAX];
+	uint64_t	ec_phys[APFS_TRUNC_MAX];
+	uint64_t	ec_bno[APFS_TRUNC_MAX];
+	uint32_t	ec_n;
+	bool		ec_over;
+};
+
+static bool
+extent_cut_pick(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
+    const uint8_t *val, uint32_t vlen, uint64_t bno, void *arg)
+{
+	const struct apfs_file_extent_val	*fe;
+	struct extent_cut			*ec;
+	uint64_t				 logical;
+	uint64_t				 len;
+
+	ec = arg;
+	if (type != APFS_TYPE_FILE_EXTENT || oid != ec->ec_id)
+		return (true);
+	if (klen < 16 || vlen < sizeof(*fe))
+		return (true);
+	logical = *(const uint64_t *)(key + 8);
+	fe      = (const struct apfs_file_extent_val *)val;
+	len     = fe->fe_len_and_flags & APFS_FILE_EXTENT_LEN_MASK;
+	if (logical + len <= ec->ec_keep)
+		return (true);
+	if (ec->ec_n >= APFS_TRUNC_MAX) {
+		ec->ec_over = true;
+		return (false);
+	}
+	ec->ec_logical[ec->ec_n] = logical;
+	ec->ec_len[ec->ec_n]     = len;
+	ec->ec_phys[ec->ec_n]    = fe->fe_phys_block_num;
+	ec->ec_bno[ec->ec_n]     = bno;
+	ec->ec_n++;
+	return (true);
+}
+
+/*
+ * Make a file shorter.
+ *
+ * The mirror of fs_apfs_grow, and the ladder it climbs was measured against
+ * apfsck on a copy of this container before a line of it was written.  Every
+ * rung is an obligation, and the checker names the one that is missing:
+ *
+ *	the file's own extent record and the length in its inode
+ *		-- and nothing complains yet, which is the trap
+ *	...and the record in the extent reference tree
+ *		"Physical extent record: bad reference count"
+ *	...and apfs_fs_alloc_count, the volume's own block count
+ *		"Volume superblock: bad block count"
+ *	...and the blocks themselves, given back
+ *		"Space manager: bad allocation bitmap"
+ *	...and, for a record removed outright, its key and value bytes
+ *	   threaded onto the node's free lists
+ *		"B-tree: wrong free space total for key area"
+ *
+ * The first rung is the one worth remembering: a truncate that shortens only
+ * the file's own record leaves a container the checker still calls valid on
+ * three of its five questions, and a reader still reads the file correctly.
+ * The damage is entirely in what nobody is asked.
+ *
+ * The blocks go to the free QUEUE rather than straight back to the bitmap, and
+ * this is what the queue is for: checkpoints still on the platter name the
+ * leaf this one is about to replace, and that leaf still names these blocks.
+ * Clearing their bits now would let the next allocation overwrite bytes an
+ * older checkpoint promises.  fq_release hands them back when no checkpoint
+ * that could still be read names them.
+ *
+ * Cutting inside a block costs nothing but a length.  A file of 12235 bytes
+ * shortened to 12000 keeps all three of its blocks, because its allocation was
+ * always the size rounded up to a block and still is; that falls out of
+ * rounding the new size up here rather than being a case anybody wrote.
+ */
+int
+fs_apfs_truncate(uint64_t ino, uint64_t id, uint64_t new_size)
+{
+	struct apfs_file_extent_val	*fe;
+	struct apfs_dstream		*ds;
+	struct apfs_inode_val		*iv;
+	struct apfs_xf_blob		*blob;
+	struct apfs_x_field		*xf;
+	struct apfs_obj_phys		*o;
+	struct btree_layout		 bl;
+	struct extent_cut		 ec;
+	struct inode_info		 ii;
+	struct inode_locate		 il;
+	uint8_t				*node;
+	const uint8_t			*k;
+	uint64_t			 hold[APFS_TRUNC_MAX];	/* bytes kept */
+	uint64_t			 gone[APFS_TRUNC_MAX];	/* first block */
+	uint64_t			 ngone[APFS_TRUNC_MAX];	/* ...how many */
+	uint64_t			 oids[2];
+	uint64_t			 paddrs[2];
+	uint64_t			 keep;
+	uint64_t			 freed;
+	uint64_t			 raw;
+	uint64_t			 xid;
+	uint64_t			 ino_leaf;
+	uint64_t			 new_leaf;
+	uint64_t			 new_root;
+	uint64_t			 root_bno;
+	uint32_t			 koff, klen, voff, vlen;
+	uint32_t			 ent, data, nexts;
+	uint32_t			 dropped;
+	uint32_t			 nmoved;
+	uint32_t			 pos;
+	uint32_t			 i;
+	int				 rv;
+	bool				 stopped;
+	bool				 shed;
+
+	if (!g_apfs.ac_mounted)
+		return (FS_APFS_E_NOMOUNT);
+	if (!g_apfs.ac_ip_valid || g_apfs.ac_ctr_omap_tree == 0)
+		return (FS_APFS_E_NOALLOC);
+	if (inode_info(ino, &ii) != FS_APFS_E_OK)
+		return (FS_APFS_E_NOTFOUND);
+	if (new_size >= ii.ii_size)
+		return (FS_APFS_E_OK);
+
+	keep = (new_size + APFS_BLOCK_SIZE - 1) &
+	    ~(uint64_t)(APFS_BLOCK_SIZE - 1);
+	xid  = g_apfs.ac_xid + 1;
+
+	ec.ec_id   = id;
+	ec.ec_keep = keep;
+	ec.ec_n    = 0;
+	ec.ec_over = false;
+	stopped    = false;
+	if (!btree_walk(g_apfs.ac_root_tree_bno, extent_cut_pick, &ec, 0,
+	    &stopped))
+		return (FS_APFS_E_IO);
+	if (ec.ec_over) {
+		kprintf("apfs: inode %llu has more than %u runs past %llu -- "
+		    "cutting that many at once is a different rung\n",
+		    (unsigned long long)ino, (unsigned)APFS_TRUNC_MAX,
+		    (unsigned long long)new_size);
+		return (FS_APFS_E_NOALLOC);
+	}
+
+	il.il_oid   = ino;
+	il.il_bno   = 0;
+	il.il_found = false;
+	stopped     = false;
+	if (!btree_walk(g_apfs.ac_root_tree_bno, inode_locate, &il, 0,
+	    &stopped))
+		return (FS_APFS_E_IO);
+	if (!il.il_found)
+		return (FS_APFS_E_NOTFOUND);
+	ino_leaf = il.il_bno;
+
+	/*
+	 * Every record that moves has to move in ONE copy of ONE node: two
+	 * copies of the same leaf in a transaction would leave the second
+	 * replacing a node the first had already released.  A file whose runs
+	 * are spread wider than its own inode's leaf is refused, out loud,
+	 * before anything has been changed.
+	 */
+	for (i = 0; i < ec.ec_n; i++) {
+		if (ec.ec_bno[i] == ino_leaf)
+			continue;
+		kprintf("apfs: inode %llu keeps a run in leaf %llu and its "
+		    "inode in %llu -- cutting across two leaves is a different "
+		    "rung\n", (unsigned long long)ino,
+		    (unsigned long long)ec.ec_bno[i],
+		    (unsigned long long)ino_leaf);
+		return (FS_APFS_E_NOALLOC);
+	}
+
+	/*
+	 * And every block about to be given back has to be in a chunk this
+	 * kernel can reach, asked NOW rather than when the giving back happens:
+	 * by then the leaf has moved and there is nothing left to refuse.
+	 */
+	freed = 0;
+	for (i = 0; i < ec.ec_n; i++) {
+		hold[i]  = (ec.ec_logical[i] < keep) ?
+		    keep - ec.ec_logical[i] : 0;
+		gone[i]  = ec.ec_phys[i] + hold[i] / APFS_BLOCK_SIZE;
+		ngone[i] = (ec.ec_len[i] - hold[i]) / APFS_BLOCK_SIZE;
+		freed   += ngone[i];
+		if (ngone[i] == 0 || chunk_for(gone[i]) != NULL)
+			continue;
+		kprintf("apfs: the %llu blocks at %llu are in a chunk this "
+		    "kernel does not hold -- cannot give them back\n",
+		    (unsigned long long)ngone[i], (unsigned long long)gone[i]);
+		return (FS_APFS_E_NOALLOC);
+	}
+
+	node = kmalloc(APFS_BLOCK_SIZE);
+	if (node == NULL)
+		return (FS_APFS_E_NOMEM);
+	rv = fs_apfs_read_block(ino_leaf, node);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+
+	/*
+	 * The records, in that one copy.  Each is found by its KEY and not by
+	 * a slot number remembered from the walk: a delete slides every entry
+	 * after it down one, and a second pass trusting the old numbering would
+	 * shorten whatever had moved into the place.
+	 */
+	dropped = 0;
+	for (i = 0; i < ec.ec_n; i++) {
+		btree_layout(node, &bl);
+		rv = FS_APFS_E_NOTFOUND;
+		for (pos = 0; pos < bl.bl_nkeys; pos++) {
+			btree_entry_loc(&bl, pos, &koff, &klen, &voff, &vlen);
+			if (klen < 16 || vlen < sizeof(*fe))
+				continue;
+			k   = bl.bl_keys + koff;
+			raw = *(const uint64_t *)k;
+			if ((raw & APFS_J_OBJ_ID_MASK) !=
+			    (id & APFS_J_OBJ_ID_MASK))
+				continue;
+			if ((uint32_t)(raw >> APFS_J_OBJ_TYPE_SHIFT) !=
+			    APFS_TYPE_FILE_EXTENT)
+				continue;
+			if (*(const uint64_t *)(k + 8) != ec.ec_logical[i])
+				continue;
+			if (hold[i] == 0) {
+				rv = leaf_delete(node, pos);
+				if (rv != FS_APFS_E_OK)
+					goto out;
+				dropped++;
+			} else {
+				fe = (struct apfs_file_extent_val *)
+				    (bl.bl_vals - voff);
+				fe->fe_len_and_flags =
+				    (fe->fe_len_and_flags &
+				    ~APFS_FILE_EXTENT_LEN_MASK) | hold[i];
+				short_n++;
+				rv = FS_APFS_E_OK;
+			}
+			break;
+		}
+		if (rv != FS_APFS_E_OK) {
+			kprintf("apfs: the run at file offset %llu is gone -- "
+			    "cannot shorten it\n",
+			    (unsigned long long)ec.ec_logical[i]);
+			goto out;
+		}
+	}
+
+	/* And the length, in the inode record inside the same copy. */
+	btree_layout(node, &bl);
+	rv = FS_APFS_E_NOTFOUND;
+	for (i = 0; i < bl.bl_nkeys; i++) {
+		btree_entry_loc(&bl, i, &koff, &klen, &voff, &vlen);
+		k   = bl.bl_keys + koff;
+		raw = *(const uint64_t *)k;
+		if ((raw & APFS_J_OBJ_ID_MASK) != ino)
+			continue;
+		if ((uint32_t)(raw >> APFS_J_OBJ_TYPE_SHIFT) != APFS_TYPE_INODE)
+			continue;
+		iv = (struct apfs_inode_val *)(bl.bl_vals - voff);
+		if (vlen < sizeof(*iv) + sizeof(*blob))
+			break;
+		blob  = (struct apfs_xf_blob *)((uint8_t *)iv + sizeof(*iv));
+		nexts = blob->xb_num_exts;
+		ent   = (uint32_t)(sizeof(*iv) + sizeof(*blob));
+		data  = ent + nexts * (uint32_t)sizeof(*xf);
+		if (data > vlen)
+			break;
+		for (pos = 0; pos < nexts; pos++) {
+			xf = (struct apfs_x_field *)((uint8_t *)iv + ent +
+			    pos * sizeof(*xf));
+			if (xf->xf_size > vlen - data)
+				break;
+			if (xf->xf_type == APFS_INO_EXT_TYPE_DSTREAM &&
+			    xf->xf_size >= sizeof(*ds)) {
+				ds = (struct apfs_dstream *)((uint8_t *)iv +
+				    data);
+				ds->ds_size         = new_size;
+				ds->ds_alloced_size = keep;
+				rv = FS_APFS_E_OK;
+			}
+			data += ((uint32_t)xf->xf_size + 7u) & ~7u;
+			if (data > vlen)
+				break;
+		}
+		break;
+	}
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs: inode %llu has no dstream to shorten\n",
+		    (unsigned long long)ino);
+		goto out;
+	}
+
+	/* The leaf moves, and so does the root whose count a delete changed. */
+	o = (struct apfs_obj_phys *)node;
+	oids[0] = o->o_oid;
+	rv = alloc_blocks(1, ino_leaf, &new_leaf);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	o->o_xid = xid;
+	rv = fs_apfs_write_block(new_leaf, node);
+	if (rv != FS_APFS_E_OK) {
+		(void)free_blocks(new_leaf, 1);
+		goto out;
+	}
+	rv = free_blocks(ino_leaf, 1);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	cow_n_spine++;
+	paddrs[0] = new_leaf;
+	nmoved    = 1;
+
+	root_bno = g_apfs.ac_root_tree_bno;
+	if (dropped != 0 && oids[0] != g_apfs.ac_root_tree_oid) {
+		rv = fs_apfs_read_block(root_bno, node);
+		if (rv != FS_APFS_E_OK)
+			goto broken;
+		tree_count_add(node, -(int64_t)dropped);
+		o = (struct apfs_obj_phys *)node;
+		oids[1] = o->o_oid;
+		rv = alloc_blocks(1, root_bno, &new_root);
+		if (rv != FS_APFS_E_OK)
+			goto broken;
+		o->o_xid = xid;
+		rv = fs_apfs_write_block(new_root, node);
+		if (rv != FS_APFS_E_OK) {
+			(void)free_blocks(new_root, 1);
+			goto broken;
+		}
+		rv = free_blocks(root_bno, 1);
+		if (rv != FS_APFS_E_OK)
+			goto broken;
+		cow_n_spine++;
+		paddrs[1] = new_root;
+		nmoved    = 2;
+		g_apfs.ac_root_tree_bno = new_root;
+	} else if (dropped != 0) {
+		/* One node that is both root and leaf: already moved above. */
+		rv = fs_apfs_read_block(new_leaf, node);
+		if (rv != FS_APFS_E_OK)
+			goto broken;
+		tree_count_add(node, -(int64_t)dropped);
+		rv = fs_apfs_write_block(new_leaf, node);
+		if (rv != FS_APFS_E_OK)
+			goto broken;
+		g_apfs.ac_root_tree_bno = new_leaf;
+	}
+	drop_n += dropped;
+
+	/* What the runs are now, in the tree that answers for the blocks. */
+	for (i = 0; i < ec.ec_n; i++) {
+		if (ngone[i] == 0)
+			continue;
+		shed = false;
+		rv = extref_shrink(ec.ec_phys[i], hold[i] / APFS_BLOCK_SIZE,
+		    xid, node, &shed);
+		if (rv != FS_APFS_E_OK) {
+			kprintf("apfs: the run at %llu lost %llu blocks but "
+			    "the extent reference tree still calls it %llu "
+			    "(%d)\n", (unsigned long long)ec.ec_phys[i],
+			    (unsigned long long)ngone[i],
+			    (unsigned long long)(ec.ec_len[i] /
+			    APFS_BLOCK_SIZE), rv);
+			goto broken;
+		}
+	}
+
+	/* The blocks, to the queue that knows when they are really free. */
+	for (i = 0; i < ec.ec_n; i++) {
+		if (ngone[i] == 0)
+			continue;
+		rv = free_blocks(gone[i], (uint32_t)ngone[i]);
+		if (rv != FS_APFS_E_OK) {
+			kprintf("apfs: the %llu blocks at %llu will not go "
+			    "back (%d)\n", (unsigned long long)ngone[i],
+			    (unsigned long long)gone[i], rv);
+			goto broken;
+		}
+	}
+
+	/*
+	 * The volume owns fewer blocks than it did, and it says so itself.
+	 * Set before the spine copies the superblock that carries it, because
+	 * that copy is the only chance to write it -- the same order, and the
+	 * same reason, as growing.
+	 */
+	g_apfs.ac_fs_alloc_count -= freed;
+
+	rv = spine_update_n(oids, paddrs, nmoved, 0, 0, xid, node);
+	if (rv != FS_APFS_E_OK)
+		goto broken;
+	if (oids[0] == g_apfs.ac_root_tree_oid)
+		g_apfs.ac_root_tree_bno = new_leaf;
+	kprintf("apfs: inode %llu cut to %llu bytes -- %u run(s) shortened, "
+	    "%u dropped, %llu block(s) queued for release\n",
+	    (unsigned long long)ino, (unsigned long long)new_size,
+	    (unsigned)(ec.ec_n - dropped), (unsigned)dropped,
+	    (unsigned long long)freed);
+	kfree(node);
+	return (FS_APFS_E_OK);
+
+out:
+	kfree(node);
+	return (rv);
+
+broken:
+	kprintf("apfs: cutting inode %llu failed after the leaf had moved "
+	    "(%d) -- this checkpoint must not be written\n",
+	    (unsigned long long)ino, rv);
+	kfree(node);
+	return (rv);
 }
 
 int
@@ -6825,6 +7398,20 @@ fs_apfs_merges(void)
 {
 
 	return (merge_n);
+}
+
+uint64_t
+fs_apfs_shortens(void)
+{
+
+	return (short_n);
+}
+
+uint64_t
+fs_apfs_drops(void)
+{
+
+	return (drop_n);
 }
 
 int

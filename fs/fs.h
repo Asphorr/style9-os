@@ -216,6 +216,22 @@ int		fs_pread(struct fs_handle *h, uint64_t off, uint8_t *buf,
 int		fs_pwrite(struct fs_handle *h, uint64_t off,
 		    const uint8_t *buf, uint32_t len, uint32_t *out_put);
 
+/*
+ * Set a resolved file's length, in either direction, and stamp it.
+ *
+ * Shorter is the interesting one: the runs past the new end are shortened or
+ * their records removed outright, and their blocks go back.  Longer is the
+ * same call the write path already makes when a write runs off the end, so
+ * the new bytes read as zeroes -- which is what POSIX says an extending
+ * truncate produces, and is here because the blocks are zeroed on the way out
+ * of the allocator rather than because anybody wrote a special case.
+ *
+ * The handle's length is updated, and the volume's generation moves, so every
+ * other handle open on the file finds out.  A backend that cannot write at all
+ * answers FS_E_ROFS.
+ */
+int		fs_truncate(struct fs_handle *h, uint64_t new_size);
+
 /* Metadata for a path.  Returns FS_E_OK and fills *out, or a negative FS_E_*. */
 int		fs_stat(const char *path, struct fs_statbuf *out);
 
@@ -270,12 +286,27 @@ void		fs_ckpt_selftest(void);
 void		fs_data_selftest(void);
 
 /*
- * Prove that a file can get longer and stay longer.  Grows the file once, on
- * the first boot that finds it still a whole number of blocks; every boot
- * after that checks the length and the appended bytes survived instead.
- * Silently does nothing when the volume is not APFS.
+ * Prove that a file can get longer and stay longer.  Grows the file back to
+ * the length the truncate test cut it to on the previous boot, and checks the
+ * bytes read back.  Silently does nothing when the volume is not APFS.
  */
 void		fs_grow_selftest(void);
+
+/*
+ * Prove that a file can get SHORTER: the length moves, the bytes below the cut
+ * are untouched, the blocks come back, and a run that ends up entirely past
+ * the new end loses its record rather than being left behind describing
+ * nothing.
+ *
+ * Runs BEFORE the growth test, and takes over its persistence claim on the way
+ * past: the file it finds is the one the previous boot grew, so the tail it
+ * checks before cutting is proof that growth reached the platter.
+ *
+ * Silently does nothing when the volume is not APFS, and says so and stops if
+ * the file is already at its shipped length -- which is what the first boot
+ * after a fresh image sees.
+ */
+void		fs_trunc_selftest(void);
 
 /*
  * Prove that a B-tree node can be split without losing a record.  Silently

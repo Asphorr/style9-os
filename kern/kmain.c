@@ -180,7 +180,14 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	 */
 	fs_data_selftest();
 
-	/* And the shape of the tree changing: a file that gets longer. */
+	/*
+	 * And the shape of the tree changing.  Shorter FIRST: the file it finds
+	 * is the one the boot before grew, so the tail it checks on the way in
+	 * is the proof that growth outlived the machine, and the length it
+	 * leaves behind is what gives the growth test something to do on every
+	 * boot instead of once in the life of an image.
+	 */
+	fs_trunc_selftest();
 	fs_grow_selftest();
 
 	/*

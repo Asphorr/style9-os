@@ -388,6 +388,55 @@ fs_pwrite(struct fs_handle *h, uint64_t off, const uint8_t *buf,
 }
 
 static int
+truncate_locked(struct fs_handle *h, uint64_t new_size)
+{
+	uint64_t	now_ns;
+	int		rv;
+
+	if (h == NULL)
+		return (FS_E_NOTFOUND);
+	if (h->fh_kind != FS_HANDLE_APFS)
+		return (FS_E_ROFS);
+
+	/*
+	 * Against the length the volume has now, not the one this handle was
+	 * opened with: "shorten it to n" and "lengthen it to n" are different
+	 * operations, and which one this is must be decided from what is
+	 * actually there.
+	 */
+	handle_refresh(h);
+	if (new_size == h->fh_size)
+		return (FS_E_OK);
+	if (new_size > h->fh_size)
+		rv = apfs_err(fs_apfs_grow(h->fh_ino, h->fh_id, new_size));
+	else
+		rv = apfs_err(fs_apfs_truncate(h->fh_ino, h->fh_id, new_size));
+	if (rv != FS_E_OK)
+		return (rv);
+	h->fh_size = new_size;
+
+	/* Stamped and closed for exactly the reasons a write is: see above. */
+	now_ns = (uint64_t)clock_walltime_us() * 1000ULL;
+	rv = apfs_err(fs_apfs_touch(h->fh_ino, now_ns));
+	if (rv == FS_E_OK)
+		rv = apfs_err(fs_apfs_checkpoint());
+	fs_gen++;
+	h->fh_gen = fs_gen;
+	return (rv);
+}
+
+int
+fs_truncate(struct fs_handle *h, uint64_t new_size)
+{
+	int	rv;
+
+	mutex_lock(&fs_lock);
+	rv = truncate_locked(h, new_size);
+	mutex_unlock(&fs_lock);
+	return (rv);
+}
+
+static int
 stat_locked(const char *path, struct fs_statbuf *out)
 {
 	struct fs_apfs_statbuf	asb;
@@ -768,10 +817,12 @@ fs_write_selftest(void)
  * guaranteed to need a new run, and a new run is what needs a new record.
  *
  * Bounded by the FILE rather than by a counter this kernel would have to keep:
- * the loop stops once the file is at least SELFTEST_GROW_TO bytes, so a later
- * boot finds it long enough already and checks instead of writing.  That
- * matters because there is no truncate yet -- a test that grew the file every
- * boot would grow it without end.
+ * the loop stops once the file is at least SELFTEST_GROW_TO bytes.  That used
+ * to mean the growing happened once, ever, because there was no truncate and a
+ * test that grew the file every boot would grow it without end.  There is one
+ * now, it runs first, and it leaves the file at the length it ships at -- so
+ * this appends again on every boot, and the whole path is exercised every time
+ * rather than once in the life of an image.
  */
 #define	SELFTEST_GROW_TO	(155648u + 6u * 4096u)
 #define	GROW_CHUNK		4096u
@@ -784,7 +835,6 @@ fs_grow_selftest(void)
 	uint8_t			*chunk;
 	uint8_t			*back;
 	uint64_t		 was;
-	uint64_t		 splits;
 	uint64_t		 merges;
 	uint64_t		 at;
 	uint32_t		 rounds;
@@ -809,7 +859,6 @@ fs_grow_selftest(void)
 		chunk[i] = (uint8_t)('a' + (i % 26));
 
 	was    = h.fh_size;
-	splits = fs_apfs_splits();
 	merges = fs_apfs_merges();
 	rounds = 0;
 
@@ -858,29 +907,17 @@ fs_grow_selftest(void)
 
 	if (rounds == 0) {
 		/*
-		 * An earlier boot did the growing, so what is worth checking
-		 * is on the platter: the length survived, and the tail still
-		 * reads as what was appended.
+		 * Nothing was appended, so the file arrived at this boot long
+		 * enough already -- which now means the truncate test did not
+		 * run, since it leaves the file at the length it ships at.
+		 * Saying so is better than reporting a pass for a path that
+		 * was not taken; the claim that the length outlives the
+		 * machine is checked where it can be, in fs_trunc_selftest,
+		 * against the tail this test wrote on the boot before.
 		 */
-		rv = fs_pread(&h, h.fh_size - GROW_CHUNK, back, GROW_CHUNK,
-		    &got);
-		if (rv != FS_E_OK || got != GROW_CHUNK) {
-			kprintf("apfs-grow: FAIL cannot read the tail "
-			    "(rv=%d got=%u)\n", rv, got);
-			goto out;
-		}
-		for (i = 0; i < GROW_CHUNK; i++) {
-			if (back[i] == chunk[i])
-				continue;
-			kprintf("apfs-grow: FAIL byte %u of the tail is "
-			    "0x%02x, wanted 0x%02x -- what an earlier boot "
-			    "appended did not survive\n", (unsigned)i,
-			    (unsigned)back[i], (unsigned)chunk[i]);
-			goto out;
-		}
-		kprintf("apfs-grow: PASS -- %s is %llu bytes from an earlier "
-		    "boot and its last block still reads what was appended\n",
-		    SELFTEST_PATH, (unsigned long long)h.fh_size);
+		kprintf("apfs-grow: %s is already %llu bytes -- nothing to "
+		    "append, skipped\n", SELFTEST_PATH,
+		    (unsigned long long)h.fh_size);
 		goto out;
 	}
 
@@ -908,24 +945,292 @@ fs_grow_selftest(void)
 	 *
 	 * The split still has to be proved, and is, by asking for one outright:
 	 * see fs_apfs_split_selftest.
+	 *
+	 * All but the FIRST, and that exception arrived with the truncate test.
+	 * It ran a moment ago and gave back the blocks immediately past this
+	 * file's run; the free queue holds them for the checkpoints that still
+	 * name them, so the first append cannot be a continuation of anything
+	 * and is given a record of its own.  Every append after it merges into
+	 * that.  The claim is written as "all but one" rather than "all"
+	 * because the one that cannot merge is not a defect -- it is the queue
+	 * doing the only thing that makes an abandoned checkpoint safe.
 	 */
-	splits = fs_apfs_merges() - merges;
-	if (splits != rounds) {
-		kprintf("apfs-grow: FAIL %u appends lengthened %llu runs -- "
-		    "the rest were given records of their own, and blocks that "
-		    "touch should never need one\n", (unsigned)rounds,
-		    (unsigned long long)splits);
+	merges = fs_apfs_merges() - merges;
+	if (merges + 1 < rounds) {
+		kprintf("apfs-grow: FAIL %u appends lengthened only %llu runs "
+		    "-- the rest were given records of their own, and blocks "
+		    "that touch should never need one\n", (unsigned)rounds,
+		    (unsigned long long)merges);
 		goto out;
 	}
 
 	kprintf("apfs-grow: PASS -- %s grew %llu -> %llu bytes over %u "
-	    "appends, every one of them lengthening the run already there "
-	    "rather than adding a record, and a reboot should still find "
-	    "it\n", SELFTEST_PATH, (unsigned long long)was,
-	    (unsigned long long)h.fh_size, (unsigned)rounds);
+	    "appends, %llu of them lengthening the run already there rather "
+	    "than adding a record, and a reboot should still find it\n",
+	    SELFTEST_PATH, (unsigned long long)was,
+	    (unsigned long long)h.fh_size, (unsigned)rounds,
+	    (unsigned long long)merges);
 out:
 	kfree(chunk);
 	kfree(back);
+}
+
+/*
+ * A FILE GETS SHORTER, AND A RECORD LEAVES A TREE
+ *
+ * Two halves, and only the second is hard.  Cutting inside a run shortens a
+ * length in place; cutting away a run entirely takes its record out of two
+ * B-trees, which is the first thing this kernel does that makes a tree
+ * smaller.  A test that only ever did the first would pass on a truncate that
+ * could not do the second at all.
+ *
+ * So it MAKES both happen rather than hoping the file is shaped right:
+ *
+ *	cut to the shipped length	-- undoes what the growth test appended
+ *	append two blocks		-- one run, one allocation, one record
+ *	cut away one of them		-- lands INSIDE that run: a shortening
+ *	append one block		-- CANNOT continue the run, because the
+ *					   block it would continue into was
+ *					   given back one checkpoint ago and the
+ *					   free queue is still holding it, so it
+ *					   gets a record of its own
+ *	cut it away			-- a whole run past the end: a dropping
+ *	cut back to the shipped length	-- leaves the file for the growth test
+ *
+ * The fourth step is the one worth reading twice.  It is deterministic not
+ * because the allocator was asked for a fresh run but because it was asked for
+ * the OLD one and refused: the free queue exists precisely so that a block an
+ * abandoned checkpoint still names cannot be handed out, and that refusal is
+ * what makes a second record certain here.
+ *
+ * On the way in it checks the tail of the file it was given, which the boot
+ * before appended.  That is the growth test's persistence claim, checked here
+ * because this is the last moment it is true.
+ */
+#define	SELFTEST_TRUNC_TO	155648u		/* what big.txt ships at */
+
+void
+fs_trunc_selftest(void)
+{
+	struct fs_handle	 h;
+	struct fs_statbuf	 st;
+	uint8_t			*edge;
+	uint8_t			*back;
+	uint8_t			*chunk;
+	uint64_t		 was;
+	uint64_t		 shortens;
+	uint64_t		 drops;
+	uint32_t		 got;
+	uint32_t		 put;
+	uint32_t		 i;
+	int			 rv;
+
+	if (!fs_apfs_ready())
+		return;
+	if (fs_open(SELFTEST_PATH, &h) != FS_E_OK) {
+		kprintf("apfs-trunc: %s absent -- skipped\n", SELFTEST_PATH);
+		return;
+	}
+	edge  = kmalloc(SELFTEST_CTX);
+	back  = kmalloc(2u * GROW_CHUNK);
+	chunk = kmalloc(2u * GROW_CHUNK);
+	if (edge == NULL || back == NULL || chunk == NULL) {
+		kprintf("apfs-trunc: no memory -- skipped\n");
+		goto out;
+	}
+	for (i = 0; i < 2u * GROW_CHUNK; i++)
+		chunk[i] = (uint8_t)('a' + (i % 26));
+
+	was = h.fh_size;
+	if (was < SELFTEST_TRUNC_TO) {
+		kprintf("apfs-trunc: %s is %llu bytes, shorter than the %u it "
+		    "ships at -- skipped\n", SELFTEST_PATH,
+		    (unsigned long long)was, (unsigned)SELFTEST_TRUNC_TO);
+		goto out;
+	}
+
+	if (was > SELFTEST_TRUNC_TO) {
+		/*
+		 * What the boot before left, checked before it is thrown away:
+		 * the file is longer than it ships because the growth test
+		 * appended to it, and its last block should still read as what
+		 * was appended.
+		 */
+		rv = fs_pread(&h, was - GROW_CHUNK, back, GROW_CHUNK, &got);
+		if (rv != FS_E_OK || got != GROW_CHUNK) {
+			kprintf("apfs-trunc: FAIL cannot read the tail of %s "
+			    "(rv=%d got=%u)\n", SELFTEST_PATH, rv,
+			    (unsigned)got);
+			goto out;
+		}
+		for (i = 0; i < GROW_CHUNK; i++) {
+			if (back[i] == chunk[i])
+				continue;
+			kprintf("apfs-trunc: FAIL byte %u of the tail is "
+			    "0x%02x, wanted 0x%02x -- what an earlier boot "
+			    "appended did not survive\n", (unsigned)i,
+			    (unsigned)back[i], (unsigned)chunk[i]);
+			goto out;
+		}
+	}
+
+	/* The bytes just below where every cut will fall, to compare after. */
+	rv = fs_pread(&h, SELFTEST_TRUNC_TO - SELFTEST_CTX, edge, SELFTEST_CTX,
+	    &got);
+	if (rv != FS_E_OK || got != SELFTEST_CTX) {
+		kprintf("apfs-trunc: FAIL cannot read the bytes below the cut "
+		    "(rv=%d got=%u)\n", rv, (unsigned)got);
+		goto out;
+	}
+
+	rv = fs_truncate(&h, SELFTEST_TRUNC_TO);
+	if (rv != FS_E_OK) {
+		kprintf("apfs-trunc: FAIL cutting %s to %u bytes (rv=%d)\n",
+		    SELFTEST_PATH, (unsigned)SELFTEST_TRUNC_TO, rv);
+		goto out;
+	}
+	if (h.fh_size != SELFTEST_TRUNC_TO) {
+		kprintf("apfs-trunc: FAIL the handle says %llu bytes after a "
+		    "cut to %u\n", (unsigned long long)h.fh_size,
+		    (unsigned)SELFTEST_TRUNC_TO);
+		goto out;
+	}
+
+	/*
+	 * Reading AT the new end gives nothing.  Not an error and not a short
+	 * read of stale bytes: the file stops there, and a truncate that moved
+	 * a length without moving the records would still answer this wrongly.
+	 */
+	rv = fs_pread(&h, SELFTEST_TRUNC_TO, back, GROW_CHUNK, &got);
+	if (rv != FS_E_OK || got != 0) {
+		kprintf("apfs-trunc: FAIL reading at the new end gave %u "
+		    "bytes (rv=%d) -- the file did not stop where it says\n",
+		    (unsigned)got, rv);
+		goto out;
+	}
+
+	/*
+	 * And the volume agrees, about the length AND about the blocks.  The
+	 * second is the one that catches a truncate which edited a number and
+	 * left the space behind it spoken for.
+	 */
+	if (fs_stat(SELFTEST_PATH, &st) != FS_E_OK) {
+		kprintf("apfs-trunc: FAIL cannot stat after cutting\n");
+		goto out;
+	}
+	if (st.fs_size != SELFTEST_TRUNC_TO ||
+	    st.fs_alloced != SELFTEST_TRUNC_TO) {
+		kprintf("apfs-trunc: FAIL the volume says %llu bytes in %llu "
+		    "allocated, wanted %u in %u -- the length reached the "
+		    "inode but the blocks did not come back\n",
+		    (unsigned long long)st.fs_size,
+		    (unsigned long long)st.fs_alloced,
+		    (unsigned)SELFTEST_TRUNC_TO, (unsigned)SELFTEST_TRUNC_TO);
+		goto out;
+	}
+
+	/* Two blocks, in one allocation, which is therefore one run. */
+	rv = fs_pwrite(&h, SELFTEST_TRUNC_TO, chunk, 2u * GROW_CHUNK, &put);
+	if (rv != FS_E_OK || put != 2u * GROW_CHUNK) {
+		kprintf("apfs-trunc: FAIL cannot append two blocks (rv=%d "
+		    "put=%u)\n", rv, (unsigned)put);
+		goto out;
+	}
+
+	/* Half of it away: the cut lands inside that run, so it is shortened. */
+	shortens = fs_apfs_shortens();
+	rv = fs_truncate(&h, SELFTEST_TRUNC_TO + GROW_CHUNK);
+	if (rv != FS_E_OK) {
+		kprintf("apfs-trunc: FAIL cutting inside the appended run "
+		    "(rv=%d)\n", rv);
+		goto out;
+	}
+	if (fs_apfs_shortens() != shortens + 1) {
+		kprintf("apfs-trunc: FAIL a cut that lands inside a two-block "
+		    "run shortened %llu records -- it should shorten exactly "
+		    "one\n", (unsigned long long)(fs_apfs_shortens() -
+		    shortens));
+		goto out;
+	}
+
+	/*
+	 * One block back.  It cannot continue the run it follows: the block
+	 * immediately past that run was given back by the cut above, and the
+	 * free queue holds it for the checkpoints that still name it, so the
+	 * allocator has to go elsewhere and the file gets a SECOND record.
+	 */
+	rv = fs_pwrite(&h, SELFTEST_TRUNC_TO + GROW_CHUNK, chunk, GROW_CHUNK,
+	    &put);
+	if (rv != FS_E_OK || put != GROW_CHUNK) {
+		kprintf("apfs-trunc: FAIL cannot append the block that must "
+		    "not merge (rv=%d put=%u)\n", rv, (unsigned)put);
+		goto out;
+	}
+
+	/* And away, which is a whole run past the end: a record leaves. */
+	drops = fs_apfs_drops();
+	rv = fs_truncate(&h, SELFTEST_TRUNC_TO + GROW_CHUNK);
+	if (rv != FS_E_OK) {
+		kprintf("apfs-trunc: FAIL cutting the run away (rv=%d)\n", rv);
+		goto out;
+	}
+	if (fs_apfs_drops() != drops + 1) {
+		kprintf("apfs-trunc: FAIL cutting away a whole run dropped "
+		    "%llu records -- either it was folded into the run before "
+		    "it, which the free queue should have prevented, or a run "
+		    "past the end was left describing nothing\n",
+		    (unsigned long long)(fs_apfs_drops() - drops));
+		goto out;
+	}
+
+	/* Back to what the file ships at, for the growth test to undo. */
+	rv = fs_truncate(&h, SELFTEST_TRUNC_TO);
+	if (rv != FS_E_OK) {
+		kprintf("apfs-trunc: FAIL cutting back to %u (rv=%d)\n",
+		    (unsigned)SELFTEST_TRUNC_TO, rv);
+		goto out;
+	}
+
+	/*
+	 * Through all of that, the bytes below the cut never moved.  Read
+	 * through the file rather than compared to what was written: they have
+	 * been past four truncations, two allocations and five checkpoints
+	 * since anybody looked at them.
+	 */
+	rv = fs_pread(&h, SELFTEST_TRUNC_TO - SELFTEST_CTX, back, SELFTEST_CTX,
+	    &got);
+	if (rv != FS_E_OK || got != SELFTEST_CTX) {
+		kprintf("apfs-trunc: FAIL cannot read below the cut afterwards "
+		    "(rv=%d got=%u)\n", rv, (unsigned)got);
+		goto out;
+	}
+	for (i = 0; i < SELFTEST_CTX; i++) {
+		if (back[i] == edge[i])
+			continue;
+		kprintf("apfs-trunc: FAIL byte %u below the cut is 0x%02x and "
+		    "was 0x%02x -- cutting the tail off disturbed what was "
+		    "kept\n", (unsigned)i, (unsigned)back[i],
+		    (unsigned)edge[i]);
+		goto out;
+	}
+
+	if (fs_stat(SELFTEST_PATH, &st) != FS_E_OK ||
+	    st.fs_size != SELFTEST_TRUNC_TO ||
+	    st.fs_alloced != SELFTEST_TRUNC_TO) {
+		kprintf("apfs-trunc: FAIL %s did not end at %u bytes in %u "
+		    "allocated\n", SELFTEST_PATH, (unsigned)SELFTEST_TRUNC_TO,
+		    (unsigned)SELFTEST_TRUNC_TO);
+		goto out;
+	}
+
+	kprintf("apfs-trunc: PASS -- %s cut %llu -> %u bytes, a run shortened "
+	    "in place and a run dropped out of both trees, the %u bytes below "
+	    "the cut untouched\n", SELFTEST_PATH, (unsigned long long)was,
+	    (unsigned)SELFTEST_TRUNC_TO, (unsigned)SELFTEST_CTX);
+out:
+	kfree(edge);
+	kfree(back);
+	kfree(chunk);
 }
 
 /* As above, and about a node that is asked to run out of room. */

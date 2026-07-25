@@ -875,6 +875,16 @@ void	fs_apfs_data_selftest(const char *path);
 int	fs_apfs_grow(uint64_t ino, uint64_t id, uint64_t new_size);
 
 /*
+ * And make one shorter, with the same two names for the same two things.  A
+ * run that reaches past the new end is shortened; a run entirely past it loses
+ * its record in both trees that name a file's blocks; the blocks go to the
+ * free queue, because checkpoints still on the platter name them.  Cutting
+ * inside a block moves the length and nothing else.  Refuses, out loud, a file
+ * whose runs are spread over more leaves than its inode's own.
+ */
+int	fs_apfs_truncate(uint64_t ino, uint64_t id, uint64_t new_size);
+
+/*
  * How many B-tree nodes this kernel has split since it booted.  Exposed so a
  * test can insist that a node really did run out of room and grow rather than
  * the insert quietly having had space all along.
@@ -888,6 +898,17 @@ uint64_t fs_apfs_splits(void);
  * that is quietly spending a record per block.
  */
 uint64_t fs_apfs_merges(void);
+
+/*
+ * How many records a truncate has shortened, and how many it has taken out of
+ * a tree altogether.  Two counters and not one, because they are two different
+ * operations wearing the same name: shortening edits a length in place, and
+ * dropping is the first thing this kernel does that makes a B-tree smaller.  A
+ * test that could not tell them apart would pass on a truncate that never once
+ * reached the harder half.
+ */
+uint64_t fs_apfs_shortens(void);
+uint64_t fs_apfs_drops(void);
 
 /*
  * Split a leaf on purpose and prove nothing was lost: the same records, in the
