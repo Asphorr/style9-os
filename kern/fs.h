@@ -46,16 +46,60 @@ struct fs_dirent {
 	char		fde_name[FS_NAME_MAX];
 };
 
-/* A file-or-directory's metadata, without reading it. */
+/*
+ * The mode word's type field, spelled the way every Unix spells it.  These
+ * live in the neutral header because three layers share the vocabulary: APFS
+ * reports these bits straight off the disk, FAT synthesises them from an
+ * attribute byte, and the Darwin syscall path copies them out to a libSystem
+ * that hands them to an Apple binary expecting exactly them.  Only the two
+ * types this filesystem can produce are listed.
+ */
+#define	FS_S_IFMT	0170000
+#define	FS_S_IFREG	0100000
+#define	FS_S_IFDIR	0040000
+
+#define	FS_ISDIR(m)	(((m) & FS_S_IFMT) == FS_S_IFDIR)
+
+/*
+ * A file-or-directory's metadata, without reading it.
+ *
+ * This used to answer three questions -- how big, which inode, directory or
+ * not -- because that is all any binary had asked.  `ls -l` asks the rest of
+ * them, and the rest of them were being read off the disk and thrown away:
+ * an APFS inode record carries the mode word, the link count, the owner and
+ * group, and four timestamps in its FIXED part, so a stat that reported none
+ * of it was paying for the tree walk and discarding the answer.
+ *
+ * Timestamps are nanoseconds since the Unix epoch, which is APFS's own unit;
+ * a filesystem with a coarser clock (FAT counts two-second ticks since 1980)
+ * converts on the way out rather than making every caller know.  Zero means
+ * "this volume does not record that time" and is distinguishable from a real
+ * 1970 timestamp only in theory, which is the usual bargain.
+ *
+ * fs_mode is a POSIX mode word with its type bits set, so it already says
+ * what fs_is_dir says.  Both are here on purpose: mode is what a filesystem
+ * that HAS permissions reports, fs_is_dir is what one that does not can
+ * always answer, and a caller that only wants to know whether to descend
+ * should not have to know which kind of volume replied.
+ */
 struct fs_statbuf {
 	uint64_t	fs_size;
 	uint64_t	fs_ino;
+	uint64_t	fs_alloced;	/* bytes the volume actually spent  */
+	uint64_t	fs_mtime_ns;	/* contents last written            */
+	uint64_t	fs_atime_ns;	/* contents last read               */
+	uint64_t	fs_ctime_ns;	/* inode last changed               */
+	uint64_t	fs_btime_ns;	/* created ("birth")                */
+	uint32_t	fs_nlink;
+	uint32_t	fs_uid;
+	uint32_t	fs_gid;
+	uint16_t	fs_mode;	/* POSIX mode word, S_IF* included  */
 	uint8_t		fs_is_dir;
 };
 
 _Static_assert(sizeof(struct fs_dirent) == 280,
     "fs_dirent is a wire format shared with user/libsystem.c");
-_Static_assert(sizeof(struct fs_statbuf) == 24,
+_Static_assert(sizeof(struct fs_statbuf) == 72,
     "fs_statbuf is a wire format shared with user/libsystem.c");
 
 #define	FS_E_OK		0

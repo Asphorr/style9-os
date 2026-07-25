@@ -168,6 +168,19 @@ extern uint8_t	_binary_gcat_macho_start[];
 extern uint8_t	_binary_gcat_macho_end[];
 
 /*
+ * A NINTH real Apple binary: gls (GNU coreutils' ls).  Where gcat reads a
+ * file's bytes, this one reads what the filesystem REMEMBERS about it -- the
+ * mode word, the owner, the link count, the date -- and prints them in a
+ * column.  Every one of those was being invented in libSystem until this
+ * binary asked, so it is the one that made the inode's fixed part matter.
+ * It also walks a directory the way modern coreutils does, opening it once
+ * and calling fstatat(dirfd(dirp), name) per entry rather than composing
+ * paths.
+ */
+extern uint8_t	_binary_gls_macho_start[];
+extern uint8_t	_binary_gls_macho_end[];
+
+/*
  * timeprobe: the self-authored Darwin-ABI probe for the wall clock -- the
  * dirlist of timekeeping.  Checks that the time is plausible, advances, and
  * never runs backwards, so the clock is proven from ring 3 before a genuine
@@ -334,6 +347,8 @@ progreg_init(void)
 	    _binary_guname_macho_start, _binary_guname_macho_end);
 	register_one("gcat",
 	    _binary_gcat_macho_start, _binary_gcat_macho_end);
+	register_one("gls",
+	    _binary_gls_macho_start, _binary_gls_macho_end);
 	register_one("timeprobe",
 	    _binary_timeprobe_macho_start, _binary_timeprobe_macho_end);
 	register_one("mmaptest",

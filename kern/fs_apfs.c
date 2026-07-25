@@ -656,6 +656,14 @@ struct inode_info {
 	uint64_t	ii_oid;
 	uint64_t	ii_private_id;
 	uint64_t	ii_size;
+	uint64_t	ii_alloced;
+	uint64_t	ii_mtime;	/* ns since the Unix epoch */
+	uint64_t	ii_atime;
+	uint64_t	ii_ctime;
+	uint64_t	ii_btime;
+	uint32_t	ii_nlink;
+	uint32_t	ii_uid;
+	uint32_t	ii_gid;
 	uint16_t	ii_mode;
 	bool		ii_found;
 };
@@ -685,7 +693,24 @@ inode_pick(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 	iv = (const struct apfs_inode_val *)val;
 	ii->ii_private_id = iv->ai_private_id;
 	ii->ii_mode       = iv->ai_mode;
-	ii->ii_found      = true;
+	ii->ii_uid        = iv->ai_owner;
+	ii->ii_gid        = iv->ai_group;
+	ii->ii_mtime      = iv->ai_mod_time;
+	ii->ii_atime      = iv->ai_access_time;
+	ii->ii_ctime      = iv->ai_change_time;
+	ii->ii_btime      = iv->ai_create_time;
+	/*
+	 * One field, two meanings, told apart by the mode: for a directory
+	 * APFS counts CHILDREN here, for anything else it counts links.  A
+	 * directory's link count in POSIX terms is 2 plus its subdirectories
+	 * -- itself, its "." and each child's ".." -- but APFS has no such
+	 * entries to count, so reporting the honest 1 beats inventing a
+	 * number no reader of this volume can verify.
+	 */
+	ii->ii_nlink = (iv->ai_mode & APFS_S_IFMT) == APFS_S_IFDIR ? 1u :
+	    (iv->ai_nchildren_or_nlink > 0 ?
+	    (uint32_t)iv->ai_nchildren_or_nlink : 1u);
+	ii->ii_found = true;
 
 	/*
 	 * No extended fields at all is normal, not an error: that is what an
@@ -709,7 +734,8 @@ inode_pick(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 		if (xf->xf_type == APFS_INO_EXT_TYPE_DSTREAM &&
 		    xf->xf_size >= sizeof(*ds)) {
 			ds = (const struct apfs_dstream *)(val + data);
-			ii->ii_size = ds->ds_size;
+			ii->ii_size    = ds->ds_size;
+			ii->ii_alloced = ds->ds_alloced_size;
 		}
 		/* Every datum is padded up to a multiple of 8. */
 		data += ((uint32_t)xf->xf_size + 7u) & ~7u;
@@ -728,6 +754,14 @@ inode_info(uint64_t oid, struct inode_info *ii)
 	ii->ii_oid        = oid;
 	ii->ii_private_id = oid;
 	ii->ii_size       = 0;
+	ii->ii_alloced    = 0;
+	ii->ii_mtime      = 0;
+	ii->ii_atime      = 0;
+	ii->ii_ctime      = 0;
+	ii->ii_btime      = 0;
+	ii->ii_nlink      = 1;
+	ii->ii_uid        = 0;
+	ii->ii_gid        = 0;
 	ii->ii_mode       = 0;
 	ii->ii_found      = false;
 	stopped = false;
@@ -753,10 +787,18 @@ fs_apfs_stat(const char *path, struct fs_apfs_statbuf *out)
 	if (rv != FS_APFS_E_OK)
 		return (rv);
 
-	out->afs_size   = is_dir ? 0 : ii.ii_size;
-	out->afs_ino    = oid;
-	out->afs_mode   = ii.ii_mode;
-	out->afs_is_dir = is_dir ? 1 : 0;
+	out->afs_size    = is_dir ? 0 : ii.ii_size;
+	out->afs_ino     = oid;
+	out->afs_alloced = is_dir ? 0 : ii.ii_alloced;
+	out->afs_mtime_ns = ii.ii_mtime;
+	out->afs_atime_ns = ii.ii_atime;
+	out->afs_ctime_ns = ii.ii_ctime;
+	out->afs_btime_ns = ii.ii_btime;
+	out->afs_nlink   = ii.ii_nlink;
+	out->afs_uid     = ii.ii_uid;
+	out->afs_gid     = ii.ii_gid;
+	out->afs_mode    = ii.ii_mode;
+	out->afs_is_dir  = is_dir ? 1 : 0;
 	return (FS_APFS_E_OK);
 }
 

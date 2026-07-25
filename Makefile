@@ -16,11 +16,28 @@ CC	= gcc
 LD	= ld
 OBJCOPY	= objcopy
 QEMU	= /mnt/c/Program\ Files/qemu/qemu-system-x86_64.exe
-# Emulated CPU.  The macOS x86_64 baseline is Penryn (SSE4.1, no AVX): ring-3
-# Darwin binaries -- our clang/ld64 dyld + real Apple binaries -- assume SSE4.1,
-# which the QEMU default (qemu64) lacks, so an XMM insn #UDs there.  Penryn has
-# no AVX, which keeps the FXSAVE-only FPU context switch (no XSAVE/YMM) correct.
-QEMU_CPU = Penryn
+# Emulated CPU.  Ring-3 Darwin binaries -- our clang/ld64 dyld and the real
+# Apple ones -- reach past the QEMU default (qemu64), where an XMM instruction
+# simply #UDs.  This was Penryn (SSE4.1) on the theory that SSE4.1 is the macOS
+# x86_64 baseline; gls disproved it by faulting on PCMPGTQ, so the answer is
+# now MEASURED rather than assumed.  Disassembling every vendored binary and
+# counting instructions by extension:
+#
+#	gls.macho         20 SSE4.2 sites (pcmpgtq), 12 SSE4.1
+#	libgmp.10.dylib   38 SSE4.2 sites, 1 SSE4.1
+#	everything else    0 SSE4.2
+#	NOTHING, anywhere, uses a VEX-encoded (AVX) instruction
+#
+# libgmp is the uncomfortable one: gfactor has been linking against SSE4.2 code
+# since it was added and only survives because GMP picks its routines from
+# CPUID at startup and found none.  It was one dispatch decision away from the
+# fault gls actually hit.
+#
+# Nehalem is the smallest model that covers what is there: it adds SSE4.2 and
+# POPCNT to Penryn and nothing else -- no AES, no XSAVE, no AVX -- so the
+# FXSAVE-only FPU context switch stays correct, which an AVX-capable model
+# would quietly invalidate (YMM state FXSAVE does not save).
+QEMU_CPU = Nehalem
 
 # Directories that contain sources and their public headers.  Listed in
 # include-search order: arch first so e.g. machine/io.h-style headers
@@ -155,6 +172,7 @@ OBJS	= \
 	$(OBJDIR)/tree_macho.o \
 	$(OBJDIR)/guname_macho.o \
 	$(OBJDIR)/gcat_macho.o \
+	$(OBJDIR)/gls_macho.o \
 	$(OBJDIR)/gfactor_macho.o \
 	$(OBJDIR)/genv_macho.o \
 	$(OBJDIR)/gtimeout_macho.o \
@@ -399,6 +417,17 @@ $(OBJDIR)/guname.macho: extern/guname.macho | $(OBJDIR)
 # binary, with nothing in it aware of what filesystem answered.  Cost four new
 # libSystem symbols.  Embedded like figlet.
 $(OBJDIR)/gcat.macho: extern/gcat.macho | $(OBJDIR)
+	cp $< $@
+
+# gls: GNU coreutils 9.11's ls, from the same bottle.  The first binary that
+# asks what the filesystem REMEMBERS -- mode, owner, link count, timestamps --
+# rather than what it holds, so it is the one that made the kernel stop
+# throwing the inode's fixed part away.  It also walks a directory the *at
+# way: opendir once, then fstatat(dirfd(dirp), name) per entry.  Cost 23 new
+# libSystem symbols, the largest gap any binary here has needed closed, of
+# which the load-bearing ones are the calendar (gmtime_r) and strmode.
+# Embedded like figlet.
+$(OBJDIR)/gls.macho: extern/gls.macho | $(OBJDIR)
 	cp $< $@
 
 # gfactor: a FOURTH real Apple x86-64 macOS CLI binary (GNU coreutils 9.11's

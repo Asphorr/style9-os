@@ -5,6 +5,7 @@
  * All rights reserved.
  */
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "fs.h"
@@ -29,6 +30,22 @@ name_copy(char *dst, const char *src, size_t cap)
 	for (i = 0; i + 1 < cap && src[i] != '\0'; i++)
 		dst[i] = src[i];
 	dst[i] = '\0';
+}
+
+/*
+ * Clear a statbuf before either backend fills it.  This is not tidiness: the
+ * struct is copied out to userspace whole, so a field neither filesystem sets
+ * would otherwise hand a Darwin binary whatever was on the kernel stack.
+ */
+static void
+zero(void *p, size_t n)
+{
+	uint8_t	*b;
+	size_t	 i;
+
+	b = p;
+	for (i = 0; i < n; i++)
+		b[i] = 0;
 }
 
 /* Both readers number their errors privately; neither numbering escapes. */
@@ -146,22 +163,45 @@ fs_stat(const char *path, struct fs_statbuf *out)
 	struct fs_fat_statbuf	fsb;
 	int			rv;
 
+	zero(out, sizeof(*out));
 	if (fs_apfs_ready()) {
 		rv = fs_apfs_stat(path, &asb);
 		if (rv != FS_APFS_E_OK)
 			return (apfs_err(rv));
-		out->fs_size   = asb.afs_size;
-		out->fs_ino    = asb.afs_ino;
-		out->fs_is_dir = asb.afs_is_dir;
+		out->fs_size     = asb.afs_size;
+		out->fs_ino      = asb.afs_ino;
+		out->fs_alloced  = asb.afs_alloced;
+		out->fs_mtime_ns = asb.afs_mtime_ns;
+		out->fs_atime_ns = asb.afs_atime_ns;
+		out->fs_ctime_ns = asb.afs_ctime_ns;
+		out->fs_btime_ns = asb.afs_btime_ns;
+		out->fs_nlink    = asb.afs_nlink;
+		out->fs_uid      = asb.afs_uid;
+		out->fs_gid      = asb.afs_gid;
+		out->fs_mode     = asb.afs_mode;
+		out->fs_is_dir   = asb.afs_is_dir;
 		return (FS_E_OK);
 	}
 	if (fs_fat_ready()) {
 		rv = fs_fat_stat2(path, &fsb);
 		if (rv != FS_FAT_E_OK)
 			return (fat_err(rv));
-		out->fs_size   = fsb.fs_size;
-		out->fs_ino    = fsb.fs_ino;
-		out->fs_is_dir = fsb.fs_is_dir;
+		out->fs_size     = fsb.fs_size;
+		out->fs_ino      = fsb.fs_ino;
+		out->fs_alloced  = fsb.fs_alloced;
+		out->fs_mtime_ns = fsb.fs_mtime_ns;
+		out->fs_atime_ns = fsb.fs_atime_ns;
+		/*
+		 * FAT records no inode-change time; the write time is the
+		 * closest true statement about when this entry last changed.
+		 */
+		out->fs_ctime_ns = fsb.fs_mtime_ns;
+		out->fs_btime_ns = fsb.fs_btime_ns;
+		out->fs_nlink    = 1;		/* FAT has no hard links */
+		out->fs_uid      = 0;
+		out->fs_gid      = 0;
+		out->fs_mode     = fsb.fs_mode;
+		out->fs_is_dir   = fsb.fs_is_dir;
 		return (FS_E_OK);
 	}
 	return (FS_E_NOMOUNT);

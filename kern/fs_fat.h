@@ -59,12 +59,36 @@ struct fs_fat_dirent {
  * A file's metadata, as fs_fat_stat2 reports it.  Also the wire format behind
  * libSystem's stat$INODE64 (which turns it into Apple's struct stat); keep the
  * field order in sync with user/libsystem.c.
+ *
+ * FAT records less than a Unix caller asks for, and the honest thing is to be
+ * explicit about which fields are READ and which are INVENTED.  Read: the
+ * write time and date, the access date, the create time and date, and the
+ * read-only attribute.  Invented: the owner and group (0, the only user this
+ * system has), the link count (1, FAT has no hard links), and the permission
+ * bits, which are derived from the one attribute bit FAT does keep.  A
+ * timestamp of zero means the entry did not carry one.
  */
 struct fs_fat_statbuf {
+	uint64_t	fs_mtime_ns;	/* last write   (0 if unrecorded) */
+	uint64_t	fs_atime_ns;	/* last access, date only         */
+	uint64_t	fs_btime_ns;	/* created                        */
+	uint64_t	fs_alloced;	/* bytes on disk (whole clusters) */
 	uint32_t	fs_size;	/* byte length (0 for a dir)    */
 	uint32_t	fs_ino;		/* stable inode (first cluster) */
+	uint16_t	fs_mode;	/* synthesised POSIX mode word  */
 	uint8_t		fs_is_dir;	/* 1 if a subdirectory          */
 };
+
+/*
+ * The modes FAT can express.  A volume with one attribute bit for "read only"
+ * and no notion of an owner cannot report more than these two shapes, so they
+ * are named here rather than open-coded: a caller reading 0755 out of a FAT
+ * stat should be able to find the line that decided it.
+ */
+#define	FS_FAT_MODE_DIR		0040755
+#define	FS_FAT_MODE_FILE	0100644
+#define	FS_FAT_MODE_DIR_RO	0040555
+#define	FS_FAT_MODE_FILE_RO	0100444
 
 /*
  * Probe the first ATA drive for a FAT volume and mount it.  Called once at

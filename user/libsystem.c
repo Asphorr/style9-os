@@ -81,6 +81,16 @@ write(int fd, const void *buf, unsigned long n)
 static void	(*atexit_fns[ATEXIT_MAX])(void);
 static int	atexit_n;
 
+/*
+ * errno's storage.  Apple's <errno.h> defines errno as (*__error()), so a
+ * binary reads it through the accessor below rather than as a symbol; one
+ * shared cell is enough for a system with one thread per process.  It lives
+ * this far up the file because the calls that SET it -- mmap, fstatat --
+ * are scattered through it, and a variable used in six places should be
+ * declared once at the top rather than forward-declared into the middle.
+ */
+static int	g_errno;
+
 void
 exit(int code)
 {
@@ -1311,6 +1321,43 @@ getopt(int argc, char *const argv[], const char *optstring)
 /* ---- filesystem metadata: stat / readdir over the private backchannel --- */
 
 /*
+ * "." names the root here, and that is a fact rather than a guess: this
+ * system has one directory tree and no per-process working directory, which
+ * is why getcwd(3) below answers "/" and chdir(3) succeeds without doing
+ * anything.  The kernel has no cwd to consult, so a path that leans on one
+ * has to be resolved on this side of the syscall -- and this is the only
+ * place that knows the cwd is a fiction.
+ *
+ * Returns `path` untouched when nothing needs rewriting, so the common case
+ * costs two comparisons and no copying.
+ */
+#define	PATH_FIX_MAX	1024
+
+static const char *
+path_abs(const char *path, char *tmp, size_t cap)
+{
+	size_t	i;
+	size_t	j;
+
+	if (path == NULL)
+		return (path);
+	if (path[0] == '.' && path[1] == '\0')
+		return ("/");
+	if (path[0] != '.' || path[1] != '/')
+		return (path);
+
+	tmp[0] = '/';
+	j = 1;
+	for (i = 2; path[i] != '\0' && j + 1 < cap; i++) {
+		if (path[i] == '/' && tmp[j - 1] == '/')
+			continue;		/* ".//x" and "./x//y" */
+		tmp[j++] = path[i];
+	}
+	tmp[j] = '\0';
+	return (tmp);
+}
+
+/*
  * The kernel reports filesystem metadata in these small neutral structs (the
  * style9-private class-0x2A calls fill them); this file then shapes them into
  * the macOS ABI the binary expects.  The layouts mirror kern/fs.h exactly -- a
@@ -1331,16 +1378,28 @@ struct fs_dirent {
 struct fs_statbuf {
 	uint64_t	fs_size;
 	uint64_t	fs_ino;
+	uint64_t	fs_alloced;
+	uint64_t	fs_mtime_ns;
+	uint64_t	fs_atime_ns;
+	uint64_t	fs_ctime_ns;
+	uint64_t	fs_btime_ns;
+	uint32_t	fs_nlink;
+	uint32_t	fs_uid;
+	uint32_t	fs_gid;
+	uint16_t	fs_mode;
 	uint8_t		fs_is_dir;
 };
 
 _Static_assert(sizeof(struct fs_dirent) == 280, "must match kern/fs.h");
-_Static_assert(sizeof(struct fs_statbuf) == 24, "must match kern/fs.h");
+_Static_assert(sizeof(struct fs_statbuf) == 72, "must match kern/fs.h");
 
 /* fs_stat backchannel: fills *sb; returns 0, or -1 (carry set) if absent. */
 static long
 s9_fs_stat(const char *path, struct fs_statbuf *sb)
 {
+	char	tmp[PATH_FIX_MAX];
+
+	path = path_abs(path, tmp, sizeof(tmp));
 	return (bsd_call(0x2A000002, (long)path, (long)sb, 0));
 }
 
@@ -1348,6 +1407,9 @@ s9_fs_stat(const char *path, struct fs_statbuf *sb)
 static long
 s9_fs_readdir(const char *path, uint32_t index, struct fs_dirent *out)
 {
+	char	tmp[PATH_FIX_MAX];
+
+	path = path_abs(path, tmp, sizeof(tmp));
 	return (bsd_call(0x2A000003, (long)path, (long)index, (long)out));
 }
 
@@ -1381,31 +1443,64 @@ s9_uname(struct darwin_uname *out)
  * the kernel reports only the neutral fs_statbuf.  The import names hold a
  * '$' no C identifier can spell, so ordinary functions are aliased onto them;
  * the read-only FS has no symlinks, so lstat is just stat.
+ *
+ * The permission bits, owner, link count and four timestamps used to be
+ * invented here -- every file 0644, every directory 0755, every date the
+ * epoch -- because the kernel reported only size, inode and a directory flag.
+ * It now reports what the volume actually records, so this stops guessing;
+ * `ls -l` prints the mode APFS stored and the day the file was written.
+ * Where a filesystem genuinely has nothing to say (FAT has no owner) the
+ * invention happens in the kernel, at the layer that knows which volume
+ * answered, rather than here where it would apply to both.
  */
+#define	STAT_BUF_SIZE	144		/* the $INODE64 struct stat */
+
 int	stat_inode64(const char *path, void *buf) __asm__("_stat$INODE64");
 int	lstat_inode64(const char *path, void *buf) __asm__("_lstat$INODE64");
+
+/* Shape a filled fs_statbuf into Apple's struct stat.  Never fails. */
+static void
+stat_shape(const struct fs_statbuf *sb, void *buf)
+{
+	unsigned char	*p;
+	int		 i;
+
+	p = (unsigned char *)buf;
+	for (i = 0; i < STAT_BUF_SIZE; i++)
+		p[i] = 0;
+
+	*(uint16_t *)(p + 4)   = sb->fs_mode;		/* st_mode    */
+	*(uint16_t *)(p + 6)   = (uint16_t)sb->fs_nlink;
+	*(uint64_t *)(p + 8)   = sb->fs_ino;
+	*(uint32_t *)(p + 16)  = sb->fs_uid;
+	*(uint32_t *)(p + 20)  = sb->fs_gid;
+	/*
+	 * The four timespecs.  The kernel reports one nanosecond count per
+	 * time; splitting it into (seconds, nanoseconds) is this layer's job
+	 * because the split is Apple's struct, not the filesystem's fact.
+	 */
+	*(int64_t *)(p + 32)   = (int64_t)(sb->fs_atime_ns / 1000000000ULL);
+	*(int64_t *)(p + 40)   = (int64_t)(sb->fs_atime_ns % 1000000000ULL);
+	*(int64_t *)(p + 48)   = (int64_t)(sb->fs_mtime_ns / 1000000000ULL);
+	*(int64_t *)(p + 56)   = (int64_t)(sb->fs_mtime_ns % 1000000000ULL);
+	*(int64_t *)(p + 64)   = (int64_t)(sb->fs_ctime_ns / 1000000000ULL);
+	*(int64_t *)(p + 72)   = (int64_t)(sb->fs_ctime_ns % 1000000000ULL);
+	*(int64_t *)(p + 80)   = (int64_t)(sb->fs_btime_ns / 1000000000ULL);
+	*(int64_t *)(p + 88)   = (int64_t)(sb->fs_btime_ns % 1000000000ULL);
+	*(int64_t *)(p + 96)   = (int64_t)sb->fs_size;
+	/* st_blocks counts 512-byte units, always, whatever st_blksize says. */
+	*(int64_t *)(p + 104)  = (int64_t)(sb->fs_alloced / 512u);
+	*(uint32_t *)(p + 112) = 4096;			/* st_blksize */
+}
 
 int
 stat_inode64(const char *path, void *buf)
 {
 	struct fs_statbuf	sb;
-	unsigned char		*p;
-	int			 i;
 
 	if (s9_fs_stat(path, &sb) < 0)
 		return (-1);				/* absent -> ENOENT */
-
-	p = (unsigned char *)buf;
-	for (i = 0; i < 144; i++)
-		p[i] = 0;
-	/* st_mode: S_IFDIR|0755 for a directory, else S_IFREG|0644. */
-	*(uint16_t *)(p + 4)   = sb.fs_is_dir ? 0x41EDu : 0x81A4u;
-	*(uint16_t *)(p + 6)   = 1;			 /* st_nlink   */
-	*(uint64_t *)(p + 8)   = sb.fs_ino;		 /* st_ino     */
-	*(int64_t  *)(p + 96)  = (int64_t)sb.fs_size;	 /* st_size    */
-	*(int64_t  *)(p + 104) =
-	    (int64_t)((sb.fs_size + 511) / 512);	 /* st_blocks  */
-	*(uint32_t *)(p + 112) = 512;			 /* st_blksize */
+	stat_shape(&sb, buf);
 	return (0);
 }
 
@@ -1454,7 +1549,7 @@ fstat64(int fd, void *buf)
 		return (-1);
 
 	p = (unsigned char *)buf;
-	for (i = 0; i < 144; i++)
+	for (i = 0; i < STAT_BUF_SIZE; i++)
 		p[i] = 0;
 	switch (ds.fds_kind) {
 	case 1:					/* console */
@@ -1463,7 +1558,7 @@ fstat64(int fd, void *buf)
 	case 2:					/* pipe end */
 		*(uint16_t *)(p + 4) = 0x1180u;	/* S_IFIFO | 0600 */
 		break;
-	default:				/* buffered regular file */
+	default:				/* regular file */
 		*(uint16_t *)(p + 4) = 0x81A4u;	/* S_IFREG | 0644 */
 		*(int64_t  *)(p + 96) = (int64_t)(uint64_t)ds.fds_size;
 		break;
@@ -1580,13 +1675,98 @@ readdir_inode64(DIR *dp)
 	return (&dp->dd_de);
 }
 
+/*
+ * dirfd / fstatat: how a directory walker asks about an entry it just read.
+ *
+ * ls(1) does not stat "path/name" -- it opens the directory once and then
+ * calls fstatat(dirfd(dirp), name, ...) per entry, which is the *at family's
+ * whole point: the directory is named by an open descriptor rather than by a
+ * path that could be replaced underneath the walk.
+ *
+ * This kernel has no *at syscalls and no descriptor for a directory: our
+ * opendir is a path plus an index, and the DIR already remembers the path.
+ * So a dirfd here is a token that finds the DIR again, and fstatat joins its
+ * remembered path to the name.  That gives up exactly what *at was invented
+ * to provide -- atomicity against a directory being moved mid-walk -- which
+ * costs nothing on a read-only volume where no directory can move.  It is
+ * worth naming the trade rather than letting the table look like an
+ * implementation detail.
+ */
+#define	DIRFD_BASE	0x7D00		/* far above any real fd number */
+#define	DIRFD_SLOTS	16
+
+#define	AT_FDCWD	(-2)		/* macOS's, and it is not -100 */
+
+static DIR	*dirfd_tab[DIRFD_SLOTS];
+
 int
-closedir(DIR *dp)
+dirfd(DIR *dp)
 {
+	int	i;
 
 	if (dp == NULL)
 		return (-1);
-	free(dp);				/* arena free is a no-op */
+	for (i = 0; i < DIRFD_SLOTS; i++) {
+		if (dirfd_tab[i] == dp)
+			return (DIRFD_BASE + i);
+	}
+	for (i = 0; i < DIRFD_SLOTS; i++) {
+		if (dirfd_tab[i] == NULL) {
+			dirfd_tab[i] = dp;
+			return (DIRFD_BASE + i);
+		}
+	}
+	g_errno = 24;					/* EMFILE */
+	return (-1);
+}
+
+int	fstatat_inode64(int fd, const char *name, void *buf, int flag)
+	    __asm__("_fstatat$INODE64");
+
+int
+fstatat_inode64(int fd, const char *name, void *buf, int flag)
+{
+	char		 joined[PATH_FIX_MAX];
+	const char	*dir;
+	size_t		 i;
+	size_t		 j;
+
+	(void)flag;			/* no symlinks: NOFOLLOW is moot */
+	if (name == NULL)
+		return (-1);
+	/* An absolute name ignores the descriptor, by definition. */
+	if (fd == AT_FDCWD || name[0] == '/')
+		return (stat_inode64(name, buf));
+
+	if (fd < DIRFD_BASE || fd >= DIRFD_BASE + DIRFD_SLOTS ||
+	    dirfd_tab[fd - DIRFD_BASE] == NULL) {
+		g_errno = 9;				/* EBADF */
+		return (-1);
+	}
+	dir = dirfd_tab[fd - DIRFD_BASE]->dd_path;
+
+	for (j = 0; dir[j] != '\0' && j + 1 < sizeof(joined); j++)
+		joined[j] = dir[j];
+	if (j > 0 && joined[j - 1] != '/' && j + 1 < sizeof(joined))
+		joined[j++] = '/';
+	for (i = 0; name[i] != '\0' && j + 1 < sizeof(joined); i++)
+		joined[j++] = name[i];
+	joined[j] = '\0';
+	return (stat_inode64(joined, buf));
+}
+
+int
+closedir(DIR *dp)
+{
+	int	i;
+
+	if (dp == NULL)
+		return (-1);
+	for (i = 0; i < DIRFD_SLOTS; i++) {
+		if (dirfd_tab[i] == dp)
+			dirfd_tab[i] = NULL;
+	}
+	free(dp);
 	return (0);
 }
 
@@ -2004,12 +2184,74 @@ setlocale(int category, const char *locale)
 	return ((char *)"C");
 }
 
+/*
+ * nl_langinfo(3): the locale's names for things.
+ *
+ * This returned "" for everything but the codeset until gls asked, and the
+ * consequence was visible rather than theoretical: gnulib's strftime -- which
+ * is what coreutils formats dates with -- gets the month abbreviation for %b
+ * from ABMON_1 + tm_mon, so `ls -l` printed a blank where every month should
+ * have been.  The C locale HAS these names; not returning them was the bug.
+ *
+ * The item numbers are Apple's <langinfo.h>, which is BSD's: CODESET 0, then
+ * the date and time formats, AM/PM, seven day names, seven abbreviations,
+ * twelve month names, twelve abbreviations.
+ */
+#define	NL_CODESET	0
+#define	NL_D_T_FMT	1
+#define	NL_D_FMT	2
+#define	NL_T_FMT	3
+#define	NL_T_FMT_AMPM	4
+#define	NL_AM_STR	5
+#define	NL_PM_STR	6
+#define	NL_DAY_1	7		/* .. DAY_7    = 13 */
+#define	NL_ABDAY_1	14		/* .. ABDAY_7  = 20 */
+#define	NL_MON_1	21		/* .. MON_12   = 32 */
+#define	NL_ABMON_1	33		/* .. ABMON_12 = 44 */
+
+static const char *const nl_days[7] = {
+	"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+	"Saturday"
+};
+
+static const char *const nl_abdays[7] = {
+	"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
+};
+
+static const char *const nl_months[12] = {
+	"January", "February", "March", "April", "May", "June", "July",
+	"August", "September", "October", "November", "December"
+};
+
+static const char *const nl_abmonths[12] = {
+	"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct",
+	"Nov", "Dec"
+};
+
 char *
 nl_langinfo(int item)
 {
 
-	/* CODESET (item 0): a non-UTF-8 name, so tools pick ASCII line-drawing. */
-	return ((char *)(item == 0 ? "US-ASCII" : ""));
+	if (item >= NL_ABMON_1 && item < NL_ABMON_1 + 12)
+		return ((char *)nl_abmonths[item - NL_ABMON_1]);
+	if (item >= NL_MON_1 && item < NL_MON_1 + 12)
+		return ((char *)nl_months[item - NL_MON_1]);
+	if (item >= NL_ABDAY_1 && item < NL_ABDAY_1 + 7)
+		return ((char *)nl_abdays[item - NL_ABDAY_1]);
+	if (item >= NL_DAY_1 && item < NL_DAY_1 + 7)
+		return ((char *)nl_days[item - NL_DAY_1]);
+
+	switch (item) {
+	/* A non-UTF-8 codeset, so tools pick ASCII line-drawing over box glyphs. */
+	case NL_CODESET:	return ((char *)"US-ASCII");
+	case NL_D_T_FMT:	return ((char *)"%a %b %e %H:%M:%S %Y");
+	case NL_D_FMT:		return ((char *)"%m/%d/%y");
+	case NL_T_FMT:		return ((char *)"%H:%M:%S");
+	case NL_T_FMT_AMPM:	return ((char *)"%I:%M:%S %p");
+	case NL_AM_STR:		return ((char *)"AM");
+	case NL_PM_STR:		return ((char *)"PM");
+	default:		return ((char *)"");
+	}
 }
 
 void *
@@ -2208,13 +2450,7 @@ uname(struct utsname *u)
 	return (0);
 }
 
-/*
- * errno location.  Apple's <errno.h> defines errno as (*__error()); a handful
- * of guname's gnulib paths read it.  One shared cell is enough -- we set it
- * nowhere, so it stays 0 (success), which is all the success path needs.
- */
-static int	g_errno;
-
+/* errno's accessor; the cell itself is declared at the top of the file. */
 int *
 __error(void)
 {
@@ -3778,5 +4014,456 @@ wctype(const char *property)
 {
 
 	(void)property;
+	return (0);
+}
+
+/* ---- gls rung: the calendar, the mode string, and the rest of ls(1) ------ */
+
+/*
+ * gls (GNU coreutils 9.11's ls) is the ninth real Apple binary, and the first
+ * one that asks the system what it REMEMBERS rather than what it is: a mode
+ * word, an owner, a link count and a date, per file.  Every one of those was
+ * being invented in this file until the kernel learned to carry them out of
+ * the inode -- so most of what follows is presentation for facts that now
+ * arrive from the disk, not substitutes for them.
+ *
+ * The exceptions are named where they occur: this volume has no ACLs, no
+ * group database and no timezone, and saying so plainly beats approximating
+ * any of the three.
+ */
+
+/*
+ * struct tm, Apple's layout: nine ints, then the two BSD extensions.  The
+ * date formatting ls(1) actually uses is gnulib's own strftime replacement,
+ * compiled into the binary; it reads tm_gmtoff and tm_zone, so both are here
+ * and both say UTC.
+ */
+struct tm {
+	int	 tm_sec;
+	int	 tm_min;
+	int	 tm_hour;
+	int	 tm_mday;
+	int	 tm_mon;		/* 0-11 */
+	int	 tm_year;		/* years since 1900 */
+	int	 tm_wday;		/* 0 = Sunday */
+	int	 tm_yday;		/* 0-365 */
+	int	 tm_isdst;
+	long	 tm_gmtoff;
+	char	*tm_zone;
+};
+
+/*
+ * The calendar, in both directions, by the same trick: shift the year to
+ * begin in March so that February's length stops being a special case, count
+ * whole 400-year eras, and let one linear formula carry the month lengths.
+ * Leap years and century rules fall out of the era arithmetic instead of
+ * being tested for.  (Howard Hinnant's days_from_civil / civil_from_days; the
+ * kernel has the forward half in kern/fs_fat.c for the same reason.)
+ */
+static int64_t
+days_from_civil(int32_t y, uint32_t m, uint32_t d)
+{
+	int64_t		era;
+	uint32_t	yoe;
+	uint32_t	doy;
+	uint32_t	doe;
+
+	y -= (int32_t)(m <= 2u);
+	era = (int64_t)(y >= 0 ? y : y - 399) / 400;
+	yoe = (uint32_t)((int64_t)y - era * 400);
+	doy = (153u * (m > 2u ? m - 3u : m + 9u) + 2u) / 5u + d - 1u;
+	doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+	return (era * 146097 + (int64_t)doe - 719468);
+}
+
+static void
+civil_from_days(int64_t z, int *y_out, unsigned *m_out, unsigned *d_out)
+{
+	int64_t		era;
+	int64_t		y;
+	uint64_t	doe;		/* day of era   [0, 146096] */
+	uint64_t	yoe;		/* year of era  [0, 399]    */
+	uint64_t	doy;		/* day of year, March-based */
+	uint64_t	mp;		/* month        [0, 11]     */
+
+	z += 719468;			/* move the epoch to 0000-03-01 */
+	era = (z >= 0 ? z : z - 146096) / 146097;
+	doe = (uint64_t)(z - era * 146097);
+	yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+	y   = (int64_t)yoe + era * 400;
+	doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+	mp  = (5 * doy + 2) / 153;
+	*d_out = (unsigned)(doy - (153 * mp + 2) / 5 + 1);
+	*m_out = (unsigned)(mp < 10 ? mp + 3 : mp - 9);
+	*y_out = (int)(y + (*m_out <= 2));
+}
+
+/*
+ * gmtime_r: seconds since the epoch to a broken-down UTC time.
+ *
+ * localtime_r is the same function.  That is not laziness: this system reads
+ * one clock, the CMOS RTC, and has no timezone database, no TZ handling and
+ * nothing that could tell it what offset the machine sits at.  Choosing one
+ * would mean printing every timestamp wrong by it.  UTC is what the hardware
+ * said, and tm_zone says so.
+ */
+struct tm *
+gmtime_r(const int64_t *t, struct tm *tm)
+{
+	int64_t		secs;
+	int64_t		days;
+	int64_t		rem;
+	unsigned	mon;
+	unsigned	day;
+	int		year;
+
+	if (t == NULL || tm == NULL)
+		return (NULL);
+	secs = *t;
+
+	/*
+	 * Floor division, not truncation: a pre-1970 timestamp divided the C
+	 * way rounds toward zero and lands a day late with a negative
+	 * remainder.  Nothing on this volume is that old, but a date routine
+	 * that is right for only half the number line is a trap for whoever
+	 * reaches for it next.
+	 */
+	days = secs / 86400;
+	rem  = secs % 86400;
+	if (rem < 0) {
+		rem += 86400;
+		days -= 1;
+	}
+
+	civil_from_days(days, &year, &mon, &day);
+	tm->tm_sec    = (int)(rem % 60);
+	tm->tm_min    = (int)((rem / 60) % 60);
+	tm->tm_hour   = (int)(rem / 3600);
+	tm->tm_mday   = (int)day;
+	tm->tm_mon    = (int)mon - 1;
+	tm->tm_year   = year - 1900;
+	/* 1970-01-01 was a Thursday (4); the +11 keeps the modulus positive. */
+	tm->tm_wday   = (int)(((days % 7) + 11) % 7);
+	tm->tm_yday   = (int)(days - days_from_civil(year, 1, 1));
+	tm->tm_isdst  = 0;
+	tm->tm_gmtoff = 0;
+	tm->tm_zone   = (char *)"UTC";
+	return (tm);
+}
+
+struct tm *
+localtime_r(const int64_t *t, struct tm *tm)
+{
+
+	return (gmtime_r(t, tm));
+}
+
+/*
+ * tzset(3): read the timezone from the environment.  There is no timezone to
+ * read and no database to read it from, so this is a genuine no-op rather
+ * than an unimplemented stub -- the state it would set is already correct.
+ */
+void
+tzset(void)
+{
+}
+
+/*
+ * strmode(3): the "drwxr-xr-x " a long listing opens with, BSD's spelling,
+ * including the trailing space.  That space is where macOS puts the '+' or
+ * '@' marking an ACL or an extended attribute; this volume has neither, so
+ * it stays blank rather than being dropped -- the column belongs there.
+ */
+void
+strmode(int mode, char *p)
+{
+
+	switch (mode & 0170000) {
+	case 0040000:	*p++ = 'd'; break;
+	case 0100000:	*p++ = '-'; break;
+	case 0120000:	*p++ = 'l'; break;
+	case 0020000:	*p++ = 'c'; break;
+	case 0060000:	*p++ = 'b'; break;
+	case 0010000:	*p++ = 'p'; break;
+	case 0140000:	*p++ = 's'; break;
+	default:	*p++ = '?'; break;
+	}
+
+	*p++ = (mode & 0400) ? 'r' : '-';
+	*p++ = (mode & 0200) ? 'w' : '-';
+	if ((mode & 04000) != 0)
+		*p++ = (mode & 0100) ? 's' : 'S';
+	else
+		*p++ = (mode & 0100) ? 'x' : '-';
+
+	*p++ = (mode & 0040) ? 'r' : '-';
+	*p++ = (mode & 0020) ? 'w' : '-';
+	if ((mode & 02000) != 0)
+		*p++ = (mode & 0010) ? 's' : 'S';
+	else
+		*p++ = (mode & 0010) ? 'x' : '-';
+
+	*p++ = (mode & 0004) ? 'r' : '-';
+	*p++ = (mode & 0002) ? 'w' : '-';
+	if ((mode & 01000) != 0)
+		*p++ = (mode & 0001) ? 't' : 'T';
+	else
+		*p++ = (mode & 0001) ? 'x' : '-';
+
+	*p++ = ' ';
+	*p = '\0';
+}
+
+/* ---- the small libc gls drags in with it -------------------------------- */
+
+size_t
+strnlen(const char *s, size_t maxlen)
+{
+	size_t	n;
+
+	for (n = 0; n < maxlen && s[n] != '\0'; n++)
+		continue;
+	return (n);
+}
+
+/*
+ * __memcpy_chk: what _FORTIFY_SOURCE compiles a memcpy into when the
+ * destination's size is known.  A copy larger than that size is a detected
+ * overflow, and the contract is to abort rather than to truncate: truncating
+ * would hide the bug the check exists to find.
+ */
+void *
+__memcpy_chk(void *dst, const void *src, size_t len, size_t dstlen)
+{
+
+	if (len > dstlen)
+		abort();
+	return (memcpy(dst, src, len));
+}
+
+/*
+ * Wide characters in the C locale, where every byte is its own character.
+ * wcwidth is how ls(1) aligns columns: one column for a printable character,
+ * zero for the null, and -1 for a control character, whose effect on the
+ * cursor a column counter cannot predict.
+ */
+int
+wcwidth(wchar_t wc)
+{
+
+	if (wc == 0)
+		return (0);
+	if (wc < 32 || (wc >= 0x7F && wc < 0xA0))
+		return (-1);
+	return (1);
+}
+
+int
+btowc(int c)
+{
+
+	return (c == -1 ? -1 : (int)(unsigned char)c);
+}
+
+wchar_t *
+wmemchr(const wchar_t *s, wchar_t c, size_t n)
+{
+	size_t	i;
+
+	for (i = 0; i < n; i++) {
+		if (s[i] == c)
+			return ((wchar_t *)&s[i]);
+	}
+	return (NULL);
+}
+
+wchar_t *
+wmemcpy(wchar_t *dst, const wchar_t *src, size_t n)
+{
+	size_t	i;
+
+	for (i = 0; i < n; i++)
+		dst[i] = src[i];
+	return (dst);
+}
+
+/*
+ * The locale, in the two shapes a program asks for it.  setlocale(3) above
+ * already answers "C"; these are the query paths.  localeconv's answer is the
+ * C locale's by definition -- "." for the decimal point, empty strings for
+ * everything monetary, and CHAR_MAX for every numeric field, which is how the
+ * standard spells "this locale does not specify one".
+ */
+struct lconv {
+	char	*decimal_point;
+	char	*thousands_sep;
+	char	*grouping;
+	char	*int_curr_symbol;
+	char	*currency_symbol;
+	char	*mon_decimal_point;
+	char	*mon_thousands_sep;
+	char	*mon_grouping;
+	char	*positive_sign;
+	char	*negative_sign;
+	char	 int_frac_digits;
+	char	 frac_digits;
+	char	 p_cs_precedes;
+	char	 p_sep_by_space;
+	char	 n_cs_precedes;
+	char	 n_sep_by_space;
+	char	 p_sign_posn;
+	char	 n_sign_posn;
+};
+
+struct lconv *
+localeconv(void)
+{
+	static struct lconv	lc;
+	static char		empty[] = "";
+	static char		dot[] = ".";
+
+	lc.decimal_point     = dot;
+	lc.thousands_sep     = empty;
+	lc.grouping          = empty;
+	lc.int_curr_symbol   = empty;
+	lc.currency_symbol   = empty;
+	lc.mon_decimal_point = empty;
+	lc.mon_thousands_sep = empty;
+	lc.mon_grouping      = empty;
+	lc.positive_sign     = empty;
+	lc.negative_sign     = empty;
+	lc.int_frac_digits   = (char)127;	/* CHAR_MAX = unspecified */
+	lc.frac_digits       = (char)127;
+	lc.p_cs_precedes     = (char)127;
+	lc.p_sep_by_space    = (char)127;
+	lc.n_cs_precedes     = (char)127;
+	lc.n_sep_by_space    = (char)127;
+	lc.p_sign_posn       = (char)127;
+	lc.n_sign_posn       = (char)127;
+	return (&lc);
+}
+
+/*
+ * uselocale(3): install a thread's locale and return the previous one.  There
+ * is one locale and it is C, so the previous one is always the global locale
+ * -- returned as a non-null token because NULL is uselocale's ERROR return,
+ * and a caller that checks would otherwise see a failure that did not happen.
+ */
+void *
+uselocale(void *loc)
+{
+	static int	global_locale;
+
+	(void)loc;
+	return (&global_locale);
+}
+
+/* MB_CUR_MAX for an explicitly named locale.  Whichever it is, it is C. */
+int
+___mb_cur_max_l(void *loc)
+{
+
+	(void)loc;
+	return (1);
+}
+
+/*
+ * The group database, which does not exist.  getgrgid above answers NULL to
+ * the same question asked by number.  ls(1) falls back to printing the
+ * numeric gid, which is the honest rendering of a system where group 0 has
+ * no name to print.
+ */
+void *
+getgrnam(const char *name)
+{
+
+	(void)name;
+	return (NULL);
+}
+
+/*
+ * POSIX.1e ACLs, which this filesystem does not have.  ls(1) calls
+ * acl_get_file (or acl_get_link_np) on every entry to decide whether to print
+ * the '+' that marks an extended ACL, and acl_get_entry to see whether what
+ * came back holds anything.
+ *
+ * NULL alone is not the answer, and getting that wrong was visible: gnulib
+ * reads a NULL return as an ERROR unless errno says the system does not do
+ * ACLs, so `ls -l` printed a bare "gls: /usr" line -- an error report with an
+ * empty message, because errno happened to be 0 -- before every single entry
+ * it then listed correctly.  ENOTSUP is both the truthful answer and the one
+ * gnulib's ACL_NOT_WELL_SUPPORTED() accepts as "no ACLs here, carry on".
+ */
+#define	DARWIN_ENOTSUP	45
+
+void *
+acl_get_file(const char *path, unsigned int type)
+{
+
+	(void)path;
+	(void)type;
+	g_errno = DARWIN_ENOTSUP;
+	return (NULL);
+}
+
+void *
+acl_get_link_np(const char *path, unsigned int type)
+{
+
+	(void)path;
+	(void)type;
+	g_errno = DARWIN_ENOTSUP;
+	return (NULL);
+}
+
+void *
+acl_get_fd_np(int fd, unsigned int type)
+{
+
+	(void)fd;
+	(void)type;
+	g_errno = DARWIN_ENOTSUP;
+	return (NULL);
+}
+
+int
+acl_get_entry(void *acl, int entry_id, void **entry_p)
+{
+
+	(void)acl;
+	(void)entry_id;
+	(void)entry_p;
+	return (-1);				/* no entries, ever */
+}
+
+int
+acl_free(void *obj)
+{
+
+	(void)obj;
+	return (0);
+}
+
+/*
+ * pthread mutexes.  Every process here has exactly one thread, so a lock is
+ * uncontended by construction: these are not stubs standing in for missing
+ * synchronisation, they are what correct synchronisation degenerates to when
+ * there is nobody to race against.  The day this system grows threads inside
+ * a Darwin process, these become real and the compiler will not remind us --
+ * which is why it is written down here.
+ */
+int
+pthread_mutex_lock(void *m)
+{
+
+	(void)m;
+	return (0);
+}
+
+int
+pthread_mutex_unlock(void *m)
+{
+
+	(void)m;
 	return (0);
 }

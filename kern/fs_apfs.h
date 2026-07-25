@@ -371,6 +371,15 @@ struct apfs_inode_val {
 	uint64_t	ai_uncompressed_size;
 } __attribute__((packed));
 
+/*
+ * ai_mode is an ordinary POSIX mode_t written straight to disk, so its type
+ * field is spelled the way POSIX froze it.  The reader needs exactly one of
+ * these bits: ai_nchildren_or_nlink means CHILDREN on a directory and LINKS
+ * on anything else, and the mode is what tells the two apart.
+ */
+#define	APFS_S_IFMT	0170000
+#define	APFS_S_IFDIR	0040000
+
 _Static_assert(sizeof(struct apfs_inode_val) == 92,
     "the fixed part of an inode record is 92 bytes, extended fields follow");
 _Static_assert(__builtin_offsetof(struct apfs_inode_val, ai_mode) == 80,
@@ -454,10 +463,26 @@ struct fs_apfs_dirent {
  * A file's metadata, as fs_apfs_stat reports it.  Sizes are 64-bit because
  * APFS's are; the Darwin syscall layer narrows them where its own wire format
  * is 32-bit, which is the right place for that decision to be visible.
+ *
+ * Everything below afs_mode comes out of the inode record's FIXED part, which
+ * the tree walk was already reading and this struct was already throwing away
+ * -- the timestamps are APFS's own nanoseconds since the Unix epoch, and the
+ * link count is nchildren for a directory (Apple stores both in one field and
+ * tells them apart by the mode).  afs_alloced is the dstream's allocated size,
+ * which is what st_blocks means: what the volume spent, not what the file
+ * says it is.
  */
 struct fs_apfs_statbuf {
 	uint64_t	afs_size;	/* byte length (0 for a directory) */
 	uint64_t	afs_ino;	/* object id                       */
+	uint64_t	afs_alloced;	/* bytes on disk (dstream)         */
+	uint64_t	afs_mtime_ns;
+	uint64_t	afs_atime_ns;
+	uint64_t	afs_ctime_ns;
+	uint64_t	afs_btime_ns;
+	uint32_t	afs_nlink;
+	uint32_t	afs_uid;
+	uint32_t	afs_gid;
 	uint16_t	afs_mode;	/* BSD mode bits from the inode    */
 	uint8_t		afs_is_dir;
 };

@@ -1898,6 +1898,41 @@ demo_darwin_spawn(void)
 	}
 
 	/*
+	 * A NINTH real Apple binary: gls (GNU coreutils' ls), in the long
+	 * form, because the short form would prove only that we can list
+	 * names -- which tree(1) already did.  `-l` is the whole point: every
+	 * column but the name comes out of the inode, so a plausible line
+	 * here means the mode word, the link count, the owner, the size and
+	 * the date all survived the trip from the on-disk record through two
+	 * translation layers into a binary built for a different kernel.
+	 *
+	 * Two directories on purpose.  /bin has no volume behind it at all --
+	 * those files are inside the kernel image -- so it exercises the
+	 * synthetic side, while / is whatever the attached disk really says.
+	 */
+	{
+		mach_port_name_t	gls_tp;
+		char			*gls_argv[4];
+
+		gls_tp = MACH_PORT_NULL;
+		gls_argv[0] = "gls";
+		gls_argv[1] = "-l";
+		gls_argv[2] = "/";
+		gls_argv[3] = "/bin";
+		printf("  >>> spawning gls -l -- a REAL Apple x86-64 macOS "
+		    "binary printing what the inodes say <<<\n");
+		child_id = spawn_args("gls", 4, gls_argv, &gls_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('gls') failed (rv=%ld)\n",
+			    child_id);
+			return (96);
+		}
+		for (i = 0; i < 4096 && task_alive((uint64_t)child_id); i++)
+			(void)yield();
+		printf("  gls retired after %d yields\n", i);
+	}
+
+	/*
 	 * The wall clock, from ring 3.  Uptime has been available since the
 	 * PIT came up, but the calendar needs a chip that was running before
 	 * we were; this probe is where that distinction gets tested rather

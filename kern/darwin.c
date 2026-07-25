@@ -2204,6 +2204,47 @@ darwin_s9_map_image(struct syscall_frame *f)
 }
 
 /*
+ * Metadata for something in the program registry, which is not on any volume:
+ * these files are part of the kernel image, so no filesystem has an opinion
+ * about when they were written or who owns them.
+ *
+ * The timestamp is the one true thing available -- the moment this kernel
+ * started running, which is when these files came into existence as far as
+ * anything can observe.  It is computed rather than sampled (wall time minus
+ * uptime is exactly the anchor clock_init took from the RTC), so repeated
+ * stats of /bin/hello agree with each other instead of drifting a second per
+ * second the way reporting "now" would.  A machine with no usable RTC reports
+ * zero, which is the same "unrecorded" a volume without timestamps reports.
+ *
+ * The mode says read-only and executable because that is precisely what a
+ * program baked into the kernel image is.
+ */
+static void
+darwin_bin_statbuf(struct fs_statbuf *sb, int is_dir)
+{
+	uint64_t	ns;
+	size_t		i;
+	uint8_t		*p;
+
+	p = (uint8_t *)sb;
+	for (i = 0; i < sizeof(*sb); i++)
+		p[i] = 0;
+
+	ns = 0;
+	if (clock_walltime_valid()) {
+		ns = (uint64_t)(clock_walltime_us() -
+		    (int64_t)clock_uptime_us()) * 1000ULL;
+	}
+	sb->fs_mtime_ns = ns;
+	sb->fs_atime_ns = ns;
+	sb->fs_ctime_ns = ns;
+	sb->fs_btime_ns = ns;
+	sb->fs_nlink    = 1;
+	sb->fs_mode     = is_dir ? (FS_S_IFDIR | 0555) : (FS_S_IFREG | 0555);
+	sb->fs_is_dir   = is_dir ? 1 : 0;
+}
+
+/*
  * fs_stat(const char *path, struct fs_statbuf *out): existence + size + type +
  * inode probe behind libSystem's stat$INODE64.  Copies the small fs_statbuf
  * out to the caller and returns 0 (carry clear) if the file is present, carry
@@ -2231,14 +2272,13 @@ darwin_s9_fs_stat(struct syscall_frame *f)
 	 * /bin.  Everything under it resolves normally, registry first.
 	 */
 	if (darwin_streq(path, DARWIN_BIN_DIR)) {
-		sb.fs_size   = 0;
+		darwin_bin_statbuf(&sb, 1);
 		sb.fs_ino    = DARWIN_BIN_INO_BASE;
-		sb.fs_is_dir = 1;
 	} else if ((pe = darwin_bin_lookup(path)) != NULL) {
+		darwin_bin_statbuf(&sb, 0);
 		sb.fs_size   = pe->pr_size;
 		sb.fs_ino    = DARWIN_BIN_INO_BASE + 1 +
 		    (uint32_t)(pe - progreg_at(0));
-		sb.fs_is_dir = 0;
 	} else {
 		rv = fs_stat(path, &sb);
 		if (rv != FS_E_OK)
