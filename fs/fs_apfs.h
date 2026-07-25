@@ -851,6 +851,16 @@ void	fs_apfs_ckpt_selftest(void);
 void	fs_apfs_data_selftest(const char *path);
 
 /*
+ * Make a file longer: `ino` names the inode record carrying its length, `id`
+ * the dstream its extents are keyed on.  A file with slack in its last block
+ * grows into it and nothing but the length changes; otherwise a run is taken,
+ * zeroed, and handed to both trees that name a file's blocks.  Refuses when
+ * the leaf it would insert into has no room -- splitting a node is not done
+ * here.  Returns FS_APFS_E_OK or a negative FS_APFS_E_*.
+ */
+int	fs_apfs_grow(uint64_t ino, uint64_t id, uint64_t new_size);
+
+/*
  * Translate a virtual object id to its block number through the object-map
  * B-tree rooted at `tree_bno`, taking the newest version no later than `xid`.
  * Returns FS_APFS_E_OK and stores the block in *paddr_out, or a negative

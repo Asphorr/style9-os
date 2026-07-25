@@ -270,6 +270,14 @@ void		fs_ckpt_selftest(void);
 void		fs_data_selftest(void);
 
 /*
+ * Prove that a file can get longer and stay longer.  Grows the file once, on
+ * the first boot that finds it still a whole number of blocks; every boot
+ * after that checks the length and the appended bytes survived instead.
+ * Silently does nothing when the volume is not APFS.
+ */
+void		fs_grow_selftest(void);
+
+/*
  * The volume generation, and what it has caught: how many handles were older
  * than the volume when used, and how many of those had a length that really
  * had moved.  The first number moving proves the check is alive; the second

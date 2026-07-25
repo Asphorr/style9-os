@@ -302,6 +302,26 @@ pwrite_locked(struct fs_handle *h, uint64_t off, const uint8_t *buf,
 	 */
 	handle_refresh(h);
 
+	/*
+	 * A write that runs past the end makes the file longer first.  Not a
+	 * clamp and not a second write: the length moves, the records that say
+	 * so move with it, and only then are the bytes put down -- so a failure
+	 * to grow is a write that did not happen rather than one that half did.
+	 *
+	 * Starting BEYOND the end is still refused, by fs_apfs_pwrite.  That
+	 * would leave a gap no extent describes, which is a sparse file and a
+	 * different thing from a longer one.
+	 */
+	if (off <= h->fh_size && off + (uint64_t)len > h->fh_size) {
+		rv = apfs_err(fs_apfs_grow(h->fh_ino, h->fh_id,
+		    off + (uint64_t)len));
+		if (rv != FS_E_OK)
+			return (rv);
+		h->fh_size = off + (uint64_t)len;
+		fs_gen++;
+		h->fh_gen = fs_gen;
+	}
+
 	rv = apfs_err(fs_apfs_pwrite(h->fh_id, h->fh_size, off, buf, len,
 	    out_put));
 	if (rv != FS_E_OK)
@@ -592,13 +612,18 @@ fs_write_selftest(void)
 	}
 
 	/*
-	 * A write that runs off the end must be refused outright.  Not
-	 * clamped: a short write reported as success is how a file ends up
-	 * half-updated with the caller told everything went in.
+	 * A write that STARTS past the end must be refused outright.  Not
+	 * clamped and not grown into: the bytes between would belong to no
+	 * extent, which is a sparse file rather than a longer one, and a short
+	 * write reported as success is how a file ends up half-updated with
+	 * the caller told everything went in.  A write that merely runs off
+	 * the end is a different matter and now lengthens the file; see
+	 * fs_apfs_grow and the growth self-test.
 	 */
-	rv = fs_pwrite(&h, h.fh_size - 4, (const uint8_t *)marker, 8, &put);
+	rv = fs_pwrite(&h, h.fh_size + 4096, (const uint8_t *)marker, 8, &put);
 	if (rv != FS_E_NOALLOC) {
-		kprintf("apfs-write: FAIL growth not refused (rv=%d)\n", rv);
+		kprintf("apfs-write: FAIL a write starting past the end was "
+		    "not refused (rv=%d)\n", rv);
 		return;
 	}
 
@@ -726,6 +751,129 @@ fs_write_selftest(void)
 	}
 	kprintf("apfs-write: PASS -- marker written at %s:0; a reboot should "
 	    "find it\n", SELFTEST_PATH);
+}
+
+/*
+ * A FILE GETS LONGER, AND STAYS LONGER
+ *
+ * Once, and then never again: the file this uses starts at a whole number of
+ * blocks, and the test appends a tail that is not, so the very fact that its
+ * length is no longer block-aligned says an earlier boot already did it.  That
+ * is what makes this safe to run at every boot with nothing to undo -- there
+ * is no truncate yet, so a test that grew the file each time would grow it
+ * without bound and fill the leaf it inserts into.
+ *
+ * The second boot is the interesting one.  It does not write at all; it checks
+ * that the length and the bytes an earlier boot appended are still there,
+ * which is a claim about the platter rather than about this kernel's memory.
+ */
+#define	GROW_TAIL	"appended by style9"
+
+void
+fs_grow_selftest(void)
+{
+	struct fs_handle	h;
+	uint8_t			back[64];
+	const char		*tail = GROW_TAIL;
+	uint64_t		was;
+	uint32_t		n;
+	uint32_t		got;
+	uint32_t		put;
+	size_t			i;
+	int			rv;
+
+	if (!fs_apfs_ready())
+		return;
+	if (fs_open(SELFTEST_PATH, &h) != FS_E_OK) {
+		kprintf("apfs-grow: %s absent -- skipped\n", SELFTEST_PATH);
+		return;
+	}
+	n = 0;
+	while (tail[n] != '\0')
+		n++;
+	if (n > sizeof(back)) {
+		kprintf("apfs-grow: tail too long -- skipped\n");
+		return;
+	}
+
+	if (h.fh_size % 4096 != 0) {
+		/*
+		 * An earlier boot grew it.  Everything worth checking is on the
+		 * disk already: the length survived, and so did the bytes.
+		 */
+		rv = fs_pread(&h, h.fh_size - n, back, n, &got);
+		if (rv != FS_E_OK || got != n) {
+			kprintf("apfs-grow: FAIL cannot read the tail "
+			    "(rv=%d got=%u)\n", rv, got);
+			return;
+		}
+		for (i = 0; i < n; i++) {
+			if (back[i] == (uint8_t)tail[i])
+				continue;
+			kprintf("apfs-grow: FAIL byte %u of the tail is 0x%02x, "
+			    "wanted 0x%02x -- what an earlier boot appended "
+			    "did not survive\n", (unsigned)i,
+			    (unsigned)back[i], (unsigned)(uint8_t)tail[i]);
+			return;
+		}
+		kprintf("apfs-grow: PASS -- %s is %llu bytes and the %u bytes "
+		    "an earlier boot appended are still there\n",
+		    SELFTEST_PATH, (unsigned long long)h.fh_size,
+		    (unsigned)n);
+		return;
+	}
+
+	was = h.fh_size;
+	rv  = fs_pwrite(&h, was, (const uint8_t *)tail, n, &put);
+	if (rv != FS_E_OK || put != n) {
+		kprintf("apfs-grow: FAIL the file would not grow (rv=%d "
+		    "put=%u)\n", rv, put);
+		return;
+	}
+	if (h.fh_size != was + n) {
+		kprintf("apfs-grow: FAIL the handle says %llu bytes, wanted "
+		    "%llu\n", (unsigned long long)h.fh_size,
+		    (unsigned long long)(was + n));
+		return;
+	}
+
+	/* What the volume says, not what the handle remembers. */
+	{
+		struct fs_statbuf	st;
+
+		if (fs_stat(SELFTEST_PATH, &st) != FS_E_OK) {
+			kprintf("apfs-grow: FAIL cannot stat after growing\n");
+			return;
+		}
+		if (st.fs_size != was + n) {
+			kprintf("apfs-grow: FAIL the volume says %llu bytes "
+			    "after growing to %llu -- the length did not "
+			    "reach the inode record\n",
+			    (unsigned long long)st.fs_size,
+			    (unsigned long long)(was + n));
+			return;
+		}
+	}
+
+	rv = fs_pread(&h, was, back, n, &got);
+	if (rv != FS_E_OK || got != n) {
+		kprintf("apfs-grow: FAIL cannot read back what was appended "
+		    "(rv=%d got=%u)\n", rv, got);
+		return;
+	}
+	for (i = 0; i < n; i++) {
+		if (back[i] == (uint8_t)tail[i])
+			continue;
+		kprintf("apfs-grow: FAIL byte %u of the new tail is 0x%02x, "
+		    "wanted 0x%02x\n", (unsigned)i, (unsigned)back[i],
+		    (unsigned)(uint8_t)tail[i]);
+		return;
+	}
+
+	kprintf("apfs-grow: PASS -- %s grew %llu -> %llu bytes, the new "
+	    "extent carries the appended text, and a reboot should still "
+	    "find it\n", SELFTEST_PATH, (unsigned long long)was,
+	    (unsigned long long)h.fh_size);
 }
 
 /* As above, and about the same file every other write test uses. */

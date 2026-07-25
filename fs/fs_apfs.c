@@ -60,6 +60,7 @@ static struct {
 	uint64_t	ac_vol_omap_bno;	/* (c) volume omap object   */
 	uint64_t	ac_root_tree_oid;	/* (m) its VIRTUAL oid      */
 	uint64_t	ac_extref_bno;		/* (c) extent reference tree */
+	uint64_t	ac_fs_alloc_count;	/* (c) blocks this volume owns */
 	uint64_t	ac_num_files;		/* (m) */
 	uint64_t	ac_num_dirs;		/* (m) */
 	uint32_t	ac_xp_desc_blocks;	/* (m) */
@@ -252,6 +253,10 @@ static int	alloc_flush(uint64_t xid);
 static struct alloc_chunk *chunk_for(uint64_t bno);
 static int	spine_update(uint64_t oid, uint64_t paddr, uint64_t xid,
 		    void *buf);
+static int	spine_update_n(const uint64_t *oids, const uint64_t *paddrs,
+		    uint32_t n, uint64_t xid, void *buf);
+static int	cow_physical(uint64_t old_bno, uint64_t xid, void *buf,
+		    uint64_t *new_bno);
 static int	extref_move(uint64_t old_start, uint64_t new_start,
 		    uint64_t blocks, uint64_t xid, void *buf);
 static int	fq_insert(uint32_t q, uint64_t xid, uint64_t paddr,
@@ -1905,6 +1910,14 @@ mount_volume(void *scratch)
 	 * is already the block it lives in and no map is asked.
 	 */
 	g_apfs.ac_extref_bno     = sb->apfs_extentref_tree_oid;
+	/*
+	 * And what the volume claims to own.  A container-wide free count is
+	 * not the same statement: this one says how many blocks belong to THIS
+	 * volume, and apfsck checks it against the extents it can reach --
+	 * "Volume superblock: bad block count", which is what the first file
+	 * this kernel lengthened produced.
+	 */
+	g_apfs.ac_fs_alloc_count = sb->apfs_fs_alloc_count;
 	return (FS_APFS_E_OK);
 }
 
@@ -3050,6 +3063,570 @@ out:
 	return (rv);
 }
 
+/* ---- growing -------------------------------------------------------------- */
+
+/*
+ * A FILE GETS LONGER
+ *
+ * Every write until now replaced a record; this one ADDS one, which is the
+ * first thing in this file that changes a tree's shape.  Three records have to
+ * agree afterwards and they live in two different trees:
+ *
+ *	the file extent    (object, offset in the file) -> run
+ *	the physical extent          (first block)      -> length, owner, count
+ *	the inode's dstream                             -> length, allocated
+ *
+ * Room was measured before any of it was designed.  The leaf holding this
+ * container's file extents has 193 bytes of free span and six spare entries in
+ * its table of contents, against 48 bytes and one entry for a file extent
+ * record -- so four inserts fit and the fifth does not.  That bound is real and
+ * it is reported rather than worked around: a node with no room has to SPLIT,
+ * a split changes the index above it, and that is the next rung.  Refusing out
+ * loud leaves a filesystem that still says the truth about itself.
+ *
+ * The table of contents is the reason a node has any bound at all.  It is a
+ * fixed reservation at the front, and the key area begins where it ends, so
+ * growing it would move every key under every offset already recorded.
+ */
+
+/*
+ * Order two file-system tree keys: negative, zero, positive.
+ *
+ * Records sort by object id FIRST and type second, which is the opposite of
+ * what comparing the raw first word would do -- the type is in the top bits.
+ * Beyond that the order is per type; the only one this needs is the file
+ * extent, whose remaining key is its offset within the file.  Two keys with
+ * the same object and type and no rule to separate them compare equal, which
+ * is honest: this returns an order, not a total order over records it has
+ * never been asked about.
+ */
+static int
+jkey_cmp(const uint8_t *a, uint32_t alen, const uint8_t *b, uint32_t blen)
+{
+	uint64_t	ra, rb;
+	uint64_t	ida, idb;
+	uint64_t	la, lb;
+	uint32_t	ta, tb;
+
+	if (alen < 8 || blen < 8)
+		return (0);
+	ra  = *(const uint64_t *)a;
+	rb  = *(const uint64_t *)b;
+	ida = ra & APFS_J_OBJ_ID_MASK;
+	idb = rb & APFS_J_OBJ_ID_MASK;
+	if (ida != idb)
+		return (ida < idb ? -1 : 1);
+	ta = (uint32_t)(ra >> APFS_J_OBJ_TYPE_SHIFT);
+	tb = (uint32_t)(rb >> APFS_J_OBJ_TYPE_SHIFT);
+	if (ta != tb)
+		return (ta < tb ? -1 : 1);
+	if (ta == APFS_TYPE_FILE_EXTENT && alen >= 16 && blen >= 16) {
+		la = *(const uint64_t *)(a + 8);
+		lb = *(const uint64_t *)(b + 8);
+		if (la != lb)
+			return (la < lb ? -1 : 1);
+	}
+	return (0);
+}
+
+/*
+ * Put a record into a variable-KV node, at the position the caller worked out,
+ * and refuse if there is no room.
+ *
+ * Keys grow up from the start of the key area and values grow down from the
+ * end of the node; the free span in the middle is what both eat into, and the
+ * node header carries where it starts and how much is left.  Both ends are
+ * taken from that span rather than from the free-list chains, which is the
+ * simpler half of the format and the one a node this young ever needs.
+ */
+static int
+leaf_insert(uint8_t *node, uint32_t pos, const void *key, uint32_t klen,
+    const void *val, uint32_t vlen)
+{
+	struct apfs_btree_node_phys	*n;
+	struct btree_layout		 bl;
+	struct apfs_kvloc		*kv;
+	uint8_t				*keys;
+	uint32_t			 koff;
+	uint32_t			 voff;
+	uint32_t			 vbase;
+	uint32_t			 i;
+
+	n = (struct apfs_btree_node_phys *)node;
+	btree_layout(node, &bl);
+	if (bl.bl_fixed || pos > bl.bl_nkeys)
+		return (FS_APFS_E_INVAL);
+	if ((uint32_t)(bl.bl_nkeys + 1) * (uint32_t)sizeof(struct apfs_kvloc) >
+	    n->btn_table_space.nl_len) {
+		kprintf("apfs: the node at level %u has %u entries and no room "
+		    "in its table of contents -- a split is a different rung\n",
+		    (unsigned)bl.bl_level, (unsigned)bl.bl_nkeys);
+		return (FS_APFS_E_NOALLOC);
+	}
+	if (klen + vlen > n->btn_free_space.nl_len) {
+		kprintf("apfs: the node at level %u has %u bytes free and the "
+		    "record needs %u -- a split is a different rung\n",
+		    (unsigned)bl.bl_level, (unsigned)n->btn_free_space.nl_len,
+		    (unsigned)(klen + vlen));
+		return (FS_APFS_E_NOALLOC);
+	}
+
+	keys = node + APFS_BTNODE_HDR_SIZE + n->btn_table_space.nl_off +
+	    n->btn_table_space.nl_len;
+	koff = n->btn_free_space.nl_off;
+	mem_copy(keys + koff, key, klen);
+	n->btn_free_space.nl_off = (uint16_t)(koff + klen);
+	n->btn_free_space.nl_len = (uint16_t)(n->btn_free_space.nl_len - klen);
+
+	/*
+	 * The value's offset is measured BACKWARDS from the end of the node,
+	 * so it is whatever is left of the free span after this value is taken
+	 * off the bottom of it.
+	 */
+	n->btn_free_space.nl_len = (uint16_t)(n->btn_free_space.nl_len - vlen);
+	vbase = APFS_BLOCK_SIZE -
+	    (((n->btn_flags & APFS_BTNODE_ROOT) != 0) ? APFS_BTREE_INFO_SIZE : 0);
+	voff = vbase - (APFS_BTNODE_HDR_SIZE + n->btn_table_space.nl_off +
+	    n->btn_table_space.nl_len + n->btn_free_space.nl_off +
+	    n->btn_free_space.nl_len);
+	mem_copy((uint8_t *)bl.bl_vals - voff, val, vlen);
+
+	kv = (struct apfs_kvloc *)(node + APFS_BTNODE_HDR_SIZE +
+	    n->btn_table_space.nl_off);
+	for (i = bl.bl_nkeys; i > pos; i--)
+		kv[i] = kv[i - 1];
+	kv[pos].k.nl_off = (uint16_t)koff;
+	kv[pos].k.nl_len = (uint16_t)klen;
+	kv[pos].v.nl_off = (uint16_t)voff;
+	kv[pos].v.nl_len = (uint16_t)vlen;
+	n->btn_nkeys++;
+	return (FS_APFS_E_OK);
+}
+
+/*
+ * How many records a tree holds is written ONCE, in the btree_info at the end
+ * of its root node -- not in the leaf the record went into.  So an insert into
+ * a leaf moves two nodes, and the root is the second.
+ */
+static void
+tree_count_add(uint8_t *root, int64_t delta)
+{
+	uint64_t	*count;
+
+	count = (uint64_t *)(root + APFS_BLOCK_SIZE - APFS_BTREE_INFO_SIZE +
+	    APFS_BTREE_INFO_KEYCOUNT);
+	*count = (uint64_t)((int64_t)*count + delta);
+}
+
+/*
+ * A newly allocated run belongs to somebody: say so in the extent reference
+ * tree.  The tree is a single node that is its own root, so its record count
+ * is in the node being edited and there is nothing above it to tell.
+ */
+static int
+extref_insert(uint64_t start, uint64_t blocks, uint64_t owner, uint64_t xid,
+    void *buf)
+{
+	struct apfs_phys_ext_val	 pv;
+	struct btree_layout		 bl;
+	uint8_t				*node;
+	uint64_t			 key;
+	uint64_t			 raw;
+	uint64_t			 new_bno;
+	uint32_t			 koff, klen, voff, vlen;
+	uint32_t			 pos;
+	int				 rv;
+
+	rv = fs_apfs_read_block(g_apfs.ac_extref_bno, buf);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	node = buf;
+	btree_layout(node, &bl);
+	if (bl.bl_level != 0 || bl.bl_fixed)
+		return (FS_APFS_E_INVAL);
+
+	key = start | ((uint64_t)APFS_TYPE_EXTENT << APFS_J_OBJ_TYPE_SHIFT);
+	for (pos = 0; pos < bl.bl_nkeys; pos++) {
+		btree_entry_loc(&bl, pos, &koff, &klen, &voff, &vlen);
+		raw = *(const uint64_t *)(bl.bl_keys + koff);
+		if ((raw & APFS_J_OBJ_ID_MASK) > start)
+			break;
+	}
+
+	pv.pe_len_and_kind = blocks |
+	    ((uint64_t)APFS_PEXT_KIND_NEW << APFS_PEXT_KIND_SHIFT);
+	pv.pe_owning_obj_id = owner;
+	pv.pe_refcnt        = 1;
+	rv = leaf_insert(node, pos, &key, (uint32_t)sizeof(key), &pv,
+	    (uint32_t)sizeof(pv));
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	tree_count_add(node, 1);
+
+	rv = cow_physical(g_apfs.ac_extref_bno, xid, buf, &new_bno);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	g_apfs.ac_extref_bno = new_bno;
+	return (FS_APFS_E_OK);
+}
+
+/*
+ * Which leaf a key belongs in: the last one holding a key no greater than it.
+ *
+ * A walk in tree order is enough to answer that, and it is the same walk every
+ * reader here already uses.  Doing it by descending the index would be faster
+ * and would need a second copy of the key ordering; this one has exactly one.
+ */
+struct leaf_find {
+	const uint8_t	*lf_key;
+	uint32_t	 lf_klen;
+	uint64_t	 lf_bno;
+	uint64_t	 lf_first;
+	bool		 lf_any;
+};
+
+static bool
+leaf_find(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
+    const uint8_t *val, uint32_t vlen, uint64_t bno, void *arg)
+{
+	struct leaf_find	*lf;
+
+	(void)oid;
+	(void)type;
+	(void)val;
+	(void)vlen;
+	lf = arg;
+	if (!lf->lf_any) {
+		lf->lf_first = bno;
+		lf->lf_any   = true;
+	}
+	if (jkey_cmp(key, klen, lf->lf_key, lf->lf_klen) <= 0)
+		lf->lf_bno = bno;
+	return (true);
+}
+
+/*
+ * Make a file longer.
+ *
+ * Two cases, and the cheap one is worth having: a file whose last block is
+ * only partly used grows into that block without any record changing except
+ * its length.  Only when the allocation really is exhausted does this take a
+ * run, hand it to both trees, and pay for a record.
+ *
+ * The new run is ZEROED.  A block just taken from the allocator holds whatever
+ * the file that had it last left there, and handing that to a reader as the
+ * tail of their file is a disclosure, not a bug in the arithmetic.
+ */
+int
+fs_apfs_grow(uint64_t ino, uint64_t id, uint64_t new_size)
+{
+	struct apfs_file_extent_val	 fe;
+	struct apfs_dstream		*ds;
+	struct apfs_inode_val		*iv;
+	struct apfs_xf_blob		*blob;
+	struct apfs_x_field		*xf;
+	struct apfs_obj_phys		*o;
+	struct btree_layout		 bl;
+	struct inode_info		 ii;
+	struct leaf_find		 lf;
+	uint8_t				*node;
+	uint8_t				*zero;
+	const uint8_t			*k;
+	uint64_t			 oids[2];
+	uint64_t			 paddrs[2];
+	uint64_t			 key[2];
+	uint64_t			 first;
+	uint64_t			 blocks;
+	uint64_t			 alloced;
+	uint64_t			 near;
+	uint64_t			 root_bno;
+	uint64_t			 new_root;
+	uint64_t			 new_leaf;
+	uint64_t			 ino_leaf;
+	uint64_t			 raw;
+	uint64_t			 xid;
+	uint64_t			 b;
+	uint32_t			 koff, klen, voff, vlen;
+	uint32_t			 nmoved;
+	uint32_t			 ent, data, nexts;
+	uint32_t			 pos;
+	uint32_t			 i;
+	int				 rv;
+	bool				 stopped;
+
+	if (!g_apfs.ac_mounted)
+		return (FS_APFS_E_NOMOUNT);
+	if (!g_apfs.ac_ip_valid || g_apfs.ac_ctr_omap_tree == 0)
+		return (FS_APFS_E_NOALLOC);
+	if (inode_info(ino, &ii) != FS_APFS_E_OK)
+		return (FS_APFS_E_NOTFOUND);
+	if (new_size <= ii.ii_size)
+		return (FS_APFS_E_OK);
+
+	alloced = ii.ii_alloced;
+	blocks  = 0;
+	first   = 0;
+	xid     = g_apfs.ac_xid + 1;
+	node    = kmalloc(APFS_BLOCK_SIZE);
+	if (node == NULL)
+		return (FS_APFS_E_NOMEM);
+
+	/*
+	 * A run, if the file has run out of one.  Taken next to the bytes it
+	 * extends, which keeps the release of the whole thing reachable later
+	 * and keeps a growing file from scattering across the container.
+	 */
+	if (new_size > alloced) {
+		blocks = (new_size - alloced + APFS_BLOCK_SIZE - 1) /
+		    APFS_BLOCK_SIZE;
+		near = 0;
+		if (alloced > 0 && extent_at(id, alloced - 1, &near) !=
+		    FS_APFS_E_OK)
+			near = 0;
+		rv = alloc_blocks((uint32_t)blocks, near, &first);
+		if (rv != FS_APFS_E_OK)
+			goto out;
+
+		zero = kmalloc(APFS_BLOCK_SIZE);
+		if (zero == NULL) {
+			(void)free_blocks(first, (uint32_t)blocks);
+			rv = FS_APFS_E_NOMEM;
+			goto out;
+		}
+		mem_zero(zero, APFS_BLOCK_SIZE);
+		for (b = 0; b < blocks; b++) {
+			rv = write_block_raw(first + b, zero);
+			if (rv != FS_APFS_E_OK) {
+				kfree(zero);
+				(void)free_blocks(first, (uint32_t)blocks);
+				goto out;
+			}
+		}
+		kfree(zero);
+	}
+
+	/*
+	 * The inode's length lives in an extended field of its record, so the
+	 * patch is a fixed-size edit inside a value that is not: find the
+	 * dstream by walking the field table, exactly as the reader does.
+	 */
+	{
+		struct inode_locate	il;
+
+		il.il_oid   = ino;
+		il.il_bno   = 0;
+		il.il_found = false;
+		stopped = false;
+		if (!btree_walk(g_apfs.ac_root_tree_bno, inode_locate, &il, 0,
+		    &stopped)) {
+			rv = FS_APFS_E_IO;
+			goto give_back;
+		}
+		if (!il.il_found) {
+			rv = FS_APFS_E_NOTFOUND;
+			goto give_back;
+		}
+		ino_leaf = il.il_bno;
+	}
+
+	/*
+	 * The extent record goes in the leaf where its key belongs, which is
+	 * not necessarily the inode's.  When they are the same leaf -- as they
+	 * are in this container -- both edits are made in one copy of it,
+	 * because copying a node twice in one transaction would leave the
+	 * second copy replacing a node the first had already released.
+	 */
+	key[0] = (id & APFS_J_OBJ_ID_MASK) |
+	    ((uint64_t)APFS_TYPE_FILE_EXTENT << APFS_J_OBJ_TYPE_SHIFT);
+	key[1] = alloced;
+	lf.lf_key   = (const uint8_t *)key;
+	lf.lf_klen  = (uint32_t)sizeof(key);
+	lf.lf_bno   = 0;
+	lf.lf_first = 0;
+	lf.lf_any   = false;
+	stopped = false;
+	if (blocks != 0) {
+		if (!btree_walk(g_apfs.ac_root_tree_bno, leaf_find, &lf, 0,
+		    &stopped)) {
+			rv = FS_APFS_E_IO;
+			goto give_back;
+		}
+		if (lf.lf_bno == 0)
+			lf.lf_bno = lf.lf_first;
+		if (lf.lf_bno != ino_leaf) {
+			kprintf("apfs: the new extent belongs in leaf %llu and "
+			    "the inode is in %llu -- growing across two leaves "
+			    "is a different rung\n",
+			    (unsigned long long)lf.lf_bno,
+			    (unsigned long long)ino_leaf);
+			rv = FS_APFS_E_NOALLOC;
+			goto give_back;
+		}
+	}
+
+	rv = fs_apfs_read_block(ino_leaf, node);
+	if (rv != FS_APFS_E_OK)
+		goto give_back;
+
+	if (blocks != 0) {
+		btree_layout(node, &bl);
+		for (pos = 0; pos < bl.bl_nkeys; pos++) {
+			btree_entry_loc(&bl, pos, &koff, &klen, &voff, &vlen);
+			if (jkey_cmp(bl.bl_keys + koff, klen,
+			    (const uint8_t *)key, (uint32_t)sizeof(key)) > 0)
+				break;
+		}
+		fe.fe_len_and_flags  = blocks * APFS_BLOCK_SIZE;
+		fe.fe_phys_block_num = first;
+		fe.fe_crypto_id      = 0;
+		rv = leaf_insert(node, pos, key, (uint32_t)sizeof(key), &fe,
+		    (uint32_t)sizeof(fe));
+		if (rv != FS_APFS_E_OK)
+			goto give_back;
+	}
+
+	/* And the length, in the inode record inside the same copy. */
+	btree_layout(node, &bl);
+	rv = FS_APFS_E_NOTFOUND;
+	for (i = 0; i < bl.bl_nkeys; i++) {
+		btree_entry_loc(&bl, i, &koff, &klen, &voff, &vlen);
+		k   = bl.bl_keys + koff;
+		raw = *(const uint64_t *)k;
+		if ((raw & APFS_J_OBJ_ID_MASK) != ino)
+			continue;
+		if ((uint32_t)(raw >> APFS_J_OBJ_TYPE_SHIFT) != APFS_TYPE_INODE)
+			continue;
+		iv = (struct apfs_inode_val *)(bl.bl_vals - voff);
+		if (vlen < sizeof(*iv) + sizeof(*blob))
+			break;
+		blob  = (struct apfs_xf_blob *)((uint8_t *)iv + sizeof(*iv));
+		nexts = blob->xb_num_exts;
+		ent   = (uint32_t)(sizeof(*iv) + sizeof(*blob));
+		data  = ent + nexts * (uint32_t)sizeof(*xf);
+		if (data > vlen)
+			break;
+		for (pos = 0; pos < nexts; pos++) {
+			xf = (struct apfs_x_field *)((uint8_t *)iv + ent +
+			    pos * sizeof(*xf));
+			if (xf->xf_size > vlen - data)
+				break;
+			if (xf->xf_type == APFS_INO_EXT_TYPE_DSTREAM &&
+			    xf->xf_size >= sizeof(*ds)) {
+				ds = (struct apfs_dstream *)((uint8_t *)iv +
+				    data);
+				ds->ds_size          = new_size;
+				ds->ds_alloced_size  = alloced +
+				    blocks * APFS_BLOCK_SIZE;
+				rv = FS_APFS_E_OK;
+			}
+			data += ((uint32_t)xf->xf_size + 7u) & ~7u;
+			if (data > vlen)
+				break;
+		}
+		break;
+	}
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs: inode %llu has no dstream to lengthen\n",
+		    (unsigned long long)ino);
+		goto give_back;
+	}
+
+	/* The leaf moves, and so does the root whose count the insert changed. */
+	o = (struct apfs_obj_phys *)node;
+	oids[0] = o->o_oid;
+	rv = alloc_blocks(1, ino_leaf, &new_leaf);
+	if (rv != FS_APFS_E_OK)
+		goto give_back;
+	o->o_xid = xid;
+	rv = fs_apfs_write_block(new_leaf, node);
+	if (rv != FS_APFS_E_OK) {
+		(void)free_blocks(new_leaf, 1);
+		goto give_back;
+	}
+	rv = free_blocks(ino_leaf, 1);
+	if (rv != FS_APFS_E_OK)
+		goto give_back;
+	cow_n_spine++;
+	paddrs[0] = new_leaf;
+	nmoved    = 1;
+
+	root_bno = g_apfs.ac_root_tree_bno;
+	if (blocks != 0 && oids[0] != g_apfs.ac_root_tree_oid) {
+		rv = fs_apfs_read_block(root_bno, node);
+		if (rv != FS_APFS_E_OK)
+			goto broken;
+		tree_count_add(node, 1);
+		o = (struct apfs_obj_phys *)node;
+		oids[1] = o->o_oid;
+		rv = alloc_blocks(1, root_bno, &new_root);
+		if (rv != FS_APFS_E_OK)
+			goto broken;
+		o->o_xid = xid;
+		rv = fs_apfs_write_block(new_root, node);
+		if (rv != FS_APFS_E_OK) {
+			(void)free_blocks(new_root, 1);
+			goto broken;
+		}
+		rv = free_blocks(root_bno, 1);
+		if (rv != FS_APFS_E_OK)
+			goto broken;
+		cow_n_spine++;
+		paddrs[1] = new_root;
+		nmoved    = 2;
+		g_apfs.ac_root_tree_bno = new_root;
+	} else if (blocks != 0) {
+		/* One node that is both root and leaf: already counted above. */
+		rv = fs_apfs_read_block(new_leaf, node);
+		if (rv != FS_APFS_E_OK)
+			goto broken;
+		tree_count_add(node, 1);
+		rv = fs_apfs_write_block(new_leaf, node);
+		if (rv != FS_APFS_E_OK)
+			goto broken;
+		g_apfs.ac_root_tree_bno = new_leaf;
+	}
+
+	if (blocks != 0) {
+		rv = extref_insert(first, blocks, ino, xid, node);
+		if (rv != FS_APFS_E_OK) {
+			kprintf("apfs: the file grew but the extent reference "
+			    "tree does not know who owns %llu (%d)\n",
+			    (unsigned long long)first, rv);
+			goto broken;
+		}
+	}
+
+	/*
+	 * The volume owns more blocks than it did, and it says so itself -- a
+	 * count apfsck recomputes from the extents it can reach.  Set before
+	 * the spine copies the superblock that carries it, because that copy is
+	 * the only chance to write it.
+	 */
+	g_apfs.ac_fs_alloc_count += blocks;
+
+	rv = spine_update_n(oids, paddrs, nmoved, xid, node);
+	if (rv != FS_APFS_E_OK)
+		goto broken;
+	if (oids[0] == g_apfs.ac_root_tree_oid)
+		g_apfs.ac_root_tree_bno = new_leaf;
+	kfree(node);
+	return (FS_APFS_E_OK);
+
+give_back:
+	if (blocks != 0)
+		(void)free_blocks(first, (uint32_t)blocks);
+out:
+	kfree(node);
+	return (rv);
+
+broken:
+	kprintf("apfs: growing inode %llu failed after the leaf had moved "
+	    "(%d) -- this checkpoint must not be written\n",
+	    (unsigned long long)ino, rv);
+	kfree(node);
+	return (rv);
+}
+
 int
 fs_apfs_size(uint64_t ino, uint64_t *size_out)
 {
@@ -3812,15 +4389,18 @@ cow_physical(uint64_t old_bno, uint64_t xid, void *buf, uint64_t *new_bno)
  * room left -- which is a B-tree split, and a different rung.
  */
 static int
-omap_replace_cow(uint64_t node_bno, uint64_t oid, uint64_t xid, uint64_t paddr,
-    void *buf, uint64_t *new_node)
+omap_replace_cow(uint64_t node_bno, const uint64_t *oids,
+    const uint64_t *paddrs, uint32_t n, uint64_t xid, void *buf,
+    uint64_t *new_node)
 {
 	struct btree_layout	 bl;
 	struct apfs_omap_key	*k;
 	struct apfs_omap_val	*v;
 	uint32_t		 koff;
 	uint32_t		 voff;
+	uint32_t		 done;
 	uint32_t		 i;
+	uint32_t		 j;
 	int			 rv;
 
 	rv = fs_apfs_read_block(node_bno, buf);
@@ -3833,19 +4413,34 @@ omap_replace_cow(uint64_t node_bno, uint64_t oid, uint64_t xid, uint64_t paddr,
 		    (unsigned long long)node_bno, (unsigned)bl.bl_level);
 		return (FS_APFS_E_INVAL);
 	}
-	for (i = 0; i < bl.bl_nkeys; i++) {
+	/*
+	 * SEVERAL AT ONCE, and that is not a convenience.  One insert moves
+	 * both the leaf it lands in and the root whose key count it changes;
+	 * doing those as two passes would copy this node twice, and copying it
+	 * twice means the second copy replaces an entry in a node the first has
+	 * already released -- correct, and six spine objects more expensive
+	 * every time.
+	 */
+	done = 0;
+	for (i = 0; i < bl.bl_nkeys && done < n; i++) {
 		btree_entry_off(&bl, i, &koff, &voff);
 		k = (struct apfs_omap_key *)(bl.bl_keys + koff);
-		if (k->ok_oid != oid)
-			continue;
-		v = (struct apfs_omap_val *)(bl.bl_vals - voff);
-		k->ok_xid   = xid;
-		v->ov_paddr = paddr;
-		return (cow_physical(node_bno, xid, buf, new_node));
+		for (j = 0; j < n; j++) {
+			if (k->ok_oid != oids[j])
+				continue;
+			v = (struct apfs_omap_val *)(bl.bl_vals - voff);
+			k->ok_xid   = xid;
+			v->ov_paddr = paddrs[j];
+			done++;
+			break;
+		}
 	}
-	kprintf("apfs: object map at %llu has no entry for oid %llu\n",
-	    (unsigned long long)node_bno, (unsigned long long)oid);
-	return (FS_APFS_E_NOTFOUND);
+	if (done != n) {
+		kprintf("apfs: object map at %llu answered for %u of %u oids\n",
+		    (unsigned long long)node_bno, (unsigned)done, (unsigned)n);
+		return (FS_APFS_E_NOTFOUND);
+	}
+	return (cow_physical(node_bno, xid, buf, new_node));
 }
 
 /*
@@ -3974,7 +4569,8 @@ extref_move(uint64_t old_start, uint64_t new_start, uint64_t blocks,
  * it does, none of this is reachable from anything on the disk.
  */
 static int
-spine_update(uint64_t oid, uint64_t paddr, uint64_t xid, void *buf)
+spine_update_n(const uint64_t *oids, const uint64_t *paddrs, uint32_t n,
+    uint64_t xid, void *buf)
 {
 	struct apfs_omap_phys		*om;
 	struct apfs_superblock		*vsb;
@@ -3985,11 +4581,12 @@ spine_update(uint64_t oid, uint64_t paddr, uint64_t xid, void *buf)
 	uint64_t			 new_vol_omap;
 	uint64_t			 new_vol_tree;
 	uint64_t			 new_vsb;
+	uint64_t			 fs_oid;
 	int				 rv;
 
-	/* 1. the volume's object map: oid now lives at paddr */
-	rv = omap_replace_cow(g_apfs.ac_vol_omap_tree, oid, xid, paddr, buf,
-	    &new_vol_tree);
+	/* 1. the volume's object map: those oids now live at those addresses */
+	rv = omap_replace_cow(g_apfs.ac_vol_omap_tree, oids, paddrs, n, xid,
+	    buf, &new_vol_tree);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
 
@@ -4022,6 +4619,7 @@ spine_update(uint64_t oid, uint64_t paddr, uint64_t xid, void *buf)
 	 * this writes back what is already there.
 	 */
 	vsb->apfs_extentref_tree_oid = g_apfs.ac_extref_bno;
+	vsb->apfs_fs_alloc_count     = g_apfs.ac_fs_alloc_count;
 	rv = alloc_blocks(1, 0, &bno);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
@@ -4039,8 +4637,9 @@ spine_update(uint64_t oid, uint64_t paddr, uint64_t xid, void *buf)
 	new_vsb = bno;
 
 	/* 4. the container's object map: the volume superblock has moved */
-	rv = omap_replace_cow(g_apfs.ac_ctr_omap_tree, g_apfs.ac_fs_oid, xid,
-	    new_vsb, buf, &new_ctr_tree);
+	fs_oid = g_apfs.ac_fs_oid;
+	rv = omap_replace_cow(g_apfs.ac_ctr_omap_tree, &fs_oid, &new_vsb, 1,
+	    xid, buf, &new_ctr_tree);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
 
@@ -4067,6 +4666,14 @@ spine_update(uint64_t oid, uint64_t paddr, uint64_t xid, void *buf)
 	g_apfs.ac_omap_oid      = new_ctr_omap;
 	g_apfs.ac_dirty         = true;
 	return (FS_APFS_E_OK);
+}
+
+/* One object moved, which is what most callers have. */
+static int
+spine_update(uint64_t oid, uint64_t paddr, uint64_t xid, void *buf)
+{
+
+	return (spine_update_n(&oid, &paddr, 1, xid, buf));
 }
 
 /*

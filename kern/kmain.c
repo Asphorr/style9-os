@@ -168,6 +168,9 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	 */
 	fs_data_selftest();
 
+	/* And the shape of the tree changing: a file that gets longer. */
+	fs_grow_selftest();
+
 	/*
 	 * Register a demo service under the bootstrap port so ring-3
 	 * code has something to look up.  MACH_PORT_TASK_SELF=1 in
