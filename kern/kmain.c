@@ -80,6 +80,15 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 
 	uart_init();
 	tty_init();
+	/*
+	 * Before the banner, because it scribbles across the screen and
+	 * clears it: the first thing a reader should see is a boot log, not
+	 * the wreckage of the test that made the console trustworthy enough
+	 * to print one.  It runs at all because everything above this line
+	 * -- and every shell above that -- has been drawing text under a
+	 * cursor that was not following it.
+	 */
+	tty_selftest();
 	kmain_banner(mb_magic, mb_info);
 
 	tty_puts("\nbringing CPU tables online...\n");
@@ -287,6 +296,7 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 		vm_pages_stats();
 		vm_map_stats();
 		darwin_cons_stats();
+		tty_stats();
 		if (fs_apfs_ready())
 			fs_apfs_stats();
 		fs_txn_stats();

@@ -346,8 +346,15 @@ syscall_console_write(const char *buf, size_t len)
 		scratch[i] = buf[i];
 	smap_user_access_end();
 
+	/*
+	 * One write(2) is one write to the console, cursor included: a
+	 * shell that repaints a line does not want the underline dragged
+	 * across every column on the way.
+	 */
+	tty_batch_begin();
 	for (i = 0; i < len; i++)
 		tty_putc(scratch[i]);
+	tty_batch_end();
 
 	return ((long)len);
 }

@@ -43,6 +43,15 @@ kvprintf(const char *fmt, va_list ap)
 
 	written = 0;
 
+	/*
+	 * One line of kernel output is one write as far as the console is
+	 * concerned, so the hardware cursor is programmed once when this
+	 * returns rather than once per character emitted along the way.
+	 * There is a single exit below, which is what makes the closing
+	 * bracket safe to place there.
+	 */
+	tty_batch_begin();
+
 	while ((ch = *fmt++) != '\0') {
 		if (ch != '%') {
 			tty_putc(ch);
@@ -150,6 +159,8 @@ kvprintf(const char *fmt, va_list ap)
 			break;
 		}
 	}
+
+	tty_batch_end();
 
 	return (written);
 }

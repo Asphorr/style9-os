@@ -51,4 +51,37 @@ void	tty_putc(char);
 void	tty_puts(const char *);
 void	tty_write(const char *, size_t);
 
+/*
+ * Where the cursor is, asked two different ways: tty_cursor_cell is
+ * what this driver thinks, tty_cursor_hw is what the CRT controller was
+ * actually told.  They exist as a pair because the only interesting
+ * question about a hardware cursor is whether those two agree, and a
+ * test that asked the driver twice would answer it wrongly every time.
+ * Both return a cell offset, row * TTY_COLS + col.
+ */
+uint16_t	tty_cursor_cell(void);
+uint16_t	tty_cursor_hw(void);
+
+/*
+ * Bracket a run of output so the hardware cursor is programmed once at
+ * the end of it instead of once per character.  Nesting is counted, so
+ * these may be used by anything that emits more than one byte -- see
+ * the note in dev/tty.c for the measurement that made them necessary.
+ * Callers that write a single character need not bother: tty_putc is
+ * already exactly one write.
+ */
+void	tty_batch_begin(void);
+void	tty_batch_end(void);
+
+/* Characters blitted and cursor moves programmed, for the boot log. */
+void	tty_stats(void);
+
+/*
+ * Prove, at boot and out loud, that the underline on the screen is
+ * where the next character will go.  Scribbles on the console and
+ * clears it afterwards, so it must run before anything worth reading
+ * has been printed.
+ */
+void	tty_selftest(void);
+
 #endif /* !_SYS_TTY_H_ */

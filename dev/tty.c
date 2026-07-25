@@ -10,6 +10,8 @@
 #include <stdint.h>
 
 #include "dbgcon.h"
+#include "io.h"
+#include "kprintf.h"
 #include "panic.h"
 #include "spinlock.h"
 #include "tty.h"
@@ -17,6 +19,31 @@
 
 #define	VGA_BASE	((volatile uint16_t *)0x000B8000)
 #define	VGA_CELLS	((size_t)TTY_COLS * TTY_ROWS)
+
+/*
+ * The text cursor is hardware, not a cell.
+ *
+ * The CRT controller draws the underline from a 16-bit character offset
+ * held in two of its indexed registers, and it stays exactly where it
+ * was last told until something tells it again.  Nothing here ever did:
+ * the blitter moved tty_row / tty_col and wrote cells, and the underline
+ * sat wherever the machine came up with it while the text appeared
+ * somewhere else on the screen.
+ *
+ * For a boot log that is cosmetic.  For a shell it is not -- the cursor
+ * is the only thing on the screen that says where the next character
+ * the user types will land, and a cursor that lies about that is worse
+ * than no cursor at all.
+ *
+ * Two registers, addressed through an index port: write the register
+ * number to VGA_CRTC_INDEX, then the byte to VGA_CRTC_DATA.  The offset
+ * is the same cell index the blitter uses, so there is nothing to
+ * convert.
+ */
+#define	VGA_CRTC_INDEX		0x3D4
+#define	VGA_CRTC_DATA		0x3D5
+#define	VGA_CRTC_CURSOR_HI	14
+#define	VGA_CRTC_CURSOR_LO	15
 
 /*
  * ANSI/VT CSI state machine.
@@ -73,7 +100,47 @@ static bool		csi_private;	/* leading '?' DEC-private */
 
 static struct spinlock	tty_lock = SPINLOCK_INIT("tty");
 
+/*
+ * What the CRTC was last told, and how often it had to be told.
+ *
+ * Programming the cursor is four port writes, and this console's only
+ * primitive is one character at a time -- kprintf, the ring-3 write
+ * path and ddb all funnel through tty_putc.  Placed naively that spends
+ * four port writes on every byte of a 50 KiB boot log, and the first
+ * version here did exactly that.  It cost 420 ms of a 4.4 s boot,
+ * measured by turning the sync off and booting again: 3970 ms to reach
+ * the shell without it, 4390 ms with.  Eight microseconds per character
+ * is what a legacy ISA-timed port write costs, and no amount of arguing
+ * that the cursor matters makes a tenth of the boot spent on it a good
+ * trade.
+ *
+ * So the cursor is programmed once per WRITE rather than once per byte,
+ * which is what a real console driver does and what the hardware wants:
+ * only the position after the last character of a run was ever going to
+ * be visible.  tty_puts, tty_write and kvprintf bracket themselves with
+ * tty_batch_begin / tty_batch_end; inside a batch a move only marks the
+ * cursor dirty, and the four port writes happen once when the outermost
+ * bracket closes.  Nesting is counted, so a kprintf reached from inside
+ * another one still leaves exactly one programming at the end.
+ *
+ * The cached offset is the other half: a move that lands where the CRTC
+ * already points costs nothing, which covers every byte of a CSI
+ * sequence -- parameters and final bytes either leave the cursor alone
+ * or move it once, not once per digit.
+ *
+ * All three numbers are reported in the boot log rather than asserted
+ * here, so this comment can be checked instead of believed.
+ */
+static uint16_t		tty_cursor_at;		/* (p) offset the CRTC holds */
+static bool		tty_cursor_dirty;	/* (p) moved inside a batch  */
+static uint32_t		tty_batch_depth;	/* (p) open brackets         */
+static uint64_t		tty_cursor_pokes;	/* (p) */
+static uint64_t		tty_batches;		/* (p) */
+static uint64_t		tty_chars;		/* (p) */
+
 static void	tty_putcell(uint16_t, uint16_t, char);
+static void	tty_cursor_sync(void);
+static void	tty_cursor_program(uint16_t);
 static void	tty_scroll(void);
 static uint16_t	tty_cell(char);
 static void	tty_putc_vga(char);
@@ -98,6 +165,12 @@ tty_init(void)
 	tty_have_saved   = false;
 	csi_state        = TTY_S_GROUND;
 	tty_csi_reset();
+	/*
+	 * Force the first sync: 0xFFFF is not a cell any 80x25 screen has,
+	 * so tty_clear's move to the home position cannot be mistaken for
+	 * "already there" and skipped.
+	 */
+	tty_cursor_at    = 0xFFFFu;
 	tty_clear();
 }
 
@@ -113,6 +186,7 @@ tty_clear(void)
 
 	tty_col = 0;
 	tty_row = 0;
+	tty_cursor_sync();
 }
 
 void
@@ -148,9 +222,149 @@ tty_putc(char ch)
 	uart_putc(ch);
 
 	tty_putc_vga(ch);
+	tty_chars++;
+	tty_cursor_sync();
 
 	if (locked)
 		spin_unlock(&tty_lock);
+}
+
+/* ---- hardware cursor ------------------------------------------------- */
+
+/*
+ * Tell the CRTC where the cursor is, if it does not already know.
+ *
+ * Called at the tail of every tty_putc rather than from each of the
+ * dozen places that move tty_row / tty_col: a cursor that is correct
+ * after some moves and stale after others is harder to reason about
+ * than one that is correct after all of them, and the cached offset
+ * makes the redundant calls free.
+ */
+static void
+tty_cursor_sync(void)
+{
+	uint16_t	off;
+
+	off = (uint16_t)((size_t)tty_row * TTY_COLS + tty_col);
+	if (off == tty_cursor_at) {
+		/*
+		 * Back where the hardware already points.  This can happen
+		 * inside a batch -- a save/restore pair, or a backspace and
+		 * a reprint -- and it settles the debt: there is nothing
+		 * left to program at the end.
+		 */
+		tty_cursor_dirty = false;
+		return;
+	}
+	if (tty_batch_depth != 0) {
+		tty_cursor_dirty = true;
+		return;
+	}
+	tty_cursor_program(off);
+}
+
+static void
+tty_cursor_program(uint16_t off)
+{
+
+	tty_cursor_at    = off;
+	tty_cursor_dirty = false;
+	tty_cursor_pokes++;
+
+	outb(VGA_CRTC_INDEX, VGA_CRTC_CURSOR_HI);
+	outb(VGA_CRTC_DATA, (uint8_t)(off >> 8));
+	outb(VGA_CRTC_INDEX, VGA_CRTC_CURSOR_LO);
+	outb(VGA_CRTC_DATA, (uint8_t)(off & 0xFFu));
+}
+
+/*
+ * Open and close a run of output.
+ *
+ * The lock is taken for the counter rather than held across the run:
+ * spin_lock panics on a same-CPU re-acquire, and every tty_putc inside
+ * the bracket takes it itself.  Two acquisitions per kprintf against
+ * the thousands it was already making per boot is not a cost worth
+ * restructuring the console to avoid.
+ *
+ * Unbalanced brackets are survivable by construction -- the depth only
+ * ever gates a cursor update, so the worst a leaked tty_batch_begin can
+ * do is leave the underline one position stale until the next write
+ * closes a bracket.
+ */
+void
+tty_batch_begin(void)
+{
+	bool	locked;
+
+	locked = false;
+	if (!panic_in_progress) {
+		spin_lock(&tty_lock);
+		locked = true;
+	}
+	tty_batch_depth++;
+	tty_batches++;
+	if (locked)
+		spin_unlock(&tty_lock);
+}
+
+void
+tty_batch_end(void)
+{
+	bool	locked;
+
+	locked = false;
+	if (!panic_in_progress) {
+		spin_lock(&tty_lock);
+		locked = true;
+	}
+	if (tty_batch_depth > 0)
+		tty_batch_depth--;
+	if (tty_batch_depth == 0 && tty_cursor_dirty)
+		tty_cursor_program((uint16_t)((size_t)tty_row * TTY_COLS +
+		    tty_col));
+	if (locked)
+		spin_unlock(&tty_lock);
+}
+
+/*
+ * Read the offset back out of the hardware.
+ *
+ * Exists for the selftest, and only for it: the cached tty_cursor_at
+ * says what this code BELIEVES it wrote, which is exactly the thing a
+ * test of "did the write happen" must not consult.  The CRTC index
+ * register is shared state, so this leaves it pointing at the low byte
+ * -- harmless, since every writer sets the index before the data.
+ */
+uint16_t
+tty_cursor_hw(void)
+{
+	uint16_t	off;
+
+	outb(VGA_CRTC_INDEX, VGA_CRTC_CURSOR_HI);
+	off = (uint16_t)((uint16_t)inb(VGA_CRTC_DATA) << 8);
+	outb(VGA_CRTC_INDEX, VGA_CRTC_CURSOR_LO);
+	off = (uint16_t)(off | inb(VGA_CRTC_DATA));
+	return (off);
+}
+
+uint16_t
+tty_cursor_cell(void)
+{
+
+	return ((uint16_t)((size_t)tty_row * TTY_COLS + tty_col));
+}
+
+void
+tty_stats(void)
+{
+
+	kprintf("tty: %llu characters blitted in %llu writes -- the cursor was "
+	    "programmed %llu times, %llu per 100 characters\n",
+	    (unsigned long long)tty_chars,
+	    (unsigned long long)tty_batches,
+	    (unsigned long long)tty_cursor_pokes,
+	    (unsigned long long)(tty_chars == 0 ? 0 :
+	    tty_cursor_pokes * 100 / tty_chars));
 }
 
 /* ---- ANSI/VT state machine ------------------------------------------- */
@@ -495,12 +709,131 @@ tty_csi_dispatch(char final)
 	}
 }
 
+/* ---- selftest -------------------------------------------------------- */
+
+/*
+ * Ask the hardware, never the driver.
+ *
+ * Every check here compares tty_cursor_hw() -- four port reads from the
+ * CRTC -- against a position worked out on paper, not against
+ * tty_cursor_cell().  Comparing the driver's two ideas of where the
+ * cursor is would pass with the CRTC never written at all, which is
+ * precisely the bug this exists to catch.
+ */
+static bool
+tty_cursor_is(uint16_t want, const char *what)
+{
+	uint16_t	got;
+
+	got = tty_cursor_hw();
+	if (got == want)
+		return (true);
+	tty_clear();
+	kprintf("tty-cursor: FAIL %s -- the CRTC holds cell %u (row %u col %u),"
+	    " the text is at cell %u (row %u col %u)\n",
+	    what,
+	    (unsigned)got, (unsigned)(got / TTY_COLS), (unsigned)(got % TTY_COLS),
+	    (unsigned)want,
+	    (unsigned)(want / TTY_COLS), (unsigned)(want % TTY_COLS));
+	return (false);
+}
+
+void
+tty_selftest(void)
+{
+	uint64_t	pokes_before;
+	uint64_t	pokes_spent;
+
+	/*
+	 * 1. Absolute positioning.  CUP is the sequence every full-screen
+	 *    program uses to put the cursor somewhere; if the CRTC does not
+	 *    follow it, nothing else here can be trusted either.
+	 */
+	tty_puts("\x1b[8;13H");
+	if (!tty_cursor_is(7 * TTY_COLS + 12, "after CUP to row 8 column 13"))
+		return;
+
+	/*
+	 * 2. Ordinary text.  Five printable bytes move the cursor five
+	 *    cells; this is the case that matters, since it is what typing
+	 *    at a shell prompt looks like.
+	 */
+	tty_puts("style");
+	if (!tty_cursor_is(7 * TTY_COLS + 17, "after five printable bytes"))
+		return;
+
+	/* 3. A newline returns to column zero of the next row. */
+	tty_putc('\n');
+	if (!tty_cursor_is(8 * TTY_COLS, "after a newline"))
+		return;
+
+	/*
+	 * 4. A scroll.  The rows move up under the cursor and the cursor
+	 *    stays on the bottom row -- a case the blitter handles in
+	 *    tty_scroll rather than in the character path, so it is a
+	 *    genuinely separate way to get this wrong.
+	 */
+	tty_puts("\x1b[25;1H");
+	if (!tty_cursor_is((TTY_ROWS - 1) * TTY_COLS, "after CUP to the last row"))
+		return;
+	tty_putc('\n');
+	if (!tty_cursor_is((TTY_ROWS - 1) * TTY_COLS, "after scrolling"))
+		return;
+
+	/*
+	 * 5. The batch.  Twenty characters are one write, and a write is
+	 *    what the CRTC is told about -- one programming, not twenty.
+	 *    This is the property that makes it affordable to keep the
+	 *    cursor honest on a per-character primitive, so it is checked
+	 *    rather than assumed.
+	 */
+	pokes_before = tty_cursor_pokes;
+	tty_puts("\x1b[12;34Hbatched output.");
+	pokes_spent = tty_cursor_pokes - pokes_before;
+	if (!tty_cursor_is(11 * TTY_COLS + 33 + 15, "after a batched write"))
+		return;
+	if (pokes_spent != 1) {
+		tty_clear();
+		kprintf("tty-cursor: FAIL a 23-byte write cost %llu cursor "
+		    "programmings, not 1\n", (unsigned long long)pokes_spent);
+		return;
+	}
+
+	/*
+	 * 6. The cache, which is a separate claim from the batch: a write
+	 *    that puts the cursor back where the hardware already points
+	 *    must cost nothing at all.
+	 */
+	pokes_before = tty_cursor_pokes;
+	tty_puts("\x1b[12;49H");
+	pokes_spent = tty_cursor_pokes - pokes_before;
+	if (pokes_spent != 0) {
+		tty_clear();
+		kprintf("tty-cursor: FAIL moving the cursor to where it "
+		    "already was cost %llu programmings, not 0\n",
+		    (unsigned long long)pokes_spent);
+		return;
+	}
+
+	/* 7. And clearing the screen brings it home. */
+	tty_clear();
+	if (!tty_cursor_is(0, "after clearing the screen"))
+		return;
+
+	kprintf("tty-cursor: PASS -- the CRTC followed the text through "
+	    "positioning, typing, a newline, a scroll and a clear; a 23-byte "
+	    "write cost one programming and a move to where it already was "
+	    "cost none\n");
+}
+
 void
 tty_puts(const char *s)
 {
 
+	tty_batch_begin();
 	while (*s != '\0')
 		tty_putc(*s++);
+	tty_batch_end();
 }
 
 void
@@ -508,8 +841,10 @@ tty_write(const char *s, size_t n)
 {
 	size_t	i;
 
+	tty_batch_begin();
 	for (i = 0; i < n; i++)
 		tty_putc(s[i]);
+	tty_batch_end();
 }
 
 static void
