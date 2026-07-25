@@ -266,6 +266,7 @@ $(OBJDIR)/%.elf: $(OBJDIR)/%.user.o $(LIB_OBJS) $(USER_DIR)/user.ld
 $(OBJDIR)/%_elf.o: $(OBJDIR)/%.elf
 	cd $(OBJDIR) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386	\
 	    --rename-section .data=.rodata.$*_elf			\
+	    --set-section-alignment .data=4096				\
 	    $*.elf $*_elf.o
 
 USER_ELFS = $(foreach p,$(USER_PROGRAMS),$(OBJDIR)/$(p).elf)

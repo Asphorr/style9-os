@@ -70,29 +70,18 @@ elf_load(struct task *target, const void *image, size_t image_size,
 }
 
 /*
- * Bring one PT_LOAD into the target task's address space:
- *	- round [p_vaddr, p_vaddr+p_memsz) out to whole pages,
- *	- allocate + map each page U=1 with R / W / X from p_flags,
- *	- zero the freshly-allocated frame (covers BSS),
- *	- copy p_filesz bytes from `image + p_offset` to the segment
- *	  start via the kernel-VA alias of the underlying frame
- *	  (works even when p_flags & PF_W is 0 -- the alias is RW
- *	  through the boot identity map, the user leaf stays RO).
+ * Bring one PT_LOAD into the target task's address space.  Validation and
+ * the p_flags -> VM_PROT_* translation happen here, because they are what
+ * this container format says; the mapping itself is vm_map_image, which is
+ * the same code kern/macho.c reaches for an LC_SEGMENT_64.  The two formats
+ * disagree about how a segment is described and agree completely about what
+ * one is, so that is where the line is drawn.
  */
 static int
 load_segment(struct task *target, const uint8_t *image, size_t image_size,
     const struct elf64_phdr *ph)
 {
-	uint64_t	va, va_start, va_end;
-	uint64_t	pa;
-	uint64_t	src_off;
-	uint64_t	remaining;
-	uint64_t	cur_va;
-	uint64_t	page_off;
-	uint64_t	chunk;
-	uint8_t		*kva;
 	uint32_t	prot;
-	size_t		i;
 
 	if (ph->p_memsz < ph->p_filesz)
 		return (ELF_E_BADSEG);
@@ -101,62 +90,24 @@ load_segment(struct task *target, const uint8_t *image, size_t image_size,
 	if (ph->p_vaddr + ph->p_memsz < ph->p_vaddr)
 		return (ELF_E_BADSEG);
 
+	/*
+	 * vme_prot carries pmap-style bits (R/W/X plus USER); vme_flags only
+	 * tracks backing semantics (ANON, COW), since "user accessibility" is
+	 * already in the prot byte and a second flag would just drift.
+	 */
 	prot = VM_PROT_READ | VM_PROT_USER;
 	if (ph->p_flags & PF_W)
 		prot |= VM_PROT_WRITE;
 	if (ph->p_flags & PF_X)
 		prot |= VM_PROT_EXEC;
 
-	va_start = ph->p_vaddr & ~(uint64_t)PAGE_MASK;
-	va_end   = (ph->p_vaddr + ph->p_memsz + PAGE_MASK) &
-	    ~(uint64_t)PAGE_MASK;
-
-	for (va = va_start; va < va_end; va += PAGE_SIZE) {
-		pa = pmm_alloc_page();
-		if (pa == PA_INVALID)
-			return (ELF_E_NOMEM);
-
-		kva = (uint8_t *)pmm_kva_from_pa(pa);
-		for (i = 0; i < PAGE_SIZE; i++)
-			kva[i] = 0;
-
-		if (!pmap_enter(target->t_pmap, va, pa, prot))
-			return (ELF_E_MAP);
-	}
-
-	/*
-	 * Record the whole segment as one entry in the task's vm_map.
-	 * vme_prot carries pmap-style bits (R/W/X plus USER); vme_flags
-	 * only tracks backing semantics (ANON, future COW), since "user
-	 * accessibility" is already in the prot byte and a second flag
-	 * would just drift.
-	 */
-	if (!vm_map_enter(target->t_map, va_start, va_end - va_start,
-	    (uint8_t)prot, VME_F_ANON))
+	switch (vm_map_image(target->t_map, target->t_pmap, ph->p_vaddr,
+	    ph->p_memsz, ph->p_filesz, image + ph->p_offset, (uint8_t)prot)) {
+	case VM_IMAGE_OK:
+		return (ELF_E_OK);
+	case VM_IMAGE_NOMEM:
+		return (ELF_E_NOMEM);
+	default:
 		return (ELF_E_MAP);
-
-	src_off   = ph->p_offset;
-	remaining = ph->p_filesz;
-	cur_va    = ph->p_vaddr;
-
-	while (remaining > 0) {
-		page_off = cur_va & PAGE_MASK;
-		chunk    = PAGE_SIZE - page_off;
-		if (chunk > remaining)
-			chunk = remaining;
-
-		pa = pmap_extract(target->t_pmap, cur_va & ~(uint64_t)PAGE_MASK);
-		if (pa == PA_INVALID)
-			return (ELF_E_MAP);
-		kva = (uint8_t *)pmm_kva_from_pa(pa & ~(uint64_t)PAGE_MASK);
-
-		for (i = 0; i < chunk; i++)
-			kva[page_off + i] = image[src_off + i];
-
-		src_off   += chunk;
-		cur_va    += chunk;
-		remaining -= chunk;
 	}
-
-	return (ELF_E_OK);
 }

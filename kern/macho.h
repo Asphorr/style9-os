@@ -246,11 +246,4 @@ int	macho_load(struct task *target, const void *image, size_t image_size,
 int	macho_map_dylib(struct task *target, const void *image,
 	    size_t image_size, uint64_t bias, uint64_t *out_span);
 
-/*
- * How the loader has been paying for program pages: borrowed straight from
- * the image in the kernel, or allocated and filled.  Every borrowed page is
- * one that used to be a fresh frame plus a 4 KiB copy, per task.
- */
-void	macho_stats(void);
-
 #endif /* !_SYS_MACHO_H_ */

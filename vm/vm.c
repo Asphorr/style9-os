@@ -44,6 +44,8 @@ static uint64_t	vm_n_fork_shared;	/* pages fork shared, not copied */
 static uint64_t	vm_n_cow_copy;		/* write faults that copied     */
 static uint64_t	vm_n_cow_steal;		/* ...that found no other owner */
 static uint64_t	vm_n_cow_race;		/* ...that lost to another one  */
+static uint64_t	vm_n_image_borrowed;	/* program pages mapped in situ */
+static uint64_t	vm_n_image_copied;	/* ...allocated and filled      */
 
 /*
  * Drop one entry.  An entry owns a reference on its object, so releasing the
@@ -313,6 +315,122 @@ vm_map_fork_share(struct vm_map *src, struct pmap *src_pm,
 		}
 	}
 	return (true);
+}
+
+/* See vm.h for what this decides and why both loaders share it. */
+int
+vm_map_image(struct vm_map *map, struct pmap *pm, uint64_t seg_va,
+    uint64_t vmsize, uint64_t filesize, const void *bytes, uint8_t prot)
+{
+	const uint8_t	*src;
+	uint8_t		*kva;
+	uint64_t	 borrow_start, borrow_end;
+	uint64_t	 img_pa;
+	uint64_t	 va, va_start, va_end;
+	uint64_t	 hi, lo;
+	uint64_t	 pa;
+	size_t		 i;
+
+	if (map == NULL || pm == NULL || bytes == NULL || filesize > vmsize)
+		return (VM_IMAGE_MAP);
+	if (vmsize == 0)
+		return (VM_IMAGE_OK);
+
+	src      = (const uint8_t *)bytes;
+	va_start = seg_va & ~VM_PAGE_MASK;
+	va_end   = VM_ALIGN_UP(seg_va + vmsize);
+
+	/*
+	 * The half-open range of pages that can point at the image itself.
+	 * Empty unless all three conditions in vm.h hold.
+	 */
+	img_pa       = pmm_pa_from_kva(src);
+	borrow_start = va_start;
+	borrow_end   = va_start;
+	if ((prot & VM_PROT_WRITE) == 0 &&
+	    ((img_pa ^ seg_va) & VM_PAGE_MASK) == 0) {
+		borrow_start = VM_ALIGN_UP(seg_va);
+		borrow_end   = VM_ALIGN_DOWN(seg_va + filesize);
+		if (borrow_end <= borrow_start) {
+			borrow_start = va_start;
+			borrow_end   = va_start;
+		}
+	}
+
+	/*
+	 * Entries before frames, deliberately.  A failure part-way through
+	 * the population loop below leaves the task holding frames that are
+	 * mapped but not described, and teardown walks the map -- so an entry
+	 * that already covers them is the difference between a reclaimed
+	 * partial load and a leaked one.
+	 */
+	if (borrow_end > borrow_start) {
+		if (borrow_start > va_start &&
+		    !vm_map_enter(map, va_start, borrow_start - va_start,
+		    prot, VME_F_ANON))
+			return (VM_IMAGE_MAP);
+		if (!vm_map_enter(map, borrow_start, borrow_end - borrow_start,
+		    prot, 0))
+			return (VM_IMAGE_MAP);
+		if (va_end > borrow_end &&
+		    !vm_map_enter(map, borrow_end, va_end - borrow_end,
+		    prot, VME_F_ANON))
+			return (VM_IMAGE_MAP);
+	} else if (!vm_map_enter(map, va_start, va_end - va_start, prot,
+	    VME_F_ANON))
+		return (VM_IMAGE_MAP);
+
+	for (va = va_start; va < va_end; va += VM_PAGE_SIZE) {
+		if (va >= borrow_start && va < borrow_end) {
+			if (!pmap_enter(pm, va, img_pa + (va - seg_va), prot))
+				return (VM_IMAGE_MAP);
+			vm_n_image_borrowed++;
+			continue;
+		}
+
+		pa = pmm_alloc_page();
+		if (pa == PA_INVALID)
+			return (VM_IMAGE_NOMEM);
+		kva = (uint8_t *)pmm_kva_from_pa(pa);
+		for (i = 0; i < VM_PAGE_SIZE; i++)
+			kva[i] = 0;
+
+		/*
+		 * Whatever part of this page the file covers.  Zeroes are
+		 * already right for the rest, which is the BSS tail and the
+		 * slack before a segment that does not start on a boundary.
+		 */
+		lo = (va > seg_va) ? va : seg_va;
+		hi = va + VM_PAGE_SIZE;
+		if (hi > seg_va + filesize)
+			hi = seg_va + filesize;
+		for (i = 0; lo + i < hi; i++)
+			kva[lo - va + i] = src[lo - seg_va + i];
+
+		if (!pmap_enter(pm, va, pa, prot)) {
+			pmm_free_page(pa);
+			return (VM_IMAGE_MAP);
+		}
+		vm_n_image_copied++;
+	}
+
+	return (VM_IMAGE_OK);
+}
+
+void
+vm_image_stats(void)
+{
+	uint64_t	total;
+
+	total = vm_n_image_borrowed + vm_n_image_copied;
+	if (total == 0)
+		return;
+	kprintf("vm: %llu program pages -- %llu borrowed from the kernel "
+	    "image, %llu copied (%llu KiB saved)\n",
+	    (unsigned long long)total,
+	    (unsigned long long)vm_n_image_borrowed,
+	    (unsigned long long)vm_n_image_copied,
+	    (unsigned long long)(vm_n_image_borrowed * VM_PAGE_SIZE / 1024));
 }
 
 /*

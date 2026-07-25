@@ -21,7 +21,6 @@
 #include "launchd.h"
 #include "progreg.h"
 #include "services.h"
-#include "macho.h"
 #include "vm.h"
 #include "fpu.h"
 #include "gdt.h"
@@ -253,7 +252,7 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 		 * mechanism is idle.
 		 */
 		pmm_stats();
-		macho_stats();
+		vm_image_stats();
 		darwin_cons_stats();
 		if (fs_apfs_ready())
 			fs_apfs_stats();

@@ -286,6 +286,67 @@ bool			 vm_map_fork_share(struct vm_map *src,
 			    struct pmap *dst_pm);
 
 /*
+ * Outcomes of vm_map_image.  Two failures rather than one because the
+ * loaders above distinguish them: out of memory is a machine that is full,
+ * a mapping failure is an image asking for something impossible.
+ */
+#define	VM_IMAGE_OK		0
+#define	VM_IMAGE_NOMEM		1
+#define	VM_IMAGE_MAP		2
+
+/*
+ * Bring one segment of an image that is ALREADY RESIDENT IN THE KERNEL into
+ * a task: `vmsize` bytes at `seg_va`, of which the first `filesize` come from
+ * `bytes` and the rest are zero.  Both program loaders reduce to exactly this
+ * -- kern/elf.c calls it with a PT_LOAD, kern/macho.c with an LC_SEGMENT_64 --
+ * and they call the same function rather than each keeping their own copy,
+ * because what it decides is subtle enough that two copies would drift.
+ *
+ * BORROWING INSTEAD OF COPYING
+ *
+ * These images are not files being read off a disk.  They are part of the
+ * kernel image: already resident, already read-only, at a physical address
+ * that can be computed.  Allocating a frame to hold a second copy of
+ * something that will never change is work with no product -- and it is done
+ * once PER TASK, which is how thirty tasks came to hold thirty private copies
+ * of the same libSystem.
+ *
+ * So a page is not copied at all when all three of these hold.  Its
+ * page-table entry points straight at the image's own frame and the task
+ * reads the kernel's only copy:
+ *
+ *	read-only    -- a writable page must be private, or one task's store
+ *	  would rewrite the image every other task is running.
+ *
+ *	wholly file-backed -- a page that runs past `filesize` has a zero-fill
+ *	  tail, and the image's frame holds whatever the linker put next in
+ *	  the kernel rather than zeroes.  Those pages stay private, which is
+ *	  also what keeps anything past the end of an image out of sight.
+ *
+ *	page-aligned -- a frame can only be mapped whole, so the image's
+ *	  physical address and the segment's virtual address must agree modulo
+ *	  the page size.  The build aligns the embedded images to make this
+ *	  true; if it ever stops, this quietly falls back to copying, which is
+ *	  what the counters in vm_image_stats are for.
+ *
+ * The borrowed pages get their own vm_map_entry WITHOUT VME_F_ANON, so a
+ * segment can end up as up to three entries.  That is not tidiness: teardown
+ * reads that flag and frees every present frame under an entry carrying it,
+ * and some of these frames are the kernel's own.
+ */
+int			 vm_map_image(struct vm_map *map, struct pmap *pm,
+			    uint64_t seg_va, uint64_t vmsize,
+			    uint64_t filesize, const void *bytes,
+			    uint8_t prot);
+
+/*
+ * How the loaders have been paying for program pages: borrowed from the
+ * kernel image, or allocated and filled.  Every borrowed page is one that
+ * used to be a fresh frame plus a 4 KiB copy, once per task.
+ */
+void			 vm_image_stats(void);
+
+/*
  * Outcomes of a fault.  Only VM_FAULT_OK means "resume the instruction";
  * every other value means the faulting thread should be retired the way an
  * unhandled fault always was.
