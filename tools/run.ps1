@@ -11,6 +11,13 @@
 #   .\tools\run.ps1 -Disk path\to\other.img  # alternate disk image
 #   .\tools\run.ps1 -NoDisk                  # no -hda at all
 #   .\tools\run.ps1 -KillExisting            # kill stale qemu first
+#   .\tools\run.ps1 -MonitorPort 4444        # expose the QEMU monitor on TCP
+#
+# -MonitorPort opens QEMU's monitor on a local TCP socket so tools\sendkeys.ps1
+# can inject real PS/2 keystrokes.  That is the only way to exercise the
+# keyboard path without a human at the keyboard: sendkey goes in at the
+# controller, through IRQ1, through the driver, through the line discipline --
+# the same road a finger takes.
 
 [CmdletBinding()]
 param(
@@ -19,6 +26,7 @@ param(
     [string] $LogFile      = 'D:\style9\os\serial.log',
     [string] $Qemu         = 'C:\Program Files\qemu\qemu-system-x86_64.exe',
     [string] $Cpu          = 'Nehalem',  # measured: gls needs SSE4.2 (pcmpgtq), nothing needs AVX -- see QEMU_CPU in the Makefile
+    [int]    $MonitorPort  = 0,
     [switch] $NoDisk,
     [switch] $KillExisting
 )
@@ -50,6 +58,9 @@ $qemuArgs = @(
 )
 if (-not $NoDisk -and (Test-Path $Disk)) {
     $qemuArgs += @('-hda', $Disk)
+}
+if ($MonitorPort -gt 0) {
+    $qemuArgs += @('-monitor', "tcp:127.0.0.1:$MonitorPort,server,nowait")
 }
 
 Write-Host "starting QEMU; serial -> $LogFile"

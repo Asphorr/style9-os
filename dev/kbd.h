@@ -28,9 +28,12 @@
  *	    -1 if no character is currently available; poll_getc_block
  *	    spins on PAUSE until one is.
  *
- * Modifier handling is intentionally minimal: only left/right Shift
- * track state.  Caps-Lock, Ctrl, Alt, Meta are deferred.  Shift state
- * is shared between the IRQ and polled paths.
+ * Modifier handling is intentionally minimal: left/right Shift select
+ * the shifted translation table, and Ctrl folds a letter key to its
+ * ASCII control code (Ctrl-C -> 0x03, Ctrl-D -> 0x04, ...), which is
+ * what a line discipline needs to see interrupt and end-of-file.
+ * Caps-Lock, Alt and Meta are deferred.  Modifier state is shared
+ * between the IRQ and polled paths so the two never disagree.
  */
 
 void	kbd_init(void);

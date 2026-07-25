@@ -13,6 +13,7 @@
 #include "fs_fat.h"
 #include "bootstrap.h"
 #include "clock.h"
+#include "darwin.h"
 #include "host.h"
 #include "klog.h"
 #include "progreg.h"
@@ -103,6 +104,14 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	kmain_run_tests();
 
 	kbd_drv_init();
+	/*
+	 * Give the keyboard its second consumer.  Until a Darwin task claims
+	 * the console this sink declines every key and the driver behaves
+	 * exactly as it did; registering it at boot rather than at first
+	 * claim keeps the driver thread free of a "has anyone registered
+	 * yet" question it would have to ask on every keystroke.
+	 */
+	kbd_drv_set_sink(darwin_cons_sink);
 	/*
 	 * Mouse comes up here, not beside kbd_init: lighting IRQ12 before
 	 * clock_init would let a pending aux byte fire an IRQ whose
@@ -214,6 +223,7 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 		 * for memory they have not touched.
 		 */
 		vm_fault_stats();
+		darwin_cons_stats();
 		if (fs_apfs_ready())
 			fs_apfs_stats();
 		bio_stats();

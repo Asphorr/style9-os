@@ -22,6 +22,13 @@ extern struct port	*port_create_kernel_owned(uint8_t kind, void *arg);
 
 mach_port_name_t	kbd_input_port;
 
+/*
+ * The optional second consumer (see kbd_drv.h).  Read by the driver thread,
+ * written once at boot before any Darwin task exists, so no lock: a torn
+ * read of a pointer written before the first keystroke is not reachable.
+ */
+static kbd_sink_fn	kbd_sink;
+
 static int	kbd_drv_dispatch(const struct mach_msg_header *req,
 		    struct port_space *from);
 static void	kbd_drv_thread(void *) __attribute__((noreturn));
@@ -60,6 +67,13 @@ kbd_drv_init(void)
 
 	kprintf("kbd_drv: stream_port=%u thread=%llu\n",
 	    (unsigned)kbd_input_port, (unsigned long long)th->th_id);
+}
+
+void
+kbd_drv_set_sink(kbd_sink_fn fn)
+{
+
+	kbd_sink = fn;
 }
 
 /*
@@ -104,6 +118,17 @@ kbd_drv_thread(void *arg)
 	for (;;) {
 		c = kbd_getc_block();
 		if (c < 0)
+			continue;
+
+		/*
+		 * Offer the key to the registered sink first.  If it takes
+		 * it, the byte is spoken for and must NOT also go to the
+		 * Mach port -- a keystroke delivered twice is worse than one
+		 * delivered to the wrong reader, because the second copy
+		 * surfaces later, out of context, at whatever prompt is up
+		 * by then.
+		 */
+		if (kbd_sink != NULL && kbd_sink((char)c))
 			continue;
 
 		msg.msgh_bits    = MACH_MSGH_BITS(

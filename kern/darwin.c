@@ -64,17 +64,41 @@
 #define	DARWIN_BIN_INO_BASE	0xB1000000u
 
 /*
- * Darwin console input.  The DARWIN_OF_CONSOLE / implicit-stdin read path
- * drains this ring; darwin_cons_feed() (driven by the SYS_CONS_FEED native
- * syscall) fills it.  Deliberately ISOLATED from the kbd/uart Mach input
- * ports the native shell consumes -- a Darwin binary reading its stdin never
- * competes with sh.elf for keystrokes, and nothing it leaves behind can leak
- * into the native surface.  v1 is single-shot: a feed marks end-of-input, so
- * once the ring drains read(2) returns 0 (EOF), which an interactive shell
- * treats as ^D and exits on.
+ * Darwin console input -- a terminal, not a mailbox.
+ *
+ * The DARWIN_OF_CONSOLE / implicit-stdin read path drains this; producers
+ * push into it one character at a time through darwin_cons_input(), which is
+ * the LINE DISCIPLINE: it echoes, it lets a typo be erased, it turns Ctrl-C
+ * into a signal and Ctrl-D into end-of-file, and it hands the reader only
+ * completed lines.  That division is the point.  A terminal in canonical
+ * mode is not a byte pipe with a read() on the end; the editing and the
+ * signals happen at the moment a key ARRIVES, whether or not anybody is
+ * currently reading, and a reader that tried to do them would echo a
+ * character only once it got round to consuming it.
+ *
+ * There are two producers and they are not alike.  The keyboard driver
+ * thread routes live keystrokes here whenever a Darwin task has claimed the
+ * console (see darwin_cons_sink), which is what makes an interactive shell
+ * interactive.  The SYS_CONS_FEED native syscall pushes a canned script and
+ * then declares end-of-input, which is what makes the boot demo
+ * reproducible.  Both go through the same discipline, so the scripted path
+ * exercises the code the live path uses rather than a parallel one.
+ *
+ * The ring is deliberately ISOLATED from the kbd/uart Mach ports the native
+ * shell consumes: nothing a Darwin binary leaves behind can leak into the
+ * native surface, and the two never race for the same keystroke -- the
+ * claim decides who gets it, once, at the driver.
  */
 #define	DARWIN_CONS_BUF		512u
 #define	DARWIN_CONS_MASK	(DARWIN_CONS_BUF - 1u)
+
+/* Longest line the discipline will accumulate before forcing it out. */
+#define	DARWIN_CONS_LINE	256u
+
+#define	DARWIN_CONS_INTR	0x03	/* Ctrl-C */
+#define	DARWIN_CONS_EOT		0x04	/* Ctrl-D */
+#define	DARWIN_CONS_ERASE	0x08	/* Ctrl-H / Backspace */
+#define	DARWIN_CONS_DEL		0x7F
 
 static long	darwin_unix(struct syscall_frame *f, uint32_t nr);
 static long	darwin_mach(struct syscall_frame *f, uint32_t trap);
@@ -102,10 +126,64 @@ static bool	darwin_zombie_reap(uint64_t ppid, uint64_t pid,
 static long	darwin_cons_read(struct syscall_frame *f, void *ubuf,
 		    size_t n);
 
-static char	darwin_cons_buf[DARWIN_CONS_BUF];
-static uint32_t	darwin_cons_head;	/* producer: darwin_cons_feed   */
-static uint32_t	darwin_cons_tail;	/* consumer: darwin_cons_read   */
-static bool	darwin_cons_eof;	/* set once a feed completes    */
+/*
+ * Lock key for the console state below:
+ *	(c) darwin_cons_lock
+ *	(a) atomic / single-writer, read without the lock
+ *
+ * The lock exists because the two producers run in different threads (the
+ * keyboard driver thread and whichever task calls SYS_CONS_FEED) and the
+ * consumer is a third.  Nothing under it sleeps -- the wake is posted after
+ * the lock is dropped, because a thread that blocks holding a spinlock in
+ * this kernel is never woken again.
+ */
+static struct spinlock	darwin_cons_lock = SPINLOCK_INIT("darwin-cons");
+
+static char	darwin_cons_buf[DARWIN_CONS_BUF];  /* (c) cooked, deliverable */
+static uint32_t	darwin_cons_head;	/* (c) producer end             */
+static uint32_t	darwin_cons_tail;	/* (c) consumer end             */
+static bool	darwin_cons_eof;	/* (c) no more input is coming  */
+
+static char	darwin_cons_line[DARWIN_CONS_LINE];	/* (c) being typed */
+static uint32_t	darwin_cons_line_len;			/* (c) */
+
+/*
+ * A scripted session waiting to be "typed".  SYS_CONS_FEED leaves the whole
+ * script here rather than pushing it into the ring, and the reader releases
+ * one line of it whenever it would otherwise have to wait.
+ *
+ * That indirection is what keeps the demo honest.  Pushing the script in one
+ * go would echo every command before the program had started, and a
+ * transcript where the commands all appear above their output proves less
+ * than one that interleaves -- while a script that did not echo at all would
+ * exercise a different path from the keyboard's.  Releasing a line at a time,
+ * on demand, through the same discipline a keystroke uses, is the model that
+ * matches what it claims to be: something typing on your behalf, at the speed
+ * the program is willing to read.
+ */
+static char	darwin_cons_script[DARWIN_CONS_BUF];	/* (c) */
+static uint32_t	darwin_cons_script_len;			/* (c) */
+static uint32_t	darwin_cons_script_off;			/* (c) */
+
+/*
+ * What the terminal did.  vo_n_wait is the one that earns its keep: it counts
+ * trips round the wait loop that produced nothing, which is the same number
+ * in either implementation and therefore the honest way to compare them.  A
+ * reader that sleeps takes one trip per wake; a reader that spun on
+ * thread_yield took one per timeslice it was handed, for as long as the
+ * prompt sat there.
+ */
+static uint64_t	darwin_cons_n_read;	/* (c) read(2) calls served      */
+static uint64_t	darwin_cons_n_wait;	/* (c) fruitless trips round it  */
+static uint64_t	darwin_cons_n_key;	/* (c) characters typed          */
+static uint64_t	darwin_cons_n_script;	/* (c) characters scripted       */
+
+/*
+ * The one thread parked in darwin_cons_read, or NULL.  Single-consumer: the
+ * console has one foreground task and that task has one thread in read(2).
+ * Registered and cleared under the lock, woken outside it.
+ */
+static struct thread *darwin_cons_waiter;	/* (c) */
 
 /*
  * The clean-room libSystem.B.dylib (user/libsystem.c), embedded as a Mach-O
@@ -526,54 +604,300 @@ darwin_ofile_clear(struct darwin_ofile *of)
 }
 
 /*
- * Foreground task for console input: the id of the last Darwin task to
- * read(2) the console.  A Ctrl-C (ETX) in the feed posts SIGINT here.  This
- * is a stand-in for process groups -- enough for the common case of one
- * interactive shell draining the console.
+ * Foreground task for console input: the id of the Darwin task that last
+ * read(2) the console.  It is also the CLAIM -- while it names a live task,
+ * the keyboard driver routes keystrokes here instead of to the Mach input
+ * port the native shell reads, so exactly one of the two surfaces receives
+ * any given key.  A stand-in for process groups, and enough for the case
+ * this system actually has: one interactive shell draining the console.
+ *
+ * Read without the lock, which is safe because a stale id is harmless: the
+ * lookup that follows it either finds a live task or does not.
  */
-static uint64_t	darwin_cons_fg_id;
+static uint64_t	darwin_cons_fg_id;		/* (a) */
+
+/* Post a signal to whoever currently holds the console, if anyone does. */
+static void
+darwin_cons_signal_fg(int sig)
+{
+	struct task	*fg;
+
+	fg = task_lookup_ref(darwin_cons_fg_id);
+	if (fg == NULL)
+		return;
+	darwin_signal_post(fg, sig);
+	task_deref(fg);
+}
+
+/* Move the line under construction into the ring, dropping it if full. */
+static void
+darwin_cons_deliver_locked(void)
+{
+	uint32_t	i;
+	uint32_t	next;
+
+	for (i = 0; i < darwin_cons_line_len; i++) {
+		next = darwin_cons_head + 1u;
+		if (next - darwin_cons_tail > DARWIN_CONS_BUF)
+			break;		/* reader is not keeping up; drop */
+		darwin_cons_buf[darwin_cons_head & DARWIN_CONS_MASK] =
+		    darwin_cons_line[i];
+		darwin_cons_head = next;
+	}
+	darwin_cons_line_len = 0;
+}
 
 /*
- * Append up to `n` bytes of console input to the ring, dropping any that
- * would overflow (scripted feeds are far smaller than DARWIN_CONS_BUF).
- * An ETX (Ctrl-C, 0x03) is not enqueued: it posts SIGINT to the foreground
- * task instead.  Marks end-of-input: a feed is a whole-input, single-shot
- * delivery, so the reader returns EOF once it drains what was queued here.
- * Driven by the SYS_CONS_FEED native syscall (kern/syscall.c).
+ * One character arriving at the terminal: the line discipline.
+ *
+ * Canonical mode, which is the mode every one of these binaries expects and
+ * the only one worth having before there is a tcsetattr to leave it with.
+ * Echo happens HERE, as the key arrives, not where the line is consumed --
+ * that is the difference between a terminal and a queue, and it is why a
+ * shell that is busy running a command still shows what you type at it.
+ *
+ * Returns with the wake, if one is owed, left to the caller: a reader is
+ * woken outside the lock, never under it.
+ */
+static struct thread *
+darwin_cons_input_locked(char c, bool *intr_out)
+{
+	struct thread	*w;
+
+	*intr_out = false;
+	switch (c) {
+	case DARWIN_CONS_INTR:
+		/*
+		 * Ctrl-C discards what was typed and signals.  Discarding is
+		 * the part that is easy to leave out and wrong to: the line
+		 * you abandoned must not arrive at the next prompt.
+		 *
+		 * It also WAKES the reader, which is not decoration.  Posting
+		 * a signal in this kernel only sets a bit -- it does not
+		 * disturb a thread already asleep in a syscall -- so a reader
+		 * parked at a prompt would sleep through its own interrupt
+		 * and collect it at the exit of whatever syscall woke it
+		 * next.  Measured, not reasoned: the first version of this
+		 * printed ^C, discarded the line correctly, and then ate the
+		 * NEXT command the user typed, because that command's read(2)
+		 * was the one that carried the stale SIGINT out to dash.
+		 */
+		darwin_cons_line_len = 0;
+		tty_putc('^');
+		tty_putc('C');
+		tty_putc('\n');
+		*intr_out = true;
+		break;
+
+	case DARWIN_CONS_EOT:
+		/*
+		 * Ctrl-D delivers what is typed so far WITHOUT a newline; on
+		 * an empty line that is a zero-byte read, which is exactly
+		 * how a Unix terminal spells end-of-file.  A shell exits on
+		 * it, which is how the console gets handed back.
+		 */
+		if (darwin_cons_line_len == 0)
+			darwin_cons_eof = true;
+		else
+			darwin_cons_deliver_locked();
+		break;
+
+	case DARWIN_CONS_ERASE:
+	case DARWIN_CONS_DEL:
+		if (darwin_cons_line_len == 0)
+			return (NULL);		/* nothing to rub out */
+		darwin_cons_line_len--;
+		tty_putc('\b');
+		tty_putc(' ');
+		tty_putc('\b');
+		return (NULL);
+
+	case '\r':
+	case '\n':
+		if (darwin_cons_line_len < DARWIN_CONS_LINE)
+			darwin_cons_line[darwin_cons_line_len++] = '\n';
+		tty_putc('\n');
+		darwin_cons_deliver_locked();
+		break;
+
+	default:
+		if (c < 0x20 && c != '\t')
+			return (NULL);		/* not a key we render */
+		if (darwin_cons_line_len >= DARWIN_CONS_LINE) {
+			/*
+			 * A line longer than the buffer is delivered rather
+			 * than truncated: losing the tail silently would be
+			 * worse than handing the reader a line it did not
+			 * ask to be split.
+			 */
+			darwin_cons_deliver_locked();
+		}
+		darwin_cons_line[darwin_cons_line_len++] = c;
+		tty_putc(c);
+		return (NULL);
+	}
+
+	w = darwin_cons_waiter;
+	darwin_cons_waiter = NULL;
+	return (w);
+}
+
+/*
+ * Push one character in from a producer.  Returns true if the console took
+ * it -- which is also the answer to "does a Darwin task want this key".
+ */
+bool
+darwin_cons_input(char c)
+{
+	struct thread	*w;
+	bool		 intr;
+
+	spin_lock(&darwin_cons_lock);
+	darwin_cons_n_key++;
+	w = darwin_cons_input_locked(c, &intr);
+	spin_unlock(&darwin_cons_lock);
+
+	/* Both of these can sleep or take other locks; neither may run above. */
+	if (intr)
+		darwin_cons_signal_fg(DARWIN_SIGINT);
+	if (w != NULL)
+		thread_wake(w);
+	return (true);
+}
+
+/*
+ * The keyboard driver's sink.  Answers "is a Darwin task holding the
+ * console" and, if so, swallows the key; otherwise the driver sends it to
+ * the Mach input port and the native shell gets it as before.  One decision,
+ * one place: nothing else in the system arbitrates the keyboard.
+ */
+bool
+darwin_cons_sink(char c)
+{
+	struct task	*fg;
+
+	if (darwin_cons_fg_id == 0)
+		return (false);
+	fg = task_lookup_ref(darwin_cons_fg_id);
+	if (fg == NULL) {
+		/*
+		 * The claimant died without releasing -- teardown normally
+		 * clears this, but a claim that outlives its task would wedge
+		 * the keyboard, so drop it here too rather than trust one path.
+		 */
+		darwin_cons_fg_id = 0;
+		return (false);
+	}
+	task_deref(fg);
+	return (darwin_cons_input(c));
+}
+
+/*
+ * Release the console if `t` was holding it.  Called when a task dies: a
+ * claim that outlived its owner would route every keystroke into a ring
+ * nobody drains, which from the keyboard's end is indistinguishable from a
+ * dead machine.
+ */
+void
+darwin_cons_release(struct task *t)
+{
+
+	if (t == NULL || t->t_id != darwin_cons_fg_id)
+		return;
+	darwin_cons_fg_id = 0;
+	spin_lock(&darwin_cons_lock);
+	/*
+	 * A parked reader belonging to a dying task cannot be woken -- and
+	 * must not be, since the thread is on its way out.  Dropping the
+	 * pointer here is what keeps a later keystroke from calling
+	 * thread_wake on freed memory.
+	 */
+	if (darwin_cons_waiter != NULL &&
+	    darwin_cons_waiter->th_task == t)
+		darwin_cons_waiter = NULL;
+	darwin_cons_line_len   = 0;
+	darwin_cons_tail       = darwin_cons_head;  /* discard unread input */
+	darwin_cons_eof        = false;	/* the next claimant starts fresh */
+	darwin_cons_script_len = 0;	/* a script belongs to its session */
+	darwin_cons_script_off = 0;
+	spin_unlock(&darwin_cons_lock);
+
+	/*
+	 * A session ending is the natural moment to say what the terminal
+	 * cost, and the only one available while the machine is still up: the
+	 * boot-time stats block has long since printed by the time anybody
+	 * types.  The waits figure is the interesting one -- see the counters.
+	 */
+	darwin_cons_stats();
+}
+
+/*
+ * Load a scripted session, driven by the SYS_CONS_FEED native syscall.  The
+ * bytes are not delivered here -- they are held until a reader asks, and then
+ * released one line at a time through the same discipline a keystroke uses
+ * (see darwin_cons_script_locked).  Running out of script is end-of-input,
+ * which is what lets a scripted shell exit without anybody typing Ctrl-D.
  */
 void
 darwin_cons_feed(const char *buf, size_t n)
 {
-	struct task	*fg;
-	size_t		 i;
-	uint32_t	 next;
+	size_t	i;
 
-	for (i = 0; i < n; i++) {
-		if (buf[i] == 0x03) {		/* Ctrl-C -> SIGINT to fg task */
-			fg = task_lookup_ref(darwin_cons_fg_id);
-			if (fg != NULL) {
-				darwin_signal_post(fg, DARWIN_SIGINT);
-				task_deref(fg);
-			}
-			continue;
-		}
-		next = darwin_cons_head + 1u;
-		if (next - darwin_cons_tail > DARWIN_CONS_BUF)
-			break;
-		darwin_cons_buf[darwin_cons_head & DARWIN_CONS_MASK] = buf[i];
-		darwin_cons_head = next;
+	spin_lock(&darwin_cons_lock);
+	if (n > sizeof(darwin_cons_script))
+		n = sizeof(darwin_cons_script);
+	for (i = 0; i < n; i++)
+		darwin_cons_script[i] = buf[i];
+	darwin_cons_script_len = (uint32_t)n;
+	darwin_cons_script_off = 0;
+	darwin_cons_eof = false;
+	spin_unlock(&darwin_cons_lock);
+}
+
+/*
+ * Release the next scripted line into the discipline, or declare end-of-input
+ * once the script is spent.  Returns false when there was nothing left to
+ * type and the caller should wait for a real key instead; *intr_out reports a
+ * Ctrl-C in the script, which the caller signals after dropping the lock
+ * exactly as it would for a typed one.
+ */
+static bool
+darwin_cons_script_locked(bool *intr_out)
+{
+	bool	intr;
+	char	c;
+
+	*intr_out = false;
+	if (darwin_cons_script_off >= darwin_cons_script_len) {
+		if (darwin_cons_script_len != 0)
+			darwin_cons_eof = true;	/* the script ran out */
+		return (false);
 	}
-	darwin_cons_eof = true;
+	do {
+		c = darwin_cons_script[darwin_cons_script_off++];
+		darwin_cons_n_script++;
+		/*
+		 * The wake this returns is discarded on purpose: the only
+		 * thread that could be parked here is the one running this,
+		 * and it is about to loop round and find the line itself.
+		 */
+		(void)darwin_cons_input_locked(c, &intr);
+		if (intr)
+			*intr_out = true;
+	} while (c != '\n' && darwin_cons_script_off < darwin_cons_script_len);
+	return (true);
 }
 
 /*
  * read(2) on a console fd (implicit stdin or an explicit CONSOLE slot):
- * serve one line of console input.  Drains the feed ring up to `n` bytes,
- * stopping after a newline -- canonical-mode shape, so an interactive
- * shell gets one complete line per read -- and echoes each consumed byte
- * so a scripted session reads like a live terminal.  An empty ring
- * returns EOF (0) once the feed is exhausted; otherwise it yields until
- * the producer delivers more.
+ * serve one line of console input.  The discipline above has already echoed
+ * it and already decided where the line ends, so this only moves bytes and
+ * waits.
+ *
+ * It waits by SLEEPING.  This used to spin on thread_yield(), which works and
+ * costs the whole machine: an interactive shell sitting at a prompt would
+ * take every timeslice offered to it, forever, to discover the ring was
+ * still empty.  Now the reader parks on the ring and the producer wakes it.
  */
 static long
 darwin_cons_read(struct syscall_frame *f, void *ubuf, size_t n)
@@ -581,6 +905,8 @@ darwin_cons_read(struct syscall_frame *f, void *ubuf, size_t n)
 	char	line[256];
 	size_t	got;
 	char	c;
+	bool	eof;
+	bool	intr;
 
 	got = 0;
 	darwin_cons_fg_id = current_thread->th_task->t_id;
@@ -588,33 +914,87 @@ darwin_cons_read(struct syscall_frame *f, void *ubuf, size_t n)
 		n = sizeof(line);
 
 	for (;;) {
+		spin_lock(&darwin_cons_lock);
 		while (got < n && darwin_cons_tail != darwin_cons_head) {
 			c = darwin_cons_buf[darwin_cons_tail & DARWIN_CONS_MASK];
 			darwin_cons_tail++;
 			line[got++] = c;
-			tty_putc(c);
 			if (c == '\n')
 				break;
 		}
-		if (got > 0)
+		eof = darwin_cons_eof;
+		if (got > 0 || eof) {
+			spin_unlock(&darwin_cons_lock);
 			break;
-		if (darwin_cons_eof)
-			return (darwin_ok(f, 0));	/* EOF */
+		}
+
+		/*
+		 * Nothing queued.  If a script is loaded, this is the moment
+		 * it gets to type its next line -- the reader asking is what
+		 * paces it, so the transcript interleaves commands with their
+		 * output instead of listing them all up front.
+		 */
+		if (darwin_cons_script_locked(&intr)) {
+			spin_unlock(&darwin_cons_lock);
+			if (intr)
+				darwin_cons_signal_fg(DARWIN_SIGINT);
+			continue;
+		}
+
 		/*
 		 * A pending, unblocked signal (e.g. SIGINT from Ctrl-C) breaks
 		 * the blocking read with EINTR; the syscall-exit path then
 		 * delivers it -- a caught handler runs, an uncaught SIGINT
-		 * terminates.  Mirrors the pipe read's interrupt check.
+		 * terminates.  Mirrors the pipe read's interrupt check, and
+		 * has to be tested before parking or a signal that arrived
+		 * while we were awake would be slept through.
 		 */
 		if ((current_thread->th_task->t_sig_pending &
-		    ~current_thread->th_task->t_sig_mask) != 0)
+		    ~current_thread->th_task->t_sig_mask) != 0) {
+			spin_unlock(&darwin_cons_lock);
 			return (darwin_err(f, DARWIN_EINTR));
-		thread_yield();
+		}
+
+		/*
+		 * Register, then park with the lock dropped ATOMICALLY with
+		 * respect to a producer: thread_block_release does the drop
+		 * under the scheduler lock, so a wake fired between the two
+		 * cannot be lost.  Doing it by hand -- unlock, then block --
+		 * is the classic missed-wakeup, and here it would hang a
+		 * shell at its prompt until the next keystroke.
+		 */
+		darwin_cons_n_wait++;
+		darwin_cons_waiter = current_thread;
+		thread_block_release(THREAD_BLOCK_SLEEP,
+		    (void *)&darwin_cons_head, &darwin_cons_lock);
 	}
 
+	darwin_cons_n_read++;
+	if (got == 0)
+		return (darwin_ok(f, 0));		/* EOF */
 	if (syscall_copyout(ubuf, line, got) != 0)
 		return (darwin_err(f, DARWIN_EFAULT));
 	return (darwin_ok(f, (long)got));
+}
+
+/*
+ * One line about the terminal, printed beside the other subsystem counters.
+ * The waits-per-read ratio is the whole point: at one wait per read the
+ * reader sleeps until something happens, which is what a terminal should
+ * cost when nobody is typing.
+ */
+void
+darwin_cons_stats(void)
+{
+
+	if (darwin_cons_n_read == 0 && darwin_cons_n_key == 0)
+		return;
+	kprintf("cons: %llu reads, %llu waits -- %llu keys typed, "
+	    "%llu scripted\n",
+	    (unsigned long long)darwin_cons_n_read,
+	    (unsigned long long)darwin_cons_n_wait,
+	    (unsigned long long)darwin_cons_n_key,
+	    (unsigned long long)darwin_cons_n_script);
 }
 
 void
@@ -626,6 +1006,12 @@ darwin_files_teardown(struct task *t)
 		if (t->t_darwin_files[i].of_type != DARWIN_OF_FREE)
 			darwin_ofile_clear(&t->t_darwin_files[i]);
 	}
+	/*
+	 * The console is a file this task may have been holding too, and the
+	 * one whose loss is not local: a claim outliving its owner would send
+	 * every keystroke into a ring nobody drains.
+	 */
+	darwin_cons_release(t);
 }
 
 int

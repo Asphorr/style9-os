@@ -8,6 +8,7 @@
 #ifndef _SYS_DARWIN_H_
 #define	_SYS_DARWIN_H_
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /*
@@ -305,14 +306,28 @@ void	darwin_files_teardown(struct task *t);
 int	darwin_files_fork_copy(struct task *parent, struct task *child);
 
 /*
- * Console input feed (kern/darwin.c).  Appends bytes to the Darwin
- * console-input ring that the personality's read(2) drains for a console
- * fd, and marks end-of-input.  Backs the SYS_CONS_FEED native syscall
- * (kern/syscall.c): the userspace driver pre-loads a command script so an
- * interactive Darwin shell runs a deterministic session over the real
- * read(2) path.
+ * The Darwin console (kern/darwin.c) -- a terminal in canonical mode, whose
+ * line discipline lives behind darwin_cons_input: echo, erase, Ctrl-C to a
+ * signal, Ctrl-D to end-of-file, and delivery a line at a time to the
+ * personality's read(2) on a console fd.
+ *
+ * Two producers feed it.  darwin_cons_sink is the keyboard driver's: it
+ * answers whether a Darwin task currently holds the console and, if so,
+ * swallows the key -- the ONE place the keyboard is arbitrated between a
+ * Darwin binary and the native shell's Mach input port.  darwin_cons_feed is
+ * the scripted one behind the SYS_CONS_FEED native syscall, which pushes a
+ * canned session through the same discipline and then declares end-of-input,
+ * so the boot demo drives the interactive path rather than a parallel one.
+ *
+ * darwin_cons_release drops the claim when its owner dies; task teardown
+ * calls it, because a claim that outlives its task routes every keystroke
+ * into a ring nobody drains.
  */
+bool	darwin_cons_input(char c);
+bool	darwin_cons_sink(char c);
 void	darwin_cons_feed(const char *buf, size_t n);
+void	darwin_cons_release(struct task *t);
+void	darwin_cons_stats(void);
 
 /*
  * Zombie bookkeeping (kern/darwin.c).  Records {pid, ppid, wait4-format
