@@ -1178,9 +1178,21 @@ fq_free_val(struct apfs_btree_node_phys *n, const struct fq_node *fn,
 
 /*
  * Put (xid, paddr, count) into queue `q`, keeping the table of contents in
- * key order.  Space comes from the node's free span rather than from its free
- * lists -- reusing a hole would mean finding one of the right size, and the
- * span is what a node that has just been reset is all of.
+ * key order.
+ *
+ * Space comes from a HOLE a release left behind if there is one, and only
+ * otherwise from the node's free span.  Every hole in this node is exactly the
+ * right size -- one queue key is as long as any other, and so is one count --
+ * so taking one is popping the head of a list rather than searching it, which
+ * is why the fs tree's inserts can go on ignoring their own free lists and
+ * this one cannot.
+ *
+ * WITHOUT THAT THE NODE BLEEDS, and it took a busier boot to see it.  The span
+ * only ever shrinks and the chain only ever grows, so a container that queues
+ * and releases for long enough runs out of span while the queue is nearly
+ * empty and starts losing blocks it has no room to record.  Measured the first
+ * time truncation gave a boot enough work to reach it: "free queue 1 is still
+ * full" printed with EIGHT keys in a node that had just been holding ninety.
  */
 static int
 fq_insert(uint32_t q, uint64_t xid, uint64_t paddr, uint64_t count)
@@ -1188,6 +1200,7 @@ fq_insert(uint32_t q, uint64_t xid, uint64_t paddr, uint64_t count)
 	struct apfs_btree_node_phys		*n;
 	struct apfs_spaceman_free_queue_key	*k;
 	struct apfs_spaceman			*sm;
+	struct apfs_nloc			*hole;
 	struct fq_node				 fn;
 	uint16_t				*toc;
 	uint64_t				 exid;
@@ -1197,13 +1210,23 @@ fq_insert(uint32_t q, uint64_t xid, uint64_t paddr, uint64_t count)
 	uint32_t				 i;
 	uint16_t				 koff;
 	uint16_t				 voff;
+	bool					 keyhole;
+	bool					 valhole;
 
 	if (q >= APFS_SFQ_COUNT || g_fq[q] == NULL || g_sm == NULL)
 		return (FS_APFS_E_INVAL);
 	n = (struct apfs_btree_node_phys *)g_fq[q];
 	fq_layout(g_fq[q], &fn);
 
-	need = (uint32_t)sizeof(*k) + (count > 1 ? 8u : 0u);
+	/*
+	 * The list's total is what says whether there is a hole: a chain with
+	 * bytes in it has a head, and asking the total rather than the head
+	 * keeps this from depending on which value means "none".
+	 */
+	keyhole = n->btn_key_free_list.nl_len >= sizeof(*k);
+	valhole = n->btn_val_free_list.nl_len >= 8u;
+	need    = (keyhole ? 0u : (uint32_t)sizeof(*k)) +
+	    ((count > 1 && !valhole) ? 8u : 0u);
 	if ((uint32_t)(fn.fn_nkeys + 1) * 4u > fn.fn_toc_len ||
 	    n->btn_free_space.nl_len < need) {
 		/*
@@ -1219,6 +1242,10 @@ fq_insert(uint32_t q, uint64_t xid, uint64_t paddr, uint64_t count)
 		    (unsigned)fn.fn_nkeys, (unsigned long long)xid);
 		fq_release(q, xid - 1);
 		fq_layout(g_fq[q], &fn);
+		keyhole = n->btn_key_free_list.nl_len >= sizeof(*k);
+		valhole = n->btn_val_free_list.nl_len >= 8u;
+		need    = (keyhole ? 0u : (uint32_t)sizeof(*k)) +
+		    ((count > 1 && !valhole) ? 8u : 0u);
 		if ((uint32_t)(fn.fn_nkeys + 1) * 4u > fn.fn_toc_len ||
 		    n->btn_free_space.nl_len < need) {
 			kprintf("apfs: free queue %u is still full -- block "
@@ -1235,25 +1262,44 @@ fq_insert(uint32_t q, uint64_t xid, uint64_t paddr, uint64_t count)
 			break;
 	}
 
-	koff = n->btn_free_space.nl_off;
-	n->btn_free_space.nl_off = (uint16_t)(koff + sizeof(*k));
-	n->btn_free_space.nl_len = (uint16_t)(n->btn_free_space.nl_len -
-	    sizeof(*k));
+	if (keyhole) {
+		koff = n->btn_key_free_list.nl_off;
+		hole = (struct apfs_nloc *)(fn.fn_keys + koff);
+		n->btn_key_free_list.nl_off = hole->nl_off;
+		n->btn_key_free_list.nl_len =
+		    (uint16_t)(n->btn_key_free_list.nl_len - sizeof(*k));
+	} else {
+		koff = n->btn_free_space.nl_off;
+		n->btn_free_space.nl_off = (uint16_t)(koff + sizeof(*k));
+		n->btn_free_space.nl_len =
+		    (uint16_t)(n->btn_free_space.nl_len - sizeof(*k));
+	}
 	k = (struct apfs_spaceman_free_queue_key *)(fn.fn_keys + koff);
 	k->sfqk_xid   = xid;
 	k->sfqk_paddr = paddr;
 
 	if (count > 1) {
-		/*
-		 * Values grow down from the end of the node, so the next one
-		 * sits at the top of what is left of the free span.
-		 */
-		n->btn_free_space.nl_len =
-		    (uint16_t)(n->btn_free_space.nl_len - 8u);
-		voff = (uint16_t)(APFS_BLOCK_SIZE - APFS_BTREE_INFO_SIZE -
-		    (APFS_BTNODE_HDR_SIZE + n->btn_table_space.nl_off +
-		    fn.fn_toc_len + n->btn_free_space.nl_off +
-		    n->btn_free_space.nl_len));
+		if (valhole) {
+			voff = n->btn_val_free_list.nl_off;
+			hole = (struct apfs_nloc *)(fn.fn_vals - voff);
+			n->btn_val_free_list.nl_off = hole->nl_off;
+			n->btn_val_free_list.nl_len =
+			    (uint16_t)(n->btn_val_free_list.nl_len - 8u);
+		} else {
+			/*
+			 * Values grow down from the end of the node, so the
+			 * next one sits at the top of what is left of the free
+			 * span -- which is where it is whether or not the key
+			 * above came out of the span too.
+			 */
+			n->btn_free_space.nl_len =
+			    (uint16_t)(n->btn_free_space.nl_len - 8u);
+			voff = (uint16_t)(APFS_BLOCK_SIZE -
+			    APFS_BTREE_INFO_SIZE -
+			    (APFS_BTNODE_HDR_SIZE + n->btn_table_space.nl_off +
+			    fn.fn_toc_len + n->btn_free_space.nl_off +
+			    n->btn_free_space.nl_len));
+		}
 		*(uint64_t *)(fn.fn_vals - voff) = count;
 	} else
 		voff = APFS_FQ_GHOST;
@@ -5473,8 +5519,12 @@ fs_apfs_alloc_selftest(void)
 	uint64_t		 old_sm;
 	uint64_t		 first;
 	uint64_t		 second;
+	uint64_t		 again;
 	uint64_t		 away;
+	struct apfs_btree_node_phys *fqn;
 	uint32_t		 run;
+	uint32_t		 room;
+	uint32_t		 held;
 	uint32_t		 i;
 	int			 taken;
 
@@ -5595,7 +5645,74 @@ fs_apfs_alloc_selftest(void)
 	}
 
 	/*
-	 * AND THE FOURTH, which is the rung this test grew for.  A file's bytes
+	 * AND THE FOURTH, which is about the queue's own node rather than the
+	 * blocks recorded in it.
+	 *
+	 * A release puts the key and count it took out onto the node's free
+	 * lists, and an insert has to take them back.  There is a reason that
+	 * looks unnecessary, and it is the reason this claim is written the
+	 * awkward way it is: a queue that reaches EMPTY has its node reset
+	 * outright -- span restored, chains cleared -- and in a quiet container
+	 * the queue empties all the time.  A BUSY one never does; there is
+	 * always something from the last few checkpoints in it, the reset never
+	 * fires, and a node that only ever ate into its span loses an entry's
+	 * worth of room per cycle until it refuses to record a release at all.
+	 * That refusal is a leaked block, and it is what a boot printed the
+	 * first time truncation gave it enough work to get there: "free queue 1
+	 * is still full" with EIGHT keys in a node that had been holding
+	 * ninety.
+	 *
+	 * So the queue is deliberately kept busy -- one release per checkpoint,
+	 * which is exactly what stops it emptying -- and the node is measured
+	 * over two stretches of that at the same depth.  The second stretch
+	 * must cost it nothing.
+	 *
+	 * Written this way because the obvious version does not work: two
+	 * take-and-release cycles with a drain between them PASS on a node that
+	 * reuses nothing, because the drain resets it.  That version was
+	 * written first, and it passed against a kernel broken on purpose.
+	 */
+	fqn = (struct apfs_btree_node_phys *)g_fq[APFS_SFQ_MAIN];
+	for (i = 0; i < 2u * (APFS_FQ_KEEP + 1u); i++) {
+		if (alloc_blocks(run, 0, &again) != FS_APFS_E_OK ||
+		    free_blocks(again, run) != FS_APFS_E_OK ||
+		    fs_apfs_checkpoint() != FS_APFS_E_OK) {
+			kprintf("apfs-alloc: FAIL cycle %u of keeping the free "
+			    "queue busy was refused\n", (unsigned)i);
+			goto out;
+		}
+	}
+	room = fqn->btn_free_space.nl_len;
+	held = fqn->btn_nkeys;
+	for (i = 0; i < APFS_FQ_KEEP + 1u; i++) {
+		if (alloc_blocks(run, 0, &again) != FS_APFS_E_OK ||
+		    free_blocks(again, run) != FS_APFS_E_OK ||
+		    fs_apfs_checkpoint() != FS_APFS_E_OK) {
+			kprintf("apfs-alloc: FAIL cycle %u of the measured "
+			    "stretch was refused\n", (unsigned)i);
+			goto out;
+		}
+	}
+	if (fqn->btn_nkeys != held) {
+		kprintf("apfs-alloc: FAIL the free queue held %u entries and "
+		    "now holds %u -- one release per checkpoint should hold it "
+		    "at a steady depth, and without that the room it has left "
+		    "cannot be compared\n", (unsigned)held,
+		    (unsigned)fqn->btn_nkeys);
+		goto out;
+	}
+	if (fqn->btn_free_space.nl_len != room) {
+		kprintf("apfs-alloc: FAIL the free queue's node went from %u "
+		    "bytes of free span to %u while holding the same %u "
+		    "entries -- it is not reusing the holes its own releases "
+		    "leave, and a queue that never empties will run out of "
+		    "room while nearly empty\n", (unsigned)room,
+		    (unsigned)fqn->btn_free_space.nl_len, (unsigned)held);
+		goto out;
+	}
+
+	/*
+	 * AND THE FIFTH, which is the rung this test grew for.  A file's bytes
 	 * are not where its metadata is: in this container the one real file
 	 * keeps its content in the chunk at block 0 while everything being
 	 * copied around it lives in the chunk at 98304.  Relocating those bytes
