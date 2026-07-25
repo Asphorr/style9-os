@@ -13,6 +13,26 @@ binaries — see *XNU binary compatibility* below.
 
 Built from scratch — no upstream tree, no glue from another OS.
 
+## Tree layout
+
+```
+arch/amd64/   boot, GDT/IDT/PIC, ISR asm, pmap, syscall entry
+kern/         kernel core: tasks, threads, sched, locks, syscalls, loaders, ddb
+vm/           physical + virtual memory: pmm, vm_map, vm_object
+fs/           block cache and file systems: APFS, FAT
+mach/         Mach IPC: ports, bootstrap, services, launchd, klog
+dev/          drivers: tty, kbd, mouse, uart, ata, rtc
+user/ lib/    ring-3 programs and libstyle9
+test/         boot-time stress harness
+```
+
+`vm/` and `fs/` sit beside `kern/` rather than inside it, which is the split
+4.4BSD drew and FreeBSD still keeps: `sys/kern` stays flat and large while
+`sys/vm` and `sys/fs` are siblings.  The claim is that memory and file systems
+are subsystems the kernel core *uses*, not parts of it — the same claim `mach/`
+and `dev/` already make here.  Every directory is on the include path, so a
+file moving between them changes no `#include` anywhere.
+
 ## What's in it
 
 | layer | files | what |
@@ -30,9 +50,9 @@ Built from scratch — no upstream tree, no glue from another OS.
 | irqs | `arch/amd64/pic.c`, `pit.c` | 8259 remap to 0x20/0x28, PIT @ 100 Hz with quantum tracking |
 | clock | `kern/tsc.c`, `clock.c` | rdtsc + PIT-anchored calibration, `uptime_ms`, busy-sleep |
 | memory map | `kern/memmap.c` | parses MB1 / MB2 / PVH boot info into one sorted table |
-| pmm | `kern/pmm.c` | bitmap page allocator, first-fit, capped at boot identity-map |
+| pmm | `vm/pmm.c` | bitmap page allocator, first-fit, capped at boot identity-map |
 | pmap | `arch/amd64/pmap.c` | per-task 4-level page tables (kernel half shared, user half private); `pmap_kenter / kremove / kextract` for kernel mappings, `pmap_enter / remove / extract` for per-task user mappings |
-| vm map | `kern/vm.c` | per-task `vm_map` records anon user-VA ranges; `vm_map_find_space` picks free holes, `vm_map_release_anon` walks `VME_F_ANON` entries at task teardown and `pmm_free_page`s each leaf before `pmap_destroy` rips the page-table tree |
+| vm map | `vm/vm.c` | per-task `vm_map` records anon user-VA ranges; `vm_map_find_space` picks free holes, `vm_map_release_anon` walks `VME_F_ANON` entries at task teardown and `pmm_free_page`s each leaf before `pmap_destroy` rips the page-table tree |
 | kmem | `kern/kmem.c` | power-of-two bucketed allocator with `0xFE` red zones around each chunk and `0xDE` freelist poison; tripwires catch heap UAF + OOB writes |
 | ddb | `kern/ddb.c`, `kprintf.c` | in-kernel debugger.  `ps`, `s task / thread / sched / ports / vm / mem / locks` introspection on whatever the kernel was doing when it dropped |
 | panic | `kern/panic.c` | KASSERT, RBP-chain backtrace with symbolicated frames, fault/panic autopsy |

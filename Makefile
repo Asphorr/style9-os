@@ -3,9 +3,20 @@
 # Tree layout:
 #   arch/amd64/		boot stub, GDT/IDT/PIC, ISR asm, trap dispatcher
 #   kern/		machine-independent kernel core
+#   vm/			physical + virtual memory (pmm, vm_map, vm_object)
+#   fs/			block cache and file systems (APFS, FAT)
+#   mach/		Mach IPC (ports, bootstrap, services)
 #   dev/		drivers (tty, kbd, dbgcon)
 #   obj/		build artefacts (created on demand)
 #   kernel.elf		final linked image, at the project root
+#
+# vm/ and fs/ sit BESIDE kern/ rather than inside it, which is the split
+# 4.4BSD draws and FreeBSD still keeps: sys/kern stays flat and large, while
+# sys/vm and sys/fs are siblings.  The claim being made is that memory and
+# file systems are subsystems the kernel core uses, not parts of it -- the
+# same claim mach/ and dev/ already make here.  Adding a directory costs one
+# word in SRCDIRS (which becomes its -I) and one in VPATH; OBJS names objects
+# without a directory, so it does not change, and no #include does either.
 #
 # Targets:
 #   make		build kernel.elf
@@ -41,12 +52,13 @@ QEMU_CPU = Nehalem
 
 # Directories that contain sources and their public headers.  Listed in
 # include-search order: arch first so e.g. machine/io.h-style headers
-# would shadow generic, then kern, dev, mach, test.  mach/ holds the
-# Mach IPC subsystem (port/bootstrap/services/klog); test/ holds the
-# boot-time stress harness.  Both sit on the include path so their
-# bodies can pull in any kernel header without indirection.
+# would shadow generic, then kern, vm, fs, dev, mach, test.  mach/ holds
+# the Mach IPC subsystem (port/bootstrap/services/klog); test/ holds the
+# boot-time stress harness.  All of them sit on the include path so their
+# bodies can pull in any kernel header without indirection -- which is why
+# moving a file between these directories does not touch a single #include.
 ARCH	= arch/amd64
-SRCDIRS	= $(ARCH) kern dev mach test
+SRCDIRS	= $(ARCH) kern vm fs dev mach test
 
 OBJDIR	= obj
 
@@ -76,7 +88,7 @@ LDFLAGS	= -m elf_x86_64 -T $(ARCH)/linker.ld			\
 
 # VPATH lets the pattern rules below find sources without the recipe
 # spelling out the source directory explicitly.
-VPATH	= $(ARCH):kern:dev:mach:test
+VPATH	= $(ARCH):kern:vm:fs:dev:mach:test
 
 OBJS	= \
 	$(OBJDIR)/boot.o	\
