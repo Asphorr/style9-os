@@ -48,6 +48,68 @@
 #define	VGA_CURSOR_DISABLE	0x20u
 
 /*
+ * The sixteen colours are not the hardware's; they are ours.
+ *
+ * A VGA attribute byte does not name a colour, it names a slot: four
+ * bits index the attribute controller's palette registers, those index
+ * the DAC, and the DAC holds the actual six-bit-per-channel RGB.  Both
+ * levels are writable, and nothing here had ever written either -- so
+ * this console had been showing the IBM CGA palette from 1981, whose
+ * blue is nearly unreadable on black and whose "brown" is a colour no
+ * one would choose.
+ *
+ * Two other things come from the same registers.  The attribute
+ * controller's mode register has a blink-enable bit which is set at
+ * reset; while it is set, the high bit of the background nibble means
+ * "blink" rather than "bright", which is why csi_apply_sgr masked the
+ * background to three bits and why only eight of the sixteen background
+ * colours were reachable.  Clearing it costs one port write and doubles
+ * them.
+ *
+ * And a trap: writes to attribute-controller registers 0x00-0x0F are
+ * IGNORED while the palette-address-source bit is set, which is also
+ * the bit that keeps video on.  So the palette is written with video
+ * off and video is turned back on afterwards -- a sequence that looks
+ * like a race and is not, because it happens once before anything is
+ * on the screen.
+ */
+#define	VGA_DAC_WRITE_INDEX	0x3C8
+#define	VGA_DAC_READ_INDEX	0x3C7
+#define	VGA_DAC_DATA		0x3C9
+#define	VGA_AC_INDEX		0x3C0
+#define	VGA_AC_DATA_READ	0x3C1
+#define	VGA_INPUT_STATUS_1	0x3DA
+#define	VGA_AC_MODE		0x10
+#define	VGA_AC_MODE_BLINK	0x08u
+#define	VGA_AC_PALETTE_ENABLE	0x20u
+
+/*
+ * A calm, low-contrast set on near-black: the console's job here is to
+ * be read for a long time, and the colours it reaches for most are the
+ * body gray at 7 and the chrome gray at 8, which have to sit a clear
+ * step apart without either of them shouting.  Eight-bit values,
+ * halved to the DAC's six bits on the way in.
+ */
+static const uint8_t	tty_rgb[16][3] = {
+	{ 0x0d, 0x0d, 0x0f },	/*  0 black          */
+	{ 0x3b, 0x6e, 0xa5 },	/*  1 blue           */
+	{ 0x5a, 0x9e, 0x5a },	/*  2 green          */
+	{ 0x3f, 0x9c, 0x99 },	/*  3 cyan           */
+	{ 0xb0, 0x52, 0x52 },	/*  4 red            */
+	{ 0x8e, 0x6b, 0xb0 },	/*  5 magenta        */
+	{ 0xa8, 0x82, 0x3c },	/*  6 brown          */
+	{ 0xb4, 0xb6, 0xba },	/*  7 light gray     */
+	{ 0x4a, 0x4d, 0x52 },	/*  8 dark gray      */
+	{ 0x6f, 0xa8, 0xdc },	/*  9 bright blue    */
+	{ 0x86, 0xc4, 0x6e },	/* 10 bright green   */
+	{ 0x63, 0xc9, 0xc3 },	/* 11 bright cyan    */
+	{ 0xe0, 0x8b, 0x7f },	/* 12 bright red     */
+	{ 0xb9, 0x8f, 0xd9 },	/* 13 bright magenta */
+	{ 0xdf, 0xc0, 0x7a },	/* 14 bright yellow  */
+	{ 0xee, 0xf0, 0xf2 },	/* 15 white          */
+};
+
+/*
  * ANSI/VT CSI state machine.
  *
  * Bytes arriving at the VGA console flow through a three-state parser:
@@ -204,6 +266,7 @@ static void	tty_putcell(uint16_t, uint16_t, char);
 static void	tty_cursor_sync(void);
 static void	tty_cursor_program(uint16_t);
 static void	tty_cursor_show(bool);
+static void	tty_palette_install(void);
 static void	tty_scroll(void);
 static void	tty_linefeed(void);
 static uint16_t	tty_cell(char);
@@ -230,6 +293,11 @@ tty_init(void)
 	tty_have_saved   = false;
 	tty_scroll_top   = 0;
 	tty_scroll_bot   = TTY_ROWS - 1;
+	/*
+	 * Before the first cell is written, so nothing is ever drawn in
+	 * the palette this console is not going to keep.
+	 */
+	tty_palette_install();
 	csi_state        = TTY_S_GROUND;
 	tty_csi_reset();
 	/*
@@ -399,6 +467,70 @@ tty_batch_end(void)
 		    tty_col));
 	if (locked)
 		spin_unlock(&tty_lock);
+}
+
+/* ---- palette --------------------------------------------------------- */
+
+/*
+ * Attribute-controller access.  Every one of these resets the
+ * index/data flip-flop first by reading the input-status register,
+ * because the flip-flop is shared state that any other writer -- or an
+ * interrupt landing between two of these -- could have left in the
+ * data position, and a write that lands in the wrong half programs a
+ * register nobody asked for.
+ */
+static void
+ac_write(uint8_t index, uint8_t value)
+{
+
+	(void)inb(VGA_INPUT_STATUS_1);
+	outb(VGA_AC_INDEX, index);	/* enable bit clear: 0x00-0x0F writable */
+	outb(VGA_AC_INDEX, value);
+}
+
+static uint8_t
+ac_read(uint8_t index)
+{
+
+	(void)inb(VGA_INPUT_STATUS_1);
+	outb(VGA_AC_INDEX, (uint8_t)(index | VGA_AC_PALETTE_ENABLE));
+	return (inb(VGA_AC_DATA_READ));
+}
+
+static void
+tty_palette_install(void)
+{
+	uint8_t	i;
+	uint8_t	mode;
+
+	/*
+	 * Attribute nibble N selects palette register N selects DAC entry
+	 * N.  The reset-time mapping is not the identity -- it interleaves
+	 * so that the sixteen text colours land on DAC entries 0-7 and
+	 * 0x38-0x3F -- and every level of indirection that is not the
+	 * identity is one more thing to be wrong about later.
+	 */
+	for (i = 0; i < 16; i++)
+		ac_write(i, i);
+
+	mode = ac_read(VGA_AC_MODE);
+	ac_write(VGA_AC_MODE, (uint8_t)(mode & ~VGA_AC_MODE_BLINK));
+
+	/* Video on again: the writes above were made with it off. */
+	(void)inb(VGA_INPUT_STATUS_1);
+	outb(VGA_AC_INDEX, VGA_AC_PALETTE_ENABLE);
+
+	/*
+	 * The DAC auto-increments, so the index is written once and the
+	 * three channels follow.  Six bits per channel, hence the shift:
+	 * the low two bits of each byte above are decoration.
+	 */
+	outb(VGA_DAC_WRITE_INDEX, 0);
+	for (i = 0; i < 16; i++) {
+		outb(VGA_DAC_DATA, (uint8_t)(tty_rgb[i][0] >> 2));
+		outb(VGA_DAC_DATA, (uint8_t)(tty_rgb[i][1] >> 2));
+		outb(VGA_DAC_DATA, (uint8_t)(tty_rgb[i][2] >> 2));
+	}
 }
 
 /*
@@ -658,21 +790,117 @@ tty_ground_put(char ch)
 
 /* ---- CSI final-byte handlers ----------------------------------------- */
 
+/*
+ * ANSI counts its colours red-first; VGA counts them blue-first.
+ *
+ *	ANSI	0 black 1 red  2 green 3 yellow 4 blue 5 magenta 6 cyan
+ *	VGA	0 black 1 blue 2 green 3 cyan   4 red  5 magenta 6 brown
+ *
+ * The two orders differ by exactly one thing -- bits 0 and 2 are
+ * swapped -- and this parser had been feeding the ANSI number straight
+ * into the attribute byte since it was written.  So "\x1b[31m" for red
+ * had always drawn blue and "\x1b[34m" for blue had always drawn red,
+ * and only black, green, magenta and white (the values the swap fixes)
+ * were ever the colour that was asked for.
+ *
+ * Nothing noticed because the shell's palette is grays plus one red,
+ * and that red is what a reader would take for "the error colour" no
+ * matter which end of the spectrum it came out of.
+ */
+static uint8_t
+tty_ansi_to_vga(uint8_t n)
+{
+
+	return ((uint8_t)((n & 0x02u) | ((n & 0x01u) << 2) |
+	    ((n & 0x04u) >> 2)));
+}
+
+/*
+ * The nearest of our sixteen to an arbitrary RGB.
+ *
+ * A program that emits 24-bit or 256-colour SGR is describing a colour
+ * this hardware cannot draw, and the choice is between dropping the
+ * parameter -- which leaves the text in whatever colour happened to be
+ * set, the worst of the options -- and picking the closest thing there
+ * is.  Squared distance in RGB is not perceptually right, but it is
+ * right enough to keep a red red, and being approximately correct beats
+ * being silently ignored.
+ */
+static uint8_t
+tty_nearest(uint8_t r, uint8_t g, uint8_t b)
+{
+	uint32_t	best;
+	uint8_t		best_i;
+	uint8_t		i;
+
+	best   = 0xFFFFFFFFu;
+	best_i = 7;
+	for (i = 0; i < 16; i++) {
+		int32_t		dr, dg, db;
+		uint32_t	d;
+
+		dr = (int32_t)r - (int32_t)tty_rgb[i][0];
+		dg = (int32_t)g - (int32_t)tty_rgb[i][1];
+		db = (int32_t)b - (int32_t)tty_rgb[i][2];
+		d  = (uint32_t)(dr * dr + dg * dg + db * db);
+		if (d < best) {
+			best   = d;
+			best_i = i;
+		}
+	}
+	return (best_i);
+}
+
+/*
+ * xterm's 256-colour cube, unpacked to RGB so tty_nearest can work on
+ * it: 0-15 are the sixteen we already have, 16-231 are a 6x6x6 cube
+ * with the well-known non-linear level steps, and 232-255 are a grey
+ * ramp.  This exists because `ls --color` and anything else that reads
+ * a modern terminfo will speak it, and a console that answers with the
+ * previous colour is worse than one that answers with grey.
+ */
+static uint8_t
+tty_from_256(uint16_t n)
+{
+	static const uint8_t	cube[6] = {
+		0x00, 0x5f, 0x87, 0xaf, 0xd7, 0xff
+	};
+	uint8_t			v;
+
+	if (n < 8)
+		return (tty_ansi_to_vga((uint8_t)n));
+	if (n < 16)
+		return ((uint8_t)(tty_ansi_to_vga((uint8_t)(n - 8)) | 0x08u));
+	if (n < 232) {
+		n -= 16;
+		return (tty_nearest(cube[(n / 36) % 6], cube[(n / 6) % 6],
+		    cube[n % 6]));
+	}
+	if (n > 255)
+		return (7);
+	v = (uint8_t)(8 + (n - 232) * 10);
+	return (tty_nearest(v, v, v));
+}
+
 static void
 csi_apply_sgr(void)
 {
 	uint8_t	fg;
 	uint8_t	bg;
+	bool	reverse;
 	uint8_t	i;
 
 	/*
 	 * Decompose the working attribute on entry so we can mutate fg /
-	 * bg independently across the parameter stream.  4-bit fg, 3-bit
-	 * bg (VGA leaves the high bg bit for blink in default text mode;
-	 * we mask it off so SGR 100..107 can't accidentally set blink).
+	 * bg independently across the parameter stream.  Four bits each:
+	 * the background used to be masked to three because the high bit
+	 * meant blink, and tty_palette_install turns blink off, so the
+	 * bright backgrounds SGR 100..107 asks for are now colours the
+	 * hardware will actually draw.
 	 */
-	fg = (uint8_t)(tty_attr & 0x0Fu);
-	bg = (uint8_t)((tty_attr >> 4) & 0x07u);
+	fg      = (uint8_t)(tty_attr & 0x0Fu);
+	bg      = (uint8_t)((tty_attr >> 4) & 0x0Fu);
+	reverse = false;
 
 	if (csi_nparam == 0) {
 		/* CSI m == CSI 0 m -- reset to default. */
@@ -684,8 +912,9 @@ csi_apply_sgr(void)
 		uint16_t	p = csi_params[i];
 
 		if (p == 0) {
-			fg = (uint8_t)(tty_attr_default & 0x0Fu);
-			bg = (uint8_t)((tty_attr_default >> 4) & 0x07u);
+			fg      = (uint8_t)(tty_attr_default & 0x0Fu);
+			bg      = (uint8_t)((tty_attr_default >> 4) & 0x0Fu);
+			reverse = false;
 			continue;
 		}
 		if (p == 1) {
@@ -693,30 +922,109 @@ csi_apply_sgr(void)
 			fg = (uint8_t)(fg | 0x08u);
 			continue;
 		}
+		if (p == 2) {
+			/*
+			 * Faint.  There is no half-intensity here, so it
+			 * means the same as "not bold" -- which is the
+			 * distinction the palette CAN draw, since 7 and 8
+			 * were chosen a clear step apart.
+			 */
+			fg = (uint8_t)(fg & 0x07u);
+			continue;
+		}
+		if (p == 7) {
+			reverse = true;
+			continue;
+		}
 		if (p == 22) {
 			fg = (uint8_t)(fg & 0x07u);
 			continue;
 		}
+		if (p == 27) {
+			reverse = false;
+			continue;
+		}
+		if (p == 39) {
+			fg = (uint8_t)(tty_attr_default & 0x0Fu);
+			continue;
+		}
+		if (p == 49) {
+			bg = (uint8_t)((tty_attr_default >> 4) & 0x0Fu);
+			continue;
+		}
 		if (p >= 30 && p <= 37) {
-			fg = (uint8_t)((fg & 0x08u) | (uint8_t)(p - 30u));
+			fg = (uint8_t)((fg & 0x08u) |
+			    tty_ansi_to_vga((uint8_t)(p - 30u)));
 			continue;
 		}
 		if (p >= 40 && p <= 47) {
-			bg = (uint8_t)(p - 40u);
+			bg = (uint8_t)((bg & 0x08u) |
+			    tty_ansi_to_vga((uint8_t)(p - 40u)));
 			continue;
 		}
 		if (p >= 90 && p <= 97) {
-			fg = (uint8_t)((uint8_t)(p - 90u) | 0x08u);
+			fg = (uint8_t)(tty_ansi_to_vga((uint8_t)(p - 90u)) |
+			    0x08u);
 			continue;
 		}
 		if (p >= 100 && p <= 107) {
-			bg = (uint8_t)((uint8_t)(p - 100u) & 0x07u);
+			bg = (uint8_t)(tty_ansi_to_vga((uint8_t)(p - 100u)) |
+			    0x08u);
+			continue;
+		}
+		/*
+		 * Extended colour: "38;5;N" / "48;5;N" for the 256-colour
+		 * cube, "38;2;R;G;B" / "48;2;R;G;B" for 24-bit.  Both are
+		 * consumed here rather than left to the loop, because their
+		 * arguments are parameters in their own right and letting
+		 * the loop see them would set a colour from a channel value.
+		 * That is the failure mode this whole branch prevents: a
+		 * "48;2;0;0;0" for black background otherwise reads as a
+		 * plain 0 (reset) followed by two more.
+		 */
+		if (p == 38 || p == 48) {
+			bool	is_fg = (p == 38);
+			uint8_t	c;
+
+			if (i + 2 < csi_nparam && csi_params[i + 1] == 5) {
+				c = tty_from_256(csi_params[i + 2]);
+				i = (uint8_t)(i + 2);
+			} else if (i + 4 < csi_nparam &&
+			    csi_params[i + 1] == 2) {
+				c = tty_nearest((uint8_t)csi_params[i + 2],
+				    (uint8_t)csi_params[i + 3],
+				    (uint8_t)csi_params[i + 4]);
+				i = (uint8_t)(i + 4);
+			} else {
+				/*
+				 * Malformed.  Swallow the rest of the
+				 * parameter list rather than resume in the
+				 * middle of it: the remaining values are
+				 * this sequence's arguments whatever they
+				 * are, and reading them as commands paints
+				 * garbage.
+				 */
+				break;
+			}
+			if (is_fg)
+				fg = c;
+			else
+				bg = c;
 			continue;
 		}
 		/* Unknown -- drop. */
 	}
 
-	tty_attr = TTY_ATTR(fg, bg);
+	/*
+	 * Reverse is applied last and to the result, not carried in the
+	 * attribute: an SGR run that sets a colour AFTER asking for
+	 * reverse means that colour to be the one swapped, which is only
+	 * true if the swap happens once at the end.
+	 */
+	if (reverse)
+		tty_attr = TTY_ATTR(bg, fg);
+	else
+		tty_attr = TTY_ATTR(fg, bg);
 }
 
 static void
@@ -1031,6 +1339,13 @@ tty_glyph_at(uint16_t row, uint16_t col)
 	return ((char)(VGA_BASE[(size_t)row * TTY_COLS + col] & 0xFFu));
 }
 
+static uint8_t
+tty_attr_at(uint16_t row, uint16_t col)
+{
+
+	return ((uint8_t)(VGA_BASE[(size_t)row * TTY_COLS + col] >> 8));
+}
+
 static void
 tty_fill_row(uint16_t row, uint16_t n, char ch)
 {
@@ -1253,6 +1568,170 @@ tty_region_selftest(void)
 	    "screenfuls of scrolling while the region underneath moved, "
 	    "resetting the margins thawed them, and DECTCEM reached the "
 	    "CRTC disable bit\n");
+}
+
+/*
+ * Write one character somewhere known, under whatever SGR run is given,
+ * and hand back the attribute byte the blitter actually stored.
+ */
+static uint8_t
+tty_sgr_probe(const char *sgr)
+{
+
+	tty_puts("\x1b[20;1H");
+	tty_puts(sgr);
+	tty_puts("#");
+	tty_puts("\x1b[0m");
+	return (tty_attr_at(19, 0));
+}
+
+void
+tty_colour_selftest(void)
+{
+	uint8_t	got;
+	uint8_t	want;
+	uint8_t	i;
+
+	/*
+	 * 1. The DAC holds OUR sixteen colours, read back off the card.
+	 *
+	 *    Asking tty_rgb what the palette is would pass with the port
+	 *    writes deleted; the read index is a separate register from
+	 *    the write index precisely so this can be checked.
+	 */
+	outb(VGA_DAC_READ_INDEX, 0);
+	for (i = 0; i < 16; i++) {
+		uint8_t	c;
+		uint8_t	ch;
+
+		for (c = 0; c < 3; c++) {
+			ch   = inb(VGA_DAC_DATA);
+			want = (uint8_t)(tty_rgb[i][c] >> 2);
+			if (ch != want) {
+				tty_clear();
+				kprintf("tty-colour: FAIL DAC entry %u channel "
+				    "%u reads 0x%x, the palette says 0x%x\n",
+				    (unsigned)i, (unsigned)c,
+				    (unsigned)ch, (unsigned)want);
+				return;
+			}
+		}
+	}
+
+	/*
+	 * 2. Blink is off, which is what makes the high background bit a
+	 *    colour instead of a timer.
+	 */
+	got = ac_read(VGA_AC_MODE);
+	if ((got & VGA_AC_MODE_BLINK) != 0) {
+		tty_clear();
+		kprintf("tty-colour: FAIL the attribute controller still has "
+		    "blink enabled (mode register = 0x%x)\n", (unsigned)got);
+		return;
+	}
+
+	/* 3. And the attribute-to-DAC mapping is the identity. */
+	for (i = 0; i < 16; i++) {
+		got = (uint8_t)(ac_read(i) & 0x3Fu);
+		if (got != i) {
+			tty_clear();
+			kprintf("tty-colour: FAIL attribute %u maps to DAC "
+			    "entry %u, not to itself\n",
+			    (unsigned)i, (unsigned)got);
+			return;
+		}
+	}
+
+	/*
+	 * 4. A bright background is reachable at all.  On a card still in
+	 *    its reset state the high background bit means blink, so this
+	 *    is the check that the mode-register write above took effect
+	 *    on the pixels and not just on the register.
+	 */
+	got = tty_sgr_probe("\x1b[107m");
+	if (((got >> 4) & 0x0Fu) != 0x0Fu) {
+		tty_clear();
+		kprintf("tty-colour: FAIL SGR 107 left background nibble %u, "
+		    "not 15\n", (unsigned)((got >> 4) & 0x0Fu));
+		return;
+	}
+
+	/*
+	 * 4b. And red is red.  ANSI counts red at 1 and blue at 4; VGA
+	 *     counts them the other way round, and this parser passed the
+	 *     ANSI number straight into the attribute byte -- so every
+	 *     "\x1b[31m" this kernel has ever emitted drew BLUE.  The two
+	 *     checks are a pair on purpose: a swap is invisible to either
+	 *     one alone, since each colour is a perfectly good colour.
+	 */
+	got = tty_sgr_probe("\x1b[31m");
+	if ((got & 0x0Fu) != 4) {
+		tty_clear();
+		kprintf("tty-colour: FAIL SGR 31 (red) set VGA colour %u; red "
+		    "is 4 here and %u is %s\n",
+		    (unsigned)(got & 0x0Fu), (unsigned)(got & 0x0Fu),
+		    (got & 0x0Fu) == 1 ? "blue -- ANSI order leaked through" :
+		    "something else again");
+		return;
+	}
+	got = tty_sgr_probe("\x1b[34m");
+	if ((got & 0x0Fu) != 1) {
+		tty_clear();
+		kprintf("tty-colour: FAIL SGR 34 (blue) set VGA colour %u, "
+		    "not 1\n", (unsigned)(got & 0x0Fu));
+		return;
+	}
+
+	/*
+	 * 5. Reverse video swaps.  The pager has been asking for this with
+	 *    "\x1b[7m" on its status bar since it was written, against a
+	 *    parser that had no case for it -- so that bar has never once
+	 *    been drawn inverse.
+	 */
+	got = tty_sgr_probe("\x1b[7m");
+	if (got != TTY_ATTR((tty_attr_default >> 4) & 0x0Fu,
+	    tty_attr_default & 0x0Fu)) {
+		tty_clear();
+		kprintf("tty-colour: FAIL SGR 7 gave attribute 0x%x; reversing "
+		    "the default 0x%x should give 0x%x\n",
+		    (unsigned)got, (unsigned)tty_attr_default,
+		    (unsigned)TTY_ATTR((tty_attr_default >> 4) & 0x0Fu,
+		    tty_attr_default & 0x0Fu));
+		return;
+	}
+
+	/*
+	 * 6. And an extended-colour sequence is consumed whole.  "48;2;
+	 *    0;0;0" is the trap: read one parameter at a time it is a 48
+	 *    nobody handles followed by a 2, a 0 -- which is RESET -- and
+	 *    two more zeroes, so a parser without this branch answers a
+	 *    request for a black background by throwing away the entire
+	 *    run.  Here it must come out as background 0 with the
+	 *    foreground the caller asked for still standing.
+	 */
+	got = tty_sgr_probe("\x1b[91;48;2;0;0;0m");
+	if (((got >> 4) & 0x0Fu) != 0 || (got & 0x0Fu) != 0x0Cu) {
+		tty_clear();
+		kprintf("tty-colour: FAIL '91;48;2;0;0;0' gave fg %u bg %u, "
+		    "not fg 12 bg 0\n",
+		    (unsigned)(got & 0x0Fu), (unsigned)((got >> 4) & 0x0Fu));
+		return;
+	}
+
+	/* 7. The 256-colour cube resolves to something sane: 196 is red. */
+	got = tty_sgr_probe("\x1b[38;5;196m");
+	if ((got & 0x0Fu) != 0x0Cu && (got & 0x0Fu) != 0x04u) {
+		tty_clear();
+		kprintf("tty-colour: FAIL 256-colour 196 (pure red) mapped to "
+		    "palette entry %u\n", (unsigned)(got & 0x0Fu));
+		return;
+	}
+
+	tty_clear();
+	kprintf("tty-colour: PASS -- the DAC holds this kernel's sixteen "
+	    "colours, blink is off so all sixteen backgrounds are colours, "
+	    "reverse video swaps, and 256-colour and 24-bit sequences are "
+	    "consumed whole instead of read as commands\n");
 }
 
 void

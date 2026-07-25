@@ -98,4 +98,12 @@ void	tty_wrap_selftest(void);
  */
 void	tty_region_selftest(void);
 
+/*
+ * And that the sixteen colours on the screen are the ones this kernel
+ * chose, that all sixteen backgrounds are colours rather than eight
+ * colours and a blink bit, and that the SGR parser neither loses
+ * reverse video nor reads a 24-bit colour's channels as commands.
+ */
+void	tty_colour_selftest(void);
+
 #endif /* !_SYS_TTY_H_ */

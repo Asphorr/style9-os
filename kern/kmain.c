@@ -91,6 +91,7 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	tty_selftest();
 	tty_wrap_selftest();
 	tty_region_selftest();
+	tty_colour_selftest();
 	kmain_banner(mb_magic, mb_info);
 
 	tty_puts("\nbringing CPU tables online...\n");
