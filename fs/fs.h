@@ -136,8 +136,22 @@ int		fs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size);
  * So a handle is the answer to "which file", kept: the backend's own name for
  * the content (an APFS dstream id, a FAT starting cluster) plus the length,
  * which is what a ranged read needs to clamp against.  It is not an open file
- * -- no cursor, no reference count, nothing to close.  It stays valid as long
- * as the file does, which on a read-only volume is forever.
+ * -- no cursor, no reference count, nothing to close.
+ *
+ * It used to say here that a handle stays valid as long as the file does,
+ * "which on a read-only volume is forever".  That sentence was true when it
+ * was written and stopped being true the moment this filesystem could write:
+ * fh_size is a COPY of a length that another writer can now change, and a
+ * handle opened before a file grew would keep clamping reads to the old end
+ * of it -- silently, since a short read is a legal answer.
+ *
+ * So the volume carries a generation number, bumped whenever any metadata
+ * changes, and a handle remembers the generation it was made at.  A ranged
+ * call whose handle predates the current generation refreshes its length from
+ * the inode before using it.  The check costs a comparison; the refresh
+ * happens only when something really did change, and needs no path -- fh_ino
+ * names the inode record directly.  A volume nobody writes to therefore pays
+ * exactly what it paid before.
  */
 #define	FS_HANDLE_NONE	0
 #define	FS_HANDLE_APFS	1
@@ -155,6 +169,12 @@ struct fs_handle {
 	 * notion.
 	 */
 	uint64_t	fh_ino;
+	/*
+	 * The volume generation this handle's fh_size was read at.  Compared,
+	 * not trusted: see the note above about the sentence that stopped
+	 * being true.
+	 */
+	uint64_t	fh_gen;
 	uint8_t		fh_kind;	/* FS_HANDLE_*                      */
 };
 
@@ -175,7 +195,7 @@ int		fs_open(const char *path, struct fs_handle *out);
  * the pager (kern/vm_object.c), which needs one 4 KiB page of a file and has
  * nowhere to put the rest of it.
  */
-int		fs_pread(const struct fs_handle *h, uint64_t off, uint8_t *buf,
+int		fs_pread(struct fs_handle *h, uint64_t off, uint8_t *buf,
 		    uint32_t len, uint32_t *out_got);
 
 /*
@@ -193,7 +213,7 @@ int		fs_pread(const struct fs_handle *h, uint64_t off, uint8_t *buf,
  * is a different answer and means a different thing: not "this write was too
  * ambitious" but "not on this volume".
  */
-int		fs_pwrite(const struct fs_handle *h, uint64_t off,
+int		fs_pwrite(struct fs_handle *h, uint64_t off,
 		    const uint8_t *buf, uint32_t len, uint32_t *out_put);
 
 /* Metadata for a path.  Returns FS_E_OK and fills *out, or a negative FS_E_*. */
@@ -221,5 +241,13 @@ int		fs_readdir(const char *path, uint32_t index,
  * Silently skipped when no writable volume is mounted.
  */
 void		fs_write_selftest(void);
+
+/*
+ * The volume generation, and what it has caught: how many handles were older
+ * than the volume when used, and how many of those had a length that really
+ * had moved.  The first number moving proves the check is alive; the second
+ * stays at zero until files can grow.
+ */
+void		fs_handle_stats(void);
 
 #endif /* !_SYS_FS_H_ */

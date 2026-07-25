@@ -48,11 +48,18 @@
 /*
  * Lock key:
  *	(c) const after vm_object_file
+ *	(f) owned by the filesystem, mutated only under its volume lock
  *	(o) protected by vo_lock
  */
 struct vm_object {
 	struct spinlock	 vo_lock;
-	struct fs_handle vo_handle;	/* (c) the file, resolved        */
+	/*
+	 * (f) the file, resolved.  Not (c): its identity is fixed, but the
+	 * filesystem refreshes the cached length in place when the volume has
+	 * changed under it, so the struct is handed to fs_pread mutable.  Only
+	 * fs/ writes it, and only while holding the volume lock.
+	 */
+	struct fs_handle vo_handle;
 	uint64_t	 vo_size;	/* (c) bytes of real content     */
 	uint64_t	 vo_n_page;	/* (o) pages served so far       */
 	uint32_t	 vo_refs;	/* (o) map entries naming it     */

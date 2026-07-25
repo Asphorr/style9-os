@@ -248,6 +248,7 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 		if (fs_apfs_ready())
 			fs_apfs_stats();
 		fs_txn_stats();
+		fs_handle_stats();
 		mutex_stats();
 		bio_stats();
 		ata_irq_stats();

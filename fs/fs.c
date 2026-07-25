@@ -43,6 +43,55 @@
 static struct mutex	fs_lock = MUTEX_INIT("fs");
 
 /*
+ * Volume generation: bumped under fs_lock whenever metadata changes, so a
+ * handle can tell whether the length it copied is still the length the file
+ * has.  Starts at 1 rather than 0 so a zeroed handle -- one that was never
+ * filled by fs_open -- can never accidentally match it.
+ */
+static uint64_t		fs_gen = 1;
+
+/*
+ * Two counters, not one, because they answer different questions.  fs_n_stale
+ * says how often the mechanism FIRED -- a handle older than the volume -- and
+ * is the only one that moves while nothing can change a file's length.
+ * fs_n_resize says how often it CORRECTED something, and stays at zero until
+ * files can grow.  Collapsing them into one number would make a working
+ * mechanism indistinguishable from a dead one for as long as that is true.
+ */
+static uint64_t		fs_n_stale;
+static uint64_t		fs_n_resize;
+
+/*
+ * Bring a handle's cached length up to date if the volume moved on since it
+ * was made.  Called with fs_lock held, from the two calls that clamp against
+ * it.  Nothing to do on FAT, which cannot be written and therefore cannot go
+ * stale, and nothing to do in the overwhelmingly common case where the
+ * generation has not changed at all.
+ */
+static void
+handle_refresh(struct fs_handle *h)
+{
+	uint64_t	size;
+
+	if (h->fh_gen == fs_gen)
+		return;
+	fs_n_stale++;
+	if (h->fh_kind == FS_HANDLE_APFS &&
+	    fs_apfs_size(h->fh_ino, &size) == FS_APFS_E_OK) {
+		if (size != h->fh_size)
+			fs_n_resize++;
+		h->fh_size = size;
+	}
+	/*
+	 * The generation is adopted even when the size turned out unchanged,
+	 * and even when the lookup failed.  Otherwise a handle to a file that
+	 * nobody is modifying would re-walk the tree on every single read for
+	 * the rest of its life, once any unrelated write had happened.
+	 */
+	h->fh_gen = fs_gen;
+}
+
+/*
  * Picking a backend.  See fs.h for what this is and is not.
  *
  * APFS goes first because recognising a container is a far more specific
@@ -169,6 +218,7 @@ open_locked(const char *path, struct fs_handle *out)
 	out->fh_id   = 0;
 	out->fh_size = 0;
 	out->fh_ino  = 0;
+	out->fh_gen  = fs_gen;
 
 	if (fs_apfs_ready()) {
 		rv = fs_apfs_open(path, &id, &size, &ino);
@@ -201,12 +251,13 @@ fs_open(const char *path, struct fs_handle *out)
 }
 
 static int
-pread_locked(const struct fs_handle *h, uint64_t off, uint8_t *buf,
+pread_locked(struct fs_handle *h, uint64_t off, uint8_t *buf,
     uint32_t len, uint32_t *out_got)
 {
 
 	if (h == NULL || out_got == NULL)
 		return (FS_E_NOTFOUND);
+	handle_refresh(h);
 	switch (h->fh_kind) {
 	case FS_HANDLE_APFS:
 		return (apfs_err(fs_apfs_pread(h->fh_id, h->fh_size, off, buf,
@@ -220,7 +271,7 @@ pread_locked(const struct fs_handle *h, uint64_t off, uint8_t *buf,
 }
 
 int
-fs_pread(const struct fs_handle *h, uint64_t off, uint8_t *buf, uint32_t len,
+fs_pread(struct fs_handle *h, uint64_t off, uint8_t *buf, uint32_t len,
     uint32_t *out_got)
 {
 	int	rv;
@@ -232,7 +283,7 @@ fs_pread(const struct fs_handle *h, uint64_t off, uint8_t *buf, uint32_t len,
 }
 
 static int
-pwrite_locked(const struct fs_handle *h, uint64_t off, const uint8_t *buf,
+pwrite_locked(struct fs_handle *h, uint64_t off, const uint8_t *buf,
     uint32_t len, uint32_t *out_put)
 {
 	uint64_t	now_ns;
@@ -242,6 +293,14 @@ pwrite_locked(const struct fs_handle *h, uint64_t off, const uint8_t *buf,
 		return (FS_E_NOTFOUND);
 	if (h->fh_kind != FS_HANDLE_APFS)
 		return (FS_E_ROFS);	/* FAT reads here; it does not write */
+
+	/*
+	 * Before the bounds check, not after: this call refuses a write that
+	 * would run past end-of-file, and deciding that against a length some
+	 * other writer has already moved is how a legal write gets rejected --
+	 * or, once files can grow, how an illegal one gets through.
+	 */
+	handle_refresh(h);
 
 	rv = apfs_err(fs_apfs_pwrite(h->fh_id, h->fh_size, off, buf, len,
 	    out_put));
@@ -259,11 +318,23 @@ pwrite_locked(const struct fs_handle *h, uint64_t off, const uint8_t *buf,
 	 * the clock this machine has, not a rounding choice.
 	 */
 	now_ns = (uint64_t)clock_walltime_us() * 1000ULL;
-	return (apfs_err(fs_apfs_touch(h->fh_ino, now_ns)));
+	rv = apfs_err(fs_apfs_touch(h->fh_ino, now_ns));
+
+	/*
+	 * Metadata moved, so every handle in the system is now suspect --
+	 * including this one, whose generation is advanced with it so the
+	 * writer does not immediately re-read what it just changed.  Bumped
+	 * even when the stamp failed: the bytes went down regardless, and a
+	 * generation that under-reports change is worse than one that
+	 * over-reports it.
+	 */
+	fs_gen++;
+	h->fh_gen = fs_gen;
+	return (rv);
 }
 
 int
-fs_pwrite(const struct fs_handle *h, uint64_t off, const uint8_t *buf,
+fs_pwrite(struct fs_handle *h, uint64_t off, const uint8_t *buf,
     uint32_t len, uint32_t *out_put)
 {
 	int	rv;
@@ -381,6 +452,18 @@ fs_readdir(const char *path, uint32_t index, struct fs_dirent *out)
 	rv = readdir_locked(path, index, out);
 	mutex_unlock(&fs_lock);
 	return (rv);
+}
+
+void
+fs_handle_stats(void)
+{
+
+	if (fs_n_stale == 0)
+		return;
+	kprintf("fs: volume generation %llu -- %llu stale handle(s) refreshed, "
+	    "%llu had actually changed length\n",
+	    (unsigned long long)fs_gen, (unsigned long long)fs_n_stale,
+	    (unsigned long long)fs_n_resize);
 }
 
 /* ---- write self-test ------------------------------------------------------ */
@@ -527,6 +610,42 @@ fs_write_selftest(void)
 		    (unsigned long long)st0.fs_mtime_ns,
 		    (unsigned long long)st1.fs_mtime_ns);
 		return;
+	}
+
+	/*
+	 * A second handle to the same file, opened BEFORE the write above and
+	 * therefore carrying a generation the write has since left behind.
+	 * Reading through it must notice.  Nothing observable changes yet --
+	 * this rung cannot alter a length -- so what is checked is that the
+	 * mechanism fires at all, which is exactly the part that would rot
+	 * unnoticed between now and the rung that needs it.
+	 */
+	{
+		struct fs_handle	stale;
+		uint64_t		n0;
+		uint8_t			one;
+
+		n0 = fs_n_stale;
+		if (fs_open(SELFTEST_PATH, &stale) != FS_E_OK) {
+			kprintf("apfs-write: FAIL second open\n");
+			return;
+		}
+		rv = fs_pwrite(&h, SELFTEST_OFF, save + SELFTEST_PAD,
+		    SELFTEST_LEN, &put);
+		if (rv != FS_E_OK) {
+			kprintf("apfs-write: FAIL write before staleness "
+			    "check (rv=%d)\n", rv);
+			return;
+		}
+		if (fs_pread(&stale, 0, &one, 1, &got) != FS_E_OK) {
+			kprintf("apfs-write: FAIL read through stale handle\n");
+			return;
+		}
+		if (fs_n_stale == n0) {
+			kprintf("apfs-write: FAIL a handle older than the "
+			    "volume was not noticed\n");
+			return;
+		}
 	}
 
 	/* The marker, and what it says about a previous boot. */

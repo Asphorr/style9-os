@@ -666,4 +666,12 @@ int	fs_apfs_pwrite(uint64_t id, uint64_t size, uint64_t off,
  */
 int	fs_apfs_touch(uint64_t oid, uint64_t mtime_ns);
 
+/*
+ * The current length of the file whose inode object id is `ino`, without
+ * resolving a path.  One tree walk instead of one per path component, which
+ * is what makes refreshing a stale handle affordable enough to do on demand
+ * rather than caching a length and hoping.
+ */
+int	fs_apfs_size(uint64_t ino, uint64_t *size_out);
+
 #endif /* !_SYS_FS_APFS_H_ */

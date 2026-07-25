@@ -1407,6 +1407,23 @@ fs_apfs_touch(uint64_t oid, uint64_t mtime_ns)
 	return (FS_APFS_E_OK);
 }
 
+int
+fs_apfs_size(uint64_t ino, uint64_t *size_out)
+{
+	struct inode_info	ii;
+	int			rv;
+
+	if (size_out == NULL)
+		return (FS_APFS_E_IO);
+	if (!g_apfs.ac_mounted)
+		return (FS_APFS_E_NOMOUNT);
+	rv = inode_info(ino, &ii);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	*size_out = ii.ii_size;
+	return (FS_APFS_E_OK);
+}
+
 struct readdir_search {
 	struct fs_apfs_dirent	*rs_out;
 	uint64_t		 rs_dir;
