@@ -59,6 +59,7 @@ struct fs_dirent {
 #define	FS_S_IFDIR	0040000
 
 #define	FS_ISDIR(m)	(((m) & FS_S_IFMT) == FS_S_IFDIR)
+#define	FS_ISREG(m)	(((m) & FS_S_IFMT) == FS_S_IFREG)
 
 /*
  * A file-or-directory's metadata, without reading it.
@@ -110,6 +111,8 @@ _Static_assert(sizeof(struct fs_statbuf) == 72,
 #define	FS_E_TOOBIG	(-5)	/* file too large to slurp    */
 #define	FS_E_ROFS	(-6)	/* this volume cannot be written */
 #define	FS_E_NOALLOC	(-7)	/* the write would need a block allocator */
+#define	FS_E_EXIST	(-8)	/* the name is already taken     */
+#define	FS_E_ISDIR	(-9)	/* ...and what it names is a directory */
 
 /* Non-zero once some filesystem is mounted and can serve files. */
 int		fs_ready(void);
@@ -232,6 +235,31 @@ int		fs_pwrite(struct fs_handle *h, uint64_t off,
  */
 int		fs_truncate(struct fs_handle *h, uint64_t new_size);
 
+/*
+ * Make a file, and unmake one.
+ *
+ * The two calls that change what a directory CONTAINS rather than what a file
+ * holds, and the last thing between this filesystem and a volume programs could
+ * live on: everything above works on a file that somebody else put there.
+ *
+ * fs_create makes an empty regular file and reports the inode number it was
+ * given, which is the volume's and not this layer's invention.  It answers
+ * FS_E_EXIST rather than truncating an existing file, because "create" and
+ * "create or replace" are different requests and only the caller knows which
+ * one it made.
+ *
+ * fs_unlink removes the name and, with it, the file: this kernel makes no hard
+ * links, so the last name is the only name.  It answers FS_E_ISDIR for a
+ * directory -- removing one of those has to decide what to do about its
+ * contents, which is a different question.
+ *
+ * Both refuse a backend that cannot write with FS_E_ROFS, and both close a
+ * checkpoint on success, because a name and the inode under it are several disk
+ * updates describing one event.
+ */
+int		fs_create(const char *path, uint64_t *ino_out);
+int		fs_unlink(const char *path);
+
 /* Metadata for a path.  Returns FS_E_OK and fills *out, or a negative FS_E_*. */
 int		fs_stat(const char *path, struct fs_statbuf *out);
 
@@ -307,6 +335,22 @@ void		fs_grow_selftest(void);
  * after a fresh image sees.
  */
 void		fs_trunc_selftest(void);
+
+/*
+ * Prove that a file can be MADE, and unmade, and that doing both costs the
+ * volume nothing it does not get back.
+ *
+ * Runs last of the write tests, and it is the one that spans boots by
+ * construction: it looks for the file the boot before left, checks the bytes in
+ * it, removes it, makes it again and leaves it there.  So every boot after the
+ * first does the whole cycle -- create, write, reboot, find, read, unlink --
+ * and the volume ends each one exactly as it started, which is the claim that
+ * matters: a node's free span only ever shrinks, and a create/unlink pair that
+ * did not reuse the room it gave back would run the volume out of names.
+ *
+ * Silently does nothing when the volume is not APFS.
+ */
+void		fs_make_selftest(void);
 
 /*
  * Prove that a B-tree node can be split without losing a record.  Silently

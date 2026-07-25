@@ -140,6 +140,8 @@ apfs_err(int rv)
 	case FS_APFS_E_NOMEM:		return (FS_E_NOMEM);
 	case FS_APFS_E_TOOBIG:		return (FS_E_TOOBIG);
 	case FS_APFS_E_NOALLOC:		return (FS_E_NOALLOC);
+	case FS_APFS_E_EXIST:		return (FS_E_EXIST);
+	case FS_APFS_E_ISDIR:		return (FS_E_ISDIR);
 	default:			return (FS_E_IO);
 	}
 }
@@ -436,6 +438,126 @@ fs_truncate(struct fs_handle *h, uint64_t new_size)
 	return (rv);
 }
 
+/*
+ * Split a path at its last separator: the directory that holds the last
+ * component, and the component.
+ *
+ * Path parsing belongs here and not in a backend.  The APFS writer is given an
+ * object id and a single name, which is what the on-disk records are keyed on;
+ * making it re-derive that from a string would put a second path parser next to
+ * the first one, and two of those drift.
+ *
+ * A trailing separator is refused rather than ignored: "make /tmp/x/" says
+ * something about directories, and this makes files.
+ */
+static int
+path_split(const char *path, char *dir, size_t dircap, const char **leaf)
+{
+	size_t	i;
+	size_t	cut;
+
+	cut = 0;
+	for (i = 0; path[i] != '\0'; i++)
+		if (path[i] == '/')
+			cut = i + 1;
+	if (i == 0 || path[i - 1] == '/')
+		return (FS_E_NOTFOUND);
+	if (cut >= dircap)
+		return (FS_E_NOTFOUND);
+	for (i = 0; i + 1 < cut; i++)
+		dir[i] = path[i];
+	dir[i] = '\0';			/* "" and "/" both name the root */
+	*leaf = path + cut;
+	return (FS_E_OK);
+}
+
+static int
+create_locked(const char *path, uint64_t *ino_out)
+{
+	char		 dir[FS_NAME_MAX];
+	const char	*leaf;
+	uint64_t	 parent;
+	uint64_t	 now_ns;
+	int		 is_dir;
+	int		 rv;
+
+	if (!fs_apfs_ready())
+		return (fs_fat_ready() ? FS_E_ROFS : FS_E_NOMOUNT);
+	rv = path_split(path, dir, sizeof(dir), &leaf);
+	if (rv != FS_E_OK)
+		return (rv);
+	rv = apfs_err(fs_apfs_lookup(dir, &parent, &is_dir));
+	if (rv != FS_E_OK)
+		return (rv);
+	if (!is_dir)
+		return (FS_E_NOTFOUND);
+
+	now_ns = (uint64_t)clock_walltime_us() * 1000ULL;
+	rv = apfs_err(fs_apfs_create(parent, leaf, now_ns, ino_out));
+	if (rv != FS_E_OK)
+		return (rv);
+	/*
+	 * Closed here for the same reason a write is: the records describing
+	 * one file are several disk updates, and a reader that got between
+	 * them would see a directory naming an inode that does not exist yet.
+	 */
+	rv = apfs_err(fs_apfs_checkpoint());
+	fs_gen++;
+	return (rv);
+}
+
+int
+fs_create(const char *path, uint64_t *ino_out)
+{
+	int	rv;
+
+	mutex_lock(&fs_lock);
+	rv = create_locked(path, ino_out);
+	mutex_unlock(&fs_lock);
+	return (rv);
+}
+
+static int
+unlink_locked(const char *path)
+{
+	char		 dir[FS_NAME_MAX];
+	const char	*leaf;
+	uint64_t	 parent;
+	uint64_t	 now_ns;
+	int		 is_dir;
+	int		 rv;
+
+	if (!fs_apfs_ready())
+		return (fs_fat_ready() ? FS_E_ROFS : FS_E_NOMOUNT);
+	rv = path_split(path, dir, sizeof(dir), &leaf);
+	if (rv != FS_E_OK)
+		return (rv);
+	rv = apfs_err(fs_apfs_lookup(dir, &parent, &is_dir));
+	if (rv != FS_E_OK)
+		return (rv);
+	if (!is_dir)
+		return (FS_E_NOTFOUND);
+
+	now_ns = (uint64_t)clock_walltime_us() * 1000ULL;
+	rv = apfs_err(fs_apfs_unlink(parent, leaf, now_ns));
+	if (rv != FS_E_OK)
+		return (rv);
+	rv = apfs_err(fs_apfs_checkpoint());
+	fs_gen++;
+	return (rv);
+}
+
+int
+fs_unlink(const char *path)
+{
+	int	rv;
+
+	mutex_lock(&fs_lock);
+	rv = unlink_locked(path);
+	mutex_unlock(&fs_lock);
+	return (rv);
+}
+
 static int
 stat_locked(const char *path, struct fs_statbuf *out)
 {
@@ -623,6 +745,16 @@ same(const uint8_t *a, const uint8_t *b, size_t n)
 		if (a[i] != b[i])
 			return (0);
 	return (1);
+}
+
+static size_t
+slen(const char *s)
+{
+	size_t	n;
+
+	for (n = 0; s[n] != '\0'; n++)
+		;
+	return (n);
 }
 
 void
@@ -1231,6 +1363,229 @@ out:
 	kfree(edge);
 	kfree(back);
 	kfree(chunk);
+}
+
+/*
+ * The file this one MAKES, in a directory small enough that counting its
+ * entries is a real check rather than a loop.
+ *
+ * It is left behind on purpose, and the next boot is what turns this from a
+ * self-consistency check into a claim about the disk: a create that never
+ * reached the platter answers every question in this function perfectly.
+ */
+#define	SELFTEST_MADE_DIR	"/etc"
+#define	SELFTEST_MADE		"/etc/made.txt"
+#define	SELFTEST_MADE_MARK	"style9 made this file from nothing.\n"
+
+/* How many names a directory holds, and whether one of them is `want`. */
+static int
+dir_count(const char *path, const char *want, int *saw_want)
+{
+	struct fs_dirent	de;
+	uint32_t		i;
+	int			n;
+	int			rv;
+
+	n = 0;
+	if (saw_want != NULL)
+		*saw_want = 0;
+	for (i = 0; i < 4096u; i++) {
+		rv = fs_readdir(path, i, &de);
+		if (rv <= 0)
+			return (rv == 0 ? n : -1);
+		n++;
+		if (saw_want != NULL && same((const uint8_t *)de.fde_name,
+		    (const uint8_t *)want, slen(want) + 1))
+			*saw_want = 1;
+	}
+	return (-1);
+}
+
+void
+fs_make_selftest(void)
+{
+	struct fs_handle	 h;
+	struct fs_statbuf	 st;
+	uint8_t			 back[sizeof(SELFTEST_MADE_MARK) - 1];
+	const char		*mark = SELFTEST_MADE_MARK;
+	const uint32_t		 marklen = sizeof(SELFTEST_MADE_MARK) - 1;
+	uint64_t		 ino;
+	uint64_t		 holes;
+	uint32_t		 got;
+	uint32_t		 put;
+	uint32_t		 i;
+	int			 before;
+	int			 after;
+	int			 saw;
+	int			 rv;
+	int			 had;
+
+	if (!fs_apfs_ready())
+		return;
+
+	before = dir_count(SELFTEST_MADE_DIR, "made.txt", &saw);
+	if (before < 0) {
+		kprintf("apfs-make: FAIL cannot list %s\n", SELFTEST_MADE_DIR);
+		return;
+	}
+	had = fs_stat(SELFTEST_MADE, &st) == FS_E_OK;
+	if (had != saw) {
+		kprintf("apfs-make: FAIL %s %s by name and %s in the "
+		    "directory listing\n", SELFTEST_MADE,
+		    had ? "exists" : "does not exist",
+		    saw ? "appears" : "does not appear");
+		return;
+	}
+
+	if (had) {
+		/*
+		 * What the boot before made, and wrote, and left.  This is the
+		 * whole claim: nothing in this function proves a create reached
+		 * the disk except finding one that a power cycle ago did.
+		 */
+		if (st.fs_size != marklen) {
+			kprintf("apfs-make: FAIL %s is %llu bytes and the boot "
+			    "that made it wrote %u\n", SELFTEST_MADE,
+			    (unsigned long long)st.fs_size, (unsigned)marklen);
+			return;
+		}
+		if (fs_open(SELFTEST_MADE, &h) != FS_E_OK ||
+		    fs_pread(&h, 0, back, marklen, &got) != FS_E_OK ||
+		    got != marklen) {
+			kprintf("apfs-make: FAIL cannot read %s back\n",
+			    SELFTEST_MADE);
+			return;
+		}
+		for (i = 0; i < marklen; i++) {
+			if (back[i] == (uint8_t)mark[i])
+				continue;
+			kprintf("apfs-make: FAIL byte %u of %s is 0x%02x, "
+			    "wanted 0x%02x -- a file made by an earlier boot "
+			    "did not survive it\n", (unsigned)i, SELFTEST_MADE,
+			    (unsigned)back[i], (unsigned)mark[i]);
+			return;
+		}
+
+		rv = fs_unlink(SELFTEST_MADE);
+		if (rv != FS_E_OK) {
+			kprintf("apfs-make: FAIL cannot unlink %s (rv=%d)\n",
+			    SELFTEST_MADE, rv);
+			return;
+		}
+		if (fs_stat(SELFTEST_MADE, &st) != FS_E_NOTFOUND) {
+			kprintf("apfs-make: FAIL %s still resolves after "
+			    "being unlinked\n", SELFTEST_MADE);
+			return;
+		}
+		after = dir_count(SELFTEST_MADE_DIR, "made.txt", &saw);
+		if (after != before - 1 || saw) {
+			kprintf("apfs-make: FAIL %s held %d names and holds "
+			    "%d after one was removed%s\n", SELFTEST_MADE_DIR,
+			    before, after, saw ? ", and still lists it" : "");
+			return;
+		}
+		before = after;
+	} else {
+		kprintf("apfs-make: %s is absent -- this is the first boot on "
+		    "this image, so there is nothing to have survived yet\n",
+		    SELFTEST_MADE);
+	}
+
+	/*
+	 * And make it.  The hole counter is read across this, not around the
+	 * whole test: when there was a file to remove, the delete just above
+	 * left holes exactly the size this create wants, and an insert that
+	 * ignored them would take the room from a span that never grows back.
+	 */
+	holes = fs_apfs_holes();
+	ino   = 0;
+	rv = fs_create(SELFTEST_MADE, &ino);
+	if (rv != FS_E_OK || ino == 0) {
+		kprintf("apfs-make: FAIL cannot make %s (rv=%d ino=%llu)\n",
+		    SELFTEST_MADE, rv, (unsigned long long)ino);
+		return;
+	}
+	if (had && fs_apfs_holes() == holes) {
+		kprintf("apfs-make: FAIL making a file straight after "
+		    "unlinking one of the same shape took no room from the "
+		    "free lists -- the node loses a record's worth of span "
+		    "every boot and will refuse a name after about fifteen\n");
+		return;
+	}
+
+	/* The volume agrees, by name, by number and in its directory. */
+	if (fs_stat(SELFTEST_MADE, &st) != FS_E_OK) {
+		kprintf("apfs-make: FAIL %s does not resolve after being "
+		    "made\n", SELFTEST_MADE);
+		return;
+	}
+	if (st.fs_ino != ino || st.fs_size != 0 || st.fs_is_dir ||
+	    !FS_ISREG(st.fs_mode)) {
+		kprintf("apfs-make: FAIL %s is inode %llu of %llu bytes, mode "
+		    "%#o -- wanted inode %llu, empty, a regular file\n",
+		    SELFTEST_MADE, (unsigned long long)st.fs_ino,
+		    (unsigned long long)st.fs_size, (unsigned)st.fs_mode,
+		    (unsigned long long)ino);
+		return;
+	}
+	after = dir_count(SELFTEST_MADE_DIR, "made.txt", &saw);
+	if (after != before + 1 || !saw) {
+		kprintf("apfs-make: FAIL %s held %d names and holds %d after "
+		    "one was made%s\n", SELFTEST_MADE_DIR, before, after,
+		    saw ? "" : ", and does not list it");
+		return;
+	}
+
+	/* A name is taken once.  Asking again is an error, not a truncation. */
+	rv = fs_create(SELFTEST_MADE, NULL);
+	if (rv != FS_E_EXIST) {
+		kprintf("apfs-make: FAIL making %s a second time answered %d, "
+		    "wanted %d -- a create that quietly replaces a file is a "
+		    "different call\n", SELFTEST_MADE, rv, FS_E_EXIST);
+		return;
+	}
+	rv = fs_unlink(SELFTEST_MADE_DIR);
+	if (rv != FS_E_ISDIR) {
+		kprintf("apfs-make: FAIL unlinking the directory %s answered "
+		    "%d, wanted %d\n", SELFTEST_MADE_DIR, rv, FS_E_ISDIR);
+		return;
+	}
+
+	/*
+	 * Bytes into a file that has none: the first write to a file this
+	 * kernel made, which is the whole point of making one.  It goes
+	 * through the growth path, so the file gets its first block, its
+	 * first extent record and its first owner.
+	 */
+	if (fs_open(SELFTEST_MADE, &h) != FS_E_OK) {
+		kprintf("apfs-make: FAIL cannot open %s\n", SELFTEST_MADE);
+		return;
+	}
+	rv = fs_pwrite(&h, 0, (const uint8_t *)mark, marklen, &put);
+	if (rv != FS_E_OK || put != marklen) {
+		kprintf("apfs-make: FAIL writing %u bytes into a file with "
+		    "none (rv=%d put=%u)\n", (unsigned)marklen, rv,
+		    (unsigned)put);
+		return;
+	}
+	if (fs_pread(&h, 0, back, marklen, &got) != FS_E_OK ||
+	    got != marklen || !same(back, (const uint8_t *)mark, marklen)) {
+		kprintf("apfs-make: FAIL %s does not read back what was just "
+		    "written into it\n", SELFTEST_MADE);
+		return;
+	}
+	if (fs_stat(SELFTEST_MADE, &st) != FS_E_OK || st.fs_size != marklen) {
+		kprintf("apfs-make: FAIL %s does not say it is %u bytes\n",
+		    SELFTEST_MADE, (unsigned)marklen);
+		return;
+	}
+
+	kprintf("apfs-make: PASS -- %s made as inode %llu, %u bytes written "
+	    "into a file that had none, %d names in %s%s\n", SELFTEST_MADE,
+	    (unsigned long long)ino, (unsigned)marklen, after,
+	    SELFTEST_MADE_DIR,
+	    had ? ", the one the boot before left having been read and "
+	    "removed first" : "");
 }
 
 /* As above, and about a node that is asked to run out of room. */

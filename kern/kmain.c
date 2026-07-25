@@ -191,6 +191,14 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	fs_grow_selftest();
 
 	/*
+	 * And a file that was not there at all.  Every test above works on
+	 * something the image already carried; this one makes its own, writes
+	 * into it, and leaves it for the next boot to find and take away again
+	 * -- so the volume ends every boot after the first exactly as it began.
+	 */
+	fs_make_selftest();
+
+	/*
 	 * Last of all, the one operation nothing else reaches any more: a node
 	 * that runs out of room.  Appending stopped filling one once runs that
 	 * touch began to be merged, so this asks for a split outright.

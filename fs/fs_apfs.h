@@ -590,6 +590,15 @@ _Static_assert(__builtin_offsetof(struct apfs_superblock, apfs_volname) == 704,
 #define	APFS_INCOMPAT_NORM_INSENSITIVE		0x00000008ULL
 #define	APFS_DREC_LEN_MASK			0x000003FFU
 
+/*
+ * ...and what a writer needs that a reader did not: the hash occupies the rest
+ * of that word, twenty-two bits above the ten the length uses.  Which hash it
+ * is, and how it was recovered, is in fs/fs_apfs.c beside the code that
+ * computes it -- the answer was not in any specification.
+ */
+#define	APFS_DREC_HASH_SHIFT			10
+#define	APFS_DREC_HASH_BITS			0x003FFFFFU
+
 /* j_drec_val_t.flags low bits: the dirent type, BSD DT_* numbering. */
 #define	APFS_DT_DIR		4
 #define	APFS_DT_REG		8
@@ -643,6 +652,15 @@ struct apfs_inode_val {
  */
 #define	APFS_S_IFMT	0170000
 #define	APFS_S_IFDIR	0040000
+#define	APFS_S_IFREG	0100000
+
+/*
+ * ai_internal_flags, of which a writer needs exactly one.  Every file and
+ * directory in this container carries NO_RSRC_FORK, which is what a volume
+ * made by anything other than a Mac says; a created inode that did not would be
+ * claiming a resource fork it has no record for.
+ */
+#define	APFS_INODE_NO_RSRC_FORK		0x0000000000008000ULL
 
 _Static_assert(sizeof(struct apfs_inode_val) == 92,
     "the fixed part of an inode record is 92 bytes, extended fields follow");
@@ -659,6 +677,15 @@ _Static_assert(__builtin_offsetof(struct apfs_inode_val, ai_mode) == 80,
  */
 #define	APFS_INO_EXT_TYPE_NAME		4
 #define	APFS_INO_EXT_TYPE_DSTREAM	8
+
+/*
+ * And the two flag values those two carry, read off the inodes already in this
+ * container rather than chosen: a name is not copied when a file is cloned, a
+ * dstream belongs to the system.  The fields are descriptive, not enforced --
+ * which is why they had to be measured rather than reasoned about.
+ */
+#define	APFS_XF_DO_NOT_COPY		0x02
+#define	APFS_XF_SYSTEM_FIELD		0x20
 
 struct apfs_xf_blob {
 	uint16_t	xb_num_exts;
@@ -789,6 +816,8 @@ struct fs_apfs_statbuf {
 #define	FS_APFS_E_NOTFOUND	(-6)	/* name absent / not a dir      */
 #define	FS_APFS_E_TOOBIG	(-7)	/* file exceeds FS_APFS_MAX_FILE */
 #define	FS_APFS_E_NOALLOC	(-8)	/* would need a block allocator  */
+#define	FS_APFS_E_EXIST		(-9)	/* the name is already taken     */
+#define	FS_APFS_E_ISDIR		(-10)	/* ...and it is a directory      */
 
 /*
  * Probe the first ATA drive for an APFS container and adopt the newest valid
@@ -909,6 +938,46 @@ uint64_t fs_apfs_merges(void);
  */
 uint64_t fs_apfs_shortens(void);
 uint64_t fs_apfs_drops(void);
+
+/*
+ * Put a name into the directory whose object id is `dir`, with an empty file
+ * under it, and report the object id it was given.  `now` is the moment to
+ * stamp, in nanoseconds since the Unix epoch, passed in for the same reason
+ * fs_apfs_touch takes one: this file knows the on-disk format, not the clock.
+ *
+ * The file is created with a dstream holding no bytes and no blocks, because an
+ * inode with no dstream at all is one nothing can ever lengthen.  Returns
+ * FS_APFS_E_EXIST if the name is taken, and refuses a name this kernel cannot
+ * hash -- anything outside ASCII -- rather than guessing at Apple's folding.
+ */
+int	fs_apfs_create(uint64_t dir, const char *name, uint64_t now,
+	    uint64_t *ino_out);
+
+/*
+ * And take a name back out, with the file under it.
+ *
+ * The blocks are given back by cutting the file to nothing first, which is the
+ * truncate above doing what it already does; what is left for this is the three
+ * records a create made and the two counts it moved.  Refuses a directory
+ * (FS_APFS_E_ISDIR) and refuses an inode with more than one link, out loud,
+ * because this kernel makes neither and unlinking one of several is a different
+ * operation from removing the last name a file has.
+ */
+int	fs_apfs_unlink(uint64_t dir, const char *name, uint64_t now);
+
+/*
+ * How many files have been made and unmade, and how many record ends have been
+ * laid into room a delete gave back.
+ *
+ * The third is the one worth having.  A node's free span only ever shrinks, so
+ * a create and an unlink that did not reuse the holes between them would cost a
+ * record's worth of room per cycle and the volume would stop taking names after
+ * about fifteen boots -- while still reporting thousands of bytes free.  A test
+ * that watches this number watches for that.
+ */
+uint64_t fs_apfs_makes(void);
+uint64_t fs_apfs_kills(void);
+uint64_t fs_apfs_holes(void);
 
 /*
  * Split a leaf on purpose and prove nothing was lost: the same records, in the

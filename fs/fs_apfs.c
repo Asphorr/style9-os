@@ -61,8 +61,18 @@ static struct {
 	uint64_t	ac_root_tree_oid;	/* (m) its VIRTUAL oid      */
 	uint64_t	ac_extref_bno;		/* (c) extent reference tree */
 	uint64_t	ac_fs_alloc_count;	/* (c) blocks this volume owns */
-	uint64_t	ac_num_files;		/* (m) */
-	uint64_t	ac_num_dirs;		/* (m) */
+	/*
+	 * The VOLUME's own next object id, which numbers inodes -- a different
+	 * namespace from the container's nx_next_oid, which numbers B-tree
+	 * nodes and is already a thousand ahead of it.  Advancing this is not
+	 * bookkeeping: the checker treats it as an assertion that everything at
+	 * or above it is unused, and a created inode whose number the volume
+	 * still calls free is the FIRST thing it complains about, ahead of the
+	 * file itself.
+	 */
+	uint64_t	ac_next_ino;		/* (c) */
+	uint64_t	ac_num_files;		/* (c) */
+	uint64_t	ac_num_dirs;		/* (c) */
 	uint32_t	ac_xp_desc_blocks;	/* (m) */
 	uint32_t	ac_xp_desc_index;	/* (c) this checkpoint's first */
 	uint32_t	ac_xp_desc_len;		/* (c) ...and how many         */
@@ -294,6 +304,9 @@ static uint64_t	 split_n;	/* nodes split in two              */
 static uint64_t	 merge_n;	/* appends that lengthened a run   */
 static uint64_t	 short_n;	/* records shortened by a truncate */
 static uint64_t	 drop_n;	/* ...and records taken out of it  */
+static uint64_t	 make_n;	/* files created                   */
+static uint64_t	 kill_n;	/* ...and names taken back out     */
+static uint64_t	 hole_n;	/* record ends reusing a deletion  */
 
 static size_t
 str_len(const char *s)
@@ -1917,6 +1930,7 @@ mount_volume(void *scratch)
 
 	g_apfs.ac_num_files = sb->apfs_num_files;
 	g_apfs.ac_num_dirs  = sb->apfs_num_directories;
+	g_apfs.ac_next_ino  = sb->apfs_next_obj_id;
 	/*
 	 * A case- or normalization-insensitive volume hashes dirent names
 	 * into the key, which changes the key's shape (and its ordering).
@@ -3214,14 +3228,92 @@ jkey_cmp(const uint8_t *a, uint32_t alen, const uint8_t *b, uint32_t blen)
 }
 
 /*
+ * A HOLE IS ROOM, AND UNTIL NOW IT WAS NOT
+ *
+ * Deleting a record threads its bytes onto one of the node's free-list chains;
+ * inserting one took only from the free span.  The span is a one-way ratchet,
+ * so a node that has records come and go loses a record's worth of room per
+ * cycle and eventually refuses an insert while claiming plenty of free bytes.
+ *
+ * That is exactly the bug the free queue had, and the free queue could be fixed
+ * the easy way: every hole in it is the same size, so taking one is popping the
+ * head of a list.  Here they are not.  A directory entry, an inode record and
+ * an extent record are three different lengths, and the chain has to be
+ * searched rather than popped.
+ *
+ * `step` is +1 for the key area, whose offsets grow with the address, and -1
+ * for the value area, whose offsets are measured backwards from the end of the
+ * node.  That sign is the whole of the difference between the two.
+ *
+ * A hole is usable only if it fits exactly or leaves at least a link behind:
+ * a remainder too small to hold its own nloc could not stay on the chain, and
+ * quietly dropping it would leave bytes belonging to nothing -- which is
+ * precisely the accounting apfsck recomputes.  Every byte of this node is
+ * either inside a record or on a chain, before and after.
+ */
+static uint32_t
+hole_find(const struct apfs_nloc *head, const uint8_t *base, int step,
+    uint32_t need)
+{
+	const struct apfs_nloc	*hole;
+	uint32_t		 off;
+
+	off = head->nl_off;
+	while (off != APFS_BTOFF_INVALID) {
+		hole = (const struct apfs_nloc *)(base + step * (int)off);
+		if (hole->nl_len == need ||
+		    hole->nl_len >= need + (uint32_t)sizeof(*hole))
+			return (off);
+		off = hole->nl_off;
+	}
+	return (APFS_BTOFF_INVALID);
+}
+
+/*
+ * Take `need` bytes out of the hole at `at`, which hole_find has already said
+ * will do, and report where they are.
+ *
+ * The bytes come off the FAR end.  A hole's own nloc sits at its first byte and
+ * whoever points at the hole names that byte, so shrinking one from the far end
+ * is an edit inside it with nothing above to tell; only a hole consumed exactly
+ * has to be unlinked, and the link that names it is either the previous hole's
+ * or the head in the node's header, which are the same four bytes in two
+ * places.
+ */
+static uint32_t
+hole_take(struct apfs_nloc *head, uint8_t *base, int step, uint32_t need,
+    uint32_t at)
+{
+	struct apfs_nloc	*prev;
+	struct apfs_nloc	*hole;
+	uint32_t		 off;
+	uint32_t		 own;
+
+	prev = head;
+	off  = head->nl_off;
+	while (off != at) {
+		prev = (struct apfs_nloc *)(base + step * (int)off);
+		off  = prev->nl_off;
+	}
+	hole = (struct apfs_nloc *)(base + step * (int)at);
+	own  = hole->nl_len;
+	if (own == need)
+		prev->nl_off = hole->nl_off;
+	else
+		hole->nl_len = (uint16_t)(own - need);
+	head->nl_len = (uint16_t)(head->nl_len - need);
+	return ((uint32_t)((int)at + step * (int)(own - need)));
+}
+
+/*
  * Put a record into a variable-KV node, at the position the caller worked out,
  * and refuse if there is no room.
  *
  * Keys grow up from the start of the key area and values grow down from the
  * end of the node; the free span in the middle is what both eat into, and the
- * node header carries where it starts and how much is left.  Both ends are
- * taken from that span rather than from the free-list chains, which is the
- * simpler half of the format and the one a node this young ever needs.
+ * node header carries where it starts and how much is left.  Either end may
+ * instead come out of a hole a delete left behind, and the two are independent:
+ * a key can be threaded into a hole while its value takes from the span.
  */
 static int
 leaf_insert(uint8_t *node, uint32_t pos, const void *key, uint32_t klen,
@@ -3230,10 +3322,12 @@ leaf_insert(uint8_t *node, uint32_t pos, const void *key, uint32_t klen,
 	struct apfs_btree_node_phys	*n;
 	struct btree_layout		 bl;
 	struct apfs_kvloc		*kv;
-	uint8_t				*keys;
+	uint32_t			 khole;
+	uint32_t			 vhole;
 	uint32_t			 koff;
 	uint32_t			 voff;
 	uint32_t			 vbase;
+	uint32_t			 need;
 	uint32_t			 i;
 
 	n = (struct apfs_btree_node_phys *)node;
@@ -3247,32 +3341,56 @@ leaf_insert(uint8_t *node, uint32_t pos, const void *key, uint32_t klen,
 		    (unsigned)bl.bl_level, (unsigned)bl.bl_nkeys);
 		return (FS_APFS_E_NOALLOC);
 	}
-	if (klen + vlen > n->btn_free_space.nl_len) {
+
+	/*
+	 * Both ends are placed before either is written, because a record that
+	 * fitted its key and then found nowhere for its value would have to put
+	 * the key back -- and the room question has to be answerable without
+	 * changing anything, which is what the split path asks it for.
+	 */
+	khole = hole_find(&n->btn_key_free_list, bl.bl_keys, 1, klen);
+	vhole = hole_find(&n->btn_val_free_list, bl.bl_vals, -1, vlen);
+	need  = (khole == APFS_BTOFF_INVALID ? klen : 0) +
+	    (vhole == APFS_BTOFF_INVALID ? vlen : 0);
+	if (need > n->btn_free_space.nl_len) {
 		kprintf("apfs: the node at level %u has %u bytes free and the "
 		    "record needs %u -- a split is a different rung\n",
 		    (unsigned)bl.bl_level, (unsigned)n->btn_free_space.nl_len,
-		    (unsigned)(klen + vlen));
+		    (unsigned)need);
 		return (FS_APFS_E_NOALLOC);
 	}
 
-	keys = node + APFS_BTNODE_HDR_SIZE + n->btn_table_space.nl_off +
-	    n->btn_table_space.nl_len;
-	koff = n->btn_free_space.nl_off;
-	mem_copy(keys + koff, key, klen);
-	n->btn_free_space.nl_off = (uint16_t)(koff + klen);
-	n->btn_free_space.nl_len = (uint16_t)(n->btn_free_space.nl_len - klen);
+	if (khole != APFS_BTOFF_INVALID) {
+		koff = hole_take(&n->btn_key_free_list, (uint8_t *)bl.bl_keys,
+		    1, klen, khole);
+		hole_n++;
+	} else {
+		koff = n->btn_free_space.nl_off;
+		n->btn_free_space.nl_off = (uint16_t)(koff + klen);
+		n->btn_free_space.nl_len =
+		    (uint16_t)(n->btn_free_space.nl_len - klen);
+	}
+	mem_copy((uint8_t *)bl.bl_keys + koff, key, klen);
 
-	/*
-	 * The value's offset is measured BACKWARDS from the end of the node,
-	 * so it is whatever is left of the free span after this value is taken
-	 * off the bottom of it.
-	 */
-	n->btn_free_space.nl_len = (uint16_t)(n->btn_free_space.nl_len - vlen);
-	vbase = APFS_BLOCK_SIZE -
-	    (((n->btn_flags & APFS_BTNODE_ROOT) != 0) ? APFS_BTREE_INFO_SIZE : 0);
-	voff = vbase - (APFS_BTNODE_HDR_SIZE + n->btn_table_space.nl_off +
-	    n->btn_table_space.nl_len + n->btn_free_space.nl_off +
-	    n->btn_free_space.nl_len);
+	if (vhole != APFS_BTOFF_INVALID) {
+		voff = hole_take(&n->btn_val_free_list, (uint8_t *)bl.bl_vals,
+		    -1, vlen, vhole);
+		hole_n++;
+	} else {
+		/*
+		 * The value's offset is measured BACKWARDS from the end of the
+		 * node, so it is whatever is left of the free span after this
+		 * value is taken off the bottom of it.
+		 */
+		n->btn_free_space.nl_len =
+		    (uint16_t)(n->btn_free_space.nl_len - vlen);
+		vbase = APFS_BLOCK_SIZE -
+		    (((n->btn_flags & APFS_BTNODE_ROOT) != 0) ?
+		    APFS_BTREE_INFO_SIZE : 0);
+		voff = vbase - (APFS_BTNODE_HDR_SIZE +
+		    n->btn_table_space.nl_off + n->btn_table_space.nl_len +
+		    n->btn_free_space.nl_off + n->btn_free_space.nl_len);
+	}
 	mem_copy((uint8_t *)bl.bl_vals - voff, val, vlen);
 
 	kv = (struct apfs_kvloc *)(node + APFS_BTNODE_HDR_SIZE +
@@ -3303,10 +3421,12 @@ leaf_insert(uint8_t *node, uint32_t pos, const void *key, uint32_t klen,
  * and threading them on makes it silent.  The value side is the same chain
  * measured backwards from the end of the node, exactly as the values are.
  *
- * The room this returns is not room a later insert can use: leaf_insert takes
- * from the free span and only from there.  A node that has had records deleted
- * therefore fills sooner than its free byte count suggests, which is the
- * simple half of the format and the half a tree this young can afford.
+ * The room this returns IS room a later insert can use -- see hole_find above.
+ * It was not, once, and that was survivable only while the one thing that could
+ * delete was a truncate: a file that is made shorter and never longer again
+ * gives its bytes back once.  A name that comes and goes is a cycle, and a node
+ * that loses a record's worth of room per cycle stops working after fifteen of
+ * them.
  */
 static int
 leaf_delete(uint8_t *node, uint32_t pos)
@@ -3627,6 +3747,7 @@ leaf_has_room(const uint8_t *node, uint32_t klen, uint32_t vlen)
 	const struct apfs_btree_node_phys	*n;
 	struct btree_layout			 bl;
 	uint32_t				 entry;
+	uint32_t				 need;
 
 	n = (const struct apfs_btree_node_phys *)node;
 	btree_layout(node, &bl);
@@ -3634,7 +3755,23 @@ leaf_has_room(const uint8_t *node, uint32_t klen, uint32_t vlen)
 	    (uint32_t)sizeof(struct apfs_kvloc);
 	if ((uint32_t)(bl.bl_nkeys + 1) * entry > n->btn_table_space.nl_len)
 		return (false);
-	return (klen + vlen <= n->btn_free_space.nl_len);
+	need = klen + vlen;
+	/*
+	 * Asked exactly the way leaf_insert answers it, holes and all.  Not of
+	 * a FIXED-KV node: leaf_insert_fixed takes from the span and only from
+	 * there, and the two fixed trees here -- the object map and the free
+	 * queues -- never reach this, so the difference is a rule stated rather
+	 * than a case ever taken.
+	 */
+	if (!bl.bl_fixed) {
+		if (hole_find(&n->btn_key_free_list, bl.bl_keys, 1, klen) !=
+		    APFS_BTOFF_INVALID)
+			need -= klen;
+		if (hole_find(&n->btn_val_free_list, bl.bl_vals, -1, vlen) !=
+		    APFS_BTOFF_INVALID)
+			need -= vlen;
+	}
+	return (need <= n->btn_free_space.nl_len);
 }
 
 /*
@@ -4853,6 +4990,844 @@ broken:
 	return (rv);
 }
 
+/* ---- names --------------------------------------------------------------- */
+
+/*
+ * A DIRECTORY ENTRY HAS TO GO WHERE THE VOLUME ALREADY PUTS THEM
+ *
+ * The reader never had to know how.  It descends on the object id -- the
+ * primary sort key, the same on every volume -- and compares names once it is
+ * in the right directory, which is exact and hash-independent.  A writer has no
+ * such luxury: a new entry must sort where an implementation that DOES hash
+ * would have put it, or what comes out is a volume only this kernel can read.
+ *
+ * So the hash had to be recovered, and it was recovered from the container
+ * rather than from the specification: CRC-32C over the name's code points, each
+ * written out as four little-endian bytes, case-folded, started at all ones and
+ * taken without a final complement, of which the low 22 bits are kept.  All
+ * twenty-six names already in this volume come out right.
+ *
+ * The near miss is the part worth keeping.  The same computation WITHOUT case
+ * folding reproduces twenty-five of the twenty-six: every name in the container
+ * is lower case except one, "Cellar", and that single directory is the entire
+ * evidence separating the two candidates.  A writer built on the wrong one
+ * would misplace mixed-case names only, which is exactly the kind of wrong that
+ * survives a test suite.
+ *
+ * Folding is ASCII, and anything else is refused out loud.  Doing it the way
+ * Apple does means normalising to NFD and folding through the full Unicode
+ * tables, neither of which this kernel carries -- and a guess at them would be
+ * silently wrong rather than absent, which is the worse of the two.
+ */
+static uint32_t
+crc32c(uint32_t crc, const uint8_t *p, uint32_t n)
+{
+	uint32_t	i;
+
+	while (n-- > 0) {
+		crc ^= *p++;
+		for (i = 0; i < 8; i++) {
+			if ((crc & 1u) != 0)
+				crc = (crc >> 1) ^ 0x82F63B78u;
+			else
+				crc >>= 1;
+		}
+	}
+	return (crc);
+}
+
+/*
+ * Build the key a directory entry sorts under: the parent's object id with the
+ * record type on top, then either the hash-and-length word or a bare length,
+ * then the name and the NUL that the recorded length counts.
+ */
+static int
+drec_key(uint64_t parent, const char *name, uint32_t nlen, uint8_t *out,
+    uint32_t *klen_out)
+{
+	uint8_t		wide[4];
+	uint32_t	crc;
+	uint32_t	i;
+	uint8_t		c;
+
+	*(uint64_t *)out = (parent & APFS_J_OBJ_ID_MASK) |
+	    ((uint64_t)APFS_TYPE_DIR_REC << APFS_J_OBJ_TYPE_SHIFT);
+	if (!g_apfs.ac_drec_hashed) {
+		*(uint16_t *)(out + 8) = (uint16_t)(nlen + 1u);
+		mem_copy(out + 10, (const uint8_t *)name, nlen);
+		out[10 + nlen] = '\0';
+		*klen_out = 10u + nlen + 1u;
+		return (FS_APFS_E_OK);
+	}
+
+	crc = 0xFFFFFFFFu;
+	for (i = 0; i < nlen; i++) {
+		c = (uint8_t)name[i];
+		if (c >= 0x80u) {
+			kprintf("apfs: \"%s\" is not ASCII -- folding a name "
+			    "the way this volume hashes them needs Unicode "
+			    "tables this kernel does not carry\n", name);
+			return (FS_APFS_E_INVAL);
+		}
+		if (c >= 'A' && c <= 'Z')
+			c = (uint8_t)(c + ('a' - 'A'));
+		wide[0] = c;
+		wide[1] = 0;
+		wide[2] = 0;
+		wide[3] = 0;
+		crc = crc32c(crc, wide, (uint32_t)sizeof(wide));
+	}
+	*(uint32_t *)(out + 8) =
+	    ((crc & APFS_DREC_HASH_BITS) << APFS_DREC_HASH_SHIFT) |
+	    ((nlen + 1u) & APFS_DREC_LEN_MASK);
+	mem_copy(out + 12, (const uint8_t *)name, nlen);
+	out[12 + nlen] = '\0';
+	*klen_out = 12u + nlen + 1u;
+	return (FS_APFS_E_OK);
+}
+
+/*
+ * A NODE OF THE FILE-SYSTEM TREE, INTO THE CHECKPOINT BEING BUILT
+ *
+ * Not cow_physical, which is for objects whose oid IS their block: a tree node
+ * is VIRTUAL, its oid is a name the object map resolves, and the copy keeps
+ * that name.  Every writer here had this open-coded; a create moves three nodes
+ * at once and open-coding it a third time is where it stops being a shape and
+ * starts being a function.
+ */
+static int
+node_cow(uint8_t *node, uint64_t old_bno, uint64_t xid, uint64_t *new_bno)
+{
+	struct apfs_obj_phys	*o;
+	int			 rv;
+
+	rv = alloc_blocks(1, old_bno, new_bno);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	o = (struct apfs_obj_phys *)node;
+	o->o_xid = xid;
+	rv = fs_apfs_write_block(*new_bno, node);
+	if (rv != FS_APFS_E_OK) {
+		(void)free_blocks(*new_bno, 1);
+		return (rv);
+	}
+	rv = free_blocks(old_bno, 1);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	cow_n_spine++;
+	return (FS_APFS_E_OK);
+}
+
+/*
+ * Find a record by key in a node the caller is holding, and say where it is.
+ *
+ * By KEY and not by a slot remembered from a walk: an insert or a delete slides
+ * everything after it, and a second pass trusting the old numbering would edit
+ * whatever had moved into the place.  That has its own comment in the truncate
+ * above because it was learned there.
+ */
+static bool
+node_slot(const uint8_t *node, uint64_t oid, uint32_t type, uint32_t *pos_out,
+    uint32_t *voff_out, uint32_t *vlen_out)
+{
+	struct btree_layout	bl;
+	uint64_t		raw;
+	uint32_t		koff, klen, voff, vlen;
+	uint32_t		i;
+
+	btree_layout(node, &bl);
+	for (i = 0; i < bl.bl_nkeys; i++) {
+		btree_entry_loc(&bl, i, &koff, &klen, &voff, &vlen);
+		if (klen < 8)
+			continue;
+		raw = *(const uint64_t *)(bl.bl_keys + koff);
+		if ((raw & APFS_J_OBJ_ID_MASK) != (oid & APFS_J_OBJ_ID_MASK))
+			continue;
+		if ((uint32_t)(raw >> APFS_J_OBJ_TYPE_SHIFT) != type)
+			continue;
+		*pos_out  = i;
+		*voff_out = voff;
+		*vlen_out = vlen;
+		return (true);
+	}
+	return (false);
+}
+
+/* Where a key belongs, in a node the caller is holding. */
+static uint32_t
+node_place(const uint8_t *node, const uint8_t *key, uint32_t klen)
+{
+	struct btree_layout	bl;
+	uint32_t		koff, klen2, voff, vlen;
+	uint32_t		i;
+
+	btree_layout(node, &bl);
+	for (i = 0; i < bl.bl_nkeys; i++) {
+		btree_entry_loc(&bl, i, &koff, &klen2, &voff, &vlen);
+		if (jkey_cmp(bl.bl_keys + koff, klen2, key, klen) > 0)
+			return (i);
+	}
+	return (bl.bl_nkeys);
+}
+
+/*
+ * The number of children a directory's inode record says it has, edited in a
+ * node the caller is holding, together with the two times that change when a
+ * directory gains or loses a name.
+ */
+static int
+dir_children_add(uint8_t *node, uint64_t dir, int32_t delta, uint64_t now)
+{
+	struct apfs_inode_val	*iv;
+	struct btree_layout	 bl;
+	uint32_t		 pos, voff, vlen;
+
+	if (!node_slot(node, dir, APFS_TYPE_INODE, &pos, &voff, &vlen))
+		return (FS_APFS_E_NOTFOUND);
+	btree_layout(node, &bl);
+	if (vlen < sizeof(*iv))
+		return (FS_APFS_E_INVAL);
+	iv = (struct apfs_inode_val *)((uint8_t *)bl.bl_vals - voff);
+	if (iv->ai_nchildren_or_nlink + delta < 0)
+		return (FS_APFS_E_INVAL);
+	iv->ai_nchildren_or_nlink += delta;
+	iv->ai_mod_time    = now;
+	iv->ai_change_time = now;
+	return (FS_APFS_E_OK);
+}
+
+/*
+ * MAKING AND UNMAKING A NAME
+ *
+ * The ladder was measured against apfsck on a copy of this container before a
+ * line of either was written, and the two are not symmetric.  Leaving one
+ * obligation out at a time, on an otherwise complete edit:
+ *
+ *	CREATE, leaving out		apfsck answers
+ *	  apfs_next_obj_id		"Inode record: free inode number in use"
+ *	  the directory entry		"Inode record: wrong directory child count"
+ *	  the inode record		"Inode record: wrong link count"
+ *	  the dstream id record		"Data stream: missing reference count"
+ *	  the parent's child count	"Inode record: wrong directory child count"
+ *	  the tree's key count		"Catalog: wrong key count in info footer"
+ *	  apfs_num_files		nothing at all
+ *
+ *	UNLINK, leaving out
+ *	  the entry, or the parent's count	as above
+ *	  the inode and dstream records	"Inode record: wrong link count"
+ *	  the tree's key count		"Catalog: wrong key count in info footer"
+ *	  the extent reference record	"Physical extent record: bad reference count"
+ *	  apfs_fs_alloc_count		"Volume superblock: bad block count"
+ *	  the blocks, given back	"Space manager: bad allocation bitmap"
+ *	  the deleted bytes, threaded	"B-tree: wrong free space total for key area"
+ *	  apfs_num_files		nothing at all
+ *
+ * Two of those are worth remembering.  The first thing the checker notices
+ * about a created file is not the file: it is that the volume still calls the
+ * number free, and that one complaint MASKS every other -- a cumulative ladder
+ * built in the obvious order says the same thing at every rung and teaches
+ * nothing.  And apfs_num_files, the count that looks most like the thing a
+ * create ought to be updating, is never checked in either direction.  It is
+ * updated anyway, for the same reason the truncate updated what nobody asked
+ * about: something other than this checker will read it.
+ *
+ * The unlink half of the ladder is the truncate's ladder with three rungs on
+ * top, and that is not a coincidence -- unlink DOES a truncate.  Cutting the
+ * file to nothing is what gives back its blocks, its extent records and its
+ * ownership records, all of which are already written and already proven; what
+ * is left over is three records and two counters.
+ */
+
+/* Longest name this kernel will make, as against the 255 it will read. */
+#define	APFS_MAKE_NAME_MAX	64
+
+/* Leaves one name can touch: the parent's, the entry's, and the new inode's. */
+#define	APFS_NAME_LEAVES	3
+
+/*
+ * Where the records of one name live, worked out before anything is changed.
+ *
+ * They are not neighbours.  An entry sorts under the PARENT's object id, while
+ * the inode record and the record that counts references to its bytes sort
+ * under the child's -- which, for a fresh file, is past everything in the
+ * volume.  So this is the first operation here that edits more than one leaf,
+ * and spine_update_n has taken a list since the split rung: what was missing
+ * was a caller with more than one leaf to give it.
+ */
+struct name_edit {
+	uint64_t	 ne_bno[APFS_NAME_LEAVES];	/* distinct leaves */
+	uint64_t	 ne_oid[APFS_NAME_LEAVES];
+	uint64_t	 ne_new[APFS_NAME_LEAVES];
+	uint8_t		*ne_node[APFS_NAME_LEAVES];
+	uint32_t	 ne_n;
+	uint32_t	 ne_root;	/* which of them is the tree root  */
+};
+
+/* Remember a leaf, once, and say which slot it took. */
+static uint32_t
+name_leaf(struct name_edit *ne, uint64_t bno)
+{
+	uint32_t	i;
+
+	for (i = 0; i < ne->ne_n; i++)
+		if (ne->ne_bno[i] == bno)
+			return (i);
+	ne->ne_bno[ne->ne_n] = bno;
+	return (ne->ne_n++);
+}
+
+/*
+ * Read every leaf the edit touches, all at once, so that a refusal costs
+ * nothing.  Every insert and delete then happens in memory; only when all of
+ * them have succeeded does anything reach the disk.
+ */
+static int
+name_read(struct name_edit *ne)
+{
+	uint32_t	i;
+	int		rv;
+
+	ne->ne_root = APFS_NAME_LEAVES;
+	for (i = 0; i < APFS_NAME_LEAVES; i++)
+		ne->ne_node[i] = NULL;
+	for (i = 0; i < ne->ne_n; i++) {
+		ne->ne_node[i] = kmalloc(APFS_BLOCK_SIZE);
+		if (ne->ne_node[i] == NULL)
+			return (FS_APFS_E_NOMEM);
+		rv = fs_apfs_read_block(ne->ne_bno[i], ne->ne_node[i]);
+		if (rv != FS_APFS_E_OK)
+			return (rv);
+		ne->ne_oid[i] =
+		    ((struct apfs_obj_phys *)ne->ne_node[i])->o_oid;
+		if (ne->ne_oid[i] == g_apfs.ac_root_tree_oid)
+			ne->ne_root = i;
+	}
+	return (FS_APFS_E_OK);
+}
+
+static void
+name_free(struct name_edit *ne)
+{
+	uint32_t	i;
+
+	for (i = 0; i < APFS_NAME_LEAVES; i++)
+		if (ne->ne_node[i] != NULL)
+			kfree(ne->ne_node[i]);
+}
+
+/*
+ * And write them, plus the root whose record count moved.  Nothing above this
+ * can fail for want of room -- that was settled in memory -- so a failure here
+ * is a disk that stopped answering, and it leaves a half-built checkpoint that
+ * must not be committed.
+ */
+static int
+name_commit(struct name_edit *ne, int64_t records, uint64_t xid,
+    uint8_t *scratch)
+{
+	uint64_t	oids[APFS_NAME_LEAVES + 1];
+	uint64_t	paddrs[APFS_NAME_LEAVES + 1];
+	uint64_t	new_root;
+	uint32_t	nmoved;
+	uint32_t	i;
+	int		rv;
+
+	if (ne->ne_root < ne->ne_n)
+		tree_count_add(ne->ne_node[ne->ne_root], records);
+
+	for (i = 0; i < ne->ne_n; i++) {
+		rv = node_cow(ne->ne_node[i], ne->ne_bno[i], xid,
+		    &ne->ne_new[i]);
+		if (rv != FS_APFS_E_OK)
+			return (rv);
+		oids[i]   = ne->ne_oid[i];
+		paddrs[i] = ne->ne_new[i];
+	}
+	nmoved = ne->ne_n;
+
+	if (ne->ne_root < ne->ne_n) {
+		g_apfs.ac_root_tree_bno = ne->ne_new[ne->ne_root];
+	} else {
+		rv = fs_apfs_read_block(g_apfs.ac_root_tree_bno, scratch);
+		if (rv != FS_APFS_E_OK)
+			return (rv);
+		tree_count_add(scratch, records);
+		oids[nmoved] = ((struct apfs_obj_phys *)scratch)->o_oid;
+		rv = node_cow(scratch, g_apfs.ac_root_tree_bno, xid, &new_root);
+		if (rv != FS_APFS_E_OK)
+			return (rv);
+		paddrs[nmoved] = new_root;
+		g_apfs.ac_root_tree_bno = new_root;
+		nmoved++;
+	}
+	return (spine_update_n(oids, paddrs, nmoved, 0, 0, xid, scratch));
+}
+
+/*
+ * Put a name into a directory, and an empty file under it.
+ *
+ * The file has a dstream from the moment it exists, holding no bytes and no
+ * blocks.  That is not the same as having none: an inode without one names
+ * something with no length at all, and every path that makes a file longer
+ * looks for a length to move.  Creating without one would produce a file that
+ * could be opened, read as empty, and never written to.
+ *
+ * A leaf with no room refuses, out loud, and this does NOT split and retry the
+ * way growing a file does.  That is the honest edge and not an oversight: a
+ * create puts records into two leaves at once, a split moves both of them and
+ * everything above, and every address worked out below would be stale --
+ * fs_apfs_grow can start over because it has one leaf to reconsider.
+ */
+int
+fs_apfs_create(uint64_t dir, const char *name, uint64_t now, uint64_t *ino_out)
+{
+	struct apfs_inode_val	*iv;
+	struct apfs_xf_blob	*blob;
+	struct apfs_x_field	*xf;
+	struct apfs_drec_val	 dv;
+	struct dirent_search	 ds;
+	struct inode_info	 ii;
+	struct inode_locate	 il;
+	struct leaf_find	 lf;
+	struct name_edit	 ne;
+	uint8_t			 dkey[12 + APFS_MAKE_NAME_MAX + 1];
+	uint8_t			 rec[sizeof(struct apfs_inode_val) +
+				     sizeof(struct apfs_xf_blob) +
+				     2 * sizeof(struct apfs_x_field) +
+				     APFS_MAKE_NAME_MAX + 8 +
+				     sizeof(struct apfs_dstream)];
+	uint8_t			*scratch;
+	uint64_t		 ikey;
+	uint64_t		 skey;
+	uint64_t		 ino;
+	uint64_t		 par_leaf;
+	uint64_t		 drec_leaf;
+	uint64_t		 ino_leaf;
+	uint32_t		 refs;
+	uint32_t		 dklen;
+	uint32_t		 vlen;
+	uint32_t		 nlen;
+	uint32_t		 data;
+	uint32_t		 pad;
+	uint32_t		 slot;
+	int			 rv;
+	bool			 stopped;
+
+	if (!g_apfs.ac_mounted)
+		return (FS_APFS_E_NOMOUNT);
+	if (!g_apfs.ac_ip_valid || g_apfs.ac_ctr_omap_tree == 0)
+		return (FS_APFS_E_NOALLOC);
+
+	nlen = (uint32_t)str_len(name);
+	if (nlen == 0 || nlen > APFS_MAKE_NAME_MAX) {
+		kprintf("apfs: a name of %u bytes is not one this kernel will "
+		    "make -- the limit is %u\n", (unsigned)nlen,
+		    (unsigned)APFS_MAKE_NAME_MAX);
+		return (FS_APFS_E_INVAL);
+	}
+	if (inode_info(dir, &ii) != FS_APFS_E_OK)
+		return (FS_APFS_E_NOTFOUND);
+	if ((ii.ii_mode & APFS_S_IFMT) != APFS_S_IFDIR) {
+		kprintf("apfs: inode %llu is not a directory -- nothing can be "
+		    "made in it\n", (unsigned long long)dir);
+		return (FS_APFS_E_NOTFOUND);
+	}
+
+	/* And the name must be free, which is a question only the tree can answer. */
+	ds.ds_name    = name;
+	ds.ds_namelen = nlen;
+	ds.ds_parent  = dir;
+	ds.ds_found   = 0;
+	ds.ds_is_dir  = false;
+	stopped = false;
+	if (!btree_walk(g_apfs.ac_root_tree_bno, dirent_match, &ds, 0, &stopped))
+		return (FS_APFS_E_IO);
+	if (ds.ds_found != 0)
+		return (FS_APFS_E_EXIST);
+
+	ino = g_apfs.ac_next_ino;
+	rv  = drec_key(dir, name, nlen, dkey, &dklen);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	ikey = (ino & APFS_J_OBJ_ID_MASK) |
+	    ((uint64_t)APFS_TYPE_INODE << APFS_J_OBJ_TYPE_SHIFT);
+	skey = (ino & APFS_J_OBJ_ID_MASK) |
+	    ((uint64_t)APFS_TYPE_DSTREAM_ID << APFS_J_OBJ_TYPE_SHIFT);
+
+	dv.dv_file_id    = ino;
+	dv.dv_date_added = now;
+	dv.dv_flags      = APFS_DT_REG;
+	refs             = 1;
+
+	/*
+	 * The inode record: a fixed part, then the two extended fields a file
+	 * has, in ascending order of type, then their data each padded up to a
+	 * multiple of eight.  Both the order and the padding were read off the
+	 * inodes already in this volume rather than taken from the layout.
+	 */
+	mem_zero(rec, (uint32_t)sizeof(rec));
+	pad = (nlen + 1u + 7u) & ~7u;
+	iv  = (struct apfs_inode_val *)rec;
+	iv->ai_parent_id          = dir;
+	iv->ai_private_id         = ino;
+	iv->ai_create_time        = now;
+	iv->ai_mod_time           = now;
+	iv->ai_change_time        = now;
+	iv->ai_access_time        = now;
+	iv->ai_internal_flags     = APFS_INODE_NO_RSRC_FORK;
+	iv->ai_nchildren_or_nlink = 1;
+	iv->ai_mode               = APFS_S_IFREG | 0644;
+	blob = (struct apfs_xf_blob *)(rec + sizeof(*iv));
+	blob->xb_num_exts  = 2;
+	blob->xb_used_data =
+	    (uint16_t)(pad + sizeof(struct apfs_dstream));
+	xf = (struct apfs_x_field *)(rec + sizeof(*iv) + sizeof(*blob));
+	xf[0].xf_type  = APFS_INO_EXT_TYPE_NAME;
+	xf[0].xf_flags = APFS_XF_DO_NOT_COPY;
+	xf[0].xf_size  = (uint16_t)(nlen + 1u);
+	xf[1].xf_type  = APFS_INO_EXT_TYPE_DSTREAM;
+	xf[1].xf_flags = APFS_XF_SYSTEM_FIELD;
+	xf[1].xf_size  = (uint16_t)sizeof(struct apfs_dstream);
+	data = (uint32_t)(sizeof(*iv) + sizeof(*blob) + 2 * sizeof(*xf));
+	mem_copy(rec + data, (const uint8_t *)name, nlen);
+	/* The NUL, the padding and the empty dstream are already zero. */
+	vlen = data + pad + (uint32_t)sizeof(struct apfs_dstream);
+
+	/* Where each of the three belongs. */
+	il.il_oid   = dir;
+	il.il_bno   = 0;
+	il.il_found = false;
+	stopped     = false;
+	if (!btree_walk(g_apfs.ac_root_tree_bno, inode_locate, &il, 0, &stopped))
+		return (FS_APFS_E_IO);
+	if (!il.il_found)
+		return (FS_APFS_E_NOTFOUND);
+	par_leaf = il.il_bno;
+
+	lf.lf_key   = dkey;
+	lf.lf_klen  = dklen;
+	lf.lf_bno   = 0;
+	lf.lf_first = 0;
+	lf.lf_any   = false;
+	stopped     = false;
+	if (!btree_walk(g_apfs.ac_root_tree_bno, leaf_find, &lf, 0, &stopped))
+		return (FS_APFS_E_IO);
+	drec_leaf = lf.lf_bno != 0 ? lf.lf_bno : lf.lf_first;
+
+	lf.lf_key   = (const uint8_t *)&ikey;
+	lf.lf_klen  = (uint32_t)sizeof(ikey);
+	lf.lf_bno   = 0;
+	lf.lf_first = 0;
+	lf.lf_any   = false;
+	stopped     = false;
+	if (!btree_walk(g_apfs.ac_root_tree_bno, leaf_find, &lf, 0, &stopped))
+		return (FS_APFS_E_IO);
+	ino_leaf = lf.lf_bno != 0 ? lf.lf_bno : lf.lf_first;
+
+	ne.ne_n = 0;
+	(void)name_leaf(&ne, par_leaf);
+	(void)name_leaf(&ne, drec_leaf);
+	(void)name_leaf(&ne, ino_leaf);
+	rv = name_read(&ne);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+
+	/*
+	 * Every edit, in memory.  The inode record and its dstream id go in
+	 * together because their keys are adjacent -- same object, neighbouring
+	 * types -- so a leaf that holds one holds the other.
+	 */
+	slot = name_leaf(&ne, drec_leaf);
+	rv = leaf_insert(ne.ne_node[slot],
+	    node_place(ne.ne_node[slot], dkey, dklen), dkey, dklen, &dv,
+	    (uint32_t)sizeof(dv));
+	if (rv != FS_APFS_E_OK)
+		goto out;
+
+	slot = name_leaf(&ne, ino_leaf);
+	rv = leaf_insert(ne.ne_node[slot],
+	    node_place(ne.ne_node[slot], (const uint8_t *)&ikey,
+	    (uint32_t)sizeof(ikey)), &ikey, (uint32_t)sizeof(ikey), rec, vlen);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	rv = leaf_insert(ne.ne_node[slot],
+	    node_place(ne.ne_node[slot], (const uint8_t *)&skey,
+	    (uint32_t)sizeof(skey)), &skey, (uint32_t)sizeof(skey), &refs,
+	    (uint32_t)sizeof(refs));
+	if (rv != FS_APFS_E_OK)
+		goto out;
+
+	slot = name_leaf(&ne, par_leaf);
+	rv = dir_children_add(ne.ne_node[slot], dir, 1, now);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+
+	/*
+	 * The volume's own claims, set before the spine copies the superblock
+	 * that carries them -- the same ordering, and the same reason, as the
+	 * block count in every writer above.
+	 */
+	g_apfs.ac_next_ino  = ino + 1;
+	g_apfs.ac_num_files += 1;
+
+	scratch = kmalloc(APFS_BLOCK_SIZE);
+	if (scratch == NULL) {
+		rv = FS_APFS_E_NOMEM;
+		goto undo;
+	}
+	rv = name_commit(&ne, 3, g_apfs.ac_xid + 1, scratch);
+	kfree(scratch);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs: making \"%s\" failed after a leaf had moved "
+		    "(%d) -- this checkpoint must not be written\n", name, rv);
+		goto out;
+	}
+
+	make_n++;
+	if (ino_out != NULL)
+		*ino_out = ino;
+	kprintf("apfs: \"%s\" made in inode %llu as inode %llu -- %u leaves "
+	    "moved\n", name, (unsigned long long)dir, (unsigned long long)ino,
+	    (unsigned)ne.ne_n);
+	name_free(&ne);
+	return (FS_APFS_E_OK);
+
+undo:
+	g_apfs.ac_next_ino   = ino;
+	g_apfs.ac_num_files -= 1;
+out:
+	name_free(&ne);
+	return (rv);
+}
+
+/*
+ * And take a name back out, with the file under it when nothing else holds it.
+ *
+ * The blocks are not this function's problem: cutting the file to nothing is,
+ * and that is a call to the truncate above, which already gives back the runs,
+ * the records in both trees that name them and the volume's block count.  What
+ * is left is the three records the create made and the two counters it moved.
+ */
+int
+fs_apfs_unlink(uint64_t dir, const char *name, uint64_t now)
+{
+	struct dirent_search	 ds;
+	struct inode_info	 ii;
+	struct inode_locate	 il;
+	struct name_edit	 ne;
+	uint8_t			 dkey[12 + APFS_MAKE_NAME_MAX + 1];
+	uint8_t			*scratch;
+	uint64_t		 child;
+	uint64_t		 par_leaf;
+	uint64_t		 drec_leaf;
+	uint64_t		 ino_leaf;
+	uint32_t		 dklen;
+	uint32_t		 nlen;
+	uint32_t		 pos, voff, vlen;
+	uint32_t		 slot;
+	int			 rv;
+	bool			 stopped;
+
+	if (!g_apfs.ac_mounted)
+		return (FS_APFS_E_NOMOUNT);
+	if (!g_apfs.ac_ip_valid || g_apfs.ac_ctr_omap_tree == 0)
+		return (FS_APFS_E_NOALLOC);
+
+	nlen = (uint32_t)str_len(name);
+	if (nlen == 0 || nlen > APFS_MAKE_NAME_MAX)
+		return (FS_APFS_E_INVAL);
+
+	ds.ds_name    = name;
+	ds.ds_namelen = nlen;
+	ds.ds_parent  = dir;
+	ds.ds_found   = 0;
+	ds.ds_is_dir  = false;
+	stopped = false;
+	if (!btree_walk(g_apfs.ac_root_tree_bno, dirent_match, &ds, 0, &stopped))
+		return (FS_APFS_E_IO);
+	if (ds.ds_found == 0)
+		return (FS_APFS_E_NOTFOUND);
+	if (ds.ds_is_dir) {
+		kprintf("apfs: \"%s\" is a directory -- taking one of those "
+		    "out is a different rung\n", name);
+		return (FS_APFS_E_ISDIR);
+	}
+	child = ds.ds_found;
+	if (inode_info(child, &ii) != FS_APFS_E_OK)
+		return (FS_APFS_E_NOTFOUND);
+	if (ii.ii_nlink != 1) {
+		kprintf("apfs: inode %llu has %u links and this kernel makes "
+		    "none -- unlinking one of several is a different rung\n",
+		    (unsigned long long)child, (unsigned)ii.ii_nlink);
+		return (FS_APFS_E_NOALLOC);
+	}
+
+	/*
+	 * The bytes first, and through the truncate rather than beside it.  It
+	 * moves leaves, so everything below has to be located afterwards.
+	 */
+	if (ii.ii_size != 0 || ii.ii_alloced != 0) {
+		rv = fs_apfs_truncate(child, ii.ii_private_id, 0);
+		if (rv != FS_APFS_E_OK)
+			return (rv);
+	}
+
+	rv = drec_key(dir, name, nlen, dkey, &dklen);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+
+	il.il_oid   = dir;
+	il.il_bno   = 0;
+	il.il_found = false;
+	stopped     = false;
+	if (!btree_walk(g_apfs.ac_root_tree_bno, inode_locate, &il, 0, &stopped))
+		return (FS_APFS_E_IO);
+	if (!il.il_found)
+		return (FS_APFS_E_NOTFOUND);
+	par_leaf = il.il_bno;
+
+	il.il_oid   = child;
+	il.il_bno   = 0;
+	il.il_found = false;
+	stopped     = false;
+	if (!btree_walk(g_apfs.ac_root_tree_bno, inode_locate, &il, 0, &stopped))
+		return (FS_APFS_E_IO);
+	if (!il.il_found)
+		return (FS_APFS_E_NOTFOUND);
+	ino_leaf = il.il_bno;
+
+	{
+		struct leaf_find	lf;
+
+		lf.lf_key   = dkey;
+		lf.lf_klen  = dklen;
+		lf.lf_bno   = 0;
+		lf.lf_first = 0;
+		lf.lf_any   = false;
+		stopped     = false;
+		if (!btree_walk(g_apfs.ac_root_tree_bno, leaf_find, &lf, 0,
+		    &stopped))
+			return (FS_APFS_E_IO);
+		drec_leaf = lf.lf_bno != 0 ? lf.lf_bno : lf.lf_first;
+	}
+
+	ne.ne_n = 0;
+	(void)name_leaf(&ne, par_leaf);
+	(void)name_leaf(&ne, drec_leaf);
+	(void)name_leaf(&ne, ino_leaf);
+	rv = name_read(&ne);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+
+	/*
+	 * The entry, found by its exact key rather than by object and type:
+	 * a directory has one record per name and they differ only past the
+	 * eighth byte, so "the DIR_REC of this parent" names all of them.
+	 */
+	slot = name_leaf(&ne, drec_leaf);
+	{
+		struct btree_layout	bl;
+		uint32_t		koff, klen;
+		uint32_t		i;
+
+		btree_layout(ne.ne_node[slot], &bl);
+		rv = FS_APFS_E_NOTFOUND;
+		for (i = 0; i < bl.bl_nkeys; i++) {
+			btree_entry_loc(&bl, i, &koff, &klen, &voff, &vlen);
+			if (klen != dklen)
+				continue;
+			if (jkey_cmp(bl.bl_keys + koff, klen, dkey, dklen) != 0)
+				continue;
+			rv = leaf_delete(ne.ne_node[slot], i);
+			break;
+		}
+		if (rv != FS_APFS_E_OK) {
+			kprintf("apfs: \"%s\" was in inode %llu a moment ago "
+			    "and is not in leaf %llu now\n", name,
+			    (unsigned long long)dir,
+			    (unsigned long long)drec_leaf);
+			goto out;
+		}
+	}
+
+	slot = name_leaf(&ne, ino_leaf);
+	if (node_slot(ne.ne_node[slot], child, APFS_TYPE_DSTREAM_ID, &pos,
+	    &voff, &vlen)) {
+		rv = leaf_delete(ne.ne_node[slot], pos);
+		if (rv != FS_APFS_E_OK)
+			goto out;
+	} else {
+		/*
+		 * A file this kernel made always has one.  One that came off
+		 * the image need not, and removing a record that is not there
+		 * would take the record after it.
+		 */
+		kprintf("apfs: inode %llu has no dstream id record -- one "
+		    "fewer to take out\n", (unsigned long long)child);
+	}
+	if (!node_slot(ne.ne_node[slot], child, APFS_TYPE_INODE, &pos, &voff,
+	    &vlen)) {
+		rv = FS_APFS_E_NOTFOUND;
+		goto out;
+	}
+	rv = leaf_delete(ne.ne_node[slot], pos);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+
+	slot = name_leaf(&ne, par_leaf);
+	rv = dir_children_add(ne.ne_node[slot], dir, -1, now);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+
+	g_apfs.ac_num_files -= 1;
+
+	scratch = kmalloc(APFS_BLOCK_SIZE);
+	if (scratch == NULL) {
+		g_apfs.ac_num_files += 1;
+		rv = FS_APFS_E_NOMEM;
+		goto out;
+	}
+	rv = name_commit(&ne, -3, g_apfs.ac_xid + 1, scratch);
+	kfree(scratch);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs: unmaking \"%s\" failed after a leaf had moved "
+		    "(%d) -- this checkpoint must not be written\n", name, rv);
+		goto out;
+	}
+
+	kill_n++;
+	kprintf("apfs: \"%s\" taken out of inode %llu -- inode %llu is gone, "
+	    "%u leaves moved\n", name, (unsigned long long)dir,
+	    (unsigned long long)child, (unsigned)ne.ne_n);
+	name_free(&ne);
+	return (FS_APFS_E_OK);
+
+out:
+	name_free(&ne);
+	return (rv);
+}
+
+uint64_t
+fs_apfs_makes(void)
+{
+
+	return (make_n);
+}
+
+uint64_t
+fs_apfs_kills(void)
+{
+
+	return (kill_n);
+}
+
+uint64_t
+fs_apfs_holes(void)
+{
+
+	return (hole_n);
+}
+
 int
 fs_apfs_size(uint64_t ino, uint64_t *size_out)
 {
@@ -5911,6 +6886,21 @@ spine_update_n(const uint64_t *oids, const uint64_t *paddrs, uint32_t n,
 	 */
 	vsb->apfs_extentref_tree_oid = g_apfs.ac_extref_bno;
 	vsb->apfs_fs_alloc_count     = g_apfs.ac_fs_alloc_count;
+	/*
+	 * And what the volume says about its own contents.  Same terms as the
+	 * two above: whoever changed one left it in g_apfs, and if nobody did,
+	 * this writes back what was already there.
+	 *
+	 * The two are not equally load-bearing, and that was measured rather
+	 * than assumed.  apfs_next_obj_id is checked -- a created inode whose
+	 * number the volume still calls free stops apfsck before it looks at
+	 * anything else.  apfs_num_files is not checked at all, in either
+	 * direction; it is written because it is the volume's own claim about
+	 * itself and something other than this checker will read it.
+	 */
+	vsb->apfs_next_obj_id        = g_apfs.ac_next_ino;
+	vsb->apfs_num_files          = g_apfs.ac_num_files;
+	vsb->apfs_num_directories    = g_apfs.ac_num_dirs;
 	rv = alloc_blocks(1, 0, &bno);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
