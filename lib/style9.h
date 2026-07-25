@@ -798,10 +798,19 @@ _Static_assert(sizeof(struct svc_tasks_reply) ==
 struct svc_progreg_reply {
 	uint32_t	pr_count;
 	uint32_t	pr_total;
+	/*
+	 * One bit per packed name, in packing order: set means the image
+	 * is a Mach-O container, so the program is a genuine Darwin
+	 * binary rather than a native style9 ELF.  Half this registry is
+	 * real Apple binaries running under a clean-room dyld, which is
+	 * the most interesting thing about the list and which a list that
+	 * renders them identically hides.
+	 */
+	uint64_t	pr_macho;
 	char		pr_names[SVC_PROGREG_BYTES];
 };
 
-_Static_assert(sizeof(struct svc_progreg_reply) == 8 + SVC_PROGREG_BYTES,
+_Static_assert(sizeof(struct svc_progreg_reply) == 16 + SVC_PROGREG_BYTES,
     "svc_progreg_reply layout pinned");
 
 #define	SVC_ECHOOL_NAME		"echool"

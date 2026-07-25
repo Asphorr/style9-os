@@ -118,14 +118,29 @@ _Static_assert(sizeof(struct svc_tasks_reply) ==
 #define	PROGREG_OP_LIST		1
 #define	SVC_PROGREG_BYTES	768
 
+/*
+ * pr_macho carries one bit per packed name, in packing order: set means
+ * the image is a Mach-O container and the program is a genuine Darwin
+ * binary rather than a native style9 ELF.  A bitmap rather than a byte
+ * per entry because it costs eight bytes for the whole registry and
+ * because the question really is one bit; sixty-four is comfortably
+ * past PROGREG_MAX and the packing gives up long before then anyway.
+ *
+ * It exists so the shell can SAY which is which.  Half the programs in
+ * this registry are real Apple binaries running under a clean-room
+ * dyld, which is the most interesting fact about the list, and a list
+ * that renders them identically hides it.
+ */
+
 /* WIRE FORMAT.  ABI-stable. */
 struct svc_progreg_reply {
 	uint32_t	pr_count;	/* names packed into pr_names   */
 	uint32_t	pr_total;	/* names the registry holds     */
+	uint64_t	pr_macho;	/* bit per packed name           */
 	char		pr_names[SVC_PROGREG_BYTES];
 };
 
-_Static_assert(sizeof(struct svc_progreg_reply) == 8 + SVC_PROGREG_BYTES,
+_Static_assert(sizeof(struct svc_progreg_reply) == 16 + SVC_PROGREG_BYTES,
     "svc_progreg_reply layout pinned");
 
 /* ---- "man" service ---- */

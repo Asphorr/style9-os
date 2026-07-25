@@ -16,6 +16,7 @@
 #include "panic.h"
 #include "pmm.h"
 #include "port.h"
+#include "macho.h"
 #include "progreg.h"
 #include "sched.h"
 #include "services.h"
@@ -216,6 +217,22 @@ svc_progreg_dispatch(const struct mach_msg_header *req,
 		for (j = 0; j < need; j++)
 			r.pr_names[off++] = e->pr_name[j];
 		r.pr_names[off++] = '\0';
+
+		/*
+		 * The image's own first four bytes decide what it is --
+		 * the same sniff usermode_setup_image makes to pick a
+		 * loader, so the shell's answer cannot drift from the
+		 * kernel's.
+		 */
+		if (e->pr_size >= sizeof(uint32_t) && r.pr_count < 64) {
+			uint32_t	magic;
+
+			magic = *(const uint32_t *)(const void *)e->pr_image;
+			if (magic == MACHO_MAGIC_64 ||
+			    magic == MACHO_FAT_MAGIC ||
+			    magic == MACHO_FAT_CIGAM)
+				r.pr_macho |= 1ull << r.pr_count;
+		}
 		r.pr_count++;
 	}
 

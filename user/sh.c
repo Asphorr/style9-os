@@ -66,6 +66,7 @@
 static char	sh_progs[SVC_PROGREG_BYTES];
 static uint32_t	sh_progs_n;	/* names packed into sh_progs      */
 static uint32_t	sh_progs_total;	/* names the registry actually has */
+static uint64_t	sh_progs_macho;	/* bit per name: a real Darwin one */
 
 /*
  * The idx'th packed name, or NULL past the end.  Walking from the front
@@ -144,6 +145,7 @@ static mach_port_name_t		fg_taskport;
 #define	ESC_FG_WHITE	"\x1b[1;37m"	/* bold white -- headers, prompt */
 #define	ESC_FG_GRAY	"\x1b[0;37m"	/* default body colour          */
 #define	ESC_FG_DGRAY	"\x1b[1;30m"	/* dark gray -- rules, chrome   */
+#define	ESC_FG_CYAN	"\x1b[0;36m"	/* Mach-O, in the program list  */
 #define	ESC_CLR_SCR	"\x1b[2J\x1b[H"
 #define	ESC_SAVE_CUR	"\x1b[s"
 #define	ESC_REST_CUR	"\x1b[u"
@@ -384,6 +386,7 @@ fetch_progs(void)
 		sh_progs[i] = reply.body.pr_names[i];
 	sh_progs_n     = reply.body.pr_count;
 	sh_progs_total = reply.body.pr_total;
+	sh_progs_macho = reply.body.pr_macho;
 }
 
 static int
@@ -1090,16 +1093,26 @@ builtin_help(void)
 		return;
 	}
 
+	/*
+	 * Colour that says something.  A name in cyan is a Mach-O -- a
+	 * genuine Apple binary that comes up under the clean-room dyld --
+	 * and a name in gray is a native style9 ELF.  That split is the
+	 * most interesting fact about this list, and a grid that drew them
+	 * alike was hiding it.  The kernel decides which is which by the
+	 * image's own first four bytes, the same sniff the loader makes,
+	 * so the two cannot drift apart.
+	 */
 	col = 0;
 	off = 0;
 	for (i = 0; i < sh_progs_n; i++) {
 		name = prog_at(i);
 		if (name == NULL)
 			break;
-		if (col == 0) {
+		if (col == 0)
 			off = sh_append(row, off, sizeof(row), "   ");
-			off = sh_append(row, off, sizeof(row), ESC_FG_GRAY);
-		}
+		off = sh_append(row, off, sizeof(row),
+		    (sh_progs_macho & (1ull << i)) != 0 ?
+		    ESC_FG_CYAN : ESC_FG_GRAY);
 		off = sh_append(row, off, sizeof(row), name);
 		off = sh_pad(row, off, sizeof(row), ' ',
 		    17 - sh_visible(name));
@@ -1116,6 +1129,18 @@ builtin_help(void)
 		row[off] = '\0';
 		panel_row(row);
 	}
+	panel_sep();
+	off = 0;
+	off = sh_append(row, off, sizeof(row), "   ");
+	off = sh_append(row, off, sizeof(row), ESC_FG_CYAN);
+	off = sh_append(row, off, sizeof(row), "cyan");
+	off = sh_append(row, off, sizeof(row), ESC_FG_GRAY);
+	off = sh_append(row, off, sizeof(row),
+	    " comes up under the clean-room dyld as a Mach-O;  gray does not");
+	off = sh_append(row, off, sizeof(row), ESC_RESET);
+	row[off] = '\0';
+	panel_row(row);
+
 	if (sh_progs_total > sh_progs_n) {
 		off = 0;
 		off = sh_append(row, off, sizeof(row), "   ");
@@ -1368,12 +1393,34 @@ pager_repaint(const char *text, size_t total_lines, size_t top,
 	 * that would have reached it.
 	 */
 	for (i = top; i < end; i++) {
-		n = pager_line_len[i];
-		if (n > sizeof(row) - 1)
-			n = sizeof(row) - 1;
+		const char	*src;
+		size_t		 lead;
+
+		src  = text + pager_line_off[i];
+		n    = pager_line_len[i];
+		lead = sizeof(ESC_FG_GRAY) - 1;
+
+		/*
+		 * A manual page's section headers are the only lines that
+		 * start in column zero with a capital -- mandoc indents
+		 * everything else -- so they can be picked out and given
+		 * the weight they have on a printed page.  Cheap, and the
+		 * difference between a page you can skim and a wall.
+		 */
+		if (n > 0 && src[0] >= 'A' && src[0] <= 'Z') {
+			for (off = 0; off < lead; off++)
+				row[off] = ESC_FG_WHITE[off];
+			lead = sizeof(ESC_FG_WHITE) - 1;
+		} else {
+			for (off = 0; off < lead; off++)
+				row[off] = ESC_FG_GRAY[off];
+		}
+
+		if (n > sizeof(row) - lead - 8)
+			n = sizeof(row) - lead - 8;
 		for (off = 0; off < n; off++)
-			row[off] = text[pager_line_off[i] + off];
-		row[n] = '\0';
+			row[lead + off] = src[off];
+		row[lead + n] = '\0';
 		panel_row(row);
 	}
 	for (i = end - top; i < PAGER_SCREEN_ROWS; i++)
