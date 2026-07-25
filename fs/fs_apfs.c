@@ -129,13 +129,11 @@ static struct {
 	uint64_t	ac_bm_wholly_free;	/* (m) chunks with no bitmap */
 	uint64_t	ac_bm_disagreed;	/* (m) chunks that did not  */
 	/*
-	 * What the chunk this kernel works in contributed to those two totals
-	 * when they were taken.  Subtract it and add what the bitmap in
-	 * memory says now, and the comparison is between three numbers from
+	 * What each chunk this kernel holds contributed to those two totals is
+	 * recorded per chunk, in alloc_chunk: subtract it, add what the bitmap
+	 * in memory says now, and the comparison is between three numbers from
 	 * the same instant again.
 	 */
-	uint64_t	ac_bm_chunk_free_at_mount;	/* (m) */
-	uint64_t	ac_bm_chunk_bits_at_mount;	/* (m) */
 
 	/*
 	 * The internal pool: the blocks that describe allocation, which
@@ -150,14 +148,17 @@ static struct {
 	uint32_t	ac_ipbm_slot;		/* (c) the live one      */
 
 	/*
-	 * A chunk the allocator can work in, chosen during the walk: one that
+	 * The chunk metadata is taken from, chosen during the walk: one that
 	 * has a real bitmap (so the edit exercises the bitmap path rather than
-	 * the wholly-free shortcut) and room to spare.
+	 * the wholly-free shortcut) and room to spare.  Where its bitmap lives
+	 * NOW is the resident chunk's business, below; these are what the walk
+	 * found, which is what the pool probe checks and what the admission
+	 * starts from.
 	 */
 	bool		ac_alloc_have;		/* (m) */
 	uint64_t	ac_alloc_cib;		/* (c) its chunk-info block  */
 	uint32_t	ac_alloc_slot;		/* (m) which chunk within it */
-	uint64_t	ac_alloc_bitmap;	/* (c) */
+	uint64_t	ac_alloc_bitmap;	/* (m) where it was at mount */
 	uint64_t	ac_alloc_base;		/* (m) first block of chunk  */
 	uint32_t	ac_alloc_blocks;	/* (m) */
 } g_apfs;
@@ -185,25 +186,69 @@ static uint8_t	*g_ipbm;	/* the internal pool bitmap */
 
 /*
  * And the device's own allocation metadata, on the same terms: the chunk
- * bitmap this kernel works in, its chunk-info block, and the blocks released
- * by the checkpoint being built.  Written by alloc_flush when a checkpoint is
- * closed, and only then.
+ * bitmaps this kernel is holding, their chunk-info block, and the blocks
+ * released by the checkpoint being built.  Written by alloc_flush when a
+ * checkpoint is closed, and only then.
+ *
+ * THE BITMAPS ARE PLURAL, and that is this rung.  A chunk bitmap is one block
+ * covering thirty-two thousand blocks of container, and until now the kernel
+ * held exactly one -- the chunk the volume's metadata lives in -- which was
+ * enough while everything it allocated and everything it released was
+ * metadata.  A file's bytes are not.  In this container the only real file has
+ * its content at block 5970, in chunk 0, while the metadata being copied
+ * around it is at 98304, in chunk 3; moving those bytes therefore frees in one
+ * chunk and allocates in another within a single transaction, and a kernel
+ * holding one bitmap cannot do it.  free_blocks said exactly that, by name.
+ *
+ * So bitmaps are admitted on demand and held until the checkpoint writes them.
+ * The set is small and fixed: an admission that does not fit is refused out
+ * loud, because the alternative -- evicting a dirty bitmap mid-transaction --
+ * means copying it into the pool and copying it again on the next bit set,
+ * which is the cost the once-per-checkpoint flush exists to avoid.
  */
-static uint8_t	*g_bm;		/* the chunk bitmap          */
-static uint8_t	*g_cib;		/* its chunk-info block      */
-static bool	 g_bm_dirty;
+#define	APFS_CHUNKS_RESIDENT	4
+
+struct alloc_chunk {
+	uint8_t		*ch_bm;		/* its allocation bitmap           */
+	uint64_t	 ch_base;	/* (m) first block it covers       */
+	uint64_t	 ch_bitmap;	/* (c) where that bitmap lives now */
+	uint32_t	 ch_blocks;	/* (m) how many blocks it covers   */
+	uint32_t	 ch_slot;	/* (m) its index in the chunk-info */
+	bool		 ch_dirty;	/* (c) */
+	/*
+	 * What the chunk said the moment it was brought in, so the running
+	 * totals can have this chunk's share subtracted and the live figure put
+	 * back.  Taken at admission rather than at mount because that is when
+	 * it is certainly still untouched: nothing can change a chunk that is
+	 * not resident, every bit going through the copy above.
+	 */
+	uint32_t	 ch_free_admit;
+	uint32_t	 ch_bits_admit;
+};
+
+static struct alloc_chunk  g_chunk[APFS_CHUNKS_RESIDENT];
+static uint32_t		   g_chunk_n;	/* how many are resident     */
+static struct alloc_chunk *g_home;	/* where metadata comes from */
+static uint8_t	*g_cib;		/* the chunk-info block      */
 static uint64_t	 alloc_n_taken;	/* device blocks allocated */
 static uint64_t	 alloc_n_given;	/* ...and released         */
+static uint64_t	 chunk_n_admit;	/* bitmaps brought into memory */
 
 /*
  * The writers reach for these before the file gets to them.  Space management
  * is one subject and stays in one place, below, rather than being hoisted up
  * here a function at a time to satisfy the order a reader happens to want.
+ *
+ * alloc_blocks takes a hint: the block the caller would like to be near.  A
+ * copy that lands in the chunk it came from keeps the release reachable, and
+ * for file data it is also the difference between a file's bytes staying
+ * together and being scattered across the container a write at a time.  Zero
+ * means "anywhere", which for metadata means the chunk it already lives in.
  */
-static int	alloc_blocks(uint32_t count, uint64_t *first_out);
+static int	alloc_blocks(uint32_t count, uint64_t near, uint64_t *first_out);
 static int	free_blocks(uint64_t first, uint32_t count);
-static int	alloc_select(uint64_t near_bno);
 static int	alloc_flush(uint64_t xid);
+static struct alloc_chunk *chunk_for(uint64_t bno);
 static int	spine_update(uint64_t oid, uint64_t paddr, uint64_t xid,
 		    void *buf);
 static int	fq_insert(uint32_t q, uint64_t xid, uint64_t paddr,
@@ -844,19 +889,28 @@ ip_load(void)
 	}
 
 	/*
-	 * And the device's bitmap, for the same reason: it changes many times
-	 * per checkpoint and is written once.
+	 * And the chunk-info block, for the same reason: it changes many times
+	 * per checkpoint and is written once.  The bitmaps it names are brought
+	 * in one at a time, as blocks in their chunks are wanted -- starting
+	 * with the one metadata comes from, which is admitted here so that a
+	 * container whose allocator cannot start says so at mount rather than
+	 * at the first write.
 	 */
-	g_bm  = kmalloc(APFS_BLOCK_SIZE);
 	g_cib = kmalloc(APFS_BLOCK_SIZE);
-	if (g_bm == NULL || g_cib == NULL)
+	if (g_cib == NULL)
 		return (FS_APFS_E_NOMEM);
-	if (read_block_raw(g_apfs.ac_alloc_bitmap, g_bm) != FS_APFS_E_OK ||
-	    fs_apfs_read_block(g_apfs.ac_alloc_cib, g_cib) != FS_APFS_E_OK) {
-		kprintf("apfs: chunk bitmap %llu or chunk-info %llu would not "
-		    "read\n", (unsigned long long)g_apfs.ac_alloc_bitmap,
+	if (fs_apfs_read_block(g_apfs.ac_alloc_cib, g_cib) != FS_APFS_E_OK) {
+		kprintf("apfs: chunk-info block %llu would not read\n",
 		    (unsigned long long)g_apfs.ac_alloc_cib);
 		return (FS_APFS_E_IO);
+	}
+	if (g_apfs.ac_alloc_have) {
+		g_home = chunk_for(g_apfs.ac_alloc_base);
+		if (g_home == NULL) {
+			kprintf("apfs: the chunk metadata was to come from "
+			    "cannot be held -- nothing will be written\n");
+			g_apfs.ac_alloc_have = false;
+		}
 	}
 
 	/*
@@ -959,16 +1013,15 @@ ip_free(uint64_t bno)
  * and the space manager agreeing with them.
  */
 static void
-alloc_count_free(uint64_t count)
+alloc_count_free(const struct alloc_chunk *ch, uint64_t count)
 {
 	struct apfs_chunk_info_block	*cib;
 	struct apfs_spaceman		*sm;
 
-	if (g_cib == NULL || g_sm == NULL)
+	if (g_cib == NULL || g_sm == NULL || ch == NULL)
 		return;
 	cib = (struct apfs_chunk_info_block *)g_cib;
-	cib->cib_chunk_info[g_apfs.ac_alloc_slot].ci_free_count +=
-	    (uint32_t)count;
+	cib->cib_chunk_info[ch->ch_slot].ci_free_count += (uint32_t)count;
 	sm = sm_mem();
 	sm->sm_dev[APFS_SD_MAIN].sm_free_count += count;
 	g_apfs.ac_sm_free = sm->sm_dev[APFS_SD_MAIN].sm_free_count;
@@ -1245,13 +1298,36 @@ fq_release(uint32_t q, uint64_t upto_xid)
 	kept   = 0;
 	oldest = 0;
 	for (i = 0; i < fn.fn_nkeys; i++) {
-		uint16_t	koff;
-		uint16_t	voff;
+		struct alloc_chunk	*ch;
+		uint16_t		 koff;
+		uint16_t		 voff;
+		bool			 hold;
 
 		fq_entry(&fn, i, &koff, &voff);
 		fq_key(&fn, i, &xid, &paddr);
 		count = fq_count_at(&fn, i);
-		if (xid > upto_xid) {
+
+		/*
+		 * Two reasons to keep an entry: it is too young to let go, or
+		 * its chunk is not in reach.  The second used to drop the entry
+		 * anyway -- the block stayed marked in use with nothing left to
+		 * say who owed it, which is a leak that survives the mount.
+		 * Holding it costs a queue slot and gets another go next
+		 * checkpoint, by which time the resident set has usually moved.
+		 */
+		hold = (xid > upto_xid);
+		ch   = NULL;
+		if (!hold && q != APFS_SFQ_IP) {
+			ch = chunk_for(paddr);
+			if (ch == NULL || paddr < ch->ch_base || paddr + count >
+			    ch->ch_base + ch->ch_blocks) {
+				kprintf("apfs: queued block %llu is in a chunk "
+				    "this checkpoint cannot reach -- held\n",
+				    (unsigned long long)paddr);
+				hold = true;
+			}
+		}
+		if (hold) {
 			if (kept != i) {
 				toc[kept * 2]     = toc[i * 2];
 				toc[kept * 2 + 1] = toc[i * 2 + 1];
@@ -1273,19 +1349,12 @@ fq_release(uint32_t q, uint64_t upto_xid)
 				    (uint8_t)~(1u << (bit & 7u));
 			}
 		} else {
-			if (paddr < g_apfs.ac_alloc_base || paddr + count >
-			    g_apfs.ac_alloc_base + g_apfs.ac_alloc_blocks) {
-				kprintf("apfs: queued block %llu is outside "
-				    "the chunk -- left alone\n",
-				    (unsigned long long)paddr);
-				continue;
-			}
-			bit = paddr - g_apfs.ac_alloc_base;
+			bit = paddr - ch->ch_base;
 			for (j = 0; j < count; j++)
-				g_bm[(bit + j) >> 3] &=
+				ch->ch_bm[(bit + j) >> 3] &=
 				    (uint8_t)~(1u << ((bit + j) & 7u));
-			alloc_count_free(count);
-			g_bm_dirty = true;
+			alloc_count_free(ch, count);
+			ch->ch_dirty = true;
 		}
 		sm->sm_fq[q].sfq_count -= count;
 		fq_n_released += count;
@@ -2750,7 +2819,7 @@ fs_apfs_touch(uint64_t oid, uint64_t mtime_ns)
 	leaf_oid = o->o_oid;
 	xid      = g_apfs.ac_xid + 1;
 
-	rv = alloc_blocks(1, &new_bno);
+	rv = alloc_blocks(1, 0, &new_bno);
 	if (rv != FS_APFS_E_OK)
 		goto out;
 	o->o_xid = xid;
@@ -3083,13 +3152,22 @@ fs_apfs_init(void)
 	}
 
 	/*
-	 * Now that the volume is known, move the allocator into the chunk its
-	 * metadata lives in.  Before this the chunk was whichever the bitmap
-	 * walk met first, which is fine for taking blocks and useless for
-	 * giving the volume's own back.
+	 * Now that the volume is known, metadata comes from the chunk its own
+	 * metadata already lives in.  Before this it was whichever chunk the
+	 * bitmap walk met first, which is fine for taking blocks and useless
+	 * for keeping a copy near the thing it replaces.
 	 */
-	if (g_apfs.ac_ip_valid)
-		(void)alloc_select(g_apfs.ac_root_tree_bno);
+	if (g_apfs.ac_ip_valid) {
+		struct alloc_chunk	*ch;
+
+		ch = chunk_for(g_apfs.ac_root_tree_bno);
+		if (ch != NULL) {
+			g_home = ch;
+			kprintf("apfs: metadata comes from the chunk @%llu that "
+			    "holds the volume's own\n",
+			    (unsigned long long)ch->ch_base);
+		}
+	}
 
 	g_apfs.ac_mounted = true;
 	kprintf("apfs: mounted -- fs B-tree root @%llu, volume omap @%llu, "
@@ -3109,10 +3187,116 @@ out:
 	kfree(scratch);
 }
 
+/* The resident chunk covering `bno`, without trying to bring one in. */
+static struct alloc_chunk *
+chunk_resident(uint64_t bno)
+{
+	struct alloc_chunk	*ch;
+	uint32_t		 i;
+
+	for (i = 0; i < g_chunk_n; i++) {
+		ch = &g_chunk[i];
+		if (bno >= ch->ch_base && bno < ch->ch_base + ch->ch_blocks)
+			return (ch);
+	}
+	return (NULL);
+}
+
+/*
+ * Bring the chunk covering `bno` into memory, or say why not.
+ *
+ * A wholly free chunk has no bitmap block at all -- the format's way of saying
+ * "nothing here is taken" -- and giving it one means allocating a block for it
+ * and telling the chunk-info, which is a different operation from this one.
+ * Nothing needs it yet: everything this kernel touches is in a chunk that has
+ * a bitmap already.
+ */
+static struct alloc_chunk *
+chunk_admit(uint64_t bno)
+{
+	const struct apfs_chunk_info_block	*cib;
+	const struct apfs_chunk_info		*ci;
+	struct alloc_chunk			*ch;
+	uint32_t				 count;
+	uint32_t				 i;
+
+	if (g_cib == NULL)
+		return (NULL);
+	if (g_chunk_n >= APFS_CHUNKS_RESIDENT) {
+		kprintf("apfs: %u chunk bitmaps are held and block %llu wants "
+		    "another -- this transaction cannot reach it\n",
+		    (unsigned)g_chunk_n, (unsigned long long)bno);
+		return (NULL);
+	}
+	cib = (const struct apfs_chunk_info_block *)g_cib;
+	count = cib->cib_chunk_info_count;
+	if (count > APFS_CI_MAX_PER_CIB)
+		count = APFS_CI_MAX_PER_CIB;
+
+	for (i = 0; i < count; i++) {
+		ci = &cib->cib_chunk_info[i];
+		if (bno < ci->ci_addr || bno >= ci->ci_addr + ci->ci_block_count)
+			continue;
+		if (ci->ci_bitmap_addr == 0) {
+			kprintf("apfs: chunk @%llu is wholly free and has no "
+			    "bitmap -- making one is a different rung\n",
+			    (unsigned long long)ci->ci_addr);
+			return (NULL);
+		}
+		if (ci->ci_block_count > APFS_BLOCK_SIZE * 8u) {
+			kprintf("apfs: chunk @%llu claims %u blocks, more than "
+			    "a bitmap block holds\n",
+			    (unsigned long long)ci->ci_addr,
+			    (unsigned)ci->ci_block_count);
+			return (NULL);
+		}
+		ch = &g_chunk[g_chunk_n];
+		if (ch->ch_bm == NULL)
+			ch->ch_bm = kmalloc(APFS_BLOCK_SIZE);
+		if (ch->ch_bm == NULL)
+			return (NULL);
+		/* Raw: a bitmap is bits, with no header to check. */
+		if (read_block_raw(ci->ci_bitmap_addr, ch->ch_bm) !=
+		    FS_APFS_E_OK) {
+			kprintf("apfs: chunk bitmap %llu would not read\n",
+			    (unsigned long long)ci->ci_bitmap_addr);
+			return (NULL);
+		}
+		ch->ch_base       = ci->ci_addr;
+		ch->ch_bitmap     = ci->ci_bitmap_addr;
+		ch->ch_blocks     = ci->ci_block_count;
+		ch->ch_slot       = i;
+		ch->ch_dirty      = false;
+		ch->ch_free_admit = ci->ci_free_count;
+		ch->ch_bits_admit = bitmap_free_count(ch->ch_bm,
+		    ci->ci_block_count);
+		g_chunk_n++;
+		chunk_n_admit++;
+		kprintf("apfs: holding the chunk @%llu -- %u free of %u, "
+		    "bitmap at %llu\n", (unsigned long long)ch->ch_base,
+		    (unsigned)ci->ci_free_count, (unsigned)ch->ch_blocks,
+		    (unsigned long long)ch->ch_bitmap);
+		return (ch);
+	}
+	kprintf("apfs: no chunk in the chunk-info covers block %llu\n",
+	    (unsigned long long)bno);
+	return (NULL);
+}
+
+/* The chunk covering `bno`, admitting it if it is not already held. */
+static struct alloc_chunk *
+chunk_for(uint64_t bno)
+{
+	struct alloc_chunk	*ch;
+
+	ch = chunk_resident(bno);
+	return (ch != NULL ? ch : chunk_admit(bno));
+}
+
 /*
  * Move `count` blocks between the free and the used state, starting at bit
- * `first` of the chosen chunk: set the bits when `take` is true, clear them
- * when it is false, and move both counters the matching way.
+ * `first` of chunk `ch`: set the bits when `take` is true, clear them when it
+ * is false, and move both counters the matching way.
  *
  * COPY-ON-WRITE, and this is where the checkpoint starts paying for itself.
  * The bitmap and the chunk-info block are not written back where they came
@@ -3136,7 +3320,7 @@ out:
  * Returns 0, or a negative FS_APFS_E_*.
  */
 static int
-alloc_bits(uint32_t first, uint32_t count, bool take)
+alloc_bits(struct alloc_chunk *ch, uint32_t first, uint32_t count, bool take)
 {
 	struct apfs_chunk_info_block	*cib;
 	struct apfs_chunk_info		*ci;
@@ -3144,11 +3328,11 @@ alloc_bits(uint32_t first, uint32_t count, bool take)
 	uint32_t			 i;
 	uint32_t			 bit;
 
-	if (g_bm == NULL || g_cib == NULL || g_sm == NULL)
+	if (ch == NULL || ch->ch_bm == NULL || g_cib == NULL || g_sm == NULL)
 		return (FS_APFS_E_INVAL);
 
 	cib = (struct apfs_chunk_info_block *)g_cib;
-	ci  = &cib->cib_chunk_info[g_apfs.ac_alloc_slot];
+	ci  = &cib->cib_chunk_info[ch->ch_slot];
 	sm  = sm_mem();
 	if (take && (ci->ci_free_count < count ||
 	    sm->sm_dev[APFS_SD_MAIN].sm_free_count < count)) {
@@ -3167,17 +3351,17 @@ alloc_bits(uint32_t first, uint32_t count, bool take)
 		 * and the chunk itself have diverged, and carrying on would
 		 * put the counters out of step with the bits.
 		 */
-		if (((g_bm[bit >> 3] & (uint8_t)(1u << (bit & 7u))) != 0) ==
+		if (((ch->ch_bm[bit >> 3] & (uint8_t)(1u << (bit & 7u))) != 0) ==
 		    take) {
 			kprintf("apfs: alloc: block %llu is already %s\n",
-			    (unsigned long long)(g_apfs.ac_alloc_base + bit),
+			    (unsigned long long)(ch->ch_base + bit),
 			    take ? "taken" : "free");
 			return (FS_APFS_E_INVAL);
 		}
 		if (take)
-			g_bm[bit >> 3] |= (uint8_t)(1u << (bit & 7u));
+			ch->ch_bm[bit >> 3] |= (uint8_t)(1u << (bit & 7u));
 		else
-			g_bm[bit >> 3] &= (uint8_t)~(1u << (bit & 7u));
+			ch->ch_bm[bit >> 3] &= (uint8_t)~(1u << (bit & 7u));
 	}
 
 	if (take) {
@@ -3188,40 +3372,70 @@ alloc_bits(uint32_t first, uint32_t count, bool take)
 		sm->sm_dev[APFS_SD_MAIN].sm_free_count += count;
 	}
 	g_apfs.ac_sm_free = sm->sm_dev[APFS_SD_MAIN].sm_free_count;
-	g_bm_dirty = true;
+	ch->ch_dirty = true;
 	return (FS_APFS_E_OK);
 }
 
-/*
- * Take a run of `count` consecutive blocks, or refuse.  A block waiting in
- * the free queue is still marked in use, so this cannot pick one up.
- */
+/* A run of `count` free blocks in this one chunk, taken, or E_NOALLOC. */
 static int
-alloc_blocks(uint32_t count, uint64_t *first_out)
+alloc_run_in(struct alloc_chunk *ch, uint32_t count, uint64_t *first_out)
 {
 	uint32_t	i;
 	uint32_t	seen;
 	int		rv;
 
-	if (!g_apfs.ac_alloc_have || g_bm == NULL || count == 0)
-		return (FS_APFS_E_INVAL);
-
 	seen = 0;
-	for (i = 0; i < g_apfs.ac_alloc_blocks; i++) {
-		if ((g_bm[i >> 3] & (uint8_t)(1u << (i & 7u))) != 0) {
+	for (i = 0; i < ch->ch_blocks; i++) {
+		if ((ch->ch_bm[i >> 3] & (uint8_t)(1u << (i & 7u))) != 0) {
 			seen = 0;
 			continue;
 		}
 		if (++seen < count)
 			continue;
-		rv = alloc_bits(i + 1 - count, count, true);
+		rv = alloc_bits(ch, i + 1 - count, count, true);
 		if (rv != FS_APFS_E_OK)
 			return (rv);
-		*first_out = g_apfs.ac_alloc_base + (i + 1 - count);
+		*first_out = ch->ch_base + (i + 1 - count);
 		alloc_n_taken += count;
 		return (FS_APFS_E_OK);
 	}
-	kprintf("apfs: no run of %u free blocks in the chunk\n",
+	return (FS_APFS_E_NOALLOC);
+}
+
+/*
+ * Take a run of `count` consecutive blocks, near `near` if that can be
+ * arranged, or refuse.  A block waiting in the free queue is still marked in
+ * use, so this cannot pick one up.
+ *
+ * The hint is not cosmetic.  A copy that lands in the chunk it came from is a
+ * copy whose release is reachable in the same transaction -- and for a file's
+ * bytes it is also what keeps a file's extents from scattering one write at a
+ * time.  When the hinted chunk cannot serve, metadata's own chunk is tried,
+ * and only then does this fail.
+ */
+static int
+alloc_blocks(uint32_t count, uint64_t near, uint64_t *first_out)
+{
+	struct alloc_chunk	*ch;
+	int			 rv;
+
+	if (!g_apfs.ac_alloc_have || count == 0)
+		return (FS_APFS_E_INVAL);
+
+	ch = (near != 0) ? chunk_for(near) : NULL;
+	if (ch != NULL) {
+		rv = alloc_run_in(ch, count, first_out);
+		if (rv != FS_APFS_E_NOALLOC)
+			return (rv);
+	}
+	if (g_home == NULL)
+		return (FS_APFS_E_INVAL);
+	if (ch != g_home) {
+		rv = alloc_run_in(g_home, count, first_out);
+		if (rv != FS_APFS_E_NOALLOC)
+			return (rv);
+	}
+	kprintf("apfs: no run of %u free blocks in any chunk being held\n",
 	    (unsigned)count);
 	return (FS_APFS_E_NOALLOC);
 }
@@ -3231,17 +3445,25 @@ alloc_blocks(uint32_t count, uint64_t *first_out)
  * doing the releasing.  The bits stay set and the counters do not move --
  * the block is not free, it is spoken for by checkpoints that still name it,
  * and fq_release is the only thing that ever makes it free again.
+ *
+ * The chunk is admitted here rather than at release time so that a run this
+ * kernel cannot reach is refused by the caller that still has a choice, not by
+ * a checkpoint that has none.
  */
 static int
 free_blocks(uint64_t first, uint32_t count)
 {
-	if (!g_apfs.ac_alloc_have || g_bm == NULL)
+	struct alloc_chunk	*ch;
+
+	if (!g_apfs.ac_alloc_have)
 		return (FS_APFS_E_INVAL);
-	if (first < g_apfs.ac_alloc_base ||
-	    first + count > g_apfs.ac_alloc_base + g_apfs.ac_alloc_blocks) {
-		kprintf("apfs: free_blocks(%llu, %u) -- outside the chunk this "
-		    "kernel works in\n", (unsigned long long)first,
-		    (unsigned)count);
+	ch = chunk_for(first);
+	if (ch == NULL)
+		return (FS_APFS_E_INVAL);
+	if (first + count > ch->ch_base + ch->ch_blocks) {
+		kprintf("apfs: free_blocks(%llu, %u) runs off the end of the "
+		    "chunk @%llu\n", (unsigned long long)first, (unsigned)count,
+		    (unsigned long long)ch->ch_base);
 		return (FS_APFS_E_INVAL);
 	}
 	alloc_n_given += count;
@@ -3271,115 +3493,69 @@ static int
 alloc_flush(uint64_t xid)
 {
 	struct apfs_chunk_info_block	*cib;
+	struct alloc_chunk		*ch;
 	uint64_t			 new_bm;
 	uint64_t			 new_cib;
-	uint64_t			 old_bm;
 	uint64_t			 old_cib;
+	uint32_t			 dirty;
+	uint32_t			 i;
 
-	if (!g_bm_dirty)
+	dirty = 0;
+	for (i = 0; i < g_chunk_n; i++)
+		if (g_chunk[i].ch_dirty)
+			dirty++;
+	if (dirty == 0)
 		return (FS_APFS_E_OK);
-	if (!g_apfs.ac_ip_valid || g_sm == NULL)
+	if (!g_apfs.ac_ip_valid || g_sm == NULL || g_cib == NULL)
 		return (FS_APFS_E_INVAL);
 
-	new_bm  = ip_alloc();
-	new_cib = (new_bm != 0) ? ip_alloc() : 0;
-	if (new_bm == 0 || new_cib == 0) {
-		if (new_bm != 0)
+	/*
+	 * Every bitmap that changed moves, and the chunk-info block that names
+	 * them moves once at the end.  A chunk left clean is left where it is:
+	 * its block is still exactly what the live checkpoint believes, so
+	 * copying it would spend a pool block to say nothing.
+	 */
+	cib = (struct apfs_chunk_info_block *)g_cib;
+	for (i = 0; i < g_chunk_n; i++) {
+		ch = &g_chunk[i];
+		if (!ch->ch_dirty)
+			continue;
+		new_bm = ip_alloc();
+		if (new_bm == 0)
+			return (FS_APFS_E_NOALLOC);
+		if (write_block_raw(new_bm, ch->ch_bm) != FS_APFS_E_OK) {
+			kprintf("apfs: new bitmap %llu for the chunk @%llu "
+			    "would not write\n", (unsigned long long)new_bm,
+			    (unsigned long long)ch->ch_base);
 			ip_free(new_bm);
-		return (FS_APFS_E_NOALLOC);
+			return (FS_APFS_E_IO);
+		}
+		cib->cib_chunk_info[ch->ch_slot].ci_xid         = xid;
+		cib->cib_chunk_info[ch->ch_slot].ci_bitmap_addr = new_bm;
+		ip_free(ch->ch_bitmap);
+		ch->ch_bitmap = new_bm;
+		ch->ch_dirty  = false;
+		cow_n_meta++;
 	}
 
-	old_bm  = g_apfs.ac_alloc_bitmap;
+	new_cib = ip_alloc();
+	if (new_cib == 0)
+		return (FS_APFS_E_NOALLOC);
 	old_cib = g_apfs.ac_alloc_cib;
-	cib = (struct apfs_chunk_info_block *)g_cib;
-	cib->cib_chunk_info[g_apfs.ac_alloc_slot].ci_xid         = xid;
-	cib->cib_chunk_info[g_apfs.ac_alloc_slot].ci_bitmap_addr = new_bm;
 	cib->cib_o.o_oid = new_cib;		/* physical: oid == block */
 	cib->cib_o.o_xid = xid;
-
-	if (write_block_raw(new_bm, g_bm) != FS_APFS_E_OK ||
-	    fs_apfs_write_block(new_cib, g_cib) != FS_APFS_E_OK) {
-		kprintf("apfs: new bitmap %llu or chunk-info %llu would not "
-		    "write\n", (unsigned long long)new_bm,
+	if (fs_apfs_write_block(new_cib, g_cib) != FS_APFS_E_OK) {
+		kprintf("apfs: new chunk-info %llu would not write\n",
 		    (unsigned long long)new_cib);
-		ip_free(new_bm);
 		ip_free(new_cib);
 		return (FS_APFS_E_IO);
 	}
 
 	*(uint64_t *)(g_sm + g_apfs.ac_sm_addr_offset) = new_cib;
-	g_apfs.ac_alloc_bitmap = new_bm;
-	g_apfs.ac_alloc_cib    = new_cib;
-	ip_free(old_bm);
+	g_apfs.ac_alloc_cib = new_cib;
 	ip_free(old_cib);
-	cow_n_meta += 2;
-	g_bm_dirty = false;
+	cow_n_meta++;
 	return (FS_APFS_E_OK);
-}
-
-/*
- * Choose the chunk this kernel allocates in: the one the volume's own
- * metadata already lives in.
- *
- * Not an arbitrary preference.  A copy-on-write of a metadata block has to
- * FREE the block it replaced, and freeing means clearing a bit in that
- * block's chunk bitmap -- so a kernel holding one chunk's bitmap can only
- * release blocks from that chunk.  Allocating out of the same chunk the old
- * blocks came from is what makes the release possible at all.
- */
-static int
-alloc_select(uint64_t near_bno)
-{
-	const struct apfs_chunk_info_block	*cib;
-	const struct apfs_chunk_info		*ci;
-	uint32_t				 count;
-	uint32_t				 i;
-
-	if (g_cib == NULL || !g_apfs.ac_alloc_have)
-		return (FS_APFS_E_INVAL);
-	cib = (const struct apfs_chunk_info_block *)g_cib;
-	count = cib->cib_chunk_info_count;
-	if (count > APFS_CI_MAX_PER_CIB)
-		count = APFS_CI_MAX_PER_CIB;
-
-	for (i = 0; i < count; i++) {
-		ci = &cib->cib_chunk_info[i];
-		if (near_bno < ci->ci_addr ||
-		    near_bno >= ci->ci_addr + ci->ci_block_count)
-			continue;
-		if (ci->ci_bitmap_addr == 0) {
-			/*
-			 * A wholly free chunk has no bitmap block at all, and
-			 * making one means allocating it and telling the
-			 * chunk-info -- a different operation from the one
-			 * this rung is about.  Nothing here needs it: the
-			 * volume's metadata is in a chunk that has one.
-			 */
-			kprintf("apfs: chunk @%llu has no bitmap -- the "
-			    "allocator stays where it was\n",
-			    (unsigned long long)ci->ci_addr);
-			return (FS_APFS_E_INVAL);
-		}
-		if (ci->ci_addr == g_apfs.ac_alloc_base)
-			return (FS_APFS_E_OK);		/* already there */
-
-		g_apfs.ac_alloc_slot   = i;
-		g_apfs.ac_alloc_bitmap = ci->ci_bitmap_addr;
-		g_apfs.ac_alloc_base   = ci->ci_addr;
-		g_apfs.ac_alloc_blocks = ci->ci_block_count;
-		if (read_block_raw(g_apfs.ac_alloc_bitmap, g_bm) !=
-		    FS_APFS_E_OK)
-			return (FS_APFS_E_IO);
-		g_apfs.ac_bm_chunk_free_at_mount = ci->ci_free_count;
-		g_apfs.ac_bm_chunk_bits_at_mount = bitmap_free_count(g_bm,
-		    ci->ci_block_count);
-		kprintf("apfs: allocating in the chunk @%llu that holds the "
-		    "volume metadata -- %u free of %u\n",
-		    (unsigned long long)ci->ci_addr,
-		    (unsigned)ci->ci_free_count, (unsigned)ci->ci_block_count);
-		return (FS_APFS_E_OK);
-	}
-	return (FS_APFS_E_NOTFOUND);
 }
 
 /*
@@ -3411,7 +3587,7 @@ cow_physical(uint64_t old_bno, uint64_t xid, void *buf, uint64_t *new_bno)
 	uint64_t		 bno;
 	int			 rv;
 
-	rv = alloc_blocks(1, &bno);
+	rv = alloc_blocks(1, 0, &bno);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
 	o = (struct apfs_obj_phys *)buf;
@@ -3525,7 +3701,7 @@ spine_update(uint64_t oid, uint64_t paddr, uint64_t xid, void *buf)
 		return (rv);
 	vsb = (struct apfs_superblock *)buf;
 	vsb->apfs_omap_oid = new_vol_omap;
-	rv = alloc_blocks(1, &bno);
+	rv = alloc_blocks(1, 0, &bno);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
 	o = (struct apfs_obj_phys *)buf;
@@ -3601,11 +3777,10 @@ alloc_snapshot(uint64_t cib_bno, uint64_t bm_bno, uint64_t sm_bno,
 
 	cib = (const struct apfs_chunk_info_block *)cib_buf;
 	sm  = (const struct apfs_spaceman *)sm_buf;
-	out->as_chunk_free = cib->cib_chunk_info[g_apfs.ac_alloc_slot].
-	    ci_free_count;
+	out->as_chunk_free = cib->cib_chunk_info[g_home->ch_slot].ci_free_count;
 	out->as_dev_free   = sm->sm_dev[APFS_SD_MAIN].sm_free_count;
 	out->as_clear_bits = bitmap_free_count((const uint8_t *)bm_buf,
-	    g_apfs.ac_alloc_blocks);
+	    g_home->ch_blocks);
 	return (FS_APFS_E_OK);
 }
 
@@ -3630,15 +3805,18 @@ alloc_snap_eq(const struct alloc_snap *a, const struct alloc_snap *b)
 static int
 alloc_run_taken(uint64_t first, uint32_t count, void *bm_buf)
 {
-	const uint8_t	*bm;
-	uint64_t	 bit;
-	uint32_t	 i;
+	const struct alloc_chunk	*ch;
+	const uint8_t			*bm;
+	uint64_t			 bit;
+	uint32_t			 i;
 
-	if (fs_apfs_read_block_raw(g_apfs.ac_alloc_bitmap, bm_buf) !=
-	    FS_APFS_E_OK)
+	ch = chunk_resident(first);
+	if (ch == NULL)
+		return (-1);
+	if (fs_apfs_read_block_raw(ch->ch_bitmap, bm_buf) != FS_APFS_E_OK)
 		return (-1);
 	bm  = (const uint8_t *)bm_buf;
-	bit = first - g_apfs.ac_alloc_base;
+	bit = first - ch->ch_base;
 	for (i = 0; i < count; i++) {
 		if ((bm[(bit + i) >> 3] & (uint8_t)(1u << ((bit + i) & 7u)))
 		    == 0)
@@ -3684,6 +3862,7 @@ fs_apfs_alloc_selftest(void)
 {
 	struct alloc_snap	 base;
 	struct alloc_snap	 live;
+	struct alloc_chunk	*other;
 	void			*cib_buf;
 	void			*sm_buf;
 	void			*bm_buf;
@@ -3693,6 +3872,8 @@ fs_apfs_alloc_selftest(void)
 	uint64_t		 old_cib;
 	uint64_t		 old_sm;
 	uint64_t		 first;
+	uint64_t		 second;
+	uint64_t		 away;
 	uint32_t		 run;
 	uint32_t		 i;
 	int			 taken;
@@ -3711,7 +3892,7 @@ fs_apfs_alloc_selftest(void)
 	}
 
 	run     = 8;
-	old_bm  = g_apfs.ac_alloc_bitmap;
+	old_bm  = g_home->ch_bitmap;
 	old_cib = g_apfs.ac_alloc_cib;
 	old_sm  = g_apfs.ac_sm_paddr;
 	if (alloc_snapshot(old_cib, old_bm, old_sm, cib_buf, sm_buf, bm_buf,
@@ -3720,7 +3901,7 @@ fs_apfs_alloc_selftest(void)
 		goto out;
 	}
 
-	if (alloc_blocks(run, &first) != FS_APFS_E_OK) {
+	if (alloc_blocks(run, 0, &first) != FS_APFS_E_OK) {
 		kprintf("apfs-alloc: FAIL could not take a run of %u\n",
 		    (unsigned)run);
 		goto out;
@@ -3755,7 +3936,7 @@ fs_apfs_alloc_selftest(void)
 		    "allocation is lost, which is the correct outcome\n");
 		goto out;
 	}
-	new_bm  = g_apfs.ac_alloc_bitmap;
+	new_bm  = g_home->ch_bitmap;
 	new_cib = g_apfs.ac_alloc_cib;
 	if (new_bm == old_bm || new_cib == old_cib) {
 		kprintf("apfs-alloc: FAIL the bitmap (%llu) or chunk-info "
@@ -3813,10 +3994,77 @@ fs_apfs_alloc_selftest(void)
 		goto out;
 	}
 
+	/*
+	 * AND THE FOURTH, which is the rung this test grew for.  A file's bytes
+	 * are not where its metadata is: in this container the one real file
+	 * keeps its content in the chunk at block 0 while everything being
+	 * copied around it lives in the chunk at 98304.  Relocating those bytes
+	 * therefore takes a run in one chunk and gives one back in another,
+	 * inside a single transaction, and the two are different bitmaps -- set
+	 * apart, dirtied apart, and written apart by the checkpoint.
+	 *
+	 * Asked of a chunk that is NOT the one metadata comes from, so that
+	 * failing to reach it fails here rather than at the first write.
+	 */
+	away  = (g_home->ch_base == 0) ?
+	    g_home->ch_base + g_home->ch_blocks : 1;
+	other = chunk_for(away);
+	if (other == NULL || other == g_home) {
+		kprintf("apfs-alloc: only one chunk can be reached -- the "
+		    "half of this test about a second one is skipped\n");
+		second = 0;
+	} else {
+		if (alloc_blocks(run, away, &second) != FS_APFS_E_OK) {
+			kprintf("apfs-alloc: FAIL no run of %u in the chunk "
+			    "@%llu\n", (unsigned)run,
+			    (unsigned long long)other->ch_base);
+			goto out;
+		}
+		if (second >= g_home->ch_base &&
+		    second < g_home->ch_base + g_home->ch_blocks) {
+			kprintf("apfs-alloc: FAIL the run at %llu came out of "
+			    "the chunk metadata uses (@%llu) -- the hint was "
+			    "ignored, and a file's bytes cannot be moved where "
+			    "they are\n", (unsigned long long)second,
+			    (unsigned long long)g_home->ch_base);
+			(void)free_blocks(second, run);
+			goto out;
+		}
+		if (free_blocks(second, run) != FS_APFS_E_OK) {
+			kprintf("apfs-alloc: FAIL the run at %llu was taken "
+			    "but cannot be given back\n",
+			    (unsigned long long)second);
+			goto out;
+		}
+		for (i = 0; i <= APFS_FQ_KEEP; i++) {
+			if (fs_apfs_checkpoint() != FS_APFS_E_OK) {
+				kprintf("apfs-alloc: FAIL checkpoint %u of "
+				    "the second wait was refused\n",
+				    (unsigned)i);
+				goto out;
+			}
+		}
+		taken = alloc_run_taken(second, run, bm_buf);
+		if (taken != 0) {
+			kprintf("apfs-alloc: FAIL the run at %llu never came "
+			    "back (%d) -- a chunk that is not the one metadata "
+			    "uses was written to and not accounted\n",
+			    (unsigned long long)second, taken);
+			goto out;
+		}
+	}
+
 	kprintf("apfs-alloc: PASS -- took %u blocks at %llu, the live "
 	    "checkpoint saw nothing, the release held them for %u "
 	    "checkpoints, then the queue let them go\n", (unsigned)run,
 	    (unsigned long long)first, (unsigned)APFS_FQ_KEEP);
+	if (second != 0)
+		kprintf("apfs-alloc: and %u more at %llu, in the chunk @%llu "
+		    "rather than the chunk @%llu metadata comes from -- two "
+		    "bitmaps, taken and returned apart\n", (unsigned)run,
+		    (unsigned long long)second,
+		    (unsigned long long)other->ch_base,
+		    (unsigned long long)g_home->ch_base);
 	kprintf("apfs-alloc: metadata moved -- bitmap %llu -> %llu, "
 	    "chunk-info %llu -> %llu, pool bitmap in ring slot %u\n",
 	    (unsigned long long)old_bm, (unsigned long long)new_bm,
@@ -4551,17 +4799,23 @@ fs_apfs_stats(void)
 	 * go of blocks the container arrived with.  So when the bitmap and
 	 * the chunk-info are in memory, all three come from there.
 	 */
-	if (g_bm != NULL && g_cib != NULL) {
+	if (g_chunk_n != 0 && g_cib != NULL) {
 		const struct apfs_chunk_info_block	*mcib;
+		const struct alloc_chunk		*ch;
 		uint64_t				 said;
 		uint64_t				 bits;
+		uint32_t				 i;
 
 		mcib = (const struct apfs_chunk_info_block *)g_cib;
-		said = g_apfs.ac_bm_free_said - g_apfs.ac_bm_chunk_free_at_mount
-		    + mcib->cib_chunk_info[g_apfs.ac_alloc_slot].ci_free_count;
-		bits = g_apfs.ac_bm_free_counted -
-		    g_apfs.ac_bm_chunk_bits_at_mount +
-		    bitmap_free_count(g_bm, g_apfs.ac_alloc_blocks);
+		said = g_apfs.ac_bm_free_said;
+		bits = g_apfs.ac_bm_free_counted;
+		for (i = 0; i < g_chunk_n; i++) {
+			ch    = &g_chunk[i];
+			said += mcib->cib_chunk_info[ch->ch_slot].ci_free_count;
+			said -= ch->ch_free_admit;
+			bits += bitmap_free_count(ch->ch_bm, ch->ch_blocks);
+			bits -= ch->ch_bits_admit;
+		}
 		kprintf("apfs: free blocks -- spaceman %llu, chunks %llu, "
 		    "clear bits %llu -- %s\n",
 		    (unsigned long long)g_apfs.ac_sm_free,
