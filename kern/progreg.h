@@ -25,7 +25,13 @@
  * SYS_SPAWN ABI does not move.
  */
 
-#define	PROGREG_MAX		40
+/*
+ * Room for the registered programs.  Raised from 40 the moment 40 was not
+ * enough, which is the whole reason register_one panics on a full table
+ * instead of dropping the last entry: a program that silently failed to
+ * register would have looked like a program that failed to LOAD.
+ */
+#define	PROGREG_MAX		48
 #define	PROGREG_NAME_MAX	24
 
 /*

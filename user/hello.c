@@ -2120,6 +2120,90 @@ demo_darwin_spawn(void)
 	}
 
 	/*
+	 * ttyprobe: the probe for the rung where the terminal can be TOLD
+	 * something.  The one keystroke fed here is the whole reason this is
+	 * driven from a program rather than run on its own: it is ONE BYTE
+	 * WITH NO NEWLINE, which a canonical terminal is obliged to hold in
+	 * its line buffer forever.  The probe reads it, and that read is the
+	 * proof from ring 3 that the discipline stopped being line-based.
+	 *
+	 * The feed goes in BEFORE the spawn because a session ending takes its
+	 * script with it, and the probe's own session is the one that must
+	 * find this.
+	 */
+	{
+		mach_port_name_t	tprobe_tp;
+
+		tprobe_tp = MACH_PORT_NULL;
+		printf("  >>> spawning ttyprobe -- the terminal, from ring 3 "
+		    "(tcgetattr / tcsetattr / TIOCGWINSZ / raw) <<<\n");
+		(void)cons_feed("q", 1);
+		child_id = spawn_args("ttyprobe", 0, NULL, &tprobe_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('ttyprobe') failed (rv=%ld)\n",
+			    child_id);
+			return (97);
+		}
+		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
+			(void)yield();
+		printf("  ttyprobe retired after %d yields\n", i);
+	}
+
+	/*
+	 * gstty, the TENTH real Apple binary, and the oracle for the rung the
+	 * probe above just de-risked.  `stty -a` reads the entire termios and
+	 * prints every flag in the words a Mac prints them in; `stty -echo`
+	 * then CHANGES our terminal and `stty sane` puts it back, so genuine
+	 * Apple code drives both directions of tcsetattr.  Nothing was written
+	 * to make this work -- it is the same binary Homebrew ships.
+	 */
+	{
+		mach_port_name_t	 stty_tp;
+		char			*stty_argv[3];
+
+		stty_argv[0] = "gstty";
+		stty_argv[1] = "-a";
+		stty_argv[2] = NULL;
+		stty_tp = MACH_PORT_NULL;
+		printf("  >>> gstty -a -- a REAL Apple binary READING OUR "
+		    "TERMINAL <<<\n");
+		child_id = spawn_args("gstty", 2, stty_argv, &stty_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('gstty -a') failed (rv=%ld)\n",
+			    child_id);
+			return (98);
+		}
+		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
+			(void)yield();
+		printf("  gstty[-a] retired after %d yields\n", i);
+
+		stty_argv[1] = "-echo";
+		stty_tp = MACH_PORT_NULL;
+		printf("  >>> gstty -echo -- and now CHANGING it <<<\n");
+		child_id = spawn_args("gstty", 2, stty_argv, &stty_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('gstty -echo') failed (rv=%ld)\n",
+			    child_id);
+			return (98);
+		}
+		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
+			(void)yield();
+		printf("  gstty[-echo] retired after %d yields\n", i);
+
+		stty_argv[1] = "sane";
+		stty_tp = MACH_PORT_NULL;
+		child_id = spawn_args("gstty", 2, stty_argv, &stty_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('gstty sane') failed (rv=%ld)\n",
+			    child_id);
+			return (98);
+		}
+		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
+			(void)yield();
+		printf("  gstty[sane] retired after %d yields\n", i);
+	}
+
+	/*
 	 * A THIRD real Apple binary: guname (GNU coreutils' uname).  The
 	 * machine-identity trick -- it asks uname(2) what it is running on and
 	 * prints the answer, never validating it.  Our kernel hands back a

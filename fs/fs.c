@@ -1500,6 +1500,59 @@ out:
 #define	SELFTEST_MADE		"/etc/made.txt"
 #define	SELFTEST_MADE_MARK	"style9 made this file from nothing.\n"
 
+/*
+ * Take every name out of a directory, so a fixture somebody else has written
+ * into can still be used.  Always removes entry ZERO rather than walking an
+ * index up: the listing is a live view of a tree that this loop is editing,
+ * and an index into it stops meaning what it meant the moment one goes.
+ *
+ * Returns false having said why -- a directory that will not empty is a bug in
+ * the writer, which is exactly the thing this must not swallow.
+ */
+static int
+dir_clear(const char *path, int held)
+{
+	struct fs_dirent	de;
+	char			full[FS_NAME_MAX];
+	size_t			dlen;
+	size_t			i;
+	int			gone;
+	int			rv;
+
+	dlen = slen(path);
+	for (gone = 0; gone < held + 1; gone++) {
+		rv = fs_readdir(path, 0, &de);
+		if (rv == 0)
+			break;			/* empty now */
+		if (rv < 0) {
+			kprintf("apfs-dirs: FAIL cannot list %s while "
+			    "clearing it\n", path);
+			return (0);
+		}
+		if (dlen + 1 + slen(de.fde_name) + 1 > sizeof(full)) {
+			kprintf("apfs-dirs: FAIL %s/%s is too long a name to "
+			    "remove\n", path, de.fde_name);
+			return (0);
+		}
+		for (i = 0; i < dlen; i++)
+			full[i] = path[i];
+		full[dlen] = '/';
+		for (i = 0; de.fde_name[i] != '\0'; i++)
+			full[dlen + 1 + i] = de.fde_name[i];
+		full[dlen + 1 + i] = '\0';
+		rv = de.fde_is_dir ? fs_rmdir(full) : fs_unlink(full);
+		if (rv != FS_E_OK) {
+			kprintf("apfs-dirs: FAIL cannot take %s out of %s "
+			    "(rv=%d)\n", de.fde_name, path, rv);
+			return (0);
+		}
+	}
+	kprintf("apfs-dirs: %s came back holding %d name(s) this test did not "
+	    "make -- somebody has been using this volume, which is what it is "
+	    "for; cleared\n", path, held);
+	return (1);
+}
+
 /* How many names a directory holds, and whether one of them is `want`. */
 static int
 dir_count(const char *path, const char *want, int *saw_want)
@@ -1779,10 +1832,7 @@ fs_dirs_selftest(void)
 
 	if (had) {
 		/*
-		 * What a power cycle ago made and left.  Empty is part of the
-		 * claim: the boot that made it put a name in and took it out
-		 * again, so a directory that comes back holding one means the
-		 * removal did not reach the disk.
+		 * What a power cycle ago made and left.
 		 */
 		if (!st.fs_is_dir || st.fs_size != 0) {
 			kprintf("apfs-dirs: FAIL %s came back as %s of %llu "
@@ -1791,12 +1841,33 @@ fs_dirs_selftest(void)
 			    "a file", (unsigned long long)st.fs_size);
 			return;
 		}
+		/*
+		 * IT MAY NOT COME BACK EMPTY, AND THAT IS NOT A FAILURE.
+		 *
+		 * This used to insist on empty, on the reasoning that the boot
+		 * which made it put a name in and took the name out, so
+		 * anything left meant a removal had not reached the disk.  That
+		 * reasoning held for exactly as long as nothing but this test
+		 * could write to the volume.  A person typing
+		 * `> /etc/madedir/hi.txt` at a real Apple shell -- which this
+		 * system now invites -- was enough to make the NEXT boot report
+		 * a regression that had not happened, and a test that cries
+		 * wolf about its own users is worse than one check short.
+		 *
+		 * So what survives the reboot is the claim worth making: the
+		 * directory is still a directory, it still lists, and whatever
+		 * it holds can still be taken out of it.  The names are cleared
+		 * and counted out loud, because a directory that will not empty
+		 * IS our bug.
+		 */
 		held = dir_count(SELFTEST_DIRS, NULL, NULL);
-		if (held != 0) {
-			kprintf("apfs-dirs: FAIL %s came back holding %d "
-			    "name(s)\n", SELFTEST_DIRS, held);
+		if (held < 0) {
+			kprintf("apfs-dirs: FAIL cannot list %s\n",
+			    SELFTEST_DIRS);
 			return;
 		}
+		if (held > 0 && !dir_clear(SELFTEST_DIRS, held))
+			return;
 
 		count = fs_apfs_dirkills();
 		rv = fs_rmdir(SELFTEST_DIRS);

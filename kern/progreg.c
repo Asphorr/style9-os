@@ -215,6 +215,27 @@ extern uint8_t	_binary_filewrite_macho_start[];
 extern uint8_t	_binary_filewrite_macho_end[];
 
 /*
+ * ttyprobe: the same kind of probe once more, for the terminal itself.  The
+ * console echoed and edited a line from the day it existed; what it could not
+ * do was be TOLD to stop -- so this checks that a raw setting reaches the
+ * kernel and reads back, that a file and a pipe answer ENOTTY, that the window
+ * size is the screen's, and that a keystroke with no newline behind it reaches
+ * a reader at all, which canonical mode makes impossible by design.
+ */
+extern uint8_t	_binary_ttyprobe_macho_start[];
+extern uint8_t	_binary_ttyprobe_macho_end[];
+
+/*
+ * A TENTH real Apple binary: gstty (GNU coreutils' stty).  Every other binary
+ * here treats the terminal as somewhere to print; this one treats it as the
+ * subject.  It reads the whole termios, names each flag, and sets them back --
+ * so a rung whose oracle is usually our own printf gets an oracle that is
+ * genuine Apple code, printing OUR terminal's settings in the words a Mac uses.
+ */
+extern uint8_t	_binary_gstty_macho_start[];
+extern uint8_t	_binary_gstty_macho_end[];
+
+/*
  * A fourth REAL Apple binary: gfactor (GNU coreutils' factor, a Homebrew
  * bottle).  Unlike the libSystem-only binaries above, it also links libgmp --
  * the first program to drive a SECOND dependency, so our dyld maps the whole
@@ -373,6 +394,10 @@ progreg_init(void)
 	    _binary_mmaptest_macho_start, _binary_mmaptest_macho_end);
 	register_one("filewrite",
 	    _binary_filewrite_macho_start, _binary_filewrite_macho_end);
+	register_one("ttyprobe",
+	    _binary_ttyprobe_macho_start, _binary_ttyprobe_macho_end);
+	register_one("gstty",
+	    _binary_gstty_macho_start, _binary_gstty_macho_end);
 	register_one("gfactor",
 	    _binary_gfactor_macho_start, _binary_gfactor_macho_end);
 	register_one("pipefork",

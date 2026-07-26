@@ -195,6 +195,8 @@ OBJS	= \
 	$(OBJDIR)/timeprobe_macho.o \
 	$(OBJDIR)/mmaptest_macho.o \
 	$(OBJDIR)/filewrite_macho.o \
+	$(OBJDIR)/ttyprobe_macho.o \
+	$(OBJDIR)/gstty_macho.o \
 	$(OBJDIR)/tree_macho.o \
 	$(OBJDIR)/guname_macho.o \
 	$(OBJDIR)/gcat_macho.o \
@@ -519,6 +521,28 @@ $(OBJDIR)/filewrite.dwn.o: $(USER_DIR)/filewrite.c | $(OBJDIR)
 $(OBJDIR)/filewrite.macho: $(OBJDIR)/filewrite.dwn.o $(OBJDIR)/libSystem.B.dylib
 	$(DARWIN_LD) $(DARWIN_LDF) -o $@ $< -L$(OBJDIR) -lSystem.B -e _entry \
 	    -pagezero_size $(DYLDHELLO_BASE)
+
+# ttyprobe (terminal probe): the same shape again, for the rung where the
+# terminal can be TOLD something.  Checks that a fresh terminal is canonical
+# with echo, that a file and a pipe both answer ENOTTY, that a raw setting
+# READS BACK (so the kernel kept it rather than libSystem pretending), that
+# VMIN=0 turns a read into a poll, and that one fed byte with no newline
+# behind it arrives anyway -- de-risking termios before stty depends on it.
+$(OBJDIR)/ttyprobe.dwn.o: $(USER_DIR)/ttyprobe.c | $(OBJDIR)
+	$(DARWIN_CC) $(DARWIN_CFLAGS) -c $< -o $@
+
+$(OBJDIR)/ttyprobe.macho: $(OBJDIR)/ttyprobe.dwn.o $(OBJDIR)/libSystem.B.dylib
+	$(DARWIN_LD) $(DARWIN_LDF) -o $@ $< -L$(OBJDIR) -lSystem.B -e _entry \
+	    -pagezero_size $(DYLDHELLO_BASE)
+
+# gstty: the TENTH real Apple x86-64 macOS CLI binary (GNU coreutils 9.11's
+# stty, from the same Homebrew bottle as gls/gcat/genv, vendored in extern/).
+# The others read files, walk directories or compute; this one does nothing but
+# interrogate and reconfigure the TERMINAL -- tcgetattr, tcsetattr and
+# TIOCGWINSZ are its entire trade -- so it is the exact oracle for the rung it
+# arrives on, and it needs no dylib we did not already have.
+$(OBJDIR)/gstty.macho: extern/gstty.macho | $(OBJDIR)
+	cp $< $@
 
 # pipefork (multi-process probe): a self-authored Darwin-ABI binary that
 # exercises fork/execve/wait4/pipe/dup2 through our libSystem -- the probe that

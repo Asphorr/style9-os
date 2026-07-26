@@ -52,7 +52,7 @@ so a flat `fs/` had stopped saying which files belonged to what.
 | usermode | `arch/amd64/usermode.c` | per-task PML4 staged at task creation; the launcher sniffs the image's 4-byte magic and routes ELF to `elf_load` or Mach-O to `macho_load` (shared `(task, image, size, &entry)` contract, shared argv/stack/port-injection path); `iretq` lands at the entry RIP with a fresh user stack |
 | elf loader | `kern/elf.c` | static ELF64 parser.  Walks PT_LOAD program headers, allocates 4 KiB user pages and maps them via the task's pmap with R/W/X taken from p_flags, copies file data via `pmm_kva_from_pa` of the freshly-allocated frame |
 | macho loader | `kern/macho.c`, `tools/elf2macho.c` | XNU binary compat, S1: thin x86-64 Mach-O + fat/universal slice picker, mapping each `LC_SEGMENT_64` the way the ELF loader maps PT_LOAD and resolving the entry from `LC_UNIXTHREAD`/`LC_MAIN`.  The build host has no Darwin cross-toolchain, so the host tool `elf2macho` rewraps a style9 ELF into a spec-shaped Mach-O; `-Ikern` shares the wire structs so loader and converter never drift |
-| darwin abi | `kern/darwin.c` | XNU binary compat, S2/S3: a per-task syscall personality, through which **ring 3 can now change the disk** -- `open(2)` honours `O_CREAT`/`O_TRUNC`/`O_APPEND`, `write(2)` on a file descriptor reaches the APFS writer, `unlink(2)` takes a name back out, `mkdir(2)`/`rmdir(2)` make and remove a directory (the mode argument is taken and dropped, said out loud: there is no umask to subtract one from and no chmod to correct it afterwards), and a real Apple `dash` redirecting with `>` makes a file that survives the machine being switched off.  A Mach-O carrying an `LC_BUILD_VERSION` for macOS is tagged `TASK_PERSONALITY_DARWIN`, and `syscall_dispatch` routes it to `darwin_dispatch`, which decodes Apple's class-encoded `%rax` -- class 2 = BSD `write`/`getpid`/`exit` with the carry-flag errno convention; class 1 = Mach `task_self_trap`/`mach_reply_port`/`mach_msg` traps -- and translates each onto the style9 primitive.  The `mach_msg` trap drives the kernel's existing message queue, so a Darwin task does real IPC; the native style9 syscall table is left untouched |
+| darwin abi | `kern/darwin.c` | XNU binary compat, S2/S3: a per-task syscall personality, through which **ring 3 can now change the disk** -- `open(2)` honours `O_CREAT`/`O_TRUNC`/`O_APPEND`, `write(2)` on a file descriptor reaches the APFS writer, `unlink(2)` takes a name back out, `mkdir(2)`/`rmdir(2)` make and remove a directory (the mode argument is taken and dropped, said out loud: there is no umask to subtract one from and no chmod to correct it afterwards), and a real Apple `dash` redirecting with `>` makes a file that survives the machine being switched off.  **The terminal can be told what to do**: `ioctl(2)` at 54 carries `TIOCGETA`/`TIOCSETA`/`TIOCGWINSZ`, the kernel keeps a `struct termios` in Apple's exact layout (asserted, not assumed -- the size is encoded in the ioctl number), and the line discipline asks the flags instead of assuming them, so a program that turns ICANON and ECHO off reads one keystroke with no Return behind it.  A file and a pipe answer ENOTTY, which is what `isatty(3)` is built out of.  A Mach-O carrying an `LC_BUILD_VERSION` for macOS is tagged `TASK_PERSONALITY_DARWIN`, and `syscall_dispatch` routes it to `darwin_dispatch`, which decodes Apple's class-encoded `%rax` -- class 2 = BSD `write`/`getpid`/`exit` with the carry-flag errno convention; class 1 = Mach `task_self_trap`/`mach_reply_port`/`mach_msg` traps -- and translates each onto the style9 primitive.  The `mach_msg` trap drives the kernel's existing message queue, so a Darwin task does real IPC; the native style9 syscall table is left untouched |
 | progreg | `kern/progreg.c` | "program registry" -- two dozen user programs embedded in the kernel image via objcopy, delivered as ELF or (for the Mach-O loader + Darwin demos) Mach-O containers.  `progreg_spawn(name)` creates a task and loads the matching image into it; `SYS_SPAWN` is the userspace door |
 | traps | `arch/amd64/idt.c`, `intr.c`, `isr.S` | 48-vector IDT, trap-frame dispatcher, symbolicated autopsy on exception |
 | irqs | `arch/amd64/pic.c`, `pit.c` | 8259 remap to 0x20/0x28, PIT @ 100 Hz with quantum tracking |
@@ -389,6 +389,29 @@ its mode must agree, and it is counted in `apfs_num_directories` --
 which, unlike `apfs_num_files`, is checked.  So both pairs are one
 function with a question in it rather than two that agree today.
 
+The terminal can now be TOLD something.  The console has echoed, edited a
+line and turned Ctrl-C into a signal since the day it existed, but all of
+it was fixed at compile time: `tcgetattr` answered ENOTTY on purpose,
+because there was nothing behind it.  There is now -- a `struct termios`
+the kernel keeps, `ioctl(2)` at 54 with `TIOCGETA` / `TIOCSETA` /
+`TIOCGWINSZ`, and a line discipline that ASKS about each thing it does
+instead of assuming it.  A program can turn ICANON and ECHO off and read
+one keystroke with no Return behind it, which is the entire admission
+price for full-screen software.  The layout is not guessed: Darwin
+encodes the argument's size into the ioctl number, `TIOCGETA` is
+`0x40487413`, and the `_Static_assert` that `struct termios` is 0x48
+bytes is that arithmetic made by the compiler.
+
+`ttyprobe` de-risks it from ring 3 the way `dirlist`, `pipefork` and
+`filewrite` did their rungs -- a file and a pipe must answer ENOTTY, a
+raw setting must READ BACK (or the kernel never kept it), `VMIN=0` must
+turn a read into a poll, and one fed byte with no newline behind it must
+arrive anyway.  Then **gstty**, GNU coreutils' `stty` and the tenth real
+Apple binary, prints our terminal in a Mac's own words (`speed 38400
+baud; rows 25; columns 80; ... isig icanon iexten echo echoe echok`) and
+changes it back and forth with `-echo` and `sane`.  It needed no dylib
+that was not already here.
+
 Next on the roadmap: **a create that splits and retries** the way growing
 a file does.  It is the one edge both making calls document out loud and
 then refuse at: records go into two leaves at once, and a split moves
@@ -413,8 +436,9 @@ unmodified Apple binaries run -- a filesystem on `dev/disk0`,
 virtual-copy OOL semantics, files that can be created and removed, a
 B-tree that grows a level, a file whose records need not share a leaf, a
 real Apple shell redirecting into a file, nodes that leave the tree when
-they empty, and directories that can be made and removed were all on this
-list once and have since landed.)
+they empty, directories that can be made and removed, and a terminal a
+program can put into raw mode were all on this list once and have since
+landed.)
 
 ## License
 

@@ -166,6 +166,82 @@ static uint32_t	darwin_cons_script_len;			/* (c) */
 static uint32_t	darwin_cons_script_off;			/* (c) */
 
 /*
+ * WHAT THE TERMINAL HAS BEEN TOLD.
+ *
+ * Until this, the discipline above was canonical because it was written that
+ * way -- the comment on it said as much: the only mode worth having before
+ * there is a tcsetattr to leave it with.  This is that tcsetattr's other end.
+ * The flags are not decoration: a full-screen program's first act is to turn
+ * ICANON and ECHO off, and until it can, every one of them is locked out.
+ *
+ * One terminal, one setting, no per-descriptor copy.  That is not a
+ * simplification of Unix -- it is Unix: the state belongs to the DEVICE, which
+ * is why two shells sharing a terminal fight over it, and why `stty` run from
+ * one of them changes what the other sees.
+ *
+ * Guarded by darwin_cons_lock: the discipline reads these on the producer's
+ * thread while an ioctl may be writing them on the consumer's.
+ */
+static struct darwin_termios	darwin_cons_tio;	/* (c) */
+
+/*
+ * A terminal nobody has configured, which is the state a session starts in and
+ * the state one that ends must be put back into.  Real Unix does NOT do the
+ * putting back -- that is why a program killed in raw mode leaves a shell
+ * typing blind and why `reset` exists -- but here the console has exactly one
+ * claimant at a time, and a wedged terminal would need a REBOOT to clear.  So
+ * darwin_cons_release restores this, and that is a deliberate difference,
+ * written down rather than discovered.
+ */
+static void
+darwin_cons_tio_default(struct darwin_termios *t)
+{
+	uint32_t	i;
+
+	t->c_iflag = DARWIN_BRKINT | DARWIN_ICRNL | DARWIN_IXON |
+	    DARWIN_IMAXBEL;
+	t->c_oflag = DARWIN_OPOST | DARWIN_ONLCR;
+	t->c_cflag = DARWIN_CS8 | DARWIN_CREAD | DARWIN_CLOCAL;
+	t->c_lflag = DARWIN_ICANON | DARWIN_ISIG | DARWIN_IEXTEN |
+	    DARWIN_ECHO | DARWIN_ECHOE | DARWIN_ECHOK | DARWIN_ECHOKE;
+	for (i = 0; i < DARWIN_NCCS; i++)
+		t->c_cc[i] = 0xFF;		/* _POSIX_VDISABLE */
+	for (i = 0; i < sizeof(t->c_pad); i++)
+		t->c_pad[i] = 0;
+	t->c_cc[DARWIN_VEOF]   = DARWIN_CONS_EOT;	/* ^D */
+	t->c_cc[DARWIN_VERASE] = DARWIN_CONS_DEL;	/* ^? */
+	t->c_cc[DARWIN_VKILL]  = 0x15;			/* ^U */
+	t->c_cc[DARWIN_VINTR]  = DARWIN_CONS_INTR;	/* ^C */
+	t->c_cc[DARWIN_VQUIT]  = 0x1C;	/* ^\ */
+	t->c_cc[DARWIN_VSUSP]  = 0x1A;	/* ^Z */
+	t->c_cc[DARWIN_VSTART] = 0x11;	/* ^Q */
+	t->c_cc[DARWIN_VSTOP]  = 0x13;	/* ^S */
+	t->c_cc[DARWIN_VMIN]   = 1;
+	t->c_cc[DARWIN_VTIME]  = 0;
+	t->c_ispeed = DARWIN_B38400;
+	t->c_ospeed = DARWIN_B38400;
+}
+
+static bool	darwin_cons_tio_ready;			/* (c) */
+
+/*
+ * The settings, made real on first use.  A boot-time init hook would do the
+ * same job and would be one more thing a future caller could arrive before;
+ * asking for the settings is the only way to reach them, so the question is
+ * the safest place to answer it.  Caller holds darwin_cons_lock.
+ */
+static struct darwin_termios *
+darwin_cons_tio_locked(void)
+{
+
+	if (!darwin_cons_tio_ready) {
+		darwin_cons_tio_default(&darwin_cons_tio);
+		darwin_cons_tio_ready = true;
+	}
+	return (&darwin_cons_tio);
+}
+
+/*
  * What the terminal did.  vo_n_wait is the one that earns its keep: it counts
  * trips round the wait loop that produced nothing, which is the same number
  * in either implementation and therefore the honest way to compare them.  A
@@ -771,11 +847,17 @@ darwin_cons_deliver_locked(void)
 /*
  * One character arriving at the terminal: the line discipline.
  *
- * Canonical mode, which is the mode every one of these binaries expects and
- * the only one worth having before there is a tcsetattr to leave it with.
  * Echo happens HERE, as the key arrives, not where the line is consumed --
  * that is the difference between a terminal and a queue, and it is why a
  * shell that is busy running a command still shows what you type at it.
+ *
+ * WHICH OF THESE THINGS HAPPEN IS NOW ASKED, not assumed.  This used to be
+ * canonical mode because it was written that way; every branch below that
+ * edits, echoes or signals is now conditional on the flag that governs it, so
+ * a program that turns ICANON and ECHO off gets what it asked for: raw bytes,
+ * one at a time, nothing printed.  The three questions are separate on purpose
+ * -- programs use all four combinations, and a "raw mode" boolean would have
+ * tied echo to editing to signals and served none of them exactly.
  *
  * Returns with the wake, if one is owed, left to the caller: a reader is
  * woken outside the lock, never under it.
@@ -783,11 +865,60 @@ darwin_cons_deliver_locked(void)
 static struct thread *
 darwin_cons_input_locked(char c, bool *intr_out)
 {
-	struct thread	*w;
+	struct darwin_termios	*tio;
+	struct thread		*w;
 
 	*intr_out = false;
-	switch (c) {
-	case DARWIN_CONS_INTR:
+	tio = darwin_cons_tio_locked();
+
+	/*
+	 * Not canonical: the byte is the message.  No editing, no line to
+	 * accumulate, and the reader is owed a wake for every single character
+	 * rather than for every line -- which is the whole point, since a
+	 * program in this mode is waiting on one keystroke.
+	 *
+	 * ISIG survives ICANON going away; they are independent flags and a
+	 * pager that wants raw keys usually still wants Ctrl-C to work.  So the
+	 * signal characters are tested first, out of c_cc rather than from the
+	 * constants, because a program is allowed to move them.
+	 */
+	if ((tio->c_lflag & DARWIN_ICANON) == 0) {
+		if ((tio->c_lflag & DARWIN_ISIG) != 0 &&
+		    (uint8_t)c == tio->c_cc[DARWIN_VINTR]) {
+			darwin_cons_line_len = 0;
+			*intr_out = true;
+			w = darwin_cons_waiter;
+			darwin_cons_waiter = NULL;
+			return (w);
+		}
+		if (darwin_cons_line_len >= DARWIN_CONS_LINE)
+			darwin_cons_deliver_locked();
+		darwin_cons_line[darwin_cons_line_len++] = c;
+		darwin_cons_deliver_locked();
+		if ((tio->c_lflag & DARWIN_ECHO) != 0)
+			tty_putc(c);
+		w = darwin_cons_waiter;
+		darwin_cons_waiter = NULL;
+		return (w);
+	}
+
+	/*
+	 * Canonical mode.  What follows was a switch on constants; it is a
+	 * chain of comparisons against c_cc because those are VARIABLES now --
+	 * a program may move its interrupt character, and one that does would
+	 * be answered by a switch that still knew only 0x03.
+	 *
+	 * Input mapping comes first: with ICRNL set -- the default, and what
+	 * every one of these programs is built for -- the Return key's carriage
+	 * return IS a newline by the time anything else looks at it.  With it
+	 * cleared, a bare CR is an ordinary byte and only LF ends a line, which
+	 * is what a program that cleared it asked for.
+	 */
+	if (c == '\r' && (tio->c_iflag & DARWIN_ICRNL) != 0)
+		c = '\n';
+
+	if ((tio->c_lflag & DARWIN_ISIG) != 0 &&
+	    (uint8_t)c == tio->c_cc[DARWIN_VINTR]) {
 		/*
 		 * Ctrl-C discards what was typed and signals.  Discarding is
 		 * the part that is easy to leave out and wrong to: the line
@@ -808,9 +939,7 @@ darwin_cons_input_locked(char c, bool *intr_out)
 		tty_putc('C');
 		tty_putc('\n');
 		*intr_out = true;
-		break;
-
-	case DARWIN_CONS_EOT:
+	} else if ((uint8_t)c == tio->c_cc[DARWIN_VEOF]) {
 		/*
 		 * Ctrl-D delivers what is typed so far WITHOUT a newline; on
 		 * an empty line that is a zero-byte read, which is exactly
@@ -821,27 +950,42 @@ darwin_cons_input_locked(char c, bool *intr_out)
 			darwin_cons_eof = true;
 		else
 			darwin_cons_deliver_locked();
-		break;
-
-	case DARWIN_CONS_ERASE:
-	case DARWIN_CONS_DEL:
+	} else if ((uint8_t)c == tio->c_cc[DARWIN_VERASE] ||
+	    c == DARWIN_CONS_ERASE) {
+		/*
+		 * Two keys, one meaning.  VERASE is one character and it is
+		 * DEL by default, but this keyboard driver sends backspace for
+		 * the key labelled backspace, and a terminal that rubbed out
+		 * on only one of them would be wrong for half the hardware
+		 * that reaches it.
+		 */
 		if (darwin_cons_line_len == 0)
 			return (NULL);		/* nothing to rub out */
 		darwin_cons_line_len--;
-		tty_putc('\b');
-		tty_putc(' ');
-		tty_putc('\b');
+		if ((tio->c_lflag & DARWIN_ECHOE) != 0) {
+			tty_putc('\b');
+			tty_putc(' ');
+			tty_putc('\b');
+		}
 		return (NULL);
-
-	case '\r':
-	case '\n':
+	} else if ((uint8_t)c == tio->c_cc[DARWIN_VKILL]) {
+		/* Ctrl-U: the whole line goes, and is seen to go. */
+		while (darwin_cons_line_len > 0) {
+			darwin_cons_line_len--;
+			if ((tio->c_lflag & DARWIN_ECHOKE) != 0) {
+				tty_putc('\b');
+				tty_putc(' ');
+				tty_putc('\b');
+			}
+		}
+		return (NULL);
+	} else if (c == '\n') {
 		if (darwin_cons_line_len < DARWIN_CONS_LINE)
 			darwin_cons_line[darwin_cons_line_len++] = '\n';
-		tty_putc('\n');
+		if ((tio->c_lflag & (DARWIN_ECHO | DARWIN_ECHONL)) != 0)
+			tty_putc('\n');
 		darwin_cons_deliver_locked();
-		break;
-
-	default:
+	} else {
 		if (c < 0x20 && c != '\t')
 			return (NULL);		/* not a key we render */
 		if (darwin_cons_line_len >= DARWIN_CONS_LINE) {
@@ -854,7 +998,8 @@ darwin_cons_input_locked(char c, bool *intr_out)
 			darwin_cons_deliver_locked();
 		}
 		darwin_cons_line[darwin_cons_line_len++] = c;
-		tty_putc(c);
+		if ((tio->c_lflag & DARWIN_ECHO) != 0)
+			tty_putc(c);
 		return (NULL);
 	}
 
@@ -941,6 +1086,14 @@ darwin_cons_release(struct task *t)
 	darwin_cons_eof        = false;	/* the next claimant starts fresh */
 	darwin_cons_script_len = 0;	/* a script belongs to its session */
 	darwin_cons_script_off = 0;
+	/*
+	 * And the SETTINGS go back with everything else.  A program that dies
+	 * holding the terminal in raw mode is not an unlikely case -- it is the
+	 * ordinary way a full-screen program ends when it crashes -- and on a
+	 * machine whose console has one claimant and no `reset` to run, leaving
+	 * it that way costs a reboot.  See darwin_cons_tio_default.
+	 */
+	darwin_cons_tio_default(darwin_cons_tio_locked());
 	spin_unlock(&darwin_cons_lock);
 
 	/*
@@ -1023,11 +1176,13 @@ darwin_cons_script_locked(bool *intr_out)
 static long
 darwin_cons_read(struct syscall_frame *f, void *ubuf, size_t n)
 {
-	char	line[256];
-	size_t	got;
-	char	c;
-	bool	eof;
-	bool	intr;
+	struct darwin_termios	*tio;
+	char			 line[256];
+	size_t			 got;
+	size_t			 least;
+	char			 c;
+	bool			 eof;
+	bool			 intr;
 
 	got = 0;
 	darwin_cons_fg_id = current_thread->th_task->t_id;
@@ -1036,15 +1191,33 @@ darwin_cons_read(struct syscall_frame *f, void *ubuf, size_t n)
 
 	for (;;) {
 		spin_lock(&darwin_cons_lock);
+		tio = darwin_cons_tio_locked();
+		/*
+		 * HOW LITTLE WILL DO.  In canonical mode the ring only ever
+		 * holds whole lines, so anything in it is a complete answer
+		 * and one byte is enough to return on.  Out of it, VMIN is the
+		 * program's own statement of how little it will settle for --
+		 * a pager waiting on a keystroke sets 1 and means it, and a
+		 * program setting 0 is asking not to be made to wait at all.
+		 *
+		 * VTIME is stored and reported back faithfully and is NOT
+		 * honoured: a timed wait wants a timer per reader, and there
+		 * is nothing here that needs one yet.  Said out loud rather
+		 * than left for someone to discover, since a program setting
+		 * VMIN=0 VTIME=5 would get a poll instead of a half-second.
+		 */
+		least = 1;
+		if ((tio->c_lflag & DARWIN_ICANON) == 0)
+			least = tio->c_cc[DARWIN_VMIN];
 		while (got < n && darwin_cons_tail != darwin_cons_head) {
 			c = darwin_cons_buf[darwin_cons_tail & DARWIN_CONS_MASK];
 			darwin_cons_tail++;
 			line[got++] = c;
-			if (c == '\n')
+			if (c == '\n' && (tio->c_lflag & DARWIN_ICANON) != 0)
 				break;
 		}
 		eof = darwin_cons_eof;
-		if (got > 0 || eof) {
+		if (got >= least || eof) {
 			spin_unlock(&darwin_cons_lock);
 			break;
 		}
@@ -1095,6 +1268,119 @@ darwin_cons_read(struct syscall_frame *f, void *ubuf, size_t n)
 	if (syscall_copyout(ubuf, line, got) != 0)
 		return (darwin_err(f, DARWIN_EFAULT));
 	return (darwin_ok(f, (long)got));
+}
+
+/*
+ * ioctl(2) on a terminal, which is the only kind of device a program here can
+ * be holding: everything else it can open is a file, a pipe, or nothing.
+ *
+ * The refusals matter as much as the answers.  ENOTTY on a file and on a pipe
+ * is not a failure to implement something -- it is the answer, and it is the
+ * one isatty(3) is built out of.  gls asks TIOCGWINSZ before deciding whether
+ * to print in columns, and a kernel that answered it for a pipe would have gls
+ * writing columns into a file.
+ *
+ * `arg` is a pointer for every request here; a caller that passes a bad one
+ * gets EFAULT from the copy rather than a fault in the kernel.
+ */
+static long
+darwin_cons_ioctl(struct syscall_frame *f, struct darwin_ofile *of,
+    int fd, unsigned long req, void *arg)
+{
+	struct darwin_termios	 tio;
+	struct darwin_winsize	 ws;
+	uint32_t		 avail;
+	int			 n;
+
+	if (of->of_type != DARWIN_OF_CONSOLE &&
+	    !(of->of_type == DARWIN_OF_FREE && fd <= 2))
+		return (darwin_err(f, of->of_type == DARWIN_OF_FREE ?
+		    DARWIN_EBADF : DARWIN_ENOTTY));
+
+	switch (req) {
+	case DARWIN_TIOCGETA:
+		spin_lock(&darwin_cons_lock);
+		tio = *darwin_cons_tio_locked();
+		spin_unlock(&darwin_cons_lock);
+		if (syscall_copyout(arg, &tio, sizeof(tio)) != 0)
+			return (darwin_err(f, DARWIN_EFAULT));
+		return (darwin_ok(f, 0));
+
+	case DARWIN_TIOCSETA:
+	case DARWIN_TIOCSETAW:
+	case DARWIN_TIOCSETAF:
+		if (syscall_copyin(&tio, arg, sizeof(tio)) != 0)
+			return (darwin_err(f, DARWIN_EFAULT));
+		spin_lock(&darwin_cons_lock);
+		*darwin_cons_tio_locked() = tio;
+		/*
+		 * The three spellings differ only in what happens to input
+		 * that has already arrived.  SETA takes effect now and leaves
+		 * it; SETAW would wait for output to drain, and there is
+		 * nothing here that buffers output to drain; SETAF discards
+		 * what is queued, which is what a program changing modes
+		 * between two of its own reads is asking for -- keystrokes
+		 * typed under the OLD rules must not arrive under the new.
+		 */
+		if (req == DARWIN_TIOCSETAF) {
+			darwin_cons_tail     = darwin_cons_head;
+			darwin_cons_line_len = 0;
+		}
+		spin_unlock(&darwin_cons_lock);
+		kprintf("darwin: the terminal is now %s with echo %s, and "
+		    "signals %s\n",
+		    (tio.c_lflag & DARWIN_ICANON) != 0 ? "canonical" : "RAW",
+		    (tio.c_lflag & DARWIN_ECHO) != 0 ? "on" : "OFF",
+		    (tio.c_lflag & DARWIN_ISIG) != 0 ? "on" : "off");
+		return (darwin_ok(f, 0));
+
+	case DARWIN_TIOCGWINSZ:
+		/*
+		 * The console's real size, not a fabricated 80x24: this is a
+		 * text-mode display and TTY_COLS x TTY_ROWS is the hardware.
+		 * The pixel fields are zero, which is what every terminal that
+		 * is not a graphics window reports.
+		 */
+		ws.ws_row    = TTY_ROWS;
+		ws.ws_col    = TTY_COLS;
+		ws.ws_xpixel = 0;
+		ws.ws_ypixel = 0;
+		if (syscall_copyout(arg, &ws, sizeof(ws)) != 0)
+			return (darwin_err(f, DARWIN_EFAULT));
+		return (darwin_ok(f, 0));
+
+	case DARWIN_TIOCSWINSZ:
+		/*
+		 * Refused, and refused honestly.  On a pty the size is a
+		 * property of the window and the program that owns it says
+		 * what it is; here it is a property of the CRT controller, and
+		 * accepting a number we would then keep contradicting -- every
+		 * TIOCGWINSZ after it would answer 25x80 again -- is worse
+		 * than saying no.
+		 */
+		return (darwin_err(f, DARWIN_EINVAL));
+
+	case DARWIN_FIONREAD:
+		spin_lock(&darwin_cons_lock);
+		avail = darwin_cons_head - darwin_cons_tail;
+		spin_unlock(&darwin_cons_lock);
+		n = (int)avail;
+		if (syscall_copyout(arg, &n, sizeof(n)) != 0)
+			return (darwin_err(f, DARWIN_EFAULT));
+		return (darwin_ok(f, 0));
+
+	default:
+		/*
+		 * ENOTTY for a request this terminal does not know, which is
+		 * what Unix answers and what the callers are written for --
+		 * "inappropriate ioctl for device" is about the REQUEST, not
+		 * about the device, however much the wording suggests
+		 * otherwise.
+		 */
+		kprintf("darwin: ioctl(%#lx) on the terminal is not one we "
+		    "answer\n", req);
+		return (darwin_err(f, DARWIN_ENOTTY));
+	}
 }
 
 /*
@@ -2473,6 +2759,17 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		if (rv < 0)
 			return (darwin_err(f, -rv));
 		return (darwin_ok(f, newfd));
+	}
+	case DARWIN_SYS_ioctl: {
+		struct task	*t;
+		int		 fd;
+
+		fd = (int)f->sf_arg0;
+		t  = current_thread->th_task;
+		if (fd < 0 || fd >= DARWIN_NOFILE)
+			return (darwin_err(f, DARWIN_EBADF));
+		return (darwin_cons_ioctl(f, &t->t_darwin_files[fd], fd,
+		    (unsigned long)f->sf_arg1, (void *)f->sf_arg2));
 	}
 	case DARWIN_SYS_fcntl: {
 		struct task	*t;

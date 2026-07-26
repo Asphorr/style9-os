@@ -75,6 +75,7 @@
 #define	DARWIN_SYS_pipe		42
 #define	DARWIN_SYS_sigaction	46
 #define	DARWIN_SYS_sigprocmask	48
+#define	DARWIN_SYS_ioctl	54
 #define	DARWIN_SYS_execve	59
 #define	DARWIN_SYS_munmap	73
 #define	DARWIN_SYS_setitimer	83
@@ -216,6 +217,104 @@ struct darwin_fdstat {
 };
 
 /*
+ * THE TERMINAL, as Darwin describes one.
+ *
+ * struct termios is written into and read out of a genuine Apple binary's own
+ * storage, so none of this is ours to choose.  The layout is not guessed
+ * either: Darwin encodes the size of the argument INTO the ioctl number --
+ * _IOR('t', 19, struct termios) is 0x40000000 | (size << 16) | ('t' << 8) | 19
+ * -- and the number the world calls TIOCGETA is 0x40487413, which says the
+ * size is 0x48.  The _Static_assert below is the same claim, made by the
+ * compiler.  (FIONREAD, 0x4004667f, was already in this tree and encodes a
+ * 4-byte int the same way, which is how the arithmetic was checked.)
+ *
+ * tcflag_t and speed_t are unsigned long -- 64 bits here -- and cc_t is a
+ * single byte, so c_cc lands at 32 and the four bytes after it are pure
+ * alignment, exactly like the padding spelled out in struct timeval below.
+ */
+#define	DARWIN_NCCS	20
+
+struct darwin_termios {
+	uint64_t	c_iflag;
+	uint64_t	c_oflag;
+	uint64_t	c_cflag;
+	uint64_t	c_lflag;
+	uint8_t		c_cc[DARWIN_NCCS];
+	uint8_t		c_pad[4];
+	uint64_t	c_ispeed;
+	uint64_t	c_ospeed;
+};
+
+_Static_assert(sizeof(struct darwin_termios) == 72,
+    "struct termios is the 0x48 in TIOCGETA");
+_Static_assert(__builtin_offsetof(struct darwin_termios, c_cc) == 32,
+    "c_cc follows four 64-bit flag words");
+_Static_assert(__builtin_offsetof(struct darwin_termios, c_ispeed) == 56,
+    "the speeds are aligned past c_cc's four bytes of padding");
+
+/* struct winsize: four u_shorts, and the 0x0008 in TIOCGWINSZ. */
+struct darwin_winsize {
+	uint16_t	ws_row;
+	uint16_t	ws_col;
+	uint16_t	ws_xpixel;
+	uint16_t	ws_ypixel;
+};
+
+_Static_assert(sizeof(struct darwin_winsize) == 8, "the 8 in TIOCGWINSZ");
+
+#define	DARWIN_TIOCGETA		0x40487413UL	/* _IOR('t', 19, termios) */
+#define	DARWIN_TIOCSETA		0x80487414UL	/* _IOW('t', 20, termios) */
+#define	DARWIN_TIOCSETAW	0x80487415UL	/* ..., drain first       */
+#define	DARWIN_TIOCSETAF	0x80487416UL	/* ..., drain and flush   */
+#define	DARWIN_TIOCGWINSZ	0x40087468UL	/* _IOR('t', 104, winsize) */
+#define	DARWIN_TIOCSWINSZ	0x80087467UL	/* _IOW('t', 103, winsize) */
+#define	DARWIN_FIONREAD		0x4004667FUL	/* _IOR('f', 127, int)    */
+
+/* c_iflag */
+#define	DARWIN_BRKINT	0x00000002UL
+#define	DARWIN_ICRNL	0x00000100UL
+#define	DARWIN_IXON	0x00000200UL
+#define	DARWIN_IMAXBEL	0x00002000UL
+
+/* c_oflag */
+#define	DARWIN_OPOST	0x00000001UL
+#define	DARWIN_ONLCR	0x00000002UL
+
+/* c_cflag */
+#define	DARWIN_CS8	0x00000300UL
+#define	DARWIN_CREAD	0x00000800UL
+#define	DARWIN_CLOCAL	0x00008000UL
+
+/* c_lflag -- the four this discipline actually acts on, and their neighbours */
+#define	DARWIN_ECHOKE	0x00000001UL
+#define	DARWIN_ECHOE	0x00000002UL
+#define	DARWIN_ECHOK	0x00000004UL
+#define	DARWIN_ECHO	0x00000008UL
+#define	DARWIN_ECHONL	0x00000010UL
+#define	DARWIN_ECHOCTL	0x00000040UL
+#define	DARWIN_ISIG	0x00000080UL
+#define	DARWIN_ICANON	0x00000100UL
+#define	DARWIN_IEXTEN	0x00000400UL
+
+/* c_cc subscripts, Darwin's order */
+#define	DARWIN_VEOF	0
+#define	DARWIN_VERASE	3
+#define	DARWIN_VKILL	5
+#define	DARWIN_VINTR	8
+#define	DARWIN_VQUIT	9
+#define	DARWIN_VSUSP	10
+#define	DARWIN_VSTART	12
+#define	DARWIN_VSTOP	13
+#define	DARWIN_VMIN	16
+#define	DARWIN_VTIME	17
+
+/*
+ * The speed a terminal that is not a serial line reports.  BSD keeps the
+ * number itself rather than an index, so this IS 38400 baud.
+ */
+#define	DARWIN_B38400	38400UL
+
+/*
  * struct timeval, EXACTLY as x86_64 Darwin lays it out -- this one is written
  * into a genuine Apple binary's own storage, so the layout is not ours to
  * choose.  tv_sec is time_t (64-bit); tv_usec is suseconds_t, a 32-BIT int at
@@ -283,6 +382,7 @@ struct darwin_uname {
 #define	DARWIN_ENODEV	19
 #define	DARWIN_EINVAL	22
 #define	DARWIN_EMFILE	24
+#define	DARWIN_ENOTTY	25
 #define	DARWIN_EEXIST	17
 #define	DARWIN_EISDIR	21
 #define	DARWIN_ENOSPC	28

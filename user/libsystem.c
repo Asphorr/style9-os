@@ -1960,6 +1960,111 @@ mbstowcs(wchar_t *pwcs, const char *s, size_t n)
 	return (i);
 }
 
+/*
+ * wcrtomb: one wide character back into bytes.  Single-byte locale, so the
+ * answer is one byte or it is an error -- and the error is the honest one:
+ * a program asking for U+00FF+ in the C locale is asking for something this
+ * encoding cannot say.  The NULL form is the standard's way of asking how
+ * many bytes a shift sequence back to the initial state costs; here, none.
+ */
+size_t
+wcrtomb(char *s, wchar_t wc, void *ps)
+{
+
+	(void)ps;
+	if (s == NULL)
+		return (1);
+	if ((unsigned long)wc > 0xFFUL) {
+		g_errno = 92;			/* EILSEQ */
+		return ((size_t)-1);
+	}
+	*s = (char)(unsigned char)wc;
+	return (1);
+}
+
+/*
+ * frexp/ldexp, and their long-double spellings.
+ *
+ * gnulib's printf pulls these in to lay out a floating-point conversion; stty
+ * imports all four and, printing no floats, calls none of them -- but an
+ * import must RESOLVE whether or not it is ever called, so they are real
+ * rather than stubs that abort.
+ *
+ * Done by multiplication rather than by taking the exponent field apart.
+ * Every step is a power of two, so nothing is rounded away and the answer is
+ * exact; the cost is a loop proportional to the exponent, which for any value
+ * a printf is handed is a handful of turns.
+ */
+double
+frexp(double x, int *e)
+{
+	int	n;
+
+	n = 0;
+	if (x != 0.0 && x == x && x - x == 0.0) {
+		while (x >= 1.0 || x <= -1.0) {
+			x *= 0.5;
+			n++;
+		}
+		while (x > -0.5 && x < 0.5) {
+			x *= 2.0;
+			n--;
+		}
+	}
+	*e = n;
+	return (x);
+}
+
+double
+ldexp(double x, int e)
+{
+
+	while (e > 0) {
+		x *= 2.0;
+		e--;
+	}
+	while (e < 0) {
+		x *= 0.5;
+		e++;
+	}
+	return (x);
+}
+
+long double
+frexpl(long double x, int *e)
+{
+	int	n;
+
+	n = 0;
+	if (x != 0.0L && x == x && x - x == 0.0L) {
+		while (x >= 1.0L || x <= -1.0L) {
+			x *= 0.5L;
+			n++;
+		}
+		while (x > -0.5L && x < 0.5L) {
+			x *= 2.0L;
+			n--;
+		}
+	}
+	*e = n;
+	return (x);
+}
+
+long double
+ldexpl(long double x, int e)
+{
+
+	while (e > 0) {
+		x *= 2.0L;
+		e--;
+	}
+	while (e < 0) {
+		x *= 0.5L;
+		e++;
+	}
+	return (x);
+}
+
 /* qsort: insertion sort -- the directories we host hold few entries. */
 static void
 qs_swap(unsigned char *a, unsigned char *b, size_t size)
@@ -2503,21 +2608,29 @@ munmap(void *addr, size_t len)
 }
 
 /*
- * ioctl: nothing here is a terminal in the sense a device ioctl means, so this
- * fails rather than pretending.  That is safe by inspection, not by hope --
- * gcat's only ioctl is FIONREAD (0x4004667f) on its input, and the code right
- * after the call accepts ENOTSUP, ENOTTY or EINVAL and takes the ordinary
- * read-loop path; any OTHER errno makes it abort with "cannot do ioctl on %s".
- * So the stub must fail with one of those three, and ENOTTY is the true one.
+ * ioctl: the terminal requests, handed to the kernel.
+ *
+ * This used to refuse everything with ENOTTY, on the grounds that nothing here
+ * was a terminal in the sense a device ioctl means.  The console is one now --
+ * it has a termios the kernel keeps and a size it can be asked for -- so the
+ * call goes through, and the refusals come from the kernel, which is the only
+ * place that knows whether a given descriptor is a terminal at all.  A file
+ * and a pipe still get ENOTTY, and that is what gcat and gls are written for:
+ * both ask, and both take the non-terminal path when told no.
+ *
+ * The third argument is a pointer for every request that reaches here; taking
+ * it as one is what the variadic declaration is hiding.
  */
 int
 ioctl(int fd, unsigned long request, ...)
 {
+	__builtin_va_list	ap;
+	void			*arg;
 
-	(void)fd;
-	(void)request;
-	g_errno = 25;					/* ENOTTY */
-	return (-1);
+	__builtin_va_start(ap, request);
+	arg = __builtin_va_arg(ap, void *);
+	__builtin_va_end(ap);
+	return ((int)bsd_call_e(0x2000036, fd, (long)request, (long)arg));
 }
 
 /*
@@ -3810,19 +3923,108 @@ wait3(int *status, int options, void *rusage)
 }
 
 /*
- * Terminal control: the serial console is not a tty (isatty already says
- * 0), so the termios family reports ENOTTY consistently.  dash only walks
- * this path when deciding whether to start job control; a uniform "no
- * terminal" keeps it non-interactive.
+ * TERMINAL CONTROL.
+ *
+ * This family used to answer ENOTTY to everything, on the grounds that there
+ * was no terminal to control.  There is one now, and the settings live in the
+ * kernel, where they belong: the state is the DEVICE's, not the descriptor's,
+ * and two programs sharing a console must see each other's changes.  So none
+ * of this keeps a copy -- every call is an ioctl, and the struct these hand
+ * about is the caller's own storage, in Apple's layout.
+ *
+ * The layout is asserted rather than trusted, for the same reason the kernel
+ * asserts it: the size is encoded in the ioctl number (0x48 in TIOCGETA), so
+ * getting it wrong would be a silent disagreement about where c_lflag is.
  */
+#define	TCSANOW		0
+#define	TCSADRAIN	1
+#define	TCSAFLUSH	2
+
+#define	S9_TIOCGETA	0x40487413UL
+#define	S9_TIOCSETA	0x80487414UL
+#define	S9_TIOCSETAW	0x80487415UL
+#define	S9_TIOCSETAF	0x80487416UL
+
+struct s9_termios {
+	unsigned long	c_iflag;
+	unsigned long	c_oflag;
+	unsigned long	c_cflag;
+	unsigned long	c_lflag;
+	unsigned char	c_cc[20];
+	unsigned char	c_pad[4];
+	unsigned long	c_ispeed;
+	unsigned long	c_ospeed;
+};
+
+_Static_assert(sizeof(struct s9_termios) == 72, "the 0x48 in TIOCGETA");
+
 int
 tcgetattr(int fd, void *termios_p)
 {
 
-	(void)fd;
-	(void)termios_p;
-	g_errno = 25;				/* ENOTTY */
-	return (-1);
+	return (ioctl(fd, S9_TIOCGETA, termios_p));
+}
+
+/*
+ * tcsetattr: the action is not a flag on the setting, it is WHICH of three
+ * requests to send -- Darwin spells the difference in the ioctl number, and
+ * the kernel is where "discard what is already typed" happens.
+ */
+int
+tcsetattr(int fd, int action, const void *termios_p)
+{
+	unsigned long	req;
+
+	switch (action) {
+	case TCSANOW:
+		req = S9_TIOCSETA;
+		break;
+	case TCSADRAIN:
+		req = S9_TIOCSETAW;
+		break;
+	case TCSAFLUSH:
+		req = S9_TIOCSETAF;
+		break;
+	default:
+		g_errno = 22;			/* EINVAL */
+		return (-1);
+	}
+	return (ioctl(fd, req, (void *)(unsigned long)termios_p));
+}
+
+/*
+ * The speed accessors are pure struct access -- no call, no terminal.  BSD
+ * keeps the baud rate itself rather than an index into a table, which is why
+ * these are one field read each and why B38400 is the number 38400.
+ */
+unsigned long
+cfgetispeed(const void *termios_p)
+{
+
+	return (((const struct s9_termios *)termios_p)->c_ispeed);
+}
+
+unsigned long
+cfgetospeed(const void *termios_p)
+{
+
+	return (((const struct s9_termios *)termios_p)->c_ospeed);
+}
+
+int
+cfsetispeed(void *termios_p, unsigned long speed)
+{
+
+	((struct s9_termios *)termios_p)->c_ispeed = speed;
+	return (0);
+}
+
+int
+cfsetospeed(void *termios_p, unsigned long speed)
+{
+
+	((struct s9_termios *)termios_p)->c_ospeed = speed;
+	return (0);
 }
 
 int
