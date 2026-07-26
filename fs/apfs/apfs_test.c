@@ -998,9 +998,9 @@ fs_apfs_index_selftest(uint64_t now)
 	(void)fs_apfs_unlink(parent, "idxa.txt", now);
 	(void)fs_apfs_unlink(parent, "idxb.txt", now);
 
-	rv = fs_apfs_create(parent, "idxa.txt", now, &ino_a);
+	rv = fs_apfs_create(parent, "idxa.txt", now, 0644, &ino_a);
 	if (rv == FS_APFS_E_OK)
-		rv = fs_apfs_create(parent, "idxb.txt", now, &ino_b);
+		rv = fs_apfs_create(parent, "idxb.txt", now, 0644, &ino_b);
 	if (rv != FS_APFS_E_OK) {
 		kprintf("apfs-index: no room in /etc for the two files this "
 		    "needs (%d) -- skipped\n", rv);
@@ -1154,7 +1154,7 @@ fs_apfs_drop_selftest(uint64_t now)
 	}
 
 	(void)fs_apfs_unlink(parent, "drop.txt", now);
-	rv = fs_apfs_create(parent, "drop.txt", now, &ino);
+	rv = fs_apfs_create(parent, "drop.txt", now, 0644, &ino);
 	if (rv != FS_APFS_E_OK) {
 		kprintf("apfs-drop: no room in /etc for the file this needs "
 		    "(%d) -- skipped\n", rv);

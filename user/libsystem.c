@@ -1501,7 +1501,7 @@ lstat_inode64(const char *path, void *buf)
  */
 struct s9_fdstat {			/* mirrors kern/darwin.h */
 	uint32_t	fds_size;
-	uint8_t		fds_kind;	/* 0 reg / 1 chr / 2 fifo */
+	uint8_t		fds_kind;	/* 0 reg / 1 chr / 2 fifo / 3 dir */
 };
 
 int
@@ -1537,6 +1537,9 @@ fstat64(int fd, void *buf)
 		break;
 	case 2:					/* pipe end */
 		*(uint16_t *)(p + 4) = 0x1180u;	/* S_IFIFO | 0600 */
+		break;
+	case 3:					/* a directory, opened */
+		*(uint16_t *)(p + 4) = 0x41EDu;	/* S_IFDIR | 0755 */
 		break;
 	default:				/* regular file */
 		*(uint16_t *)(p + 4) = 0x81A4u;	/* S_IFREG | 0644 */
@@ -1653,6 +1656,119 @@ readdir_inode64(DIR *dp)
 	dp->dd_de.d_namlen = (uint16_t)i;
 	dp->dd_de.d_reclen = (uint16_t)sizeof(struct dirent);
 	return (&dp->dd_de);
+}
+
+/*
+ * THE FD-RELATIVE FAMILY, all of it built on one question to the kernel:
+ * WHAT PATH IS THIS DESCRIPTOR ON.
+ *
+ * openat, fdopendir, fchdir and fchmod are the same request in four
+ * vocabularies, and a kernel with vnodes would answer none of them by name.
+ * This one has no vnodes and remembers the path an fd was opened by, so the
+ * whole family reduces to "ask, then call the plain version" -- which is
+ * honest as long as nothing can rename a file out from under an open
+ * descriptor, and nothing here can yet.
+ *
+ * s9_fs_fdpath returns the length or -1 with errno set.
+ */
+static long	bsd_call_e(long nr, long a, long b, long c);
+int		open(const char *path, int flags, ...);
+int		close(int fd);
+int		chdir(const char *path);
+
+static long
+s9_fs_fdpath(int fd, char *buf, size_t cap)
+{
+
+	return (bsd_call_e(0x2A000006, fd, (long)buf, (long)cap));
+}
+
+/*
+ * Join a directory fd and a relative name into one path.  AT_FDCWD and an
+ * absolute name both mean "the fd is not part of the answer", which is the
+ * case almost every caller actually takes.
+ */
+#define	AT_FDCWD	(-2)
+
+static int
+at_path(int fd, const char *name, char *out, size_t cap)
+{
+	size_t	n;
+	size_t	i;
+
+	if (name != NULL && name[0] == '/')
+		fd = AT_FDCWD;
+	if (fd == AT_FDCWD) {
+		n = 0;
+	} else {
+		if (s9_fs_fdpath(fd, out, cap) < 0)
+			return (-1);
+		for (n = 0; out[n] != '\0'; n++)
+			continue;
+		if (n + 1 >= cap) {
+			g_errno = 63;			/* ENAMETOOLONG */
+			return (-1);
+		}
+		if (n > 0 && out[n - 1] != '/')
+			out[n++] = '/';
+	}
+	for (i = 0; name != NULL && name[i] != '\0'; i++) {
+		if (n + 1 >= cap) {
+			g_errno = 63;
+			return (-1);
+		}
+		out[n++] = name[i];
+	}
+	out[n] = '\0';
+	return (0);
+}
+
+int
+openat(int fd, const char *path, int flags, ...)
+{
+	__builtin_va_list	ap;
+	char			full[1024];
+	int			mode;
+
+	__builtin_va_start(ap, flags);
+	mode = __builtin_va_arg(ap, int);
+	__builtin_va_end(ap);
+	if (at_path(fd, path, full, sizeof(full)) != 0)
+		return (-1);
+	return (open(full, flags, mode));
+}
+
+DIR	*fdopendir_inode64(int fd) __asm__("_fdopendir$INODE64");
+
+/*
+ * fdopendir: a directory stream from a descriptor.  The fd is CLOSED here
+ * rather than remembered, because our DIR is a path and an index and has
+ * nothing to do with a descriptor afterwards -- and because closedir(3) is
+ * documented to close what fdopendir was given, so a caller that goes on to
+ * use the fd is relying on something no system promises.
+ */
+DIR *
+fdopendir_inode64(int fd)
+{
+	char	full[1024];
+	DIR	*dp;
+
+	if (s9_fs_fdpath(fd, full, sizeof(full)) < 0)
+		return (NULL);
+	dp = opendir_inode64(full);
+	if (dp != NULL)
+		(void)close(fd);
+	return (dp);
+}
+
+int
+fchdir(int fd)
+{
+	char	full[1024];
+
+	if (s9_fs_fdpath(fd, full, sizeof(full)) < 0)
+		return (-1);
+	return (chdir(full));
 }
 
 /*
@@ -3789,13 +3905,95 @@ getcwd(char *buf, size_t size)
 	return (buf);
 }
 
-/* umask on a read-only volume: the historical default, never consulted. */
+/*
+ * umask: the kernel's now, and it means something.
+ *
+ * This used to answer 022 without keeping it -- true of a read-only volume,
+ * where no create could be affected by a mask.  The volume is writable, the
+ * kernel subtracts this from every mkdir and every O_CREAT, and a program
+ * that sets it expects the next file it makes to show the difference.
+ */
 int
 umask(int mask)
 {
 
-	(void)mask;
-	return (022);
+	return ((int)bsd_call_e(0x200003C, mask, 0, 0));
+}
+
+/*
+ * chmod, fchmod, lchmod.
+ *
+ * lchmod is chmod because NOTHING IN THIS SYSTEM IS A SYMLINK -- neither
+ * filesystem here can make one and neither can name one -- so "do not follow
+ * the link" is a distinction without a case.  That is why it forwards rather
+ * than failing: an lchmod that refused would be refusing on a ground that does
+ * not exist here.
+ */
+int
+chmod(const char *path, unsigned short mode)
+{
+
+	return ((int)bsd_call_e(0x200000F, (long)path, (long)mode, 0));
+}
+
+int
+fchmod(int fd, unsigned short mode)
+{
+
+	return ((int)bsd_call_e(0x200007C, fd, (long)mode, 0));
+}
+
+int
+lchmod(const char *path, unsigned short mode)
+{
+
+	return (chmod(path, mode));
+}
+
+/*
+ * chown, fchown, lchown -- and this family CANNOT be honoured, so it says so
+ * rather than pretending.
+ *
+ * There are no users here.  No uid table, no login, no credentials on a task;
+ * every inode on the volume says owner 0, group 0, and that is not a default
+ * this system could change -- it is the only value it has a meaning for.  So a
+ * request to leave the owner alone (-1, -1) or to set it to root succeeds
+ * because it is already true, and anything else answers EPERM, which is
+ * exactly what a real kernel tells an unprivileged caller and exactly what
+ * every caller of chown is written to handle.
+ */
+static int
+chown_common(long owner, long group)
+{
+
+	if ((owner == -1 || owner == 0) && (group == -1 || group == 0))
+		return (0);
+	g_errno = 1;					/* EPERM */
+	return (-1);
+}
+
+int
+chown(const char *path, unsigned int owner, unsigned int group)
+{
+
+	(void)path;
+	return (chown_common((long)(int)owner, (long)(int)group));
+}
+
+int
+fchown(int fd, unsigned int owner, unsigned int group)
+{
+
+	(void)fd;
+	return (chown_common((long)(int)owner, (long)(int)group));
+}
+
+int
+lchown(const char *path, unsigned int owner, unsigned int group)
+{
+
+	(void)path;
+	return (chown_common((long)(int)owner, (long)(int)group));
 }
 
 /*

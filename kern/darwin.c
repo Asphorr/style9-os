@@ -110,6 +110,7 @@ static long	darwin_s9_fs_stat(struct syscall_frame *f);
 static long	darwin_s9_fs_readdir(struct syscall_frame *f);
 static long	darwin_s9_uname(struct syscall_frame *f);
 static long	darwin_s9_fs_fstat(struct syscall_frame *f);
+static long	darwin_s9_fs_fdpath(struct syscall_frame *f);
 static bool	darwin_streq(const char *a, const char *b);
 static const struct progreg_entry *darwin_bin_lookup(const char *path);
 
@@ -773,6 +774,7 @@ darwin_ofile_clear(struct darwin_ofile *of)
 {
 
 	switch (of->of_type) {
+	case DARWIN_OF_DIR:
 	case DARWIN_OF_FILE:
 		if (of->of_buf != NULL)
 			kfree(of->of_buf);
@@ -1271,6 +1273,29 @@ darwin_cons_read(struct syscall_frame *f, void *ubuf, size_t n)
 }
 
 /*
+ * What a create actually gets: what was asked for, less what this task's umask
+ * takes away.
+ *
+ * Every program asks for the most it could possibly want -- 0666 for a file,
+ * 0777 for a directory -- and every Unix hands back less.  That is not a
+ * courtesy, it is where the number in `ls -l` comes from, and a system without
+ * it has to either ignore the argument (which this did, out loud) or produce
+ * world-writable files nobody asked for.
+ *
+ * The argument arrives as a long because that is how a syscall carries one;
+ * only the low twelve bits mean anything, and the type bits a caller may have
+ * folded in are the filesystem's business rather than the caller's.
+ */
+static uint16_t
+darwin_mode_arg(long raw)
+{
+	struct task	*t;
+
+	t = current_thread->th_task;
+	return ((uint16_t)((uint32_t)raw & 07777u & ~(uint32_t)t->t_darwin_umask));
+}
+
+/*
  * ioctl(2) on a terminal, which is the only kind of device a program here can
  * be holding: everything else it can open is a file, a pipe, or nothing.
  *
@@ -1523,6 +1548,7 @@ darwin_files_fork_copy(struct task *parent, struct task *child)
 		case DARWIN_OF_CONSOLE:
 			dst->of_type = DARWIN_OF_CONSOLE;
 			break;
+		case DARWIN_OF_DIR:
 		case DARWIN_OF_FILE:
 			/*
 			 * Private cursor.  POSIX shares the offset through the
@@ -1546,7 +1572,15 @@ darwin_files_fork_copy(struct task *parent, struct task *child)
 			dst->of_size   = src->of_size;
 			dst->of_off    = src->of_off;
 			dst->of_flags  = src->of_flags;
-			dst->of_type   = DARWIN_OF_FILE;
+			/*
+			 * The SOURCE's type, not a constant: a directory
+			 * descriptor copies exactly like a file one -- a
+			 * duplicated name and nothing else, since it has no
+			 * buffer and no handle -- but it must stay a
+			 * directory on the other side, and a line that said
+			 * FILE here would have quietly turned it into one.
+			 */
+			dst->of_type   = src->of_type;
 			break;
 		case DARWIN_OF_PIPE_R:
 			spin_lock(&src->of_pipe->p_lock);
@@ -1599,6 +1633,7 @@ darwin_dup_install(struct task *t, int oldfd, int newfd)
 	case DARWIN_OF_CONSOLE:
 		dst->of_type = DARWIN_OF_CONSOLE;
 		return (0);
+	case DARWIN_OF_DIR:
 	case DARWIN_OF_FILE:
 		buf = NULL;
 		if (src->of_buf != NULL) {
@@ -1615,7 +1650,7 @@ darwin_dup_install(struct task *t, int oldfd, int newfd)
 		dst->of_size   = src->of_size;
 		dst->of_off    = src->of_off;
 		dst->of_flags  = src->of_flags;
-		dst->of_type   = DARWIN_OF_FILE;
+		dst->of_type   = src->of_type;
 		return (0);
 	case DARWIN_OF_PIPE_R:
 		spin_lock(&src->of_pipe->p_lock);
@@ -2344,13 +2379,59 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		flags   = (uint32_t)f->sf_arg1;
 		writing = (flags & DARWIN_O_ACCMODE) != DARWIN_O_RDONLY;
 
+		/*
+		 * A DIRECTORY CAN BE OPENED, and that is not a technicality.
+		 *
+		 * fs_open answers about bytes, so it says "not found" for a
+		 * directory -- which is what a program asking for one got, and
+		 * the reason GNU mkdir reported that the directory it had just
+		 * successfully created did not exist: it opens what it makes.
+		 * Measured, not guessed; the kernel said so in one line once
+		 * the failing open was made to print.
+		 *
+		 * What comes back is a descriptor that names a PLACE.  There
+		 * is nothing to read through it -- read(2) answers EISDIR --
+		 * and writing to one is refused before it starts.  It carries
+		 * the path, which is what every call that takes a directory fd
+		 * actually wants.
+		 */
+		{
+			struct fs_statbuf	dst;
+
+			if (fs_stat(path, &dst) == FS_E_OK && dst.fs_is_dir) {
+				if (writing || (flags & DARWIN_O_TRUNC) != 0)
+					return (darwin_err(f, DARWIN_EISDIR));
+				fd = darwin_fd_alloc(current_thread->th_task);
+				if (fd < 0)
+					return (darwin_err(f, DARWIN_EMFILE));
+				t = current_thread->th_task;
+				t->t_darwin_files[fd].of_path =
+				    darwin_path_dup(path);
+				t->t_darwin_files[fd].of_size  = 0;
+				t->t_darwin_files[fd].of_off   = 0;
+				t->t_darwin_files[fd].of_flags = flags;
+				t->t_darwin_files[fd].of_type  = DARWIN_OF_DIR;
+				kprintf("darwin: UNIX open('%s') -> fd=%d "
+				    "(a directory, which names a place and "
+				    "not bytes)\n", path, fd);
+				return (darwin_ok(f, fd));
+			}
+		}
+
 		buf = NULL;
 		on_disk = true;
 		rv = fs_open(path, &handle);
 		if (rv == FS_E_NOTFOUND && (flags & DARWIN_O_CREAT) != 0) {
 			uint64_t	ino;
 
-			rv = fs_create(path, &ino);
+			/*
+			 * open(2)'s third argument, at last taken seriously.
+			 * It is a REQUEST, not the answer: what a file is
+			 * created with is the request less this task's umask,
+			 * which is why every program asks for 0666 and every
+			 * Unix produces 0644.
+			 */
+			rv = fs_create(path, darwin_mode_arg(f->sf_arg2), &ino);
 			if (rv == FS_E_OK)
 				rv = fs_open(path, &handle);
 			else if (rv == FS_E_ROFS || rv == FS_E_NOMOUNT)
@@ -2372,8 +2453,11 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		if (rv == FS_E_NOTFOUND || rv == FS_E_NOMOUNT) {
 			/* Not on the disk: try the synthetic /bin (progreg). */
 			pe = darwin_bin_lookup(path);
-			if (pe == NULL)
+			if (pe == NULL) {
+				kprintf("darwin: open('%s') -- nothing of that "
+				    "name on the volume or in /bin\n", path);
 				return (darwin_err(f, DARWIN_ENOENT));
+			}
 			/*
 			 * A built-in is an image in the kernel's own text.
 			 * There is nowhere for a write to it to go, and
@@ -2465,6 +2549,15 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			return (darwin_err(f, DARWIN_EBADF));
 		case DARWIN_OF_CONSOLE:
 			return (darwin_cons_read(f, (void *)f->sf_arg1, n));
+		case DARWIN_OF_DIR:
+			/*
+			 * A directory is not a stream of bytes to anything
+			 * above this kernel: a walker calls readdir(3), which
+			 * goes down the fs_readdir backchannel and never
+			 * touches this path.  EISDIR is what a modern Unix
+			 * answers and what makes the difference visible.
+			 */
+			return (darwin_err(f, DARWIN_EISDIR));
 		case DARWIN_OF_FILE:
 			avail = of->of_size - of->of_off;
 			if (n > (size_t)avail)
@@ -2527,13 +2620,12 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 	 * mkdir(2) and rmdir(2), which share everything with unlink above
 	 * except which call they end in.
 	 *
-	 * The MODE is taken and dropped, and that is worth saying rather than
-	 * hiding: the writer stamps 0755 on every directory it makes, because
-	 * this kernel has no umask to subtract one from and no chmod to correct
-	 * it with afterwards.  A caller asking for 0700 gets 0755 and is not
-	 * told, which is the honest edge -- reporting EINVAL for a mode that is
-	 * perfectly legal would be worse, and pretending to honour it would be
-	 * worse still.
+	 * THE MODE IS HONOURED NOW.  It used to be taken and dropped, said out
+	 * loud right here: the writer stamped 0755 on every directory because
+	 * there was no umask to subtract and no chmod to correct it with
+	 * afterwards.  There are both, so `mkdir foo` -- which asks for 0777,
+	 * as every program does -- comes out 0755 the way it does on a Mac, and
+	 * `mkdir -m 700` comes out 0700 because it was asked for.
 	 */
 	case DARWIN_SYS_mkdir:
 	case DARWIN_SYS_rmdir: {
@@ -2554,7 +2646,8 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		    sizeof(path)) != 0)
 			return (darwin_err(f, DARWIN_ENAMETOOLONG));
 
-		rv = make ? fs_mkdir(path, NULL) : fs_rmdir(path);
+		rv = make ? fs_mkdir(path, darwin_mode_arg(f->sf_arg1), NULL) :
+		    fs_rmdir(path);
 		if (rv != FS_E_OK) {
 			/*
 			 * "Already there" is to a mkdir what "not there" is
@@ -2759,6 +2852,88 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		if (rv < 0)
 			return (darwin_err(f, -rv));
 		return (darwin_ok(f, newfd));
+	}
+	/*
+	 * umask(2): the bits a create may not grant, and the OLD value back.
+	 *
+	 * Returning the previous mask is not a nicety -- it is the only way to
+	 * read the thing, since there is no getumask, and a program that wants
+	 * to know sets it twice.
+	 */
+	case DARWIN_SYS_umask: {
+		struct task	*t;
+		uint16_t	 was;
+
+		t   = current_thread->th_task;
+		was = t->t_darwin_umask;
+		t->t_darwin_umask = (uint16_t)((uint32_t)f->sf_arg0 & 07777u);
+		return (darwin_ok(f, (long)was));
+	}
+	/*
+	 * chmod(2) and fchmod(2): the permission bits of something that is
+	 * already there.
+	 *
+	 * There is no ownership check because there are no owners -- one user,
+	 * root, and a volume whose inodes all say uid 0.  What a real kernel
+	 * would refuse here it would refuse on grounds this system does not
+	 * have, so the check is absent rather than faked.
+	 */
+	case DARWIN_SYS_chmod:
+	case DARWIN_SYS_fchmod: {
+		char			 path[DARWIN_PATH_MAX];
+		char			 raw[DARWIN_PATH_MAX];
+		struct darwin_ofile	*of;
+		struct task		*t;
+		long			 len;
+		uint16_t		 mode;
+		int			 rv;
+		int			 fd;
+
+		t = current_thread->th_task;
+		if (nr == DARWIN_SYS_fchmod) {
+			/*
+			 * An fd is a path here, because this kernel has no
+			 * vnodes: what it remembers about an open file is the
+			 * name it was opened by.  A descriptor onto something
+			 * with no name -- a pipe, the console, a built-in
+			 * image -- has nothing to chmod, and says so.
+			 */
+			fd = (int)f->sf_arg0;
+			if (fd < 0 || fd >= DARWIN_NOFILE)
+				return (darwin_err(f, DARWIN_EBADF));
+			of = &t->t_darwin_files[fd];
+			if ((of->of_type != DARWIN_OF_FILE &&
+			    of->of_type != DARWIN_OF_DIR) ||
+			    of->of_path == NULL)
+				return (darwin_err(f, DARWIN_EINVAL));
+			for (len = 0; of->of_path[len] != '\0'; len++) {
+				if (len >= (long)sizeof(path) - 1)
+					return (darwin_err(f,
+					    DARWIN_ENAMETOOLONG));
+				path[len] = of->of_path[len];
+			}
+			path[len] = '\0';
+			mode = (uint16_t)((uint32_t)f->sf_arg1 & 07777u);
+		} else {
+			len = syscall_copyin_str((const char *)f->sf_arg0, raw,
+			    sizeof(raw));
+			if (len < 0)
+				return (darwin_err(f, DARWIN_EFAULT));
+			if (darwin_path_resolve(t, raw, path,
+			    sizeof(path)) != 0)
+				return (darwin_err(f, DARWIN_ENAMETOOLONG));
+			mode = (uint16_t)((uint32_t)f->sf_arg1 & 07777u);
+		}
+
+		rv = fs_chmod(path, mode);
+		if (rv != FS_E_OK) {
+			kprintf("darwin: chmod('%s', %04o) refused (rv=%d)\n",
+			    path, (unsigned)mode, rv);
+			return (darwin_err(f, darwin_fs_errno(rv)));
+		}
+		kprintf("darwin: UNIX chmod('%s') -- the mode is %04o now\n",
+		    path, (unsigned)mode);
+		return (darwin_ok(f, 0));
 	}
 	case DARWIN_SYS_ioctl: {
 		struct task	*t;
@@ -3290,6 +3465,8 @@ darwin_style9(struct syscall_frame *f, uint32_t num)
 		return (darwin_s9_uname(f));
 	case DARWIN_S9_fs_fstat:
 		return (darwin_s9_fs_fstat(f));
+	case DARWIN_S9_fs_fdpath:
+		return (darwin_s9_fs_fdpath(f));
 	default:
 		kprintf("darwin: unimplemented style9 call %u\n",
 		    (unsigned)num);
@@ -3571,6 +3748,9 @@ darwin_s9_fs_fstat(struct syscall_frame *f)
 		ds.fds_size = of->of_size;
 		ds.fds_kind = DARWIN_FDSTAT_REG;
 		break;
+	case DARWIN_OF_DIR:
+		ds.fds_kind = DARWIN_FDSTAT_DIR;
+		break;
 	case DARWIN_OF_PIPE_R:
 	case DARWIN_OF_PIPE_W:
 		ds.fds_kind = DARWIN_FDSTAT_FIFO;
@@ -3581,6 +3761,54 @@ darwin_s9_fs_fstat(struct syscall_frame *f)
 	if (syscall_copyout((void *)f->sf_arg1, &ds, sizeof(ds)) != 0)
 		return (darwin_err(f, DARWIN_EFAULT));
 	return (darwin_ok(f, 0));
+}
+
+/*
+ * fs_fdpath(int fd, char *buf, size_t cap): what path an fd was opened by.
+ *
+ * ONE CALL, FIVE SYMBOLS.  The *at family, fdopendir, fchdir and fchmod all
+ * ask the same question in different words -- "the thing this descriptor is
+ * on, by name" -- and a kernel with vnodes would answer none of them this way.
+ * This one has no vnodes: what it keeps about an open file is the path it was
+ * opened by, which was being kept for diagnostics and turns out to be exactly
+ * what libSystem needs to build the rest of the family on top of the calls
+ * that already work.
+ *
+ * The limit of that honesty is worth stating: a file RENAMED after it was
+ * opened would answer with the name it no longer has.  Nothing here can rename
+ * yet -- that is a later rung -- and when it can, this becomes a lie that has
+ * to be replaced by an inode-keyed answer rather than patched.
+ *
+ * Returns the length, or fails: EBADF for a descriptor that is not open,
+ * EINVAL for one with no name at all (a pipe, the console, a built-in image).
+ */
+static long
+darwin_s9_fs_fdpath(struct syscall_frame *f)
+{
+	struct darwin_ofile	*of;
+	struct task		*t;
+	size_t			 cap;
+	size_t			 n;
+	int			 fd;
+
+	fd  = (int)f->sf_arg0;
+	cap = (size_t)f->sf_arg2;
+	t   = current_thread->th_task;
+	if (fd < 0 || fd >= DARWIN_NOFILE)
+		return (darwin_err(f, DARWIN_EBADF));
+	of = &t->t_darwin_files[fd];
+	if (of->of_type == DARWIN_OF_FREE)
+		return (darwin_err(f, DARWIN_EBADF));
+	if (of->of_path == NULL)
+		return (darwin_err(f, DARWIN_EINVAL));
+
+	for (n = 0; of->of_path[n] != '\0'; n++)
+		continue;
+	if (cap < n + 1)
+		return (darwin_err(f, DARWIN_ERANGE));
+	if (syscall_copyout((void *)f->sf_arg1, of->of_path, n + 1) != 0)
+		return (darwin_err(f, DARWIN_EFAULT));
+	return (darwin_ok(f, (long)n));
 }
 
 /*

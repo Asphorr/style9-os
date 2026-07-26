@@ -93,6 +93,14 @@ struct vm_map;
 #define	DARWIN_OF_CONSOLE	2
 #define	DARWIN_OF_PIPE_R	3
 #define	DARWIN_OF_PIPE_W	4
+/*
+ * A DIRECTORY, opened.  Its own type rather than a flag on a file, because
+ * what a descriptor onto one is FOR is different: it names a place, and every
+ * call that takes it -- openat, fdopendir, fchdir, fchmod -- wants the name,
+ * not the bytes.  read(2) on one answers EISDIR, which is what a modern Unix
+ * does and what makes the distinction visible from ring 3.
+ */
+#define	DARWIN_OF_DIR		5
 
 struct darwin_pipe;
 
@@ -243,6 +251,20 @@ struct task {
 	 * same reasoning t_darwin_dylib_next records.
 	 */
 	char			 t_darwin_cwd[DARWIN_PATH_MAX];
+
+	/*
+	 * The permission bits a create must NOT grant.
+	 *
+	 * A umask is not a security measure here -- there is one user and it is
+	 * root -- it is the reason `mkdir foo` produces 0755 when every program
+	 * on earth asks for 0777 and expects the system to take the rest away.
+	 * Without one, the mode a caller passed had to be ignored outright, and
+	 * that was the honest edge documented on mkdir(2) until this.
+	 *
+	 * 022 at task_create and copied at fork, like the working directory
+	 * above, and read and written only by this task's own threads.
+	 */
+	uint16_t		 t_darwin_umask;
 };
 
 extern struct task		*kernel_task;

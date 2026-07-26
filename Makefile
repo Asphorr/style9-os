@@ -197,6 +197,8 @@ OBJS	= \
 	$(OBJDIR)/filewrite_macho.o \
 	$(OBJDIR)/ttyprobe_macho.o \
 	$(OBJDIR)/gstty_macho.o \
+	$(OBJDIR)/gmkdir_macho.o \
+	$(OBJDIR)/grmdir_macho.o \
 	$(OBJDIR)/tree_macho.o \
 	$(OBJDIR)/guname_macho.o \
 	$(OBJDIR)/gcat_macho.o \
@@ -542,6 +544,18 @@ $(OBJDIR)/ttyprobe.macho: $(OBJDIR)/ttyprobe.dwn.o $(OBJDIR)/libSystem.B.dylib
 # TIOCGWINSZ are its entire trade -- so it is the exact oracle for the rung it
 # arrives on, and it needs no dylib we did not already have.
 $(OBJDIR)/gstty.macho: extern/gstty.macho | $(OBJDIR)
+	cp $< $@
+
+# gmkdir / grmdir: the ELEVENTH and TWELFTH real Apple binaries (GNU coreutils
+# 9.11's mkdir and rmdir, from the bottle gls and gstty came out of).  They are
+# what makes the directory rung usable by hand rather than only by our own
+# self-tests, and what they needed was not directories at all -- both were
+# already there -- but the MODE WORD: chmod, the ownership calls that cannot be
+# honoured here and say so, and the fd-relative family.
+$(OBJDIR)/gmkdir.macho: extern/gmkdir.macho | $(OBJDIR)
+	cp $< $@
+
+$(OBJDIR)/grmdir.macho: extern/grmdir.macho | $(OBJDIR)
 	cp $< $@
 
 # pipefork (multi-process probe): a self-authored Darwin-ABI binary that

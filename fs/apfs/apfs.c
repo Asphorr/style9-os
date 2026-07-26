@@ -3256,8 +3256,29 @@ inode_where(uint64_t oid, uint64_t *bno_out)
 	return (FS_APFS_E_OK);
 }
 
-int
-fs_apfs_touch(uint64_t oid, uint64_t mtime_ns)
+/*
+ * AMENDING AN INODE'S FIXED PART.
+ *
+ * Two callers want this and they differ by one line: a touch moves the times,
+ * a chmod moves the permission bits and the change time with them.  Everything
+ * else -- finding the record, re-deriving its offset with the reader's own
+ * layout code, copy-on-writing the leaf, telling the spine where it went -- is
+ * identical, and identical code that exists twice is code that gets fixed
+ * once.  Same argument as make_at and unmake_at, and the same shape: one
+ * function with a question in it.
+ *
+ * The MODE is amended in its low bits only.  The type nibble is not a
+ * permission and moving it is not a chmod: apfsck checks an inode's type
+ * against the type in the directory entry that names it, so a chmod that
+ * turned a directory into a regular file would leave a volume the checker
+ * rejects by name ("file mode doesn't match dentry type").  Unix agrees --
+ * chmod(2) takes the file's type as given.
+ */
+#define	INODE_AMEND_TIME	0x1u	/* modification and change times   */
+#define	INODE_AMEND_MODE	0x2u	/* permission bits, and change time */
+
+static int
+inode_amend(uint64_t oid, uint32_t what, uint64_t ns, uint16_t perm)
 {
 	struct btree_layout	 bl;
 	struct apfs_inode_val	*iv;
@@ -3312,8 +3333,12 @@ fs_apfs_touch(uint64_t oid, uint64_t mtime_ns)
 			goto out;
 		}
 		iv = (struct apfs_inode_val *)(bl.bl_vals - voff);
-		iv->ai_mod_time    = mtime_ns;
-		iv->ai_change_time = mtime_ns;
+		if ((what & INODE_AMEND_TIME) != 0)
+			iv->ai_mod_time = ns;
+		if ((what & INODE_AMEND_MODE) != 0)
+			iv->ai_mode = (uint16_t)((iv->ai_mode & APFS_S_IFMT) |
+			    (perm & 07777u));
+		iv->ai_change_time = ns;
 		rv = FS_APFS_E_OK;
 		break;
 	}
@@ -3363,6 +3388,29 @@ fs_apfs_touch(uint64_t oid, uint64_t mtime_ns)
 out:
 	kfree(node);
 	return (rv);
+}
+
+int
+fs_apfs_touch(uint64_t oid, uint64_t mtime_ns)
+{
+
+	return (inode_amend(oid, INODE_AMEND_TIME, mtime_ns, 0));
+}
+
+/*
+ * chmod: the permission bits, and the change time that goes with them.
+ *
+ * The record does not move and does not change LENGTH -- a mode is sixteen
+ * bits inside a value that is already there -- so this is the cheapest edit
+ * this writer can make, and the only one that cannot fail for want of room.
+ * It still copies the leaf and updates the spine, because a block written in
+ * place would be a block the live checkpoint still names.
+ */
+int
+fs_apfs_chmod(uint64_t oid, uint16_t perm, uint64_t now_ns)
+{
+
+	return (inode_amend(oid, INODE_AMEND_MODE, now_ns, perm));
 }
 
 /* ---- growing -------------------------------------------------------------- */
@@ -6290,7 +6338,7 @@ dir_children_add(uint8_t *node, uint64_t dir, int32_t delta, uint64_t now)
  * fs_apfs_grow can start over because it has one leaf to reconsider.
  */
 static int
-make_at(uint64_t dir, const char *name, uint64_t now, bool isdir,
+make_at(uint64_t dir, const char *name, uint64_t now, bool isdir, uint16_t perm,
     uint64_t *ino_out)
 {
 	struct apfs_inode_val	*iv;
@@ -6403,8 +6451,15 @@ make_at(uint64_t dir, const char *name, uint64_t now, bool isdir,
 	iv->ai_internal_flags     = APFS_INODE_NO_RSRC_FORK;
 	/* One field, two meanings: a directory counts children, and has none. */
 	iv->ai_nchildren_or_nlink = isdir ? 0 : 1;
-	iv->ai_mode               = isdir ? (APFS_S_IFDIR | 0755) :
-	    (APFS_S_IFREG | 0644);
+	/*
+	 * The type is the writer's and the permission bits are the caller's.
+	 * This used to stamp 0755 and 0644 regardless of what was asked for,
+	 * because there was no umask to subtract and no chmod to correct it
+	 * afterwards; there are both now, so a mode arrives here already
+	 * reduced and is written as given.
+	 */
+	iv->ai_mode               = (uint16_t)((isdir ? APFS_S_IFDIR :
+	    APFS_S_IFREG) | (perm & 07777u));
 	blob = (struct apfs_xf_blob *)(rec + sizeof(*iv));
 	blob->xb_num_exts  = (uint16_t)nexts;
 	blob->xb_used_data = (uint16_t)(pad + dslen);
@@ -6529,17 +6584,19 @@ out:
 }
 
 int
-fs_apfs_create(uint64_t dir, const char *name, uint64_t now, uint64_t *ino_out)
+fs_apfs_create(uint64_t dir, const char *name, uint64_t now, uint16_t perm,
+    uint64_t *ino_out)
 {
 
-	return (make_at(dir, name, now, false, ino_out));
+	return (make_at(dir, name, now, false, perm, ino_out));
 }
 
 int
-fs_apfs_mkdir(uint64_t dir, const char *name, uint64_t now, uint64_t *ino_out)
+fs_apfs_mkdir(uint64_t dir, const char *name, uint64_t now, uint16_t perm,
+    uint64_t *ino_out)
 {
 
-	return (make_at(dir, name, now, true, ino_out));
+	return (make_at(dir, name, now, true, perm, ino_out));
 }
 
 struct dir_probe {

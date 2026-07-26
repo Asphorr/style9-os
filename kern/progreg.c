@@ -236,6 +236,19 @@ extern uint8_t	_binary_gstty_macho_start[];
 extern uint8_t	_binary_gstty_macho_end[];
 
 /*
+ * The ELEVENTH and TWELFTH: gmkdir and grmdir (GNU coreutils' mkdir and
+ * rmdir).  The kernel could make and remove directories before these arrived;
+ * what it could not do was let a person do it BY HAND, because nothing that
+ * ships in a bottle would run without the mode word being real -- chmod, a
+ * umask that is subtracted, and an ownership family honest enough to refuse.
+ */
+extern uint8_t	_binary_gmkdir_macho_start[];
+extern uint8_t	_binary_gmkdir_macho_end[];
+
+extern uint8_t	_binary_grmdir_macho_start[];
+extern uint8_t	_binary_grmdir_macho_end[];
+
+/*
  * A fourth REAL Apple binary: gfactor (GNU coreutils' factor, a Homebrew
  * bottle).  Unlike the libSystem-only binaries above, it also links libgmp --
  * the first program to drive a SECOND dependency, so our dyld maps the whole
@@ -398,6 +411,10 @@ progreg_init(void)
 	    _binary_ttyprobe_macho_start, _binary_ttyprobe_macho_end);
 	register_one("gstty",
 	    _binary_gstty_macho_start, _binary_gstty_macho_end);
+	register_one("gmkdir",
+	    _binary_gmkdir_macho_start, _binary_gmkdir_macho_end);
+	register_one("grmdir",
+	    _binary_grmdir_macho_start, _binary_grmdir_macho_end);
 	register_one("gfactor",
 	    _binary_gfactor_macho_start, _binary_gfactor_macho_end);
 	register_one("pipefork",

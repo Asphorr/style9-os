@@ -2204,6 +2204,63 @@ demo_darwin_spawn(void)
 	}
 
 	/*
+	 * gmkdir and grmdir, the ELEVENTH and TWELFTH real Apple binaries, and
+	 * the pair that makes a directory usable BY HAND rather than only by
+	 * our own self-tests.
+	 *
+	 * The order is the whole demonstration: mkdir -m 700 asks for a mode
+	 * and gls is asked what arrived, which is the check that the umask is
+	 * subtracted and the bits are written rather than stamped.  Then rmdir
+	 * takes it away.  Every one of these is unmodified Homebrew code.
+	 */
+	{
+		mach_port_name_t	 dir_tp;
+		char			*dir_argv[4];
+
+		printf("  >>> gmkdir / grmdir -- REAL Apple binaries making "
+		    "and removing a directory <<<\n");
+		dir_argv[0] = "gmkdir";
+		dir_argv[1] = "-m";
+		dir_argv[2] = "700";
+		dir_argv[3] = "/etc/appledir";
+		dir_tp = MACH_PORT_NULL;
+		child_id = spawn_args("gmkdir", 4, dir_argv, &dir_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('gmkdir') failed (rv=%ld)\n",
+			    child_id);
+			return (99);
+		}
+		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
+			(void)yield();
+		printf("  gmkdir retired after %d yields\n", i);
+
+		dir_argv[0] = "gls";
+		dir_argv[1] = "-ld";
+		dir_argv[2] = "/etc/appledir";
+		dir_argv[3] = NULL;
+		dir_tp = MACH_PORT_NULL;
+		child_id = spawn_args("gls", 3, dir_argv, &dir_tp);
+		if (child_id >= 0)
+			for (i = 0; i < 8192 &&
+			    task_alive((uint64_t)child_id); i++)
+				(void)yield();
+
+		dir_argv[0] = "grmdir";
+		dir_argv[1] = "/etc/appledir";
+		dir_argv[2] = NULL;
+		dir_tp = MACH_PORT_NULL;
+		child_id = spawn_args("grmdir", 2, dir_argv, &dir_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('grmdir') failed (rv=%ld)\n",
+			    child_id);
+			return (99);
+		}
+		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
+			(void)yield();
+		printf("  grmdir retired after %d yields\n", i);
+	}
+
+	/*
 	 * A THIRD real Apple binary: guname (GNU coreutils' uname).  The
 	 * machine-identity trick -- it asks uname(2) what it is running on and
 	 * prints the answer, never validating it.  Our kernel hands back a

@@ -962,7 +962,7 @@ uint64_t fs_apfs_drops(void);
  * hash -- anything outside ASCII -- rather than guessing at Apple's folding.
  */
 int	fs_apfs_create(uint64_t dir, const char *name, uint64_t now,
-	    uint64_t *ino_out);
+	    uint16_t perm, uint64_t *ino_out);
 
 /*
  * And take a name back out, with the file under it.
@@ -994,7 +994,7 @@ int	fs_apfs_unlink(uint64_t dir, const char *name, uint64_t now);
  * is gone, and the checker says so.
  */
 int	fs_apfs_mkdir(uint64_t dir, const char *name, uint64_t now,
-	    uint64_t *ino_out);
+	    uint16_t perm, uint64_t *ino_out);
 int	fs_apfs_rmdir(uint64_t dir, const char *name, uint64_t now);
 
 /*
@@ -1224,6 +1224,14 @@ int	fs_apfs_pwrite(uint64_t id, uint64_t size, uint64_t off,
  * new checkpoint, which is the next rung and not this one.
  */
 int	fs_apfs_touch(uint64_t oid, uint64_t mtime_ns);
+
+/*
+ * fs_apfs_chmod: the permission bits of an inode that already exists, and the
+ * change time that any Unix moves with them.  Only the low twelve bits are
+ * the caller's to set -- the type nibble belongs to the format, and the
+ * checker tests it against the type in the directory entry.
+ */
+int	fs_apfs_chmod(uint64_t oid, uint16_t perm, uint64_t now_ns);
 
 /*
  * The current length of the file whose inode object id is `ino`, without

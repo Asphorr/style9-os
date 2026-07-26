@@ -855,6 +855,7 @@ arch_darwin_fork(struct syscall_frame *f)
 	 */
 	for (si = 0; si < DARWIN_PATH_MAX; si++)
 		child->t_darwin_cwd[si] = parent->t_darwin_cwd[si];
+	child->t_darwin_umask = parent->t_darwin_umask;
 
 	/*
 	 * A fork(2) child inherits its parent's signal dispositions and

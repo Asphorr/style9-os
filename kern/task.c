@@ -129,6 +129,11 @@ task_create(const char *name)
 	 */
 	t->t_darwin_cwd[0] = '/';
 	t->t_darwin_cwd[1] = '\0';
+	/*
+	 * And with the historical mask, which is what makes `mkdir foo` come
+	 * out 0755 when the caller asked for 0777 -- as every one of them does.
+	 */
+	t->t_darwin_umask = 022;
 	{
 		size_t	fi;
 

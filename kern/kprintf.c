@@ -124,6 +124,21 @@ kvprintf(const char *fmt, va_list ap)
 				    (uint64_t)va_arg(ap, unsigned int),
 				    10, false, width, zeropad, left_align);
 			break;
+		/*
+		 * Octal, which exists here for exactly one reason: a mode
+		 * word.  0755 is a number nobody reads in decimal, and a
+		 * diagnostic that printed 493 would be technically correct
+		 * and useless.
+		 */
+		case 'o':
+			if (length >= 1)
+				written += emit_uint(va_arg(ap, unsigned long),
+				    8, false, width, zeropad, left_align);
+			else
+				written += emit_uint(
+				    (uint64_t)va_arg(ap, unsigned int),
+				    8, false, width, zeropad, left_align);
+			break;
 		case 'x':
 			if (length >= 1)
 				written += emit_uint(va_arg(ap, unsigned long),

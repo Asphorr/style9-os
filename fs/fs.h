@@ -268,10 +268,18 @@ int		fs_truncate(struct fs_handle *h, uint64_t new_size);
  * close a checkpoint on success, because a name and the inode under it are
  * several disk updates describing one event.
  */
-int		fs_create(const char *path, uint64_t *ino_out);
+int		fs_create(const char *path, uint16_t perm, uint64_t *ino_out);
 int		fs_unlink(const char *path);
-int		fs_mkdir(const char *path, uint64_t *ino_out);
+int		fs_mkdir(const char *path, uint16_t perm, uint64_t *ino_out);
 int		fs_rmdir(const char *path);
+
+/*
+ * fs_chmod: set the permission bits of an existing name.  Only the low twelve
+ * are taken; the type belongs to the file and not to the caller.  FAT answers
+ * FS_E_ROFS -- its directory entry has no mode to set, and pretending would
+ * leave a program unable to tell a chmod that worked from one that did not.
+ */
+int		fs_chmod(const char *path, uint16_t mode);
 
 /* Metadata for a path.  Returns FS_E_OK and fills *out, or a negative FS_E_*. */
 int		fs_stat(const char *path, struct fs_statbuf *out);

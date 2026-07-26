@@ -52,7 +52,7 @@ so a flat `fs/` had stopped saying which files belonged to what.
 | usermode | `arch/amd64/usermode.c` | per-task PML4 staged at task creation; the launcher sniffs the image's 4-byte magic and routes ELF to `elf_load` or Mach-O to `macho_load` (shared `(task, image, size, &entry)` contract, shared argv/stack/port-injection path); `iretq` lands at the entry RIP with a fresh user stack |
 | elf loader | `kern/elf.c` | static ELF64 parser.  Walks PT_LOAD program headers, allocates 4 KiB user pages and maps them via the task's pmap with R/W/X taken from p_flags, copies file data via `pmm_kva_from_pa` of the freshly-allocated frame |
 | macho loader | `kern/macho.c`, `tools/elf2macho.c` | XNU binary compat, S1: thin x86-64 Mach-O + fat/universal slice picker, mapping each `LC_SEGMENT_64` the way the ELF loader maps PT_LOAD and resolving the entry from `LC_UNIXTHREAD`/`LC_MAIN`.  The build host has no Darwin cross-toolchain, so the host tool `elf2macho` rewraps a style9 ELF into a spec-shaped Mach-O; `-Ikern` shares the wire structs so loader and converter never drift |
-| darwin abi | `kern/darwin.c` | XNU binary compat, S2/S3: a per-task syscall personality, through which **ring 3 can now change the disk** -- `open(2)` honours `O_CREAT`/`O_TRUNC`/`O_APPEND`, `write(2)` on a file descriptor reaches the APFS writer, `unlink(2)` takes a name back out, `mkdir(2)`/`rmdir(2)` make and remove a directory (the mode argument is taken and dropped, said out loud: there is no umask to subtract one from and no chmod to correct it afterwards), and a real Apple `dash` redirecting with `>` makes a file that survives the machine being switched off.  **The terminal can be told what to do**: `ioctl(2)` at 54 carries `TIOCGETA`/`TIOCSETA`/`TIOCGWINSZ`, the kernel keeps a `struct termios` in Apple's exact layout (asserted, not assumed -- the size is encoded in the ioctl number), and the line discipline asks the flags instead of assuming them, so a program that turns ICANON and ECHO off reads one keystroke with no Return behind it.  A file and a pipe answer ENOTTY, which is what `isatty(3)` is built out of.  A Mach-O carrying an `LC_BUILD_VERSION` for macOS is tagged `TASK_PERSONALITY_DARWIN`, and `syscall_dispatch` routes it to `darwin_dispatch`, which decodes Apple's class-encoded `%rax` -- class 2 = BSD `write`/`getpid`/`exit` with the carry-flag errno convention; class 1 = Mach `task_self_trap`/`mach_reply_port`/`mach_msg` traps -- and translates each onto the style9 primitive.  The `mach_msg` trap drives the kernel's existing message queue, so a Darwin task does real IPC; the native style9 syscall table is left untouched |
+| darwin abi | `kern/darwin.c` | XNU binary compat, S2/S3: a per-task syscall personality, through which **ring 3 can now change the disk** -- `open(2)` honours `O_CREAT`/`O_TRUNC`/`O_APPEND`, `write(2)` on a file descriptor reaches the APFS writer, `unlink(2)` takes a name back out, `mkdir(2)`/`rmdir(2)` make and remove a directory with the mode they were given less this task's `umask(2)`, `chmod(2)`/`fchmod(2)` change one afterwards, a directory can be OPENED (a descriptor that names a place: `read(2)` on it answers EISDIR, and `openat`/`fdopendir`/`fchdir`/`fchmod` are built on it), and a real Apple `dash` redirecting with `>` makes a file that survives the machine being switched off.  **The terminal can be told what to do**: `ioctl(2)` at 54 carries `TIOCGETA`/`TIOCSETA`/`TIOCGWINSZ`, the kernel keeps a `struct termios` in Apple's exact layout (asserted, not assumed -- the size is encoded in the ioctl number), and the line discipline asks the flags instead of assuming them, so a program that turns ICANON and ECHO off reads one keystroke with no Return behind it.  A file and a pipe answer ENOTTY, which is what `isatty(3)` is built out of.  A Mach-O carrying an `LC_BUILD_VERSION` for macOS is tagged `TASK_PERSONALITY_DARWIN`, and `syscall_dispatch` routes it to `darwin_dispatch`, which decodes Apple's class-encoded `%rax` -- class 2 = BSD `write`/`getpid`/`exit` with the carry-flag errno convention; class 1 = Mach `task_self_trap`/`mach_reply_port`/`mach_msg` traps -- and translates each onto the style9 primitive.  The `mach_msg` trap drives the kernel's existing message queue, so a Darwin task does real IPC; the native style9 syscall table is left untouched |
 | progreg | `kern/progreg.c` | "program registry" -- two dozen user programs embedded in the kernel image via objcopy, delivered as ELF or (for the Mach-O loader + Darwin demos) Mach-O containers.  `progreg_spawn(name)` creates a task and loads the matching image into it; `SYS_SPAWN` is the userspace door |
 | traps | `arch/amd64/idt.c`, `intr.c`, `isr.S` | 48-vector IDT, trap-frame dispatcher, symbolicated autopsy on exception |
 | irqs | `arch/amd64/pic.c`, `pit.c` | 8259 remap to 0x20/0x28, PIT @ 100 Hz with quantum tracking |
@@ -411,6 +411,29 @@ Apple binary, prints our terminal in a Mac's own words (`speed 38400
 baud; rows 25; columns 80; ... isig icanon iexten echo echoe echok`) and
 changes it back and forth with `-echo` and `sane`.  It needed no dylib
 that was not already here.
+
+The MODE WORD stopped being decoration.  `mkdir(2)` used to take a mode
+and drop it -- documented as an honest edge, since there was no umask to
+subtract and no chmod to correct it afterwards.  There is now a `chmod`
+in the APFS writer (the cheapest edit it can make: sixteen bits inside a
+record that does not move or change length, though the leaf still copies
+because a block written in place is a block the live checkpoint names), a
+real per-task `umask(2)`, and creates that write the mode they were
+given.  What proves it is not this boot: the directory self-test leaves
+its fixture wearing **0711**, which no create here produces, and the
+boot after finds it still wearing it.
+
+That is what **gmkdir** and **grmdir** -- coreutils' `mkdir` and `rmdir`,
+the ELEVENTH and TWELFTH real Apple binaries -- needed.  Not directories:
+those already worked.  They needed the mode word, an ownership family
+honest enough to refuse (there are no users here, so anything but root
+answers EPERM), the fd-relative calls, and one thing measured rather than
+guessed: **a directory can be opened**.  GNU mkdir reported that the
+directory it had just successfully created did not exist, because it
+opens what it makes and `fs_open` answers about bytes.  A descriptor onto
+a directory names a PLACE -- `read(2)` on one answers EISDIR -- and it is
+what `openat`, `fdopendir`, `fchdir` and `fchmod` are all built on, all
+four through one kernel call that answers "what path is this fd on".
 
 Next on the roadmap: **a create that splits and retries** the way growing
 a file does.  It is the one edge both making calls document out loud and

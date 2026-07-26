@@ -68,6 +68,7 @@
 #define	DARWIN_SYS_wait4	7
 #define	DARWIN_SYS_unlink	10
 #define	DARWIN_SYS_chdir	12
+#define	DARWIN_SYS_chmod	15
 #define	DARWIN_SYS_getpid	20
 #define	DARWIN_SYS_kill		37
 #define	DARWIN_SYS_getppid	39
@@ -77,10 +78,12 @@
 #define	DARWIN_SYS_sigprocmask	48
 #define	DARWIN_SYS_ioctl	54
 #define	DARWIN_SYS_execve	59
+#define	DARWIN_SYS_umask	60
 #define	DARWIN_SYS_munmap	73
 #define	DARWIN_SYS_setitimer	83
 #define	DARWIN_SYS_dup2		90
 #define	DARWIN_SYS_gettimeofday	116
+#define	DARWIN_SYS_fchmod	124
 #define	DARWIN_SYS_fcntl	92
 #define	DARWIN_SYS_mkdir	136
 #define	DARWIN_SYS_rmdir	137
@@ -198,6 +201,7 @@
 #define	DARWIN_S9_fs_readdir		3
 #define	DARWIN_S9_uname			4
 #define	DARWIN_S9_fs_fstat		5
+#define	DARWIN_S9_fs_fdpath		6
 
 /*
  * fs_fstat(int fd, struct darwin_fdstat *out): the fd-flavored sibling of
@@ -210,6 +214,7 @@
 #define	DARWIN_FDSTAT_REG	0
 #define	DARWIN_FDSTAT_CHR	1
 #define	DARWIN_FDSTAT_FIFO	2
+#define	DARWIN_FDSTAT_DIR	3
 
 struct darwin_fdstat {
 	uint32_t	fds_size;	/* byte length (regular files)   */

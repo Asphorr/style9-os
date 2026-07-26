@@ -477,7 +477,7 @@ path_split(const char *path, char *dir, size_t dircap, const char **leaf)
 }
 
 static int
-create_locked(const char *path, uint64_t *ino_out)
+create_locked(const char *path, uint16_t perm, uint64_t *ino_out)
 {
 	char		 dir[FS_NAME_MAX];
 	const char	*leaf;
@@ -498,7 +498,7 @@ create_locked(const char *path, uint64_t *ino_out)
 		return (FS_E_NOTFOUND);
 
 	now_ns = (uint64_t)clock_walltime_us() * 1000ULL;
-	rv = apfs_err(fs_apfs_create(parent, leaf, now_ns, ino_out));
+	rv = apfs_err(fs_apfs_create(parent, leaf, now_ns, perm, ino_out));
 	if (rv != FS_E_OK)
 		return (rv);
 	/*
@@ -512,12 +512,12 @@ create_locked(const char *path, uint64_t *ino_out)
 }
 
 int
-fs_create(const char *path, uint64_t *ino_out)
+fs_create(const char *path, uint16_t perm, uint64_t *ino_out)
 {
 	int	rv;
 
 	mutex_lock(&fs_lock);
-	rv = create_locked(path, ino_out);
+	rv = create_locked(path, perm, ino_out);
 	mutex_unlock(&fs_lock);
 	return (rv);
 }
@@ -596,7 +596,7 @@ path_undress(const char *path, char *out, size_t cap)
  * whole of both of them and they differ only in which call ends them.
  */
 static int
-dir_locked(const char *path, int make, uint64_t *ino_out)
+dir_locked(const char *path, int make, uint16_t perm, uint64_t *ino_out)
 {
 	char		 norm[FS_NAME_MAX];
 	char		 dir[FS_NAME_MAX];
@@ -621,7 +621,7 @@ dir_locked(const char *path, int make, uint64_t *ino_out)
 		return (FS_E_NOTDIR);
 
 	now_ns = (uint64_t)clock_walltime_us() * 1000ULL;
-	rv = make ? fs_apfs_mkdir(parent, leaf, now_ns, ino_out) :
+	rv = make ? fs_apfs_mkdir(parent, leaf, now_ns, perm, ino_out) :
 	    fs_apfs_rmdir(parent, leaf, now_ns);
 	rv = apfs_err(rv);
 	if (rv != FS_E_OK)
@@ -632,12 +632,12 @@ dir_locked(const char *path, int make, uint64_t *ino_out)
 }
 
 int
-fs_mkdir(const char *path, uint64_t *ino_out)
+fs_mkdir(const char *path, uint16_t perm, uint64_t *ino_out)
 {
 	int	rv;
 
 	mutex_lock(&fs_lock);
-	rv = dir_locked(path, 1, ino_out);
+	rv = dir_locked(path, 1, perm, ino_out);
 	mutex_unlock(&fs_lock);
 	return (rv);
 }
@@ -648,7 +648,44 @@ fs_rmdir(const char *path)
 	int	rv;
 
 	mutex_lock(&fs_lock);
-	rv = dir_locked(path, 0, NULL);
+	rv = dir_locked(path, 0, 0, NULL);
+	mutex_unlock(&fs_lock);
+	return (rv);
+}
+
+/*
+ * fs_chmod: the permission bits of something that already exists.
+ *
+ * FAT is refused rather than approximated.  Its directory entry has no mode
+ * word at all -- what a stat of a FAT file reports is synthesised from the
+ * read-only attribute and a convention -- so a chmod there could only pretend,
+ * and a chmod that silently does nothing is worse than one that says no: a
+ * program checks the mode afterwards, and only one of the two answers can be
+ * told apart from success.
+ */
+int
+fs_chmod(const char *path, uint16_t mode)
+{
+	struct fs_apfs_statbuf	asb;
+	uint64_t		now_ns;
+	int			rv;
+
+	mutex_lock(&fs_lock);
+	if (!fs_apfs_ready()) {
+		mutex_unlock(&fs_lock);
+		return (fs_fat_ready() ? FS_E_ROFS : FS_E_NOMOUNT);
+	}
+	rv = apfs_err(fs_apfs_stat(path, &asb));
+	if (rv != FS_E_OK) {
+		mutex_unlock(&fs_lock);
+		return (rv);
+	}
+	now_ns = (uint64_t)clock_walltime_us() * 1000ULL;
+	rv = apfs_err(fs_apfs_chmod(asb.afs_ino, mode, now_ns));
+	if (rv == FS_E_OK) {
+		rv = apfs_err(fs_apfs_checkpoint());
+		fs_gen++;
+	}
 	mutex_unlock(&fs_lock);
 	return (rv);
 }
@@ -1675,7 +1712,7 @@ fs_make_selftest(void)
 	 */
 	holes = fs_apfs_holes();
 	ino   = 0;
-	rv = fs_create(SELFTEST_MADE, &ino);
+	rv = fs_create(SELFTEST_MADE, 0644, &ino);
 	/*
 	 * A leaf with no room refuses, and a create does not split and retry
 	 * the way growing a file does -- it puts records into two leaves at
@@ -1728,7 +1765,7 @@ fs_make_selftest(void)
 	}
 
 	/* A name is taken once.  Asking again is an error, not a truncation. */
-	rv = fs_create(SELFTEST_MADE, NULL);
+	rv = fs_create(SELFTEST_MADE, 0644, NULL);
 	if (rv != FS_E_EXIST) {
 		kprintf("apfs-make: FAIL making %s a second time answered %d, "
 		    "wanted %d -- a create that quietly replaces a file is a "
@@ -1799,6 +1836,12 @@ fs_make_selftest(void)
 #define	SELFTEST_DIRS		"/etc/madedir"
 #define	SELFTEST_DIRS_SLASH	"/etc/madedir/"
 #define	SELFTEST_DIRS_FILE	"/etc/madedir/inside.txt"
+/*
+ * The mode this test leaves on it, chosen because NOTHING ELSE PRODUCES IT: a
+ * create here makes 0755, and a directory found wearing 0711 next boot got it
+ * from a chmod that survived the machine being switched off.
+ */
+#define	SELFTEST_DIRS_MODE	0711
 
 void
 fs_dirs_selftest(void)
@@ -1839,6 +1882,28 @@ fs_dirs_selftest(void)
 			    "bytes -- wanted a directory of none\n",
 			    SELFTEST_DIRS, st.fs_is_dir ? "a directory" :
 			    "a file", (unsigned long long)st.fs_size);
+			return;
+		}
+		/*
+		 * AND WEARING THE MODE THE LAST BOOT CHMODDED IT TO.  0755 is
+		 * accepted without complaint and reported: that is a directory
+		 * made by a boot from before chmod existed, and the first boot
+		 * on such an image would otherwise report a regression that is
+		 * really an upgrade.  Anything else is neither.
+		 */
+		if ((st.fs_mode & 07777) == SELFTEST_DIRS_MODE)
+			kprintf("apfs-dirs: %s came back wearing %04o -- a "
+			    "chmod from the boot before survived the machine "
+			    "being switched off\n", SELFTEST_DIRS,
+			    (unsigned)SELFTEST_DIRS_MODE);
+		else if ((st.fs_mode & 07777) == 0755)
+			kprintf("apfs-dirs: %s came back at 0755, which is "
+			    "what a boot older than chmod would have left\n",
+			    SELFTEST_DIRS);
+		else {
+			kprintf("apfs-dirs: FAIL %s came back wearing %04o, "
+			    "which nothing here writes\n", SELFTEST_DIRS,
+			    (unsigned)(st.fs_mode & 07777));
 			return;
 		}
 		/*
@@ -1904,7 +1969,7 @@ fs_dirs_selftest(void)
 	/* And make one.  A full leaf refuses here exactly as a create does. */
 	count = fs_apfs_dirmakes();
 	ino   = 0;
-	rv = fs_mkdir(SELFTEST_DIRS, &ino);
+	rv = fs_mkdir(SELFTEST_DIRS, 0755, &ino);
 	if (rv == FS_E_NOALLOC) {
 		kprintf("apfs-dirs: the leaf that would hold %s is full, and a "
 		    "mkdir that splits and retries is the same rung a create "
@@ -1956,13 +2021,13 @@ fs_dirs_selftest(void)
 	 * with the separator a directory is entitled to must reach the same
 	 * name, not a different one.
 	 */
-	rv = fs_mkdir(SELFTEST_DIRS, NULL);
+	rv = fs_mkdir(SELFTEST_DIRS, 0755, NULL);
 	if (rv != FS_E_EXIST) {
 		kprintf("apfs-dirs: FAIL making %s a second time answered %d, "
 		    "wanted %d\n", SELFTEST_DIRS, rv, FS_E_EXIST);
 		return;
 	}
-	rv = fs_mkdir(SELFTEST_DIRS_SLASH, NULL);
+	rv = fs_mkdir(SELFTEST_DIRS_SLASH, 0755, NULL);
 	if (rv != FS_E_EXIST) {
 		kprintf("apfs-dirs: FAIL making %s answered %d, wanted %d -- "
 		    "the trailing separator named something else\n",
@@ -1996,7 +2061,7 @@ fs_dirs_selftest(void)
 	 * kernel made a moment ago, the create keys an entry under its object
 	 * id, and the removal must then refuse while that entry is there.
 	 */
-	rv = fs_create(SELFTEST_DIRS_FILE, NULL);
+	rv = fs_create(SELFTEST_DIRS_FILE, 0644, NULL);
 	if (rv == FS_E_NOALLOC) {
 		kprintf("apfs-dirs: PASS -- %s made as inode %llu, %d names in "
 		    "%s; the leaf that would hold a name INSIDE it is full, so "
@@ -2050,6 +2115,35 @@ fs_dirs_selftest(void)
 	if (held != 0) {
 		kprintf("apfs-dirs: FAIL %s holds %d name(s) after the only "
 		    "one was removed\n", SELFTEST_DIRS, held);
+		return;
+	}
+
+	/*
+	 * AND IT IS LEFT WEARING A MODE NOTHING ELSE WOULD PRODUCE.
+	 *
+	 * A chmod that reached a cache and no further answers every question
+	 * asked during this boot perfectly.  0711 is not a mode any create
+	 * here produces, so a directory that comes back wearing it next boot
+	 * can only have got it from a chmod that reached the platter -- which
+	 * is the one claim about chmod a single boot cannot make.
+	 */
+	rv = fs_chmod(SELFTEST_DIRS, SELFTEST_DIRS_MODE);
+	if (rv != FS_E_OK) {
+		kprintf("apfs-dirs: FAIL chmod of %s answered %d\n",
+		    SELFTEST_DIRS, rv);
+		return;
+	}
+	if (fs_stat(SELFTEST_DIRS, &st) != FS_E_OK ||
+	    (st.fs_mode & 07777) != SELFTEST_DIRS_MODE) {
+		kprintf("apfs-dirs: FAIL %s reads back as %04o after being "
+		    "chmodded to %04o\n", SELFTEST_DIRS,
+		    (unsigned)(st.fs_mode & 07777),
+		    (unsigned)SELFTEST_DIRS_MODE);
+		return;
+	}
+	if (!FS_ISDIR(st.fs_mode)) {
+		kprintf("apfs-dirs: FAIL a chmod took the directory bit off "
+		    "%s\n", SELFTEST_DIRS);
 		return;
 	}
 
