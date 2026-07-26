@@ -265,10 +265,15 @@ static struct alloc_chunk *chunk_for(uint64_t bno);
 static int	spine_update(uint64_t oid, uint64_t paddr, uint64_t xid,
 		    void *buf);
 static int	spine_update_n(const uint64_t *oids, const uint64_t *paddrs,
-		    uint32_t n, uint64_t ins_oid, uint64_t ins_paddr,
-		    uint64_t xid, void *buf);
+		    uint32_t n, const uint64_t *ins_oids,
+		    const uint64_t *ins_paddrs, uint32_t nins, uint64_t xid,
+		    void *buf);
 static int	cow_physical(uint64_t old_bno, uint64_t xid, void *buf,
 		    uint64_t *new_bno);
+static int	node_cow(uint8_t *node, uint64_t old_bno, uint64_t xid,
+		    uint64_t *new_bno);
+static uint32_t	node_place(const uint8_t *node, const uint8_t *key,
+		    uint32_t klen);
 static int	extref_move(uint64_t old_start, uint64_t new_start,
 		    uint64_t blocks, uint64_t xid, void *buf);
 static int	fq_insert(uint32_t q, uint64_t xid, uint64_t paddr,
@@ -307,6 +312,7 @@ static uint64_t	 drop_n;	/* ...and records taken out of it  */
 static uint64_t	 make_n;	/* files created                   */
 static uint64_t	 kill_n;	/* ...and names taken back out     */
 static uint64_t	 hole_n;	/* record ends reusing a deletion  */
+static uint64_t	 deep_n;	/* levels the tree has gained      */
 
 static size_t
 str_len(const char *s)
@@ -3832,16 +3838,27 @@ leaf_insert_fixed(uint8_t *node, uint32_t pos, const void *key, uint32_t klen,
 }
 
 /*
- * Build a node holding records [from, to) of another, laid out afresh.
+ * Build a node holding records [from, to) of another, laid out afresh, and
+ * SAYING WHAT KIND OF NODE IT IS.
  *
  * Rebuilding rather than moving bytes about is the point.  A node's key area
  * accumulates holes as records come and go, and half of one copied verbatim
  * would carry a free-list chain describing space that is no longer in it.
  * Re-inserting each record produces a layout correct by construction, through
  * the same insert every other writer here goes through.
+ *
+ * The kind is an argument because the tree can now gain a level, and the two
+ * halves a root splits into are not roots.  Three things say so and the
+ * checker reads all three: the ROOT flag, which also decides whether the last
+ * forty bytes are a btree_info or free space; the object type, which is
+ * BTREE_ROOT for one and BTREE_NODE for the others; and the level.  Leaving
+ * the flag on a half was answered with "B-tree node: wrong object type for
+ * root" and leaving the type behind with "wrong object type for nonroot" --
+ * the same obligation seen from either side.
  */
 static int
-node_rebuild(const uint8_t *src, uint32_t from, uint32_t to, uint8_t *dst)
+node_rebuild_as(const uint8_t *src, uint32_t from, uint32_t to, uint8_t *dst,
+    uint16_t flags, uint32_t type)
 {
 	const struct apfs_btree_node_phys	*s;
 	struct apfs_btree_node_phys		*d;
@@ -3858,6 +3875,8 @@ node_rebuild(const uint8_t *src, uint32_t from, uint32_t to, uint8_t *dst)
 	mem_zero(dst, APFS_BLOCK_SIZE);
 	d  = (struct apfs_btree_node_phys *)dst;
 	*d = *s;
+	d->btn_o.o_type = (s->btn_o.o_type & ~APFS_OBJ_TYPE_MASK) | type;
+	d->btn_flags              = flags;
 	d->btn_nkeys              = 0;
 	d->btn_table_space.nl_off = 0;
 	d->btn_table_space.nl_len = s->btn_table_space.nl_len;
@@ -3892,56 +3911,189 @@ node_rebuild(const uint8_t *src, uint32_t from, uint32_t to, uint8_t *dst)
 	return (FS_APFS_E_OK);
 }
 
+/* The same node again, which is what a split of anything but a root wants. */
+static int
+node_rebuild(const uint8_t *src, uint32_t from, uint32_t to, uint8_t *dst)
+{
+	const struct apfs_btree_node_phys	*s;
+
+	s = (const struct apfs_btree_node_phys *)src;
+	return (node_rebuild_as(src, from, to, dst, s->btn_flags,
+	    s->btn_o.o_type & APFS_OBJ_TYPE_MASK));
+}
+
 /*
- * Split the leaf at `bno` in two and tell everything that has to know.
+ * How many NODES a tree has, which lives beside the record count in the
+ * btree_info at the end of the root -- so every split moves the root as well,
+ * whether or not the root is the node that split.
+ */
+static void
+tree_nodes_add(uint8_t *root, int64_t delta)
+{
+	uint64_t	*count;
+
+	count = (uint64_t *)(root + APFS_BLOCK_SIZE - APFS_BTREE_INFO_SIZE +
+	    APFS_BTREE_INFO_NODECOUNT);
+	*count = (uint64_t)((int64_t)*count + delta);
+}
+
+/*
+ * WHO IS ABOVE A NODE
  *
- * Five objects move together and none of them is reachable until the
- * checkpoint commits: the lower half (keeping the oid it had), the upper half
- * (a brand new object), the parent that gains a separator and a node in its
- * count, the volume's object map that gains an entry, and the spine above all
- * of it.
+ * A split hands its parent a separator, and until now "the parent" was a word
+ * for the root: the tree was two levels deep and there was nothing else it
+ * could be.  A tree that can gain a level has to be asked.
+ *
+ * By SEARCH and not by key.  Descending on the key is faster and is what a
+ * lookup does, but it answers a different question -- which node a key BELONGS
+ * in -- and the two agree only while the tree is in order, which is exactly
+ * what the caller is in the middle of maintaining.  Following the child
+ * pointers until the block turns up cannot be fooled by a separator that is
+ * wrong, and the cost is a handful of node reads once per split.
+ *
+ * The path is the block AND oid of every node from the root down, because the
+ * two are different questions in a copy-on-write tree: the block is where a
+ * node is now, the oid is the name everything above it uses, and a copy
+ * changes the first without touching the second.
+ */
+#define	APFS_TREE_MAX_DEPTH	8
+
+struct tree_path {
+	uint64_t	tp_bno[APFS_TREE_MAX_DEPTH];
+	uint64_t	tp_oid[APFS_TREE_MAX_DEPTH];
+	uint32_t	tp_n;			/* the root is [0] */
+};
+
+static bool
+path_walk(uint64_t bno, uint64_t want, struct tree_path *tp, uint32_t depth)
+{
+	struct btree_layout	 bl;
+	uint8_t			*node;
+	uint64_t		 oid;
+	uint64_t		 child;
+	uint32_t		 koff, klen, voff, vlen;
+	uint32_t		 i;
+	bool			 found;
+
+	if (depth >= APFS_TREE_MAX_DEPTH)
+		return (false);
+	node = kmalloc(APFS_BLOCK_SIZE);
+	if (node == NULL)
+		return (false);
+	if (fs_apfs_read_block(bno, node) != FS_APFS_E_OK) {
+		kfree(node);
+		return (false);
+	}
+	tp->tp_bno[depth] = bno;
+	tp->tp_oid[depth] = ((const struct apfs_obj_phys *)node)->o_oid;
+	if (bno == want) {
+		tp->tp_n = depth + 1;
+		kfree(node);
+		return (true);
+	}
+	btree_layout(node, &bl);
+	found = false;
+	if ((bl.bl_flags & APFS_BTNODE_LEAF) == 0) {
+		for (i = 0; !found && i < bl.bl_nkeys; i++) {
+			btree_entry_loc(&bl, i, &koff, &klen, &voff, &vlen);
+			oid = *(const uint64_t *)(bl.bl_vals - voff);
+			if (fs_apfs_omap_lookup(g_apfs.ac_vol_omap_tree, oid,
+			    view_xid(), &child) != FS_APFS_E_OK)
+				break;
+			found = path_walk(child, want, tp, depth + 1);
+		}
+	}
+	kfree(node);
+	return (found);
+}
+
+static bool
+path_to(uint64_t want, struct tree_path *tp)
+{
+
+	tp->tp_n = 0;
+	return (path_walk(g_apfs.ac_root_tree_bno, want, tp, 0));
+}
+
+/*
+ * THE TREE GAINS A LEVEL
+ *
+ * Every other split has somewhere to put its separator.  The root does not:
+ * there is nothing above it, and there cannot be -- the volume superblock
+ * names the root's OID, so a root that made way for a new node above it would
+ * be a root the volume could no longer find.
+ *
+ * So the root does not move.  It splits DOWNWARD: its records go into two new
+ * nodes at the level it used to occupy, and the root itself is rebuilt in
+ * place, one level higher, holding two records that name them.  It keeps its
+ * oid, its block moves the way every copy's does, and the tree is a level
+ * deeper without anything outside it having to be told.
+ *
+ * Both halves are therefore NEW objects -- which is why the object map's
+ * insertion side had to become a list; a leaf split makes one and this makes
+ * two, in a node that has to be copied once either way.
+ *
+ * What the checker asks for, leaving out one obligation at a time:
+ *
+ *	leaving out			apfsck answers
+ *	  the root's new level		"B-tree: node levels are corrupted"
+ *	  the ROOT flag, off the halves	"wrong object type for root"
+ *	  the halves' object type	"wrong object type for nonroot"
+ *	  the two object-map entries	"Object map: record missing for id"
+ *	  the tree's node count		"Catalog: wrong node count in info
+ *					 footer"
+ *	  the volume's block count	"Volume superblock: bad block count"
+ *	  the container's next oid	"Object header: unassigned object id"
+ *
+ * The last is the container's nx_next_oid, and it is the same trap the create
+ * rung found in the volume's apfs_next_obj_id one namespace down: it is not a
+ * counter kept for tidiness, it is an assertion that everything at or above it
+ * is unused, and an object handed a number the container still calls free is
+ * caught by the header check before anything else is looked at.
  */
 static int
-leaf_split(uint64_t bno, uint64_t xid, uint8_t *scratch)
+tree_grow(uint64_t xid, uint8_t *scratch)
 {
-	struct apfs_obj_phys		*o;
+	struct apfs_btree_node_phys	*n;
 	struct btree_layout		 bl;
-	struct btree_layout		 rl;
 	uint8_t				*lo;
 	uint8_t				*hi;
-	uint8_t				*sep;
-	uint64_t			 oids[2];
-	uint64_t			 paddrs[2];
-	uint64_t			 lo_bno;
-	uint64_t			 hi_bno;
-	uint64_t			 lo_oid;
-	uint64_t			 hi_oid;
+	uint8_t				*nr;
+	uint64_t			 ins_oids[2];
+	uint64_t			 ins_paddrs[2];
+	uint64_t			 child;
+	uint64_t			 root_oid;
 	uint64_t			 root_bno;
 	uint64_t			 new_root;
-	uint64_t			*nodes;
-	uint32_t			 half;
 	uint32_t			 nkeys;
+	uint32_t			 half;
 	uint32_t			 koff, klen, voff, vlen;
-	uint32_t			 seplen;
-	uint32_t			 pos;
+	uint32_t			 i;
 	int				 rv;
 
-	lo  = kmalloc(APFS_BLOCK_SIZE);
-	hi  = kmalloc(APFS_BLOCK_SIZE);
-	sep = kmalloc(APFS_BLOCK_SIZE);
-	if (lo == NULL || hi == NULL || sep == NULL) {
+	lo = kmalloc(APFS_BLOCK_SIZE);
+	hi = kmalloc(APFS_BLOCK_SIZE);
+	nr = kmalloc(APFS_BLOCK_SIZE);
+	if (lo == NULL || hi == NULL || nr == NULL) {
 		rv = FS_APFS_E_NOMEM;
 		goto out;
 	}
 
-	rv = fs_apfs_read_block(bno, scratch);
+	root_bno = g_apfs.ac_root_tree_bno;
+	rv = fs_apfs_read_block(root_bno, scratch);
 	if (rv != FS_APFS_E_OK)
 		goto out;
 	btree_layout(scratch, &bl);
-	if ((bl.bl_flags & APFS_BTNODE_ROOT) != 0) {
-		kprintf("apfs: the node at %llu is the tree's root -- giving "
-		    "the tree another level is a different rung\n",
-		    (unsigned long long)bno);
+	if ((bl.bl_flags & APFS_BTNODE_ROOT) == 0) {
+		kprintf("apfs: the node at %llu is not the tree's root\n",
+		    (unsigned long long)root_bno);
+		rv = FS_APFS_E_INVAL;
+		goto out;
+	}
+	if ((uint32_t)bl.bl_level + 2u > APFS_TREE_MAX_DEPTH) {
+		kprintf("apfs: the tree is already %u levels deep and this "
+		    "kernel walks %u\n", (unsigned)(bl.bl_level + 1),
+		    (unsigned)APFS_TREE_MAX_DEPTH);
 		rv = FS_APFS_E_NOALLOC;
 		goto out;
 	}
@@ -3950,9 +4102,249 @@ leaf_split(uint64_t bno, uint64_t xid, uint8_t *scratch)
 		rv = FS_APFS_E_INVAL;
 		goto out;
 	}
-	half   = nkeys / 2;
-	lo_oid = ((const struct apfs_obj_phys *)scratch)->o_oid;
+	half     = nkeys / 2;
+	root_oid = ((const struct apfs_obj_phys *)scratch)->o_oid;
+	if (g_apfs.ac_next_oid == 0) {
+		rv = FS_APFS_E_INVAL;
+		goto out;
+	}
+	ins_oids[0] = g_apfs.ac_next_oid;
+	ins_oids[1] = g_apfs.ac_next_oid + 1;
 
+	/*
+	 * The halves first, at the level the root is at now, and no longer
+	 * roots -- so they lose the flag, the type and the forty bytes of
+	 * btree_info, which become free space they can use.
+	 */
+	rv = node_rebuild_as(scratch, 0, half, lo,
+	    (uint16_t)(bl.bl_flags & ~APFS_BTNODE_ROOT), APFS_OBJ_BTREE_NODE);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	rv = node_rebuild_as(scratch, half, nkeys, hi,
+	    (uint16_t)(bl.bl_flags & ~APFS_BTNODE_ROOT), APFS_OBJ_BTREE_NODE);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+
+	/*
+	 * And the root: the same node with no records in it, one level up.
+	 * Rebuilding an EMPTY range is how it keeps its flags, its object type
+	 * and its btree_info without any of that being written out again here.
+	 */
+	rv = node_rebuild_as(scratch, 0, 0, nr, bl.bl_flags,
+	    APFS_OBJ_BTREE_ROOT);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	n = (struct apfs_btree_node_phys *)nr;
+	n->btn_level = (uint16_t)(bl.bl_level + 1);
+	for (i = 0; i < 2; i++) {
+		btree_entry_loc(&bl, i == 0 ? 0 : half, &koff, &klen, &voff,
+		    &vlen);
+		child = ins_oids[i];
+		rv = leaf_insert(nr, i, bl.bl_keys + koff, klen, &child,
+		    (uint32_t)sizeof(child));
+		if (rv != FS_APFS_E_OK)
+			goto out;
+	}
+	tree_nodes_add(nr, 2);
+
+	rv = alloc_blocks(1, root_bno, &ins_paddrs[0]);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	rv = alloc_blocks(1, root_bno, &ins_paddrs[1]);
+	if (rv != FS_APFS_E_OK) {
+		(void)free_blocks(ins_paddrs[0], 1);
+		goto out;
+	}
+	for (i = 0; i < 2; i++) {
+		n = (struct apfs_btree_node_phys *)(i == 0 ? lo : hi);
+		n->btn_o.o_oid = ins_oids[i];
+		n->btn_o.o_xid = xid;
+		rv = fs_apfs_write_block(ins_paddrs[i], i == 0 ? lo : hi);
+		if (rv != FS_APFS_E_OK) {
+			(void)free_blocks(ins_paddrs[0], 1);
+			(void)free_blocks(ins_paddrs[1], 1);
+			goto out;
+		}
+	}
+	cow_n_spine += 2;
+
+	rv = node_cow(nr, root_bno, xid, &new_root);
+	if (rv != FS_APFS_E_OK)
+		goto broken;
+
+	/* Two nodes more belong to this volume: three written, one freed. */
+	g_apfs.ac_fs_alloc_count += 2;
+
+	rv = spine_update_n(&root_oid, &new_root, 1, ins_oids, ins_paddrs, 2,
+	    xid, scratch);
+	if (rv != FS_APFS_E_OK)
+		goto broken;
+
+	g_apfs.ac_root_tree_bno = new_root;
+	g_apfs.ac_next_oid      = ins_oids[1] + 1;
+	deep_n++;
+	kprintf("apfs: the tree is %u levels deep -- the root kept oid %llu at "
+	    "%llu and its %u children went to new oids %llu and %llu\n",
+	    (unsigned)(bl.bl_level + 2), (unsigned long long)root_oid,
+	    (unsigned long long)new_root, (unsigned)nkeys,
+	    (unsigned long long)ins_oids[0], (unsigned long long)ins_oids[1]);
+	rv = FS_APFS_E_OK;
+out:
+	kfree(lo);
+	kfree(hi);
+	kfree(nr);
+	return (rv);
+
+broken:
+	kprintf("apfs: giving the tree another level failed part way (%d) -- "
+	    "this checkpoint must not be written\n", rv);
+	kfree(lo);
+	kfree(hi);
+	kfree(nr);
+	return (rv);
+}
+
+/*
+ * Split the node at `bno` in two and tell everything that has to know.
+ *
+ * Objects move together and none of them is reachable until the checkpoint
+ * commits: the lower half (keeping the oid it had), the upper half (a brand
+ * new object), the parent that gains a separator, the ROOT whose btree_info
+ * counts the tree's nodes, the volume's object map that gains an entry, and
+ * the spine above all of it.  The parent and the root are the same node in a
+ * two-level tree and different ones in a deeper tree, which is the whole of
+ * what changed when the tree learned to grow.
+ *
+ * NOTHING BETWEEN THEM MOVES, and that is worth saying because it looks like
+ * an omission.  An interior node names its children by oid, and a copy keeps
+ * its oid -- so a node three levels down can be rewritten without the levels
+ * above it knowing, and the object map absorbs the whole difference.  That
+ * indirection is what copy-on-write buys with the lookup it costs on every
+ * descent.
+ *
+ * ROOM ABOVE IS ASKED FOR FIRST, before a block is allocated or a byte
+ * written.  A split that got half way and found the parent full would have
+ * nowhere to put the half it had already made.  A full parent makes room the
+ * same way this node is about to -- by splitting, which asks the same question
+ * one level up -- and the recursion ends at the root, which cannot split
+ * sideways and grows the tree instead.  Either way the question is then asked
+ * again of a parent that is half empty by construction.
+ */
+static int
+node_split(uint64_t bno, uint64_t xid, uint8_t *scratch)
+{
+	struct tree_path		 tp;
+	struct apfs_obj_phys		*o;
+	struct btree_layout		 bl;
+	uint8_t				*lo;
+	uint8_t				*hi;
+	uint8_t				*sep;
+	uint8_t				*par;
+	uint64_t			 oids[3];
+	uint64_t			 paddrs[3];
+	uint64_t			 lo_bno;
+	uint64_t			 hi_bno;
+	uint64_t			 lo_oid;
+	uint64_t			 hi_oid;
+	uint64_t			 parent_bno;
+	uint64_t			 new_parent;
+	uint64_t			 new_root;
+	uint64_t			 top;
+	uint32_t			 half;
+	uint32_t			 nkeys;
+	uint32_t			 koff, klen, voff, vlen;
+	uint32_t			 seplen;
+	uint32_t			 nmoved;
+	uint32_t			 tries;
+	bool				 under_root;
+	int				 rv;
+
+	lo  = kmalloc(APFS_BLOCK_SIZE);
+	hi  = kmalloc(APFS_BLOCK_SIZE);
+	sep = kmalloc(APFS_BLOCK_SIZE);
+	par = kmalloc(APFS_BLOCK_SIZE);
+	if (lo == NULL || hi == NULL || sep == NULL || par == NULL) {
+		rv = FS_APFS_E_NOMEM;
+		goto out;
+	}
+
+	nkeys      = 0;
+	half       = 0;
+	seplen     = 0;
+	parent_bno = 0;
+	under_root = false;
+	for (tries = 0; ; tries++) {
+		rv = fs_apfs_read_block(bno, scratch);
+		if (rv != FS_APFS_E_OK)
+			goto out;
+		btree_layout(scratch, &bl);
+		if ((bl.bl_flags & APFS_BTNODE_ROOT) != 0) {
+			/*
+			 * The root has nobody to hand a separator to, so it
+			 * does not split sideways -- it grows the tree.
+			 */
+			rv = tree_grow(xid, scratch);
+			goto out;
+		}
+		nkeys = bl.bl_nkeys;
+		if (nkeys < 2) {
+			rv = FS_APFS_E_INVAL;
+			goto out;
+		}
+		half = nkeys / 2;
+		/*
+		 * The separator is the first key of the upper half, which is
+		 * this node's key at `half` -- known before the halves exist,
+		 * because its LENGTH is what the parent needs room for.
+		 */
+		btree_entry_loc(&bl, half, &koff, &klen, &voff, &vlen);
+		if (klen == 0 || klen > APFS_BLOCK_SIZE) {
+			rv = FS_APFS_E_INVAL;
+			goto out;
+		}
+		seplen = klen;
+
+		if (!path_to(bno, &tp) || tp.tp_n < 2) {
+			kprintf("apfs: the node at %llu is not reachable from "
+			    "the root of the tree it is being split in\n",
+			    (unsigned long long)bno);
+			rv = FS_APFS_E_NOTFOUND;
+			goto out;
+		}
+		parent_bno = tp.tp_bno[tp.tp_n - 2];
+		under_root = tp.tp_n == 2;
+		rv = fs_apfs_read_block(parent_bno, par);
+		if (rv != FS_APFS_E_OK)
+			goto out;
+		if (leaf_has_room(par, seplen, (uint32_t)sizeof(hi_oid)))
+			break;
+		if (tries > 1) {
+			kprintf("apfs: making room above the node at %llu did "
+			    "not settle\n", (unsigned long long)bno);
+			rv = FS_APFS_E_NOALLOC;
+			goto out;
+		}
+		/*
+		 * The parent is full, so it has to make room of its own before
+		 * this node can hand it anything -- and what it does about that
+		 * is the same question one level up.  A full node that is not
+		 * the root SPLITS, which hands its own parent a separator; a
+		 * full ROOT cannot, and grows the tree instead.  So the
+		 * recursion always ends, and it ends at the only node that has
+		 * another way out.
+		 *
+		 * Whatever happens up there, everything worked out below is
+		 * stale afterwards -- the parent may be a different node now --
+		 * so the loop starts again from the victim rather than trying
+		 * to patch up what it had.
+		 */
+		rv = under_root ? tree_grow(xid, scratch) :
+		    node_split(parent_bno, xid, scratch);
+		if (rv != FS_APFS_E_OK)
+			goto out;
+	}
+
+	lo_oid = ((const struct apfs_obj_phys *)scratch)->o_oid;
 	rv = node_rebuild(scratch, 0, half, lo);
 	if (rv != FS_APFS_E_OK)
 		goto out;
@@ -3961,18 +4353,16 @@ leaf_split(uint64_t bno, uint64_t xid, uint8_t *scratch)
 		goto out;
 
 	/*
-	 * The separator, taken out of the upper half's own first key and kept
-	 * aside: the parent is read into the same scratch buffer the node came
-	 * from, so a pointer into that buffer would be reading the parent by
-	 * the time it is used.
+	 * The separator kept aside: the root is read into the same scratch
+	 * buffer the node came from, so a pointer into that buffer would be
+	 * reading the root by the time it is used.
 	 */
 	btree_layout(hi, &bl);
 	btree_entry_loc(&bl, 0, &koff, &klen, &voff, &vlen);
-	if (klen == 0 || klen > APFS_BLOCK_SIZE) {
+	if (klen != seplen) {
 		rv = FS_APFS_E_INVAL;
 		goto out;
 	}
-	seplen = klen;
 	mem_copy(sep, bl.bl_keys + koff, seplen);
 
 	hi_oid = g_apfs.ac_next_oid;
@@ -4013,58 +4403,46 @@ leaf_split(uint64_t bno, uint64_t xid, uint8_t *scratch)
 	 * key) -> (that child's oid), so the value is eight bytes whatever the
 	 * key length happens to be.
 	 */
-	root_bno = g_apfs.ac_root_tree_bno;
-	rv = fs_apfs_read_block(root_bno, scratch);
-	if (rv != FS_APFS_E_OK)
-		goto broken;
-	btree_layout(scratch, &rl);
-	if (rl.bl_level != 1) {
-		kprintf("apfs: the tree is %u levels deep and this split only "
-		    "knows a leaf directly under the root\n",
-		    (unsigned)(rl.bl_level + 1));
-		rv = FS_APFS_E_NOALLOC;
-		goto broken;
-	}
-	for (pos = 0; pos < rl.bl_nkeys; pos++) {
-		btree_entry_loc(&rl, pos, &koff, &klen, &voff, &vlen);
-		if (jkey_cmp(rl.bl_keys + koff, klen, sep, seplen) > 0)
-			break;
-	}
-	rv = leaf_insert(scratch, pos, sep, seplen, &hi_oid,
-	    (uint32_t)sizeof(hi_oid));
+	rv = leaf_insert(par, node_place(par, sep, seplen), sep, seplen,
+	    &hi_oid, (uint32_t)sizeof(hi_oid));
 	if (rv != FS_APFS_E_OK)
 		goto broken;
 	/*
 	 * One more node in the tree.  The RECORD count does not move: the same
-	 * records are still there, in two nodes instead of one.
+	 * records are still there, in two nodes instead of one.  The count is
+	 * in the root, which is the parent only while the tree is two levels
+	 * deep -- otherwise it is a second node to copy, above a parent that
+	 * has already been dealt with.
 	 */
-	nodes = (uint64_t *)(scratch + APFS_BLOCK_SIZE - APFS_BTREE_INFO_SIZE +
-	    APFS_BTREE_INFO_NODECOUNT);
-	*nodes += 1;
-
-	o = (struct apfs_obj_phys *)scratch;
-	oids[0] = o->o_oid;
-	rv = alloc_blocks(1, root_bno, &new_root);
+	if (under_root)
+		tree_nodes_add(par, 1);
+	rv = node_cow(par, parent_bno, xid, &new_parent);
 	if (rv != FS_APFS_E_OK)
 		goto broken;
-	o->o_xid = xid;
-	rv = fs_apfs_write_block(new_root, scratch);
-	if (rv != FS_APFS_E_OK) {
-		(void)free_blocks(new_root, 1);
-		goto broken;
-	}
-	rv = free_blocks(root_bno, 1);
-	if (rv != FS_APFS_E_OK)
-		goto broken;
-	cow_n_spine++;
-	paddrs[0] = new_root;
+	oids[0]   = tp.tp_oid[tp.tp_n - 2];
+	paddrs[0] = new_parent;
 	oids[1]   = lo_oid;
 	paddrs[1] = lo_bno;
+	nmoved    = 2;
+	top       = new_parent;
+	if (!under_root) {
+		rv = fs_apfs_read_block(tp.tp_bno[0], scratch);
+		if (rv != FS_APFS_E_OK)
+			goto broken;
+		tree_nodes_add(scratch, 1);
+		rv = node_cow(scratch, tp.tp_bno[0], xid, &new_root);
+		if (rv != FS_APFS_E_OK)
+			goto broken;
+		oids[2]   = tp.tp_oid[0];
+		paddrs[2] = new_root;
+		nmoved    = 3;
+		top       = new_root;
+	}
 
 	/*
-	 * The object map learns where all three are: the root and the lower
-	 * half by replacement, the upper half by insertion, all inside one
-	 * copy of its node.
+	 * The object map learns where all of them are: the halves and the
+	 * nodes above by replacement, the new half by insertion, all inside
+	 * one copy of its node.
 	 */
 	/*
 	 * One more block belongs to this volume: two nodes were written where
@@ -4083,31 +4461,35 @@ leaf_split(uint64_t bno, uint64_t xid, uint8_t *scratch)
 	 */
 	g_apfs.ac_fs_alloc_count += 1;
 
-	rv = spine_update_n(oids, paddrs, 2, hi_oid, hi_bno, xid, scratch);
+	rv = spine_update_n(oids, paddrs, nmoved, &hi_oid, &hi_bno, 1, xid,
+	    scratch);
 	if (rv != FS_APFS_E_OK)
 		goto broken;
 
-	g_apfs.ac_root_tree_bno = new_root;
+	g_apfs.ac_root_tree_bno = top;
 	g_apfs.ac_next_oid      = hi_oid + 1;
 	split_n++;
-	kprintf("apfs: leaf %llu split -- %u records stay as oid %llu at %llu, "
-	    "%u move to a new oid %llu at %llu\n", (unsigned long long)bno,
-	    (unsigned)half, (unsigned long long)lo_oid,
+	kprintf("apfs: node %llu split -- %u records stay as oid %llu at %llu, "
+	    "%u move to a new oid %llu at %llu, under the node at %llu\n",
+	    (unsigned long long)bno, (unsigned)half, (unsigned long long)lo_oid,
 	    (unsigned long long)lo_bno, (unsigned)(nkeys - half),
-	    (unsigned long long)hi_oid, (unsigned long long)hi_bno);
+	    (unsigned long long)hi_oid, (unsigned long long)hi_bno,
+	    (unsigned long long)new_parent);
 	rv = FS_APFS_E_OK;
 out:
 	kfree(lo);
 	kfree(hi);
 	kfree(sep);
+	kfree(par);
 	return (rv);
 
 broken:
-	kprintf("apfs: splitting the leaf at %llu failed part way (%d) -- this "
+	kprintf("apfs: splitting the node at %llu failed part way (%d) -- this "
 	    "checkpoint must not be written\n", (unsigned long long)bno, rv);
 	kfree(lo);
 	kfree(hi);
 	kfree(sep);
+	kfree(par);
 	return (rv);
 }
 
@@ -4300,7 +4682,7 @@ grow_once(uint64_t ino, uint64_t id, uint64_t new_size, uint64_t *full_leaf)
 			    "is a different rung\n",
 			    (unsigned long long)lf.lf_bno,
 			    (unsigned long long)ino_leaf);
-			rv = FS_APFS_E_NOALLOC;
+			rv = FS_APFS_E_SPREAD;
 			goto give_back;
 		}
 	}
@@ -4506,7 +4888,7 @@ grow_once(uint64_t ino, uint64_t id, uint64_t new_size, uint64_t *full_leaf)
 	 */
 	g_apfs.ac_fs_alloc_count += blocks;
 
-	rv = spine_update_n(oids, paddrs, nmoved, 0, 0, xid, node);
+	rv = spine_update_n(oids, paddrs, nmoved, NULL, NULL, 0, xid, node);
 	if (rv != FS_APFS_E_OK)
 		goto broken;
 	if (oids[0] == g_apfs.ac_root_tree_oid)
@@ -4557,7 +4939,7 @@ fs_apfs_grow(uint64_t ino, uint64_t id, uint64_t new_size)
 	scratch = kmalloc(APFS_BLOCK_SIZE);
 	if (scratch == NULL)
 		return (FS_APFS_E_NOMEM);
-	rv = leaf_split(full, g_apfs.ac_xid + 1, scratch);
+	rv = node_split(full, g_apfs.ac_xid + 1, scratch);
 	kfree(scratch);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
@@ -4747,7 +5129,7 @@ fs_apfs_truncate(uint64_t ino, uint64_t id, uint64_t new_size)
 		    "rung\n", (unsigned long long)ino,
 		    (unsigned long long)ec.ec_bno[i],
 		    (unsigned long long)ino_leaf);
-		return (FS_APFS_E_NOALLOC);
+		return (FS_APFS_E_SPREAD);
 	}
 
 	/*
@@ -4965,7 +5347,7 @@ fs_apfs_truncate(uint64_t ino, uint64_t id, uint64_t new_size)
 	 */
 	g_apfs.ac_fs_alloc_count -= freed;
 
-	rv = spine_update_n(oids, paddrs, nmoved, 0, 0, xid, node);
+	rv = spine_update_n(oids, paddrs, nmoved, NULL, NULL, 0, xid, node);
 	if (rv != FS_APFS_E_OK)
 		goto broken;
 	if (oids[0] == g_apfs.ac_root_tree_oid)
@@ -5360,7 +5742,8 @@ name_commit(struct name_edit *ne, int64_t records, uint64_t xid,
 		g_apfs.ac_root_tree_bno = new_root;
 		nmoved++;
 	}
-	return (spine_update_n(oids, paddrs, nmoved, 0, 0, xid, scratch));
+	return (spine_update_n(oids, paddrs, nmoved, NULL, NULL, 0, xid,
+	    scratch));
 }
 
 /*
@@ -6625,8 +7008,9 @@ cow_physical(uint64_t old_bno, uint64_t xid, void *buf, uint64_t *new_bno)
  */
 static int
 omap_replace_cow(uint64_t node_bno, const uint64_t *oids,
-    const uint64_t *paddrs, uint32_t n, uint64_t ins_oid,
-    uint64_t ins_paddr, uint64_t xid, void *buf, uint64_t *new_node)
+    const uint64_t *paddrs, uint32_t n, const uint64_t *ins_oids,
+    const uint64_t *ins_paddrs, uint32_t nins, uint64_t xid, void *buf,
+    uint64_t *new_node)
 {
 	struct btree_layout	 bl;
 	struct apfs_omap_key	*k;
@@ -6677,27 +7061,34 @@ omap_replace_cow(uint64_t node_bno, const uint64_t *oids,
 	}
 
 	/*
-	 * And a wholly NEW object, when one has just been made.  A split is
+	 * And wholly NEW objects, when some have just been made.  A split is
 	 * the only thing that does this: the upper half is an object nothing
 	 * has ever heard of, and writing its block does not make it
 	 * reachable -- this entry does.
+	 *
+	 * A LIST, since the tree learned to gain a level: a root that splits
+	 * makes TWO objects at once, because it has to keep its own oid -- the
+	 * volume superblock names it -- so both halves are new.  Inserting them
+	 * one call at a time would copy this node twice for the same reason the
+	 * replacements above are a list.
 	 */
-	if (ins_oid != 0) {
+	for (j = 0; j < nins; j++) {
 		struct apfs_omap_key	 ik;
 		struct apfs_omap_val	 iv;
 		uint64_t		*count;
 
+		btree_layout(buf, &bl);
 		for (i = 0; i < bl.bl_nkeys; i++) {
 			btree_entry_off(&bl, i, &koff, &voff);
 			k = (struct apfs_omap_key *)(bl.bl_keys + koff);
-			if (k->ok_oid > ins_oid)
+			if (k->ok_oid > ins_oids[j])
 				break;
 		}
-		ik.ok_oid   = ins_oid;
+		ik.ok_oid   = ins_oids[j];
 		ik.ok_xid   = xid;
 		iv.ov_flags = 0;
 		iv.ov_size  = APFS_BLOCK_SIZE;
-		iv.ov_paddr = ins_paddr;
+		iv.ov_paddr = ins_paddrs[j];
 		rv = leaf_insert_fixed(buf, i, &ik, (uint32_t)sizeof(ik), &iv,
 		    (uint32_t)sizeof(iv));
 		if (rv != FS_APFS_E_OK)
@@ -6836,7 +7227,8 @@ extref_move(uint64_t old_start, uint64_t new_start, uint64_t blocks,
  */
 static int
 spine_update_n(const uint64_t *oids, const uint64_t *paddrs, uint32_t n,
-    uint64_t ins_oid, uint64_t ins_paddr, uint64_t xid, void *buf)
+    const uint64_t *ins_oids, const uint64_t *ins_paddrs, uint32_t nins,
+    uint64_t xid, void *buf)
 {
 	struct apfs_omap_phys		*om;
 	struct apfs_superblock		*vsb;
@@ -6852,7 +7244,7 @@ spine_update_n(const uint64_t *oids, const uint64_t *paddrs, uint32_t n,
 
 	/* 1. the volume's object map: those oids now live at those addresses */
 	rv = omap_replace_cow(g_apfs.ac_vol_omap_tree, oids, paddrs, n,
-	    ins_oid, ins_paddr, xid, buf, &new_vol_tree);
+	    ins_oids, ins_paddrs, nins, xid, buf, &new_vol_tree);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
 
@@ -6920,7 +7312,7 @@ spine_update_n(const uint64_t *oids, const uint64_t *paddrs, uint32_t n,
 	/* 4. the container's object map: the volume superblock has moved */
 	fs_oid = g_apfs.ac_fs_oid;
 	rv = omap_replace_cow(g_apfs.ac_ctr_omap_tree, &fs_oid, &new_vsb, 1,
-	    0, 0, xid, buf, &new_ctr_tree);
+	    NULL, NULL, 0, xid, buf, &new_ctr_tree);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
 
@@ -6954,7 +7346,7 @@ static int
 spine_update(uint64_t oid, uint64_t paddr, uint64_t xid, void *buf)
 {
 
-	return (spine_update_n(&oid, &paddr, 1, 0, 0, xid, buf));
+	return (spine_update_n(&oid, &paddr, 1, NULL, NULL, 0, xid, buf));
 }
 
 /*
@@ -7563,16 +7955,100 @@ leaf_probe(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
  * is a claim this kernel can make about itself, rather than one it has to send
  * a container away to have checked.
  */
+
+/*
+ * Every separator in the tree against the child it names, at every level.
+ *
+ * Recursive since the tree can be more than two levels deep, and the level
+ * that used to be the only one is now the least interesting: a wrong
+ * separator written INTO an interior node by a split of another interior node
+ * is invisible from the root, which still names the same child by the same
+ * key it always did.
+ */
+static bool
+index_check(uint64_t bno, uint32_t depth)
+{
+	struct btree_layout	 bl;
+	struct btree_layout	 cl;
+	uint8_t			*node;
+	uint8_t			*child;
+	uint64_t		 oid;
+	uint64_t		 cbno;
+	uint32_t		 koff, klen, voff, vlen;
+	uint32_t		 ckoff, cklen, cvoff, cvlen;
+	uint32_t		 i;
+	bool			 ok;
+
+	if (depth >= APFS_TREE_MAX_DEPTH)
+		return (false);
+	node  = kmalloc(APFS_BLOCK_SIZE);
+	child = kmalloc(APFS_BLOCK_SIZE);
+	if (node == NULL || child == NULL) {
+		kfree(node);
+		kfree(child);
+		return (false);
+	}
+	ok = fs_apfs_read_block(bno, node) == FS_APFS_E_OK;
+	if (!ok)
+		kprintf("apfs-split: FAIL the node at %llu will not read\n",
+		    (unsigned long long)bno);
+	else
+		btree_layout(node, &bl);
+	if (ok && (bl.bl_flags & APFS_BTNODE_LEAF) != 0)
+		goto done;
+	for (i = 0; ok && i < bl.bl_nkeys; i++) {
+		btree_entry_loc(&bl, i, &koff, &klen, &voff, &vlen);
+		oid = *(const uint64_t *)(bl.bl_vals - voff);
+		if (fs_apfs_omap_lookup(g_apfs.ac_vol_omap_tree, oid,
+		    view_xid(), &cbno) != FS_APFS_E_OK ||
+		    fs_apfs_read_block(cbno, child) != FS_APFS_E_OK) {
+			kprintf("apfs-split: FAIL the node at %llu names child "
+			    "oid %llu, which the object map cannot place\n",
+			    (unsigned long long)bno, (unsigned long long)oid);
+			ok = false;
+			break;
+		}
+		btree_layout(child, &cl);
+		btree_entry_loc(&cl, 0, &ckoff, &cklen, &cvoff, &cvlen);
+		if (jkey_cmp(bl.bl_keys + koff, klen, cl.bl_keys + ckoff,
+		    cklen) != 0) {
+			kprintf("apfs-split: FAIL the node at %llu says child "
+			    "%u starts at one key and the child at %llu starts "
+			    "at another -- the separator is from the wrong "
+			    "node\n", (unsigned long long)bno, (unsigned)i,
+			    (unsigned long long)cbno);
+			ok = false;
+			break;
+		}
+		if (cl.bl_level + 1 != bl.bl_level) {
+			kprintf("apfs-split: FAIL the node at %llu is at level "
+			    "%u and its child at %llu at level %u\n",
+			    (unsigned long long)bno, (unsigned)bl.bl_level,
+			    (unsigned long long)cbno, (unsigned)cl.bl_level);
+			ok = false;
+			break;
+		}
+		ok = index_check(cbno, depth + 1);
+	}
+done:
+	kfree(node);
+	kfree(child);
+	return (ok);
+}
+
 void
 fs_apfs_split_selftest(void)
 {
 	struct fs_apfs_statbuf	 st;
+	struct btree_layout	 bl;
 	struct leaf_probe	 lp;
 	uint8_t			*scratch;
 	uint64_t		 before;
 	uint64_t		 victim;
 	uint64_t		 after;
 	uint64_t		 splits;
+	uint64_t		 deeper;
+	uint32_t		 was;
 	bool			 stopped;
 
 	if (!g_apfs.ac_mounted || !g_apfs.ac_ip_valid) {
@@ -7606,16 +8082,16 @@ fs_apfs_split_selftest(void)
 	}
 
 	/*
-	 * ROOM ABOVE, asked before the split rather than discovered inside it.
-	 *
-	 * A split hands the parent a separator, and this test takes one node
-	 * per boot without ever giving one back -- so an image booted enough
-	 * times reaches the day the root's table of contents is full.  That is
-	 * the edge the split rung named when it was written, and reaching it is
-	 * not a failure of anything: the refusal is correct and the container is
-	 * untouched.  Saying so, rather than reporting FAIL, is the difference
-	 * between a test that knows what it is asking for and one that does not.
+	 * HOW DEEP THE TREE IS BEFORE, because this test is the reason it
+	 * gets deeper.  It takes a node per boot and never gives one back, so
+	 * an image booted enough times reaches the day the root's table of
+	 * contents is full -- which used to be where this stopped and said so.
+	 * Now the split grows the tree instead, and the two are told apart
+	 * here by the level the root reports and by the counter the growth
+	 * bumps.
 	 */
+	deeper = deep_n;
+	was    = 0;
 	if (fs_apfs_read_block(g_apfs.ac_root_tree_bno, scratch) !=
 	    FS_APFS_E_OK) {
 		kprintf("apfs-split: FAIL the root at %llu will not read\n",
@@ -7623,19 +8099,10 @@ fs_apfs_split_selftest(void)
 		kfree(scratch);
 		return;
 	}
-	if (!leaf_has_room(scratch, 24u, 8u)) {
-		struct btree_layout	bl;
+	btree_layout(scratch, &bl);
+	was = (uint32_t)bl.bl_level + 1u;
 
-		btree_layout(scratch, &bl);
-		kprintf("apfs-split: the root holds %u children and has room "
-		    "for no more -- splitting again would have to grow the "
-		    "tree a level, which is the next rung; skipped\n",
-		    (unsigned)bl.bl_nkeys);
-		kfree(scratch);
-		return;
-	}
-
-	if (leaf_split(victim, g_apfs.ac_xid + 1, scratch) !=
+	if (node_split(victim, g_apfs.ac_xid + 1, scratch) !=
 	    FS_APFS_E_OK) {
 		kprintf("apfs-split: FAIL the leaf at %llu would not split\n",
 		    (unsigned long long)victim);
@@ -7643,7 +8110,12 @@ fs_apfs_split_selftest(void)
 		return;
 	}
 	kfree(scratch);
-	if (split_n != splits + 1) {
+	/*
+	 * At least one, and more than one when the leaf's parent was full and
+	 * had to split before it could take a separator.  Both are the same
+	 * operation asking itself the same question a level up.
+	 */
+	if (split_n <= splits) {
 		kprintf("apfs-split: FAIL the split was not counted\n");
 		return;
 	}
@@ -7674,72 +8146,12 @@ fs_apfs_split_selftest(void)
 	}
 
 	/*
-	 * Every separator against the child it names.  This is the half the
-	 * walk is blind to, and the half a wrong split shows up in.
+	 * Every separator against the child it names, at every level.  This is
+	 * the half the walk is blind to, and the half a wrong split shows up
+	 * in.
 	 */
-	{
-		struct btree_layout	 rl;
-		struct btree_layout	 cl;
-		uint8_t			*root;
-		uint8_t			*child;
-		uint64_t		 oid;
-		uint64_t		 bno;
-		uint32_t		 koff, klen, voff, vlen;
-		uint32_t		 ckoff, cklen, cvoff, cvlen;
-		uint32_t		 i;
-		int			 bad;
-
-		root  = kmalloc(APFS_BLOCK_SIZE);
-		child = kmalloc(APFS_BLOCK_SIZE);
-		if (root == NULL || child == NULL) {
-			kprintf("apfs-split: FAIL no memory to check the "
-			    "index\n");
-			kfree(root);
-			kfree(child);
-			return;
-		}
-		bad = 0;
-		if (fs_apfs_read_block(g_apfs.ac_root_tree_bno, root) !=
-		    FS_APFS_E_OK)
-			bad = 1;
-		else {
-			btree_layout(root, &rl);
-			for (i = 0; !bad && rl.bl_level > 0 &&
-			    i < rl.bl_nkeys; i++) {
-				btree_entry_loc(&rl, i, &koff, &klen, &voff,
-				    &vlen);
-				oid = *(const uint64_t *)(rl.bl_vals - voff);
-				if (fs_apfs_omap_lookup(g_apfs.ac_vol_omap_tree,
-				    oid, view_xid(), &bno) != FS_APFS_E_OK ||
-				    fs_apfs_read_block(bno, child) !=
-				    FS_APFS_E_OK) {
-					kprintf("apfs-split: FAIL the index "
-					    "names child oid %llu, which the "
-					    "object map cannot place\n",
-					    (unsigned long long)oid);
-					bad = 1;
-					break;
-				}
-				btree_layout(child, &cl);
-				btree_entry_loc(&cl, 0, &ckoff, &cklen, &cvoff,
-				    &cvlen);
-				if (jkey_cmp(rl.bl_keys + koff, klen,
-				    cl.bl_keys + ckoff, cklen) != 0) {
-					kprintf("apfs-split: FAIL the index "
-					    "says child %u starts at one key "
-					    "and the child at %llu starts at "
-					    "another -- the separator is from "
-					    "the wrong node\n", (unsigned)i,
-					    (unsigned long long)bno);
-					bad = 1;
-				}
-			}
-		}
-		kfree(root);
-		kfree(child);
-		if (bad)
-			return;
-	}
+	if (!index_check(g_apfs.ac_root_tree_bno, 0))
+		return;
 
 	/* And a file, because a count can be right while a lookup is not. */
 	if (fs_apfs_stat("/var/db/big.txt", &st) != FS_APFS_E_OK) {
@@ -7748,10 +8160,55 @@ fs_apfs_split_selftest(void)
 		return;
 	}
 
+	/*
+	 * A GROWTH IS NOT A SPLIT AND HAS TO BE TOLD APART FROM ONE.  Both
+	 * leave a tree that walks and counts right; only one of them changes
+	 * how deep it is, and a level gained without the counter moving (or
+	 * the other way about) means the two disagree about what happened.
+	 */
+	{
+		uint8_t			*root;
+		uint32_t		 now;
+
+		root = kmalloc(APFS_BLOCK_SIZE);
+		if (root == NULL) {
+			kprintf("apfs-split: FAIL no memory to read the "
+			    "root\n");
+			return;
+		}
+		if (fs_apfs_read_block(g_apfs.ac_root_tree_bno, root) !=
+		    FS_APFS_E_OK) {
+			kprintf("apfs-split: FAIL the root will not read after "
+			    "the split\n");
+			kfree(root);
+			return;
+		}
+		btree_layout(root, &bl);
+		now = (uint32_t)bl.bl_level + 1u;
+		kfree(root);
+		if (now != was + (uint32_t)(deep_n - deeper)) {
+			kprintf("apfs-split: FAIL the tree was %u levels deep "
+			    "and is %u, and %llu levels were reported\n",
+			    (unsigned)was, (unsigned)now,
+			    (unsigned long long)(deep_n - deeper));
+			return;
+		}
+		if (deep_n != deeper)
+			kprintf("apfs-split: the root was full, so the tree "
+			    "grew to %u levels before the leaf could split\n",
+			    (unsigned)now);
+		else if (split_n > splits + 1)
+			kprintf("apfs-split: the leaf's parent was full, so "
+			    "%llu nodes split rather than one, and the tree is "
+			    "still %u levels\n",
+			    (unsigned long long)(split_n - splits),
+			    (unsigned)now);
+	}
+
 	kprintf("apfs-split: PASS -- leaf %llu split in two, %llu records "
-	    "before and after, every separator matching the child it names, "
-	    "and /var/db/big.txt still resolves to %llu bytes\n",
-	    (unsigned long long)victim, (unsigned long long)before,
+	    "before and after, every separator at every level matching the "
+	    "child it names, and /var/db/big.txt still resolves to %llu "
+	    "bytes\n", (unsigned long long)victim, (unsigned long long)before,
 	    (unsigned long long)st.afs_size);
 }
 

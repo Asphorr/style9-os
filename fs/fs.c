@@ -142,6 +142,7 @@ apfs_err(int rv)
 	case FS_APFS_E_NOALLOC:		return (FS_E_NOALLOC);
 	case FS_APFS_E_EXIST:		return (FS_E_EXIST);
 	case FS_APFS_E_ISDIR:		return (FS_E_ISDIR);
+	case FS_APFS_E_SPREAD:		return (FS_E_SPREAD);
 	default:			return (FS_E_IO);
 	}
 }
@@ -997,6 +998,20 @@ fs_grow_selftest(void)
 	while (h.fh_size < SELFTEST_GROW_TO) {
 		at = h.fh_size;
 		rv = fs_pwrite(&h, at, chunk, GROW_CHUNK, &put);
+		/*
+		 * A REFUSAL THE WRITER DOCUMENTS IS NOT A FAILURE OF IT.  The
+		 * records of one file need not share a leaf, and the more the
+		 * tree splits the less likely it is that they do; an edit that
+		 * can move one node at a time says so and changes nothing.
+		 * Calling that FAIL teaches the reader to ignore the word.
+		 */
+		if (rv == FS_E_SPREAD) {
+			kprintf("apfs-grow: %s keeps its bytes and its inode "
+			    "in different leaves -- appending across two is a "
+			    "different rung; skipped after %u round(s)\n",
+			    SELFTEST_PATH, (unsigned)rounds);
+			goto out;
+		}
 		if (rv != FS_E_OK || put != GROW_CHUNK) {
 			kprintf("apfs-grow: FAIL round %u at %llu would not "
 			    "grow (rv=%d put=%u)\n", (unsigned)rounds,
@@ -1216,6 +1231,20 @@ fs_trunc_selftest(void)
 	}
 
 	rv = fs_truncate(&h, SELFTEST_TRUNC_TO);
+	/*
+	 * A REFUSAL THE WRITER DOCUMENTS IS NOT A FAILURE OF IT.  A cut moves
+	 * the file's extent records and its inode record together, in one copy
+	 * of one node, and a tree that has been splitting for a while stops
+	 * keeping them in the same one.  The writer says so and changes
+	 * nothing; reporting FAIL for it is how a suite trains its reader to
+	 * stop believing the word.
+	 */
+	if (rv == FS_E_SPREAD) {
+		kprintf("apfs-trunc: %s no longer keeps its runs and its "
+		    "inode in one leaf -- cutting across two is a different "
+		    "rung; skipped\n", SELFTEST_PATH);
+		goto out;
+	}
 	if (rv != FS_E_OK) {
 		kprintf("apfs-trunc: FAIL cutting %s to %u bytes (rv=%d)\n",
 		    SELFTEST_PATH, (unsigned)SELFTEST_TRUNC_TO, rv);

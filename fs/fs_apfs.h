@@ -818,6 +818,8 @@ struct fs_apfs_statbuf {
 #define	FS_APFS_E_NOALLOC	(-8)	/* would need a block allocator  */
 #define	FS_APFS_E_EXIST		(-9)	/* the name is already taken     */
 #define	FS_APFS_E_ISDIR		(-10)	/* ...and it is a directory      */
+#define	FS_APFS_E_SPREAD	(-11)	/* records span more leaves than
+					   this edit can hold at once   */
 
 /*
  * Probe the first ATA drive for an APFS container and adopt the newest valid

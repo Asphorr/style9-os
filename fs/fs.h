@@ -113,6 +113,8 @@ _Static_assert(sizeof(struct fs_statbuf) == 72,
 #define	FS_E_NOALLOC	(-7)	/* the write would need a block allocator */
 #define	FS_E_EXIST	(-8)	/* the name is already taken     */
 #define	FS_E_ISDIR	(-9)	/* ...and what it names is a directory */
+#define	FS_E_SPREAD	(-10)	/* the records are in more nodes than one
+				   edit can move at once */
 
 /* Non-zero once some filesystem is mounted and can serve files. */
 int		fs_ready(void);
