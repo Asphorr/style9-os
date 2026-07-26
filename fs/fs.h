@@ -389,6 +389,14 @@ void		fs_index_selftest(void);
 void		fs_drop_selftest(void);
 
 /*
+ * And that finding a record by descending on its key answers exactly what
+ * reading every record in the tree answers -- the same record, out of the same
+ * leaf, with the same tail behind it.  Silently does nothing when the volume
+ * is not APFS.
+ */
+void		fs_seek_selftest(void);
+
+/*
  * The volume generation, and what it has caught: how many handles were older
  * than the volume when used, and how many of those had a length that really
  * had moved.  The first number moving proves the check is alive; the second

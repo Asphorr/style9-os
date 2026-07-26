@@ -1768,3 +1768,15 @@ fs_drop_selftest(void)
 	mutex_unlock(&fs_lock);
 }
 
+/* And that a lookup by key agrees with reading the whole tree. */
+void
+fs_seek_selftest(void)
+{
+
+	if (!fs_apfs_ready())
+		return;
+	mutex_lock(&fs_lock);
+	fs_apfs_seek_selftest();
+	mutex_unlock(&fs_lock);
+}
+

@@ -183,8 +183,10 @@ static struct {
  * not about how the walk reads on the page.
  */
 static uint64_t	g_n_walks;	/* whole-tree walks started      */
+static uint64_t	g_n_seeks;	/* reads that descended on a key instead */
 static uint64_t	g_n_nodes;	/* B-tree nodes read during them */
 static uint64_t	g_n_recs;	/* leaf records handed to a callback */
+static uint64_t	g_n_cmps;	/* keys compared while descending    */
 
 /*
  * The ephemeral layer, in memory.  These two are the objects whose home is
@@ -313,6 +315,9 @@ static int	extref_move(uint64_t old_start, uint64_t new_start,
 static int	fq_insert(uint32_t q, uint64_t xid, uint64_t paddr,
 		    uint64_t count);
 static void	fq_release(uint32_t q, uint64_t upto_xid);
+static uint32_t	crc32c(uint32_t crc, const uint8_t *p, uint32_t n);
+static int	drec_key(uint64_t parent, const char *name, uint32_t nlen,
+		    uint8_t *out, uint32_t *klen_out, bool complain);
 
 /*
  * The transaction id a READ should ask about.
@@ -2041,6 +2046,152 @@ mount_volume(void *scratch)
 /* ---- file-system tree ----------------------------------------------------- */
 
 /*
+ * How deep a descent will follow child pointers before it decides the tree is
+ * lying to it.  Every loop here that walks down is bounded by it, and so is
+ * the path a split records on its way back up.
+ */
+#define	APFS_TREE_MAX_DEPTH	8
+
+/*
+ * Order two file-system tree keys: negative, zero, positive.
+ *
+ * Records sort by object id FIRST and type second, which is the opposite of
+ * what comparing the raw first word would do -- the type is in the top bits.
+ * Beyond that the order is per type; the only one this needs is the file
+ * extent, whose remaining key is its offset within the file.  Two keys with
+ * the same object and type and no rule to separate them compare equal, which
+ * is honest: this returns an order, not a total order over records it has
+ * never been asked about.
+ *
+ * This lived with the writer until now, because only the writer needed it: a
+ * reader that visits every record in turn never has to know which of two keys
+ * comes first.  The reader below descends on them, so the order stopped being
+ * a property of one operation and became a property of the tree.
+ */
+static int
+jkey_cmp(const uint8_t *a, uint32_t alen, const uint8_t *b, uint32_t blen)
+{
+	uint64_t	ra, rb;
+	uint64_t	ida, idb;
+	uint64_t	la, lb;
+	uint32_t	ta, tb;
+
+	g_n_cmps++;
+	if (alen < 8 || blen < 8)
+		return (0);
+	ra  = *(const uint64_t *)a;
+	rb  = *(const uint64_t *)b;
+	ida = ra & APFS_J_OBJ_ID_MASK;
+	idb = rb & APFS_J_OBJ_ID_MASK;
+	if (ida != idb)
+		return (ida < idb ? -1 : 1);
+	ta = (uint32_t)(ra >> APFS_J_OBJ_TYPE_SHIFT);
+	tb = (uint32_t)(rb >> APFS_J_OBJ_TYPE_SHIFT);
+	if (ta != tb)
+		return (ta < tb ? -1 : 1);
+	if (ta == APFS_TYPE_FILE_EXTENT && alen >= 16 && blen >= 16) {
+		la = *(const uint64_t *)(a + 8);
+		lb = *(const uint64_t *)(b + 8);
+		if (la != lb)
+			return (la < lb ? -1 : 1);
+		return (0);
+	}
+	/*
+	 * Directory entries, because a node's separator can be one and getting
+	 * two of them the wrong way round would put a record in the wrong half
+	 * of a split.  Hashed volumes sort by the word holding the name's
+	 * length and hash and then by the name; plain ones by the name alone.
+	 * Which of the two this volume is was settled at mount.
+	 */
+	if (ta == APFS_TYPE_DIR_REC) {
+		uint32_t	ha, hb;
+		uint32_t	off;
+		uint32_t	n;
+		uint32_t	i;
+
+		off = g_apfs.ac_drec_hashed ? 12u : 10u;
+		if (alen < off || blen < off)
+			return (0);
+		if (g_apfs.ac_drec_hashed) {
+			ha = *(const uint32_t *)(a + 8);
+			hb = *(const uint32_t *)(b + 8);
+			if (ha != hb)
+				return (ha < hb ? -1 : 1);
+		}
+		n = (alen - off < blen - off) ? alen - off : blen - off;
+		for (i = 0; i < n; i++) {
+			if (a[off + i] != b[off + i])
+				return (a[off + i] < b[off + i] ? -1 : 1);
+		}
+		if (alen != blen)
+			return (alen < blen ? -1 : 1);
+	}
+	return (0);
+}
+
+/*
+ * WHERE A KEY GOES IN A NODE THE CALLER IS HOLDING
+ *
+ * Two questions, and they are not the same one.  An INTERIOR node is asked
+ * which child to go down: the last one whose separator is not greater than the
+ * key, because a child is filed under its own first key, so a key belongs
+ * under the last child that starts at or before it.  A LEAF is asked where the
+ * key would be: the first record that is not less than it, which is the record
+ * itself when it exists and the one after it when it does not.
+ *
+ * Binary, not linear.  A linear pass over one node is what the whole-tree walk
+ * already did and would have made this a shorter walk rather than a different
+ * shape.  The nodes here hold up to fifty-odd records, so it is five
+ * comparisons instead of fifty, and the count of comparisons is printed with
+ * the rest of the statistics because a claim about cost that nobody measures
+ * is decoration.
+ *
+ * A separator that compares EQUAL to several children's first keys would make
+ * the first answer skip records, and jkey_cmp does return equal for record
+ * types it has no rule for.  That is not a hazard here and it is not an
+ * assumption either: the self-test seeks every record on the volume by its own
+ * key and demands the same record back, which is exactly the case that would
+ * break if two keys the tree keeps apart compared the same.
+ */
+static uint32_t
+node_child_for(const struct btree_layout *bl, const uint8_t *key, uint32_t klen)
+{
+	uint32_t	koff, klen2, voff, vlen;
+	uint32_t	lo, hi, mid;
+
+	lo = 0;
+	hi = bl->bl_nkeys;
+	while (lo < hi) {
+		mid = lo + (hi - lo) / 2u;
+		btree_entry_loc(bl, mid, &koff, &klen2, &voff, &vlen);
+		if (jkey_cmp(bl->bl_keys + koff, klen2, key, klen) <= 0)
+			lo = mid + 1u;
+		else
+			hi = mid;
+	}
+	return (lo == 0 ? 0 : lo - 1u);
+}
+
+static uint32_t
+node_lower(const struct btree_layout *bl, const uint8_t *key, uint32_t klen)
+{
+	uint32_t	koff, klen2, voff, vlen;
+	uint32_t	lo, hi, mid;
+
+	lo = 0;
+	hi = bl->bl_nkeys;
+	while (lo < hi) {
+		mid = lo + (hi - lo) / 2u;
+		btree_entry_loc(bl, mid, &koff, &klen2, &voff, &vlen);
+		if (jkey_cmp(bl->bl_keys + koff, klen2, key, klen) < 0)
+			lo = mid + 1u;
+		else
+			hi = mid;
+	}
+	return (lo);
+}
+
+/*
  * Callback fired for every leaf record, in tree order.  Returning false
  * stops the walk -- a lookup that has found its answer should not keep
  * reading blocks.
@@ -2056,36 +2207,63 @@ typedef bool (*apfs_rec_fn)(uint64_t oid, uint32_t type, const uint8_t *key,
     uint32_t klen, const uint8_t *val, uint32_t vlen, uint64_t bno, void *arg);
 
 /*
- * Walk the volume's file-system tree in order.
+ * DESCENDING ON THE KEY
+ *
+ * Read the volume's file-system tree in order, starting at `key` -- or at the
+ * smallest key on the volume when there is none, which is the whole-tree walk
+ * every reader here used to do and which is still what the self-test uses as
+ * its oracle.
  *
  * Unlike the container's object map, this tree's interior nodes point at
  * children by VIRTUAL oid, so every descent costs an object-map lookup --
  * that indirection is the price copy-on-write charges for being able to
  * rewrite a node without touching its parent.
  *
- * The walk visits everything rather than binary-searching, which is what
- * lets this reader stay free of Apple's name hash (see fs_apfs.h).  For the
- * directory sizes a Darwin binary here actually opens, whole-tree order is
- * cheap; a real implementation would descend on the key instead.
+ * WHY IT TOOK THIS LONG.  The original walk visited everything rather than
+ * descending, and the reason was written down beside it: whole-tree order
+ * needs no key ordering at all, and a reader that needs no key ordering needs
+ * no name hash -- which was the one part of this format nobody had published.
+ * That reasoning expired.  The hash was measured for the writer three rungs
+ * ago (drec_key), the ordering is jkey_cmp above, and both have been trusted
+ * to decide which half of a splitting node a record belongs in ever since.
+ * The reader was the last thing still reading fifty-four records to answer a
+ * question about one.
+ *
+ * THE SCAN IS THE WALK, ENTERED PART-WAY.  It is deliberately the same
+ * recursion and the same callback, because the two have to agree about order
+ * and the cheapest way to make them agree is for there to be one of them.
+ * The key prunes only the LEFTMOST path: at every level the first child
+ * visited is entered at the key, and every child after it from its beginning,
+ * because once the descent has passed the key everything to the right of it
+ * is wanted whole.  A caller that wants a RUN -- one file's extents, one
+ * directory's entries -- therefore gets its records consecutively and returns
+ * false when it sees the first record that is not its own.
  */
 static bool
-btree_walk(uint64_t bno, apfs_rec_fn fn, void *arg, int depth, bool *stopped)
+btree_scan(uint64_t bno, const uint8_t *key, uint32_t klen, apfs_rec_fn fn,
+    void *arg, int depth, bool *stopped)
 {
 	struct btree_layout	 bl;
 	uint8_t			*node;
 	uint64_t		 child_oid;
 	uint64_t		 child_bno;
 	uint32_t		 koff;
-	uint32_t		 klen;
+	uint32_t		 klen2;
 	uint32_t		 voff;
 	uint32_t		 vlen;
+	uint32_t		 first;
 	uint32_t		 i;
+	bool			 leaf;
 	bool			 ok;
 
 	if (depth > 8)			/* corrupt tree must not spin us */
 		return (false);
-	if (depth == 0)
-		g_n_walks++;
+	if (depth == 0) {
+		if (key == NULL)
+			g_n_walks++;
+		else
+			g_n_seeks++;
+	}
 	node = kmalloc(APFS_BLOCK_SIZE);
 	if (node == NULL)
 		return (false);
@@ -2095,11 +2273,18 @@ btree_walk(uint64_t bno, apfs_rec_fn fn, void *arg, int depth, bool *stopped)
 	}
 	g_n_nodes++;
 	btree_layout(node, &bl);
+	leaf = (bl.bl_flags & APFS_BTNODE_LEAF) != 0;
+
+	first = 0;
+	if (key != NULL && bl.bl_nkeys != 0) {
+		first = leaf ? node_lower(&bl, key, klen) :
+		    node_child_for(&bl, key, klen);
+	}
 
 	ok = true;
-	for (i = 0; i < bl.bl_nkeys && !*stopped; i++) {
-		btree_entry_loc(&bl, i, &koff, &klen, &voff, &vlen);
-		if ((bl.bl_flags & APFS_BTNODE_LEAF) != 0) {
+	for (i = first; i < bl.bl_nkeys && !*stopped; i++) {
+		btree_entry_loc(&bl, i, &koff, &klen2, &voff, &vlen);
+		if (leaf) {
 			const uint8_t	*k;
 			uint64_t	 raw;
 
@@ -2108,7 +2293,7 @@ btree_walk(uint64_t bno, apfs_rec_fn fn, void *arg, int depth, bool *stopped)
 			raw = *(const uint64_t *)k;
 			if (!fn(raw & APFS_J_OBJ_ID_MASK,
 			    (uint32_t)(raw >> APFS_J_OBJ_TYPE_SHIFT),
-			    k, klen, bl.bl_vals - voff, vlen, bno, arg))
+			    k, klen2, bl.bl_vals - voff, vlen, bno, arg))
 				*stopped = true;
 			continue;
 		}
@@ -2118,7 +2303,8 @@ btree_walk(uint64_t bno, apfs_rec_fn fn, void *arg, int depth, bool *stopped)
 			ok = false;
 			break;
 		}
-		if (!btree_walk(child_bno, fn, arg, depth + 1, stopped)) {
+		if (!btree_scan(child_bno, i == first ? key : NULL, klen, fn,
+		    arg, depth + 1, stopped)) {
 			ok = false;
 			break;
 		}
@@ -2127,12 +2313,83 @@ btree_walk(uint64_t bno, apfs_rec_fn fn, void *arg, int depth, bool *stopped)
 	return (ok);
 }
 
+/* Every record, in order: the scan with nothing to skip to. */
+static bool
+btree_walk(uint64_t bno, apfs_rec_fn fn, void *arg, int depth, bool *stopped)
+{
+
+	return (btree_scan(bno, NULL, 0, fn, arg, depth, stopped));
+}
+
+/*
+ * WHICH LEAF A KEY BELONGS IN -- the question an insert asks, and the one
+ * question here that is not about a record that exists.
+ *
+ * The same descent, stopped at the leaf and asked nothing further: the last
+ * child whose first key is not greater than this one, all the way down.  The
+ * walk-based answer this replaces said "the last leaf holding a key no greater
+ * than the wanted one, and the first leaf if there is none", and the two are
+ * the same sentence read from different ends -- which is why the self-test
+ * checks them against each other over every key on the volume rather than
+ * taking my word for it.
+ */
+static int
+leaf_home(const uint8_t *key, uint32_t klen, uint64_t *bno_out)
+{
+	struct btree_layout	 bl;
+	uint8_t			*node;
+	uint64_t		 bno;
+	uint64_t		 oid;
+	uint32_t		 koff, klen2, voff, vlen;
+	uint32_t		 depth;
+	int			 rv;
+
+	node = kmalloc(APFS_BLOCK_SIZE);
+	if (node == NULL)
+		return (FS_APFS_E_NOMEM);
+	g_n_seeks++;
+	bno = g_apfs.ac_root_tree_bno;
+	rv = FS_APFS_E_OK;
+	for (depth = 0; depth < APFS_TREE_MAX_DEPTH; depth++) {
+		rv = fs_apfs_read_block(bno, node);
+		if (rv != FS_APFS_E_OK)
+			break;
+		g_n_nodes++;
+		btree_layout(node, &bl);
+		if ((bl.bl_flags & APFS_BTNODE_LEAF) != 0) {
+			*bno_out = bno;
+			kfree(node);
+			return (FS_APFS_E_OK);
+		}
+		if (bl.bl_nkeys == 0) {
+			rv = FS_APFS_E_IO;
+			break;
+		}
+		btree_entry_loc(&bl, node_child_for(&bl, key, klen), &koff,
+		    &klen2, &voff, &vlen);
+		oid = *(const uint64_t *)(bl.bl_vals - voff);
+		rv = fs_apfs_omap_lookup(g_apfs.ac_vol_omap_tree, oid,
+		    view_xid(), &bno);
+		if (rv != FS_APFS_E_OK)
+			break;
+	}
+	kfree(node);
+	return (rv != FS_APFS_E_OK ? rv : FS_APFS_E_IO);
+}
+
 /*
  * Name inside a directory-record key.  The fixed part is the 8-byte record
  * header plus either a 4-byte length-and-hash (hashed volumes) or a 2-byte
  * length; the name follows, NUL-terminated, and the recorded length counts
  * that NUL.
+ *
+ * APFS_DREC_KEY_MAX is the widest key that layout can produce, and it is the
+ * bound every buffer holding a BUILT one uses -- see drec_key.  Note that it
+ * is the reading limit and not the writing one: this kernel makes names far
+ * shorter than it is willing to look up.
  */
+#define	APFS_DREC_KEY_MAX	(12u + FS_APFS_NAME_MAX + 1u)
+
 static const char *
 drec_name(const uint8_t *key, uint32_t klen, uint32_t *len_out)
 {
@@ -2156,12 +2413,38 @@ drec_name(const uint8_t *key, uint32_t klen, uint32_t *len_out)
 	return ((const char *)key + 10);
 }
 
+/*
+ * The key every one of a directory's entries sorts AFTER: its object id, the
+ * entry type, and a name word of zero.
+ *
+ * Zero is what makes it a floor rather than a name.  On a volume that hashes
+ * names that word holds the hash and the length together, and on one that does
+ * not it holds the length alone -- and the length counts a trailing NUL, so no
+ * real entry can record zero for it.  A scan from here therefore begins at the
+ * directory's first name whichever kind of volume this is.
+ */
+static void
+drec_low_key(uint64_t dir, uint8_t *out, uint32_t *klen_out)
+{
+
+	*(uint64_t *)out = (dir & APFS_J_OBJ_ID_MASK) |
+	    ((uint64_t)APFS_TYPE_DIR_REC << APFS_J_OBJ_TYPE_SHIFT);
+	if (g_apfs.ac_drec_hashed) {
+		*(uint32_t *)(out + 8) = 0;
+		*klen_out = 12u;
+	} else {
+		*(uint16_t *)(out + 8) = 0;
+		*klen_out = 10u;
+	}
+}
+
 struct dirent_search {
 	const char	*ds_name;
 	size_t		 ds_namelen;
 	uint64_t	 ds_parent;
 	uint64_t	 ds_found;
 	bool		 ds_is_dir;
+	bool		 ds_keyed;	/* the scan started at this name */
 };
 
 static bool
@@ -2173,19 +2456,28 @@ dirent_match(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 	const char			*name;
 	uint32_t			 nlen;
 	size_t				 i;
+	bool				 hit;
 
 	(void)bno;
 	ds = arg;
-	if (type != APFS_TYPE_DIR_REC || oid != ds->ds_parent)
-		return (true);
-	if (vlen < sizeof(*dv))
-		return (true);
-	name = drec_name(key, klen, &nlen);
-	if (name == NULL || nlen != ds->ds_namelen)
-		return (true);
-	for (i = 0; i < ds->ds_namelen; i++)
-		if (name[i] != ds->ds_name[i])
-			return (true);
+	hit = false;
+	if (type == APFS_TYPE_DIR_REC && oid == ds->ds_parent &&
+	    vlen >= sizeof(*dv)) {
+		name = drec_name(key, klen, &nlen);
+		if (name != NULL && nlen == ds->ds_namelen) {
+			hit = true;
+			for (i = 0; hit && i < ds->ds_namelen; i++)
+				hit = name[i] == ds->ds_name[i];
+		}
+	}
+	/*
+	 * Not this name.  A read that DESCENDED on it has already had its
+	 * answer: the first record handed over is either the entry or the one
+	 * that sorts after it, and there is nothing further to look at.  A read
+	 * that started at the beginning of the tree has to keep going.
+	 */
+	if (!hit)
+		return (!ds->ds_keyed);
 
 	dv = (const struct apfs_drec_val *)val;
 	ds->ds_found  = dv->dv_file_id;
@@ -2197,10 +2489,13 @@ int
 fs_apfs_lookup(const char *path, uint64_t *oid_out, int *is_dir_out)
 {
 	struct dirent_search	ds;
+	uint8_t			 dkey[APFS_DREC_KEY_MAX];
 	const char		*p;
 	const char		*comp;
 	uint64_t		 oid;
+	uint32_t		 dklen;
 	bool			 is_dir;
+	bool			 ok;
 	bool			 stopped;
 
 	if (!g_apfs.ac_mounted)
@@ -2225,8 +2520,23 @@ fs_apfs_lookup(const char *path, uint64_t *oid_out, int *is_dir_out)
 		ds.ds_found   = 0;
 		ds.ds_is_dir  = false;
 		stopped = false;
-		if (!btree_walk(g_apfs.ac_root_tree_bno, dirent_match, &ds, 0,
-		    &stopped))
+		/*
+		 * An entry sorts under its parent's object id and the hash of
+		 * its own name, and this kernel can compute both -- so the
+		 * whole of a path component costs one descent.  A name it
+		 * cannot fold still reads: anything outside ASCII on a volume
+		 * that hashes names has no key this kernel can build, and for
+		 * those the tree is read the way it always was.
+		 */
+		ds.ds_keyed = drec_key(oid, comp, (uint32_t)(p - comp), dkey,
+		    &dklen, false) == FS_APFS_E_OK;
+		if (ds.ds_keyed)
+			ok = btree_scan(g_apfs.ac_root_tree_bno, dkey, dklen,
+			    dirent_match, &ds, 0, &stopped);
+		else
+			ok = btree_walk(g_apfs.ac_root_tree_bno, dirent_match,
+			    &ds, 0, &stopped);
+		if (!ok)
 			return (FS_APFS_E_IO);
 		if (ds.ds_found == 0)
 			return (FS_APFS_E_NOTFOUND);
@@ -2284,10 +2594,15 @@ inode_pick(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 	(void)klen;
 	(void)bno;
 	ii = arg;
+	/*
+	 * Reached by a descent on this inode's own key, so the first record
+	 * handed over is either it or proof that there is none -- either way
+	 * there is nothing after it worth reading.
+	 */
 	if (type != APFS_TYPE_INODE || oid != ii->ii_oid)
-		return (true);
+		return (false);
 	if (vlen < sizeof(*iv))
-		return (true);
+		return (false);
 
 	iv = (const struct apfs_inode_val *)val;
 	ii->ii_private_id = iv->ai_private_id;
@@ -2348,7 +2663,8 @@ inode_pick(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 static int
 inode_info(uint64_t oid, struct inode_info *ii)
 {
-	bool	stopped;
+	uint64_t	key;
+	bool		stopped;
 
 	ii->ii_oid        = oid;
 	ii->ii_private_id = oid;
@@ -2363,8 +2679,11 @@ inode_info(uint64_t oid, struct inode_info *ii)
 	ii->ii_gid        = 0;
 	ii->ii_mode       = 0;
 	ii->ii_found      = false;
+	key = (oid & APFS_J_OBJ_ID_MASK) |
+	    ((uint64_t)APFS_TYPE_INODE << APFS_J_OBJ_TYPE_SHIFT);
 	stopped = false;
-	if (!btree_walk(g_apfs.ac_root_tree_bno, inode_pick, ii, 0, &stopped))
+	if (!btree_scan(g_apfs.ac_root_tree_bno, (const uint8_t *)&key,
+	    (uint32_t)sizeof(key), inode_pick, ii, 0, &stopped))
 		return (FS_APFS_E_IO);
 	return (ii->ii_found ? FS_APFS_E_OK : FS_APFS_E_NOTFOUND);
 }
@@ -2402,6 +2721,27 @@ fs_apfs_stat(const char *path, struct fs_apfs_statbuf *out)
 }
 
 /*
+ * The key one of a data stream's runs sorts under, and -- with `logical` zero
+ * -- the key every one of them sorts at or after.
+ *
+ * That second use is how every read of a file's bytes starts, and it starts
+ * there rather than at the byte it wants ON PURPOSE.  A run is keyed by where
+ * it BEGINS, so the run covering some offset can begin long before it, and a
+ * descent to the offset itself would land past the record that holds it.
+ * Beginning at the stream's first run costs the records before the window and
+ * cannot be wrong; the descent has already skipped every other object on the
+ * volume, which is where the cost was.
+ */
+static void
+extent_key(uint64_t id, uint64_t logical, uint64_t *out)
+{
+
+	out[0] = (id & APFS_J_OBJ_ID_MASK) |
+	    ((uint64_t)APFS_TYPE_FILE_EXTENT << APFS_J_OBJ_TYPE_SHIFT);
+	out[1] = logical;
+}
+
+/*
  * Copying part of a file's extents into a buffer.  The wanted byte window is
  * [er_lo, er_hi) of the file and er_buf holds er_lo; a whole-file read is just
  * the window [0, size).  er_bounce holds the one partial block a window whose
@@ -2436,8 +2776,9 @@ extent_copy(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 
 	(void)bno;
 	er = arg;
+	/* Past this stream's runs, which a scan that began at them has left. */
 	if (type != APFS_TYPE_FILE_EXTENT || oid != er->er_id)
-		return (true);
+		return (false);
 	/* Key is the record header plus the byte offset this run covers. */
 	if (klen < 16 || vlen < sizeof(*fe))
 		return (true);
@@ -2511,6 +2852,7 @@ fs_apfs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size)
 	struct extent_read	 er;
 	uint8_t			*buf;
 	uint8_t			*bounce;
+	uint64_t		 ekey[2];
 	uint64_t		 oid;
 	int			 is_dir;
 	int			 rv;
@@ -2560,8 +2902,10 @@ fs_apfs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size)
 	er.er_hi     = st.afs_size;
 	er.er_got    = 0;
 	er.er_rv     = FS_APFS_E_OK;
+	extent_key(er.er_id, 0, ekey);
 	stopped = false;
-	if (!btree_walk(g_apfs.ac_root_tree_bno, extent_copy, &er, 0, &stopped))
+	if (!btree_scan(g_apfs.ac_root_tree_bno, (const uint8_t *)ekey,
+	    (uint32_t)sizeof(ekey), extent_copy, &er, 0, &stopped))
 		er.er_rv = FS_APFS_E_IO;
 	kfree(bounce);
 
@@ -2628,6 +2972,7 @@ fs_apfs_pread(uint64_t id, uint64_t size, uint64_t off, uint8_t *buf,
 {
 	struct extent_read	 er;
 	uint8_t			*bounce;
+	uint64_t		 ekey[2];
 	uint64_t		 hi;
 	bool			 stopped;
 
@@ -2660,8 +3005,10 @@ fs_apfs_pread(uint64_t id, uint64_t size, uint64_t off, uint8_t *buf,
 	er.er_hi     = hi;
 	er.er_got    = 0;
 	er.er_rv     = FS_APFS_E_OK;
+	extent_key(id, 0, ekey);
 	stopped = false;
-	if (!btree_walk(g_apfs.ac_root_tree_bno, extent_copy, &er, 0, &stopped))
+	if (!btree_scan(g_apfs.ac_root_tree_bno, (const uint8_t *)ekey,
+	    (uint32_t)sizeof(ekey), extent_copy, &er, 0, &stopped))
 		er.er_rv = FS_APFS_E_IO;
 	kfree(bounce);
 
@@ -2743,8 +3090,9 @@ extent_locate(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 	uint64_t				 len;
 
 	el = arg;
+	/* Past this stream's runs: the offset asked about is in none of them. */
 	if (type != APFS_TYPE_FILE_EXTENT || oid != el->el_id)
-		return (true);
+		return (false);
 	if (klen < 16 || vlen < sizeof(*fe))
 		return (true);
 
@@ -2767,14 +3115,16 @@ static int
 extent_at(uint64_t id, uint64_t off, uint64_t *phys_out)
 {
 	struct extent_locate	el;
+	uint64_t		ekey[2];
 	bool			stopped;
 
 	el.el_id    = id;
 	el.el_want  = off;
 	el.el_found = false;
+	extent_key(id, 0, ekey);
 	stopped = false;
-	if (!btree_walk(g_apfs.ac_root_tree_bno, extent_locate, &el, 0,
-	    &stopped))
+	if (!btree_scan(g_apfs.ac_root_tree_bno, (const uint8_t *)ekey,
+	    (uint32_t)sizeof(ekey), extent_locate, &el, 0, &stopped))
 		return (FS_APFS_E_IO);
 	if (!el.el_found)
 		return (FS_APFS_E_NOTFOUND);
@@ -2946,6 +3296,7 @@ fs_apfs_pwrite(uint64_t id, uint64_t size, uint64_t off, const uint8_t *buf,
 	struct extent_locate	 el;
 	uint8_t			*bounce;
 	uint8_t			*node;
+	uint64_t		 ekey[2];
 	uint64_t		 pos;
 	uint64_t		 end;
 	uint32_t		 moved;
@@ -2995,9 +3346,10 @@ fs_apfs_pwrite(uint64_t id, uint64_t size, uint64_t off, const uint8_t *buf,
 		el.el_id    = id;
 		el.el_want  = pos;
 		el.el_found = false;
+		extent_key(id, 0, ekey);
 		stopped = false;
-		if (!btree_walk(g_apfs.ac_root_tree_bno, extent_locate, &el, 0,
-		    &stopped)) {
+		if (!btree_scan(g_apfs.ac_root_tree_bno, (const uint8_t *)ekey,
+		    (uint32_t)sizeof(ekey), extent_locate, &el, 0, &stopped)) {
 			rv = FS_APFS_E_IO;
 			goto out;
 		}
@@ -3059,21 +3411,51 @@ inode_locate(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 	(void)vlen;
 	il = arg;
 	if (type != APFS_TYPE_INODE || oid != il->il_oid)
-		return (true);
+		return (false);		/* the descent landed: there is none */
 	il->il_bno   = bno;
 	il->il_found = true;
 	return (false);
+}
+
+/*
+ * The leaf an inode record lives in.
+ *
+ * An inode's key is nothing but its object id and the record type, so this is
+ * the plainest descent in the file -- and it had been written out longhand
+ * around a whole-tree walk in six places, which is what made it worth being a
+ * function rather than a shape.
+ */
+static int
+inode_where(uint64_t oid, uint64_t *bno_out)
+{
+	struct inode_locate	il;
+	uint64_t		key;
+	bool			stopped;
+
+	key = (oid & APFS_J_OBJ_ID_MASK) |
+	    ((uint64_t)APFS_TYPE_INODE << APFS_J_OBJ_TYPE_SHIFT);
+	il.il_oid   = oid;
+	il.il_bno   = 0;
+	il.il_found = false;
+	stopped = false;
+	if (!btree_scan(g_apfs.ac_root_tree_bno, (const uint8_t *)&key,
+	    (uint32_t)sizeof(key), inode_locate, &il, 0, &stopped))
+		return (FS_APFS_E_IO);
+	if (!il.il_found)
+		return (FS_APFS_E_NOTFOUND);
+	*bno_out = il.il_bno;
+	return (FS_APFS_E_OK);
 }
 
 int
 fs_apfs_touch(uint64_t oid, uint64_t mtime_ns)
 {
 	struct btree_layout	 bl;
-	struct inode_locate	 il;
 	struct apfs_inode_val	*iv;
 	struct apfs_obj_phys	*o;
 	uint8_t			*node;
 	const uint8_t		*k;
+	uint64_t		 ino_leaf;
 	uint64_t		 leaf_oid;
 	uint64_t		 new_bno;
 	uint64_t		 raw;
@@ -3081,26 +3463,20 @@ fs_apfs_touch(uint64_t oid, uint64_t mtime_ns)
 	uint32_t		 koff, klen, voff, vlen;
 	uint32_t		 i;
 	int			 rv;
-	bool			 stopped;
 
 	if (!g_apfs.ac_mounted)
 		return (FS_APFS_E_NOMOUNT);
 	if (!g_apfs.ac_ip_valid || g_apfs.ac_ctr_omap_tree == 0)
 		return (FS_APFS_E_NOALLOC);
 
-	il.il_oid   = oid;
-	il.il_bno   = 0;
-	il.il_found = false;
-	stopped = false;
-	if (!btree_walk(g_apfs.ac_root_tree_bno, inode_locate, &il, 0, &stopped))
-		return (FS_APFS_E_IO);
-	if (!il.il_found)
-		return (FS_APFS_E_NOTFOUND);
+	rv = inode_where(oid, &ino_leaf);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
 
 	node = kmalloc(APFS_BLOCK_SIZE);
 	if (node == NULL)
 		return (FS_APFS_E_NOMEM);
-	rv = fs_apfs_read_block(il.il_bno, node);
+	rv = fs_apfs_read_block(ino_leaf, node);
 	if (rv != FS_APFS_E_OK)
 		goto out;
 
@@ -3154,7 +3530,7 @@ fs_apfs_touch(uint64_t oid, uint64_t mtime_ns)
 		(void)free_blocks(new_bno, 1);
 		goto out;
 	}
-	rv = free_blocks(il.il_bno, 1);
+	rv = free_blocks(ino_leaf, 1);
 	if (rv != FS_APFS_E_OK)
 		goto out;
 	cow_n_spine++;
@@ -3205,77 +3581,6 @@ out:
  * fixed reservation at the front, and the key area begins where it ends, so
  * growing it would move every key under every offset already recorded.
  */
-
-/*
- * Order two file-system tree keys: negative, zero, positive.
- *
- * Records sort by object id FIRST and type second, which is the opposite of
- * what comparing the raw first word would do -- the type is in the top bits.
- * Beyond that the order is per type; the only one this needs is the file
- * extent, whose remaining key is its offset within the file.  Two keys with
- * the same object and type and no rule to separate them compare equal, which
- * is honest: this returns an order, not a total order over records it has
- * never been asked about.
- */
-static int
-jkey_cmp(const uint8_t *a, uint32_t alen, const uint8_t *b, uint32_t blen)
-{
-	uint64_t	ra, rb;
-	uint64_t	ida, idb;
-	uint64_t	la, lb;
-	uint32_t	ta, tb;
-
-	if (alen < 8 || blen < 8)
-		return (0);
-	ra  = *(const uint64_t *)a;
-	rb  = *(const uint64_t *)b;
-	ida = ra & APFS_J_OBJ_ID_MASK;
-	idb = rb & APFS_J_OBJ_ID_MASK;
-	if (ida != idb)
-		return (ida < idb ? -1 : 1);
-	ta = (uint32_t)(ra >> APFS_J_OBJ_TYPE_SHIFT);
-	tb = (uint32_t)(rb >> APFS_J_OBJ_TYPE_SHIFT);
-	if (ta != tb)
-		return (ta < tb ? -1 : 1);
-	if (ta == APFS_TYPE_FILE_EXTENT && alen >= 16 && blen >= 16) {
-		la = *(const uint64_t *)(a + 8);
-		lb = *(const uint64_t *)(b + 8);
-		if (la != lb)
-			return (la < lb ? -1 : 1);
-		return (0);
-	}
-	/*
-	 * Directory entries, because a node's separator can be one and getting
-	 * two of them the wrong way round would put a record in the wrong half
-	 * of a split.  Hashed volumes sort by the word holding the name's
-	 * length and hash and then by the name; plain ones by the name alone.
-	 * Which of the two this volume is was settled at mount.
-	 */
-	if (ta == APFS_TYPE_DIR_REC) {
-		uint32_t	ha, hb;
-		uint32_t	off;
-		uint32_t	n;
-		uint32_t	i;
-
-		off = g_apfs.ac_drec_hashed ? 12u : 10u;
-		if (alen < off || blen < off)
-			return (0);
-		if (g_apfs.ac_drec_hashed) {
-			ha = *(const uint32_t *)(a + 8);
-			hb = *(const uint32_t *)(b + 8);
-			if (ha != hb)
-				return (ha < hb ? -1 : 1);
-		}
-		n = (alen - off < blen - off) ? alen - off : blen - off;
-		for (i = 0; i < n; i++) {
-			if (a[off + i] != b[off + i])
-				return (a[off + i] < b[off + i] ? -1 : 1);
-		}
-		if (alen != blen)
-			return (alen < blen ? -1 : 1);
-	}
-	return (0);
-}
 
 /*
  * A HOLE IS ROOM, AND UNTIL NOW IT WAS NOT
@@ -3725,9 +4030,14 @@ extref_shrink(uint64_t start, uint64_t keep, uint64_t xid, void *buf,
 /*
  * Which leaf a key belongs in: the last one holding a key no greater than it.
  *
- * A walk in tree order is enough to answer that, and it is the same walk every
- * reader here already uses.  Doing it by descending the index would be faster
- * and would need a second copy of the key ordering; this one has exactly one.
+ * A walk in tree order is enough to answer that, and it was how every writer
+ * here asked -- until the reader learned to descend, and leaf_home came to
+ * answer the same question in three block reads instead of the whole tree.
+ *
+ * This is kept because two answers are worth more than one when the question
+ * is where a write lands.  The self-test asks both about every key on the
+ * volume and requires them to agree, so the descent is checked against the
+ * thing it replaced rather than against itself.
  */
 struct leaf_find {
 	const uint8_t	*lf_key;
@@ -4018,8 +4328,6 @@ tree_nodes_of(const uint8_t *root, uint64_t *out)
  * node is now, the oid is the name everything above it uses, and a copy
  * changes the first without touching the second.
  */
-#define	APFS_TREE_MAX_DEPTH	8
-
 struct tree_path {
 	uint64_t	tp_bno[APFS_TREE_MAX_DEPTH];
 	uint64_t	tp_oid[APFS_TREE_MAX_DEPTH];
@@ -5106,7 +5414,6 @@ grow_once(uint64_t ino, uint64_t id, uint64_t new_size, uint64_t *full_leaf)
 	struct btree_layout		 bl;
 	struct inode_info		 ii;
 	struct leaf_edit		 ne;
-	struct leaf_find		 lf;
 	uint8_t				*node;
 	uint8_t				*zero;
 	const uint8_t			*k;
@@ -5164,9 +5471,11 @@ grow_once(uint64_t ino, uint64_t id, uint64_t new_size, uint64_t *full_leaf)
 			last.el_id    = id;
 			last.el_want  = alloced - 1;
 			last.el_found = false;
+			extent_key(id, 0, key);
 			stopped = false;
-			if (!btree_walk(g_apfs.ac_root_tree_bno, extent_locate,
-			    &last, 0, &stopped)) {
+			if (!btree_scan(g_apfs.ac_root_tree_bno,
+			    (const uint8_t *)key, (uint32_t)sizeof(key),
+			    extent_locate, &last, 0, &stopped)) {
 				rv = FS_APFS_E_IO;
 				goto out;
 			}
@@ -5221,24 +5530,9 @@ grow_once(uint64_t ino, uint64_t id, uint64_t new_size, uint64_t *full_leaf)
 	 * patch is a fixed-size edit inside a value that is not: find the
 	 * dstream by walking the field table, exactly as the reader does.
 	 */
-	{
-		struct inode_locate	il;
-
-		il.il_oid   = ino;
-		il.il_bno   = 0;
-		il.il_found = false;
-		stopped = false;
-		if (!btree_walk(g_apfs.ac_root_tree_bno, inode_locate, &il, 0,
-		    &stopped)) {
-			rv = FS_APFS_E_IO;
-			goto give_back;
-		}
-		if (!il.il_found) {
-			rv = FS_APFS_E_NOTFOUND;
-			goto give_back;
-		}
-		ino_leaf = il.il_bno;
-	}
+	rv = inode_where(ino, &ino_leaf);
+	if (rv != FS_APFS_E_OK)
+		goto give_back;
 
 	/*
 	 * WHICH LEAF THE EXTENT BELONGS IN, which need not be the inode's.
@@ -5250,25 +5544,15 @@ grow_once(uint64_t ino, uint64_t id, uint64_t new_size, uint64_t *full_leaf)
 	 * the de-duplication in edit_leaf means the common case (one leaf,
 	 * named twice) still copies a single node.
 	 */
-	key[0] = (id & APFS_J_OBJ_ID_MASK) |
-	    ((uint64_t)APFS_TYPE_FILE_EXTENT << APFS_J_OBJ_TYPE_SHIFT);
-	key[1] = alloced;
-	lf.lf_key   = (const uint8_t *)key;
-	lf.lf_klen  = (uint32_t)sizeof(key);
-	lf.lf_bno   = 0;
-	lf.lf_first = 0;
-	lf.lf_any   = false;
-	stopped = false;
+	extent_key(id, alloced, key);
 	ext_leaf = ino_leaf;
 	if (blocks != 0 && merge) {
 		ext_leaf = last.el_bno;		/* the record being lengthened */
 	} else if (blocks != 0) {
-		if (!btree_walk(g_apfs.ac_root_tree_bno, leaf_find, &lf, 0,
-		    &stopped)) {
-			rv = FS_APFS_E_IO;
+		rv = leaf_home((const uint8_t *)key, (uint32_t)sizeof(key),
+		    &ext_leaf);
+		if (rv != FS_APFS_E_OK)
 			goto give_back;
-		}
-		ext_leaf = lf.lf_bno != 0 ? lf.lf_bno : lf.lf_first;
 	}
 
 	ext_slot = edit_leaf(&ne, ext_leaf);
@@ -5522,8 +5806,9 @@ extent_cut_pick(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 	uint64_t				 len;
 
 	ec = arg;
+	/* Past this stream's runs: there is nothing further of it to cut. */
 	if (type != APFS_TYPE_FILE_EXTENT || oid != ec->ec_id)
-		return (true);
+		return (false);
 	if (klen < 16 || vlen < sizeof(*fe))
 		return (true);
 	logical = *(const uint64_t *)(key + 8);
@@ -5589,11 +5874,11 @@ fs_apfs_truncate(uint64_t ino, uint64_t id, uint64_t new_size)
 	struct btree_layout		 bl;
 	struct extent_cut		 ec;
 	struct inode_info		 ii;
-	struct inode_locate		 il;
 	struct leaf_edit		 ne;
 	uint8_t				*node;
 	uint8_t				*leaf;
 	const uint8_t			*k;
+	uint64_t			 ekey[2];
 	uint64_t			 hold[APFS_TRUNC_MAX];	/* bytes kept */
 	uint64_t			 gone[APFS_TRUNC_MAX];	/* first block */
 	uint64_t			 ngone[APFS_TRUNC_MAX];	/* ...how many */
@@ -5629,9 +5914,10 @@ fs_apfs_truncate(uint64_t ino, uint64_t id, uint64_t new_size)
 	ec.ec_keep = keep;
 	ec.ec_n    = 0;
 	ec.ec_over = false;
+	extent_key(id, 0, ekey);
 	stopped    = false;
-	if (!btree_walk(g_apfs.ac_root_tree_bno, extent_cut_pick, &ec, 0,
-	    &stopped))
+	if (!btree_scan(g_apfs.ac_root_tree_bno, (const uint8_t *)ekey,
+	    (uint32_t)sizeof(ekey), extent_cut_pick, &ec, 0, &stopped))
 		return (FS_APFS_E_IO);
 	if (ec.ec_over) {
 		kprintf("apfs: inode %llu has more than %u runs past %llu -- "
@@ -5641,16 +5927,9 @@ fs_apfs_truncate(uint64_t ino, uint64_t id, uint64_t new_size)
 		return (FS_APFS_E_NOALLOC);
 	}
 
-	il.il_oid   = ino;
-	il.il_bno   = 0;
-	il.il_found = false;
-	stopped     = false;
-	if (!btree_walk(g_apfs.ac_root_tree_bno, inode_locate, &il, 0,
-	    &stopped))
-		return (FS_APFS_E_IO);
-	if (!il.il_found)
-		return (FS_APFS_E_NOTFOUND);
-	ino_leaf = il.il_bno;
+	rv = inode_where(ino, &ino_leaf);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
 
 	/*
 	 * WHICH LEAVES THIS TOUCHES, worked out before anything is changed.
@@ -5928,17 +6207,26 @@ crc32c(uint32_t crc, const uint8_t *p, uint32_t n)
 /*
  * Build the key a directory entry sorts under: the parent's object id with the
  * record type on top, then either the hash-and-length word or a bare length,
- * then the name and the NUL that the recorded length counts.
+ * then the name and the NUL that the recorded length counts.  `out` holds
+ * APFS_DREC_KEY_MAX bytes.
+ *
+ * `complain` is for the difference between the two callers.  A WRITE that
+ * cannot fold a name has to say why it is refusing, in the one message that
+ * explains what is missing.  A LOOKUP has somewhere else to go -- the walk
+ * that needs no key at all -- and would be printing a warning about a file it
+ * is about to find.
  */
 static int
 drec_key(uint64_t parent, const char *name, uint32_t nlen, uint8_t *out,
-    uint32_t *klen_out)
+    uint32_t *klen_out, bool complain)
 {
 	uint8_t		wide[4];
 	uint32_t	crc;
 	uint32_t	i;
 	uint8_t		c;
 
+	if (nlen > FS_APFS_NAME_MAX)
+		return (FS_APFS_E_INVAL);
 	*(uint64_t *)out = (parent & APFS_J_OBJ_ID_MASK) |
 	    ((uint64_t)APFS_TYPE_DIR_REC << APFS_J_OBJ_TYPE_SHIFT);
 	if (!g_apfs.ac_drec_hashed) {
@@ -5953,9 +6241,11 @@ drec_key(uint64_t parent, const char *name, uint32_t nlen, uint8_t *out,
 	for (i = 0; i < nlen; i++) {
 		c = (uint8_t)name[i];
 		if (c >= 0x80u) {
-			kprintf("apfs: \"%s\" is not ASCII -- folding a name "
-			    "the way this volume hashes them needs Unicode "
-			    "tables this kernel does not carry\n", name);
+			if (complain)
+				kprintf("apfs: \"%s\" is not ASCII -- folding "
+				    "a name the way this volume hashes them "
+				    "needs Unicode tables this kernel does "
+				    "not carry\n", name);
 			return (FS_APFS_E_INVAL);
 		}
 		if (c >= 'A' && c <= 'Z')
@@ -6154,8 +6444,6 @@ fs_apfs_create(uint64_t dir, const char *name, uint64_t now, uint64_t *ino_out)
 	struct apfs_drec_val	 dv;
 	struct dirent_search	 ds;
 	struct inode_info	 ii;
-	struct inode_locate	 il;
-	struct leaf_find	 lf;
 	struct leaf_edit	 ne;
 	uint8_t			 dkey[12 + APFS_MAKE_NAME_MAX + 1];
 	uint8_t			 rec[sizeof(struct apfs_inode_val) +
@@ -6200,22 +6488,29 @@ fs_apfs_create(uint64_t dir, const char *name, uint64_t now, uint64_t *ino_out)
 		return (FS_APFS_E_NOTFOUND);
 	}
 
+	/*
+	 * The key first, because the name has to have one before anything else
+	 * is worth doing -- and because the question after this is asked BY it.
+	 */
+	rv = drec_key(dir, name, nlen, dkey, &dklen, true);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+
 	/* And the name must be free, which is a question only the tree can answer. */
 	ds.ds_name    = name;
 	ds.ds_namelen = nlen;
 	ds.ds_parent  = dir;
 	ds.ds_found   = 0;
 	ds.ds_is_dir  = false;
+	ds.ds_keyed   = true;
 	stopped = false;
-	if (!btree_walk(g_apfs.ac_root_tree_bno, dirent_match, &ds, 0, &stopped))
+	if (!btree_scan(g_apfs.ac_root_tree_bno, dkey, dklen, dirent_match, &ds,
+	    0, &stopped))
 		return (FS_APFS_E_IO);
 	if (ds.ds_found != 0)
 		return (FS_APFS_E_EXIST);
 
 	ino = g_apfs.ac_next_ino;
-	rv  = drec_key(dir, name, nlen, dkey, &dklen);
-	if (rv != FS_APFS_E_OK)
-		return (rv);
 	ikey = (ino & APFS_J_OBJ_ID_MASK) |
 	    ((uint64_t)APFS_TYPE_INODE << APFS_J_OBJ_TYPE_SHIFT);
 	skey = (ino & APFS_J_OBJ_ID_MASK) |
@@ -6261,35 +6556,16 @@ fs_apfs_create(uint64_t dir, const char *name, uint64_t now, uint64_t *ino_out)
 	vlen = data + pad + (uint32_t)sizeof(struct apfs_dstream);
 
 	/* Where each of the three belongs. */
-	il.il_oid   = dir;
-	il.il_bno   = 0;
-	il.il_found = false;
-	stopped     = false;
-	if (!btree_walk(g_apfs.ac_root_tree_bno, inode_locate, &il, 0, &stopped))
-		return (FS_APFS_E_IO);
-	if (!il.il_found)
-		return (FS_APFS_E_NOTFOUND);
-	par_leaf = il.il_bno;
-
-	lf.lf_key   = dkey;
-	lf.lf_klen  = dklen;
-	lf.lf_bno   = 0;
-	lf.lf_first = 0;
-	lf.lf_any   = false;
-	stopped     = false;
-	if (!btree_walk(g_apfs.ac_root_tree_bno, leaf_find, &lf, 0, &stopped))
-		return (FS_APFS_E_IO);
-	drec_leaf = lf.lf_bno != 0 ? lf.lf_bno : lf.lf_first;
-
-	lf.lf_key   = (const uint8_t *)&ikey;
-	lf.lf_klen  = (uint32_t)sizeof(ikey);
-	lf.lf_bno   = 0;
-	lf.lf_first = 0;
-	lf.lf_any   = false;
-	stopped     = false;
-	if (!btree_walk(g_apfs.ac_root_tree_bno, leaf_find, &lf, 0, &stopped))
-		return (FS_APFS_E_IO);
-	ino_leaf = lf.lf_bno != 0 ? lf.lf_bno : lf.lf_first;
+	rv = inode_where(dir, &par_leaf);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	rv = leaf_home(dkey, dklen, &drec_leaf);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	rv = leaf_home((const uint8_t *)&ikey, (uint32_t)sizeof(ikey),
+	    &ino_leaf);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
 
 	edit_init(&ne);
 	(void)edit_leaf(&ne, par_leaf);
@@ -6385,7 +6661,6 @@ fs_apfs_unlink(uint64_t dir, const char *name, uint64_t now)
 {
 	struct dirent_search	 ds;
 	struct inode_info	 ii;
-	struct inode_locate	 il;
 	struct leaf_edit	 ne;
 	uint8_t			 dkey[12 + APFS_MAKE_NAME_MAX + 1];
 	uint8_t			*scratch;
@@ -6408,14 +6683,19 @@ fs_apfs_unlink(uint64_t dir, const char *name, uint64_t now)
 	nlen = (uint32_t)str_len(name);
 	if (nlen == 0 || nlen > APFS_MAKE_NAME_MAX)
 		return (FS_APFS_E_INVAL);
+	rv = drec_key(dir, name, nlen, dkey, &dklen, true);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
 
 	ds.ds_name    = name;
 	ds.ds_namelen = nlen;
 	ds.ds_parent  = dir;
 	ds.ds_found   = 0;
 	ds.ds_is_dir  = false;
+	ds.ds_keyed   = true;
 	stopped = false;
-	if (!btree_walk(g_apfs.ac_root_tree_bno, dirent_match, &ds, 0, &stopped))
+	if (!btree_scan(g_apfs.ac_root_tree_bno, dkey, dklen, dirent_match, &ds,
+	    0, &stopped))
 		return (FS_APFS_E_IO);
 	if (ds.ds_found == 0)
 		return (FS_APFS_E_NOTFOUND);
@@ -6444,44 +6724,15 @@ fs_apfs_unlink(uint64_t dir, const char *name, uint64_t now)
 			return (rv);
 	}
 
-	rv = drec_key(dir, name, nlen, dkey, &dklen);
+	rv = inode_where(dir, &par_leaf);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
-
-	il.il_oid   = dir;
-	il.il_bno   = 0;
-	il.il_found = false;
-	stopped     = false;
-	if (!btree_walk(g_apfs.ac_root_tree_bno, inode_locate, &il, 0, &stopped))
-		return (FS_APFS_E_IO);
-	if (!il.il_found)
-		return (FS_APFS_E_NOTFOUND);
-	par_leaf = il.il_bno;
-
-	il.il_oid   = child;
-	il.il_bno   = 0;
-	il.il_found = false;
-	stopped     = false;
-	if (!btree_walk(g_apfs.ac_root_tree_bno, inode_locate, &il, 0, &stopped))
-		return (FS_APFS_E_IO);
-	if (!il.il_found)
-		return (FS_APFS_E_NOTFOUND);
-	ino_leaf = il.il_bno;
-
-	{
-		struct leaf_find	lf;
-
-		lf.lf_key   = dkey;
-		lf.lf_klen  = dklen;
-		lf.lf_bno   = 0;
-		lf.lf_first = 0;
-		lf.lf_any   = false;
-		stopped     = false;
-		if (!btree_walk(g_apfs.ac_root_tree_bno, leaf_find, &lf, 0,
-		    &stopped))
-			return (FS_APFS_E_IO);
-		drec_leaf = lf.lf_bno != 0 ? lf.lf_bno : lf.lf_first;
-	}
+	rv = inode_where(child, &ino_leaf);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	rv = leaf_home(dkey, dklen, &drec_leaf);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
 
 	edit_init(&ne);
 	(void)edit_leaf(&ne, par_leaf);
@@ -6644,8 +6895,14 @@ readdir_pick(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 
 	(void)bno;
 	rs = arg;
+	/*
+	 * Past this directory's entries.  The scan began at the first of them,
+	 * so a record belonging to anything else is the end of the directory --
+	 * which is also how an index beyond the last name reports that there is
+	 * no such entry.
+	 */
 	if (type != APFS_TYPE_DIR_REC || oid != rs->rs_dir)
-		return (true);
+		return (false);
 	if (vlen < sizeof(*dv))
 		return (true);
 	name = drec_name(key, klen, &nlen);
@@ -6672,7 +6929,9 @@ fs_apfs_readdir(const char *path, uint32_t index, struct fs_apfs_dirent *out)
 {
 	struct readdir_search	rs;
 	struct inode_info	ii;
+	uint8_t			dkey[APFS_DREC_KEY_MAX];
 	uint64_t		oid;
+	uint32_t		dklen;
 	int			is_dir;
 	int			rv;
 	bool			stopped;
@@ -6690,8 +6949,10 @@ fs_apfs_readdir(const char *path, uint32_t index, struct fs_apfs_dirent *out)
 	rs.rs_want = index;
 	rs.rs_seen = 0;
 	rs.rs_hit  = false;
+	drec_low_key(oid, dkey, &dklen);
 	stopped = false;
-	if (!btree_walk(g_apfs.ac_root_tree_bno, readdir_pick, &rs, 0, &stopped))
+	if (!btree_scan(g_apfs.ac_root_tree_bno, dkey, dklen, readdir_pick, &rs,
+	    0, &stopped))
 		return (FS_APFS_E_IO);
 	if (!rs.rs_hit)
 		return (0);
@@ -8737,19 +8998,13 @@ inode_slot_of(uint64_t oid, uint8_t *scratch, uint64_t *bno_out,
     uint32_t *at_out, uint32_t *nkeys_out)
 {
 	struct btree_layout	bl;
-	struct inode_locate	il;
+	uint64_t		bno;
 	uint32_t		koff, klen, voff, vlen;
 	uint32_t		pos;
-	bool			stopped;
 
-	il.il_oid   = oid;
-	il.il_bno   = 0;
-	il.il_found = false;
-	stopped     = false;
-	if (!btree_walk(g_apfs.ac_root_tree_bno, inode_locate, &il, 0,
-	    &stopped) || !il.il_found)
+	if (inode_where(oid, &bno) != FS_APFS_E_OK)
 		return (false);
-	if (fs_apfs_read_block(il.il_bno, scratch) != FS_APFS_E_OK)
+	if (fs_apfs_read_block(bno, scratch) != FS_APFS_E_OK)
 		return (false);
 
 	btree_layout(scratch, &bl);
@@ -8765,7 +9020,7 @@ inode_slot_of(uint64_t oid, uint8_t *scratch, uint64_t *bno_out,
 	if (pos == bl.bl_nkeys)
 		return (false);
 
-	*bno_out   = il.il_bno;
+	*bno_out   = bno;
 	*at_out    = pos;
 	*nkeys_out = bl.bl_nkeys;
 	return (true);
@@ -9190,6 +9445,328 @@ fs_apfs_drop_selftest(uint64_t now)
 clean:
 	(void)fs_apfs_unlink(parent, "drop.txt", now);
 	(void)fs_apfs_checkpoint();
+}
+
+/*
+ * A DESCENT FINDS WHAT A WALK FINDS
+ *
+ * Reading the whole tree needs no key ordering; descending on one is a claim
+ * that this kernel's idea of the order is the order the volume was actually
+ * written in.  apfsck cannot check that -- it reads the volume with its own
+ * ordering and would agree with itself whatever this file believed -- so the
+ * proof has to be here, and the only oracle worth having is the walk that was
+ * right before.
+ *
+ * Every record on the volume is sought BY ITS OWN KEY, and three things are
+ * demanded of the answer: the same record, out of the same leaf block, and
+ * then the whole of the rest of the tree behind it in the same order.  That
+ * last one is the part worth paying for.  A descent that lands correctly and
+ * then skips a subtree on the way right would pass a test that only looked at
+ * the first record, and skipping a subtree is exactly what an off-by-one in
+ * the pruning does; so the tail is fingerprinted record by record, order and
+ * contents both, and compared against the walk's own tail from the same place.
+ *
+ * It runs over what Apple's tools put on this volume, not over what this
+ * kernel writes: inodes, directory entries with hashed keys, data streams,
+ * extents, extended attributes, sibling links.  Types this file has no
+ * ordering rule for are in there too, and they are the ones that would break
+ * it -- jkey_cmp returns EQUAL for two of them, and two records that compare
+ * equal but are kept apart by the tree are a record the descent cannot reach.
+ * If that is ever true of this volume, this test says so.
+ *
+ * The insertion answer is checked against its own oracle in the same pass:
+ * leaf_home descends to the leaf a key belongs in, the walk-based leaf_find it
+ * replaces says the same thing a slower way, and the writer only changed over
+ * once the two had agreed about every key here.
+ */
+#define	APFS_SEEK_KEY_MAX	160u
+#define	APFS_SEEK_RECS_MAX	1024u
+
+struct seek_probe {
+	uint32_t	*sp_fp;		/* fingerprint per record, or NULL */
+	uint32_t	 sp_n;		/* records seen                    */
+	uint32_t	 sp_max;
+	uint32_t	 sp_want;	/* which one to keep a copy of     */
+	uint32_t	 sp_hash;	/* order-sensitive, over them all  */
+	uint8_t		 sp_key[APFS_SEEK_KEY_MAX];
+	uint32_t	 sp_klen;
+	uint64_t	 sp_bno;
+	uint64_t	 sp_oid;
+	uint32_t	 sp_type;
+	bool		 sp_hit;
+	bool		 sp_wide;	/* a key too long to have kept     */
+};
+
+static void
+seek_probe_init(struct seek_probe *sp, uint32_t *fp, uint32_t max,
+    uint32_t want)
+{
+
+	sp->sp_fp   = fp;
+	sp->sp_n    = 0;
+	sp->sp_max  = max;
+	sp->sp_want = want;
+	sp->sp_hash = 0;
+	sp->sp_klen = 0;
+	sp->sp_bno  = 0;
+	sp->sp_oid  = 0;
+	sp->sp_type = 0;
+	sp->sp_hit  = false;
+	sp->sp_wide = false;
+}
+
+static bool
+seek_see(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
+    const uint8_t *val, uint32_t vlen, uint64_t bno, void *arg)
+{
+	struct seek_probe	*sp;
+	uint32_t		 fp;
+	uint32_t		 i;
+
+	sp = arg;
+	fp = crc32c(crc32c(0xFFFFFFFFu, key, klen), val, vlen);
+	if (sp->sp_fp != NULL && sp->sp_n < sp->sp_max)
+		sp->sp_fp[sp->sp_n] = fp;
+	sp->sp_hash = sp->sp_hash * 31u + fp;
+	if (sp->sp_n == sp->sp_want && !sp->sp_hit) {
+		if (klen > APFS_SEEK_KEY_MAX)
+			sp->sp_wide = true;
+		else
+			for (i = 0; i < klen; i++)
+				sp->sp_key[i] = key[i];
+		sp->sp_klen = klen;
+		sp->sp_bno  = bno;
+		sp->sp_oid  = oid;
+		sp->sp_type = type;
+		sp->sp_hit  = true;
+	}
+	sp->sp_n++;
+	return (true);
+}
+
+void
+fs_apfs_seek_selftest(void)
+{
+	struct seek_probe	 all;
+	struct seek_probe	 one;
+	struct seek_probe	 tail;
+	struct leaf_find	 lf;
+	uint32_t		*fp;
+	uint64_t		 home;
+	uint64_t		 gap_key[1];
+	uint64_t		 was_reads;
+	uint64_t		 was_nodes;
+	uint64_t		 was_recs;
+	uint32_t		 total;
+	uint32_t		 i, j;
+	uint32_t		 gaps;
+	uint64_t		 prev_oid;
+	uint32_t		 prev_type;
+	bool			 stopped;
+
+	if (!g_apfs.ac_mounted) {
+		kprintf("apfs-seek: SKIP not mounted\n");
+		return;
+	}
+
+	fp = kmalloc(APFS_SEEK_RECS_MAX * sizeof(*fp));
+	if (fp == NULL) {
+		kprintf("apfs-seek: SKIP no memory\n");
+		return;
+	}
+
+	/*
+	 * What this costs, kept so the PASS line can say it.  The counters this
+	 * kernel prints at the end of a boot are about reading the FILESYSTEM,
+	 * and a test that reads the whole tree three times per record would
+	 * otherwise be most of what they measured.
+	 */
+	was_reads = g_n_walks + g_n_seeks;
+	was_nodes = g_n_nodes;
+	was_recs  = g_n_recs;
+
+	/* Pass one: the whole tree, every record's fingerprint in order. */
+	seek_probe_init(&all, fp, APFS_SEEK_RECS_MAX, 0xFFFFFFFFu);
+	stopped = false;
+	if (!btree_walk(g_apfs.ac_root_tree_bno, seek_see, &all, 0, &stopped)) {
+		kprintf("apfs-seek: FAIL the tree will not walk\n");
+		kfree(fp);
+		return;
+	}
+	total = all.sp_n;
+	if (total == 0 || total > APFS_SEEK_RECS_MAX) {
+		kprintf("apfs-seek: FAIL the tree holds %u records, which this "
+		    "test is not built for\n", (unsigned)total);
+		kfree(fp);
+		return;
+	}
+
+	gaps = 0;
+	prev_oid  = 0;
+	prev_type = 0;
+	for (i = 0; i < total; i++) {
+		uint32_t	expect;
+
+		/* The i'th record, by walking to it. */
+		seek_probe_init(&one, NULL, 0, i);
+		stopped = false;
+		if (!btree_walk(g_apfs.ac_root_tree_bno, seek_see, &one, 0,
+		    &stopped) || !one.sp_hit) {
+			kprintf("apfs-seek: FAIL record %u will not come out of "
+			    "a walk\n", (unsigned)i);
+			goto out;
+		}
+		if (one.sp_wide) {
+			kprintf("apfs-seek: FAIL record %u has a %u-byte key, "
+			    "longer than this test can hold\n", (unsigned)i,
+			    (unsigned)one.sp_klen);
+			goto out;
+		}
+
+		/* The same record, by descending on its key. */
+		seek_probe_init(&tail, NULL, 0, 0);
+		stopped = false;
+		if (!btree_scan(g_apfs.ac_root_tree_bno, one.sp_key,
+		    one.sp_klen, seek_see, &tail, 0, &stopped) ||
+		    !tail.sp_hit) {
+			kprintf("apfs-seek: FAIL the descent on record %u's own "
+			    "key found nothing\n", (unsigned)i);
+			goto out;
+		}
+		if (tail.sp_oid != one.sp_oid || tail.sp_type != one.sp_type ||
+		    tail.sp_klen != one.sp_klen || tail.sp_bno != one.sp_bno) {
+			kprintf("apfs-seek: FAIL record %u is object %llu type "
+			    "%u in the leaf at %llu, and its own key descends "
+			    "to object %llu type %u in the leaf at %llu\n",
+			    (unsigned)i, (unsigned long long)one.sp_oid,
+			    (unsigned)one.sp_type, (unsigned long long)one.sp_bno,
+			    (unsigned long long)tail.sp_oid,
+			    (unsigned)tail.sp_type,
+			    (unsigned long long)tail.sp_bno);
+			goto out;
+		}
+
+		/*
+		 * And everything behind it.  The walk's tail from the same
+		 * record, combined the same way -- a sum would pass on a
+		 * descent that returned the right records in the wrong order.
+		 */
+		expect = 0;
+		for (j = i; j < total; j++)
+			expect = expect * 31u + fp[j];
+		if (tail.sp_n != total - i || tail.sp_hash != expect) {
+			kprintf("apfs-seek: FAIL entered at record %u the tree "
+			    "yields %u records (%08x), and the walk yields %u "
+			    "from there (%08x)\n", (unsigned)i,
+			    (unsigned)tail.sp_n, (unsigned)tail.sp_hash,
+			    (unsigned)(total - i), (unsigned)expect);
+			goto out;
+		}
+
+		/* Where an insert would put this key, both ways of asking. */
+		if (leaf_home(one.sp_key, one.sp_klen, &home) != FS_APFS_E_OK) {
+			kprintf("apfs-seek: FAIL no leaf claims record %u's "
+			    "key\n", (unsigned)i);
+			goto out;
+		}
+		lf.lf_key   = one.sp_key;
+		lf.lf_klen  = one.sp_klen;
+		lf.lf_bno   = 0;
+		lf.lf_first = 0;
+		lf.lf_any   = false;
+		stopped = false;
+		if (!btree_walk(g_apfs.ac_root_tree_bno, leaf_find, &lf, 0,
+		    &stopped)) {
+			kprintf("apfs-seek: FAIL the tree will not walk\n");
+			goto out;
+		}
+		if (home != (lf.lf_bno != 0 ? lf.lf_bno : lf.lf_first) ||
+		    home != one.sp_bno) {
+			kprintf("apfs-seek: FAIL record %u lives in the leaf at "
+			    "%llu, the descent puts its key in %llu and the "
+			    "walk puts it in %llu\n", (unsigned)i,
+			    (unsigned long long)one.sp_bno,
+			    (unsigned long long)home,
+			    (unsigned long long)(lf.lf_bno != 0 ? lf.lf_bno :
+			    lf.lf_first));
+			goto out;
+		}
+
+		/*
+		 * A key that is NOT on the volume, when the records leave room
+		 * for one: a type between two this object really has.  The
+		 * descent must land on the record after it, which is the whole
+		 * of what "where it would go" means.
+		 */
+		if (one.sp_oid == prev_oid && one.sp_type > prev_type + 1u) {
+			gap_key[0] = (one.sp_oid & APFS_J_OBJ_ID_MASK) |
+			    ((uint64_t)(prev_type + 1u) <<
+			    APFS_J_OBJ_TYPE_SHIFT);
+			seek_probe_init(&tail, NULL, 0, 0);
+			stopped = false;
+			if (!btree_scan(g_apfs.ac_root_tree_bno,
+			    (const uint8_t *)gap_key, (uint32_t)sizeof(gap_key),
+			    seek_see, &tail, 0, &stopped) || !tail.sp_hit ||
+			    tail.sp_oid != one.sp_oid ||
+			    tail.sp_type != one.sp_type ||
+			    tail.sp_n != total - i) {
+				kprintf("apfs-seek: FAIL object %llu has no "
+				    "type-%u record, and a descent for one "
+				    "should have stopped at its type-%u -- it "
+				    "reached object %llu type %u\n",
+				    (unsigned long long)one.sp_oid,
+				    (unsigned)(prev_type + 1u),
+				    (unsigned)one.sp_type,
+				    (unsigned long long)tail.sp_oid,
+				    (unsigned)tail.sp_type);
+				goto out;
+			}
+			gaps++;
+		}
+		prev_oid  = one.sp_oid;
+		prev_type = one.sp_type;
+	}
+
+	/*
+	 * Below everything and above everything.  An object id of zero names
+	 * nothing -- the root directory is 2 -- so a key under the smallest one
+	 * has to bring the whole tree back, and one over the largest nothing at
+	 * all.  Fifteen is the largest type the four bits above an object id
+	 * can hold, which is what makes the second key unreachable rather than
+	 * merely unlikely.
+	 */
+	gap_key[0] = 0;
+	seek_probe_init(&tail, NULL, 0, 0);
+	stopped = false;
+	if (!btree_scan(g_apfs.ac_root_tree_bno, (const uint8_t *)gap_key,
+	    (uint32_t)sizeof(gap_key), seek_see, &tail, 0, &stopped) ||
+	    tail.sp_n != total || tail.sp_hash != all.sp_hash) {
+		kprintf("apfs-seek: FAIL a key below every record brings back "
+		    "%u of %u records\n", (unsigned)tail.sp_n, (unsigned)total);
+		goto out;
+	}
+	gap_key[0] = APFS_J_OBJ_ID_MASK | (15ULL << APFS_J_OBJ_TYPE_SHIFT);
+	seek_probe_init(&tail, NULL, 0, 0);
+	stopped = false;
+	if (!btree_scan(g_apfs.ac_root_tree_bno, (const uint8_t *)gap_key,
+	    (uint32_t)sizeof(gap_key), seek_see, &tail, 0, &stopped) ||
+	    tail.sp_n != 0) {
+		kprintf("apfs-seek: FAIL a key above every record brings back "
+		    "%u\n", (unsigned)tail.sp_n);
+		goto out;
+	}
+
+	kprintf("apfs-seek: PASS -- each of %u records answers to its own key "
+	    "out of the leaf it lives in, with the rest of the tree behind it "
+	    "in order; %u key(s) that are not there land on the record after "
+	    "them; and the leaf an insert would use is the one the walk names "
+	    "(checking it cost %llu tree reads, %llu nodes and %llu records of "
+	    "the totals below)\n", (unsigned)total, (unsigned)gaps,
+	    (unsigned long long)(g_n_walks + g_n_seeks - was_reads),
+	    (unsigned long long)(g_n_nodes - was_nodes),
+	    (unsigned long long)(g_n_recs - was_recs));
+out:
+	kfree(fp);
 }
 
 /*
@@ -9887,13 +10464,19 @@ fs_apfs_stats(void)
 		kprintf("apfs: not mounted\n");
 		return;
 	}
-	kprintf("apfs: %llu tree walks -- %llu nodes read, %llu records visited"
-	    " (%llu nodes, %llu records each)\n",
+	kprintf("apfs: %llu tree reads -- %llu descended on a key, %llu read "
+	    "every record; %llu nodes, %llu records, %llu keys compared "
+	    "(%llu nodes, %llu records each)\n",
+	    (unsigned long long)(g_n_walks + g_n_seeks),
+	    (unsigned long long)g_n_seeks,
 	    (unsigned long long)g_n_walks,
 	    (unsigned long long)g_n_nodes,
 	    (unsigned long long)g_n_recs,
-	    (unsigned long long)(g_n_walks ? g_n_nodes / g_n_walks : 0),
-	    (unsigned long long)(g_n_walks ? g_n_recs / g_n_walks : 0));
+	    (unsigned long long)g_n_cmps,
+	    (unsigned long long)((g_n_walks + g_n_seeks) ?
+	    g_n_nodes / (g_n_walks + g_n_seeks) : 0),
+	    (unsigned long long)((g_n_walks + g_n_seeks) ?
+	    g_n_recs / (g_n_walks + g_n_seeks) : 0));
 
 	if (!g_apfs.ac_sm_valid) {
 		kprintf("apfs: space manager not read\n");

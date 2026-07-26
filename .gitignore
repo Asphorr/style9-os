@@ -15,7 +15,12 @@ live.log
 # them serial-apfs.log, serial-fat.log, serial-break.log and so on.  Those
 # escaped a rule that matched only "serial.log" and were committed by
 # `git add -A` three times before anyone noticed.
-serial*.log
+#
+# And then serial.log2 and serial.log3 escaped THAT one, because a glob
+# anchored at the end matches nothing after it: a session comparing two boots
+# numbers the second and third rather than naming them.  So the rule now ends
+# open as well.
+serial*.log*
 
 # Screendumps and other ad-hoc debug artefacts.
 *.png

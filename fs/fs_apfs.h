@@ -581,10 +581,14 @@ _Static_assert(__builtin_offsetof(struct apfs_superblock, apfs_volname) == 704,
  * feature flags pick which.  A case- or normalization-insensitive volume
  * stores a 22-bit hash of the name alongside its length, and orders entries
  * within a directory BY THAT HASH; a plain volume stores just the length and
- * orders by name.  Computing the hash means reproducing Apple's Unicode
- * normalization, so this reader does not: it descends on the object id --
- * the primary sort key, and hash-independent -- and compares names directly
- * once there.  Costlier for a huge directory, exact for any of them.
+ * orders by name.
+ *
+ * Computing that hash means reproducing Apple's case folding, which is why
+ * this reader once refused to and read every record in the tree instead.  It
+ * no longer does: the hash is recovered and computed (see fs/fs_apfs.c), and a
+ * name is found by descending on its key like anything else.  The old way is
+ * still the fallback for a name this kernel cannot fold -- anything outside
+ * ASCII -- and it is still exact, just costlier.
  */
 #define	APFS_INCOMPAT_CASE_INSENSITIVE		0x00000001ULL
 #define	APFS_INCOMPAT_NORM_INSENSITIVE		0x00000008ULL
@@ -833,10 +837,12 @@ void	fs_apfs_init(void);
 int	fs_apfs_ready(void);
 
 /*
- * What the reader's whole-tree walk has cost so far: walks started, B-tree
- * nodes read, leaf records handed to a callback.  The walk is O(tree) per
- * question by construction, so these say whether that is a real cost on this
- * volume or a theoretical one.
+ * What reading the file-system tree has cost so far: reads started and how
+ * many of them descended on a key rather than visiting every record, B-tree
+ * nodes read, records handed to a callback, keys compared.  The two kinds are
+ * counted apart because the difference between them is the whole point -- a
+ * read that descends costs the depth of the tree and a read that does not
+ * costs the size of the volume.
  */
 void	fs_apfs_stats(void);
 
@@ -1009,6 +1015,16 @@ void	fs_apfs_index_selftest(uint64_t now);
  * nanoseconds, for the same reason as the test above.
  */
 void	fs_apfs_drop_selftest(uint64_t now);
+
+/*
+ * Prove that descending on a key finds what reading every record finds.  Every
+ * record on the volume is sought by its own key and has to come back out of
+ * the leaf it lives in with the rest of the tree behind it, in order; keys
+ * that are not on the volume have to land on the record after them; and the
+ * leaf an insert would use has to be the one the old whole-tree answer names.
+ * Reads only, so it can run at any point and changes nothing.
+ */
+void	fs_apfs_seek_selftest(void);
 
 /*
  * Translate a virtual object id to its block number through the object-map
