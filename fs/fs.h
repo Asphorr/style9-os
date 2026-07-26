@@ -212,7 +212,7 @@ int		fs_pread(struct fs_handle *h, uint64_t off, uint8_t *buf,
  * produce by forgetting a call.
  *
  * What this cannot do is grow a file or fill a hole: both need a block
- * allocator, which the APFS writer does not have (see fs/fs_apfs.h for why
+ * allocator, which the APFS writer does not have (see fs/apfs/apfs.h for why
  * that boundary is where it is), and both return FS_E_NOALLOC having changed
  * nothing.  A backend with no write support at all returns FS_E_ROFS, which
  * is a different answer and means a different thing: not "this write was too
@@ -292,7 +292,7 @@ void		fs_write_selftest(void);
  * Close the volume's current transaction, so that what has been written is
  * written as of a point in time rather than gradually.
  *
- * On APFS this writes a checkpoint (see fs/fs_apfs.h); the container is the
+ * On APFS this writes a checkpoint (see fs/apfs/apfs.h); the container is the
  * old one entire until the last block lands and the new one entire
  * afterwards.  On FAT there is nothing to close -- every write there is
  * already final the moment it reaches the platter -- so this succeeds without

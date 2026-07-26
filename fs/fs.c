@@ -8,10 +8,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "apfs.h"
 #include "clock.h"
+#include "fat.h"
 #include "fs.h"
-#include "fs_apfs.h"
-#include "fs_fat.h"
 #include "kmem.h"
 #include "kprintf.h"
 #include "mutex.h"
@@ -1742,7 +1742,7 @@ fs_data_selftest(void)
 
 /*
  * As above, and about a node that stops starting where its parent says.  The
- * clock is passed in because fs_apfs.c has none -- the same reason create and
+ * clock is passed in because fs/apfs/apfs.c has none -- the same reason create and
  * unlink take a timestamp rather than reading one.
  */
 void

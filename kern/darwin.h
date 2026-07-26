@@ -183,7 +183,7 @@
  * knowing anything about Apple's struct stat.  libSystem's stat$INODE64 issues
  * this, then fills the macOS-ABI struct itself (keeping the layout knowledge in
  * the clean-room ABI layer, not the kernel).  Copies the small fs_fat_statbuf
- * (kern/fs_fat.h) out to *out; returns 0 in %rax (carry clear), or carry set on
+ * (fs/fat/fat.h) out to *out; returns 0 in %rax (carry clear), or carry set on
  * absence.
  *
  * fs_readdir(const char *path, uint32_t index, struct fs_fat_dirent *out):

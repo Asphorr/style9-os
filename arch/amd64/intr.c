@@ -400,7 +400,7 @@ deliver_exception_and_wait(struct port *exc, const struct trapframe *tf,
  * The one condition either kind of fault has to meet is that the interrupted
  * code could have slept, because filling a page can sleep: no spinlock was
  * held.  The preempt count is global here, so that is the whole test -- a
- * thread that blocks holding a lock is never woken again (kern/bio.c has the
+ * thread that blocks holding a lock is never woken again (fs/bio.c has the
  * account).  The kernel's user-copy paths satisfy it by construction: they
  * bounce through a stack buffer and drop their locks before copying, which
  * they already did for other reasons.  A fault that fails the test is telling

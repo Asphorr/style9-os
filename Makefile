@@ -4,7 +4,9 @@
 #   arch/amd64/		boot stub, GDT/IDT/PIC, ISR asm, trap dispatcher
 #   kern/		machine-independent kernel core
 #   vm/			physical + virtual memory (pmm, vm_map, vm_object)
-#   fs/			block cache and file systems (APFS, FAT)
+#   fs/			block cache, transactions, and the neutral file layer
+#   fs/apfs/		the APFS reader and writer, and its self-tests
+#   fs/fat/		the FAT reader
 #   mach/		Mach IPC (ports, bootstrap, services)
 #   dev/		drivers (tty, kbd, dbgcon)
 #   obj/		build artefacts (created on demand)
@@ -17,6 +19,13 @@
 # same claim mach/ and dev/ already make here.  Adding a directory costs one
 # word in SRCDIRS (which becomes its -I) and one in VPATH; OBJS names objects
 # without a directory, so it does not change, and no #include does either.
+#
+# A file system gets a directory of its own, which is the same split again one
+# level down: fs/ holds what every file system uses (the block cache, the
+# transaction layer, the neutral layer that dispatches to whichever volume
+# mounted) and each format holds itself.  There are two of them and one is
+# thirty times the size of the other, so the flat fs/ that carried both had
+# stopped saying which files belonged to what.
 #
 # Targets:
 #   make		build kernel.elf
@@ -58,7 +67,7 @@ QEMU_CPU = Nehalem
 # bodies can pull in any kernel header without indirection -- which is why
 # moving a file between these directories does not touch a single #include.
 ARCH	= arch/amd64
-SRCDIRS	= $(ARCH) kern vm fs dev mach test
+SRCDIRS	= $(ARCH) kern vm fs fs/apfs fs/fat dev mach test
 
 OBJDIR	= obj
 
@@ -88,7 +97,7 @@ LDFLAGS	= -m elf_x86_64 -T $(ARCH)/linker.ld			\
 
 # VPATH lets the pattern rules below find sources without the recipe
 # spelling out the source directory explicitly.
-VPATH	= $(ARCH):kern:vm:fs:dev:mach:test
+VPATH	= $(ARCH):kern:vm:fs:fs/apfs:fs/fat:dev:mach:test
 
 OBJS	= \
 	$(OBJDIR)/boot.o	\
@@ -149,8 +158,9 @@ OBJS	= \
 	$(OBJDIR)/macho.o	\
 	$(OBJDIR)/darwin.o	\
 	$(OBJDIR)/bio.o		\
-	$(OBJDIR)/fs_fat.o	\
-	$(OBJDIR)/fs_apfs.o	\
+	$(OBJDIR)/fat.o		\
+	$(OBJDIR)/apfs.o	\
+	$(OBJDIR)/apfs_test.o	\
 	$(OBJDIR)/fs_txn.o	\
 	$(OBJDIR)/fs.o		\
 	$(OBJDIR)/progreg.o	\

@@ -730,7 +730,7 @@ vm_map_stats(void)
  * The shape of this is dictated by one rule: the pager sleeps.  Reading a
  * file-backed page goes down through the filesystem to the disk driver, which
  * blocks waiting for the drive's interrupt, and a thread that blocks while
- * holding a spinlock in this kernel never wakes up again (kern/bio.c has the
+ * holding a spinlock in this kernel never wakes up again (fs/bio.c has the
  * full account).  So the map lock is taken twice with the slow part outside
  * both windows: once to read what the entry promises, then again to install
  * the result -- and the second window has to re-examine everything the first

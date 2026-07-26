@@ -4104,7 +4104,7 @@ struct tm {
  * whole 400-year eras, and let one linear formula carry the month lengths.
  * Leap years and century rules fall out of the era arithmetic instead of
  * being tested for.  (Howard Hinnant's days_from_civil / civil_from_days; the
- * kernel has the forward half in kern/fs_fat.c for the same reason.)
+ * kernel has the forward half in fs/fat/fat.c for the same reason.)
  */
 static int64_t
 days_from_civil(int32_t y, uint32_t m, uint32_t d)

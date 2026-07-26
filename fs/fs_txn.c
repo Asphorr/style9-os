@@ -9,7 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "fs_apfs.h"
+#include "apfs.h"
 #include "fs_txn.h"
 #include "kmem.h"
 #include "kprintf.h"
@@ -17,7 +17,7 @@
 /*
  * See fs_txn.h for what this guarantees and what it deliberately does not.
  *
- * The block primitives come from fs_apfs.c because APFS is the only backend
+ * The block primitives come from fs/apfs/apfs.c because APFS is the only backend
  * here that can be written; a second writable format would want its own read
  * and seal, and this would take them as arguments rather than by name.  The
  * orchestration -- collect, coalesce, all-or-nothing before the flush -- is

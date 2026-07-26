@@ -11,7 +11,7 @@
 
 #include "ata_drv.h"
 #include "bio.h"
-#include "fs_fat.h"
+#include "fat.h"
 #include "kmem.h"
 #include "kprintf.h"
 
@@ -369,7 +369,7 @@ ent_fill(struct fat_ent *e, const uint8_t *de)
 /*
  * The permission bits FAT does not have.  One attribute bit distinguishes
  * read-only from writable and that is the whole of what the volume knows, so
- * the answer is one of four constants -- named in fs_fat.h precisely so that
+ * the answer is one of four constants -- named in fat.h precisely so that
  * a reader who sees 0755 on a filesystem with no owners can find the line
  * that invented it.
  */

@@ -31,7 +31,7 @@
  * meaningfully offer anyway, and it keeps the whole layer clear of the
  * aliasing questions a shared page cache would raise.  The repeated reads
  * that a private-per-task rule implies are absorbed one level down, by the
- * block cache (kern/bio.c) -- which is the layer that should be absorbing
+ * block cache (fs/bio.c) -- which is the layer that should be absorbing
  * them.  When a writable shared mapping is wanted, this is the struct that
  * grows a page list.
  *
@@ -87,7 +87,7 @@ void			 vm_object_deref(struct vm_object *);
  * MUST NOT be called with any spinlock held.  It reads the disk, the disk
  * read sleeps waiting for the drive's interrupt, and a thread that blocks
  * while holding a spinlock in this kernel is never woken again (the preempt
- * count is global; see kern/bio.c for the full account of that rule).
+ * count is global; see fs/bio.c for the full account of that rule).
  *
  * Returns 0 on success, -1 if the file could not be read.
  */

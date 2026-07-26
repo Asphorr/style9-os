@@ -8,10 +8,10 @@
 #include <stdint.h>
 
 #include "ata_drv.h"
+#include "apfs.h"
 #include "bio.h"
+#include "fat.h"
 #include "fs.h"
-#include "fs_apfs.h"
-#include "fs_fat.h"
 #include "fs_txn.h"
 #include "bootstrap.h"
 #include "clock.h"
@@ -161,7 +161,7 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	/*
 	 * And the other half of writing: the space accounting.  Takes a run of
 	 * free blocks, checks the disk agrees, and gives it back -- see
-	 * fs/fs_apfs.h for why it cannot honestly keep them.
+	 * fs/apfs/apfs.h for why it cannot honestly keep them.
 	 */
 	if (fs_apfs_ready())
 		fs_apfs_alloc_selftest();

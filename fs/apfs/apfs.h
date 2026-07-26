@@ -585,7 +585,7 @@ _Static_assert(__builtin_offsetof(struct apfs_superblock, apfs_volname) == 704,
  *
  * Computing that hash means reproducing Apple's case folding, which is why
  * this reader once refused to and read every record in the tree instead.  It
- * no longer does: the hash is recovered and computed (see fs/fs_apfs.c), and a
+ * no longer does: the hash is recovered and computed (see fs/apfs/apfs.c), and a
  * name is found by descending on its key like anything else.  The old way is
  * still the fallback for a name this kernel cannot fold -- anything outside
  * ASCII -- and it is still exact, just costlier.
@@ -597,7 +597,7 @@ _Static_assert(__builtin_offsetof(struct apfs_superblock, apfs_volname) == 704,
 /*
  * ...and what a writer needs that a reader did not: the hash occupies the rest
  * of that word, twenty-two bits above the ten the length uses.  Which hash it
- * is, and how it was recovered, is in fs/fs_apfs.c beside the code that
+ * is, and how it was recovered, is in fs/apfs/apfs.c beside the code that
  * computes it -- the answer was not in any specification.
  */
 #define	APFS_DREC_HASH_SHIFT			10
