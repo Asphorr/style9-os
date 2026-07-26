@@ -81,6 +81,8 @@
 #define	DARWIN_SYS_dup2		90
 #define	DARWIN_SYS_gettimeofday	116
 #define	DARWIN_SYS_fcntl	92
+#define	DARWIN_SYS_mkdir	136
+#define	DARWIN_SYS_rmdir	137
 #define	DARWIN_SYS_sigreturn	184
 #define	DARWIN_SYS_mmap		197
 #define	DARWIN_SYS_lseek	199
@@ -290,6 +292,7 @@ struct darwin_uname {
 #define	DARWIN_ERANGE	34
 #define	DARWIN_ENAMETOOLONG	63
 #define	DARWIN_ENOTDIR	20
+#define	DARWIN_ENOTEMPTY	66
 #define	DARWIN_ENOSYS	78
 
 /*

@@ -39,6 +39,15 @@
  *	7. Writing to a built-in (/bin/gcat, which lives in the kernel's own
  *	   text) is still refused: the volume being writable does not make
  *	   everything writable.
+ *	8. mkdir makes a DIRECTORY that was not there, and refuses to make it
+ *	   twice.  Everything after this is checked through calls that know
+ *	   nothing about directories, because a name that can be made INSIDE
+ *	   one is the only proof from out here that what reached the disk is a
+ *	   directory rather than a record that resembles one.
+ *	9. rmdir will not remove it while that name is in it, does remove it
+ *	   once the name is gone, and takes the path to the file with it.
+ *	10. The two removals do not stand in for each other: rmdir refuses a
+ *	   file, unlink refuses a directory.
  *
  * Freestanding: no SDK headers, prototypes declared as <fcntl.h>/<unistd.h>
  * would alias them, entry at _entry (ld -e), relinked low like dyldhello.
@@ -62,7 +71,12 @@ typedef __SIZE_TYPE__	size_t;
 
 #define	SEEK_SET	0
 
+#define	EEXIST		17
+#define	ENOTDIR		20
+#define	EISDIR		21
+#define	ENOSPC		28
 #define	EROFS		30
+#define	ENOTEMPTY	66
 
 extern int	*__error(void);		/* Apple's <errno.h>: errno == *__error() */
 extern int	 open(const char *path, int flags, ...);
@@ -71,10 +85,15 @@ extern long	 write(int fd, const void *buf, unsigned long n);
 extern int	 close(int fd);
 extern long	 lseek(int fd, long off, int whence);
 extern int	 unlink(const char *path);
+extern int	 mkdir(const char *path, unsigned short mode);
+extern int	 rmdir(const char *path);
 extern int	 printf(const char *fmt, ...);
 extern void	 exit(int code);
 
 #define	PATH		"/etc/filewrite.txt"
+#define	DIR		"/etc/ring3dir"
+#define	DIRFILE		"/etc/ring3dir/inside.txt"
+#define	HELD		"/etc/hello.txt"	/* off the image, never made */
 #define	FIRST		"style9: written from ring 3 by filewrite\n"
 #define	SECOND		"style9: and appended to, later\n"
 
@@ -244,6 +263,66 @@ entry(void)
 		(void)close(fd);
 	} else
 		printf("filewrite: PASS /bin/gcat is still read-only\n");
+
+	/*
+	 * 8. A DIRECTORY, which ring 3 could not make at all until this rung.
+	 *
+	 * Whatever an earlier run left goes first, in the order that works:
+	 * the name inside, then the directory over it.
+	 */
+	(void)unlink(DIRFILE);
+	(void)rmdir(DIR);
+	if (mkdir(DIR, 0755) != 0) {
+		if (*__error() == ENOSPC)
+			printf("filewrite: the leaf that would hold %s is "
+			    "full, and splitting one is a different rung; "
+			    "skipped\n", DIR);
+		else
+			fail("mkdir would not make " DIR);
+	} else if (mkdir(DIR, 0755) == 0 || *__error() != EEXIST) {
+		fail("mkdir made " DIR " a second time");
+	} else {
+		printf("filewrite: PASS mkdir made %s, and would not make it "
+		    "again\n", DIR);
+
+		/*
+		 * 9. A name inside it -- the whole proof, from out here, that
+		 * what went on the disk is a directory: open(O_CREAT) does not
+		 * know one from the other, and it had to find this one to put
+		 * anything under it.
+		 */
+		fd = open(DIRFILE, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+		if (fd < 0) {
+			fail("nothing can be made inside a directory ring 3 "
+			    "just made");
+		} else {
+			(void)write(fd, FIRST, slen(FIRST));
+			(void)close(fd);
+			if (rmdir(DIR) == 0 || *__error() != ENOTEMPTY)
+				fail("rmdir removed a directory that was "
+				    "still holding a name");
+			else if (unlink(DIRFILE) != 0)
+				fail("cannot unlink the file inside " DIR);
+			else if (rmdir(DIR) != 0)
+				fail("rmdir would not remove an emptied " DIR);
+			else if (open(DIRFILE, O_RDONLY) >= 0)
+				fail("the directory is gone and a path "
+				    "through it still opens");
+			else
+				printf("filewrite: PASS %s took a name, "
+				    "refused to go while it held one, and "
+				    "went when it did not\n", DIR);
+		}
+	}
+
+	/* 10. and the two removals are not each other. */
+	if (rmdir(HELD) == 0 || *__error() != ENOTDIR)
+		fail("rmdir accepted " HELD ", which is a file");
+	else if (unlink("/etc") == 0 || *__error() != EISDIR)
+		fail("unlink accepted /etc, which is a directory");
+	else
+		printf("filewrite: PASS rmdir refuses a file and unlink "
+		    "refuses a directory\n");
 
 	if (fails != 0) {
 		printf("filewrite: %d check(s) FAILED\n", fails);

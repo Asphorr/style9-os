@@ -142,6 +142,8 @@ apfs_err(int rv)
 	case FS_APFS_E_NOALLOC:		return (FS_E_NOALLOC);
 	case FS_APFS_E_EXIST:		return (FS_E_EXIST);
 	case FS_APFS_E_ISDIR:		return (FS_E_ISDIR);
+	case FS_APFS_E_NOTDIR:		return (FS_E_NOTDIR);
+	case FS_APFS_E_NOTEMPTY:	return (FS_E_NOTEMPTY);
 	case FS_APFS_E_SPREAD:		return (FS_E_SPREAD);
 	default:			return (FS_E_IO);
 	}
@@ -449,7 +451,9 @@ fs_truncate(struct fs_handle *h, uint64_t new_size)
  * the first one, and two of those drift.
  *
  * A trailing separator is refused rather than ignored: "make /tmp/x/" says
- * something about directories, and this makes files.
+ * something about directories, and this makes files.  The calls that DO make
+ * directories take it off first -- see path_undress below, which exists so
+ * that the refusal here can stay a refusal.
  */
 static int
 path_split(const char *path, char *dir, size_t dircap, const char **leaf)
@@ -555,6 +559,96 @@ fs_unlink(const char *path)
 
 	mutex_lock(&fs_lock);
 	rv = unlink_locked(path);
+	mutex_unlock(&fs_lock);
+	return (rv);
+}
+
+/*
+ * Take the trailing separators off a path, keeping "/" itself.
+ *
+ * Only the two directory calls do this, and the asymmetry is the point.
+ * "mkdir /tmp/x/" is a request that can be honoured exactly as written -- the
+ * slash claims the name is a directory, and it is about to be one -- whereas
+ * "create /tmp/x/" claims something the call cannot deliver, so path_split
+ * goes on refusing it rather than quietly making a file with the name the
+ * caller did not ask for.
+ */
+static int
+path_undress(const char *path, char *out, size_t cap)
+{
+	size_t	n;
+
+	for (n = 0; path[n] != '\0'; n++) {
+		if (n + 1 >= cap)
+			return (FS_E_NOTFOUND);
+		out[n] = path[n];
+	}
+	while (n > 1 && out[n - 1] == '/')
+		n--;
+	out[n] = '\0';
+	return (FS_E_OK);
+}
+
+/*
+ * Making and removing a directory: the same two steps as for a file -- find
+ * the directory that will hold the name, then hand the backend an object id
+ * and one component -- and one function, because at this layer that is the
+ * whole of both of them and they differ only in which call ends them.
+ */
+static int
+dir_locked(const char *path, int make, uint64_t *ino_out)
+{
+	char		 norm[FS_NAME_MAX];
+	char		 dir[FS_NAME_MAX];
+	const char	*leaf;
+	uint64_t	 parent;
+	uint64_t	 now_ns;
+	int		 is_dir;
+	int		 rv;
+
+	if (!fs_apfs_ready())
+		return (fs_fat_ready() ? FS_E_ROFS : FS_E_NOMOUNT);
+	rv = path_undress(path, norm, sizeof(norm));
+	if (rv != FS_E_OK)
+		return (rv);
+	rv = path_split(norm, dir, sizeof(dir), &leaf);
+	if (rv != FS_E_OK)
+		return (rv);
+	rv = apfs_err(fs_apfs_lookup(dir, &parent, &is_dir));
+	if (rv != FS_E_OK)
+		return (rv);
+	if (!is_dir)
+		return (FS_E_NOTDIR);
+
+	now_ns = (uint64_t)clock_walltime_us() * 1000ULL;
+	rv = make ? fs_apfs_mkdir(parent, leaf, now_ns, ino_out) :
+	    fs_apfs_rmdir(parent, leaf, now_ns);
+	rv = apfs_err(rv);
+	if (rv != FS_E_OK)
+		return (rv);
+	rv = apfs_err(fs_apfs_checkpoint());
+	fs_gen++;
+	return (rv);
+}
+
+int
+fs_mkdir(const char *path, uint64_t *ino_out)
+{
+	int	rv;
+
+	mutex_lock(&fs_lock);
+	rv = dir_locked(path, 1, ino_out);
+	mutex_unlock(&fs_lock);
+	return (rv);
+}
+
+int
+fs_rmdir(const char *path)
+{
+	int	rv;
+
+	mutex_lock(&fs_lock);
+	rv = dir_locked(path, 0, NULL);
 	mutex_unlock(&fs_lock);
 	return (rv);
 }
@@ -1629,6 +1723,270 @@ fs_make_selftest(void)
 	    (unsigned long long)ino, (unsigned)marklen, after,
 	    SELFTEST_MADE_DIR,
 	    had ? ", the one the boot before left having been read and "
+	    "removed first" : "");
+}
+
+/*
+ * THE DIRECTORY THIS ONE MAKES
+ *
+ * Same shape as the file above and for the same reason: it is left on the
+ * volume, and the boot after is what turns a self-consistency check into a
+ * claim about the disk.  A mkdir that never reached the platter answers every
+ * question here perfectly, once.
+ *
+ * What this asks that the file could not: whether the record written is a
+ * directory to the REST OF THE KERNEL and not just to apfsck.  A name is put
+ * into it -- which means the reader descended into a directory that did not
+ * exist an instant ago, and the writer keyed an entry under it -- and then
+ * the removal is asked for while that name is still there, and must be
+ * refused.  Refusals are checked against the writer's own counter rather than
+ * against the error code, because an error is also what a half-done edit
+ * answers; the counter says whether anything happened.
+ */
+#define	SELFTEST_DIRS		"/etc/madedir"
+#define	SELFTEST_DIRS_SLASH	"/etc/madedir/"
+#define	SELFTEST_DIRS_FILE	"/etc/madedir/inside.txt"
+
+void
+fs_dirs_selftest(void)
+{
+	struct fs_statbuf	 st;
+	uint64_t		 ino;
+	uint64_t		 count;
+	int			 before;
+	int			 after;
+	int			 held;
+	int			 saw;
+	int			 rv;
+	int			 had;
+
+	if (!fs_apfs_ready())
+		return;
+
+	before = dir_count(SELFTEST_MADE_DIR, "madedir", &saw);
+	if (before < 0) {
+		kprintf("apfs-dirs: FAIL cannot list %s\n", SELFTEST_MADE_DIR);
+		return;
+	}
+	had = fs_stat(SELFTEST_DIRS, &st) == FS_E_OK;
+	if (had != saw) {
+		kprintf("apfs-dirs: FAIL %s %s by name and %s in the "
+		    "directory listing\n", SELFTEST_DIRS,
+		    had ? "exists" : "does not exist",
+		    saw ? "appears" : "does not appear");
+		return;
+	}
+
+	if (had) {
+		/*
+		 * What a power cycle ago made and left.  Empty is part of the
+		 * claim: the boot that made it put a name in and took it out
+		 * again, so a directory that comes back holding one means the
+		 * removal did not reach the disk.
+		 */
+		if (!st.fs_is_dir || st.fs_size != 0) {
+			kprintf("apfs-dirs: FAIL %s came back as %s of %llu "
+			    "bytes -- wanted a directory of none\n",
+			    SELFTEST_DIRS, st.fs_is_dir ? "a directory" :
+			    "a file", (unsigned long long)st.fs_size);
+			return;
+		}
+		held = dir_count(SELFTEST_DIRS, NULL, NULL);
+		if (held != 0) {
+			kprintf("apfs-dirs: FAIL %s came back holding %d "
+			    "name(s)\n", SELFTEST_DIRS, held);
+			return;
+		}
+
+		count = fs_apfs_dirkills();
+		rv = fs_rmdir(SELFTEST_DIRS);
+		if (rv != FS_E_OK) {
+			kprintf("apfs-dirs: FAIL cannot remove %s (rv=%d)\n",
+			    SELFTEST_DIRS, rv);
+			return;
+		}
+		if (fs_apfs_dirkills() != count + 1) {
+			kprintf("apfs-dirs: FAIL removing %s answered success "
+			    "without the writer having removed one\n",
+			    SELFTEST_DIRS);
+			return;
+		}
+		if (fs_stat(SELFTEST_DIRS, &st) != FS_E_NOTFOUND) {
+			kprintf("apfs-dirs: FAIL %s still resolves after being "
+			    "removed\n", SELFTEST_DIRS);
+			return;
+		}
+		after = dir_count(SELFTEST_MADE_DIR, "madedir", &saw);
+		if (after != before - 1 || saw) {
+			kprintf("apfs-dirs: FAIL %s held %d names and holds %d "
+			    "after one was removed%s\n", SELFTEST_MADE_DIR,
+			    before, after, saw ? ", and still lists it" : "");
+			return;
+		}
+		before = after;
+	} else {
+		kprintf("apfs-dirs: %s is absent -- this is the first boot on "
+		    "this image, so there is nothing to have survived yet\n",
+		    SELFTEST_DIRS);
+	}
+
+	/* And make one.  A full leaf refuses here exactly as a create does. */
+	count = fs_apfs_dirmakes();
+	ino   = 0;
+	rv = fs_mkdir(SELFTEST_DIRS, &ino);
+	if (rv == FS_E_NOALLOC) {
+		kprintf("apfs-dirs: the leaf that would hold %s is full, and a "
+		    "mkdir that splits and retries is the same rung a create "
+		    "is waiting on; skipped\n", SELFTEST_DIRS);
+		return;
+	}
+	if (rv != FS_E_OK || ino == 0) {
+		kprintf("apfs-dirs: FAIL cannot make %s (rv=%d ino=%llu)\n",
+		    SELFTEST_DIRS, rv, (unsigned long long)ino);
+		return;
+	}
+	if (fs_apfs_dirmakes() != count + 1) {
+		kprintf("apfs-dirs: FAIL making %s answered success without "
+		    "the writer having made one\n", SELFTEST_DIRS);
+		return;
+	}
+
+	/* The volume agrees, by name, by number, by mode and in its parent. */
+	if (fs_stat(SELFTEST_DIRS, &st) != FS_E_OK) {
+		kprintf("apfs-dirs: FAIL %s does not resolve after being "
+		    "made\n", SELFTEST_DIRS);
+		return;
+	}
+	if (st.fs_ino != ino || st.fs_size != 0 || !st.fs_is_dir ||
+	    !FS_ISDIR(st.fs_mode)) {
+		kprintf("apfs-dirs: FAIL %s is inode %llu of %llu bytes, mode "
+		    "%#o -- wanted inode %llu, empty, a directory\n",
+		    SELFTEST_DIRS, (unsigned long long)st.fs_ino,
+		    (unsigned long long)st.fs_size, (unsigned)st.fs_mode,
+		    (unsigned long long)ino);
+		return;
+	}
+	held = dir_count(SELFTEST_DIRS, NULL, NULL);
+	if (held != 0) {
+		kprintf("apfs-dirs: FAIL a directory made an instant ago holds "
+		    "%d name(s)\n", held);
+		return;
+	}
+	after = dir_count(SELFTEST_MADE_DIR, "madedir", &saw);
+	if (after != before + 1 || !saw) {
+		kprintf("apfs-dirs: FAIL %s held %d names and holds %d after "
+		    "one was made%s\n", SELFTEST_MADE_DIR, before, after,
+		    saw ? "" : ", and does not list it");
+		return;
+	}
+
+	/*
+	 * A name is taken once, whatever kind of thing took it -- and asking
+	 * with the separator a directory is entitled to must reach the same
+	 * name, not a different one.
+	 */
+	rv = fs_mkdir(SELFTEST_DIRS, NULL);
+	if (rv != FS_E_EXIST) {
+		kprintf("apfs-dirs: FAIL making %s a second time answered %d, "
+		    "wanted %d\n", SELFTEST_DIRS, rv, FS_E_EXIST);
+		return;
+	}
+	rv = fs_mkdir(SELFTEST_DIRS_SLASH, NULL);
+	if (rv != FS_E_EXIST) {
+		kprintf("apfs-dirs: FAIL making %s answered %d, wanted %d -- "
+		    "the trailing separator named something else\n",
+		    SELFTEST_DIRS_SLASH, rv, FS_E_EXIST);
+		return;
+	}
+	rv = fs_unlink(SELFTEST_DIRS);
+	if (rv != FS_E_ISDIR) {
+		kprintf("apfs-dirs: FAIL unlinking the directory %s answered "
+		    "%d, wanted %d\n", SELFTEST_DIRS, rv, FS_E_ISDIR);
+		return;
+	}
+	rv = fs_rmdir(SELFTEST_PATH);
+	if (rv != FS_E_NOTDIR) {
+		kprintf("apfs-dirs: FAIL removing the file %s as a directory "
+		    "answered %d, wanted %d\n", SELFTEST_PATH, rv,
+		    FS_E_NOTDIR);
+		return;
+	}
+	rv = fs_rmdir(SELFTEST_MADE_DIR);
+	if (rv != FS_E_NOTEMPTY) {
+		kprintf("apfs-dirs: FAIL removing %s, which holds %d names, "
+		    "answered %d, wanted %d\n", SELFTEST_MADE_DIR, after, rv,
+		    FS_E_NOTEMPTY);
+		return;
+	}
+
+	/*
+	 * And a name INSIDE it, which is the part no amount of checking the
+	 * record could stand in for: the lookup descends into a directory this
+	 * kernel made a moment ago, the create keys an entry under its object
+	 * id, and the removal must then refuse while that entry is there.
+	 */
+	rv = fs_create(SELFTEST_DIRS_FILE, NULL);
+	if (rv == FS_E_NOALLOC) {
+		kprintf("apfs-dirs: PASS -- %s made as inode %llu, %d names in "
+		    "%s; the leaf that would hold a name INSIDE it is full, so "
+		    "that half is skipped%s\n", SELFTEST_DIRS,
+		    (unsigned long long)ino, after, SELFTEST_MADE_DIR,
+		    had ? ", the one the boot before left having been removed "
+		    "first" : "");
+		return;
+	}
+	if (rv != FS_E_OK) {
+		kprintf("apfs-dirs: FAIL cannot make %s inside a directory "
+		    "this kernel just made (rv=%d)\n", SELFTEST_DIRS_FILE, rv);
+		return;
+	}
+	held = dir_count(SELFTEST_DIRS, "inside.txt", &saw);
+	if (held != 1 || !saw) {
+		kprintf("apfs-dirs: FAIL %s holds %d name(s)%s after one was "
+		    "made in it\n", SELFTEST_DIRS, held,
+		    saw ? "" : " and does not list it");
+		return;
+	}
+
+	count = fs_apfs_dirkills();
+	rv = fs_rmdir(SELFTEST_DIRS);
+	if (rv != FS_E_NOTEMPTY) {
+		kprintf("apfs-dirs: FAIL removing %s while it holds a name "
+		    "answered %d, wanted %d\n", SELFTEST_DIRS, rv,
+		    FS_E_NOTEMPTY);
+		return;
+	}
+	if (fs_apfs_dirkills() != count) {
+		kprintf("apfs-dirs: FAIL removing %s was refused and the "
+		    "writer removed one anyway\n", SELFTEST_DIRS);
+		return;
+	}
+	if (fs_stat(SELFTEST_DIRS_FILE, &st) != FS_E_OK) {
+		kprintf("apfs-dirs: FAIL %s did not survive a refused "
+		    "removal of the directory holding it\n",
+		    SELFTEST_DIRS_FILE);
+		return;
+	}
+
+	/* Emptied again, and left that way for the boot after this one. */
+	rv = fs_unlink(SELFTEST_DIRS_FILE);
+	if (rv != FS_E_OK) {
+		kprintf("apfs-dirs: FAIL cannot unlink %s (rv=%d)\n",
+		    SELFTEST_DIRS_FILE, rv);
+		return;
+	}
+	held = dir_count(SELFTEST_DIRS, NULL, NULL);
+	if (held != 0) {
+		kprintf("apfs-dirs: FAIL %s holds %d name(s) after the only "
+		    "one was removed\n", SELFTEST_DIRS, held);
+		return;
+	}
+
+	kprintf("apfs-dirs: PASS -- %s made as inode %llu, a name made inside "
+	    "it and taken back out, removal refused while it held one, %d "
+	    "names in %s%s\n", SELFTEST_DIRS, (unsigned long long)ino, after,
+	    SELFTEST_MADE_DIR,
+	    had ? ", the directory the boot before left having been read and "
 	    "removed first" : "");
 }
 

@@ -199,6 +199,15 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	fs_make_selftest();
 
 	/*
+	 * And a DIRECTORY that was not there at all, which is the same claim
+	 * about a different record -- and one more besides: a name is made
+	 * inside it, so a directory this kernel invented an instant ago is one
+	 * the reader can descend into and the writer can key an entry under.
+	 * It is emptied again and left, for the same reason the file above is.
+	 */
+	fs_dirs_selftest();
+
+	/*
 	 * And the one test in here the kernel cannot satisfy: a file a REAL
 	 * Apple shell redirected into, during the boot before this one.  It has
 	 * to run here, before ring 3 starts, or it would be checking what was

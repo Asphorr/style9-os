@@ -206,6 +206,10 @@ extern uint8_t	_binary_mmaptest_macho_end[];
  * change the volume.  Makes a file, reads it back through another descriptor,
  * overwrites part of it, appends, truncates, unlinks -- and checks that a
  * program built into this kernel's text still refuses to be written to.
+ *
+ * It makes a DIRECTORY too, and proves it is one through calls that know
+ * nothing about directories: open(O_CREAT) had to find it to put a file under
+ * it, and rmdir then refuses to take it away while that name is there.
  */
 extern uint8_t	_binary_filewrite_macho_start[];
 extern uint8_t	_binary_filewrite_macho_end[];

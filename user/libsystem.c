@@ -3700,6 +3700,28 @@ unlink(const char *path)
 	return ((int)bsd_call_e(0x200000A, (long)path, 0, 0));
 }
 
+/*
+ * mkdir(2) and rmdir(2).  Straight through, for the same reason unlink is:
+ * the volume can be written now, and the answer is the kernel's to give.
+ *
+ * mode_t is sixteen bits on Darwin and is passed as declared even though this
+ * kernel stamps 0755 on every directory regardless -- a libc that dropped the
+ * argument here would be hiding the fact somewhere the kernel cannot say so.
+ */
+int
+mkdir(const char *path, unsigned short mode)
+{
+
+	return ((int)bsd_call_e(0x2000088, (long)path, (long)mode, 0));
+}
+
+int
+rmdir(const char *path)
+{
+
+	return ((int)bsd_call_e(0x2000089, (long)path, 0, 0));
+}
+
 int
 mkstemp(char *tmpl)
 {

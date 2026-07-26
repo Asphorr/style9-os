@@ -824,6 +824,9 @@ struct fs_apfs_statbuf {
 #define	FS_APFS_E_ISDIR		(-10)	/* ...and it is a directory      */
 #define	FS_APFS_E_SPREAD	(-11)	/* records span more leaves than
 					   this edit can hold at once   */
+#define	FS_APFS_E_NOTDIR	(-12)	/* ...and it is NOT a directory  */
+#define	FS_APFS_E_NOTEMPTY	(-13)	/* a directory that still holds a
+					   name, which nothing may remove */
 
 /*
  * Probe the first ATA drive for an APFS container and adopt the newest valid
@@ -974,6 +977,27 @@ int	fs_apfs_create(uint64_t dir, const char *name, uint64_t now,
 int	fs_apfs_unlink(uint64_t dir, const char *name, uint64_t now);
 
 /*
+ * The same two calls again for a DIRECTORY, and they are the same two calls:
+ * one function each, with a question in it, rather than a pair that agrees
+ * today.  What differs on disk is smaller than it looks and none of it is
+ * optional -- a directory's inode carries no data stream at all (a checker
+ * that finds one says so), its entry is typed a directory (as does one that
+ * finds the two disagreeing), its child count starts at zero, and it is
+ * counted in apfs_num_directories, which unlike apfs_num_files is checked.
+ *
+ * fs_apfs_rmdir removes a directory that holds nothing.  "Holds nothing" is
+ * asked of the TREE and not of the count in the directory's own record: the
+ * count is a claim and the records are the thing.  Refuses a name that is not
+ * a directory (FS_APFS_E_NOTDIR) and one that still holds a name
+ * (FS_APFS_E_NOTEMPTY); the second is not politeness towards POSIX, since a
+ * directory removed out from under its children leaves entries whose parent
+ * is gone, and the checker says so.
+ */
+int	fs_apfs_mkdir(uint64_t dir, const char *name, uint64_t now,
+	    uint64_t *ino_out);
+int	fs_apfs_rmdir(uint64_t dir, const char *name, uint64_t now);
+
+/*
  * How many files have been made and unmade, and how many record ends have been
  * laid into room a delete gave back.
  *
@@ -986,6 +1010,17 @@ int	fs_apfs_unlink(uint64_t dir, const char *name, uint64_t now);
 uint64_t fs_apfs_makes(void);
 uint64_t fs_apfs_kills(void);
 uint64_t fs_apfs_holes(void);
+
+/*
+ * And the same two for directories, counted apart from files on purpose.  A
+ * refusal is the thing worth watching here: a test that asks for a directory
+ * it must not get -- one that is not empty, one that is not a directory --
+ * proves nothing by being answered with an error, because an error is also
+ * what a writer that half-did the work and then failed would answer.  These
+ * say whether the work happened.
+ */
+uint64_t fs_apfs_dirmakes(void);
+uint64_t fs_apfs_dirkills(void);
 
 /*
  * Split a leaf on purpose and prove nothing was lost: the same records, in the

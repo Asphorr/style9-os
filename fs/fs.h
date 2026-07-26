@@ -115,6 +115,8 @@ _Static_assert(sizeof(struct fs_statbuf) == 72,
 #define	FS_E_ISDIR	(-9)	/* ...and what it names is a directory */
 #define	FS_E_SPREAD	(-10)	/* the records are in more nodes than one
 				   edit can move at once */
+#define	FS_E_NOTDIR	(-11)	/* ...and what it names is NOT a directory */
+#define	FS_E_NOTEMPTY	(-12)	/* a directory that still holds a name     */
 
 /* Non-zero once some filesystem is mounted and can serve files. */
 int		fs_ready(void);
@@ -252,15 +254,24 @@ int		fs_truncate(struct fs_handle *h, uint64_t new_size);
  *
  * fs_unlink removes the name and, with it, the file: this kernel makes no hard
  * links, so the last name is the only name.  It answers FS_E_ISDIR for a
- * directory -- removing one of those has to decide what to do about its
- * contents, which is a different question.
+ * directory, which is fs_rmdir's business.
  *
- * Both refuse a backend that cannot write with FS_E_ROFS, and both close a
- * checkpoint on success, because a name and the inode under it are several disk
- * updates describing one event.
+ * fs_mkdir and fs_rmdir are the same two calls for a directory.  fs_rmdir
+ * answers FS_E_NOTDIR for a name that is not one and FS_E_NOTEMPTY for one
+ * that still holds a name: this removes a directory, it does not remove what
+ * is in it, and doing both is a decision for whoever asked rather than for
+ * this layer.  A directory being made or removed may have a trailing separator
+ * ("/tmp/x/" names the same thing as "/tmp/x"), which the file calls refuse --
+ * there the slash is a claim about the name that the call cannot honour.
+ *
+ * All four refuse a backend that cannot write with FS_E_ROFS, and all four
+ * close a checkpoint on success, because a name and the inode under it are
+ * several disk updates describing one event.
  */
 int		fs_create(const char *path, uint64_t *ino_out);
 int		fs_unlink(const char *path);
+int		fs_mkdir(const char *path, uint64_t *ino_out);
+int		fs_rmdir(const char *path);
 
 /* Metadata for a path.  Returns FS_E_OK and fills *out, or a negative FS_E_*. */
 int		fs_stat(const char *path, struct fs_statbuf *out);
@@ -353,6 +364,18 @@ void		fs_trunc_selftest(void);
  * Silently does nothing when the volume is not APFS.
  */
 void		fs_make_selftest(void);
+
+/*
+ * The same claim for a DIRECTORY, and one the file above cannot make: that a
+ * directory this kernel wrote is a directory to the rest of the kernel.  A
+ * name is made inside one that did not exist an instant earlier -- so the
+ * lookup descended into it and the writer keyed an entry under it -- and the
+ * removal is then asked for while that name is still there and must refuse.
+ * The directory is left empty on the volume for the boot after.
+ *
+ * Silently does nothing when the volume is not APFS.
+ */
+void		fs_dirs_selftest(void);
 
 /*
  * Prove that a RING-3 program wrote to this volume and that the bytes outlived

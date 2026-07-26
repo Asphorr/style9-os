@@ -607,6 +607,8 @@ darwin_fs_errno(int rv)
 	case FS_E_NOMOUNT:	return (DARWIN_EROFS);
 	case FS_E_EXIST:	return (DARWIN_EEXIST);
 	case FS_E_ISDIR:	return (DARWIN_EISDIR);
+	case FS_E_NOTDIR:	return (DARWIN_ENOTDIR);
+	case FS_E_NOTEMPTY:	return (DARWIN_ENOTEMPTY);
 	case FS_E_NOALLOC:	return (DARWIN_ENOSPC);
 	case FS_E_SPREAD:	return (DARWIN_ENOSPC);
 	default:		return (DARWIN_EIO);
@@ -2233,6 +2235,55 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		}
 		kprintf("darwin: UNIX unlink('%s') -- the name is gone\n",
 		    path);
+		return (darwin_ok(f, 0));
+	}
+	/*
+	 * mkdir(2) and rmdir(2), which share everything with unlink above
+	 * except which call they end in.
+	 *
+	 * The MODE is taken and dropped, and that is worth saying rather than
+	 * hiding: the writer stamps 0755 on every directory it makes, because
+	 * this kernel has no umask to subtract one from and no chmod to correct
+	 * it with afterwards.  A caller asking for 0700 gets 0755 and is not
+	 * told, which is the honest edge -- reporting EINVAL for a mode that is
+	 * perfectly legal would be worse, and pretending to honour it would be
+	 * worse still.
+	 */
+	case DARWIN_SYS_mkdir:
+	case DARWIN_SYS_rmdir: {
+		char		path[DARWIN_PATH_MAX];
+		char		raw[DARWIN_PATH_MAX];
+		const char	*what;
+		long		len;
+		int		rv;
+		bool		make;
+
+		make = nr == DARWIN_SYS_mkdir;
+		what = make ? "mkdir" : "rmdir";
+		len = syscall_copyin_str((const char *)f->sf_arg0, raw,
+		    sizeof(raw));
+		if (len < 0)
+			return (darwin_err(f, DARWIN_EFAULT));
+		if (darwin_path_resolve(current_thread->th_task, raw, path,
+		    sizeof(path)) != 0)
+			return (darwin_err(f, DARWIN_ENAMETOOLONG));
+
+		rv = make ? fs_mkdir(path, NULL) : fs_rmdir(path);
+		if (rv != FS_E_OK) {
+			/*
+			 * "Already there" is to a mkdir what "not there" is
+			 * to an unlink: the ordinary answer to a program that
+			 * asked rather than looked first, and not worth a
+			 * line.  Everything else is.
+			 */
+			if (rv != FS_E_NOTFOUND &&
+			    !(make && rv == FS_E_EXIST))
+				kprintf("darwin: %s('%s') refused (rv=%d)\n",
+				    what, path, rv);
+			return (darwin_err(f, darwin_fs_errno(rv)));
+		}
+		kprintf("darwin: UNIX %s('%s') -- the directory %s\n", what,
+		    path, make ? "is there" : "is gone");
 		return (darwin_ok(f, 0));
 	}
 	case DARWIN_SYS_close: {

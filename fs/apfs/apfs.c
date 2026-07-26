@@ -195,6 +195,8 @@ static uint64_t	 short_n;	/* records shortened by a truncate */
 static uint64_t	 drop_n;	/* ...and records taken out of it  */
 static uint64_t	 make_n;	/* files created                   */
 static uint64_t	 kill_n;	/* ...and names taken back out     */
+static uint64_t	 dmake_n;	/* directories made                */
+static uint64_t	 dkill_n;	/* ...and directories removed      */
 static uint64_t	 hole_n;	/* record ends reusing a deletion  */
 uint64_t	 deep_n;	/* levels the tree has gained      */
 uint64_t	 reidx_n;	/* index keys corrected after an edit */
@@ -6205,19 +6207,81 @@ dir_children_add(uint8_t *node, uint64_t dir, int32_t delta, uint64_t now)
  * file to nothing is what gives back its blocks, its extent records and its
  * ownership records, all of which are already written and already proven; what
  * is left over is three records and two counters.
+ *
+ * A DIRECTORY IS ALMOST THE SAME EDIT, and measuring is how one finds out
+ * where "almost" stops.  The same ladder, run again for a mkdir and an rmdir:
+ *
+ *	MKDIR, leaving out		apfsck answers
+ *	  apfs_next_obj_id		"Inode record: free inode number in use"
+ *	  the directory entry		"Inode record: wrong directory child count"
+ *	  the inode record		"Inode record: no name for primary link"
+ *	  the parent's child count	"Inode record: wrong directory child count"
+ *	  the tree's key count		"Catalog: wrong key count in info footer"
+ *	  apfs_num_directories		"Volume superblock: bad directory count"
+ *
+ *	RMDIR, leaving out
+ *	  the entry, or the parent's count	as above
+ *	  the inode record		"Inode record: directory has hard links"
+ *	  the tree's key count		"Catalog: wrong key count in info footer"
+ *	  apfs_num_directories		"Volume superblock: bad directory count"
+ *	  the deleted bytes, threaded	"B-tree: wrong free space total for key
+ *					area"
+ *
+ * Four things there that reasoning would not have produced.
+ *
+ * THE COUNT A CREATE MAY OMIT, A MKDIR MAY NOT.  apfs_num_files is checked by
+ * nothing in either direction and apfs_num_directories is checked exactly.
+ * The two sit next to each other in the volume superblock and look like a
+ * pair; they are not one.  (Nor does either count the root or the private
+ * directory: this volume holds fourteen directories and says twelve, and the
+ * checker agrees with the twelve.)
+ *
+ * A DIRECTORY HAS NO DATA STREAM, and that is not a convention either --
+ *
+ *	Inode record: has dstream but isn't a regular file.
+ *
+ * is the answer to a directory inode carrying the extended field a file's
+ * does.  So a mkdir's record is not a create's with the mode changed: it is
+ * shorter by an extended field and a dstream, and there is no dstream id
+ * record beside it.
+ *
+ * THE ENTRY AND THE INODE MUST AGREE ABOUT WHAT THEY DESCRIBE.  A directory
+ * entry carries a type of its own beside the object id, and
+ *
+ *	Inode record: file mode doesn't match dentry type.
+ *
+ * answers either of them being written the other's way round.  The mode and
+ * the entry type are therefore written from the same question and not from
+ * two that happen to agree.
+ *
+ * AND A DIRECTORY THAT STILL HOLDS A NAME MAY NOT GO.  Removing one anyway
+ * leaves the names behind, and the first of them is answered with
+ *
+ *	Dentry record: parent inode missing
+ *
+ * so emptiness is not a courtesy this kernel extends to POSIX -- it is an
+ * obligation of the format, and it is asked of the tree.
+ *
+ * All of which is why each of these is ONE function with a question in it
+ * rather than two that agree today.  The difference between making a file and
+ * making a directory is eight lines out of two hundred, and eight lines is
+ * exactly the size of a difference that gets fixed on one side only.
  */
 
 /* Longest name this kernel will make, as against the 255 it will read. */
 #define	APFS_MAKE_NAME_MAX	64
 
 /*
- * Put a name into a directory, and an empty file under it.
+ * Put a name into a directory, and under it an empty file -- or, when `isdir`,
+ * an empty directory.
  *
- * The file has a dstream from the moment it exists, holding no bytes and no
+ * A FILE has a dstream from the moment it exists, holding no bytes and no
  * blocks.  That is not the same as having none: an inode without one names
  * something with no length at all, and every path that makes a file longer
  * looks for a length to move.  Creating without one would produce a file that
- * could be opened, read as empty, and never written to.
+ * could be opened, read as empty, and never written to.  A DIRECTORY must not
+ * have one at all, which is the measured half of the same fact and the reason
+ * the record below is assembled around a question instead of copied.
  *
  * A leaf with no room refuses, out loud, and this does NOT split and retry the
  * way growing a file does.  That is the honest edge and not an oversight: a
@@ -6225,8 +6289,9 @@ dir_children_add(uint8_t *node, uint64_t dir, int32_t delta, uint64_t now)
  * everything above, and every address worked out below would be stale --
  * fs_apfs_grow can start over because it has one leaf to reconsider.
  */
-int
-fs_apfs_create(uint64_t dir, const char *name, uint64_t now, uint64_t *ino_out)
+static int
+make_at(uint64_t dir, const char *name, uint64_t now, bool isdir,
+    uint64_t *ino_out)
 {
 	struct apfs_inode_val	*iv;
 	struct apfs_xf_blob	*blob;
@@ -6252,6 +6317,8 @@ fs_apfs_create(uint64_t dir, const char *name, uint64_t now, uint64_t *ino_out)
 	uint32_t		 dklen;
 	uint32_t		 vlen;
 	uint32_t		 nlen;
+	uint32_t		 nexts;
+	uint32_t		 dslen;
 	uint32_t		 data;
 	uint32_t		 pad;
 	uint32_t		 slot;
@@ -6308,18 +6375,25 @@ fs_apfs_create(uint64_t dir, const char *name, uint64_t now, uint64_t *ino_out)
 
 	dv.dv_file_id    = ino;
 	dv.dv_date_added = now;
-	dv.dv_flags      = APFS_DT_REG;
+	dv.dv_flags      = isdir ? APFS_DT_DIR : APFS_DT_REG;
 	refs             = 1;
 
 	/*
-	 * The inode record: a fixed part, then the two extended fields a file
-	 * has, in ascending order of type, then their data each padded up to a
-	 * multiple of eight.  Both the order and the padding were read off the
-	 * inodes already in this volume rather than taken from the layout.
+	 * The inode record: a fixed part, then the extended fields, in
+	 * ascending order of type, then their data each padded up to a multiple
+	 * of eight.  Both the order and the padding were read off the inodes
+	 * already in this volume rather than taken from the layout.
+	 *
+	 * A file has two of those fields and a directory has one.  The count,
+	 * the used-data total, the record's length and whether a dstream id
+	 * record follows are four statements of that same one fact, which is
+	 * why they are written from one variable rather than four constants.
 	 */
 	mem_zero(rec, (uint32_t)sizeof(rec));
-	pad = (nlen + 1u + 7u) & ~7u;
-	iv  = (struct apfs_inode_val *)rec;
+	pad   = (nlen + 1u + 7u) & ~7u;
+	nexts = isdir ? 1u : 2u;
+	dslen = isdir ? 0u : (uint32_t)sizeof(struct apfs_dstream);
+	iv    = (struct apfs_inode_val *)rec;
 	iv->ai_parent_id          = dir;
 	iv->ai_private_id         = ino;
 	iv->ai_create_time        = now;
@@ -6327,25 +6401,29 @@ fs_apfs_create(uint64_t dir, const char *name, uint64_t now, uint64_t *ino_out)
 	iv->ai_change_time        = now;
 	iv->ai_access_time        = now;
 	iv->ai_internal_flags     = APFS_INODE_NO_RSRC_FORK;
-	iv->ai_nchildren_or_nlink = 1;
-	iv->ai_mode               = APFS_S_IFREG | 0644;
+	/* One field, two meanings: a directory counts children, and has none. */
+	iv->ai_nchildren_or_nlink = isdir ? 0 : 1;
+	iv->ai_mode               = isdir ? (APFS_S_IFDIR | 0755) :
+	    (APFS_S_IFREG | 0644);
 	blob = (struct apfs_xf_blob *)(rec + sizeof(*iv));
-	blob->xb_num_exts  = 2;
-	blob->xb_used_data =
-	    (uint16_t)(pad + sizeof(struct apfs_dstream));
+	blob->xb_num_exts  = (uint16_t)nexts;
+	blob->xb_used_data = (uint16_t)(pad + dslen);
 	xf = (struct apfs_x_field *)(rec + sizeof(*iv) + sizeof(*blob));
 	xf[0].xf_type  = APFS_INO_EXT_TYPE_NAME;
 	xf[0].xf_flags = APFS_XF_DO_NOT_COPY;
 	xf[0].xf_size  = (uint16_t)(nlen + 1u);
-	xf[1].xf_type  = APFS_INO_EXT_TYPE_DSTREAM;
-	xf[1].xf_flags = APFS_XF_SYSTEM_FIELD;
-	xf[1].xf_size  = (uint16_t)sizeof(struct apfs_dstream);
-	data = (uint32_t)(sizeof(*iv) + sizeof(*blob) + 2 * sizeof(*xf));
+	if (!isdir) {
+		xf[1].xf_type  = APFS_INO_EXT_TYPE_DSTREAM;
+		xf[1].xf_flags = APFS_XF_SYSTEM_FIELD;
+		xf[1].xf_size  = (uint16_t)sizeof(struct apfs_dstream);
+	}
+	data = (uint32_t)(sizeof(*iv) + sizeof(*blob)) + nexts *
+	    (uint32_t)sizeof(*xf);
 	mem_copy(rec + data, (const uint8_t *)name, nlen);
 	/* The NUL, the padding and the empty dstream are already zero. */
-	vlen = data + pad + (uint32_t)sizeof(struct apfs_dstream);
+	vlen = data + pad + dslen;
 
-	/* Where each of the three belongs. */
+	/* Where each of them belongs. */
 	rv = inode_where(dir, &par_leaf);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
@@ -6366,9 +6444,9 @@ fs_apfs_create(uint64_t dir, const char *name, uint64_t now, uint64_t *ino_out)
 		goto out;
 
 	/*
-	 * Every edit, in memory.  The inode record and its dstream id go in
-	 * together because their keys are adjacent -- same object, neighbouring
-	 * types -- so a leaf that holds one holds the other.
+	 * Every edit, in memory.  A file's inode record and its dstream id go
+	 * in together because their keys are adjacent -- same object,
+	 * neighbouring types -- so a leaf that holds one holds the other.
 	 */
 	slot = edit_leaf(&ne, drec_leaf);
 	rv = leaf_insert(ne.le_node[slot],
@@ -6383,12 +6461,14 @@ fs_apfs_create(uint64_t dir, const char *name, uint64_t now, uint64_t *ino_out)
 	    (uint32_t)sizeof(ikey)), &ikey, (uint32_t)sizeof(ikey), rec, vlen);
 	if (rv != FS_APFS_E_OK)
 		goto out;
-	rv = leaf_insert(ne.le_node[slot],
-	    node_place(ne.le_node[slot], (const uint8_t *)&skey,
-	    (uint32_t)sizeof(skey)), &skey, (uint32_t)sizeof(skey), &refs,
-	    (uint32_t)sizeof(refs));
-	if (rv != FS_APFS_E_OK)
-		goto out;
+	if (!isdir) {
+		rv = leaf_insert(ne.le_node[slot],
+		    node_place(ne.le_node[slot], (const uint8_t *)&skey,
+		    (uint32_t)sizeof(skey)), &skey, (uint32_t)sizeof(skey),
+		    &refs, (uint32_t)sizeof(refs));
+		if (rv != FS_APFS_E_OK)
+			goto out;
+	}
 
 	slot = edit_leaf(&ne, par_leaf);
 	rv = dir_children_add(ne.le_node[slot], dir, 1, now);
@@ -6400,15 +6480,18 @@ fs_apfs_create(uint64_t dir, const char *name, uint64_t now, uint64_t *ino_out)
 	 * that carries them -- the same ordering, and the same reason, as the
 	 * block count in every writer above.
 	 */
-	g_apfs.ac_next_ino  = ino + 1;
-	g_apfs.ac_num_files += 1;
+	g_apfs.ac_next_ino = ino + 1;
+	if (isdir)
+		g_apfs.ac_num_dirs += 1;
+	else
+		g_apfs.ac_num_files += 1;
 
 	scratch = kmalloc(APFS_BLOCK_SIZE);
 	if (scratch == NULL) {
 		rv = FS_APFS_E_NOMEM;
 		goto undo;
 	}
-	rv = edit_commit(&ne, 3, g_apfs.ac_xid + 1, scratch);
+	rv = edit_commit(&ne, isdir ? 2 : 3, g_apfs.ac_xid + 1, scratch);
 	kfree(scratch);
 	if (rv != FS_APFS_E_OK) {
 		if (!edit_moved(&ne)) {
@@ -6421,33 +6504,114 @@ fs_apfs_create(uint64_t dir, const char *name, uint64_t now, uint64_t *ino_out)
 		goto out;
 	}
 
-	make_n++;
+	if (isdir)
+		dmake_n++;
+	else
+		make_n++;
 	if (ino_out != NULL)
 		*ino_out = ino;
-	kprintf("apfs: \"%s\" made in inode %llu as inode %llu -- %u leaves "
-	    "moved\n", name, (unsigned long long)dir, (unsigned long long)ino,
+	kprintf("apfs: %s\"%s\" made in inode %llu as inode %llu -- %u leaves "
+	    "moved\n", isdir ? "directory " : "", name,
+	    (unsigned long long)dir, (unsigned long long)ino,
 	    (unsigned)ne.le_n);
 	edit_free(&ne);
 	return (FS_APFS_E_OK);
 
 undo:
-	g_apfs.ac_next_ino   = ino;
-	g_apfs.ac_num_files -= 1;
+	g_apfs.ac_next_ino = ino;
+	if (isdir)
+		g_apfs.ac_num_dirs -= 1;
+	else
+		g_apfs.ac_num_files -= 1;
 out:
 	edit_free(&ne);
 	return (rv);
 }
 
+int
+fs_apfs_create(uint64_t dir, const char *name, uint64_t now, uint64_t *ino_out)
+{
+
+	return (make_at(dir, name, now, false, ino_out));
+}
+
+int
+fs_apfs_mkdir(uint64_t dir, const char *name, uint64_t now, uint64_t *ino_out)
+{
+
+	return (make_at(dir, name, now, true, ino_out));
+}
+
+struct dir_probe {
+	uint64_t	dp_dir;
+	bool		dp_any;
+};
+
+static bool
+dirent_any(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
+    const uint8_t *val, uint32_t vlen, uint64_t bno, void *arg)
+{
+	struct dir_probe	*dp;
+
+	(void)key;
+	(void)klen;
+	(void)val;
+	(void)vlen;
+	(void)bno;
+	dp = arg;
+	/*
+	 * The scan began at this directory's first possible entry, so the very
+	 * first record handed over is either one of its names or proof that it
+	 * has none.  Either way there is nothing behind it worth reading.
+	 */
+	if (type != APFS_TYPE_DIR_REC || oid != dp->dp_dir)
+		return (false);
+	dp->dp_any = true;
+	return (false);
+}
+
 /*
- * And take a name back out, with the file under it when nothing else holds it.
+ * Does this directory hold a name?
  *
- * The blocks are not this function's problem: cutting the file to nothing is,
+ * Asked of the TREE, and not of the child count in the directory's own inode
+ * record.  The count is a claim about the records, the records are the thing,
+ * and the case this question exists for -- a count that does not match what is
+ * there -- is exactly the case where the cheaper of the two answers wrong.  It
+ * costs one descent, which is the depth of the tree rather than its size.
+ */
+static int
+dir_empty(uint64_t dir, bool *empty_out)
+{
+	struct dir_probe	dp;
+	uint8_t			dkey[APFS_DREC_KEY_MAX];
+	uint32_t		dklen;
+	bool			stopped;
+
+	dp.dp_dir = dir;
+	dp.dp_any = false;
+	drec_low_key(dir, dkey, &dklen);
+	stopped = false;
+	if (!btree_scan(g_apfs.ac_root_tree_bno, dkey, dklen, dirent_any, &dp,
+	    0, &stopped))
+		return (FS_APFS_E_IO);
+	*empty_out = !dp.dp_any;
+	return (FS_APFS_E_OK);
+}
+
+/*
+ * And take a name back out, with what was under it.
+ *
+ * A FILE's blocks are not this function's problem: cutting it to nothing is,
  * and that is a call to the truncate above, which already gives back the runs,
  * the records in both trees that name them and the volume's block count.  What
  * is left is the three records the create made and the two counters it moved.
+ *
+ * A DIRECTORY has no blocks, no dstream and nothing to cut.  What it has
+ * instead is a question that must be answered before anything is touched, and
+ * being empty is the whole of it.
  */
-int
-fs_apfs_unlink(uint64_t dir, const char *name, uint64_t now)
+static int
+unmake_at(uint64_t dir, const char *name, uint64_t now, bool isdir)
 {
 	struct dirent_search	 ds;
 	struct inode_info	 ii;
@@ -6462,8 +6626,10 @@ fs_apfs_unlink(uint64_t dir, const char *name, uint64_t now)
 	uint32_t		 nlen;
 	uint32_t		 pos, voff, vlen;
 	uint32_t		 slot;
+	uint32_t		 gone;
 	int			 rv;
 	bool			 stopped;
+	bool			 empty;
 
 	if (!g_apfs.ac_mounted)
 		return (FS_APFS_E_NOMOUNT);
@@ -6489,26 +6655,41 @@ fs_apfs_unlink(uint64_t dir, const char *name, uint64_t now)
 		return (FS_APFS_E_IO);
 	if (ds.ds_found == 0)
 		return (FS_APFS_E_NOTFOUND);
-	if (ds.ds_is_dir) {
-		kprintf("apfs: \"%s\" is a directory -- taking one of those "
-		    "out is a different rung\n", name);
-		return (FS_APFS_E_ISDIR);
+	if (ds.ds_is_dir != isdir) {
+		kprintf("apfs: \"%s\" is %sa directory, and %s\n", name,
+		    ds.ds_is_dir ? "" : "not ",
+		    isdir ? "rmdir takes out nothing else" :
+		    "unlink does not take those out");
+		return (isdir ? FS_APFS_E_NOTDIR : FS_APFS_E_ISDIR);
 	}
 	child = ds.ds_found;
 	if (inode_info(child, &ii) != FS_APFS_E_OK)
 		return (FS_APFS_E_NOTFOUND);
-	if (ii.ii_nlink != 1) {
+	if (!isdir && ii.ii_nlink != 1) {
 		kprintf("apfs: inode %llu has %u links and this kernel makes "
 		    "none -- unlinking one of several is a different rung\n",
 		    (unsigned long long)child, (unsigned)ii.ii_nlink);
 		return (FS_APFS_E_NOALLOC);
 	}
+	if (isdir) {
+		rv = dir_empty(child, &empty);
+		if (rv != FS_APFS_E_OK)
+			return (rv);
+		if (!empty) {
+			kprintf("apfs: \"%s\" still holds a name -- a directory "
+			    "taken out from over its children leaves entries "
+			    "whose parent is gone\n", name);
+			return (FS_APFS_E_NOTEMPTY);
+		}
+	}
 
 	/*
 	 * The bytes first, and through the truncate rather than beside it.  It
-	 * moves leaves, so everything below has to be located afterwards.
+	 * moves leaves, so everything below has to be located afterwards.  A
+	 * directory has no bytes, which is the one thing these two do not
+	 * share.
 	 */
-	if (ii.ii_size != 0 || ii.ii_alloced != 0) {
+	if (!isdir && (ii.ii_size != 0 || ii.ii_alloced != 0)) {
 		rv = fs_apfs_truncate(child, ii.ii_private_id, 0);
 		if (rv != FS_APFS_E_OK)
 			return (rv);
@@ -6537,6 +6718,7 @@ fs_apfs_unlink(uint64_t dir, const char *name, uint64_t now)
 	 * a directory has one record per name and they differ only past the
 	 * eighth byte, so "the DIR_REC of this parent" names all of them.
 	 */
+	gone = 0;
 	slot = edit_leaf(&ne, drec_leaf);
 	{
 		struct btree_layout	bl;
@@ -6561,15 +6743,24 @@ fs_apfs_unlink(uint64_t dir, const char *name, uint64_t now)
 			    (unsigned long long)drec_leaf);
 			goto out;
 		}
+		gone++;
 	}
 
+	/*
+	 * How many records actually left, counted rather than assumed, because
+	 * the tree's key count is told this number at the end.  A file this
+	 * kernel made has a dstream id record and a directory has none, and
+	 * this used to say three whatever it had found -- which would have told
+	 * the tree that a record it still holds is gone.
+	 */
 	slot = edit_leaf(&ne, ino_leaf);
 	if (node_slot(ne.le_node[slot], child, APFS_TYPE_DSTREAM_ID, &pos,
 	    &voff, &vlen)) {
 		rv = leaf_delete(ne.le_node[slot], pos);
 		if (rv != FS_APFS_E_OK)
 			goto out;
-	} else {
+		gone++;
+	} else if (!isdir) {
 		/*
 		 * A file this kernel made always has one.  One that came off
 		 * the image need not, and removing a record that is not there
@@ -6586,45 +6777,70 @@ fs_apfs_unlink(uint64_t dir, const char *name, uint64_t now)
 	rv = leaf_delete(ne.le_node[slot], pos);
 	if (rv != FS_APFS_E_OK)
 		goto out;
+	gone++;
 
 	slot = edit_leaf(&ne, par_leaf);
 	rv = dir_children_add(ne.le_node[slot], dir, -1, now);
 	if (rv != FS_APFS_E_OK)
 		goto out;
 
-	g_apfs.ac_num_files -= 1;
+	if (isdir)
+		g_apfs.ac_num_dirs -= 1;
+	else
+		g_apfs.ac_num_files -= 1;
 
 	scratch = kmalloc(APFS_BLOCK_SIZE);
 	if (scratch == NULL) {
-		g_apfs.ac_num_files += 1;
 		rv = FS_APFS_E_NOMEM;
-		goto out;
+		goto undo;
 	}
-	rv = edit_commit(&ne, -3, g_apfs.ac_xid + 1, scratch);
+	rv = edit_commit(&ne, -(int64_t)gone, g_apfs.ac_xid + 1, scratch);
 	kfree(scratch);
 	if (rv != FS_APFS_E_OK) {
 		if (!edit_moved(&ne)) {
-			g_apfs.ac_num_files += 1;
 			kprintf("apfs: unmaking \"%s\" was refused before "
 			    "anything moved (%d) -- the volume is as it was\n",
 			    name, rv);
-			goto out;
+			goto undo;
 		}
 		kprintf("apfs: unmaking \"%s\" failed after a leaf had moved "
 		    "(%d) -- this checkpoint must not be written\n", name, rv);
 		goto out;
 	}
 
-	kill_n++;
-	kprintf("apfs: \"%s\" taken out of inode %llu -- inode %llu is gone, "
-	    "%u leaves moved\n", name, (unsigned long long)dir,
-	    (unsigned long long)child, (unsigned)ne.le_n);
+	if (isdir)
+		dkill_n++;
+	else
+		kill_n++;
+	kprintf("apfs: %s\"%s\" taken out of inode %llu -- inode %llu is gone "
+	    "with %u record(s), %u leaves moved\n", isdir ? "directory " : "",
+	    name, (unsigned long long)dir, (unsigned long long)child,
+	    (unsigned)gone, (unsigned)ne.le_n);
 	edit_free(&ne);
 	return (FS_APFS_E_OK);
 
+undo:
+	if (isdir)
+		g_apfs.ac_num_dirs += 1;
+	else
+		g_apfs.ac_num_files += 1;
 out:
 	edit_free(&ne);
 	return (rv);
+}
+
+int
+fs_apfs_unlink(uint64_t dir, const char *name, uint64_t now)
+{
+
+	return (unmake_at(dir, name, now, false));
+}
+
+int
+fs_apfs_rmdir(uint64_t dir, const char *name, uint64_t now)
+{
+
+	return (unmake_at(dir, name, now, true));
 }
 
 uint64_t
@@ -6646,6 +6862,20 @@ fs_apfs_holes(void)
 {
 
 	return (hole_n);
+}
+
+uint64_t
+fs_apfs_dirmakes(void)
+{
+
+	return (dmake_n);
+}
+
+uint64_t
+fs_apfs_dirkills(void)
+{
+
+	return (dkill_n);
 }
 
 int
