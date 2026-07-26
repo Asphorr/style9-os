@@ -184,6 +184,7 @@ OBJS	= \
 	$(OBJDIR)/dirlist_macho.o \
 	$(OBJDIR)/timeprobe_macho.o \
 	$(OBJDIR)/mmaptest_macho.o \
+	$(OBJDIR)/filewrite_macho.o \
 	$(OBJDIR)/tree_macho.o \
 	$(OBJDIR)/guname_macho.o \
 	$(OBJDIR)/gcat_macho.o \
@@ -492,6 +493,20 @@ $(OBJDIR)/mmaptest.dwn.o: $(USER_DIR)/mmaptest.c | $(OBJDIR)
 	$(DARWIN_CC) $(DARWIN_CFLAGS) -c $< -o $@
 
 $(OBJDIR)/mmaptest.macho: $(OBJDIR)/mmaptest.dwn.o $(OBJDIR)/libSystem.B.dylib
+	$(DARWIN_LD) $(DARWIN_LDF) -o $@ $< -L$(OBJDIR) -lSystem.B -e _entry \
+	    -pagezero_size $(DYLDHELLO_BASE)
+
+# filewrite (volume-writing probe): the same shape again, for the rung where
+# ring 3 can change the disk.  Checks that O_CREAT makes a file, that the bytes
+# come back through a DIFFERENT descriptor, that an overwrite in the middle
+# leaves the length alone, that O_APPEND ignores the cursor, that O_TRUNC
+# empties at open time, that unlink removes the name, and that a built-in is
+# still refused -- de-risking open/write/unlink before dash's `>` depends on
+# them.
+$(OBJDIR)/filewrite.dwn.o: $(USER_DIR)/filewrite.c | $(OBJDIR)
+	$(DARWIN_CC) $(DARWIN_CFLAGS) -c $< -o $@
+
+$(OBJDIR)/filewrite.macho: $(OBJDIR)/filewrite.dwn.o $(OBJDIR)/libSystem.B.dylib
 	$(DARWIN_LD) $(DARWIN_LDF) -o $@ $< -L$(OBJDIR) -lSystem.B -e _entry \
 	    -pagezero_size $(DYLDHELLO_BASE)
 

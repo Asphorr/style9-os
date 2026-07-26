@@ -199,6 +199,14 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	fs_make_selftest();
 
 	/*
+	 * And the one test in here the kernel cannot satisfy: a file a REAL
+	 * Apple shell redirected into, during the boot before this one.  It has
+	 * to run here, before ring 3 starts, or it would be checking what was
+	 * written moments ago instead of what survived the power going off.
+	 */
+	fs_shell_selftest();
+
+	/*
 	 * Last of all, the two operations nothing else reaches any more.  A
 	 * node that runs out of room: appending stopped filling one once runs
 	 * that touch began to be merged, so this asks for a split outright.

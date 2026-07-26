@@ -202,6 +202,15 @@ extern uint8_t	_binary_mmaptest_macho_start[];
 extern uint8_t	_binary_mmaptest_macho_end[];
 
 /*
+ * filewrite: the same kind of probe again, for the rung where ring 3 can
+ * change the volume.  Makes a file, reads it back through another descriptor,
+ * overwrites part of it, appends, truncates, unlinks -- and checks that a
+ * program built into this kernel's text still refuses to be written to.
+ */
+extern uint8_t	_binary_filewrite_macho_start[];
+extern uint8_t	_binary_filewrite_macho_end[];
+
+/*
  * A fourth REAL Apple binary: gfactor (GNU coreutils' factor, a Homebrew
  * bottle).  Unlike the libSystem-only binaries above, it also links libgmp --
  * the first program to drive a SECOND dependency, so our dyld maps the whole
@@ -358,6 +367,8 @@ progreg_init(void)
 	    _binary_timeprobe_macho_start, _binary_timeprobe_macho_end);
 	register_one("mmaptest",
 	    _binary_mmaptest_macho_start, _binary_mmaptest_macho_end);
+	register_one("filewrite",
+	    _binary_filewrite_macho_start, _binary_filewrite_macho_end);
 	register_one("gfactor",
 	    _binary_gfactor_macho_start, _binary_gfactor_macho_end);
 	register_one("pipefork",

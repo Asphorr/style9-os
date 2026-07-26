@@ -2095,6 +2095,31 @@ demo_darwin_spawn(void)
 	}
 
 	/*
+	 * filewrite: the probe for the rung where ring 3 can CHANGE the disk.
+	 * Everything under it -- an APFS writer that makes, grows, shortens and
+	 * removes files, and an outside checker that accepts what it leaves --
+	 * has been provable for a while and was reachable only from the
+	 * kernel's own self-tests, because open(2) answered EROFS to every
+	 * write mode.  This is the first program that puts bytes on the volume.
+	 */
+	{
+		mach_port_name_t	wprobe_tp;
+
+		wprobe_tp = MACH_PORT_NULL;
+		printf("  >>> spawning filewrite -- the volume, from ring 3 "
+		    "(open O_CREAT / write / append / truncate / unlink) <<<\n");
+		child_id = spawn_args("filewrite", 0, NULL, &wprobe_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('filewrite') failed (rv=%ld)\n",
+			    child_id);
+			return (96);
+		}
+		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
+			(void)yield();
+		printf("  filewrite retired after %d yields\n", i);
+	}
+
+	/*
 	 * A THIRD real Apple binary: guname (GNU coreutils' uname).  The
 	 * machine-identity trick -- it asks uname(2) what it is running on and
 	 * prints the answer, never validating it.  Our kernel hands back a
@@ -2267,6 +2292,38 @@ demo_darwin_spawn(void)
 		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
 			(void)yield();
 		printf("  dash[pipeline] retired after %d yields\n", i);
+
+		/*
+		 * REDIRECTION, which is a shell writing to the disk.
+		 *
+		 * `>` is not a shell feature the way `|` is: dash opens the
+		 * file with O_WRONLY|O_CREAT|O_TRUNC, dup2s it onto fd 1, and
+		 * then every builtin that prints is writing to the volume
+		 * without knowing it.  Nothing in dash was changed to make
+		 * this work -- what changed is that open(2) stopped answering
+		 * EROFS.  gcat, a genuine Apple binary, reads the result back,
+		 * so both ends of this line are Apple code.
+		 *
+		 * The file is LEFT BEHIND on purpose: the boot after this one
+		 * finds it in apfs-shell, which is the only proof that the
+		 * bytes reached the platter rather than a cache.
+		 */
+		printf("  >>> dash -c 'echo ... > /etc/notes.txt' -- a REAL "
+		    "Apple shell WRITING TO THE VOLUME <<<\n");
+		sh_tp = MACH_PORT_NULL;
+		sh_argv[2] =
+		    "echo a line from a real Apple shell > /etc/notes.txt; "
+		    "echo appended by the same shell >> /etc/notes.txt; "
+		    "gcat /etc/notes.txt";
+		child_id = spawn_args("dash", 3, sh_argv, &sh_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('dash>') failed (rv=%ld)\n",
+			    child_id);
+			return (103);
+		}
+		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
+			(void)yield();
+		printf("  dash[redirect] retired after %d yields\n", i);
 
 		printf("  >>> dash /bin/demo.sh -- a shell SCRIPT from the "
 		    "synthetic /bin <<<\n");

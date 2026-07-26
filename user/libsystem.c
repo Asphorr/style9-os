@@ -3685,14 +3685,19 @@ umask(int mask)
 	return (022);
 }
 
-/* Nothing to delete and nowhere to create a temp file: read-only volume. */
+/*
+ * unlink(2), which reaches the kernel now that the volume can be written.
+ *
+ * It used to answer EROFS from here without asking anybody, which was true of
+ * every volume this system could mount at the time.  It is not true any more,
+ * and a libc that keeps saying so is a libc that makes the kernel look
+ * broken.
+ */
 int
 unlink(const char *path)
 {
 
-	(void)path;
-	g_errno = 30;				/* EROFS */
-	return (-1);
+	return ((int)bsd_call_e(0x200000A, (long)path, 0, 0));
 }
 
 int

@@ -355,6 +355,17 @@ void		fs_trunc_selftest(void);
 void		fs_make_selftest(void);
 
 /*
+ * Prove that a RING-3 program wrote to this volume and that the bytes outlived
+ * the machine being turned off.
+ *
+ * The one test here the kernel cannot satisfy by itself: it looks for the file
+ * a real Apple shell redirected into during the PREVIOUS boot, which is a
+ * claim about open(2), write(2), the checkpoint under them, and the disk.  The
+ * first boot on a fresh volume skips, saying so.
+ */
+void		fs_shell_selftest(void);
+
+/*
  * Prove that a B-tree node can be split without losing a record.  Silently
  * does nothing when the volume is not APFS.
  */

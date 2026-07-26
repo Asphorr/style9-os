@@ -66,6 +66,7 @@
 #define	DARWIN_SYS_open		5
 #define	DARWIN_SYS_close	6
 #define	DARWIN_SYS_wait4	7
+#define	DARWIN_SYS_unlink	10
 #define	DARWIN_SYS_chdir	12
 #define	DARWIN_SYS_getpid	20
 #define	DARWIN_SYS_kill		37
@@ -89,6 +90,23 @@
  * number is Darwin's, not an invention.
  */
 #define	DARWIN_SYS___getcwd	326
+
+/*
+ * open(2)'s vocabulary, as Darwin's <sys/fcntl.h> spells it.
+ *
+ * The access mode is NOT a bitmask of the other flags: it is the low two bits,
+ * where 0 means read, 1 write and 2 both -- so "is this open for writing" is a
+ * comparison and not a bit test, and treating it as one is how O_RDONLY|O_TRUNC
+ * (a legal, if odd, request) gets mistaken for a write.
+ */
+#define	DARWIN_O_ACCMODE	0x0003
+#define	DARWIN_O_RDONLY		0x0000
+#define	DARWIN_O_WRONLY		0x0001
+#define	DARWIN_O_RDWR		0x0002
+#define	DARWIN_O_APPEND		0x0008
+#define	DARWIN_O_CREAT		0x0200
+#define	DARWIN_O_TRUNC		0x0400
+#define	DARWIN_O_EXCL		0x0800
 
 /*
  * mmap(2)'s vocabulary, as <sys/mman.h> spells it on Darwin.  The protection
@@ -263,6 +281,9 @@ struct darwin_uname {
 #define	DARWIN_ENODEV	19
 #define	DARWIN_EINVAL	22
 #define	DARWIN_EMFILE	24
+#define	DARWIN_EEXIST	17
+#define	DARWIN_EISDIR	21
+#define	DARWIN_ENOSPC	28
 #define	DARWIN_ESPIPE	29
 #define	DARWIN_EROFS	30
 #define	DARWIN_EPIPE	32

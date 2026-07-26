@@ -583,6 +583,112 @@ darwin_file_read(struct syscall_frame *f, struct darwin_ofile *of, void *ubuf,
 	return (darwin_ok(f, (long)done));
 }
 
+/*
+ * What a filesystem refusal is called in Darwin's numbering.
+ *
+ * FS_E_SPREAD is the interesting one and it is a judgement call: the writer
+ * moves a file's records in one copy of one node and refuses when they have
+ * been split across two, which is a documented edge of the truncate rung and
+ * not a full disk.  ENOSPC is the closest true thing a program can be told --
+ * room could not be found -- and EIO would say the volume was damaged, which
+ * it is not.  A shell prints "No space left on device" and stops, which is the
+ * right behaviour for a request this kernel cannot yet carry out.
+ */
+static int
+darwin_fs_errno(int rv)
+{
+
+	switch (rv) {
+	case FS_E_OK:		return (0);
+	case FS_E_NOTFOUND:	return (DARWIN_ENOENT);
+	case FS_E_NOMEM:	return (DARWIN_ENOMEM);
+	case FS_E_TOOBIG:	return (DARWIN_ENOMEM);
+	case FS_E_ROFS:		return (DARWIN_EROFS);
+	case FS_E_NOMOUNT:	return (DARWIN_EROFS);
+	case FS_E_EXIST:	return (DARWIN_EEXIST);
+	case FS_E_ISDIR:	return (DARWIN_EISDIR);
+	case FS_E_NOALLOC:	return (DARWIN_ENOSPC);
+	case FS_E_SPREAD:	return (DARWIN_ENOSPC);
+	default:		return (DARWIN_EIO);
+	}
+}
+
+/*
+ * write(2) to a disk-backed fd: bounce through the kernel, then hand it to the
+ * filesystem, the mirror image of darwin_file_read and for the same reasons --
+ * fs_pwrite reads out of kernel memory, and a user page must not be held while
+ * the disk write sleeps.
+ *
+ * O_APPEND is resolved HERE, per call, against the length the volume has now
+ * rather than the one this fd was opened with.  That is the whole content of
+ * the flag: two shells appending to the same log must not overwrite each
+ * other, and a cursor remembered from open time is exactly how they would.
+ *
+ * The write is not reported as short unless the filesystem shortened it.  A
+ * partial write that returned success would be indistinguishable to the caller
+ * from a full one, and a shell writing a line would silently produce half of it.
+ */
+#define	DARWIN_WRITE_CHUNK	(64u * 1024u)
+
+static long
+darwin_file_write(struct syscall_frame *f, struct darwin_ofile *of,
+    const void *ubuf, size_t n)
+{
+	uint8_t		*bounce;
+	uint64_t	 at;
+	size_t		 done;
+	size_t		 chunk;
+	uint32_t	 put;
+	int		 rv;
+
+	if ((of->of_flags & DARWIN_O_ACCMODE) == DARWIN_O_RDONLY)
+		return (darwin_err(f, DARWIN_EBADF));
+	if (of->of_handle.fh_kind == FS_HANDLE_NONE)
+		return (darwin_err(f, DARWIN_EROFS));
+	if (n == 0)
+		return (darwin_ok(f, 0));
+
+	bounce = kmalloc(n < DARWIN_WRITE_CHUNK ? n : DARWIN_WRITE_CHUNK);
+	if (bounce == NULL)
+		return (darwin_err(f, DARWIN_ENOMEM));
+
+	at = ((of->of_flags & DARWIN_O_APPEND) != 0) ?
+	    of->of_handle.fh_size : (uint64_t)of->of_off;
+	for (done = 0; done < n; done += put) {
+		chunk = n - done;
+		if (chunk > DARWIN_WRITE_CHUNK)
+			chunk = DARWIN_WRITE_CHUNK;
+		if (syscall_copyin(bounce, (const uint8_t *)ubuf + done,
+		    chunk) != 0) {
+			kfree(bounce);
+			return (darwin_err(f, DARWIN_EFAULT));
+		}
+		put = 0;
+		rv = fs_pwrite(&of->of_handle, at + done, bounce,
+		    (uint32_t)chunk, &put);
+		if (rv != FS_E_OK) {
+			if (done != 0)
+				break;		/* a short write, not an error */
+			kfree(bounce);
+			kprintf("darwin: write to '%s' refused (rv=%d)\n",
+			    of->of_path != NULL ? of->of_path : "?", rv);
+			return (darwin_err(f, darwin_fs_errno(rv)));
+		}
+		if (put == 0)
+			break;
+	}
+	kfree(bounce);
+
+	/*
+	 * The cursor follows the bytes, and the fd's idea of the length
+	 * follows the handle's -- which fs_pwrite has already moved if the
+	 * write ran off the end.
+	 */
+	of->of_off  = (uint32_t)(at + done);
+	of->of_size = (uint32_t)of->of_handle.fh_size;
+	return (darwin_ok(f, (long)done));
+}
+
 /* Release whatever one slot holds and return it to FREE. */
 static void
 darwin_ofile_clear(struct darwin_ofile *of)
@@ -612,6 +718,7 @@ darwin_ofile_clear(struct darwin_ofile *of)
 	of->of_handle.fh_size = 0;
 	of->of_size          = 0;
 	of->of_off           = 0;
+	of->of_flags         = 0;
 	of->of_type          = DARWIN_OF_FREE;
 }
 
@@ -1150,6 +1257,7 @@ darwin_files_fork_copy(struct task *parent, struct task *child)
 			dst->of_path   = darwin_path_dup(src->of_path);
 			dst->of_size   = src->of_size;
 			dst->of_off    = src->of_off;
+			dst->of_flags  = src->of_flags;
 			dst->of_type   = DARWIN_OF_FILE;
 			break;
 		case DARWIN_OF_PIPE_R:
@@ -1218,6 +1326,7 @@ darwin_dup_install(struct task *t, int oldfd, int newfd)
 		dst->of_path   = darwin_path_dup(src->of_path);
 		dst->of_size   = src->of_size;
 		dst->of_off    = src->of_off;
+		dst->of_flags  = src->of_flags;
 		dst->of_type   = DARWIN_OF_FILE;
 		return (0);
 	case DARWIN_OF_PIPE_R:
@@ -1794,6 +1903,9 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		case DARWIN_OF_PIPE_W:
 			return (darwin_pipe_write(f, of->of_pipe,
 			    (const void *)f->sf_arg1, (size_t)f->sf_arg2));
+		case DARWIN_OF_FILE:
+			return (darwin_file_write(f, of,
+			    (const void *)f->sf_arg1, (size_t)f->sf_arg2));
 		default:
 			return (darwin_err(f, DARWIN_EBADF));
 		}
@@ -1913,9 +2025,11 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		uint8_t				*buf;
 		uint32_t			 size;
 		uint32_t			 k;
+		uint32_t			 flags;
 		long				 len;
 		int				 fd;
 		int				 rv;
+		bool				 writing;
 		bool				 on_disk;
 
 		len = syscall_copyin_str((const char *)f->sf_arg0, raw,
@@ -1929,14 +2043,36 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			return (darwin_err(f, DARWIN_ENAMETOOLONG));
 
 		/*
-		 * Everything reachable here is read-only; say so instead of
-		 * accepting a write-mode open whose writes would then vanish.
-		 * O_WRONLY/O_RDWR live in the low access-mode bits; O_APPEND
-		 * is 0x8, O_CREAT 0x200, O_TRUNC 0x400 (Darwin <sys/fcntl.h>).
+		 * WHAT AN OPEN FOR WRITING NOW MEANS
+		 *
+		 * This used to answer EROFS to every write mode, because the
+		 * volume underneath could only be read and an fd that accepted
+		 * writes would have swallowed them.  The volume can be written
+		 * now, so the flags are honoured -- and the three that MAKE or
+		 * UNMAKE bytes are answered here rather than at the first
+		 * write, because that is what open(2) promises: after it
+		 * returns, the file exists and is the length the flags say.
 		 */
-		if ((f->sf_arg1 & 3) != 0 || (f->sf_arg1 & 0x608) != 0)
-			return (darwin_err(f, DARWIN_EROFS));
+		flags   = (uint32_t)f->sf_arg1;
+		writing = (flags & DARWIN_O_ACCMODE) != DARWIN_O_RDONLY;
 
+		buf = NULL;
+		on_disk = true;
+		rv = fs_open(path, &handle);
+		if (rv == FS_E_NOTFOUND && (flags & DARWIN_O_CREAT) != 0) {
+			uint64_t	ino;
+
+			rv = fs_create(path, &ino);
+			if (rv == FS_E_OK)
+				rv = fs_open(path, &handle);
+			else if (rv == FS_E_ROFS || rv == FS_E_NOMOUNT)
+				return (darwin_err(f, DARWIN_EROFS));
+			else if (rv != FS_E_EXIST)
+				return (darwin_err(f, darwin_fs_errno(rv)));
+		} else if (rv == FS_E_OK && (flags & DARWIN_O_CREAT) != 0 &&
+		    (flags & DARWIN_O_EXCL) != 0) {
+			return (darwin_err(f, DARWIN_EEXIST));
+		}
 		/*
 		 * Resolve, do not read.  What an fd needs is the answer to
 		 * "which file"; the bytes come later and only the ones asked
@@ -1945,14 +2081,18 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		 * and put a ceiling on how large a file could be opened at
 		 * all.
 		 */
-		buf = NULL;
-		on_disk = true;
-		rv = fs_open(path, &handle);
 		if (rv == FS_E_NOTFOUND || rv == FS_E_NOMOUNT) {
 			/* Not on the disk: try the synthetic /bin (progreg). */
 			pe = darwin_bin_lookup(path);
 			if (pe == NULL)
 				return (darwin_err(f, DARWIN_ENOENT));
+			/*
+			 * A built-in is an image in the kernel's own text.
+			 * There is nowhere for a write to it to go, and
+			 * saying so is the whole of what EROFS is for.
+			 */
+			if (writing || (flags & DARWIN_O_TRUNC) != 0)
+				return (darwin_err(f, DARWIN_EROFS));
 			if (pe->pr_size > 0x7FFFFFFF)
 				return (darwin_err(f, DARWIN_ENOMEM));
 			buf = kmalloc(pe->pr_size != 0 ?
@@ -1971,6 +2111,23 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 				return (darwin_err(f, DARWIN_ENOMEM));
 			return (darwin_err(f, DARWIN_EIO));
 		} else {
+			/*
+			 * O_TRUNC means the file is empty when open returns,
+			 * not when something first writes: a shell that
+			 * redirects into a file and then produces no output
+			 * has still emptied it, and that is the difference
+			 * between `> f` and nothing at all.
+			 */
+			if ((flags & DARWIN_O_TRUNC) != 0 &&
+			    handle.fh_size != 0) {
+				rv = fs_truncate(&handle, 0);
+				if (rv != FS_E_OK) {
+					kprintf("darwin: open('%s'): O_TRUNC "
+					    "refused (rv=%d)\n", path, rv);
+					return (darwin_err(f,
+					    darwin_fs_errno(rv)));
+				}
+			}
 			if (handle.fh_size > 0xFFFFFFFFULL)
 				return (darwin_err(f, DARWIN_ENOMEM));
 			size = (uint32_t)handle.fh_size;
@@ -1988,12 +2145,14 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		/* Kept for diagnostics; the handle is what gets read. */
 		t->t_darwin_files[fd].of_path =
 		    on_disk ? darwin_path_dup(path) : NULL;
-		t->t_darwin_files[fd].of_size = size;
-		t->t_darwin_files[fd].of_off  = 0;
-		t->t_darwin_files[fd].of_type = DARWIN_OF_FILE;
-		kprintf("darwin: UNIX open('%s') -> fd=%d (%u bytes, %s)\n",
+		t->t_darwin_files[fd].of_size  = size;
+		t->t_darwin_files[fd].of_off   = 0;
+		t->t_darwin_files[fd].of_flags = flags;
+		t->t_darwin_files[fd].of_type  = DARWIN_OF_FILE;
+		kprintf("darwin: UNIX open('%s') -> fd=%d (%u bytes, %s%s)\n",
 		    path, fd, (unsigned)size,
-		    on_disk ? "on the volume" : "built in");
+		    on_disk ? "on the volume" : "built in",
+		    writing ? ", for writing" : "");
 		return (darwin_ok(f, fd));
 	}
 	case DARWIN_SYS_read: {
@@ -2040,6 +2199,41 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		default:
 			return (darwin_err(f, DARWIN_EBADF));
 		}
+	}
+	case DARWIN_SYS_unlink: {
+		char	path[DARWIN_PATH_MAX];
+		char	raw[DARWIN_PATH_MAX];
+		long	len;
+		int	rv;
+
+		len = syscall_copyin_str((const char *)f->sf_arg0, raw,
+		    sizeof(raw));
+		if (len < 0)
+			return (darwin_err(f, DARWIN_EFAULT));
+		if (darwin_path_resolve(current_thread->th_task, raw, path,
+		    sizeof(path)) != 0)
+			return (darwin_err(f, DARWIN_ENAMETOOLONG));
+
+		/*
+		 * An open fd is NOT kept alive by this.  Unix says a file lives
+		 * until its last name and its last descriptor are gone, and
+		 * that promise needs a reference count on the inode, which
+		 * needs a vnode layer this kernel does not have.  So the bytes
+		 * go now and a descriptor still open on them reads what is no
+		 * longer there.  Said out loud rather than discovered: no
+		 * program here holds a file it has unlinked, and one that did
+		 * would be relying on something never implemented.
+		 */
+		rv = fs_unlink(path);
+		if (rv != FS_E_OK) {
+			if (rv != FS_E_NOTFOUND)
+				kprintf("darwin: unlink('%s') refused "
+				    "(rv=%d)\n", path, rv);
+			return (darwin_err(f, darwin_fs_errno(rv)));
+		}
+		kprintf("darwin: UNIX unlink('%s') -- the name is gone\n",
+		    path);
+		return (darwin_ok(f, 0));
 	}
 	case DARWIN_SYS_close: {
 		struct darwin_ofile	*of;

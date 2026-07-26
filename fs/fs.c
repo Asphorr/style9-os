@@ -1632,6 +1632,90 @@ fs_make_selftest(void)
 	    "removed first" : "");
 }
 
+/*
+ * WHAT A SHELL LEFT ON THE DISK, ONE BOOT AGO
+ *
+ * Every other test here writes through this layer and reads back through it,
+ * which proves the writer and proves nothing about who can reach it.  This one
+ * cannot be satisfied by anything the kernel does: the file it looks for is
+ * made by dash redirecting into it -- open(2) with O_CREAT, dup2 onto fd 1,
+ * and the shell's own `echo` -- during the PREVIOUS boot, and by then this has
+ * already run and found nothing.
+ *
+ * So the first boot skips, every boot after it checks, and what it checks is
+ * that bytes a ring-3 program wrote survived a power cycle.  A write that
+ * reached a cache and no further answers this with a missing file.
+ *
+ * The two lines are spelled out here and in user/hello.c, which is a
+ * duplication on purpose: if the demo changes what it writes, this fails
+ * loudly rather than quietly checking nothing.
+ */
+#define	SELFTEST_SHELL		"/etc/notes.txt"
+#define	SELFTEST_SHELL_TEXT	"a line from a real Apple shell\n" \
+				"appended by the same shell\n"
+
+void
+fs_shell_selftest(void)
+{
+	struct fs_handle	 h;
+	uint8_t			 back[sizeof(SELFTEST_SHELL_TEXT)];
+	const char		*want = SELFTEST_SHELL_TEXT;
+	const uint32_t		 wantlen = sizeof(SELFTEST_SHELL_TEXT) - 1;
+	uint32_t		 got;
+	int			 rv;
+
+	if (!fs_apfs_ready())
+		return;
+
+	rv = fs_open(SELFTEST_SHELL, &h);
+	if (rv == FS_E_NOTFOUND) {
+		kprintf("apfs-shell: %s is not there -- no shell has written "
+		    "to this volume yet; skipped\n", SELFTEST_SHELL);
+		return;
+	}
+	if (rv != FS_E_OK) {
+		kprintf("apfs-shell: FAIL cannot open %s (rv=%d)\n",
+		    SELFTEST_SHELL, rv);
+		return;
+	}
+	/*
+	 * EMPTY IS A STATE THE DISK CAN HONESTLY BE IN, and it is worth
+	 * naming rather than failing on.  A redirection is two events -- the
+	 * file is created and emptied by open(2), then written -- and each
+	 * closes its own checkpoint, so a machine switched off between them
+	 * leaves exactly this: the name, with nothing in it.  That is the
+	 * crash-consistent midpoint the checkpoint boundary exists to
+	 * produce, not a write that went missing.  Anything ELSE in the file
+	 * is a failure, because nothing but the shell writes here.
+	 */
+	if (h.fh_size == 0) {
+		kprintf("apfs-shell: %s is there but empty -- a boot was "
+		    "interrupted between the shell creating it and writing "
+		    "into it, which is a state this volume is allowed to be "
+		    "in; skipped\n", SELFTEST_SHELL);
+		return;
+	}
+	if (h.fh_size != wantlen) {
+		kprintf("apfs-shell: FAIL %s is %llu bytes and a shell wrote "
+		    "%u\n", SELFTEST_SHELL, (unsigned long long)h.fh_size,
+		    (unsigned)wantlen);
+		return;
+	}
+	if (fs_pread(&h, 0, back, wantlen, &got) != FS_E_OK || got != wantlen) {
+		kprintf("apfs-shell: FAIL %s will not read back (got %u of "
+		    "%u)\n", SELFTEST_SHELL, (unsigned)got, (unsigned)wantlen);
+		return;
+	}
+	if (!same(back, (const uint8_t *)want, wantlen)) {
+		kprintf("apfs-shell: FAIL %s holds something other than what "
+		    "a shell wrote into it\n", SELFTEST_SHELL);
+		return;
+	}
+	kprintf("apfs-shell: PASS -- %u bytes a REAL Apple shell redirected "
+	    "into %s in an earlier boot are still there, byte for byte\n",
+	    (unsigned)wantlen, SELFTEST_SHELL);
+}
+
 /* As above, and about a node that is asked to run out of room. */
 void
 fs_split_selftest(void)

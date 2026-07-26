@@ -109,6 +109,7 @@ struct darwin_ofile {
 	char			*of_path;	/* FILE: what it was named  */
 	uint32_t		 of_size;	/* FILE: valid bytes       */
 	uint32_t		 of_off;	/* FILE: read cursor       */
+	uint32_t		 of_flags;	/* FILE: DARWIN_O_* it was opened with */
 	uint8_t			 of_type;	/* DARWIN_OF_*             */
 };
 
