@@ -989,6 +989,17 @@ uint64_t fs_apfs_holes(void);
 void	fs_apfs_split_selftest(void);
 
 /*
+ * Make a node stop starting where its parent says it does, and prove the
+ * writer notices.  Arranged rather than waited for, out of two files that take
+ * turns: the leaf holding one's inode record is split AT that record so it
+ * becomes the key the index files that half under, the file is unlinked, and
+ * the other is what keeps that half from emptying -- so it stays on the volume
+ * and is the next boot's victim.  Takes the wall clock in nanoseconds, because
+ * this file has no clock of its own.
+ */
+void	fs_apfs_index_selftest(uint64_t now);
+
+/*
  * Translate a virtual object id to its block number through the object-map
  * B-tree rooted at `tree_bno`, taking the newest version no later than `xid`.
  * Returns FS_APFS_E_OK and stores the block in *paddr_out, or a negative

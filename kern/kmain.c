@@ -199,11 +199,15 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	fs_make_selftest();
 
 	/*
-	 * Last of all, the one operation nothing else reaches any more: a node
-	 * that runs out of room.  Appending stopped filling one once runs that
-	 * touch began to be merged, so this asks for a split outright.
+	 * Last of all, the two operations nothing else reaches any more.  A
+	 * node that runs out of room: appending stopped filling one once runs
+	 * that touch began to be merged, so this asks for a split outright.
+	 * And a node that stops starting where the index above it says it
+	 * does, which needs a delete to land on a node's first record -- so
+	 * that is arranged rather than waited for.
 	 */
 	fs_split_selftest();
+	fs_index_selftest();
 
 	/*
 	 * Register a demo service under the bootstrap port so ring-3

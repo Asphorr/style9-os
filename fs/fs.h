@@ -361,6 +361,15 @@ void		fs_make_selftest(void);
 void		fs_split_selftest(void);
 
 /*
+ * Prove that the index above a node is corrected when the node stops starting
+ * where the index says it does -- which is what a delete of a node's first
+ * record does, and which the checker rejects.  Arranged on purpose, because
+ * waiting for it is not a test.  Silently does nothing when the volume is not
+ * APFS.
+ */
+void		fs_index_selftest(void);
+
+/*
  * The volume generation, and what it has caught: how many handles were older
  * than the volume when used, and how many of those had a length that really
  * had moved.  The first number moving proves the check is alive; the second
