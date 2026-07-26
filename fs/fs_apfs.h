@@ -1000,6 +1000,17 @@ void	fs_apfs_split_selftest(void);
 void	fs_apfs_index_selftest(uint64_t now);
 
 /*
+ * Make a node lose its last record, and prove it leaves the tree rather than
+ * staying in it holding nothing -- which apfsck calls "B-tree: keys are out of
+ * order", since the index above still files it under a key it no longer has.
+ * A freshly made file has the highest key on the volume, so splitting the leaf
+ * that holds its inode record AT that record puts it alone in a node; unlinking
+ * it is then the whole of the arrangement.  Takes the wall clock in
+ * nanoseconds, for the same reason as the test above.
+ */
+void	fs_apfs_drop_selftest(uint64_t now);
+
+/*
  * Translate a virtual object id to its block number through the object-map
  * B-tree rooted at `tree_bno`, taking the newest version no later than `xid`.
  * Returns FS_APFS_E_OK and stores the block in *paddr_out, or a negative

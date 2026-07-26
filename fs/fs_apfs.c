@@ -262,11 +262,45 @@ static int	alloc_blocks(uint32_t count, uint64_t near, uint64_t *first_out);
 static int	free_blocks(uint64_t first, uint32_t count);
 static int	alloc_flush(uint64_t xid);
 static struct alloc_chunk *chunk_for(uint64_t bno);
+
+/*
+ * EVERYTHING AN OBJECT MAP CAN BE TOLD, IN ONE COPY OF ITS NODE
+ *
+ * Three kinds of change, and they travel together because they are one event.
+ * The map node is copied once per transaction -- that is the rule the whole
+ * spine is built on -- so a caller that made three calls would copy it three
+ * times, and the second copy would be replacing an entry in a node the first
+ * had already released.  Correct, and six spine objects more expensive each
+ * time.
+ *
+ * Which of the three a caller fills in says what it did:
+ *
+ *	oe_oids/oe_paddrs	an object MOVED.  Every writer here does this,
+ *				because every write is a copy.
+ *	oe_new/oe_new_paddrs	an object was MADE, and writing its block did
+ *				not make it reachable -- this entry does.  A
+ *				split makes one; a root that splits makes two,
+ *				since it must keep its own oid.
+ *	oe_gone			an object is GONE: a node that lost its last
+ *				record and left the tree.  The map is the only
+ *				place that still names it, and a map that goes
+ *				on naming it is answered with "Omap record:
+ *				oid-xid combination is never used".
+ */
+struct omap_edit {
+	const uint64_t	*oe_oids;
+	const uint64_t	*oe_paddrs;
+	uint32_t	 oe_n;
+	const uint64_t	*oe_new;
+	const uint64_t	*oe_new_paddrs;
+	uint32_t	 oe_nnew;
+	const uint64_t	*oe_gone;
+	uint32_t	 oe_ngone;
+};
+
 static int	spine_update(uint64_t oid, uint64_t paddr, uint64_t xid,
 		    void *buf);
-static int	spine_update_n(const uint64_t *oids, const uint64_t *paddrs,
-		    uint32_t n, const uint64_t *ins_oids,
-		    const uint64_t *ins_paddrs, uint32_t nins, uint64_t xid,
+static int	spine_update_n(const struct omap_edit *oe, uint64_t xid,
 		    void *buf);
 static int	cow_physical(uint64_t old_bno, uint64_t xid, void *buf,
 		    uint64_t *new_bno);
@@ -314,6 +348,7 @@ static uint64_t	 kill_n;	/* ...and names taken back out     */
 static uint64_t	 hole_n;	/* record ends reusing a deletion  */
 static uint64_t	 deep_n;	/* levels the tree has gained      */
 static uint64_t	 reidx_n;	/* index keys corrected after an edit */
+static uint64_t	 drop_n;	/* emptied nodes taken out of a tree */
 
 static size_t
 str_len(const char *s)
@@ -342,6 +377,14 @@ mem_zero(uint8_t *dst, size_t n)
 
 	for (i = 0; i < n; i++)
 		dst[i] = 0;
+}
+
+/* Nothing to say to the object map yet; the caller fills in what it did. */
+static void
+omap_edit_init(struct omap_edit *oe)
+{
+
+	mem_zero((uint8_t *)oe, sizeof(*oe));
 }
 
 uint64_t
@@ -3939,6 +3982,24 @@ tree_nodes_add(uint8_t *root, int64_t delta)
 }
 
 /*
+ * And the same number read back, from a buffer the caller says is a root.
+ * Says so rather than trusting: the forty bytes are a btree_info only in a
+ * node carrying the ROOT flag, and in any other node they are records.
+ */
+static bool
+tree_nodes_of(const uint8_t *root, uint64_t *out)
+{
+	struct btree_layout	bl;
+
+	btree_layout(root, &bl);
+	if ((bl.bl_flags & APFS_BTNODE_ROOT) == 0)
+		return (false);
+	*out = *(const uint64_t *)(root + APFS_BLOCK_SIZE -
+	    APFS_BTREE_INFO_SIZE + APFS_BTREE_INFO_NODECOUNT);
+	return (true);
+}
+
+/*
  * WHO IS ABOVE A NODE
  *
  * A split hands its parent a separator, and until now "the parent" was a word
@@ -4052,7 +4113,9 @@ struct leaf_edit {
 	uint64_t	 le_oid[APFS_EDIT_LEAVES];
 	uint64_t	 le_new[APFS_EDIT_LEAVES];
 	uint8_t		*le_node[APFS_EDIT_LEAVES];
+	bool		 le_gone[APFS_EDIT_LEAVES];	/* left the tree   */
 	uint32_t	 le_n;
+	uint32_t	 le_dropped;	/* how many of them did            */
 	uint32_t	 le_root;	/* which of them is the tree root  */
 };
 
@@ -4087,11 +4150,13 @@ edit_init(struct leaf_edit *ne)
 {
 	uint32_t	i;
 
-	ne->le_n    = 0;
-	ne->le_root = APFS_EDIT_LEAVES;
+	ne->le_n       = 0;
+	ne->le_dropped = 0;
+	ne->le_root    = APFS_EDIT_LEAVES;
 	for (i = 0; i < APFS_EDIT_LEAVES; i++) {
 		ne->le_node[i] = NULL;
 		ne->le_new[i]  = 0;
+		ne->le_gone[i] = false;
 	}
 }
 
@@ -4196,6 +4261,114 @@ edit_free(struct leaf_edit *ne)
  * that can fail for want of room, which is why this runs before anything has
  * been copied.
  */
+/*
+ * A NODE THAT HAS LOST ITS LAST RECORD LEAVES THE TREE
+ *
+ * It cannot stay.  A node is filed above under a key that is its own first
+ * key, and a node with no records has no first key, so the index above it
+ * describes a record nobody can find -- which is not a matter of tidiness:
+ * an emptied node left in place was answered with
+ *
+ *	B-tree: keys are out of order.
+ *
+ * measured on a copy of the image before this was written.  Which is why the
+ * writer used to refuse the delete outright rather than leave one behind.
+ *
+ * Taking it out is five things, and the same measurement says what each one is
+ * for -- everything below done except one:
+ *
+ *	the parent stops naming it	B-tree: keys are out of order
+ *	the object map forgets its oid	Omap record: oid-xid combination is
+ *					never used
+ *	its block goes back		Space manager: bad allocation bitmap
+ *	the tree counts one node fewer	Catalog: wrong node count in info footer
+ *	the volume owns one block fewer	Volume superblock: bad block count
+ *
+ * This does the first; the other four happen in edit_commit, which is where
+ * blocks move and where the object map is told.  The node is not copied at
+ * all -- it is marked gone, and a gone node's block is released instead.
+ *
+ * WHAT THIS DOES NOT DO is give a LEVEL back.  A root left with a single child
+ * could be replaced by that child, and the same measurement says it does not
+ * have to be: a root with one child is accepted in silence.  So the tree can
+ * end up taller than its contents need, which costs a lookup one hop and is
+ * not a correctness question.  Collapsing it is its own rung.
+ *
+ * The cascade IS here, though, and it falls out of the shape rather than being
+ * arranged: the parent joins the edit, and if it was holding nothing but this
+ * child it is now empty itself, and the pass over the edit reaches it.
+ */
+static int
+node_drop(struct leaf_edit *ne, uint32_t i, uint8_t *scratch)
+{
+	struct tree_path	 tp;
+	struct btree_layout	 bl;
+	uint8_t			*parent;
+	uint32_t		 pkoff, pklen, pvoff, pvlen;
+	uint32_t		 pslot;
+	uint32_t		 pos;
+	int			 rv;
+
+	(void)scratch;
+	if (!path_to(ne->le_bno[i], &tp) || tp.tp_n < 2) {
+		kprintf("apfs: the empty node at %llu is not reachable from "
+		    "the root of the tree it is in\n",
+		    (unsigned long long)ne->le_bno[i]);
+		return (FS_APFS_E_NOTFOUND);
+	}
+	pslot = edit_leaf(ne, tp.tp_bno[tp.tp_n - 2]);
+	if (pslot == APFS_EDIT_LEAVES) {
+		kprintf("apfs: no room in this edit for the index above the "
+		    "empty node at %llu\n", (unsigned long long)ne->le_bno[i]);
+		return (FS_APFS_E_SPREAD);
+	}
+	if (ne->le_node[pslot] == NULL) {
+		rv = edit_load(ne, pslot);
+		if (rv != FS_APFS_E_OK)
+			return (rv);
+	}
+	parent = ne->le_node[pslot];
+
+	btree_layout(parent, &bl);
+	for (pos = 0; pos < bl.bl_nkeys; pos++) {
+		btree_entry_loc(&bl, pos, &pkoff, &pklen, &pvoff, &pvlen);
+		if (pvlen != sizeof(uint64_t))
+			continue;
+		if (*(const uint64_t *)(bl.bl_vals - pvoff) == ne->le_oid[i])
+			break;
+	}
+	if (pos == bl.bl_nkeys) {
+		kprintf("apfs: the node above the empty one at %llu does not "
+		    "name oid %llu\n", (unsigned long long)ne->le_bno[i],
+		    (unsigned long long)ne->le_oid[i]);
+		return (FS_APFS_E_NOTFOUND);
+	}
+	/*
+	 * The root is the one node that cannot go, since the volume superblock
+	 * names it -- so a tree whose last leaf has emptied stops here rather
+	 * than unmaking itself.  Nothing can reach this while the volume holds
+	 * a single file, because the root directory's own records are in it.
+	 */
+	if (bl.bl_nkeys == 1 && ne->le_oid[pslot] == g_apfs.ac_root_tree_oid) {
+		kprintf("apfs: the tree's last node has emptied -- a tree with "
+		    "nothing in it is not a state this writer makes\n");
+		return (FS_APFS_E_NOALLOC);
+	}
+	rv = leaf_delete(parent, pos);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+
+	ne->le_gone[i] = true;
+	ne->le_dropped++;
+	drop_n++;
+	kprintf("apfs: the node at %llu lost its last record and left the tree "
+	    "-- oid %llu names nothing now, and the node at %llu holds %u\n",
+	    (unsigned long long)ne->le_bno[i],
+	    (unsigned long long)ne->le_oid[i],
+	    (unsigned long long)ne->le_bno[pslot], (unsigned)(bl.bl_nkeys - 1));
+	return (FS_APFS_E_OK);
+}
+
 static int
 edit_reindex_one(struct leaf_edit *ne, uint32_t i, uint8_t *scratch)
 {
@@ -4210,15 +4383,13 @@ edit_reindex_one(struct leaf_edit *ne, uint32_t i, uint8_t *scratch)
 	uint32_t		 n;
 	int			 rv;
 
+	if (ne->le_gone[i])
+		return (FS_APFS_E_OK);		/* not in the tree any more */
 	if (ne->le_oid[i] == g_apfs.ac_root_tree_oid)
 		return (FS_APFS_E_OK);		/* nothing above it */
 	btree_layout(ne->le_node[i], &bl);
-	if (bl.bl_nkeys == 0) {
-		kprintf("apfs: the node at %llu has lost its last record -- "
-		    "taking an empty node out of the tree is a different "
-		    "rung\n", (unsigned long long)ne->le_bno[i]);
-		return (FS_APFS_E_NOALLOC);
-	}
+	if (bl.bl_nkeys == 0)
+		return (node_drop(ne, i, scratch));
 
 	if (!path_to(ne->le_bno[i], &tp) || tp.tp_n < 2) {
 		kprintf("apfs: the node at %llu is not reachable from the root "
@@ -4292,17 +4463,29 @@ static int
 edit_reindex(struct leaf_edit *ne, uint8_t *scratch)
 {
 	uint32_t	i;
+	uint32_t	settled;
 	int		rv;
 
 	/*
 	 * The bound is re-read every time round, because correcting a parent
 	 * puts that parent INTO this list -- and it may need correcting too.
+	 *
+	 * And the whole pass repeats until nothing changes, because a node can
+	 * be dealt with and then invalidated by a node dealt with after it: a
+	 * parent already walked past is emptied by the LAST of its children
+	 * going, and an empty node that nobody looks at again is exactly what
+	 * this is here to prevent.  Two numbers say whether anything happened
+	 * -- how many nodes the edit holds, and how many have left the tree --
+	 * and a pass that moves neither is a pass that found nothing to do.
 	 */
-	for (i = 0; i < ne->le_n; i++) {
-		rv = edit_reindex_one(ne, i, scratch);
-		if (rv != FS_APFS_E_OK)
-			return (rv);
-	}
+	do {
+		settled = ne->le_n + ne->le_dropped;
+		for (i = 0; i < ne->le_n; i++) {
+			rv = edit_reindex_one(ne, i, scratch);
+			if (rv != FS_APFS_E_OK)
+				return (rv);
+		}
+	} while (settled != ne->le_n + ne->le_dropped);
 	return (FS_APFS_E_OK);
 }
 
@@ -4316,34 +4499,57 @@ static int
 edit_commit(struct leaf_edit *ne, int64_t records, uint64_t xid,
     uint8_t *scratch)
 {
-	uint64_t	oids[APFS_EDIT_LEAVES + 1];
-	uint64_t	paddrs[APFS_EDIT_LEAVES + 1];
-	uint64_t	new_root;
-	uint32_t	nmoved;
-	uint32_t	i;
-	int		rv;
+	struct omap_edit	oe;
+	uint64_t		oids[APFS_EDIT_LEAVES + 1];
+	uint64_t		paddrs[APFS_EDIT_LEAVES + 1];
+	uint64_t		gone[APFS_EDIT_LEAVES];
+	uint64_t		new_root;
+	uint32_t		nmoved;
+	uint32_t		ngone;
+	uint32_t		i;
+	int			rv;
 
 	/*
 	 * FIRST, and in memory: an index that no longer describes its child is
 	 * the one thing here that can still refuse, and it can add nodes to
-	 * the list this function is about to copy.
+	 * the list this function is about to copy.  It is also where a node
+	 * that has lost its last record leaves the tree, which takes nodes OUT
+	 * of that list -- so the two counts below are not both le_n.
 	 */
 	rv = edit_reindex(ne, scratch);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
 
-	if (ne->le_root < ne->le_n)
+	if (ne->le_root < ne->le_n) {
 		tree_count_add(ne->le_node[ne->le_root], records);
+		tree_nodes_add(ne->le_node[ne->le_root],
+		    -(int64_t)ne->le_dropped);
+	}
 
+	nmoved = 0;
+	ngone  = 0;
 	for (i = 0; i < ne->le_n; i++) {
+		/*
+		 * A node that has left the tree is not copied: nothing names it
+		 * any more, so a copy would be a block written for no reader.
+		 * Its block goes back and its oid goes on the list the object
+		 * map has to forget.
+		 */
+		if (ne->le_gone[i]) {
+			rv = free_blocks(ne->le_bno[i], 1);
+			if (rv != FS_APFS_E_OK)
+				return (rv);
+			gone[ngone++] = ne->le_oid[i];
+			continue;
+		}
 		rv = node_cow(ne->le_node[i], ne->le_bno[i], xid,
 		    &ne->le_new[i]);
 		if (rv != FS_APFS_E_OK)
 			return (rv);
-		oids[i]   = ne->le_oid[i];
-		paddrs[i] = ne->le_new[i];
+		oids[nmoved]   = ne->le_oid[i];
+		paddrs[nmoved] = ne->le_new[i];
+		nmoved++;
 	}
-	nmoved = ne->le_n;
 
 	if (ne->le_root < ne->le_n) {
 		g_apfs.ac_root_tree_bno = ne->le_new[ne->le_root];
@@ -4352,6 +4558,7 @@ edit_commit(struct leaf_edit *ne, int64_t records, uint64_t xid,
 		if (rv != FS_APFS_E_OK)
 			return (rv);
 		tree_count_add(scratch, records);
+		tree_nodes_add(scratch, -(int64_t)ne->le_dropped);
 		oids[nmoved] = ((struct apfs_obj_phys *)scratch)->o_oid;
 		rv = node_cow(scratch, g_apfs.ac_root_tree_bno, xid, &new_root);
 		if (rv != FS_APFS_E_OK)
@@ -4360,8 +4567,21 @@ edit_commit(struct leaf_edit *ne, int64_t records, uint64_t xid,
 		g_apfs.ac_root_tree_bno = new_root;
 		nmoved++;
 	}
-	return (spine_update_n(oids, paddrs, nmoved, NULL, NULL, 0, xid,
-	    scratch));
+
+	/*
+	 * The volume owns one block fewer per node dropped, and it has to say
+	 * so BEFORE the spine runs -- the volume superblock carrying that count
+	 * is one of the things the spine copies.
+	 */
+	g_apfs.ac_fs_alloc_count -= ne->le_dropped;
+
+	omap_edit_init(&oe);
+	oe.oe_oids   = oids;
+	oe.oe_paddrs = paddrs;
+	oe.oe_n      = nmoved;
+	oe.oe_gone   = gone;
+	oe.oe_ngone  = ngone;
+	return (spine_update_n(&oe, xid, scratch));
 }
 
 /*
@@ -4405,6 +4625,7 @@ tree_grow(uint64_t xid, uint8_t *scratch)
 {
 	struct apfs_btree_node_phys	*n;
 	struct btree_layout		 bl;
+	struct omap_edit		 oe;
 	uint8_t				*lo;
 	uint8_t				*hi;
 	uint8_t				*nr;
@@ -4524,8 +4745,14 @@ tree_grow(uint64_t xid, uint8_t *scratch)
 	/* Two nodes more belong to this volume: three written, one freed. */
 	g_apfs.ac_fs_alloc_count += 2;
 
-	rv = spine_update_n(&root_oid, &new_root, 1, ins_oids, ins_paddrs, 2,
-	    xid, scratch);
+	omap_edit_init(&oe);
+	oe.oe_oids       = &root_oid;
+	oe.oe_paddrs     = &new_root;
+	oe.oe_n          = 1;
+	oe.oe_new        = ins_oids;
+	oe.oe_new_paddrs = ins_paddrs;
+	oe.oe_nnew       = 2;
+	rv = spine_update_n(&oe, xid, scratch);
 	if (rv != FS_APFS_E_OK)
 		goto broken;
 
@@ -4592,6 +4819,7 @@ node_split_at(uint64_t bno, uint32_t at, uint64_t xid, uint8_t *scratch)
 	struct tree_path		 tp;
 	struct apfs_obj_phys		*o;
 	struct btree_layout		 bl;
+	struct omap_edit		 oe;
 	uint8_t				*lo;
 	uint8_t				*hi;
 	uint8_t				*sep;
@@ -4817,8 +5045,14 @@ node_split_at(uint64_t bno, uint32_t at, uint64_t xid, uint8_t *scratch)
 	 */
 	g_apfs.ac_fs_alloc_count += 1;
 
-	rv = spine_update_n(oids, paddrs, nmoved, &hi_oid, &hi_bno, 1, xid,
-	    scratch);
+	omap_edit_init(&oe);
+	oe.oe_oids       = oids;
+	oe.oe_paddrs     = paddrs;
+	oe.oe_n          = nmoved;
+	oe.oe_new        = &hi_oid;
+	oe.oe_new_paddrs = &hi_bno;
+	oe.oe_nnew       = 1;
+	rv = spine_update_n(&oe, xid, scratch);
 	if (rv != FS_APFS_E_OK)
 		goto broken;
 
@@ -7160,6 +7394,90 @@ cow_physical(uint64_t old_bno, uint64_t xid, void *buf, uint64_t *new_bno)
 }
 
 /*
+ * Take an entry out of a node whose records are all one size.
+ *
+ * The variable-KV delete threads the freed bytes onto a chain, because the
+ * records around them are all different lengths and a hole is only useful to a
+ * record that fits it.  Here every key is sixteen bytes and so is every value,
+ * which makes the chain unnecessary and, worse, a leak: leaf_insert_fixed takes
+ * from the free span and never looks at a chain, so bytes put on one would
+ * never come back, and an object map that gains and loses an entry per
+ * transaction is a cycle -- the same shape that ate the free queue's node and
+ * then the catalog's.
+ *
+ * So the hole is FILLED rather than remembered.  The last record placed in the
+ * key area is moved into the freed key's bytes and the table entry that named
+ * it is pointed at the new place; the same on the value side, measured from the
+ * other end.  Which record that is has nothing to do with which record is last
+ * in key ORDER -- the table of contents is what puts records in order, and the
+ * areas it points into are just storage.
+ */
+static int
+omap_slot_drop(uint8_t *node, uint32_t pos)
+{
+	struct apfs_btree_node_phys	*n;
+	struct btree_layout		 bl;
+	struct apfs_kvoff		*kv;
+	uint8_t				*keys;
+	uint8_t				*vals;
+	uint32_t			 klen = sizeof(struct apfs_omap_key);
+	uint32_t			 vlen = sizeof(struct apfs_omap_val);
+	uint32_t			 last_koff;
+	uint32_t			 last_voff;
+	uint32_t			 koff, voff;
+	uint32_t			 i;
+
+	n = (struct apfs_btree_node_phys *)node;
+	btree_layout(node, &bl);
+	if (!bl.bl_fixed || pos >= bl.bl_nkeys)
+		return (FS_APFS_E_INVAL);
+	kv   = (struct apfs_kvoff *)(node + APFS_BTNODE_HDR_SIZE +
+	    n->btn_table_space.nl_off);
+	keys = node + APFS_BTNODE_HDR_SIZE + n->btn_table_space.nl_off +
+	    n->btn_table_space.nl_len;
+	vals = node + APFS_BLOCK_SIZE -
+	    (((n->btn_flags & APFS_BTNODE_ROOT) != 0) ?
+	    APFS_BTREE_INFO_SIZE : 0);
+	koff = kv[pos].k;
+	voff = kv[pos].v;
+
+	/*
+	 * Where the last key and the last value were put: the key area is
+	 * filled forwards to btn_free_space.nl_off, and the value area
+	 * backwards from the end of the node to just past the free span.
+	 */
+	last_koff = n->btn_free_space.nl_off - klen;
+	last_voff = (uint32_t)(vals - (keys + n->btn_free_space.nl_off +
+	    n->btn_free_space.nl_len));
+
+	if (koff != last_koff) {
+		mem_copy(keys + koff, keys + last_koff, klen);
+		for (i = 0; i < bl.bl_nkeys; i++)
+			if (kv[i].k == last_koff) {
+				kv[i].k = (uint16_t)koff;
+				break;
+			}
+	}
+	n->btn_free_space.nl_off = (uint16_t)last_koff;
+	n->btn_free_space.nl_len = (uint16_t)(n->btn_free_space.nl_len + klen);
+
+	if (voff != last_voff) {
+		mem_copy(vals - voff, vals - last_voff, vlen);
+		for (i = 0; i < bl.bl_nkeys; i++)
+			if (kv[i].v == last_voff) {
+				kv[i].v = (uint16_t)voff;
+				break;
+			}
+	}
+	n->btn_free_space.nl_len = (uint16_t)(n->btn_free_space.nl_len + vlen);
+
+	for (i = pos; i + 1 < bl.bl_nkeys; i++)
+		kv[i] = kv[i + 1];
+	n->btn_nkeys--;
+	return (FS_APFS_E_OK);
+}
+
+/*
  * Point an object map's entry for `oid` at `paddr`, and copy the node.
  *
  * REPLACES the entry rather than adding one.  A map may hold several versions
@@ -7169,14 +7487,13 @@ cow_physical(uint64_t old_bno, uint64_t xid, void *buf, uint64_t *new_bno)
  * room left -- which is a B-tree split, and a different rung.
  */
 static int
-omap_replace_cow(uint64_t node_bno, const uint64_t *oids,
-    const uint64_t *paddrs, uint32_t n, const uint64_t *ins_oids,
-    const uint64_t *ins_paddrs, uint32_t nins, uint64_t xid, void *buf,
-    uint64_t *new_node)
+omap_replace_cow(uint64_t node_bno, const struct omap_edit *oe, uint64_t xid,
+    void *buf, uint64_t *new_node)
 {
 	struct btree_layout	 bl;
 	struct apfs_omap_key	*k;
 	struct apfs_omap_val	*v;
+	uint64_t		*count;
 	uint32_t		 koff;
 	uint32_t		 voff;
 	uint32_t		 done;
@@ -7203,23 +7520,51 @@ omap_replace_cow(uint64_t node_bno, const uint64_t *oids,
 	 * every time.
 	 */
 	done = 0;
-	for (i = 0; i < bl.bl_nkeys && done < n; i++) {
+	for (i = 0; i < bl.bl_nkeys && done < oe->oe_n; i++) {
 		btree_entry_off(&bl, i, &koff, &voff);
 		k = (struct apfs_omap_key *)(bl.bl_keys + koff);
-		for (j = 0; j < n; j++) {
-			if (k->ok_oid != oids[j])
+		for (j = 0; j < oe->oe_n; j++) {
+			if (k->ok_oid != oe->oe_oids[j])
 				continue;
 			v = (struct apfs_omap_val *)(bl.bl_vals - voff);
 			k->ok_xid   = xid;
-			v->ov_paddr = paddrs[j];
+			v->ov_paddr = oe->oe_paddrs[j];
 			done++;
 			break;
 		}
 	}
-	if (done != n) {
+	if (done != oe->oe_n) {
 		kprintf("apfs: object map at %llu answered for %u of %u oids\n",
-		    (unsigned long long)node_bno, (unsigned)done, (unsigned)n);
+		    (unsigned long long)node_bno, (unsigned)done,
+		    (unsigned)oe->oe_n);
 		return (FS_APFS_E_NOTFOUND);
+	}
+
+	/*
+	 * And oids that name nothing any more.  Before the inserts, because a
+	 * deletion gives the span back and an insert that follows can use it.
+	 */
+	for (j = 0; j < oe->oe_ngone; j++) {
+		btree_layout(buf, &bl);
+		for (i = 0; i < bl.bl_nkeys; i++) {
+			btree_entry_off(&bl, i, &koff, &voff);
+			k = (struct apfs_omap_key *)(bl.bl_keys + koff);
+			if (k->ok_oid == oe->oe_gone[j])
+				break;
+		}
+		if (i == bl.bl_nkeys) {
+			kprintf("apfs: the object map at %llu does not name oid "
+			    "%llu, so it cannot stop naming it\n",
+			    (unsigned long long)node_bno,
+			    (unsigned long long)oe->oe_gone[j]);
+			return (FS_APFS_E_NOTFOUND);
+		}
+		rv = omap_slot_drop(buf, i);
+		if (rv != FS_APFS_E_OK)
+			return (rv);
+		count = (uint64_t *)((uint8_t *)buf + APFS_BLOCK_SIZE -
+		    APFS_BTREE_INFO_SIZE + APFS_BTREE_INFO_KEYCOUNT);
+		*count -= 1;
 	}
 
 	/*
@@ -7234,23 +7579,22 @@ omap_replace_cow(uint64_t node_bno, const uint64_t *oids,
 	 * one call at a time would copy this node twice for the same reason the
 	 * replacements above are a list.
 	 */
-	for (j = 0; j < nins; j++) {
+	for (j = 0; j < oe->oe_nnew; j++) {
 		struct apfs_omap_key	 ik;
 		struct apfs_omap_val	 iv;
-		uint64_t		*count;
 
 		btree_layout(buf, &bl);
 		for (i = 0; i < bl.bl_nkeys; i++) {
 			btree_entry_off(&bl, i, &koff, &voff);
 			k = (struct apfs_omap_key *)(bl.bl_keys + koff);
-			if (k->ok_oid > ins_oids[j])
+			if (k->ok_oid > oe->oe_new[j])
 				break;
 		}
-		ik.ok_oid   = ins_oids[j];
+		ik.ok_oid   = oe->oe_new[j];
 		ik.ok_xid   = xid;
 		iv.ov_flags = 0;
 		iv.ov_size  = APFS_BLOCK_SIZE;
-		iv.ov_paddr = ins_paddrs[j];
+		iv.ov_paddr = oe->oe_new_paddrs[j];
 		rv = leaf_insert_fixed(buf, i, &ik, (uint32_t)sizeof(ik), &iv,
 		    (uint32_t)sizeof(iv));
 		if (rv != FS_APFS_E_OK)
@@ -7388,13 +7732,12 @@ extref_move(uint64_t old_start, uint64_t new_start, uint64_t blocks,
  * it does, none of this is reachable from anything on the disk.
  */
 static int
-spine_update_n(const uint64_t *oids, const uint64_t *paddrs, uint32_t n,
-    const uint64_t *ins_oids, const uint64_t *ins_paddrs, uint32_t nins,
-    uint64_t xid, void *buf)
+spine_update_n(const struct omap_edit *oe, uint64_t xid, void *buf)
 {
 	struct apfs_omap_phys		*om;
 	struct apfs_superblock		*vsb;
 	struct apfs_obj_phys		*o;
+	struct omap_edit		 ctr;
 	uint64_t			 bno;
 	uint64_t			 new_ctr_omap;
 	uint64_t			 new_ctr_tree;
@@ -7405,8 +7748,8 @@ spine_update_n(const uint64_t *oids, const uint64_t *paddrs, uint32_t n,
 	int				 rv;
 
 	/* 1. the volume's object map: those oids now live at those addresses */
-	rv = omap_replace_cow(g_apfs.ac_vol_omap_tree, oids, paddrs, n,
-	    ins_oids, ins_paddrs, nins, xid, buf, &new_vol_tree);
+	rv = omap_replace_cow(g_apfs.ac_vol_omap_tree, oe, xid, buf,
+	    &new_vol_tree);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
 
@@ -7473,8 +7816,12 @@ spine_update_n(const uint64_t *oids, const uint64_t *paddrs, uint32_t n,
 
 	/* 4. the container's object map: the volume superblock has moved */
 	fs_oid = g_apfs.ac_fs_oid;
-	rv = omap_replace_cow(g_apfs.ac_ctr_omap_tree, &fs_oid, &new_vsb, 1,
-	    NULL, NULL, 0, xid, buf, &new_ctr_tree);
+	omap_edit_init(&ctr);
+	ctr.oe_oids   = &fs_oid;
+	ctr.oe_paddrs = &new_vsb;
+	ctr.oe_n      = 1;
+	rv = omap_replace_cow(g_apfs.ac_ctr_omap_tree, &ctr, xid, buf,
+	    &new_ctr_tree);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
 
@@ -7507,8 +7854,13 @@ spine_update_n(const uint64_t *oids, const uint64_t *paddrs, uint32_t n,
 static int
 spine_update(uint64_t oid, uint64_t paddr, uint64_t xid, void *buf)
 {
+	struct omap_edit	oe;
 
-	return (spine_update_n(&oid, &paddr, 1, NULL, NULL, 0, xid, buf));
+	omap_edit_init(&oe);
+	oe.oe_oids   = &oid;
+	oe.oe_paddrs = &paddr;
+	oe.oe_n      = 1;
+	return (spine_update_n(&oe, xid, buf));
 }
 
 /*
@@ -8427,24 +8779,16 @@ inode_slot_of(uint64_t oid, uint8_t *scratch, uint64_t *bno_out,
  * fallen, and an image can run for twenty boots without it coming up -- and
  * then produce a volume the checker rejects, which is how it was found.
  *
- * So it is arranged, out of two files that take turns.
+ * So it is arranged, out of two files.  The leaf holding the first one's inode
+ * record is split AT that record, which makes the record the upper half's
+ * first and therefore the key the index above files that half under; then the
+ * file is unlinked and the correction has to happen.  The second file is made
+ * afterwards, so its key is just past the first's and it goes to the same
+ * half: it is what stops that half emptying, which is a different question and
+ * has its own test below.
  *
- * The VICTIM is the one whose record is to start a node: the leaf holding its
- * inode record is split AT that record, so the record becomes the upper half's
- * first, which makes it that half's key in the index above -- and then the file
- * is unlinked and the key it left behind has to be corrected.
- *
- * The KEEPER is a second file made afterwards, and so with a higher inode
- * number and a key just past the victim's.  It goes to the same half, and it is
- * what stops that half emptying when the victim goes, a case this writer
- * refuses for its own reasons.  It is left on the volume ON PURPOSE.
- *
- * Which is what makes the arrangement hold for every boot after the first
- * without setting it up again.  The keeper is now a node's first record, so
- * next boot IT is the victim, the file made beside it is the new keeper, and no
- * split is needed at all -- the tree is already in the shape the test wants.
- * The two names alternate between the roles forever, and the volume carries
- * exactly one of them at a time.
+ * Both are taken away again, so the volume ends the boot as it began -- which
+ * it could not do until a node that lost its last record could leave the tree.
  *
  * What has to survive it is the invariant apfsck states as
  *
@@ -8457,23 +8801,16 @@ inode_slot_of(uint64_t oid, uint8_t *scratch, uint64_t *bno_out,
 void
 fs_apfs_index_selftest(uint64_t now)
 {
-	static const char *const	path[2] = {
-		"/etc/idxa.txt", "/etc/idxb.txt"
-	};
-	static const char *const	name[2] = { "idxa.txt", "idxb.txt" };
-	uint8_t				*scratch;
-	uint64_t			 parent;
-	uint64_t			 ino[2];
-	uint64_t			 bno;
-	uint64_t			 fixed;
-	uint32_t			 nkeys;
-	uint32_t			 at;
-	int				 victim;
-	int				 keeper;
-	int				 is_dir;
-	int				 i;
-	int				 rv;
-	bool				 have[2];
+	uint8_t		*scratch;
+	uint64_t	 parent;
+	uint64_t	 ino_a;
+	uint64_t	 ino_b;
+	uint64_t	 bno;
+	uint64_t	 fixed;
+	uint32_t	 nkeys;
+	uint32_t	 at;
+	int		 is_dir;
+	int		 rv;
 
 	if (!g_apfs.ac_mounted || !g_apfs.ac_ip_valid) {
 		kprintf("apfs-index: nothing writable -- skipped\n");
@@ -8485,101 +8822,60 @@ fs_apfs_index_selftest(uint64_t now)
 		return;
 	}
 
-	/*
-	 * Whichever of the pair is on the volume is the victim -- the lower
-	 * inode number if a run was interrupted and left both, since that is
-	 * the one whose record comes first.
-	 */
-	for (i = 0; i < 2; i++) {
-		ino[i]  = 0;
-		have[i] = fs_apfs_lookup(path[i], &ino[i], &is_dir) ==
-		    FS_APFS_E_OK && !is_dir;
-	}
-	if (have[0] && have[1])
-		victim = ino[0] < ino[1] ? 0 : 1;
-	else if (have[0])
-		victim = 0;
-	else if (have[1])
-		victim = 1;
-	else {
-		victim = 0;
-		rv = fs_apfs_create(parent, name[0], now, &ino[0]);
-		if (rv != FS_APFS_E_OK) {
-			kprintf("apfs-index: no room in /etc for the file this "
-			    "starts from (%d) -- skipped\n", rv);
-			return;
-		}
-		have[0] = true;
-	}
-	keeper = 1 - victim;
-	if (!have[keeper]) {
-		rv = fs_apfs_create(parent, name[keeper], now, &ino[keeper]);
-		if (rv != FS_APFS_E_OK) {
-			kprintf("apfs-index: no room in /etc for the file that "
-			    "keeps the node from emptying (%d) -- skipped\n",
-			    rv);
-			(void)fs_apfs_checkpoint();
-			return;
-		}
+	/* Whatever an interrupted run left, so this starts from nothing. */
+	(void)fs_apfs_unlink(parent, "idxa.txt", now);
+	(void)fs_apfs_unlink(parent, "idxb.txt", now);
+
+	rv = fs_apfs_create(parent, "idxa.txt", now, &ino_a);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_create(parent, "idxb.txt", now, &ino_b);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-index: no room in /etc for the two files this "
+		    "needs (%d) -- skipped\n", rv);
+		goto clean;
 	}
 	if (fs_apfs_checkpoint() != FS_APFS_E_OK) {
-		kprintf("apfs-index: FAIL the checkpoint after making them was "
-		    "refused\n");
+		kprintf("apfs-index: FAIL the checkpoint after making them "
+		    "was refused\n");
 		return;
 	}
 
 	scratch = kmalloc(APFS_BLOCK_SIZE);
 	if (scratch == NULL) {
 		kprintf("apfs-index: no memory -- skipped\n");
-		return;
+		goto clean;
 	}
-	if (!inode_slot_of(ino[victim], scratch, &bno, &at, &nkeys)) {
+	if (!inode_slot_of(ino_a, scratch, &bno, &at, &nkeys)) {
 		kprintf("apfs-index: FAIL inode %llu is not in the tree\n",
-		    (unsigned long long)ino[victim]);
+		    (unsigned long long)ino_a);
 		kfree(scratch);
 		return;
 	}
+	if (at == 0 || bno == g_apfs.ac_root_tree_bno) {
+		kprintf("apfs-index: inode %llu sits at slot %u of the node at "
+		    "%llu, which cannot be split there -- skipped\n",
+		    (unsigned long long)ino_a, (unsigned)at,
+		    (unsigned long long)bno);
+		kfree(scratch);
+		goto clean;
+	}
 
 	/*
-	 * Only the first boot on an image has to arrange anything: after that
-	 * the record is already a node's first, left that way by the correction
-	 * the last boot made.
+	 * Split so that the record starts the upper half.  The parent now
+	 * files that half under this record's key, and the file it belongs to
+	 * is about to go.
 	 */
-	if (at != 0) {
-		if (bno == g_apfs.ac_root_tree_bno) {
-			kprintf("apfs-index: the whole tree is one node, so no "
-			    "index names it -- skipped\n");
-			kfree(scratch);
-			return;
-		}
-		rv = node_split_at(bno, at, g_apfs.ac_xid + 1, scratch);
-		if (rv != FS_APFS_E_OK) {
-			kprintf("apfs-index: leaf %llu would not split at %u "
-			    "(%d) -- skipped\n", (unsigned long long)bno,
-			    (unsigned)at, rv);
-			kfree(scratch);
-			return;
-		}
-		if (fs_apfs_checkpoint() != FS_APFS_E_OK) {
-			kprintf("apfs-index: FAIL the checkpoint after the "
-			    "split was refused\n");
-			kfree(scratch);
-			return;
-		}
-		if (!inode_slot_of(ino[victim], scratch, &bno, &at, &nkeys) ||
-		    at != 0) {
-			kprintf("apfs-index: FAIL inode %llu does not start a "
-			    "node after splitting there\n",
-			    (unsigned long long)ino[victim]);
-			kfree(scratch);
-			return;
-		}
-	}
+	rv = node_split_at(bno, at, g_apfs.ac_xid + 1, scratch);
 	kfree(scratch);
-	if (nkeys < 2) {
-		kprintf("apfs-index: node %llu holds nothing but inode %llu, "
-		    "and emptying it is a different rung -- skipped\n",
-		    (unsigned long long)bno, (unsigned long long)ino[victim]);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-index: the node at %llu would not split at %u "
+		    "(%d) -- skipped\n", (unsigned long long)bno, (unsigned)at,
+		    rv);
+		goto clean;
+	}
+	if (fs_apfs_checkpoint() != FS_APFS_E_OK) {
+		kprintf("apfs-index: FAIL the checkpoint after the split was "
+		    "refused\n");
 		return;
 	}
 	if (!index_check(g_apfs.ac_root_tree_bno, 0)) {
@@ -8589,11 +8885,11 @@ fs_apfs_index_selftest(uint64_t now)
 	}
 
 	fixed = reidx_n;
-	rv = fs_apfs_unlink(parent, name[victim], now);
+	rv = fs_apfs_unlink(parent, "idxa.txt", now);
 	if (rv != FS_APFS_E_OK) {
 		kprintf("apfs-index: FAIL cannot unlink the file whose record "
 		    "starts a node (%d)\n", rv);
-		return;
+		goto clean;
 	}
 	if (fs_apfs_checkpoint() != FS_APFS_E_OK) {
 		kprintf("apfs-index: FAIL the checkpoint after the unlink was "
@@ -8603,7 +8899,7 @@ fs_apfs_index_selftest(uint64_t now)
 	if (reidx_n == fixed) {
 		kprintf("apfs-index: FAIL a node lost its first record and no "
 		    "index key was corrected\n");
-		return;
+		goto clean;
 	}
 	if (!index_check(g_apfs.ac_root_tree_bno, 0)) {
 		kprintf("apfs-index: FAIL the index is wrong after the "
@@ -8611,13 +8907,289 @@ fs_apfs_index_selftest(uint64_t now)
 		return;
 	}
 
-	kprintf("apfs-index: PASS -- node %llu was made to start at inode "
-	    "%llu's record, that record was deleted, and %llu index key(s) "
-	    "were corrected so that every node still starts where its parent "
-	    "says it does; %s stays behind holding that node open for the next "
-	    "boot\n", (unsigned long long)bno,
-	    (unsigned long long)ino[victim],
-	    (unsigned long long)(reidx_n - fixed), name[keeper]);
+	rv = fs_apfs_unlink(parent, "idxb.txt", now);
+	if (rv != FS_APFS_E_OK || fs_apfs_checkpoint() != FS_APFS_E_OK) {
+		kprintf("apfs-index: FAIL cannot take the second file back "
+		    "out (%d)\n", rv);
+		return;
+	}
+	kprintf("apfs-index: PASS -- a node was made to start at inode %llu's "
+	    "record, that record was deleted, and %llu index key(s) were "
+	    "corrected so that every node still starts where its parent says "
+	    "it does\n", (unsigned long long)ino_a,
+	    (unsigned long long)(reidx_n - fixed));
+	return;
+
+clean:
+	(void)fs_apfs_unlink(parent, "idxa.txt", now);
+	(void)fs_apfs_unlink(parent, "idxb.txt", now);
+	(void)fs_apfs_checkpoint();
+}
+
+/*
+ * AND THE NODE ITSELF GOES
+ *
+ * The tree only ever gained nodes, and the writer refused a delete that would
+ * have left an empty one behind rather than leave it -- which made an ordinary
+ * unlink fail for a reason that had nothing to do with the file.
+ *
+ * Arranged the same way and more simply than the index test above, because a
+ * freshly made file has the highest key on the volume: split the leaf holding
+ * its inode record AT that record, and the upper half holds that file's
+ * records and nothing else.  Unlink it and the half has to go.
+ *
+ * The claim is checked from three sides -- the counter moved, the tree says it
+ * holds one node fewer than it did, and every node still starts where its
+ * parent says it does -- because the first alone would pass on a writer that
+ * unhooked the node and forgot to say so, which is precisely the state apfsck
+ * calls "wrong node count in info footer".
+ *
+ * AND THE CASCADE IS ARRANGED TOO, when the tree is deep enough to allow it.
+ * A node that empties takes its parent's last entry, and a parent left holding
+ * nothing has to go the same way -- which no ordinary delete on this volume
+ * reaches, because a split always leaves its parent with at least two
+ * children.  So the node ABOVE the file's is split as well, at the entry that
+ * names it, which leaves a node whose only child is the one about to empty.
+ * Then the unlink takes two nodes out instead of one, and the count says so.
+ */
+void
+fs_apfs_drop_selftest(uint64_t now)
+{
+	struct tree_path	 tp;
+	struct btree_layout	 bl;
+	uint8_t			*scratch;
+	uint64_t		 parent;
+	uint64_t		 ino;
+	uint64_t		 bno;
+	uint64_t		 oid;
+	uint64_t		 before;
+	uint64_t		 after;
+	uint64_t		 dropped;
+	uint32_t		 nkeys;
+	uint32_t		 at;
+	uint32_t		 expect;
+	int			 is_dir;
+	int			 rv;
+
+	if (!g_apfs.ac_mounted || !g_apfs.ac_ip_valid) {
+		kprintf("apfs-drop: nothing writable -- skipped\n");
+		return;
+	}
+	if (fs_apfs_lookup("/etc", &parent, &is_dir) != FS_APFS_E_OK ||
+	    !is_dir) {
+		kprintf("apfs-drop: /etc is not there -- skipped\n");
+		return;
+	}
+
+	(void)fs_apfs_unlink(parent, "drop.txt", now);
+	rv = fs_apfs_create(parent, "drop.txt", now, &ino);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-drop: no room in /etc for the file this needs "
+		    "(%d) -- skipped\n", rv);
+		(void)fs_apfs_checkpoint();
+		return;
+	}
+	if (fs_apfs_checkpoint() != FS_APFS_E_OK) {
+		kprintf("apfs-drop: FAIL the checkpoint after making it was "
+		    "refused\n");
+		return;
+	}
+
+	scratch = kmalloc(APFS_BLOCK_SIZE);
+	if (scratch == NULL) {
+		kprintf("apfs-drop: no memory -- skipped\n");
+		goto clean;
+	}
+	if (!inode_slot_of(ino, scratch, &bno, &at, &nkeys)) {
+		kprintf("apfs-drop: FAIL inode %llu is not in the tree\n",
+		    (unsigned long long)ino);
+		kfree(scratch);
+		return;
+	}
+	if (at == 0 || bno == g_apfs.ac_root_tree_bno) {
+		kprintf("apfs-drop: inode %llu sits at slot %u of the node at "
+		    "%llu, which cannot be split there -- skipped\n",
+		    (unsigned long long)ino, (unsigned)at,
+		    (unsigned long long)bno);
+		kfree(scratch);
+		goto clean;
+	}
+	rv = node_split_at(bno, at, g_apfs.ac_xid + 1, scratch);
+	kfree(scratch);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-drop: the node at %llu would not split at %u "
+		    "(%d) -- skipped\n", (unsigned long long)bno, (unsigned)at,
+		    rv);
+		goto clean;
+	}
+	if (fs_apfs_checkpoint() != FS_APFS_E_OK) {
+		kprintf("apfs-drop: FAIL the checkpoint after the split was "
+		    "refused\n");
+		return;
+	}
+
+	/*
+	 * What the upper half holds now.  Asked rather than assumed: the file
+	 * is expected to be alone in it, and a half holding anything else
+	 * would not empty when the file goes -- so the test would pass without
+	 * having tried what it says it tries.
+	 */
+	scratch = kmalloc(APFS_BLOCK_SIZE);
+	if (scratch == NULL) {
+		kprintf("apfs-drop: no memory -- skipped\n");
+		goto clean;
+	}
+	if (!inode_slot_of(ino, scratch, &bno, &at, &nkeys) || at != 0) {
+		kprintf("apfs-drop: FAIL inode %llu does not start a node "
+		    "after splitting there\n", (unsigned long long)ino);
+		kfree(scratch);
+		return;
+	}
+	if (nkeys > 2) {
+		kprintf("apfs-drop: the node at %llu holds %u records and not "
+		    "just inode %llu's, so it would not empty -- skipped\n",
+		    (unsigned long long)bno, (unsigned)nkeys,
+		    (unsigned long long)ino);
+		kfree(scratch);
+		goto clean;
+	}
+
+	/*
+	 * And the node above it, split at the entry that names this one -- so
+	 * that entry ends up alone in a node too, and the delete has to take
+	 * two nodes out rather than one.  Every step of it is a question the
+	 * tree might answer no to (the parent may BE the root, or may hold
+	 * this child anywhere but last), and a no just means the simpler
+	 * arrangement, which is still worth testing.
+	 */
+	expect = 1;
+	oid    = ((const struct apfs_obj_phys *)scratch)->o_oid;
+
+	/*
+	 * A node hanging straight off the root cannot be left an only child:
+	 * the root is the one node that may not go, so emptying it is refused
+	 * rather than cascaded.  A tree that shallow is grown a level first --
+	 * by the same operation a full root goes through -- which puts a node
+	 * between the leaf and the root for the arrangement below to use.
+	 */
+	if (path_to(bno, &tp) && tp.tp_n < 3) {
+		kprintf("apfs-drop: the tree is %u level(s) deep, so the node "
+		    "above %llu is the root itself -- growing it one to have "
+		    "a cascade to arrange\n", (unsigned)tp.tp_n,
+		    (unsigned long long)bno);
+		if (tree_grow(g_apfs.ac_xid + 1, scratch) != FS_APFS_E_OK ||
+		    fs_apfs_checkpoint() != FS_APFS_E_OK)
+			kprintf("apfs-drop: the tree would not grow -- no "
+			    "cascade this boot\n");
+	}
+
+	if (!path_to(bno, &tp) || tp.tp_n < 3) {
+		kprintf("apfs-drop: the node at %llu hangs straight off the "
+		    "root, so there is no cascade to arrange\n",
+		    (unsigned long long)bno);
+	} else if (fs_apfs_read_block(tp.tp_bno[tp.tp_n - 2], scratch) !=
+	    FS_APFS_E_OK) {
+		kprintf("apfs-drop: the node above %llu will not read\n",
+		    (unsigned long long)bno);
+	} else {
+		uint32_t	koff, klen, voff, vlen;
+		uint32_t	slot;
+
+		btree_layout(scratch, &bl);
+		for (slot = 0; slot < bl.bl_nkeys; slot++) {
+			btree_entry_loc(&bl, slot, &koff, &klen, &voff, &vlen);
+			if (vlen == sizeof(oid) &&
+			    *(const uint64_t *)(bl.bl_vals - voff) == oid)
+				break;
+		}
+		if (slot == 0 || slot + 1 != bl.bl_nkeys) {
+			kprintf("apfs-drop: oid %llu is child %u of %u under "
+			    "the node at %llu, and only the last one can be "
+			    "left alone there -- no cascade this boot\n",
+			    (unsigned long long)oid, (unsigned)slot,
+			    (unsigned)bl.bl_nkeys,
+			    (unsigned long long)tp.tp_bno[tp.tp_n - 2]);
+		} else {
+			rv = node_split_at(tp.tp_bno[tp.tp_n - 2], slot,
+			    g_apfs.ac_xid + 1, scratch);
+			if (rv != FS_APFS_E_OK)
+				kprintf("apfs-drop: the node above would not "
+				    "split at %u (%d) -- no cascade this "
+				    "boot\n", (unsigned)slot, rv);
+			else if (fs_apfs_checkpoint() != FS_APFS_E_OK) {
+				kprintf("apfs-drop: FAIL the checkpoint after "
+				    "the second split was refused\n");
+				kfree(scratch);
+				return;
+			} else
+				expect = 2;
+		}
+	}
+
+	if (fs_apfs_read_block(g_apfs.ac_root_tree_bno, scratch) !=
+	    FS_APFS_E_OK || !tree_nodes_of(scratch, &before)) {
+		kprintf("apfs-drop: FAIL the tree will not say how many nodes "
+		    "it has\n");
+		kfree(scratch);
+		return;
+	}
+	kfree(scratch);
+
+	dropped = drop_n;
+	rv = fs_apfs_unlink(parent, "drop.txt", now);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-drop: FAIL cannot unlink the file that is alone "
+		    "in a node (%d)\n", rv);
+		goto clean;
+	}
+	if (fs_apfs_checkpoint() != FS_APFS_E_OK) {
+		kprintf("apfs-drop: FAIL the checkpoint after the unlink was "
+		    "refused\n");
+		return;
+	}
+	if (drop_n - dropped != expect) {
+		kprintf("apfs-drop: FAIL %u node(s) should have left the tree "
+		    "and %llu did\n", (unsigned)expect,
+		    (unsigned long long)(drop_n - dropped));
+		return;
+	}
+	scratch = kmalloc(APFS_BLOCK_SIZE);
+	if (scratch == NULL) {
+		kprintf("apfs-drop: no memory to read the node count back\n");
+		return;
+	}
+	if (fs_apfs_read_block(g_apfs.ac_root_tree_bno, scratch) !=
+	    FS_APFS_E_OK || !tree_nodes_of(scratch, &after)) {
+		kprintf("apfs-drop: FAIL the tree will not say how many nodes "
+		    "it has now\n");
+		kfree(scratch);
+		return;
+	}
+	kfree(scratch);
+	if (after + expect != before) {
+		kprintf("apfs-drop: FAIL the tree held %llu nodes and holds "
+		    "%llu after %u left it\n", (unsigned long long)before,
+		    (unsigned long long)after, (unsigned)expect);
+		return;
+	}
+	if (!index_check(g_apfs.ac_root_tree_bno, 0)) {
+		kprintf("apfs-drop: FAIL the index is wrong after a node "
+		    "left the tree\n");
+		return;
+	}
+
+	kprintf("apfs-drop: PASS -- inode %llu was alone in the node at %llu%s, "
+	    "and taking it away took %u node(s) with it: %llu where there were "
+	    "%llu, and every one of them still starts where its parent says it "
+	    "does\n", (unsigned long long)ino, (unsigned long long)bno,
+	    expect > 1 ? ", which was alone under the node above it" : "",
+	    (unsigned)expect, (unsigned long long)after,
+	    (unsigned long long)before);
+	return;
+
+clean:
+	(void)fs_apfs_unlink(parent, "drop.txt", now);
+	(void)fs_apfs_checkpoint();
 }
 
 /*
@@ -9452,11 +10024,11 @@ fs_apfs_stats(void)
 	 * longer starts where its parent said it did, which is a thing a
 	 * delete does without looking like it does.
 	 */
-	if (split_n != 0 || deep_n != 0 || reidx_n != 0)
-		kprintf("apfs: tree shape -- %llu node(s) split, %llu level(s) "
-		    "gained, %llu index key(s) corrected\n",
-		    (unsigned long long)split_n, (unsigned long long)deep_n,
-		    (unsigned long long)reidx_n);
+	if (split_n != 0 || deep_n != 0 || reidx_n != 0 || drop_n != 0)
+		kprintf("apfs: tree shape -- %llu node(s) split, %llu dropped, "
+		    "%llu level(s) gained, %llu index key(s) corrected\n",
+		    (unsigned long long)split_n, (unsigned long long)drop_n,
+		    (unsigned long long)deep_n, (unsigned long long)reidx_n);
 
 	/*
 	 * And the queues.  The number to watch is what is still waiting: it

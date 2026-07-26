@@ -381,6 +381,14 @@ void		fs_split_selftest(void);
 void		fs_index_selftest(void);
 
 /*
+ * Prove that a node which has lost its last record leaves the tree -- the
+ * parent stops naming it, the object map forgets its oid, its block goes back,
+ * and both counts that describe the tree follow.  Arranged on purpose, like
+ * the one above.  Silently does nothing when the volume is not APFS.
+ */
+void		fs_drop_selftest(void);
+
+/*
  * The volume generation, and what it has caught: how many handles were older
  * than the volume when used, and how many of those had a length that really
  * had moved.  The first number moving proves the check is alive; the second

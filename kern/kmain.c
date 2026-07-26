@@ -207,15 +207,18 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	fs_shell_selftest();
 
 	/*
-	 * Last of all, the two operations nothing else reaches any more.  A
+	 * Last of all, the three operations nothing else reaches any more.  A
 	 * node that runs out of room: appending stopped filling one once runs
 	 * that touch began to be merged, so this asks for a split outright.
-	 * And a node that stops starting where the index above it says it
-	 * does, which needs a delete to land on a node's first record -- so
-	 * that is arranged rather than waited for.
+	 * A node that stops starting where the index above it says it does,
+	 * which needs a delete to land on a node's first record.  And a node
+	 * that has nothing left in it at all, which has to leave the tree.
+	 * The last two are arranged rather than waited for, because where a
+	 * delete lands is a property of where the splits fell.
 	 */
 	fs_split_selftest();
 	fs_index_selftest();
+	fs_drop_selftest();
 
 	/*
 	 * Register a demo service under the bootstrap port so ring-3

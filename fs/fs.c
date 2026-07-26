@@ -1756,3 +1756,15 @@ fs_index_selftest(void)
 	mutex_unlock(&fs_lock);
 }
 
+/* And about a node that has nothing left in it. */
+void
+fs_drop_selftest(void)
+{
+
+	if (!fs_apfs_ready())
+		return;
+	mutex_lock(&fs_lock);
+	fs_apfs_drop_selftest((uint64_t)clock_walltime_us() * 1000ULL);
+	mutex_unlock(&fs_lock);
+}
+
