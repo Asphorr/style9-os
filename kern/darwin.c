@@ -777,6 +777,15 @@ darwin_ofile_clear(struct darwin_ofile *of)
 	switch (of->of_type) {
 	case DARWIN_OF_DIR:
 	case DARWIN_OF_FILE:
+		/*
+		 * THE ONE PLACE A DESCRIPTOR STOPS EXISTING, which is why the
+		 * file is given back here and not in close(2): dup2 over a live
+		 * slot, a task being torn down and an exec all end a descriptor
+		 * without going near that syscall, and each of them would
+		 * otherwise have to remember.  Harmless on a directory, whose
+		 * handle was never filled in and reads as FS_HANDLE_NONE.
+		 */
+		(void)fs_close(&of->of_handle);
 		if (of->of_buf != NULL)
 			kfree(of->of_buf);
 		if (of->of_path != NULL)
@@ -1567,6 +1576,15 @@ darwin_files_fork_copy(struct task *parent, struct task *child)
 				for (k = 0; k < src->of_size; k++)
 					buf[k] = src->of_buf[k];
 			}
+			/*
+			 * The child holds every file its parent held: a fork
+			 * doubles the descriptors, so it doubles the claims.
+			 */
+			if (fs_hold(&src->of_handle) != FS_E_OK) {
+				if (buf != NULL)
+					kfree(buf);
+				return (-1);
+			}
 			dst->of_buf    = buf;
 			dst->of_handle = src->of_handle;
 			dst->of_path   = darwin_path_dup(src->of_path);
@@ -1644,6 +1662,16 @@ darwin_dup_install(struct task *t, int oldfd, int newfd)
 				return (-DARWIN_ENOMEM);
 			for (k = 0; k < src->of_size; k++)
 				buf[k] = src->of_buf[k];
+		}
+		/*
+		 * A duplicate is a second holder, and the claim is made BEFORE
+		 * the copy: a refusal here must leave the target slot free
+		 * rather than holding a handle the filesystem is not counting.
+		 */
+		if (fs_hold(&src->of_handle) != FS_E_OK) {
+			if (buf != NULL)
+				kfree(buf);
+			return (-DARWIN_EMFILE);
 		}
 		dst->of_buf    = buf;
 		dst->of_handle = src->of_handle;
@@ -2497,12 +2525,25 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 				if (rv != FS_E_OK) {
 					kprintf("darwin: open('%s'): O_TRUNC "
 					    "refused (rv=%d)\n", path, rv);
+					/*
+					 * EVERY EXIT PAST fs_open GIVES THE
+					 * FILE BACK.  A resolved handle is a
+					 * claim on the file now, and one
+					 * dropped on the floor is permanent:
+					 * the row is never freed, so the
+					 * kernel's count of open files creeps
+					 * up until opens start failing, at a
+					 * point unrelated to the cause.
+					 */
+					(void)fs_close(&handle);
 					return (darwin_err(f,
 					    darwin_fs_errno(rv)));
 				}
 			}
-			if (handle.fh_size > 0xFFFFFFFFULL)
+			if (handle.fh_size > 0xFFFFFFFFULL) {
+				(void)fs_close(&handle);
 				return (darwin_err(f, DARWIN_ENOMEM));
+			}
 			size = (uint32_t)handle.fh_size;
 		}
 
@@ -2511,6 +2552,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		if (fd < 0) {
 			if (buf != NULL)
 				kfree(buf);
+			(void)fs_close(&handle);
 			return (darwin_err(f, DARWIN_EMFILE));
 		}
 		t->t_darwin_files[fd].of_buf    = buf;
@@ -2597,14 +2639,19 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			return (darwin_err(f, DARWIN_ENAMETOOLONG));
 
 		/*
-		 * An open fd is NOT kept alive by this.  Unix says a file lives
-		 * until its last name and its last descriptor are gone, and
-		 * that promise needs a reference count on the inode, which
-		 * needs a vnode layer this kernel does not have.  So the bytes
-		 * go now and a descriptor still open on them reads what is no
-		 * longer there.  Said out loud rather than discovered: no
-		 * program here holds a file it has unlinked, and one that did
-		 * would be relying on something never implemented.
+		 * AN OPEN DESCRIPTOR NOW KEEPS THE FILE ALIVE.  Unix says a
+		 * file lives until its last name and its last descriptor are
+		 * both gone; this used to keep only the first half and said so
+		 * out loud, because the second needs the filesystem to know
+		 * what is open and nothing told it.  Something does now (see
+		 * fs_open), so the choice is made one layer down: if anything
+		 * still holds this file, the name goes and the bytes wait in
+		 * the volume's private directory until the last close.
+		 *
+		 * Which happened is not reported here.  From ring 3 the two are
+		 * the same event -- the name is gone either way -- and a kernel
+		 * that announced the difference would be inviting programs to
+		 * depend on it.
 		 */
 		rv = fs_unlink(path);
 		if (rv != FS_E_OK) {

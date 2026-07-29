@@ -367,6 +367,71 @@ entry(void)
 		    "taken and a source that is not there\n");
 	(void)unlink(MOVED);
 
+	/*
+	 * 13. A FILE THAT OUTLIVES ITS OWN NAME.
+	 *
+	 * The oldest promise Unix makes about unlink and the one this kernel
+	 * used to say out loud it did not keep: a file lives until its last
+	 * name AND its last descriptor are gone.  It has to be asked from out
+	 * here, because the whole of it is what a HOLDER sees -- the kernel's
+	 * own test can prove the records are still on the volume, and only a
+	 * program still reading through a descriptor can prove they are still
+	 * the file it opened.
+	 *
+	 * Read AFTER the unlink and from a non-zero offset, so that a kernel
+	 * which had quietly kept the bytes in a buffer at open time could not
+	 * pass: what is checked is that the volume still answers.
+	 */
+	fd = open(PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0)
+		fail("cannot make the file to unlink while open");
+	else {
+		put = write(fd, FIRST, slen(FIRST));
+		(void)close(fd);
+		if (put != (long)slen(FIRST))
+			fail("the write before the unlink was short");
+	}
+	fd = open(PATH, O_RDONLY);
+	if (fd < 0)
+		fail("cannot open the file to unlink");
+	else {
+		if (unlink(PATH) != 0)
+			fail("unlink refused a file that is open");
+		else if (open(PATH, O_RDONLY) >= 0)
+			fail(PATH " still opens after being unlinked");
+		else if (lseek(fd, 8, SEEK_SET) != 8)
+			fail("lseek would not move in an unlinked file");
+		else {
+			got = read(fd, buf, sizeof(buf));
+			if (got != (long)slen(FIRST) - 8 ||
+			    !same(buf, FIRST + 8, (size_t)got))
+				fail("the bytes of an unlinked file are gone "
+				    "while it is still open");
+			else
+				printf("filewrite: PASS %s read %ld byte(s) "
+				    "through a descriptor after its only name "
+				    "was unlinked\n", PATH, got);
+		}
+		(void)close(fd);
+		/*
+		 * And now it really is gone.  Asked by making the name again:
+		 * an O_EXCL create is the one question whose answer tells
+		 * "the name is free" from "the name is free and the old file is
+		 * still sitting somewhere holding its blocks", because the
+		 * second is what a missing reap leaves and neither open nor
+		 * stat can see it.
+		 */
+		fd = open(PATH, O_WRONLY | O_CREAT | O_EXCL, 0644);
+		if (fd < 0)
+			fail("the name did not come free after the last close");
+		else {
+			(void)close(fd);
+			(void)unlink(PATH);
+			printf("filewrite: PASS the name came free once the "
+			    "last descriptor on it closed\n");
+		}
+	}
+
 	if (fails != 0) {
 		printf("filewrite: %d check(s) FAILED\n", fails);
 		exit(1);

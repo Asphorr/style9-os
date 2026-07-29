@@ -596,6 +596,38 @@ _Static_assert(__builtin_offsetof(struct apfs_superblock, apfs_volname) == 704,
 #define	APFS_ROOT_DIR_INO	2
 
 /*
+ * And so is the private directory's, which is what makes a Unix unlink
+ * possible on this volume at all.
+ *
+ * A file whose last name is taken away while a descriptor is still open on it
+ * must keep its bytes until that descriptor closes.  Somewhere it has to live
+ * in the meantime, and the format says where: this directory, which every
+ * volume is formatted with and which no path ever reaches, holds the files
+ * that have no name left.  A checker knows what it is looking at in there and
+ * calls them ORPHANS.
+ *
+ * What one has to look like was measured with apfsck rather than read off a
+ * layout, one refusal at a time:
+ *
+ *	- the ENTRY under this directory is named "0x%llx-dead", the object id
+ *	  in lower-case hex, or the answer is "Orphan inode: wrong name";
+ *	- the inode record's ai_parent_id must NOT be this directory, or the
+ *	  answer is "Inode record: parent is private directory".  It names the
+ *	  root here, which is the only parent that cannot be removed out from
+ *	  under it while it waits -- a dangling one reads as "Inode record:
+ *	  free inode number in use" the moment the old directory is rmdir'd;
+ *	- the link count must be ZERO, or the answer is "Orphan inode: has a
+ *	  link count".  Which is the truth: the entry in here is not a name,
+ *	  it is a place to wait, and nothing can open it by walking a path.
+ *
+ * No flag in ai_internal_flags is wanted, which was measured too.
+ */
+#define	APFS_PRIV_DIR_INO	3
+
+/* "0x" + 16 hex digits + "-dead" + NUL -- no name of ours collides. */
+#define	APFS_ORPHAN_NAME_MAX	24
+
+/*
  * Directory-entry keys come in two shapes and the volume's incompatible
  * feature flags pick which.  A case- or normalization-insensitive volume
  * stores a 22-bit hash of the name alongside its length, and orders entries
@@ -1036,6 +1068,72 @@ int	fs_apfs_rmdir(uint64_t dir, const char *name, uint64_t now);
  */
 int	fs_apfs_rename(uint64_t odir, const char *oname, uint64_t ndir,
 	    const char *nname, uint64_t now);
+
+/*
+ * Take a name away from a file that something still holds open.
+ *
+ * The entry leaves its directory for the private one, under the name the
+ * format wants there; the inode record follows it, as it does for a rename,
+ * except that what it is rebuilt with is the ROOT for a parent and ZERO for a
+ * link count.  The bytes are not touched.  Afterwards no path reaches the
+ * file and every open descriptor still does, which is what Unix promises and
+ * what this kernel used to say out loud that it did not keep.
+ *
+ * Refuses FS_APFS_E_ISDIR for a directory: an open directory whose name is
+ * taken away is a real case and a different one, since a directory in here
+ * would still have children whose parent is unreachable.
+ *
+ * *ino_out gets the object id, because that is the only handle on the file
+ * afterwards -- there is no name left to ask about.
+ */
+int	fs_apfs_orphan(uint64_t dir, const char *name, uint64_t now,
+	    uint64_t *ino_out);
+
+/*
+ * And let one go, when the last descriptor on it closes.
+ *
+ * The same work as an unlink -- the bytes, the three records, the counters --
+ * asked for by object id, since the caller has no name and the one in the
+ * private directory is derived rather than remembered.
+ */
+int	fs_apfs_reap(uint64_t ino, uint64_t now);
+
+/*
+ * Everything the private directory is still holding, let go at once.
+ *
+ * Called after mounting, and the case it exists for is a crash: an orphan is
+ * created by a kernel that means to reap it and gets to only if it lives that
+ * long.  A volume that comes up with names in here is a volume whose last boot
+ * ended between the two, and the format's answer -- the reason the directory
+ * exists rather than a log -- is that they can simply be finished now.
+ *
+ * *n_out gets how many, which is zero on every clean boot and the whole point
+ * of the number on the others.
+ */
+int	fs_apfs_reap_all(uint64_t now, uint32_t *n_out);
+
+/*
+ * How many names have been taken from files still open, and how many of those
+ * files have since been let go.
+ *
+ * They are counted apart because they are not the same event and need not
+ * balance within one boot: a file orphaned by a kernel that then stopped is
+ * reaped by the next one, and the pair of numbers across two boots is how a
+ * test says so.
+ */
+uint64_t fs_apfs_orphans(void);
+uint64_t fs_apfs_reaps(void);
+
+/*
+ * apfs-orphan: a file kept alive by nothing but a promise.
+ *
+ * Arranges it, like the rungs above: writes a file with a length, takes its
+ * name away, and then asks the questions that only hold if the bytes survived
+ * -- the length is what it was, the path no longer resolves, the object id
+ * still does.  Then lets it go and checks the volume is back where it started,
+ * because an orphan that is never reaped is a leak that apfsck calls valid.
+ */
+void	fs_apfs_orphan_selftest(uint64_t now);
 
 /*
  * How many files have been made and unmade, and how many record ends have been

@@ -198,6 +198,8 @@ static uint64_t	 kill_n;	/* ...and names taken back out     */
 static uint64_t	 dmake_n;	/* directories made                */
 static uint64_t	 dkill_n;	/* ...and directories removed      */
 static uint64_t	 move_n;	/* names moved by a rename         */
+static uint64_t	 orph_n;	/* names taken from an open file   */
+static uint64_t	 reap_n;	/* ...and those files let go       */
 static uint64_t	 hole_n;	/* record ends reusing a deletion  */
 uint64_t	 deep_n;	/* levels the tree has gained      */
 uint64_t	 reidx_n;	/* index keys corrected after an edit */
@@ -2385,6 +2387,15 @@ struct inode_info {
 	uint32_t	ii_gid;
 	uint16_t	ii_mode;
 	bool		ii_found;
+	/*
+	 * No names left, which ii_nlink cannot say.  That field reports 1 for a
+	 * file whose record claims none, because a file off the image may claim
+	 * none and still be perfectly reachable -- so the one state where the
+	 * count is meant literally is the one the count is rounded away from.
+	 * Asked of the record rather than of ii_nlink, and only ever true of a
+	 * file waiting in the private directory.
+	 */
+	bool		ii_orphan;
 };
 
 static bool
@@ -2436,6 +2447,8 @@ inode_pick(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 	ii->ii_nlink = (iv->ai_mode & APFS_S_IFMT) == APFS_S_IFDIR ? 1u :
 	    (iv->ai_nchildren_or_nlink > 0 ?
 	    (uint32_t)iv->ai_nchildren_or_nlink : 1u);
+	ii->ii_orphan = (iv->ai_mode & APFS_S_IFMT) != APFS_S_IFDIR &&
+	    iv->ai_nchildren_or_nlink == 0;
 	ii->ii_found = true;
 
 	/*
@@ -2492,6 +2505,7 @@ inode_info(uint64_t oid, struct inode_info *ii)
 	ii->ii_gid        = 0;
 	ii->ii_mode       = 0;
 	ii->ii_found      = false;
+	ii->ii_orphan     = false;
 	key = (oid & APFS_J_OBJ_ID_MASK) |
 	    ((uint64_t)APFS_TYPE_INODE << APFS_J_OBJ_TYPE_SHIFT);
 	stopped = false;
@@ -5590,25 +5604,44 @@ grow_once(uint64_t ino, uint64_t id, uint64_t new_size, uint64_t *full_leaf)
 		goto give_back;
 	}
 
+	/*
+	 * THE EXTENT-REFERENCE TREE, AND WHY ITS REFUSAL GIVES THE BLOCKS BACK.
+	 *
+	 * Both of these fail before they copy anything -- extref_insert refuses
+	 * a full node and extref_extend a run it cannot find, and neither has
+	 * reached its cow_physical by then -- and the catalog edit above is
+	 * still only in memory.  So NOTHING has moved, and the blocks this grow
+	 * took out of the bitmap are the one thing that has changed.
+	 *
+	 * They used to be kept.  The failure printed "this checkpoint must not
+	 * be written", which was a wish rather than a mechanism: the boot went
+	 * on, the next checkpoint wrote the bitmap with those blocks marked
+	 * used, and nothing on the volume named them.  What apfsck calls
+	 * that is "Space manager: bad allocation bitmap", three boots later,
+	 * with every
+	 * self-test passing in between.  Giving them back turns a silent
+	 * corruption into an honest refusal.
+	 */
 	if (blocks != 0 && merge) {
 		merge_n++;
 		rv = extref_extend(last.el_phys, blocks, xid, node);
 		if (rv != FS_APFS_E_OK) {
-			kprintf("apfs: the run at %llu grew but the extent "
-			    "reference tree still calls it %llu blocks "
-			    "(%d)\n",
-			    (unsigned long long)last.el_phys,
-			    (unsigned long long)(last.el_len / APFS_BLOCK_SIZE),
-			    rv);
-			goto broken;
+			kprintf("apfs: the run at %llu cannot grow in the "
+			    "extent reference tree (%d) -- the %llu block(s) "
+			    "taken for it go back and nothing is written\n",
+			    (unsigned long long)last.el_phys, rv,
+			    (unsigned long long)blocks);
+			goto give_back;
 		}
 	} else if (blocks != 0) {
 		rv = extref_insert(first, blocks, ino, xid, node);
 		if (rv != FS_APFS_E_OK) {
-			kprintf("apfs: the file grew but the extent reference "
-			    "tree does not know who owns %llu (%d)\n",
-			    (unsigned long long)first, rv);
-			goto broken;
+			kprintf("apfs: the extent reference tree will not take "
+			    "an owner for %llu (%d) -- the %llu block(s) go "
+			    "back and nothing is written\n",
+			    (unsigned long long)first, rv,
+			    (unsigned long long)blocks);
+			goto give_back;
 		}
 	}
 
@@ -6872,7 +6905,14 @@ unmake_at(uint64_t dir, const char *name, uint64_t now, bool isdir)
 	child = ds.ds_found;
 	if (inode_info(child, &ii) != FS_APFS_E_OK)
 		return (FS_APFS_E_NOTFOUND);
-	if (!isdir && ii.ii_nlink != 1) {
+	/*
+	 * An ORPHAN is exempt, and explicitly rather than by arithmetic: it has
+	 * no names at all, ii_nlink rounds that up to one, and the guard would
+	 * therefore let it through by accident.  What comes through here is a
+	 * file being let go from the private directory, which is the one caller
+	 * for which "how many names does it have" is already settled.
+	 */
+	if (!isdir && !ii.ii_orphan && ii.ii_nlink != 1) {
 		kprintf("apfs: inode %llu has %u links and this kernel makes "
 		    "none -- unlinking one of several is a different rung\n",
 		    (unsigned long long)child, (unsigned)ii.ii_nlink);
@@ -7262,14 +7302,57 @@ dir_under(uint64_t dir, uint64_t top, bool *under)
 }
 
 /*
+ * The name a file waits under once it has none.
+ *
+ * Derived from the object id and never stored, which is what makes the private
+ * directory usable without a table on the side: a caller holding the id can
+ * always say what the entry is called, and two orphans cannot collide because
+ * two live files cannot share an id.
+ */
+static void
+orphan_name(uint64_t ino, char *out)
+{
+	static const char	hex[] = "0123456789abcdef";
+	uint64_t		v;
+	uint32_t		n;
+	uint32_t		i;
+
+	out[0] = '0';
+	out[1] = 'x';
+	n = 2;
+	/* No leading zeroes: apfsck wants the "%llx" of it, not a width. */
+	for (i = 16; i > 0; i--) {
+		v = (ino >> ((i - 1) * 4)) & 0xfu;
+		if (v != 0 || n > 2 || i == 1)
+			out[n++] = hex[v];
+	}
+	out[n++] = '-';
+	out[n++] = 'd';
+	out[n++] = 'e';
+	out[n++] = 'a';
+	out[n++] = 'd';
+	out[n]   = '\0';
+}
+
+/*
  * One attempt at moving a name, which NAMES the leaf that had no room -- the
  * same bargain make_once strikes, and for the same reason: a split moves the
  * leaf, its parent, the root and the object map, so nothing worked out below
  * survives one.
+ *
+ * ORPHANING IS THE SAME MOVE, and is done here rather than beside here because
+ * the three ways it differs are three lines and the two hundred it would share
+ * are the hard ones.  A file whose last name is taken away while something
+ * still holds it open moves into the private directory, and there it must say
+ * what the format wants said of an orphan: a parent that is not the private
+ * directory (the root, which cannot be removed out from under it), and a link
+ * count of zero.  Everything else -- building the record before deleting it,
+ * carrying the entry's value across whole, the counters, the split retry -- is
+ * the same problem with the same answer.
  */
 static int
 move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
-    uint64_t now, uint64_t *full_leaf)
+    uint64_t now, bool orphan, uint64_t *full_leaf)
 {
 	struct apfs_drec_val	 dv;
 	struct btree_layout	 bl;
@@ -7385,6 +7468,18 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 		    (unsigned long long)child, (unsigned)ii.ii_nlink);
 		return (FS_APFS_E_NOALLOC);
 	}
+	/*
+	 * A DIRECTORY CANNOT WAIT IN THERE.  Not a limitation of this writer:
+	 * an orphaned directory would still hold entries, and their parent
+	 * would be a place no path reaches -- so every name under it becomes
+	 * unreachable while remaining perfectly valid, which is the one shape
+	 * of damage a checker cannot tell from a healthy volume.
+	 */
+	if (orphan && isdir) {
+		kprintf("apfs: \"%s\" is a directory -- one held open while "
+		    "its name goes away is a rung of its own\n", oname);
+		return (FS_APFS_E_ISDIR);
+	}
 	if (child == APFS_ROOT_DIR_INO)
 		return (FS_APFS_E_INVAL);
 	/*
@@ -7453,10 +7548,19 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 	}
 	btree_layout(ne.le_node[slot], &bl);
 	old = (const uint8_t *)bl.bl_vals - voff;
-	rv  = inode_renamed(old, vlen, ndir, nname, nnlen, now, rec,
-	    APFS_BLOCK_SIZE, &rlen);
+	rv  = inode_renamed(old, vlen, orphan ? APFS_ROOT_DIR_INO : ndir, nname,
+	    nnlen, now, rec, APFS_BLOCK_SIZE, &rlen);
 	if (rv != FS_APFS_E_OK)
 		goto out;
+	/*
+	 * The parent went in above, as an argument; the link count goes on
+	 * afterwards, because inode_renamed carries the fixed part across
+	 * verbatim by design -- it rebuilds a record, it does not decide what
+	 * the file is.  Zero is not bookkeeping: it is the statement that no
+	 * name reaches this file, which is exactly what just became true.
+	 */
+	if (orphan)
+		((struct apfs_inode_val *)rec)->ai_nchildren_or_nlink = 0;
 
 	/*
 	 * The old entry out.  By its exact key, like unmake_at: a directory has
@@ -7568,11 +7672,20 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 		goto out;
 	}
 
-	move_n++;
-	kprintf("apfs: \"%s\" in inode %llu is now \"%s\" in inode %llu -- "
-	    "inode %llu, %u leaves moved\n", oname, (unsigned long long)odir,
-	    nname, (unsigned long long)ndir, (unsigned long long)child,
-	    (unsigned)ne.le_n);
+	if (orphan) {
+		orph_n++;
+		kprintf("apfs: \"%s\" is gone from inode %llu -- inode %llu "
+		    "waits in the private directory as \"%s\", %llu byte(s) "
+		    "still there, %u leaves moved\n", oname,
+		    (unsigned long long)odir, (unsigned long long)child, nname,
+		    (unsigned long long)ii.ii_size, (unsigned)ne.le_n);
+	} else {
+		move_n++;
+		kprintf("apfs: \"%s\" in inode %llu is now \"%s\" in inode "
+		    "%llu -- inode %llu, %u leaves moved\n", oname,
+		    (unsigned long long)odir, nname, (unsigned long long)ndir,
+		    (unsigned long long)child, (unsigned)ne.le_n);
+	}
 	rv = FS_APFS_E_OK;
 out:
 	edit_free(&ne);
@@ -7594,7 +7707,7 @@ out:
  */
 static int
 move_at(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
-    uint64_t now)
+    uint64_t now, bool orphan)
 {
 	uint8_t		*scratch;
 	uint64_t	 full;
@@ -7603,7 +7716,7 @@ move_at(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 
 	for (tries = 0; ; tries++) {
 		full = 0;
-		rv = move_once(odir, oname, ndir, nname, now, &full);
+		rv = move_once(odir, oname, ndir, nname, now, orphan, &full);
 		if (rv != FS_APFS_E_NOALLOC || full == 0)
 			return (rv);
 		if (tries >= 2) {
@@ -7629,7 +7742,197 @@ fs_apfs_rename(uint64_t odir, const char *oname, uint64_t ndir,
     const char *nname, uint64_t now)
 {
 
-	return (move_at(odir, oname, ndir, nname, now));
+	return (move_at(odir, oname, ndir, nname, now, false));
+}
+
+/*
+ * Which object a name in a directory stands for.
+ *
+ * The orphan calls need this before they can do anything, because the entry a
+ * file waits under is DERIVED from its object id -- so the id has to be known
+ * before the name it moves to can be spelled.  One descent, and the writer
+ * below resolves the name a second time; that is a descent, not a scan, and
+ * paying it keeps the move in one function instead of two halves.
+ */
+static int
+dirent_find(uint64_t dir, const char *name, uint64_t *child, bool *isdir)
+{
+	struct dirent_search	ds;
+	uint8_t			dkey[12 + APFS_MAKE_NAME_MAX + 1];
+	uint32_t		dklen;
+	uint32_t		nlen;
+	int			rv;
+	bool			stopped;
+
+	nlen = (uint32_t)str_len(name);
+	if (nlen == 0 || nlen > APFS_MAKE_NAME_MAX)
+		return (FS_APFS_E_INVAL);
+	rv = drec_key(dir, name, nlen, dkey, &dklen, true);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+
+	ds.ds_name    = name;
+	ds.ds_namelen = nlen;
+	ds.ds_parent  = dir;
+	ds.ds_found   = 0;
+	ds.ds_is_dir  = false;
+	ds.ds_keyed   = true;
+	stopped = false;
+	if (!btree_scan(g_apfs.ac_root_tree_bno, dkey, dklen, dirent_match, &ds,
+	    0, &stopped))
+		return (FS_APFS_E_IO);
+	if (ds.ds_found == 0)
+		return (FS_APFS_E_NOTFOUND);
+	*child = ds.ds_found;
+	*isdir = ds.ds_is_dir;
+	return (FS_APFS_E_OK);
+}
+
+int
+fs_apfs_orphan(uint64_t dir, const char *name, uint64_t now, uint64_t *ino_out)
+{
+	char		dead[APFS_ORPHAN_NAME_MAX];
+	uint64_t	child;
+	int		rv;
+	bool		isdir;
+
+	if (!g_apfs.ac_mounted)
+		return (FS_APFS_E_NOMOUNT);
+	rv = dirent_find(dir, name, &child, &isdir);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	if (isdir)
+		return (FS_APFS_E_ISDIR);
+
+	orphan_name(child, dead);
+	rv = move_at(dir, name, APFS_PRIV_DIR_INO, dead, now, true);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	if (ino_out != NULL)
+		*ino_out = child;
+	return (FS_APFS_E_OK);
+}
+
+int
+fs_apfs_reap(uint64_t ino, uint64_t now)
+{
+	struct inode_info	ii;
+	char			dead[APFS_ORPHAN_NAME_MAX];
+	int			rv;
+
+	if (!g_apfs.ac_mounted)
+		return (FS_APFS_E_NOMOUNT);
+
+	/*
+	 * ASKED FOR PROOF FIRST, because this destroys and the caller's word
+	 * for it is a counter kept somewhere else.  An inode that still has a
+	 * name has a link count, and taking its bytes on a caller's say-so
+	 * would leave a live entry pointing at nothing -- which is not a shape
+	 * this kernel can produce today and is exactly the shape a wrong
+	 * reference count would produce tomorrow.
+	 */
+	rv = inode_info(ino, &ii);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	if (!ii.ii_orphan) {
+		kprintf("apfs: inode %llu still has a name -- it is not "
+		    "waiting to be let go\n", (unsigned long long)ino);
+		return (FS_APFS_E_INVAL);
+	}
+
+	orphan_name(ino, dead);
+	rv = unmake_at(APFS_PRIV_DIR_INO, dead, now, false);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	reap_n++;
+	return (FS_APFS_E_OK);
+}
+
+struct orphan_probe {
+	uint64_t	op_child;
+	bool		op_any;
+};
+
+static bool
+orphan_first(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
+    const uint8_t *val, uint32_t vlen, uint64_t bno, void *arg)
+{
+	struct orphan_probe	*op;
+
+	(void)key;
+	(void)klen;
+	(void)bno;
+	op = arg;
+	/*
+	 * The scan began at the private directory's first possible entry, so
+	 * the first record handed over is either one of its names or proof
+	 * that it has none.  Nothing behind it is worth reading either way.
+	 */
+	if (type != APFS_TYPE_DIR_REC || oid != APFS_PRIV_DIR_INO)
+		return (false);
+	if (vlen >= sizeof(struct apfs_drec_val)) {
+		op->op_child = ((const struct apfs_drec_val *)val)->dv_file_id;
+		op->op_any   = true;
+	}
+	return (false);
+}
+
+int
+fs_apfs_reap_all(uint64_t now, uint32_t *n_out)
+{
+	struct orphan_probe	op;
+	uint8_t			dkey[APFS_DREC_KEY_MAX];
+	uint32_t		dklen;
+	uint32_t		n;
+	int			rv;
+	bool			stopped;
+
+	*n_out = 0;
+	if (!g_apfs.ac_mounted)
+		return (FS_APFS_E_NOMOUNT);
+
+	/*
+	 * ONE AT A TIME, re-asking the tree after each, rather than listing
+	 * them and then removing the list.  Every reap rewrites leaves and can
+	 * split or drop one, so a list gathered beforehand is a list of places
+	 * that have since moved -- and the cost of asking again is a descent,
+	 * against a whole boot's worth of work already done by the time this
+	 * runs.
+	 *
+	 * The bound is not decoration.  If a reap ever answered success without
+	 * taking the entry out, this would sit here forever on the same one,
+	 * and a mount that never finishes is harder to diagnose than a mount
+	 * that says what it gave up on.
+	 */
+	for (n = 0; n < 4096; n++) {
+		op.op_child = 0;
+		op.op_any   = false;
+		drec_low_key(APFS_PRIV_DIR_INO, dkey, &dklen);
+		stopped = false;
+		if (!btree_scan(g_apfs.ac_root_tree_bno, dkey, dklen,
+		    orphan_first, &op, 0, &stopped))
+			return (FS_APFS_E_IO);
+		if (!op.op_any)
+			break;
+		rv = fs_apfs_reap(op.op_child, now);
+		if (rv != FS_APFS_E_OK) {
+			kprintf("apfs: inode %llu was left in the private "
+			    "directory and cannot be let go (%d)\n",
+			    (unsigned long long)op.op_child, rv);
+			return (rv);
+		}
+	}
+	if (n >= 4096) {
+		kprintf("apfs: the private directory is still not empty after "
+		    "%u reaps -- giving up rather than looping\n", n);
+		return (FS_APFS_E_INVAL);
+	}
+
+	*n_out = n;
+	if (n != 0)
+		kprintf("apfs: %u file(s) were left waiting in the private "
+		    "directory by an earlier boot and have been let go\n", n);
+	return (FS_APFS_E_OK);
 }
 
 uint64_t
@@ -7637,6 +7940,20 @@ fs_apfs_moves(void)
 {
 
 	return (move_n);
+}
+
+uint64_t
+fs_apfs_orphans(void)
+{
+
+	return (orph_n);
+}
+
+uint64_t
+fs_apfs_reaps(void)
+{
+
+	return (reap_n);
 }
 
 uint64_t

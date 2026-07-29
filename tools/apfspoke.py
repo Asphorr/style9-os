@@ -5,6 +5,8 @@ apfsck can be asked what it thinks of the result.
     python3 tools/apfspoke.py IMAGE list                 -- names, entry vs record
     python3 tools/apfspoke.py IMAGE name   NAME LETTER   -- the inode's NAME field
     python3 tools/apfspoke.py IMAGE parent NAME OID      -- the inode's ai_parent_id
+    python3 tools/apfspoke.py IMAGE nlink  NAME N        -- the link count
+    python3 tools/apfspoke.py IMAGE flags  NAME BITS     -- ai_internal_flags
     python3 tools/apfspoke.py IMAGE footer [KEY VAL]     -- the root's btree_info
 
 This is a MEASURING INSTRUMENT, not a repair tool.  A writer that forgets an
@@ -260,6 +262,18 @@ def main():
         struct.pack_into("<Q", b, at, int(sys.argv[4]))
         print("inode %d in node %d: parent %d -> %s (the entry is still in "
               "%d)" % (child, bno, was, sys.argv[4], was))
+    elif what == "nlink":
+        at = va + 56		# ai_nchildren_or_nlink
+        was = struct.unpack_from("<i", b, at)[0]
+        struct.pack_into("<i", b, at, int(sys.argv[4]))
+        print("inode %d in node %d: link count %d -> %s" %
+              (child, bno, was, sys.argv[4]))
+    elif what == "flags":
+        at = va + 48		# ai_internal_flags
+        was = u64(b, at)
+        struct.pack_into("<Q", b, at, int(sys.argv[4], 0))
+        print("inode %d in node %d: internal flags 0x%x -> %s" %
+              (child, bno, was, sys.argv[4]))
     else:
         raise SystemExit("no such poke: %s" % what)
     reseal(img, bno, b)

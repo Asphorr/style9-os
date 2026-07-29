@@ -502,8 +502,55 @@ less is refused, so the two are high-water marks that rise with an insert
 and are never lowered -- a delete does not have to walk the tree to
 tighten a bound no reader needs tight.
 
+And then the writer stopped being the thing that was behind.  A file can
+now **outlive its own name**, which is the oldest promise Unix makes about
+`unlink(2)` and the one this kernel used to say out loud, in a comment, that
+it did not keep: a file lives until its last name AND its last descriptor
+are gone, and the second half needed the filesystem to know what was open.
+Nothing told it.  The volume, meanwhile, had been ready the whole time --
+every APFS container is formatted with a **private directory** that no path
+reaches, for exactly this, and a checker looking in there knows it is
+looking at orphans.
+
+So what this rung mostly added is not a writer.  It is one row per open
+file in `fs/fs.c` -- an object id and a count -- and the places a descriptor
+is born, copied and dies wired to it: `open`, `dup`, `fork`, and the single
+point where a slot is released.  `unlink` then asks the one question it
+could never ask before, and if anything is holding the file, the name goes
+and the bytes wait.
+
+**mmap was the holder that nearly got away.**  A mapping copies the handle
+into a VM object and pages through it long after the descriptor is closed,
+which POSIX is explicit about, so the object takes a claim too.  That is
+where the rung cost its panic: giving a file back can reach the volume and
+sleep on the disk, `vm_map_remove` was freeing entries under the map's
+spinlock, and a thread that blocks holding one in this kernel is never woken
+again.  It now unlinks entries under the lock and frees them after, which is
+what every kernel that has been here before does.  Found by `mmaptest` on
+the first `munmap` of a mapped file -- the same lesson this file keeps
+recording, that a comment explaining why an ordering is safe marks the place
+it stopped being safe.
+
+What an orphan has to look like was **measured with apfsck**, one refusal at
+a time, before any of it was written: the entry is named `0x<oid>-dead`
+("Orphan inode: wrong name"), the inode's parent must NOT be the private
+directory ("Inode record: parent is private directory") and is the root
+here, since a dangling parent reads as "free inode number in use" the moment
+the old directory is removed, and the link count must be **zero** ("Orphan
+inode: has a link count").  No flag is wanted, which was measured too.
+
+The half no self-test can reach is the **crash**: a volume that comes up
+with files in its private directory is one whose last boot ended between an
+unlink and the close that would have finished it.  Such a volume is
+perfectly valid -- apfsck accepts it, which is the whole reason the reap has
+to be the kernel's job -- so one was fabricated with the host runner and
+booted, and the mount said "1 file(s) were left waiting in the private
+directory by an earlier boot and have been let go."
+
 Next on the roadmap: **replacing an existing name** with a rename, which
-POSIX requires and this refuses out loud, and real SMP.
+POSIX requires and this refuses out loud; a **torn-write stand**, which
+would make the checkpoint's promise that an interruption anywhere leaves the
+old transaction a measurement rather than a claim; and real SMP.
 
 Reading the tree stopped being O(volume) per question along the way.  The
 same boot that read **54434 records over 6381 nodes** to answer its 1718

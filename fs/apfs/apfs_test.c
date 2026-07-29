@@ -1878,21 +1878,26 @@ moved_ok(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 	return (true);
 }
 
-/* The length the volume says a file has, or a complaint and false. */
+/*
+ * The length the volume says a file has, or a complaint and false.
+ *
+ * Told which test is asking, because two of them now do and a failure line
+ * that names the wrong one sends whoever reads it to the wrong writer.
+ */
 static bool
-size_still(uint64_t ino, uint64_t want, const char *where)
+size_still(const char *who, uint64_t ino, uint64_t want, const char *where)
 {
 	uint64_t	got;
 
 	got = 0;
 	if (fs_apfs_size(ino, &got) != FS_APFS_E_OK) {
-		kprintf("apfs-move: FAIL inode %llu has no length at all %s\n",
+		kprintf("%s: FAIL inode %llu has no length at all %s\n", who,
 		    (unsigned long long)ino, where);
 		return (false);
 	}
 	if (got != want) {
-		kprintf("apfs-move: FAIL inode %llu is %llu bytes %s and was "
-		    "%llu -- the data stream did not come across\n",
+		kprintf("%s: FAIL inode %llu is %llu bytes %s and was %llu -- "
+		    "the data stream did not come across\n", who,
 		    (unsigned long long)ino, (unsigned long long)got, where,
 		    (unsigned long long)want);
 		return (false);
@@ -1971,7 +1976,7 @@ fs_apfs_move_selftest(uint64_t now)
 		    rv);
 		goto clean;
 	}
-	if (!size_still(file, APFS_MOVE_SIZE, "before any move"))
+	if (!size_still("apfs-move", file, APFS_MOVE_SIZE, "before any move"))
 		goto clean;
 
 	/* Same directory, same length of name: the plainest move there is. */
@@ -1983,19 +1988,22 @@ fs_apfs_move_selftest(uint64_t now)
 	if (!moved_ok(etc, "mvtwo.txt", etc, "mvconsiderablylongername.txt",
 	    now, "/etc/mvtwo.txt", "/etc/mvconsiderablylongername.txt", file))
 		goto clean;
-	if (!size_still(file, APFS_MOVE_SIZE, "under a longer name"))
+	if (!size_still("apfs-move", file, APFS_MOVE_SIZE,
+	    "under a longer name"))
 		goto clean;
 	if (!moved_ok(etc, "mvconsiderablylongername.txt", etc, "mvs", now,
 	    "/etc/mvconsiderablylongername.txt", "/etc/mvs", file))
 		goto clean;
-	if (!size_still(file, APFS_MOVE_SIZE, "under a shorter name"))
+	if (!size_still("apfs-move", file, APFS_MOVE_SIZE,
+	    "under a shorter name"))
 		goto clean;
 
 	/* And into another directory, which is the half that moves counts. */
 	if (!moved_ok(etc, "mvs", var, "mvone.txt", now, "/etc/mvs",
 	    "/var/mvone.txt", file))
 		goto clean;
-	if (!size_still(file, APFS_MOVE_SIZE, "in another directory"))
+	if (!size_still("apfs-move", file, APFS_MOVE_SIZE,
+	    "in another directory"))
 		goto clean;
 
 	/*
@@ -2140,6 +2148,198 @@ clean:
 	(void)fs_apfs_unlink(etc, "mvtwo.txt", now);
 	(void)fs_apfs_unlink(etc, "mvconsiderablylongername.txt", now);
 	(void)fs_apfs_unlink(etc, "mvs", now);
+	(void)fs_apfs_checkpoint();
+}
+
+/*
+ * A FILE WITH NO NAME
+ *
+ * The rung this checks is not "a record moved into another directory" -- that
+ * is the rename above, and it would pass this test without keeping any of the
+ * promise.  What is checked is that the BYTES outlive the name: a file is given
+ * a length, its name is taken away, and then the questions are asked that only
+ * a file which is still whole can answer -- its length, its object id, its
+ * records.  A writer that treated an orphan as a deletion with a delay would
+ * fail on the first of those and pass the last two.
+ *
+ * The path is asked about too, and must NOT resolve.  Both halves matter: an
+ * orphan still reachable by name is not an orphan, and an orphan whose bytes
+ * are gone is just an unlink that lied about when.
+ *
+ * And it is let go at the end, which is the part that keeps this test honest
+ * about the volume rather than only about the writer: an orphan that is never
+ * reaped is a leak apfsck calls perfectly valid, so the check that the private
+ * directory is empty afterwards is the only thing standing between this rung
+ * and a filesystem that quietly fills up.
+ */
+#define	APFS_ORPHAN_DIR		"/etc"
+#define	APFS_ORPHAN_SIZE	7000u
+
+/*
+ * Is the private directory holding anything?  Asked of the TREE, like every
+ * other emptiness question here, and for the same reason: the count in its
+ * inode record is a claim about the records and the records are the thing.
+ */
+static bool
+priv_dir_empty(uint64_t now)
+{
+	uint32_t	n;
+
+	n = 0;
+	/*
+	 * Reaping nothing is how the question gets asked, since a reap-all over
+	 * an empty directory does no work and reports the count it found.  It
+	 * costs one descent and needs no second walker to go wrong -- and if
+	 * the answer is the unwanted one it has also cleaned up, which is why
+	 * it is given the real clock rather than a zero.
+	 */
+	if (fs_apfs_reap_all(now, &n) != FS_APFS_E_OK)
+		return (false);
+	return (n == 0);
+}
+
+void
+fs_apfs_orphan_selftest(uint64_t now)
+{
+	uint64_t	etc;
+	uint64_t	file, gone;
+	uint64_t	orphans, reaps;
+	uint64_t	got;
+	uint32_t	left;
+	int		is_dir;
+	int		rv;
+
+	if (!g_apfs.ac_mounted || !g_apfs.ac_ip_valid) {
+		kprintf("apfs-orphan: nothing writable -- skipped\n");
+		return;
+	}
+	if (fs_apfs_lookup(APFS_ORPHAN_DIR, &etc, &is_dir) != FS_APFS_E_OK ||
+	    !is_dir) {
+		kprintf("apfs-orphan: %s is not there -- skipped\n",
+		    APFS_ORPHAN_DIR);
+		return;
+	}
+
+	/*
+	 * Whatever an interrupted run left behind, by name and then by the
+	 * private directory -- an orphan has no name to be found under, so the
+	 * second sweep is the only one that can reach one.
+	 */
+	(void)fs_apfs_unlink(etc, "orphan.txt", now);
+	left = 0;
+	(void)fs_apfs_reap_all(now, &left);
+	(void)fs_apfs_checkpoint();
+
+	orphans = fs_apfs_orphans();
+	reaps   = fs_apfs_reaps();
+	file    = 0;
+	gone    = 0;
+
+	rv = fs_apfs_create(etc, "orphan.txt", now, 0644, &file);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_grow(file, file, APFS_ORPHAN_SIZE);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_checkpoint();
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-orphan: FAIL cannot make the file to orphan "
+		    "(%d)\n", rv);
+		return;
+	}
+	if (!size_still("apfs-orphan", file, APFS_ORPHAN_SIZE,
+	    "before its name went"))
+		goto clean;
+
+	/* The name goes. */
+	rv = fs_apfs_orphan(etc, "orphan.txt", now, &gone);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-orphan: FAIL taking the name away was refused "
+		    "(%d)\n", rv);
+		goto clean;
+	}
+	if (gone != file) {
+		kprintf("apfs-orphan: FAIL the name stood for inode %llu and "
+		    "the orphan is %llu\n", (unsigned long long)file,
+		    (unsigned long long)gone);
+		goto clean;
+	}
+	if (fs_apfs_checkpoint() != FS_APFS_E_OK) {
+		kprintf("apfs-orphan: FAIL the checkpoint after it was "
+		    "refused\n");
+		goto clean;
+	}
+
+	/* No path reaches it... */
+	if (fs_apfs_lookup("/etc/orphan.txt", &got, &is_dir) !=
+	    FS_APFS_E_NOTFOUND) {
+		kprintf("apfs-orphan: FAIL /etc/orphan.txt still resolves "
+		    "after its name was taken away\n");
+		goto clean;
+	}
+	/* ...and the file is entirely there. */
+	if (!size_still("apfs-orphan", file, APFS_ORPHAN_SIZE,
+	    "with no name left"))
+		goto clean;
+
+	/*
+	 * A SECOND ORPHANING OF THE SAME FILE IS NOT POSSIBLE, and the reason
+	 * to ask is that it is the shape a wrong reference count upstairs
+	 * produces: a name already gone, taken away twice.
+	 */
+	rv = fs_apfs_orphan(etc, "orphan.txt", now, &got);
+	if (rv != FS_APFS_E_NOTFOUND) {
+		kprintf("apfs-orphan: FAIL orphaning a name that is already "
+		    "gone answered %d, not NOTFOUND\n", rv);
+		goto clean;
+	}
+	/* And a file that still has a name cannot be let go. */
+	rv = fs_apfs_reap(etc, now);
+	if (rv != FS_APFS_E_INVAL) {
+		kprintf("apfs-orphan: FAIL letting go of a directory that is "
+		    "still named answered %d, not INVAL\n", rv);
+		goto clean;
+	}
+
+	/* Then it is let go, and the volume is back where it started. */
+	rv = fs_apfs_reap(file, now);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_checkpoint();
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-orphan: FAIL letting the orphan go was refused "
+		    "(%d)\n", rv);
+		goto clean;
+	}
+	if (fs_apfs_size(file, &got) == FS_APFS_E_OK) {
+		kprintf("apfs-orphan: FAIL inode %llu still has a length after "
+		    "being let go\n", (unsigned long long)file);
+		goto clean;
+	}
+	if (!priv_dir_empty(now)) {
+		kprintf("apfs-orphan: FAIL the private directory is still "
+		    "holding something\n");
+		goto clean;
+	}
+	if (!index_check(g_apfs.ac_root_tree_bno, 0)) {
+		kprintf("apfs-orphan: FAIL the index is wrong afterwards\n");
+		goto clean;
+	}
+	file = 0;
+
+	kprintf("apfs-orphan: PASS -- %llu file(s) kept whole with no name at "
+	    "all (%u bytes each), %llu let go, %u found waiting from an "
+	    "earlier run, two refusals\n",
+	    (unsigned long long)(fs_apfs_orphans() - orphans),
+	    (unsigned)APFS_ORPHAN_SIZE,
+	    (unsigned long long)(fs_apfs_reaps() - reaps), (unsigned)left);
+
+clean:
+	/*
+	 * Both sweeps again, and in this order: the file may still have its
+	 * name, or may be waiting with none, and after a failure which of those
+	 * is true is exactly what is not known.
+	 */
+	(void)fs_apfs_unlink(etc, "orphan.txt", now);
+	if (file != 0)
+		(void)fs_apfs_reap(file, now);
 	(void)fs_apfs_checkpoint();
 }
 

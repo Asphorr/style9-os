@@ -63,6 +63,93 @@ static uint64_t		fs_n_stale;
 static uint64_t		fs_n_resize;
 
 /*
+ * WHAT IS OPEN
+ *
+ * A descriptor used to be a private thing: the kernel handed one out and the
+ * filesystem never heard of it again.  That is why unlink said out loud that it
+ * did not keep Unix's promise -- a file lives until its last NAME and its last
+ * DESCRIPTOR are both gone, and nothing here could answer the second half.
+ *
+ * This is that answer, and it is deliberately not a vnode layer.  What has to
+ * be known is one bit per open file -- whether anything still holds it -- so
+ * what is kept is a count per OBJECT ID, which every handle already carries.
+ * Two descriptors onto one file share a row; a file nothing holds has no row.
+ * There is nothing here to look a path up in, nothing to invalidate when a name
+ * moves, and nothing that has to be right for reading and writing to work,
+ * because reads and writes never consult it.  It is consulted by unlink, which
+ * asks "is anyone holding this", and by close, which answers "not any more".
+ *
+ * Sized against the descriptor table rather than guessed: DARWIN_NOFILE is 16
+ * per task, so 32 distinct open FILES is room for two tasks holding entirely
+ * different sets with nothing shared -- and the rows are per file, so the usual
+ * case of several tasks holding the same few is one row each.
+ */
+#define	FS_OPEN_MAX	32
+
+struct fs_open {
+	uint64_t	fo_ino;
+	uint32_t	fo_refs;
+	/*
+	 * Its last name is already gone and it is waiting in the volume's
+	 * private directory.  Kept here rather than read back off the record
+	 * because the question is asked on the close path, where a tree descent
+	 * per closed descriptor would be paid by every program that ever opens
+	 * a file, for a case almost none of them are in.
+	 */
+	bool		fo_nameless;
+};
+
+static struct fs_open	fs_opens[FS_OPEN_MAX];	/* (fs_lock) */
+static uint64_t		fs_n_orphan;	/* (fs_lock) unlinked open */
+static uint64_t		fs_n_reap;	/* (fs_lock) ...and let go */
+
+/* The row for this file, or NULL.  Called with fs_lock held. */
+static struct fs_open *
+open_row(uint64_t ino)
+{
+	size_t	i;
+
+	for (i = 0; i < FS_OPEN_MAX; i++)
+		if (fs_opens[i].fo_refs != 0 && fs_opens[i].fo_ino == ino)
+			return (&fs_opens[i]);
+	return (NULL);
+}
+
+/*
+ * One more holder of this file.  Called with fs_lock held.
+ *
+ * A FULL TABLE IS REFUSED RATHER THAN IGNORED.  The tempting alternative --
+ * hand the descriptor out untracked -- puts the system back in the state this
+ * whole rung exists to leave, except now it is in it only sometimes and only
+ * under load, which is the shape of bug that gets diagnosed years later.
+ */
+static int
+open_hold(uint64_t ino)
+{
+	struct fs_open	*fo;
+	size_t		 i;
+
+	fo = open_row(ino);
+	if (fo != NULL) {
+		fo->fo_refs++;
+		return (FS_E_OK);
+	}
+	for (i = 0; i < FS_OPEN_MAX; i++) {
+		if (fs_opens[i].fo_refs != 0)
+			continue;
+		fs_opens[i].fo_ino      = ino;
+		fs_opens[i].fo_refs     = 1;
+		fs_opens[i].fo_nameless = false;
+		return (FS_E_OK);
+	}
+	kprintf("fs: %u files are already open and inode %llu would be one "
+	    "more -- refused, because a file this kernel is not counting is a "
+	    "file unlink would take out from under its own reader\n",
+	    (unsigned)FS_OPEN_MAX, (unsigned long long)ino);
+	return (FS_E_NOSPACE);
+}
+
+/*
  * Bring a handle's cached length up to date if the volume moved on since it
  * was made.  Called with fs_lock held, from the two calls that clamp against
  * it.  Nothing to do on FAT, which cannot be written and therefore cannot go
@@ -231,6 +318,14 @@ open_locked(const char *path, struct fs_handle *out)
 		rv = fs_apfs_open(path, &id, &size, &ino);
 		if (rv != FS_APFS_E_OK)
 			return (apfs_err(rv));
+		/*
+		 * Counted BEFORE the handle is filled in, so that a refusal
+		 * leaves the caller with the zeroed handle it came in with
+		 * rather than a usable one the filesystem is not counting.
+		 */
+		rv = open_hold(ino);
+		if (rv != FS_E_OK)
+			return (rv);
 		out->fh_kind = FS_HANDLE_APFS;
 		out->fh_ino  = ino;
 	} else if (fs_fat_ready()) {
@@ -254,6 +349,83 @@ fs_open(const char *path, struct fs_handle *out)
 	mutex_lock(&fs_lock);
 	rv = open_locked(path, out);
 	mutex_unlock(&fs_lock);
+	return (rv);
+}
+
+int
+fs_hold(const struct fs_handle *h)
+{
+	int	rv;
+
+	if (h == NULL || h->fh_kind != FS_HANDLE_APFS)
+		return (FS_E_OK);
+	mutex_lock(&fs_lock);
+	rv = open_hold(h->fh_ino);
+	mutex_unlock(&fs_lock);
+	return (rv);
+}
+
+/*
+ * The last holder lets go, and if its name went while it was holding, this is
+ * where the file actually stops existing.
+ *
+ * The reap happens HERE, in the filesystem, and not in whichever syscall
+ * happened to close the last descriptor.  Every caller that can drop a
+ * reference -- close, dup2 over a live slot, a task being torn down, an exec
+ * replacing an address space -- would otherwise each have to know about the
+ * private directory and each have to get it right.
+ */
+int
+fs_close(struct fs_handle *h)
+{
+	struct fs_open	*fo;
+	uint64_t	 ino;
+	uint64_t	 now_ns;
+	int		 rv;
+
+	if (h == NULL || h->fh_kind != FS_HANDLE_APFS)
+		return (FS_E_OK);
+	ino = h->fh_ino;
+	rv  = FS_E_OK;
+
+	mutex_lock(&fs_lock);
+	fo = open_row(ino);
+	if (fo == NULL) {
+		/*
+		 * Said out loud rather than shrugged off: a handle whose file
+		 * nothing is counting means a hold was lost somewhere, and the
+		 * consequence of that is an unlink taking bytes out from under
+		 * a live reader.  Nothing here can repair it; naming it is what
+		 * turns it into a bug report instead of a mystery.
+		 */
+		kprintf("fs: closing inode %llu, which was not on the open "
+		    "list -- a reference was lost somewhere\n",
+		    (unsigned long long)ino);
+		mutex_unlock(&fs_lock);
+		return (FS_E_NOTFOUND);
+	}
+	fo->fo_refs--;
+	if (fo->fo_refs == 0 && fo->fo_nameless) {
+		now_ns = (uint64_t)clock_walltime_us() * 1000ULL;
+		rv = apfs_err(fs_apfs_reap(ino, now_ns));
+		if (rv == FS_E_OK)
+			rv = apfs_err(fs_apfs_checkpoint());
+		fs_gen++;
+		fs_n_reap++;
+		if (rv != FS_E_OK)
+			kprintf("fs: inode %llu was the last hold on a file "
+			    "with no name and it will not go (%d) -- it stays "
+			    "in the private directory for the next mount\n",
+			    (unsigned long long)ino, rv);
+	}
+	if (fo->fo_refs == 0)
+		fo->fo_nameless = false;
+	mutex_unlock(&fs_lock);
+
+	h->fh_kind = FS_HANDLE_NONE;
+	h->fh_ino  = 0;
+	h->fh_id   = 0;
+	h->fh_size = 0;
 	return (rv);
 }
 
@@ -526,9 +698,11 @@ fs_create(const char *path, uint16_t perm, uint64_t *ino_out)
 static int
 unlink_locked(const char *path)
 {
+	struct fs_open	*fo;
 	char		 dir[FS_NAME_MAX];
 	const char	*leaf;
 	uint64_t	 parent;
+	uint64_t	 child;
 	uint64_t	 now_ns;
 	int		 is_dir;
 	int		 rv;
@@ -544,12 +718,64 @@ unlink_locked(const char *path)
 	if (!is_dir)
 		return (FS_E_NOTFOUND);
 
+	/*
+	 * WHICH FILE THIS IS, before deciding what taking its name away means.
+	 * A second descent, paid only by unlink, and it buys the only question
+	 * that matters here: is anything holding this open.  If something is,
+	 * the name goes and the file does not -- which is what Unix has always
+	 * promised and what the comment in the syscall used to apologise for.
+	 */
+	child = 0;
+	rv = apfs_err(fs_apfs_lookup(path, &child, &is_dir));
+	if (rv != FS_E_OK)
+		return (rv);
+	fo = is_dir ? NULL : open_row(child);
+
 	now_ns = (uint64_t)clock_walltime_us() * 1000ULL;
-	rv = apfs_err(fs_apfs_unlink(parent, leaf, now_ns));
+	if (fo != NULL) {
+		rv = apfs_err(fs_apfs_orphan(parent, leaf, now_ns, &child));
+		if (rv == FS_E_OK) {
+			fo->fo_nameless = true;
+			fs_n_orphan++;
+		}
+	} else
+		rv = apfs_err(fs_apfs_unlink(parent, leaf, now_ns));
 	if (rv != FS_E_OK)
 		return (rv);
 	rv = apfs_err(fs_apfs_checkpoint());
 	fs_gen++;
+	return (rv);
+}
+
+/*
+ * Everything an earlier boot left waiting.  See fs_apfs_reap_all: a volume that
+ * comes up with files in its private directory is a volume whose last boot
+ * ended between an unlink and the close that would have finished it, and the
+ * format's answer is that they can simply be finished now.
+ *
+ * Run once, from kmain, after the volume is mounted and before anything opens
+ * anything -- which is what makes it safe to reap every one of them without
+ * consulting the open list: at this point nothing in the system holds a file.
+ */
+int
+fs_reap_orphans(void)
+{
+	uint64_t	now_ns;
+	uint32_t	n;
+	int		rv;
+
+	if (!fs_apfs_ready())
+		return (FS_E_OK);
+	now_ns = (uint64_t)clock_walltime_us() * 1000ULL;
+	n = 0;
+	mutex_lock(&fs_lock);
+	rv = apfs_err(fs_apfs_reap_all(now_ns, &n));
+	if (rv == FS_E_OK && n != 0) {
+		rv = apfs_err(fs_apfs_checkpoint());
+		fs_n_reap += n;
+		fs_gen++;
+	}
+	mutex_unlock(&fs_lock);
 	return (rv);
 }
 
@@ -897,12 +1123,25 @@ void
 fs_handle_stats(void)
 {
 
-	if (fs_n_stale == 0)
+	if (fs_n_stale == 0 && fs_n_orphan == 0)
 		return;
 	kprintf("fs: volume generation %llu -- %llu stale handle(s) refreshed, "
 	    "%llu had actually changed length\n",
 	    (unsigned long long)fs_gen, (unsigned long long)fs_n_stale,
 	    (unsigned long long)fs_n_resize);
+	/*
+	 * And the two the private directory is for.  Reported at the END of a
+	 * boot rather than with the self-test that checks the table, because
+	 * these only move when something in ring 3 unlinks a file it is holding
+	 * -- which happens long after the tests.  They need not balance within
+	 * one boot: a file orphaned by a kernel that then stopped is reaped by
+	 * the next one, which is what the difference across two boots says.
+	 */
+	if (fs_n_orphan != 0 || fs_n_reap != 0)
+		kprintf("fs: %llu name(s) taken from files something still had "
+		    "open, %llu of those files since let go\n",
+		    (unsigned long long)fs_n_orphan,
+		    (unsigned long long)fs_n_reap);
 }
 
 /* ---- write self-test ------------------------------------------------------ */
@@ -960,6 +1199,13 @@ void
 fs_write_selftest(void)
 {
 	struct fs_handle	h;
+	/*
+	 * The second handle lives up here rather than in the block that uses
+	 * it, so that the single exit below can give it back: a handle is a
+	 * claim on the file now, and one abandoned by an early return is a row
+	 * in the kernel's open-file table that nothing will ever free.
+	 */
+	struct fs_handle	stale;
 	struct fs_statbuf	st0;
 	struct fs_statbuf	st1;
 	uint8_t			save[SELFTEST_CTX];
@@ -975,21 +1221,28 @@ fs_write_selftest(void)
 	if (!fs_apfs_ready())
 		return;			/* nothing here can be written */
 
+	/*
+	 * Emptied before anything can jump to the exit, so that closing it
+	 * there is a no-op on the paths that never opened it.  fs_open zeroes
+	 * what it is given, but only the paths that reach it.
+	 */
+	stale.fh_kind = FS_HANDLE_NONE;
+
 	rv = fs_open(SELFTEST_PATH, &h);
 	if (rv != FS_E_OK) {
 		kprintf("apfs-write: %s absent (rv=%d) -- self-test skipped\n",
 		    SELFTEST_PATH, rv);
-		return;
+		goto done;
 	}
 	if (h.fh_size < SELFTEST_OFF + SELFTEST_CTX) {
 		kprintf("apfs-write: %s too small -- self-test skipped\n",
 		    SELFTEST_PATH);
-		return;
+		goto done;
 	}
 
 	if (fs_stat(SELFTEST_PATH, &st0) != FS_E_OK) {
 		kprintf("apfs-write: FAIL cannot stat before\n");
-		return;
+		goto done;
 	}
 
 	/*
@@ -1005,14 +1258,14 @@ fs_write_selftest(void)
 	if (rv != FS_E_NOALLOC) {
 		kprintf("apfs-write: FAIL a write starting past the end was "
 		    "not refused (rv=%d)\n", rv);
-		return;
+		goto done;
 	}
 
 	/* The window as it stands, so we can put it back and check neighbours. */
 	rv = fs_pread(&h, SELFTEST_OFF - SELFTEST_PAD, save, SELFTEST_CTX, &got);
 	if (rv != FS_E_OK || got != SELFTEST_CTX) {
 		kprintf("apfs-write: FAIL pre-read (rv=%d got=%u)\n", rv, got);
-		return;
+		goto done;
 	}
 
 	for (i = 0; i < SELFTEST_LEN; i++)
@@ -1021,17 +1274,17 @@ fs_write_selftest(void)
 	rv = fs_pwrite(&h, SELFTEST_OFF, pat, SELFTEST_LEN, &put);
 	if (rv != FS_E_OK || put != SELFTEST_LEN) {
 		kprintf("apfs-write: FAIL write (rv=%d put=%u)\n", rv, put);
-		return;
+		goto done;
 	}
 
 	rv = fs_pread(&h, SELFTEST_OFF - SELFTEST_PAD, back, SELFTEST_CTX, &got);
 	if (rv != FS_E_OK || got != SELFTEST_CTX) {
 		kprintf("apfs-write: FAIL read-back (rv=%d got=%u)\n", rv, got);
-		return;
+		goto done;
 	}
 	if (!same(back + SELFTEST_PAD, pat, SELFTEST_LEN)) {
 		kprintf("apfs-write: FAIL written bytes differ\n");
-		return;
+		goto done;
 	}
 	/*
 	 * The half of this that matters.  Both ends of the write land inside
@@ -1044,7 +1297,7 @@ fs_write_selftest(void)
 	    save + SELFTEST_PAD + SELFTEST_LEN,
 	    SELFTEST_CTX - SELFTEST_PAD - SELFTEST_LEN)) {
 		kprintf("apfs-write: FAIL neighbouring bytes clobbered\n");
-		return;
+		goto done;
 	}
 
 	/* Put it back, and prove the restore too. */
@@ -1052,23 +1305,23 @@ fs_write_selftest(void)
 	    &put);
 	if (rv != FS_E_OK) {
 		kprintf("apfs-write: FAIL restore (rv=%d)\n", rv);
-		return;
+		goto done;
 	}
 	rv = fs_pread(&h, SELFTEST_OFF - SELFTEST_PAD, back, SELFTEST_CTX, &got);
 	if (rv != FS_E_OK || !same(back, save, SELFTEST_CTX)) {
 		kprintf("apfs-write: FAIL restore did not restore\n");
-		return;
+		goto done;
 	}
 
 	if (fs_stat(SELFTEST_PATH, &st1) != FS_E_OK) {
 		kprintf("apfs-write: FAIL cannot stat after\n");
-		return;
+		goto done;
 	}
 	if (st1.fs_mtime_ns <= st0.fs_mtime_ns) {
 		kprintf("apfs-write: FAIL mtime did not move (%llu -> %llu)\n",
 		    (unsigned long long)st0.fs_mtime_ns,
 		    (unsigned long long)st1.fs_mtime_ns);
-		return;
+		goto done;
 	}
 
 	/*
@@ -1080,30 +1333,29 @@ fs_write_selftest(void)
 	 * unnoticed between now and the rung that needs it.
 	 */
 	{
-		struct fs_handle	stale;
 		uint64_t		n0;
 		uint8_t			one;
 
 		n0 = fs_n_stale;
 		if (fs_open(SELFTEST_PATH, &stale) != FS_E_OK) {
 			kprintf("apfs-write: FAIL second open\n");
-			return;
+			goto done;
 		}
 		rv = fs_pwrite(&h, SELFTEST_OFF, save + SELFTEST_PAD,
 		    SELFTEST_LEN, &put);
 		if (rv != FS_E_OK) {
 			kprintf("apfs-write: FAIL write before staleness "
 			    "check (rv=%d)\n", rv);
-			return;
+			goto done;
 		}
 		if (fs_pread(&stale, 0, &one, 1, &got) != FS_E_OK) {
 			kprintf("apfs-write: FAIL read through stale handle\n");
-			return;
+			goto done;
 		}
 		if (fs_n_stale == n0) {
 			kprintf("apfs-write: FAIL a handle older than the "
 			    "volume was not noticed\n");
-			return;
+			goto done;
 		}
 	}
 
@@ -1111,27 +1363,37 @@ fs_write_selftest(void)
 	rv = fs_pread(&h, 0, mark, (uint32_t)sizeof(mark), &got);
 	if (rv != FS_E_OK || got != sizeof(mark)) {
 		kprintf("apfs-write: FAIL marker read (rv=%d)\n", rv);
-		return;
+		goto done;
 	}
 	if (same(mark, (const uint8_t *)marker, sizeof(mark))) {
 		kprintf("apfs-write: PASS -- and the marker at %s:0 is still "
 		    "there from an earlier boot\n", SELFTEST_PATH);
-		return;
+		goto done;
 	}
 	rv = fs_pwrite(&h, 0, (const uint8_t *)marker, (uint32_t)sizeof(mark),
 	    &put);
 	if (rv != FS_E_OK || put != sizeof(mark)) {
 		kprintf("apfs-write: FAIL marker write (rv=%d put=%u)\n", rv,
 		    put);
-		return;
+		goto done;
 	}
 	rv = fs_pread(&h, 0, mark, (uint32_t)sizeof(mark), &got);
 	if (rv != FS_E_OK || !same(mark, (const uint8_t *)marker, sizeof(mark))) {
 		kprintf("apfs-write: FAIL marker read-back\n");
-		return;
+		goto done;
 	}
 	kprintf("apfs-write: PASS -- marker written at %s:0; a reboot should "
 	    "find it\n", SELFTEST_PATH);
+done:
+	/*
+	 * BOTH HANDLES BACK, ON EVERY PATH.  This function had twenty-two exits
+	 * and gave nothing back at any of them, which was free while a handle
+	 * was only an answer to "which file".  It is a claim now, and one left
+	 * behind makes the next unlink of that file take the name only and
+	 * leave the bytes waiting for a close that never comes.
+	 */
+	(void)fs_close(&stale);
+	(void)fs_close(&h);
 }
 
 /*
@@ -1316,6 +1578,8 @@ fs_grow_selftest(void)
 	    (unsigned long long)h.fh_size, (unsigned)rounds,
 	    (unsigned long long)merges);
 out:
+	/* The handle is a claim; every path through here ends it. */
+	(void)fs_close(&h);
 	kfree(chunk);
 	kfree(back);
 }
@@ -1587,6 +1851,8 @@ fs_trunc_selftest(void)
 	    "the cut untouched\n", SELFTEST_PATH, (unsigned long long)was,
 	    (unsigned)SELFTEST_TRUNC_TO, (unsigned)SELFTEST_CTX);
 out:
+	/* As above: the file goes back however this ended. */
+	(void)fs_close(&h);
 	kfree(edge);
 	kfree(back);
 	kfree(chunk);
@@ -1734,8 +2000,19 @@ fs_make_selftest(void)
 		    got != marklen) {
 			kprintf("apfs-make: FAIL cannot read %s back\n",
 			    SELFTEST_MADE);
+			(void)fs_close(&h);
 			return;
 		}
+		/*
+		 * GIVEN BACK BEFORE THE UNLINK BELOW, and that is not tidiness.
+		 * A handle is a claim on the file now, so an unlink with this
+		 * one still held would do what Unix says and take the NAME only
+		 * -- the file would go and wait in the private directory, this
+		 * test would pass, and the volume would carry an orphan nothing
+		 * ever closes.  Which is exactly what happened: the second boot
+		 * of an acceptance run reported the removal as an orphaning.
+		 */
+		(void)fs_close(&h);
 		for (i = 0; i < marklen; i++) {
 			if (back[i] == (uint8_t)mark[i])
 				continue;
@@ -1854,18 +2131,18 @@ fs_make_selftest(void)
 		kprintf("apfs-make: FAIL writing %u bytes into a file with "
 		    "none (rv=%d put=%u)\n", (unsigned)marklen, rv,
 		    (unsigned)put);
-		return;
+		goto done;
 	}
 	if (fs_pread(&h, 0, back, marklen, &got) != FS_E_OK ||
 	    got != marklen || !same(back, (const uint8_t *)mark, marklen)) {
 		kprintf("apfs-make: FAIL %s does not read back what was just "
 		    "written into it\n", SELFTEST_MADE);
-		return;
+		goto done;
 	}
 	if (fs_stat(SELFTEST_MADE, &st) != FS_E_OK || st.fs_size != marklen) {
 		kprintf("apfs-make: FAIL %s does not say it is %u bytes\n",
 		    SELFTEST_MADE, (unsigned)marklen);
-		return;
+		goto done;
 	}
 
 	kprintf("apfs-make: PASS -- %s made as inode %llu, %u bytes written "
@@ -1874,6 +2151,14 @@ fs_make_selftest(void)
 	    SELFTEST_MADE_DIR,
 	    had ? ", the one the boot before left having been read and "
 	    "removed first" : "");
+done:
+	/*
+	 * ONE EXIT, so the claim goes back however this ended.  These tests
+	 * used to return from wherever they noticed a problem, which was
+	 * harmless while a handle was only an answer; it stopped being harmless
+	 * the moment a handle became a claim, and a leaked one is permanent.
+	 */
+	(void)fs_close(&h);
 }
 
 /*
@@ -2248,12 +2533,12 @@ fs_shell_selftest(void)
 	if (rv == FS_E_NOTFOUND) {
 		kprintf("apfs-shell: %s is not there -- no shell has written "
 		    "to this volume yet; skipped\n", SELFTEST_SHELL);
-		return;
+		goto done;
 	}
 	if (rv != FS_E_OK) {
 		kprintf("apfs-shell: FAIL cannot open %s (rv=%d)\n",
 		    SELFTEST_SHELL, rv);
-		return;
+		goto done;
 	}
 	/*
 	 * EMPTY IS A STATE THE DISK CAN HONESTLY BE IN, and it is worth
@@ -2270,27 +2555,30 @@ fs_shell_selftest(void)
 		    "interrupted between the shell creating it and writing "
 		    "into it, which is a state this volume is allowed to be "
 		    "in; skipped\n", SELFTEST_SHELL);
-		return;
+		goto done;
 	}
 	if (h.fh_size != wantlen) {
 		kprintf("apfs-shell: FAIL %s is %llu bytes and a shell wrote "
 		    "%u\n", SELFTEST_SHELL, (unsigned long long)h.fh_size,
 		    (unsigned)wantlen);
-		return;
+		goto done;
 	}
 	if (fs_pread(&h, 0, back, wantlen, &got) != FS_E_OK || got != wantlen) {
 		kprintf("apfs-shell: FAIL %s will not read back (got %u of "
 		    "%u)\n", SELFTEST_SHELL, (unsigned)got, (unsigned)wantlen);
-		return;
+		goto done;
 	}
 	if (!same(back, (const uint8_t *)want, wantlen)) {
 		kprintf("apfs-shell: FAIL %s holds something other than what "
 		    "a shell wrote into it\n", SELFTEST_SHELL);
-		return;
+		goto done;
 	}
 	kprintf("apfs-shell: PASS -- %u bytes a REAL Apple shell redirected "
 	    "into %s in an earlier boot are still there, byte for byte\n",
 	    (unsigned)wantlen, SELFTEST_SHELL);
+done:
+	/* As in the tests above: the claim goes back however this ended. */
+	(void)fs_close(&h);
 }
 
 /* As above, and about a node that is asked to run out of room. */
@@ -2378,6 +2666,63 @@ fs_move_selftest(void)
 		return;
 	mutex_lock(&fs_lock);
 	fs_apfs_move_selftest((uint64_t)clock_walltime_us() * 1000ULL);
+	mutex_unlock(&fs_lock);
+}
+
+/*
+ * IS ANYTHING STILL HELD?
+ *
+ * Asked at the end of the boot's self-tests, and it is not bookkeeping.  A
+ * handle became a CLAIM in this rung, and a claim dropped on the floor is
+ * invisible: the row stays, the file stays counted, and the next unlink of
+ * that file quietly does the RIGHT thing for a held file -- takes the name and
+ * leaves the bytes waiting for a close that will never come.  The volume is
+ * valid, every test passes, and an orphan nobody asked for rides to the next
+ * boot.
+ *
+ * Which is exactly what happened.  These tests had twenty-odd exits between
+ * them and gave nothing back at any of them; the second boot of an acceptance
+ * run reported apfs-make's removal as an ORPHANING, and three boots later the
+ * allocation bitmap was wrong.  Nothing failed until then.  So the invariant
+ * gets asked for out loud, at the one moment it is knowable: after the tests
+ * and before anything a user runs.
+ */
+void
+fs_open_check(void)
+{
+	size_t		i;
+	uint32_t	held;
+
+	if (!fs_apfs_ready())
+		return;
+	held = 0;
+	mutex_lock(&fs_lock);
+	for (i = 0; i < FS_OPEN_MAX; i++) {
+		if (fs_opens[i].fo_refs == 0)
+			continue;
+		held++;
+		kprintf("fs-open: FAIL inode %llu is still held %u time(s)%s "
+		    "-- a self-test opened a file and did not give it back\n",
+		    (unsigned long long)fs_opens[i].fo_ino,
+		    (unsigned)fs_opens[i].fo_refs,
+		    fs_opens[i].fo_nameless ? " and has no name left" : "");
+	}
+	mutex_unlock(&fs_lock);
+	if (held == 0)
+		kprintf("fs-open: PASS -- of %u rows, every file the "
+		    "self-tests opened was given back\n",
+		    (unsigned)FS_OPEN_MAX);
+}
+
+/* And about a file that outlives its own name. */
+void
+fs_orphan_selftest(void)
+{
+
+	if (!fs_apfs_ready())
+		return;
+	mutex_lock(&fs_lock);
+	fs_apfs_orphan_selftest((uint64_t)clock_walltime_us() * 1000ULL);
 	mutex_unlock(&fs_lock);
 }
 

@@ -39,6 +39,19 @@ vm_object_file(const struct fs_handle *h, const char *path)
 	if (obj == NULL)
 		return (NULL);
 
+	/*
+	 * A MAPPING HOLDS THE FILE, and says so.  A copy of a handle is a
+	 * second claim on the bytes -- POSIX is explicit that a mapping keeps
+	 * the file alive after the descriptor it was made from has been closed
+	 * -- and the pager reads through this one long afterwards.  Without
+	 * this, mmap-then-close-then-unlink would let the filesystem take the
+	 * extents away underneath a live mapping, and the fault that noticed
+	 * would arrive nowhere near the call that caused it.
+	 */
+	if (fs_hold(h) != FS_E_OK) {
+		kfree(obj);
+		return (NULL);
+	}
 	spin_init(&obj->vo_lock, "vm_object");
 	obj->vo_handle = *h;
 	obj->vo_size   = h->fh_size;
@@ -70,8 +83,17 @@ vm_object_deref(struct vm_object *obj)
 	spin_lock(&obj->vo_lock);
 	last = (--obj->vo_refs == 0);
 	spin_unlock(&obj->vo_lock);
-	if (last)
-		kfree(obj);
+	if (!last)
+		return;
+	/*
+	 * And gives it back here, OUTSIDE the lock: the last close of a file
+	 * whose name is already gone reaps it, which writes the volume and
+	 * sleeps on the disk -- and a thread that blocks holding a spinlock in
+	 * this kernel is never woken again.  Nothing else can reach the object
+	 * by now, so there is nothing left for the lock to protect.
+	 */
+	(void)fs_close(&obj->vo_handle);
+	kfree(obj);
 }
 
 int

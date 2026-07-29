@@ -144,6 +144,12 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	fs_fat_init();
 	fs_apfs_init();
 	/*
+	 * Anything an interrupted boot left with no name is finished now, while
+	 * nothing in the system holds a file and the answer is therefore known
+	 * without asking.  Zero on every clean boot; the log says so when not.
+	 */
+	(void)fs_reap_orphans();
+	/*
 	 * Mounting is the block cache's worst honest workload: probing two
 	 * filesystems and walking a volume's tree asks for the same metadata
 	 * blocks over and over.  Reporting here says what that cost.
@@ -253,6 +259,22 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	 * be against a pristine volume.
 	 */
 	fs_move_selftest();
+
+	/*
+	 * And a file that outlives the name it was reached by, which is the
+	 * half of unlink(2) this kernel used to say out loud it did not keep.
+	 * After the move test because it is the same machinery pointed at the
+	 * private directory, and a failure there is worth reading first.
+	 */
+	fs_orphan_selftest();
+
+	/*
+	 * And that every file those tests opened was given back.  Last of the
+	 * filesystem tests on purpose: it is an assertion about all of them,
+	 * and the only moment it can be made is after the last one and before
+	 * ring 3 opens anything of its own.
+	 */
+	fs_open_check();
 
 	/*
 	 * And then, against the tree those three leave behind -- three levels

@@ -1159,6 +1159,23 @@ vm_map_remove(struct vm_map *map, uint64_t va, uint64_t size)
 	end = va + size;
 	n   = 0;
 
+	/*
+	 * UNLINKED UNDER THE LOCK, FREED AFTER IT.
+	 *
+	 * Dropping an entry gives up its reference on the object, and a
+	 * file-backed object's last reference gives the FILE back -- which can
+	 * reach the volume, which sleeps on the disk, and a thread that blocks
+	 * holding a spinlock in this kernel is never woken again.  It was not
+	 * always so: an object used to own nothing that could sleep, and the
+	 * free was done in place.  The moment a mapping began holding its file
+	 * open, that became a panic on the first munmap of a mapped file --
+	 * found exactly that way, in mmaptest.
+	 *
+	 * The unlinked entries are strung together on the same vme_next they
+	 * were held by, which costs nothing: once out of the map they are
+	 * nobody's but this function's.
+	 */
+	gone = NULL;
 	spin_lock(&map->vm_lock);
 	pp = &map->vm_head;
 	while (*pp != NULL) {
@@ -1166,9 +1183,9 @@ vm_map_remove(struct vm_map *map, uint64_t va, uint64_t size)
 		if (cur->vme_start >= end)
 			break;
 		if (cur->vme_start >= va && cur->vme_end <= end) {
-			gone = cur;
 			*pp = cur->vme_next;
-			entry_free(gone);
+			cur->vme_next = gone;
+			gone = cur;
 			map->vm_count--;
 			n++;
 			continue;
@@ -1176,6 +1193,12 @@ vm_map_remove(struct vm_map *map, uint64_t va, uint64_t size)
 		pp = &cur->vme_next;
 	}
 	spin_unlock(&map->vm_lock);
+
+	while (gone != NULL) {
+		cur = gone->vme_next;
+		entry_free(gone);
+		gone = cur;
+	}
 	return (n);
 }
 

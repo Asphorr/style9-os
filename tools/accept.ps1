@@ -76,10 +76,21 @@ for ($b = 1; $b -le $Boots; $b++) {
     # There is no last line to wait for either: a finished boot sits at an
     # interactive prompt.  What says the automated part is over is the log
     # GOING QUIET, so that is what is waited for.
+    # AND WAITING FOR THE LOG TO GO QUIET IS NOT WAITING FOR THE BOOT EITHER.
+    # The TUI draws a status line with a clock in it, so on a boot that reaches
+    # the shell the log never stops growing -- the quiet test then never fires,
+    # the boot runs to $TimeoutSec, and the tally is of whatever prefix the
+    # clock left behind.  That is the same failure as the one below, wearing a
+    # different hat: two boots of one run were counted at 79 and 88 with
+    # nothing failing.
+    #
+    # So the LAST AUTOMATED LINE is what is waited for, with the quiet test
+    # kept as the fallback for a boot that dies before reaching it.
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     $done = $false
     $lastLen = -1
     $quiet = 0
+    $settle = -1
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 3
         if (-not (Test-Path $log)) { continue }
@@ -87,6 +98,11 @@ for ($b = 1; $b -le $Boots; $b++) {
         if ($len -eq $lastLen) { $quiet++ } else { $quiet = 0; $lastLen = $len }
         $txt = Get-Content $log -Raw -ErrorAction SilentlyContinue
         $ran = $txt -match 'filewrite: (done|\d+ check\(s\) FAILED)'
+        # The last thing the boot does on its own: the shell demo finishing.
+        if ($txt -match '\[demo\.sh\] done') {
+            if ($settle -lt 0) { $settle = 0 } else { $settle++ }
+        }
+        if ($settle -ge 2) { $done = $true; break }
         if ($ran -and $quiet -ge 4) { $done = $true; break }
     }
     Kill-Qemu
@@ -108,8 +124,12 @@ for ($b = 1; $b -le $Boots; $b++) {
     # a native command's stderr into a terminating error under 'Stop'.  The
     # exit code is the thing being asked for, so the preference is relaxed
     # around the call rather than the notice being chased.
+    # STDERR IS WHERE apfsck SAYS WHAT IS WRONG.  This used to send it to
+    # $null, so a failing boot printed "apfsck exit 1:" and then nothing at
+    # all -- the instrument going quiet at the exact moment it had something
+    # to say.  Cost a boot's worth of guessing.
     $ErrorActionPreference = 'Continue'
-    $ck = wsl /usr/sbin/apfsck -c (Wsl-Path $disk) 2>$null
+    $ck = wsl /usr/sbin/apfsck -c (Wsl-Path $disk) 2>&1
     $rc = $LASTEXITCODE
     $ErrorActionPreference = 'Stop'
     if ($rc -eq 0) { Write-Host "[accept] boot ${b}: apfsck exit 0" }

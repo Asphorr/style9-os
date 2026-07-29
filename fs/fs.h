@@ -124,6 +124,12 @@ _Static_assert(sizeof(struct fs_statbuf) == 72,
  * says ask differently and the other says the disk is lying.
  */
 #define	FS_E_INVAL	(-13)
+/*
+ * Too many files are open at once -- of the kernel's table of them, not of the
+ * volume.  Its own code because it is not the disk being full and not the heap
+ * being exhausted: nothing is wrong and the answer is to close something.
+ */
+#define	FS_E_NOSPACE	(-14)
 
 /* Non-zero once some filesystem is mounted and can serve files. */
 int		fs_ready(void);
@@ -195,8 +201,36 @@ struct fs_handle {
 /*
  * Resolve `path` to a handle.  Directories are refused: a handle is a thing
  * to read.  Returns FS_E_OK, or a negative FS_E_*.
+ *
+ * A HANDLE IS NOW A CLAIM, not just an answer.  The filesystem counts the files
+ * something is holding, so that unlink can tell a name nobody is using from a
+ * name a running program has open; the price is that every handle this hands
+ * out has to be given back with fs_close, and every COPY of one -- fork, dup --
+ * has to say so with fs_hold.  FS_E_NOSPACE means the kernel is already holding
+ * as many distinct files as it can count.
  */
 int		fs_open(const char *path, struct fs_handle *out);
+
+/*
+ * One more holder of an already-open file, for the calls that duplicate a
+ * descriptor rather than making one.  Cheap: no path, no tree, one row.
+ */
+int		fs_hold(const struct fs_handle *h);
+
+/*
+ * Give a handle back, and empty it.  When the last holder of a file whose name
+ * was taken away while it was open lets go, this is where the file's bytes
+ * actually go -- see fs_unlink.  Harmless on a zeroed or non-disk handle, which
+ * is what lets a caller close a descriptor without knowing what backs it.
+ */
+int		fs_close(struct fs_handle *h);
+
+/*
+ * Finish what an interrupted boot started: reap every file left waiting with no
+ * name.  Called once from kmain after the volume mounts.  Reports how many only
+ * in the log, since the number is zero on every clean boot.
+ */
+int		fs_reap_orphans(void);
 
 /*
  * Read at most `len` bytes of a resolved file starting at byte offset `off`
@@ -259,9 +293,14 @@ int		fs_truncate(struct fs_handle *h, uint64_t new_size);
  * "create or replace" are different requests and only the caller knows which
  * one it made.
  *
- * fs_unlink removes the name and, with it, the file: this kernel makes no hard
- * links, so the last name is the only name.  It answers FS_E_ISDIR for a
- * directory, which is fs_rmdir's business.
+ * fs_unlink removes the name and, USUALLY, the file with it: this kernel makes
+ * no hard links, so the last name is the only name.  The exception is the one
+ * Unix has always made -- if something still holds the file open, the name goes
+ * now and the bytes go when the last descriptor closes.  In between, the file
+ * is reachable through every open descriptor and through no path at all, which
+ * is a state the volume itself provides for (see APFS_PRIV_DIR_INO) rather than
+ * one this layer invents.  It answers FS_E_ISDIR for a directory, which is
+ * fs_rmdir's business.
  *
  * fs_mkdir and fs_rmdir are the same two calls for a directory.  fs_rmdir
  * answers FS_E_NOTDIR for a name that is not one and FS_E_NOTEMPTY for one
@@ -466,6 +505,21 @@ void		fs_room_selftest(void);
  * afterwards.  Silently does nothing when the volume is not APFS.
  */
 void		fs_move_selftest(void);
+
+/*
+ * apfs-orphan through this layer's lock: a file kept whole by nothing but an
+ * open descriptor.  See fs/apfs/apfs.h for what it arranges and why the
+ * refusals are asked for.
+ */
+void		fs_orphan_selftest(void);
+
+/*
+ * fs-open: nothing the self-tests opened is still held.  Run after all of them
+ * and before ring 3 gets going, because that is the only moment the answer is
+ * knowable -- and because a leaked claim is silent until it turns some later
+ * unlink into an orphaning and the boot after that into a wrong bitmap.
+ */
+void		fs_open_check(void);
 
 /*
  * And that finding a record by descending on its key answers exactly what

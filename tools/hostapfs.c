@@ -170,6 +170,7 @@ static const struct hosttest	tests[] = {
 	{ "stream", fs_apfs_stream_selftest, true  },
 	{ "room",   fs_apfs_room_selftest,   true  },
 	{ "move",   fs_apfs_move_selftest,   true  },
+	{ "orphan", fs_apfs_orphan_selftest, true  },
 	{ "seek",   run_seek,		     false },
 	{ "ckpt",   run_ckpt,		     false },
 };
