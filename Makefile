@@ -770,7 +770,42 @@ log: kernel.elf $(DISKIMG)
 	@cat $(LOGFILE)
 	@printf '\n--- end ---\n'
 
+# THE APFS WRITER, BUILT FOR THE HOST
+#
+# fs/apfs reaches outside itself for five symbols and no assembler, so it
+# compiles and runs as an ordinary program against an image FILE -- see the
+# header of tools/hostapfs.c for what that buys and what it does not.  Built
+# with the host's own flags rather than CFLAGS: none of -ffreestanding,
+# -mcmodel=kernel or -mno-sse describes a userland program, and the point is
+# to run the same C somewhere a debugger and a second compiler can reach it.
+#
+# -fno-strict-aliasing is not a workaround for this harness.  The writer reads
+# on-disk structures through pointers of several types, which is exactly what
+# the kernel build's -O2 does too; saying so here keeps the two builds honest
+# about compiling the same language.
+HOSTCC	 ?= gcc
+HOSTAPFS  = $(OBJDIR)/hostapfs
+HOSTSRC	  = tools/hostapfs.c fs/apfs/apfs.c fs/apfs/apfs_test.c
+HOSTFLAGS = -std=c11 -O1 -g -Wall -Wextra -fno-strict-aliasing $(INCLUDES)
+
+hostapfs: $(HOSTAPFS)
+
+$(HOSTAPFS): $(HOSTSRC) | $(OBJDIR)
+	$(HOSTCC) $(HOSTFLAGS) -o $@ $(HOSTSRC)
+	@printf 'hostapfs: %s\n' $@
+
+# One run of the whole ladder against a FRESH image, and apfsck on what it
+# leaves.  The image is removed first because $(DISKIMG) is a timestamp rule
+# over the fixture: once it exists it is newer for ever, and a target that is
+# silently up to date is a test that silently starts from the last run's
+# damage.  That cost a whole acceptance pass once.
+hostcheck: $(HOSTAPFS)
+	@rm -f $(DISKIMG)
+	@$(MAKE) --no-print-directory $(DISKIMG) >/dev/null
+	./$(HOSTAPFS) $(DISKIMG) $(T)
+	apfsck -c $(DISKIMG) && printf 'hostcheck: apfsck is happy\n'
+
 clean:
 	rm -rf $(OBJDIR) kernel.elf
 
-.PHONY: all run log disk clean
+.PHONY: all run log disk clean hostapfs hostcheck

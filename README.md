@@ -121,7 +121,22 @@ incremental changes.
 
 Requires `gcc` with `-mcmodel=kernel`, GNU `ld`, and `qemu-system-x86_64`.
 Built+tested with the toolchain in WSL on a Windows host; a PowerShell
-wrapper for QEMU launching is in `tools/runlog.ps1`.
+wrapper for QEMU launching is in `tools/runlog.ps1`, and
+`tools/accept.ps1` boots the kernel N times over and runs `apfsck` after
+each, which is what a filesystem change is held to.
+
+`make hostcheck` runs the **APFS subsystem and its self-tests on the
+host**, with no kernel and no QEMU: `fs/apfs` reaches outside itself for
+five symbols and no assembler — `bio_read`, `bio_write`, `kmalloc`,
+`kfree`, `kprintf`, measured with `nm` rather than assumed — and each has
+a one-line answer over a file.  Fourteen seconds for the whole ladder
+twice plus `apfsck`, against about four minutes for one boot, which is
+longer than most changes take to write.  The list runs **twice on
+purpose**: a mounted volume legitimately keeps buffers it never frees, so
+a leak is not "something still held at the end" but the same work costing
+more the second time.  Its limits are written where it is defined —
+notably that every test leaves the volume as it found it, so a defect
+that exists only mid-run is gone before `apfsck` is called.
 
 ## Stress tests
 
