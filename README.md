@@ -456,7 +456,39 @@ appeared on the fourth boot under the new fill-a-leaf self-test, which is
 another way of saying a user would have found it; both cases are now
 arranged on purpose rather than waited for.
 
-Next on the roadmap: **rename**, and real SMP.
+A name can now **move**, within a directory or between two, taking a file
+with its bytes or a directory with everything under it.  Nothing is made
+and nothing destroyed, which is what makes a rename the one writer here
+whose success moves no count at all -- and what makes the hard half of it
+the INODE record rather than the entry.  That record carries a name and a
+parent of its own; apfsck holds both to the entry that names them
+("wrong name for only link", "bad parent for only link"), and a name of a
+different length makes the record a different length, because the name
+lives in an extended field with everything else packed after it.  So the
+record is rebuilt beside the old one and put back, carrying every field
+it had -- and the field that matters is the data stream, since a rename
+that assembled a fresh record the way a create does would leave a
+perfectly valid empty file where the caller's data used to be.
+
+Both of those answers were **measured before the writer existed**.
+`tools/apfspoke.py` pokes one field of one record on a copy of the
+container and re-seals the block: the disagreement a forgetful rename
+leaves behind is exactly the disagreement a poked record has, and
+producing it that way costs no kernel at all.
+
+And this rung, like the last one, made an older hole reachable.  The
+longest key and value a tree has ever held are recorded in the footer of
+its root node, and nothing here had ever written them, because every name
+this system had made was shorter than one the image came with.  A rename
+to a 28-character name was not, and apfsck said "Catalog: wrong maximum
+key size in info footer."  The same tool settled what the field means: a
+footer claiming MORE than any record needs is accepted and one claiming
+less is refused, so the two are high-water marks that rise with an insert
+and are never lowered -- a delete does not have to walk the tree to
+tighten a bound no reader needs tight.
+
+Next on the roadmap: **replacing an existing name** with a rename, which
+POSIX requires and this refuses out loud, and real SMP.
 
 Reading the tree stopped being O(volume) per question along the way.  The
 same boot that read **54434 records over 6381 nodes** to answer its 1718

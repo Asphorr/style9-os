@@ -71,6 +71,7 @@ typedef __SIZE_TYPE__	size_t;
 
 #define	SEEK_SET	0
 
+#define	ENOENT		2
 #define	EEXIST		17
 #define	ENOTDIR		20
 #define	EISDIR		21
@@ -87,6 +88,7 @@ extern long	 lseek(int fd, long off, int whence);
 extern int	 unlink(const char *path);
 extern int	 mkdir(const char *path, unsigned short mode);
 extern int	 rmdir(const char *path);
+extern int	 rename(const char *from, const char *to);
 extern int	 printf(const char *fmt, ...);
 extern void	 exit(int code);
 
@@ -94,6 +96,7 @@ extern void	 exit(int code);
 #define	DIR		"/etc/ring3dir"
 #define	DIRFILE		"/etc/ring3dir/inside.txt"
 #define	HELD		"/etc/hello.txt"	/* off the image, never made */
+#define	MOVED		"/var/db/moved.txt"	/* and in another directory */
 #define	FIRST		"style9: written from ring 3 by filewrite\n"
 #define	SECOND		"style9: and appended to, later\n"
 
@@ -318,6 +321,51 @@ entry(void)
 	else
 		printf("filewrite: PASS rmdir refuses a file and unlink "
 		    "refuses a directory\n");
+
+	/*
+	 * 11. A NAME THAT MOVES, and its bytes with it.
+	 *
+	 * The bytes are what makes this worth asking from out here rather than
+	 * leaving to the kernel's own tests: a file's length lives in the same
+	 * packed record as its name, so a rename to a name of a different
+	 * length rewrites the record around it, and a program that reads the
+	 * file afterwards is the only one that can say the length survived.
+	 */
+	(void)unlink(MOVED);
+	fd = open(PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0)
+		fail("cannot make a file to move");
+	else {
+		put = write(fd, FIRST, slen(FIRST));
+		(void)close(fd);
+		if (put != (long)slen(FIRST))
+			fail("the write before the move was short");
+		else if (rename(PATH, MOVED) != 0)
+			fail("rename refused " PATH " -> " MOVED);
+		else if (open(PATH, O_RDONLY) >= 0)
+			fail(PATH " still opens after being renamed away");
+		else {
+			got = slurp(MOVED, buf, sizeof(buf));
+			if (got != (long)slen(FIRST) ||
+			    !same(buf, FIRST, slen(FIRST)))
+				fail("the bytes did not cross the rename");
+			else
+				printf("filewrite: PASS rename moved %s to %s "
+				    "with all %u of its bytes\n", PATH, MOVED,
+				    (unsigned)slen(FIRST));
+		}
+	}
+
+	/* 12. and it will not move a name onto one that is taken. */
+	if (rename(MOVED, HELD) == 0 || *__error() != EEXIST)
+		fail("rename replaced " HELD ", which this kernel refuses");
+	else if (rename("/etc/nothing-of-that-name", MOVED) == 0 ||
+	    *__error() != ENOENT)
+		fail("rename moved a name that is not there");
+	else
+		printf("filewrite: PASS rename refuses a destination that is "
+		    "taken and a source that is not there\n");
+	(void)unlink(MOVED);
 
 	if (fails != 0) {
 		printf("filewrite: %d check(s) FAILED\n", fails);

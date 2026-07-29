@@ -1,0 +1,118 @@
+# Acceptance harness for the APFS writer: N boots in a row, apfsck after every
+# one of them, and a tally of what each boot said.
+#
+#   .\tools\accept.ps1 -Boots 6 [-Fresh] [-TimeoutSec 200]
+#
+# -Fresh regenerates obj/style9.apfs from the fixture first, so boot 1 starts
+# from the pristine volume the way a first boot on an image does.
+#
+# THE DISK IS NOT OPTIONAL.  A QEMU that came up without one runs a clean
+# looking set of tests against nothing at all, which reads as a pass.  That has
+# happened twice, so this checks the kernel found a drive and throws if it did
+# not.
+
+[CmdletBinding()]
+param(
+    [int]    $Boots      = 3,
+    [int]    $TimeoutSec = 300,
+    [string] $Root       = 'D:\style9\os',
+    [switch] $Fresh
+)
+
+$ErrorActionPreference = 'Stop'
+$disk = Join-Path $Root 'obj\style9.apfs'
+$log  = Join-Path $Root 'serial.log'
+
+function Kill-Qemu {
+    Get-Process qemu-system-x86_64 -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+    for ($i = 0; $i -lt 50; $i++) {
+        if (-not (Get-Process qemu-system-x86_64 -ErrorAction SilentlyContinue)) { return }
+        Start-Sleep -Milliseconds 200
+    }
+    throw 'qemu would not die'
+}
+
+function Wsl-Path([string] $p) {
+    $p = $p.Replace('\', '/')
+    return '/mnt/' + $p.Substring(0,1).ToLower() + $p.Substring(2)
+}
+
+if ($Fresh) {
+    # The image MUST be removed first.  `make disk` is a timestamp rule over
+    # the gzipped fixture, so once an image exists it is newer than the fixture
+    # for ever and the target is silently up to date -- which means a run asked
+    # to start from a pristine volume quietly starts from whatever the last
+    # boot left, damage included.  That cost a whole acceptance run once.
+    Write-Host '[accept] regenerating obj/style9.apfs from the fixture'
+    Remove-Item $disk -ErrorAction SilentlyContinue
+    Push-Location $Root
+    # Relaxed for the same reason as the apfsck call below: WSL writes a
+    # cosmetic notice to stderr on this host, and PowerShell turns a native
+    # command's stderr into a TERMINATING error under 'Stop'.
+    $ErrorActionPreference = 'Continue'
+    wsl make disk 2>&1 | Out-Null
+    $ErrorActionPreference = 'Stop'
+    Pop-Location
+    if (-not (Test-Path $disk)) { throw 'make disk produced no image' }
+    $age = (Get-Date) - (Get-Item $disk).LastWriteTime
+    if ($age.TotalMinutes -gt 2) { throw 'the image was not rebuilt just now' }
+}
+if (-not (Test-Path $disk)) { throw "no disk image at $disk" }
+
+for ($b = 1; $b -le $Boots; $b++) {
+    Kill-Qemu
+    Remove-Item $log -ErrorAction SilentlyContinue
+    Write-Host "[accept] boot $b/$Boots"
+    & (Join-Path $Root 'tools\run.ps1') -Disk $disk | Out-Null
+
+    # WAITING FOR ONE TEST IS NOT WAITING FOR THE BOOT.  This used to stop at
+    # `filewrite: done` and kill QEMU, but filewrite is followed by ttyprobe,
+    # gstty, the Apple binaries and a shell -- so every boot was cut off at
+    # whatever point the three-second poll happened to land, and the PASS
+    # tally silently counted a different prefix each time.  One boot in six
+    # reported 73 where its neighbours reported 83, with nothing failing.
+    #
+    # There is no last line to wait for either: a finished boot sits at an
+    # interactive prompt.  What says the automated part is over is the log
+    # GOING QUIET, so that is what is waited for.
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $done = $false
+    $lastLen = -1
+    $quiet = 0
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 3
+        if (-not (Test-Path $log)) { continue }
+        $len = (Get-Item $log).Length
+        if ($len -eq $lastLen) { $quiet++ } else { $quiet = 0; $lastLen = $len }
+        $txt = Get-Content $log -Raw -ErrorAction SilentlyContinue
+        $ran = $txt -match 'filewrite: (done|\d+ check\(s\) FAILED)'
+        if ($ran -and $quiet -ge 4) { $done = $true; break }
+    }
+    Kill-Qemu
+    if (-not $done) { Write-Host "[accept] boot ${b}: TIMED OUT before the boot went quiet" }
+
+    $lines = Get-Content $log -ErrorAction SilentlyContinue
+    if (-not ($lines | Select-String -Pattern 'ata: .*drive' -Quiet)) {
+        throw "boot ${b}: the kernel never reported a drive -- it ran against nothing"
+    }
+    $pass  = ($lines | Select-String -Pattern 'PASS' ).Count
+    $fail  = ($lines | Select-String -Pattern 'FAIL' ).Count
+    $panic = ($lines | Select-String -Pattern 'panic').Count
+    Write-Host "[accept] boot ${b}: $pass PASS / $fail FAIL / $panic panic"
+    if ($fail -gt 0) { $lines | Select-String -Pattern 'FAIL' | ForEach-Object { "    $_" } }
+    $lines | Select-String -Pattern '^apfs-(room|move):' | ForEach-Object { "    $_" }
+    Copy-Item $log (Join-Path $Root "serial-accept$b.log") -Force
+
+    # WSL writes a cosmetic notice to stderr on this host, and PowerShell turns
+    # a native command's stderr into a terminating error under 'Stop'.  The
+    # exit code is the thing being asked for, so the preference is relaxed
+    # around the call rather than the notice being chased.
+    $ErrorActionPreference = 'Continue'
+    $ck = wsl /usr/sbin/apfsck -c (Wsl-Path $disk) 2>$null
+    $rc = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($rc -eq 0) { Write-Host "[accept] boot ${b}: apfsck exit 0" }
+    else { Write-Host "[accept] boot ${b}: apfsck exit ${rc}:"; $ck | ForEach-Object { "    $_" } }
+}
+Write-Host '[accept] done'

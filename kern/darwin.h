@@ -85,6 +85,7 @@
 #define	DARWIN_SYS_gettimeofday	116
 #define	DARWIN_SYS_fchmod	124
 #define	DARWIN_SYS_fcntl	92
+#define	DARWIN_SYS_rename	128
 #define	DARWIN_SYS_mkdir	136
 #define	DARWIN_SYS_rmdir	137
 #define	DARWIN_SYS_sigreturn	184

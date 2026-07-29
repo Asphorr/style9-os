@@ -246,6 +246,15 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	fs_room_selftest();
 
 	/*
+	 * And a name moved rather than made or destroyed, which is the one
+	 * writer whose success changes no count on the volume.  It runs after
+	 * the fill above for the same reason that one runs after the splits:
+	 * the leaves it moves records between are fuller here than they would
+	 * be against a pristine volume.
+	 */
+	fs_move_selftest();
+
+	/*
 	 * And then, against the tree those three leave behind -- three levels
 	 * deep, with split halves and a node's worth of gaps in it -- that
 	 * looking a record up by its key answers what reading every record

@@ -1798,6 +1798,352 @@ clean:
 }
 
 /*
+ * A NAME THAT MOVES
+ *
+ * A rename creates nothing and destroys nothing, which is what makes it hard
+ * to check from outside: the counts do not move, the record total does not
+ * move, and a writer that did half the job leaves a volume with exactly as
+ * many things in it as a writer that did all of it.  So this asks the two
+ * questions the volume can answer -- does the new name resolve to the inode
+ * the old one named, and has the old name stopped resolving -- after every
+ * move, and one more that only a file can answer.
+ *
+ * THE BYTES ARE THE POINT OF THE LONG NAMES.  A file's length and the blocks
+ * under it live in an extended field of the inode record, beside the field
+ * holding its name; the record is packed, so a name of a different length puts
+ * everything after it somewhere else.  A rename that rebuilt that record the
+ * way a create writes one -- which is the obvious way to write it -- would
+ * produce a perfectly valid empty file.  So a file is given a length here,
+ * moved to a longer name and then to a shorter one, and asked its length after
+ * each: three sizes that must all be the one it was given.
+ *
+ * WHAT IS NOT CHECKED IN HERE is the two directories' child counts, and that
+ * is deliberate rather than forgotten.  The count is a claim about records
+ * that a reader would have to re-derive to disprove, which is precisely what
+ * apfsck does with it -- "Inode record: wrong directory child count" is the
+ * measured answer to leaving either half out -- and the acceptance run checks
+ * every boot with it.  What this test adds is the half apfsck cannot see: the
+ * refusals, which leave no trace on the volume at all.
+ *
+ * A RENAME THAT MEETS A FULL LEAF takes the same loop a create does, and it is
+ * arranged for the create by apfs-room rather than again here.  Whether one
+ * turns up during these moves depends on how full the leaves already are, so
+ * it is reported when it happens and not required.
+ */
+#define	APFS_MOVE_DIR		"/etc"
+#define	APFS_MOVE_OTHER		"/var"
+#define	APFS_MOVE_SIZE		9000u
+
+/*
+ * One move, and the three things that must be true after it.  Every step below
+ * is one of these, which is what keeps the test itself from being longer than
+ * the writer.
+ */
+static bool
+moved_ok(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
+    uint64_t now, const char *opath, const char *npath, uint64_t want)
+{
+	uint64_t	got;
+	int		is_dir;
+	int		rv;
+
+	rv = fs_apfs_rename(odir, oname, ndir, nname, now);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-move: FAIL %s -> %s was refused (%d)\n", opath,
+		    npath, rv);
+		return (false);
+	}
+	if (fs_apfs_checkpoint() != FS_APFS_E_OK) {
+		kprintf("apfs-move: FAIL the checkpoint after %s -> %s was "
+		    "refused\n", opath, npath);
+		return (false);
+	}
+	got = 0;
+	if (fs_apfs_lookup(npath, &got, &is_dir) != FS_APFS_E_OK) {
+		kprintf("apfs-move: FAIL %s does not resolve after the move\n",
+		    npath);
+		return (false);
+	}
+	if (got != want) {
+		kprintf("apfs-move: FAIL %s is inode %llu and %s named %llu\n",
+		    npath, (unsigned long long)got, opath,
+		    (unsigned long long)want);
+		return (false);
+	}
+	if (fs_apfs_lookup(opath, &got, &is_dir) != FS_APFS_E_NOTFOUND) {
+		kprintf("apfs-move: FAIL %s still resolves after moving to "
+		    "%s\n", opath, npath);
+		return (false);
+	}
+	return (true);
+}
+
+/* The length the volume says a file has, or a complaint and false. */
+static bool
+size_still(uint64_t ino, uint64_t want, const char *where)
+{
+	uint64_t	got;
+
+	got = 0;
+	if (fs_apfs_size(ino, &got) != FS_APFS_E_OK) {
+		kprintf("apfs-move: FAIL inode %llu has no length at all %s\n",
+		    (unsigned long long)ino, where);
+		return (false);
+	}
+	if (got != want) {
+		kprintf("apfs-move: FAIL inode %llu is %llu bytes %s and was "
+		    "%llu -- the data stream did not come across\n",
+		    (unsigned long long)ino, (unsigned long long)got, where,
+		    (unsigned long long)want);
+		return (false);
+	}
+	return (true);
+}
+
+void
+fs_apfs_move_selftest(uint64_t now)
+{
+	uint64_t	etc, var;
+	uint64_t	file, dir, inner, deep;
+	uint64_t	splits;
+	uint64_t	moves;
+	uint64_t	got;
+	int		is_dir;
+	int		rv;
+
+	if (!g_apfs.ac_mounted || !g_apfs.ac_ip_valid) {
+		kprintf("apfs-move: nothing writable -- skipped\n");
+		return;
+	}
+	if (fs_apfs_lookup(APFS_MOVE_DIR, &etc, &is_dir) != FS_APFS_E_OK ||
+	    !is_dir ||
+	    fs_apfs_lookup(APFS_MOVE_OTHER, &var, &is_dir) != FS_APFS_E_OK ||
+	    !is_dir) {
+		kprintf("apfs-move: %s and %s are not both there -- skipped\n",
+		    APFS_MOVE_DIR, APFS_MOVE_OTHER);
+		return;
+	}
+
+	/*
+	 * Whatever an interrupted run left behind.  The directory is looked for
+	 * by path under each name it can be sitting at, and emptied through its
+	 * OBJECT ID -- which is the one thing about it that no move changed.
+	 */
+	got = 0;
+	if (fs_apfs_lookup("/etc/mvdir", &got, &is_dir) == FS_APFS_E_OK ||
+	    fs_apfs_lookup("/etc/mvdir2", &got, &is_dir) == FS_APFS_E_OK ||
+	    fs_apfs_lookup("/var/mvdir2", &got, &is_dir) == FS_APFS_E_OK) {
+		(void)fs_apfs_rmdir(got, "deeper", now);
+		(void)fs_apfs_unlink(got, "inner.txt", now);
+	}
+	(void)fs_apfs_unlink(etc, "mvone.txt", now);
+	(void)fs_apfs_unlink(etc, "mvtwo.txt", now);
+	(void)fs_apfs_unlink(etc, "mvconsiderablylongername.txt", now);
+	(void)fs_apfs_unlink(etc, "mvs", now);
+	(void)fs_apfs_unlink(var, "mvone.txt", now);
+	(void)fs_apfs_rmdir(var, "mvdir2", now);
+	(void)fs_apfs_rmdir(etc, "mvdir2", now);
+	(void)fs_apfs_rmdir(etc, "mvdir", now);
+	(void)fs_apfs_checkpoint();
+
+	splits = split_n;
+	moves  = fs_apfs_moves();
+	file   = 0;
+	dir    = 0;
+	inner  = 0;
+	deep   = 0;
+
+	rv = fs_apfs_create(etc, "mvone.txt", now, 0644, &file);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-move: FAIL cannot make the file to move (%d)\n",
+		    rv);
+		return;
+	}
+	/*
+	 * And bytes under it, because an empty file cannot tell a rename that
+	 * carried its data stream across from one that wrote a fresh record.
+	 */
+	rv = fs_apfs_grow(file, file, APFS_MOVE_SIZE);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_checkpoint();
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-move: FAIL cannot give the file a length (%d)\n",
+		    rv);
+		goto clean;
+	}
+	if (!size_still(file, APFS_MOVE_SIZE, "before any move"))
+		goto clean;
+
+	/* Same directory, same length of name: the plainest move there is. */
+	if (!moved_ok(etc, "mvone.txt", etc, "mvtwo.txt", now,
+	    "/etc/mvone.txt", "/etc/mvtwo.txt", file))
+		goto clean;
+
+	/* Longer, so the record grows; then shorter, so it shrinks. */
+	if (!moved_ok(etc, "mvtwo.txt", etc, "mvconsiderablylongername.txt",
+	    now, "/etc/mvtwo.txt", "/etc/mvconsiderablylongername.txt", file))
+		goto clean;
+	if (!size_still(file, APFS_MOVE_SIZE, "under a longer name"))
+		goto clean;
+	if (!moved_ok(etc, "mvconsiderablylongername.txt", etc, "mvs", now,
+	    "/etc/mvconsiderablylongername.txt", "/etc/mvs", file))
+		goto clean;
+	if (!size_still(file, APFS_MOVE_SIZE, "under a shorter name"))
+		goto clean;
+
+	/* And into another directory, which is the half that moves counts. */
+	if (!moved_ok(etc, "mvs", var, "mvone.txt", now, "/etc/mvs",
+	    "/var/mvone.txt", file))
+		goto clean;
+	if (!size_still(file, APFS_MOVE_SIZE, "in another directory"))
+		goto clean;
+
+	/*
+	 * A name renamed to ITSELF changes nothing and says so.  POSIX requires
+	 * the success; what is checked here is that the file is still there
+	 * afterwards, since a writer that took the entry out before putting it
+	 * back would answer the same and leave nothing behind.
+	 */
+	rv = fs_apfs_rename(var, "mvone.txt", var, "mvone.txt", now);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-move: FAIL renaming a name to itself was "
+		    "refused (%d)\n", rv);
+		goto clean;
+	}
+	if (fs_apfs_lookup("/var/mvone.txt", &got, &is_dir) != FS_APFS_E_OK ||
+	    got != file) {
+		kprintf("apfs-move: FAIL /var/mvone.txt did not survive being "
+		    "renamed to itself\n");
+		goto clean;
+	}
+
+	/* A DIRECTORY MOVES WITH ALL OF IT, and none of it is touched. */
+	rv = fs_apfs_mkdir(etc, "mvdir", now, 0755, &dir);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_checkpoint();
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_create(dir, "inner.txt", now, 0644, &inner);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_checkpoint();
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-move: FAIL cannot make the directory to move "
+		    "(%d)\n", rv);
+		goto clean;
+	}
+	if (!moved_ok(etc, "mvdir", etc, "mvdir2", now, "/etc/mvdir",
+	    "/etc/mvdir2", dir))
+		goto clean;
+	if (!moved_ok(etc, "mvdir2", var, "mvdir2", now, "/etc/mvdir2",
+	    "/var/mvdir2", dir))
+		goto clean;
+	/*
+	 * The child was never mentioned in either move.  Its entry sorts under
+	 * the directory's object id, which did not change, and its own record
+	 * names that same id as its parent -- so a subtree moves by moving one
+	 * name, and this is what says so.
+	 */
+	got = 0;
+	if (fs_apfs_lookup("/var/mvdir2/inner.txt", &got, &is_dir) !=
+	    FS_APFS_E_OK || got != inner) {
+		kprintf("apfs-move: FAIL /var/mvdir2/inner.txt does not "
+		    "resolve to inode %llu after its directory moved twice\n",
+		    (unsigned long long)inner);
+		goto clean;
+	}
+
+	/* THE REFUSALS, none of which may leave a mark. */
+	rv = fs_apfs_rename(var, "mvone.txt", var, "mvdir2", now);
+	if (rv != FS_APFS_E_EXIST) {
+		kprintf("apfs-move: FAIL moving onto a name that is taken "
+		    "answered %d, not EXIST\n", rv);
+		goto clean;
+	}
+	rv = fs_apfs_rename(var, "mvnothing.txt", var, "mvhere.txt", now);
+	if (rv != FS_APFS_E_NOTFOUND) {
+		kprintf("apfs-move: FAIL moving a name that is not there "
+		    "answered %d, not NOTFOUND\n", rv);
+		goto clean;
+	}
+	/*
+	 * And a directory into itself, asked twice: once directly, and once
+	 * through a child, because a check that only compared the two object
+	 * ids would pass the first and detach the volume on the second.
+	 */
+	rv = fs_apfs_rename(var, "mvdir2", dir, "loop", now);
+	if (rv != FS_APFS_E_INVAL) {
+		kprintf("apfs-move: FAIL moving a directory into itself "
+		    "answered %d, not INVAL\n", rv);
+		goto clean;
+	}
+	rv = fs_apfs_mkdir(dir, "deeper", now, 0755, &deep);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_checkpoint();
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-move: FAIL cannot make the directory below "
+		    "(%d)\n", rv);
+		goto clean;
+	}
+	rv = fs_apfs_rename(var, "mvdir2", deep, "loop", now);
+	if (rv != FS_APFS_E_INVAL) {
+		kprintf("apfs-move: FAIL moving a directory under its own "
+		    "child answered %d, not INVAL\n", rv);
+		goto clean;
+	}
+	/*
+	 * And into something that is not a directory at all.  Finding the old
+	 * name says the SOURCE's parent holds entries; nothing says that of the
+	 * destination, and a file would have taken a child in the field it
+	 * counts links in.
+	 */
+	rv = fs_apfs_rename(var, "mvdir2", file, "loop", now);
+	if (rv != FS_APFS_E_NOTDIR) {
+		kprintf("apfs-move: FAIL moving into a file answered %d, not "
+		    "NOTDIR\n", rv);
+		goto clean;
+	}
+	/* Refused five times, and still exactly where it was. */
+	got = 0;
+	if (fs_apfs_lookup("/var/mvdir2/inner.txt", &got, &is_dir) !=
+	    FS_APFS_E_OK || got != inner) {
+		kprintf("apfs-move: FAIL the refusals did not leave "
+		    "/var/mvdir2 as they found it\n");
+		goto clean;
+	}
+
+	if (!index_check(g_apfs.ac_root_tree_bno, 0)) {
+		kprintf("apfs-move: FAIL the index is wrong after the moves\n");
+		goto clean;
+	}
+
+	kprintf("apfs-move: PASS -- %llu move(s): a file to a longer name and "
+	    "a shorter one with its %u bytes intact, into another directory, "
+	    "a directory with a child in it moved twice, five refusals that "
+	    "left no mark%s\n", (unsigned long long)(fs_apfs_moves() - moves),
+	    (unsigned)APFS_MOVE_SIZE,
+	    split_n != splits ? ", and a leaf split to make room" : "");
+
+clean:
+	/*
+	 * Emptied through the directory's object id for the reason above: this
+	 * runs after a failure too, and a failure is exactly the case where
+	 * which name the directory is under is the thing not to be assumed.
+	 */
+	if (dir != 0) {
+		(void)fs_apfs_rmdir(dir, "deeper", now);
+		(void)fs_apfs_unlink(dir, "inner.txt", now);
+	}
+	(void)fs_apfs_rmdir(var, "mvdir2", now);
+	(void)fs_apfs_rmdir(etc, "mvdir2", now);
+	(void)fs_apfs_rmdir(etc, "mvdir", now);
+	(void)fs_apfs_unlink(var, "mvone.txt", now);
+	(void)fs_apfs_unlink(etc, "mvone.txt", now);
+	(void)fs_apfs_unlink(etc, "mvtwo.txt", now);
+	(void)fs_apfs_unlink(etc, "mvconsiderablylongername.txt", now);
+	(void)fs_apfs_unlink(etc, "mvs", now);
+	(void)fs_apfs_checkpoint();
+}
+
+/*
  * A DESCENT FINDS WHAT A WALK FINDS
  *
  * Reading the whole tree needs no key ordering; descending on one is a claim

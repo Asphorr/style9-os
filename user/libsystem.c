@@ -4015,9 +4015,10 @@ unlink(const char *path)
  * mkdir(2) and rmdir(2).  Straight through, for the same reason unlink is:
  * the volume can be written now, and the answer is the kernel's to give.
  *
- * mode_t is sixteen bits on Darwin and is passed as declared even though this
- * kernel stamps 0755 on every directory regardless -- a libc that dropped the
- * argument here would be hiding the fact somewhere the kernel cannot say so.
+ * mode_t is sixteen bits on Darwin and is passed as declared.  It used to say
+ * here that the kernel stamped 0755 regardless and the argument was carried
+ * only so that the fact stayed visible; the kernel has a chmod and a umask
+ * now, and the mode is honoured, so the note went the way the behaviour did.
  */
 int
 mkdir(const char *path, unsigned short mode)
@@ -4031,6 +4032,18 @@ rmdir(const char *path)
 {
 
 	return ((int)bsd_call_e(0x2000089, (long)path, 0, 0));
+}
+
+/*
+ * rename(2).  Two paths, one call, and nothing done here between them --
+ * a libc that "helpfully" unlinked the destination first would break the one
+ * promise programs use this call for.
+ */
+int
+rename(const char *from, const char *to)
+{
+
+	return ((int)bsd_call_e(0x2000080, (long)from, (long)to, 0));
 }
 
 int

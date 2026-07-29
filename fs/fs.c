@@ -145,6 +145,7 @@ apfs_err(int rv)
 	case FS_APFS_E_NOTDIR:		return (FS_E_NOTDIR);
 	case FS_APFS_E_NOTEMPTY:	return (FS_E_NOTEMPTY);
 	case FS_APFS_E_SPREAD:		return (FS_E_SPREAD);
+	case FS_APFS_E_INVAL:		return (FS_E_INVAL);
 	default:			return (FS_E_IO);
 	}
 }
@@ -649,6 +650,72 @@ fs_rmdir(const char *path)
 
 	mutex_lock(&fs_lock);
 	rv = dir_locked(path, 0, 0, NULL);
+	mutex_unlock(&fs_lock);
+	return (rv);
+}
+
+/*
+ * MOVING A NAME, which is two path splits and ONE transaction.
+ *
+ * The transaction is the point.  A rename is the call POSIX asks to be atomic
+ * -- programs write a temporary file and rename it over the real one precisely
+ * so that a reader sees one or the other and never a half-written file -- and
+ * that promise is kept below this layer, by an edit that names every leaf it
+ * touches, changes them all in memory and only then writes.  What this layer
+ * must not do is turn one such edit into two, which is why there is no
+ * "unlink then create" anywhere in it.
+ *
+ * A trailing separator is refused on both paths, as it is for a create.  It
+ * claims the name is a directory, and this call moves whatever is there.
+ */
+static int
+rename_locked(const char *opath, const char *npath)
+{
+	char		 odir[FS_NAME_MAX];
+	char		 ndir[FS_NAME_MAX];
+	const char	*oleaf;
+	const char	*nleaf;
+	uint64_t	 oparent;
+	uint64_t	 nparent;
+	uint64_t	 now_ns;
+	int		 is_dir;
+	int		 rv;
+
+	if (!fs_apfs_ready())
+		return (fs_fat_ready() ? FS_E_ROFS : FS_E_NOMOUNT);
+	rv = path_split(opath, odir, sizeof(odir), &oleaf);
+	if (rv != FS_E_OK)
+		return (rv);
+	rv = path_split(npath, ndir, sizeof(ndir), &nleaf);
+	if (rv != FS_E_OK)
+		return (rv);
+	rv = apfs_err(fs_apfs_lookup(odir, &oparent, &is_dir));
+	if (rv != FS_E_OK)
+		return (rv);
+	if (!is_dir)
+		return (FS_E_NOTDIR);
+	rv = apfs_err(fs_apfs_lookup(ndir, &nparent, &is_dir));
+	if (rv != FS_E_OK)
+		return (rv);
+	if (!is_dir)
+		return (FS_E_NOTDIR);
+
+	now_ns = (uint64_t)clock_walltime_us() * 1000ULL;
+	rv = apfs_err(fs_apfs_rename(oparent, oleaf, nparent, nleaf, now_ns));
+	if (rv != FS_E_OK)
+		return (rv);
+	rv = apfs_err(fs_apfs_checkpoint());
+	fs_gen++;
+	return (rv);
+}
+
+int
+fs_rename(const char *opath, const char *npath)
+{
+	int	rv;
+
+	mutex_lock(&fs_lock);
+	rv = rename_locked(opath, npath);
 	mutex_unlock(&fs_lock);
 	return (rv);
 }
@@ -2299,6 +2366,18 @@ fs_room_selftest(void)
 		return;
 	mutex_lock(&fs_lock);
 	fs_apfs_room_selftest((uint64_t)clock_walltime_us() * 1000ULL);
+	mutex_unlock(&fs_lock);
+}
+
+/* And about a name that moves without anything being made or destroyed. */
+void
+fs_move_selftest(void)
+{
+
+	if (!fs_apfs_ready())
+		return;
+	mutex_lock(&fs_lock);
+	fs_apfs_move_selftest((uint64_t)clock_walltime_us() * 1000ULL);
 	mutex_unlock(&fs_lock);
 }
 

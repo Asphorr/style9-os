@@ -423,6 +423,25 @@ struct apfs_omap_val {
 #define	APFS_BTREE_INFO_NODECOUNT	32
 
 /*
+ * And two more that a writer has to keep true, which nothing here touched
+ * until a rename put a name longer than any on the image into the tree:
+ *
+ *	Catalog: wrong maximum key size in info footer.
+ *
+ * They are HIGH-WATER MARKS rather than measurements.  A footer claiming MORE
+ * than any record needs is accepted and one claiming less is refused, which
+ * was measured with tools/apfspoke.py on a copy of this container rather than
+ * assumed -- so they are raised when a record exceeds them and never lowered.
+ * Lowering would mean walking the whole tree after every delete to find the
+ * new maximum, to tighten a bound no reader needs tight.
+ *
+ * A create could always have produced this and never did: every name the tests
+ * made was shorter than "standard.flf", which the image came with.
+ */
+#define	APFS_BTREE_INFO_LONGKEY		16
+#define	APFS_BTREE_INFO_LONGVAL		20
+
+/*
  * "No such offset", in a node's free-list heads.  A zero would name the first
  * byte of the key area, which a checker walking the chain reads as a hole
  * header sitting on top of a live record.
@@ -998,6 +1017,27 @@ int	fs_apfs_mkdir(uint64_t dir, const char *name, uint64_t now,
 int	fs_apfs_rmdir(uint64_t dir, const char *name, uint64_t now);
 
 /*
+ * Move a name, within one directory or between two, taking what is under it.
+ *
+ * Nothing is created and nothing destroyed: the same inode ends up with a
+ * different name, in a different place, and the tree holds exactly as many
+ * records as it did.  What makes it a rung of its own is that the inode RECORD
+ * has to follow -- it carries the name and the parent, apfsck checks both
+ * against the entry that names it, and a name of a different length makes the
+ * record a different length, so it is rebuilt rather than amended.
+ *
+ * Refuses FS_APFS_E_NOTFOUND for a name that is not there, FS_APFS_E_EXIST for
+ * a destination that is taken (replacing what is already there is a rung up),
+ * and FS_APFS_E_INVAL for the root, for an inode with more than one link, and
+ * for a directory moved into itself -- which would take every name inside it
+ * out of the volume.  Renaming a name to itself succeeds and changes nothing;
+ * renaming one to another spelling of itself is a real move, so the case a
+ * caller asks for is the case the volume keeps.
+ */
+int	fs_apfs_rename(uint64_t odir, const char *oname, uint64_t ndir,
+	    const char *nname, uint64_t now);
+
+/*
  * How many files have been made and unmade, and how many record ends have been
  * laid into room a delete gave back.
  *
@@ -1021,6 +1061,29 @@ uint64_t fs_apfs_holes(void);
  */
 uint64_t fs_apfs_dirmakes(void);
 uint64_t fs_apfs_dirkills(void);
+
+/*
+ * Names moved.  Worth its own counter for the reason above and one more: a
+ * rename is the only writer here whose success moves no total at all -- the
+ * same records, the same key count, the same file and directory counts -- so
+ * this is the only number that says it happened.
+ */
+uint64_t fs_apfs_moves(void);
+
+/*
+ * apfs-move: a name moved, within a directory and between two.
+ *
+ * Arranges what it checks, like the two above.  A file is given a length and
+ * then moved to a longer name and a shorter one, because the length lives in
+ * an extended field packed after the name and a rename that rebuilt the record
+ * instead of carrying it across would leave a valid empty file behind.  A
+ * directory is moved with a child in it, which nothing touches.  And the
+ * refusals are asked for -- onto a name that is taken, of a name that is not
+ * there, of a directory into itself, under its own child, and into something
+ * that is not a directory -- because a refusal leaves no trace on the volume
+ * for a checker to find afterwards.
+ */
+void	fs_apfs_move_selftest(uint64_t now);
 
 /*
  * Split a leaf on purpose and prove nothing was lost: the same records, in the

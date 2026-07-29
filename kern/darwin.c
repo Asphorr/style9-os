@@ -688,6 +688,7 @@ darwin_fs_errno(int rv)
 	case FS_E_NOTEMPTY:	return (DARWIN_ENOTEMPTY);
 	case FS_E_NOALLOC:	return (DARWIN_ENOSPC);
 	case FS_E_SPREAD:	return (DARWIN_ENOSPC);
+	case FS_E_INVAL:	return (DARWIN_EINVAL);
 	default:		return (DARWIN_EIO);
 	}
 }
@@ -2614,6 +2615,53 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		}
 		kprintf("darwin: UNIX unlink('%s') -- the name is gone\n",
 		    path);
+		return (darwin_ok(f, 0));
+	}
+	/*
+	 * rename(2).  Two paths in, one transaction out.
+	 *
+	 * The reason a program reaches for this rather than unlink-then-create
+	 * is that it must not be interruptible half way, and none of that is
+	 * this function's doing: it resolves two names against the caller's
+	 * working directory and hands both to a single filesystem call, and the
+	 * atomicity is kept by the edit underneath, which changes every leaf it
+	 * touches in memory before writing any of them.
+	 *
+	 * AN OPEN DESCRIPTOR ON THE FILE STILL ANSWERS WITH THE OLD PATH.  A
+	 * descriptor here remembers the name it was opened with rather than
+	 * pointing at the inode, which is what fchdir, fchmod and the fd
+	 * relative calls are built on -- and this is the call that makes that
+	 * shortcut visible, exactly as the comment where it is made predicted.
+	 * Nothing here holds a descriptor across a rename of its own file.
+	 */
+	case DARWIN_SYS_rename: {
+		char	opath[DARWIN_PATH_MAX];
+		char	npath[DARWIN_PATH_MAX];
+		char	raw[DARWIN_PATH_MAX];
+		int	rv;
+
+		if (syscall_copyin_str((const char *)f->sf_arg0, raw,
+		    sizeof(raw)) < 0)
+			return (darwin_err(f, DARWIN_EFAULT));
+		if (darwin_path_resolve(current_thread->th_task, raw, opath,
+		    sizeof(opath)) != 0)
+			return (darwin_err(f, DARWIN_ENAMETOOLONG));
+		if (syscall_copyin_str((const char *)f->sf_arg1, raw,
+		    sizeof(raw)) < 0)
+			return (darwin_err(f, DARWIN_EFAULT));
+		if (darwin_path_resolve(current_thread->th_task, raw, npath,
+		    sizeof(npath)) != 0)
+			return (darwin_err(f, DARWIN_ENAMETOOLONG));
+
+		rv = fs_rename(opath, npath);
+		if (rv != FS_E_OK) {
+			if (rv != FS_E_NOTFOUND)
+				kprintf("darwin: rename('%s', '%s') refused "
+				    "(rv=%d)\n", opath, npath, rv);
+			return (darwin_err(f, darwin_fs_errno(rv)));
+		}
+		kprintf("darwin: UNIX rename('%s', '%s') -- one name, moved\n",
+		    opath, npath);
 		return (darwin_ok(f, 0));
 	}
 	/*

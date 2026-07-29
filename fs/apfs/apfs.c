@@ -197,6 +197,7 @@ static uint64_t	 make_n;	/* files created                   */
 static uint64_t	 kill_n;	/* ...and names taken back out     */
 static uint64_t	 dmake_n;	/* directories made                */
 static uint64_t	 dkill_n;	/* ...and directories removed      */
+static uint64_t	 move_n;	/* names moved by a rename         */
 static uint64_t	 hole_n;	/* record ends reusing a deletion  */
 uint64_t	 deep_n;	/* levels the tree has gained      */
 uint64_t	 reidx_n;	/* index keys corrected after an edit */
@@ -2371,6 +2372,7 @@ fs_apfs_lookup(const char *path, uint64_t *oid_out, int *is_dir_out)
  */
 struct inode_info {
 	uint64_t	ii_oid;
+	uint64_t	ii_parent;	/* the directory it hangs under */
 	uint64_t	ii_private_id;
 	uint64_t	ii_size;
 	uint64_t	ii_alloced;
@@ -2414,6 +2416,7 @@ inode_pick(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 		return (false);
 
 	iv = (const struct apfs_inode_val *)val;
+	ii->ii_parent     = iv->ai_parent_id;
 	ii->ii_private_id = iv->ai_private_id;
 	ii->ii_mode       = iv->ai_mode;
 	ii->ii_uid        = iv->ai_owner;
@@ -2476,6 +2479,7 @@ inode_info(uint64_t oid, struct inode_info *ii)
 	bool		stopped;
 
 	ii->ii_oid        = oid;
+	ii->ii_parent     = 0;
 	ii->ii_private_id = oid;
 	ii->ii_size       = 0;
 	ii->ii_alloced    = 0;
@@ -3708,6 +3712,56 @@ tree_count_add(uint8_t *root, int64_t delta)
 }
 
 /*
+ * And the longest key and value it has ever held, in the same footer, raised
+ * to cover a record that is longer than anything before it.
+ *
+ * Never lowered.  A footer that claims more than any record needs is accepted
+ * and one that claims less is refused -- measured, not assumed -- so a delete
+ * has nothing to do here, and does not have to walk the tree to find out.
+ */
+static void
+tree_longest_raise(uint8_t *root, uint32_t klen, uint32_t vlen)
+{
+	uint32_t	*lkey;
+	uint32_t	*lval;
+
+	lkey = (uint32_t *)(root + APFS_BLOCK_SIZE - APFS_BTREE_INFO_SIZE +
+	    APFS_BTREE_INFO_LONGKEY);
+	lval = (uint32_t *)(root + APFS_BLOCK_SIZE - APFS_BTREE_INFO_SIZE +
+	    APFS_BTREE_INFO_LONGVAL);
+	if (klen > *lkey)
+		*lkey = klen;
+	if (vlen > *lval)
+		*lval = vlen;
+}
+
+/*
+ * The longest key and value in one node, raising what the caller already has.
+ *
+ * A node of FIXED key and value size has none: its two sizes are stated in the
+ * footer's own fixed part and the longest-* fields of such a tree are zero, so
+ * measuring one would put a number where the format wants none.
+ */
+static void
+node_longest(const uint8_t *node, uint32_t *klen, uint32_t *vlen)
+{
+	struct btree_layout	bl;
+	uint32_t		koff, kl, voff, vl;
+	uint32_t		i;
+
+	btree_layout(node, &bl);
+	if (bl.bl_fixed)
+		return;
+	for (i = 0; i < bl.bl_nkeys; i++) {
+		btree_entry_loc(&bl, i, &koff, &kl, &voff, &vl);
+		if (kl > *klen)
+			*klen = kl;
+		if (vl > *vlen)
+			*vlen = vl;
+	}
+}
+
+/*
  * A newly allocated run belongs to somebody: say so in the extent reference
  * tree.  The tree is a single node that is its own root, so its record count
  * is in the node being edited and there is nothing above it to tell.
@@ -4655,6 +4709,8 @@ edit_commit(struct leaf_edit *ne, int64_t records, uint64_t xid,
 	uint64_t		new_root;
 	uint32_t		nmoved;
 	uint32_t		ngone;
+	uint32_t		klen;
+	uint32_t		vlen;
 	uint32_t		i;
 	int			rv;
 
@@ -4669,10 +4725,25 @@ edit_commit(struct leaf_edit *ne, int64_t records, uint64_t xid,
 	if (rv != FS_APFS_E_OK)
 		return (rv);
 
+	/*
+	 * What the longest record in this edit turned out to be, measured after
+	 * the reindex above rather than passed in by the caller.  Measured
+	 * because an index key is a COPY of a leaf's first key, so an edit that
+	 * puts a long key at the start of a leaf makes the node ABOVE it hold
+	 * one too -- and the reindex is what puts it there.  No caller could
+	 * report that about itself.
+	 */
+	klen = 0;
+	vlen = 0;
+	for (i = 0; i < ne->le_n; i++)
+		if (!ne->le_gone[i])
+			node_longest(ne->le_node[i], &klen, &vlen);
+
 	if (ne->le_root < ne->le_n) {
 		tree_count_add(ne->le_node[ne->le_root], records);
 		tree_nodes_add(ne->le_node[ne->le_root],
 		    -(int64_t)ne->le_dropped);
+		tree_longest_raise(ne->le_node[ne->le_root], klen, vlen);
 	}
 
 	nmoved = 0;
@@ -4708,6 +4779,7 @@ edit_commit(struct leaf_edit *ne, int64_t records, uint64_t xid,
 			return (rv);
 		tree_count_add(scratch, records);
 		tree_nodes_add(scratch, -(int64_t)ne->le_dropped);
+		tree_longest_raise(scratch, klen, vlen);
 		oids[nmoved] = ((struct apfs_obj_phys *)scratch)->o_oid;
 		rv = node_cow(scratch, g_apfs.ac_root_tree_bno, xid, &new_root);
 		if (rv != FS_APFS_E_OK)
@@ -7003,6 +7075,568 @@ fs_apfs_rmdir(uint64_t dir, const char *name, uint64_t now)
 {
 
 	return (unmake_at(dir, name, now, true));
+}
+
+/*
+ * MOVING A NAME
+ *
+ * A rename is the two writers above run together, and the half that had to be
+ * measured is not the half it looks like.  Taking the old entry out and
+ * putting a new one in is the obvious work; what is easy to leave out is the
+ * INODE record, which carries a name and a parent of its own and has to be
+ * made to agree with the entry naming it.  Each of those left out in turn, on
+ * an otherwise complete move:
+ *
+ *	RENAME, leaving out		apfsck answers
+ *	  the name in the record	"Inode record: wrong name for only link"
+ *	  ai_parent_id			"Inode record: bad parent for only link"
+ *	  either parent's child count	"Inode record: wrong directory child
+ *					count"
+ *
+ * The first two were measured before a line of this was written, by a host
+ * tool that poked one field of one record on a copy of this container and
+ * re-sealed the block: the disagreement a forgetful rename leaves behind is
+ * exactly the disagreement a poked record has, and producing it that way costs
+ * no kernel at all.  The third is the create ladder's, unchanged.
+ *
+ * "for only link" is the checker saying what this kernel happens to be true
+ * of.  A volume with hard links keeps the other names in SIBLING_LINK records
+ * and the question becomes which of them moved; nothing here makes a second
+ * link, and unmake_at already refuses an inode that has one.
+ *
+ * THE RECORD CHANGES LENGTH, which is what makes this rung unlike every edit
+ * above it.  A name lives in an extended field, the fields are packed with
+ * each datum padded to eight bytes, and a rename from "a" to "bbbbbbbbb"
+ * makes the record eight bytes longer.  So the inode record is not amended
+ * where it lies, the way a chmod amends a mode: it is built beside the old
+ * one, deleted, and put back.  Everything that is not the name and the parent
+ * is carried across verbatim -- and the DSTREAM field is why that matters,
+ * since it holds the file's length and the blocks it has, and a rename that
+ * rebuilt the record the way a create writes one would quietly empty every
+ * file it moved.
+ */
+
+/*
+ * The old record with a different name in it, a different parent, and a change
+ * time.  Returns the new length, which is the old one plus or minus a multiple
+ * of eight.
+ */
+static int
+inode_renamed(const uint8_t *old, uint32_t olen, uint64_t ndir,
+    const char *name, uint32_t nlen, uint64_t now, uint8_t *out, uint32_t cap,
+    uint32_t *len_out)
+{
+	const struct apfs_inode_val	*oiv;
+	const struct apfs_xf_blob	*oblob;
+	const struct apfs_x_field	*oxf;
+	struct apfs_inode_val		*niv;
+	struct apfs_xf_blob		*nblob;
+	struct apfs_x_field		*nxf;
+	uint32_t			 nexts;
+	uint32_t			 ent;
+	uint32_t			 odata;
+	uint32_t			 ndata;
+	uint32_t			 used;
+	uint32_t			 size;
+	uint32_t			 pad;
+	uint32_t			 i;
+	bool				 named;
+
+	if (olen < sizeof(*oiv) + sizeof(*oblob))
+		return (FS_APFS_E_INVAL);
+	oiv   = (const struct apfs_inode_val *)old;
+	oblob = (const struct apfs_xf_blob *)(old + sizeof(*oiv));
+	nexts = oblob->xb_num_exts;
+	ent   = (uint32_t)(sizeof(*oiv) + sizeof(*oblob));
+	odata = ent + nexts * (uint32_t)sizeof(*oxf);
+	if (odata > olen || odata > cap)
+		return (FS_APFS_E_INVAL);
+
+	/*
+	 * The fixed part, the blob and the whole field table come across as
+	 * they are; only one field's size and one field's data change, and the
+	 * table is walked below to fix the one.
+	 */
+	mem_copy(out, old, odata);
+	niv = (struct apfs_inode_val *)out;
+	niv->ai_parent_id   = ndir;
+	niv->ai_change_time = now;
+	nblob = (struct apfs_xf_blob *)(out + sizeof(*niv));
+	nxf   = (struct apfs_x_field *)(out + ent);
+
+	ndata = odata;
+	used  = 0;
+	named = false;
+	for (i = 0; i < nexts; i++) {
+		oxf  = (const struct apfs_x_field *)(old + ent +
+		    i * sizeof(*oxf));
+		size = oxf->xf_size;
+		if (size > olen - odata)
+			return (FS_APFS_E_INVAL);
+		if (oxf->xf_type == APFS_INO_EXT_TYPE_NAME) {
+			named = true;
+			nxf[i].xf_size = (uint16_t)(nlen + 1u);
+			pad = (nlen + 1u + 7u) & ~7u;
+			if (pad > cap - ndata)
+				return (FS_APFS_E_NOALLOC);
+			mem_zero(out + ndata, pad);
+			mem_copy(out + ndata, (const uint8_t *)name, nlen);
+		} else {
+			pad = (size + 7u) & ~7u;
+			if (pad > cap - ndata)
+				return (FS_APFS_E_NOALLOC);
+			mem_zero(out + ndata, pad);
+			mem_copy(out + ndata, old + odata, size);
+		}
+		/*
+		 * The old field's datum is padded past the end of the record
+		 * only if the record is malformed -- but `olen - odata` below
+		 * is unsigned, so a record that IS would wrap the next round's
+		 * bounds check and read whatever follows the node.  It comes
+		 * off the disk, so it is bounded rather than trusted.
+		 */
+		odata += (size + 7u) & ~7u;
+		if (odata > olen)
+			return (FS_APFS_E_INVAL);
+		ndata += pad;
+		used  += pad;
+	}
+	/*
+	 * An inode with no name field is one this kernel cannot move: the
+	 * checker requires the record to name the link, and there would be
+	 * nowhere to write the new name without inventing a field.  Nothing on
+	 * this volume is like that, and saying so beats writing one that is.
+	 */
+	if (!named) {
+		kprintf("apfs: the inode record has no name field -- there is "
+		    "nothing in it to rename\n");
+		return (FS_APFS_E_INVAL);
+	}
+	nblob->xb_used_data = (uint16_t)used;
+	*len_out = ndata;
+	return (FS_APFS_E_OK);
+}
+
+/*
+ * Is `dir` the directory `top`, or somewhere underneath it?
+ *
+ * Asked before a directory moves, because moving one into itself detaches the
+ * whole subtree: every record in it stays in the tree, nothing left in the
+ * volume names it, and walking up from anything inside it goes round for ever.
+ * The walk is up the parent chain, which is as deep as the path is long, and
+ * it ends at the root -- whose parent is an object id that is not an object.
+ */
+static int
+dir_under(uint64_t dir, uint64_t top, bool *under)
+{
+	struct inode_info	ii;
+	uint64_t		up;
+	uint32_t		hops;
+	int			rv;
+
+	*under = false;
+	up = dir;
+	for (hops = 0; up != APFS_ROOT_DIR_INO; hops++) {
+		if (up == top) {
+			*under = true;
+			return (FS_APFS_E_OK);
+		}
+		/*
+		 * A chain longer than any tree here could be is a chain with a
+		 * loop in it, and a loop is the very thing this exists to keep
+		 * out.  Refusing beats walking it.
+		 */
+		if (hops > 64) {
+			kprintf("apfs: the parents of inode %llu do not reach "
+			    "the root in %u hops -- something above it is "
+			    "already a loop\n", (unsigned long long)dir,
+			    (unsigned)hops);
+			return (FS_APFS_E_INVAL);
+		}
+		rv = inode_info(up, &ii);
+		if (rv != FS_APFS_E_OK)
+			return (rv);
+		up = ii.ii_parent;
+	}
+	return (FS_APFS_E_OK);
+}
+
+/*
+ * One attempt at moving a name, which NAMES the leaf that had no room -- the
+ * same bargain make_once strikes, and for the same reason: a split moves the
+ * leaf, its parent, the root and the object map, so nothing worked out below
+ * survives one.
+ */
+static int
+move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
+    uint64_t now, uint64_t *full_leaf)
+{
+	struct apfs_drec_val	 dv;
+	struct btree_layout	 bl;
+	struct dirent_search	 ds;
+	struct inode_info	 ii;
+	struct leaf_edit	 ne;
+	uint8_t			 okey[12 + APFS_MAKE_NAME_MAX + 1];
+	uint8_t			 nkey[12 + APFS_MAKE_NAME_MAX + 1];
+	uint8_t			*rec;
+	uint8_t			*scratch;
+	const uint8_t		*old;
+	uint64_t		 child;
+	uint64_t		 ikey;
+	uint64_t		 opar_leaf;
+	uint64_t		 npar_leaf;
+	uint64_t		 odrec_leaf;
+	uint64_t		 ndrec_leaf;
+	uint64_t		 ino_leaf;
+	uint32_t		 oklen, nklen;
+	uint32_t		 onlen, nnlen;
+	uint32_t		 koff, klen, voff, vlen;
+	uint32_t		 rlen;
+	uint32_t		 pos;
+	uint32_t		 slot;
+	uint32_t		 i;
+	int			 rv;
+	bool			 stopped;
+	bool			 isdir;
+	bool			 under;
+
+	if (!g_apfs.ac_mounted)
+		return (FS_APFS_E_NOMOUNT);
+	if (!g_apfs.ac_ip_valid || g_apfs.ac_ctr_omap_tree == 0)
+		return (FS_APFS_E_NOALLOC);
+
+	onlen = (uint32_t)str_len(oname);
+	nnlen = (uint32_t)str_len(nname);
+	if (onlen == 0 || onlen > APFS_MAKE_NAME_MAX ||
+	    nnlen == 0 || nnlen > APFS_MAKE_NAME_MAX)
+		return (FS_APFS_E_INVAL);
+	rv = drec_key(odir, oname, onlen, okey, &oklen, true);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	rv = drec_key(ndir, nname, nnlen, nkey, &nklen, true);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+
+	/*
+	 * The same name, in the same directory, is a rename POSIX says must
+	 * succeed and change nothing -- and it is answered on the KEYS rather
+	 * than on the strings, because the key is what the tree is ordered on
+	 * and two names that differ only in case are two keys.  Renaming "a" to
+	 * "A" therefore does the whole move, and the volume keeps the case the
+	 * caller asked for.
+	 */
+	if (oklen == nklen) {
+		for (i = 0; i < oklen && okey[i] == nkey[i]; i++)
+			;
+		if (i == oklen)
+			return (FS_APFS_E_OK);
+	}
+
+	ds.ds_name    = oname;
+	ds.ds_namelen = onlen;
+	ds.ds_parent  = odir;
+	ds.ds_found   = 0;
+	ds.ds_is_dir  = false;
+	ds.ds_keyed   = true;
+	stopped = false;
+	if (!btree_scan(g_apfs.ac_root_tree_bno, okey, oklen, dirent_match, &ds,
+	    0, &stopped))
+		return (FS_APFS_E_IO);
+	if (ds.ds_found == 0)
+		return (FS_APFS_E_NOTFOUND);
+	child = ds.ds_found;
+	isdir = ds.ds_is_dir;
+
+	/* And the name it moves to must be free.  Clobbering is a rung up. */
+	ds.ds_name    = nname;
+	ds.ds_namelen = nnlen;
+	ds.ds_parent  = ndir;
+	ds.ds_found   = 0;
+	ds.ds_is_dir  = false;
+	ds.ds_keyed   = true;
+	stopped = false;
+	if (!btree_scan(g_apfs.ac_root_tree_bno, nkey, nklen, dirent_match, &ds,
+	    0, &stopped))
+		return (FS_APFS_E_IO);
+	if (ds.ds_found != 0)
+		return (FS_APFS_E_EXIST);
+
+	/*
+	 * The destination has to BE a directory, asked of its record.  Finding
+	 * the old name proved that much about the source -- something filed an
+	 * entry under it -- but nothing has asked anything of the destination
+	 * yet, and "the name is free" is exactly as true of a regular file.
+	 * Handing one to dir_children_add would add a child to something that
+	 * counts LINKS in that field.
+	 */
+	if (inode_info(ndir, &ii) != FS_APFS_E_OK)
+		return (FS_APFS_E_NOTFOUND);
+	if ((ii.ii_mode & APFS_S_IFMT) != APFS_S_IFDIR) {
+		kprintf("apfs: inode %llu is not a directory -- nothing can be "
+		    "moved into it\n", (unsigned long long)ndir);
+		return (FS_APFS_E_NOTDIR);
+	}
+
+	if (inode_info(child, &ii) != FS_APFS_E_OK)
+		return (FS_APFS_E_NOTFOUND);
+	if (!isdir && ii.ii_nlink != 1) {
+		kprintf("apfs: inode %llu has %u links -- moving one name of "
+		    "several is a different rung\n",
+		    (unsigned long long)child, (unsigned)ii.ii_nlink);
+		return (FS_APFS_E_NOALLOC);
+	}
+	if (child == APFS_ROOT_DIR_INO)
+		return (FS_APFS_E_INVAL);
+	/*
+	 * The destination must not be inside what is moving.  Only asked of a
+	 * directory that is changing parents: a file contains nothing, and a
+	 * directory renamed where it stands cannot be its own new ancestor.
+	 */
+	if (isdir && ndir != odir) {
+		rv = dir_under(ndir, child, &under);
+		if (rv != FS_APFS_E_OK)
+			return (rv);
+		if (under) {
+			kprintf("apfs: inode %llu is inside \"%s\" -- a "
+			    "directory moved under itself takes every name in "
+			    "it out of the volume\n",
+			    (unsigned long long)ndir, oname);
+			return (FS_APFS_E_INVAL);
+		}
+	}
+
+	/*
+	 * Five leaves at the most -- two parents, two entries and the inode --
+	 * against the nine an edit can hold, so the slots below are not checked
+	 * for overflow the way a wider writer's would have to be.
+	 */
+	rv = inode_where(odir, &opar_leaf);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	rv = inode_where(ndir, &npar_leaf);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	rv = inode_where(child, &ino_leaf);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	rv = leaf_home(okey, oklen, &odrec_leaf);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	rv = leaf_home(nkey, nklen, &ndrec_leaf);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+
+	rec = kmalloc(APFS_BLOCK_SIZE);
+	if (rec == NULL)
+		return (FS_APFS_E_NOMEM);
+	edit_init(&ne);
+	(void)edit_leaf(&ne, opar_leaf);
+	(void)edit_leaf(&ne, npar_leaf);
+	(void)edit_leaf(&ne, odrec_leaf);
+	(void)edit_leaf(&ne, ndrec_leaf);
+	(void)edit_leaf(&ne, ino_leaf);
+	rv = edit_read(&ne);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+
+	/*
+	 * THE NEW RECORD IS BUILT FIRST, while the old one is still a record.
+	 * A delete threads the value's bytes onto the node's free list by
+	 * writing a link into the first of them, so the moment the old record
+	 * goes the buffer it was in stops saying what it said.
+	 */
+	slot = edit_leaf(&ne, ino_leaf);
+	if (!node_slot(ne.le_node[slot], child, APFS_TYPE_INODE, &pos, &voff,
+	    &vlen)) {
+		rv = FS_APFS_E_NOTFOUND;
+		goto out;
+	}
+	btree_layout(ne.le_node[slot], &bl);
+	old = (const uint8_t *)bl.bl_vals - voff;
+	rv  = inode_renamed(old, vlen, ndir, nname, nnlen, now, rec,
+	    APFS_BLOCK_SIZE, &rlen);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+
+	/*
+	 * The old entry out.  By its exact key, like unmake_at: a directory has
+	 * one record per name and they differ only past the eighth byte, so
+	 * "the DIR_REC of this parent" names all of them at once.
+	 */
+	slot = edit_leaf(&ne, odrec_leaf);
+	btree_layout(ne.le_node[slot], &bl);
+	rv = FS_APFS_E_NOTFOUND;
+	for (i = 0; i < bl.bl_nkeys; i++) {
+		btree_entry_loc(&bl, i, &koff, &klen, &voff, &vlen);
+		if (klen != oklen)
+			continue;
+		if (jkey_cmp(bl.bl_keys + koff, klen, okey, oklen) != 0)
+			continue;
+		/*
+		 * Carried across whole rather than rebuilt, so that whatever an
+		 * entry says beyond the object id and the type keeps saying it.
+		 * A shorter one than this kernel knows how to read is refused
+		 * BEFORE the delete, since there would be nothing to put back.
+		 */
+		if (vlen < sizeof(dv)) {
+			rv = FS_APFS_E_INVAL;
+			break;
+		}
+		dv = *(const struct apfs_drec_val *)
+		    ((const uint8_t *)bl.bl_vals - voff);
+		rv = leaf_delete(ne.le_node[slot], i);
+		break;
+	}
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs: \"%s\" was in inode %llu a moment ago and is "
+		    "not in leaf %llu now\n", oname, (unsigned long long)odir,
+		    (unsigned long long)odrec_leaf);
+		goto out;
+	}
+
+	/*
+	 * And the new entry in, carrying the old one's value: the object id it
+	 * names, its type, and the date it was ADDED, which is a fact about the
+	 * name and not about this move.  The delete came first so that a rename
+	 * within one directory has the old entry's room to put the new one in.
+	 */
+	slot = edit_leaf(&ne, ndrec_leaf);
+	*full_leaf = ndrec_leaf;
+	rv = leaf_insert(ne.le_node[slot],
+	    node_place(ne.le_node[slot], nkey, nklen), nkey, nklen, &dv,
+	    (uint32_t)sizeof(dv));
+	if (rv != FS_APFS_E_OK)
+		goto out;
+
+	/* Then the record itself, out and back in at its own unchanged key. */
+	slot = edit_leaf(&ne, ino_leaf);
+	if (!node_slot(ne.le_node[slot], child, APFS_TYPE_INODE, &pos, &voff,
+	    &vlen)) {
+		rv = FS_APFS_E_NOTFOUND;
+		goto out;
+	}
+	rv = leaf_delete(ne.le_node[slot], pos);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	ikey = (child & APFS_J_OBJ_ID_MASK) |
+	    ((uint64_t)APFS_TYPE_INODE << APFS_J_OBJ_TYPE_SHIFT);
+	*full_leaf = ino_leaf;
+	rv = leaf_insert(ne.le_node[slot],
+	    node_place(ne.le_node[slot], (const uint8_t *)&ikey,
+	    (uint32_t)sizeof(ikey)), &ikey, (uint32_t)sizeof(ikey), rec, rlen);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	*full_leaf = 0;
+
+	/*
+	 * The counts.  A name that stays in its directory changes neither
+	 * count, and the times still move: the directory was modified, and one
+	 * call with nothing to add says that in one place rather than two.
+	 */
+	if (odir == ndir) {
+		slot = edit_leaf(&ne, opar_leaf);
+		rv = dir_children_add(ne.le_node[slot], odir, 0, now);
+	} else {
+		slot = edit_leaf(&ne, opar_leaf);
+		rv = dir_children_add(ne.le_node[slot], odir, -1, now);
+		if (rv == FS_APFS_E_OK) {
+			slot = edit_leaf(&ne, npar_leaf);
+			rv = dir_children_add(ne.le_node[slot], ndir, 1, now);
+		}
+	}
+	if (rv != FS_APFS_E_OK)
+		goto out;
+
+	scratch = kmalloc(APFS_BLOCK_SIZE);
+	if (scratch == NULL) {
+		rv = FS_APFS_E_NOMEM;
+		goto out;
+	}
+	/*
+	 * Two records out and two back in: the tree holds exactly as many keys
+	 * as it did, and nothing about the volume's file or directory counts
+	 * has changed either.  A rename is the only writer here that moves no
+	 * totals at all.
+	 */
+	rv = edit_commit(&ne, 0, g_apfs.ac_xid + 1, scratch);
+	kfree(scratch);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs: moving \"%s\" failed (%d) -- %s\n", oname, rv,
+		    edit_moved(&ne) ? "a leaf had moved, and this checkpoint "
+		    "must not be written" : "before anything moved, so the "
+		    "volume is as it was");
+		goto out;
+	}
+
+	move_n++;
+	kprintf("apfs: \"%s\" in inode %llu is now \"%s\" in inode %llu -- "
+	    "inode %llu, %u leaves moved\n", oname, (unsigned long long)odir,
+	    nname, (unsigned long long)ndir, (unsigned long long)child,
+	    (unsigned)ne.le_n);
+	rv = FS_APFS_E_OK;
+out:
+	edit_free(&ne);
+	kfree(rec);
+	return (rv);
+}
+
+/*
+ * And the same, with the room made underneath it -- make_at's loop, for the
+ * same two reasons and with the same ceiling.
+ *
+ * TWO inserts here can be refused: the new entry, which sorts under the
+ * destination directory's object id, and the inode record, which sorts under
+ * the child's and comes back LONGER when the new name is longer than the old.
+ * Neither says anything about the other, so splitting for one can be answered
+ * by the other, and two is still the ceiling: each of those leaves needs at
+ * most one split, and half a node is room enough for either record several
+ * times over.
+ */
+static int
+move_at(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
+    uint64_t now)
+{
+	uint8_t		*scratch;
+	uint64_t	 full;
+	uint32_t	 tries;
+	int		 rv;
+
+	for (tries = 0; ; tries++) {
+		full = 0;
+		rv = move_once(odir, oname, ndir, nname, now, &full);
+		if (rv != FS_APFS_E_NOALLOC || full == 0)
+			return (rv);
+		if (tries >= 2) {
+			kprintf("apfs: the leaf at %llu still has no room for "
+			    "\"%s\" after %u split(s) -- whatever is refusing, "
+			    "it is not a full node\n", (unsigned long long)full,
+			    nname, (unsigned)tries);
+			return (rv);
+		}
+
+		scratch = kmalloc(APFS_BLOCK_SIZE);
+		if (scratch == NULL)
+			return (FS_APFS_E_NOMEM);
+		rv = node_split_at(full, 0, g_apfs.ac_xid + 1, scratch);
+		kfree(scratch);
+		if (rv != FS_APFS_E_OK)
+			return (rv);
+	}
+}
+
+int
+fs_apfs_rename(uint64_t odir, const char *oname, uint64_t ndir,
+    const char *nname, uint64_t now)
+{
+
+	return (move_at(odir, oname, ndir, nname, now));
+}
+
+uint64_t
+fs_apfs_moves(void)
+{
+
+	return (move_n);
 }
 
 uint64_t

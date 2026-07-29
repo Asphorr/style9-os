@@ -117,6 +117,13 @@ _Static_assert(sizeof(struct fs_statbuf) == 72,
 				   edit can move at once */
 #define	FS_E_NOTDIR	(-11)	/* ...and what it names is NOT a directory */
 #define	FS_E_NOTEMPTY	(-12)	/* a directory that still holds a name     */
+/*
+ * The request itself makes no sense -- a name this volume cannot spell, a
+ * directory asked to move inside itself.  Distinct from FS_E_IO, which these
+ * used to be answered with, because a caller can tell EINVAL from EIO: one
+ * says ask differently and the other says the disk is lying.
+ */
+#define	FS_E_INVAL	(-13)
 
 /* Non-zero once some filesystem is mounted and can serve files. */
 int		fs_ready(void);
@@ -272,6 +279,22 @@ int		fs_create(const char *path, uint16_t perm, uint64_t *ino_out);
 int		fs_unlink(const char *path);
 int		fs_mkdir(const char *path, uint16_t perm, uint64_t *ino_out);
 int		fs_rmdir(const char *path);
+
+/*
+ * fs_rename: move a name, within a directory or between two, taking whatever
+ * is under it -- a file with its bytes, a directory with everything in it.
+ *
+ * ONE transaction, which is the whole reason this is a call of its own and not
+ * an unlink beside a create.  A program that writes a temporary file and
+ * renames it over the real one is relying on a reader seeing one file or the
+ * other and never a half-written one, and that promise is only worth anything
+ * if the two edits reach the disk together.
+ *
+ * FS_E_EXIST if the destination is taken -- replacing what is there is a rung
+ * this kernel has not climbed -- and FS_E_INVAL for a directory asked to move
+ * inside itself, which would take every name in it out of the volume.
+ */
+int		fs_rename(const char *opath, const char *npath);
 
 /*
  * fs_chmod: set the permission bits of an existing name.  Only the low twelve
@@ -434,6 +457,15 @@ void		fs_stream_selftest(void);
  * nothing when the volume is not APFS.
  */
 void		fs_room_selftest(void);
+
+/*
+ * And that a name can move -- within a directory, into another one, to a
+ * longer name and a shorter one -- carrying the inode, its bytes and, when it
+ * is a directory, everything under it.  The refusals are asked for too, since
+ * a refusal is the one outcome that leaves nothing on the volume to check
+ * afterwards.  Silently does nothing when the volume is not APFS.
+ */
+void		fs_move_selftest(void);
 
 /*
  * And that finding a record by descending on its key answers exactly what
