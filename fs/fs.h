@@ -420,6 +420,22 @@ void		fs_index_selftest(void);
 void		fs_drop_selftest(void);
 
 /*
+ * And that a file whose inode record and data stream record a split has put in
+ * different nodes is still removed whole -- the failure it guards against is
+ * an unlink that answered success and left half a file behind.  Silently does
+ * nothing when the volume is not APFS.
+ */
+void		fs_stream_selftest(void);
+
+/*
+ * And that a create whose leaf has no room splits it and carries on, rather
+ * than refusing for a reason that has nothing to do with the name it was
+ * asked for.  The full leaf is arranged by filling one.  Silently does
+ * nothing when the volume is not APFS.
+ */
+void		fs_room_selftest(void);
+
+/*
  * And that finding a record by descending on its key answers exactly what
  * reading every record in the tree answers -- the same record, out of the same
  * leaf, with the same tail behind it.  Silently does nothing when the volume

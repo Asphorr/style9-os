@@ -435,11 +435,28 @@ a directory names a PLACE -- `read(2)` on one answers EISDIR -- and it is
 what `openat`, `fdopendir`, `fchdir` and `fchmod` are all built on, all
 four through one kernel call that answers "what path is this fd on".
 
-Next on the roadmap: **a create that splits and retries** the way growing
-a file does.  It is the one edge both making calls document out loud and
-then refuse at: records go into two leaves at once, and a split moves
-both of them and everything above, so every address worked out beforehand
-is stale.  Also open: rename, and real SMP.
+A create now **splits and retries**, which was the last edge either making
+call documented out loud and then refused at.  A name's records go into
+two leaves at once -- the entry under the DIRECTORY's object id, the
+inode under its OWN -- so a split moves both of them and everything above
+them, and every address worked out beforehand is stale.  The writer
+therefore does not resume: it makes the room and starts over from the
+beginning, and it asks again after each split rather than once, because
+either of the two leaves can be the full one.
+
+What that cost was one latent bug it made reachable, and the shape of it
+is worth keeping.  A file's inode record and the reference count of its
+data stream are adjacent in key order and are written into the same node,
+so an unlink looked for the second where the first was.  Adjacent means
+the same node only until a SPLIT falls between them -- and a leaf filled
+with twenty inodes and cut down the middle does exactly that.  The unlink
+then answered success, took the inode and the entry, and left the stream
+record behind, which apfsck calls "Data stream: has no references."  It
+appeared on the fourth boot under the new fill-a-leaf self-test, which is
+another way of saying a user would have found it; both cases are now
+arranged on purpose rather than waited for.
+
+Next on the roadmap: **rename**, and real SMP.
 
 Reading the tree stopped being O(volume) per question along the way.  The
 same boot that read **54434 records over 6381 nodes** to answer its 1718

@@ -273,12 +273,7 @@ entry(void)
 	(void)unlink(DIRFILE);
 	(void)rmdir(DIR);
 	if (mkdir(DIR, 0755) != 0) {
-		if (*__error() == ENOSPC)
-			printf("filewrite: the leaf that would hold %s is "
-			    "full, and splitting one is a different rung; "
-			    "skipped\n", DIR);
-		else
-			fail("mkdir would not make " DIR);
+		fail("mkdir would not make " DIR);
 	} else if (mkdir(DIR, 0755) == 0 || *__error() != EEXIST) {
 		fail("mkdir made " DIR " a second time");
 	} else {

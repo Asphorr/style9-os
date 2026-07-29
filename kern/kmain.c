@@ -230,6 +230,22 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	fs_drop_selftest();
 
 	/*
+	 * And a file whose two records a split has put on either side of a
+	 * node boundary, which is the case an unlink used to answer success to
+	 * while leaving half of it on the volume.
+	 */
+	fs_stream_selftest();
+
+	/*
+	 * And the same three shapes again, this time asked for by an ordinary
+	 * caller rather than by a test: names go into a directory until a leaf
+	 * has no room, and the create that finds it full is the one that has to
+	 * split it.  Runs after the three above so that the tree it fills is
+	 * the deep one they leave behind.
+	 */
+	fs_room_selftest();
+
+	/*
 	 * And then, against the tree those three leave behind -- three levels
 	 * deep, with split halves and a node's worth of gaps in it -- that
 	 * looking a record up by its key answers what reading every record

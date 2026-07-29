@@ -3549,8 +3549,9 @@ leaf_insert(uint8_t *node, uint32_t pos, const void *key, uint32_t klen,
 	if ((uint32_t)(bl.bl_nkeys + 1) * (uint32_t)sizeof(struct apfs_kvloc) >
 	    n->btn_table_space.nl_len) {
 		kprintf("apfs: the node at level %u has %u entries and no room "
-		    "in its table of contents -- a split is a different rung\n",
-		    (unsigned)bl.bl_level, (unsigned)bl.bl_nkeys);
+		    "in its table of contents -- whoever asked has to make "
+		    "room and ask again\n", (unsigned)bl.bl_level,
+		    (unsigned)bl.bl_nkeys);
 		return (FS_APFS_E_NOALLOC);
 	}
 
@@ -3566,9 +3567,9 @@ leaf_insert(uint8_t *node, uint32_t pos, const void *key, uint32_t klen,
 	    (vhole == APFS_BTOFF_INVALID ? vlen : 0);
 	if (need > n->btn_free_space.nl_len) {
 		kprintf("apfs: the node at level %u has %u bytes free and the "
-		    "record needs %u -- a split is a different rung\n",
-		    (unsigned)bl.bl_level, (unsigned)n->btn_free_space.nl_len,
-		    (unsigned)need);
+		    "record needs %u -- whoever asked has to make room and ask "
+		    "again\n", (unsigned)bl.bl_level,
+		    (unsigned)n->btn_free_space.nl_len, (unsigned)need);
 		return (FS_APFS_E_NOALLOC);
 	}
 
@@ -6331,15 +6332,15 @@ dir_children_add(uint8_t *node, uint64_t dir, int32_t delta, uint64_t now)
  * have one at all, which is the measured half of the same fact and the reason
  * the record below is assembled around a question instead of copied.
  *
- * A leaf with no room refuses, out loud, and this does NOT split and retry the
- * way growing a file does.  That is the honest edge and not an oversight: a
- * create puts records into two leaves at once, a split moves both of them and
- * everything above, and every address worked out below would be stale --
- * fs_apfs_grow can start over because it has one leaf to reconsider.
+ * A leaf with no room refuses and NAMES the leaf, which is the only thing a
+ * caller can act on: a split moves that leaf, its parent, the root and the
+ * object map, so every address worked out below is stale the moment one
+ * happens and there is nothing here to resume.  make_at, underneath, turns
+ * that refusal into room and asks again from the beginning.
  */
 static int
-make_at(uint64_t dir, const char *name, uint64_t now, bool isdir, uint16_t perm,
-    uint64_t *ino_out)
+make_once(uint64_t dir, const char *name, uint64_t now, bool isdir,
+    uint16_t perm, uint64_t *ino_out, uint64_t *full_leaf)
 {
 	struct apfs_inode_val	*iv;
 	struct apfs_xf_blob	*blob;
@@ -6501,9 +6502,22 @@ make_at(uint64_t dir, const char *name, uint64_t now, bool isdir, uint16_t perm,
 	/*
 	 * Every edit, in memory.  A file's inode record and its dstream id go
 	 * in together because their keys are adjacent -- same object,
-	 * neighbouring types -- so a leaf that holds one holds the other.
+	 * neighbouring types -- and, HERE, adjacent is enough: neither record
+	 * exists yet, a node boundary falls between two records that do, and
+	 * nothing of this brand new object id can be sitting between them.
+	 * That is a fact about creating and not about the pair: once both are
+	 * on the volume a split can land between them, which is why unmaking a
+	 * name asks for the second one's leaf rather than assuming this one.
+	 *
+	 * Which leaf is being asked is recorded as each is asked, so that a
+	 * refusal names it.  Asked rather than measured beforehand because the
+	 * two leaves are sometimes ONE leaf -- a name and the inode it makes
+	 * can land in the same node while the tree is small -- and then the
+	 * question is not whether either record fits but whether all of them
+	 * do.  The insert answering it in turn is that question, exactly.
 	 */
 	slot = edit_leaf(&ne, drec_leaf);
+	*full_leaf = drec_leaf;
 	rv = leaf_insert(ne.le_node[slot],
 	    node_place(ne.le_node[slot], dkey, dklen), dkey, dklen, &dv,
 	    (uint32_t)sizeof(dv));
@@ -6511,6 +6525,7 @@ make_at(uint64_t dir, const char *name, uint64_t now, bool isdir, uint16_t perm,
 		goto out;
 
 	slot = edit_leaf(&ne, ino_leaf);
+	*full_leaf = ino_leaf;
 	rv = leaf_insert(ne.le_node[slot],
 	    node_place(ne.le_node[slot], (const uint8_t *)&ikey,
 	    (uint32_t)sizeof(ikey)), &ikey, (uint32_t)sizeof(ikey), rec, vlen);
@@ -6524,6 +6539,7 @@ make_at(uint64_t dir, const char *name, uint64_t now, bool isdir, uint16_t perm,
 		if (rv != FS_APFS_E_OK)
 			goto out;
 	}
+	*full_leaf = 0;
 
 	slot = edit_leaf(&ne, par_leaf);
 	rv = dir_children_add(ne.le_node[slot], dir, 1, now);
@@ -6581,6 +6597,66 @@ undo:
 out:
 	edit_free(&ne);
 	return (rv);
+}
+
+/*
+ * And the same, with the room made underneath it.
+ *
+ * TWO leaves can be the full one, and that is the whole of what makes this
+ * harder than growing a file: a name's entry sorts under the PARENT's object
+ * id and the inode it names sorts under the CHILD's, so once the tree has more
+ * than one leaf they are different nodes and either can be the one with no
+ * room.  Splitting the first and asking again can therefore be answered by the
+ * second, which is why this is a loop and not the single retry above.
+ *
+ * It stops after two.  Each of the two leaves needs at most one split -- a half
+ * empty node has room for three records the size of these by a wide margin --
+ * so a third refusal is not a full node at all, and a writer that kept
+ * splitting in the hope that it would help would answer a bug elsewhere by
+ * filling the volume with half-empty nodes.
+ *
+ * The split happens BEFORE the attempt it makes room for, never half way
+ * through one, for the reason make_once gives: nothing it computed survives a
+ * split.  Starting over costs a re-walk of a tree that is a few nodes deep and
+ * buys a writer with no half-finished state to unpick.
+ */
+static int
+make_at(uint64_t dir, const char *name, uint64_t now, bool isdir, uint16_t perm,
+    uint64_t *ino_out)
+{
+	uint8_t		*scratch;
+	uint64_t	 full;
+	uint32_t	 tries;
+	int		 rv;
+
+	for (tries = 0; ; tries++) {
+		/*
+		 * Cleared before each attempt: a refusal that has nothing to do
+		 * with a full node -- an unmounted volume, an allocator with
+		 * nowhere to write -- answers FS_APFS_E_NOALLOC as well, and
+		 * splitting a leaf on the strength of it would be splitting one
+		 * at random.
+		 */
+		full = 0;
+		rv = make_once(dir, name, now, isdir, perm, ino_out, &full);
+		if (rv != FS_APFS_E_NOALLOC || full == 0)
+			return (rv);
+		if (tries >= 2) {
+			kprintf("apfs: the leaf at %llu still has no room for "
+			    "\"%s\" after %u split(s) -- whatever is refusing, "
+			    "it is not a full node\n", (unsigned long long)full,
+			    name, (unsigned)tries);
+			return (rv);
+		}
+
+		scratch = kmalloc(APFS_BLOCK_SIZE);
+		if (scratch == NULL)
+			return (FS_APFS_E_NOMEM);
+		rv = node_split_at(full, 0, g_apfs.ac_xid + 1, scratch);
+		kfree(scratch);
+		if (rv != FS_APFS_E_OK)
+			return (rv);
+	}
 }
 
 int
@@ -6676,9 +6752,11 @@ unmake_at(uint64_t dir, const char *name, uint64_t now, bool isdir)
 	uint8_t			 dkey[12 + APFS_MAKE_NAME_MAX + 1];
 	uint8_t			*scratch;
 	uint64_t		 child;
+	uint64_t		 skey;
 	uint64_t		 par_leaf;
 	uint64_t		 drec_leaf;
 	uint64_t		 ino_leaf;
+	uint64_t		 ds_leaf;
 	uint32_t		 dklen;
 	uint32_t		 nlen;
 	uint32_t		 pos, voff, vlen;
@@ -6761,11 +6839,36 @@ unmake_at(uint64_t dir, const char *name, uint64_t now, bool isdir)
 	rv = leaf_home(dkey, dklen, &drec_leaf);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
+	/*
+	 * AND THE DATA STREAM RECORD IS ASKED FOR SEPARATELY, though it sorts
+	 * immediately after the inode's and was written into the same node.
+	 * Adjacent in key order means the same node only until a SPLIT falls
+	 * between them, and a split can: both records exist by then, so a cut
+	 * at the midpoint of a leaf full of inodes lands between one and its
+	 * own stream as readily as between two files.
+	 *
+	 * Looking only where the inode is left the stream record behind, and
+	 * quietly: the branch below reads "this file has none", which is a real
+	 * case for a file that came off the image, so it printed a line and
+	 * carried on.  What the volume was left with is what apfsck calls
+	 * "Data stream: has no references", and it took a create filling a leaf
+	 * with twenty inodes and splitting it to produce one.
+	 */
+	ds_leaf = ino_leaf;
+	if (!isdir) {
+		skey = (child & APFS_J_OBJ_ID_MASK) |
+		    ((uint64_t)APFS_TYPE_DSTREAM_ID << APFS_J_OBJ_TYPE_SHIFT);
+		rv = leaf_home((const uint8_t *)&skey, (uint32_t)sizeof(skey),
+		    &ds_leaf);
+		if (rv != FS_APFS_E_OK)
+			return (rv);
+	}
 
 	edit_init(&ne);
 	(void)edit_leaf(&ne, par_leaf);
 	(void)edit_leaf(&ne, drec_leaf);
 	(void)edit_leaf(&ne, ino_leaf);
+	(void)edit_leaf(&ne, ds_leaf);
 	rv = edit_read(&ne);
 	if (rv != FS_APFS_E_OK)
 		goto out;
@@ -6810,7 +6913,7 @@ unmake_at(uint64_t dir, const char *name, uint64_t now, bool isdir)
 	 * this used to say three whatever it had found -- which would have told
 	 * the tree that a record it still holds is gone.
 	 */
-	slot = edit_leaf(&ne, ino_leaf);
+	slot = edit_leaf(&ne, ds_leaf);
 	if (node_slot(ne.le_node[slot], child, APFS_TYPE_DSTREAM_ID, &pos,
 	    &voff, &vlen)) {
 		rv = leaf_delete(ne.le_node[slot], pos);
@@ -6826,6 +6929,8 @@ unmake_at(uint64_t dir, const char *name, uint64_t now, bool isdir)
 		kprintf("apfs: inode %llu has no dstream id record -- one "
 		    "fewer to take out\n", (unsigned long long)child);
 	}
+	/* Its own leaf again, which is the stream's only when they share. */
+	slot = edit_leaf(&ne, ino_leaf);
 	if (!node_slot(ne.le_node[slot], child, APFS_TYPE_INODE, &pos, &voff,
 	    &vlen)) {
 		rv = FS_APFS_E_NOTFOUND;

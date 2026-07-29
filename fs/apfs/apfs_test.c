@@ -1364,6 +1364,439 @@ clean:
 	(void)fs_apfs_checkpoint();
 }
 
+/* Is there still a data stream record under this object id? */
+struct stream_probe {
+	uint64_t	sp_id;
+	bool		sp_found;
+};
+
+static bool
+stream_see(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
+    const uint8_t *val, uint32_t vlen, uint64_t bno, void *arg)
+{
+	struct stream_probe	*sp;
+
+	(void)key;
+	(void)klen;
+	(void)val;
+	(void)vlen;
+	(void)bno;
+	sp = arg;
+	/*
+	 * The descent starts at the record's own key, so anything under a
+	 * larger object id is past the answer and the walk can stop there.
+	 */
+	if (oid != sp->sp_id)
+		return (false);
+	if (type == APFS_TYPE_DSTREAM_ID)
+		sp->sp_found = true;
+	return (true);
+}
+
+/*
+ * AN INODE AND ITS DATA STREAM, IN TWO DIFFERENT NODES
+ *
+ * A file this kernel makes gets two records under its own object id, one after
+ * the other: the inode, and the reference count of the stream its bytes hang
+ * off.  They are written into the same node because nothing can sort between
+ * them, and unlinking looked for the second where the first was on exactly that
+ * reasoning.
+ *
+ * It is the reasoning, not the arithmetic, that was wrong.  Adjacent in key
+ * order means the same node only until a SPLIT falls between them -- and once
+ * both records exist, a cut at the middle of a leaf full of inodes lands
+ * between a file and its own stream as readily as between two files.  The
+ * unlink then took the inode and the entry and left the stream record behind,
+ * and said so in a line that reads as a normal case:
+ *
+ *	apfs: inode 332 has no dstream id record -- one fewer to take out
+ *
+ * which is what a file that came off the image genuinely looks like.  What the
+ * volume was left with is what apfsck calls
+ *
+ *	Data stream: has no references.
+ *
+ * FOUND ON THE FOURTH BOOT, by the test below this one, which is another way of
+ * saying it would have been found by a user.  So it is arranged here instead:
+ * make a file, split the leaf holding its records AT the stream record so that
+ * the inode ends the lower half and the stream starts the upper, and unlink it.
+ * The claim is checked where the bug was invisible -- not that the unlink
+ * answered success, which it always did, but that no record of that stream is
+ * left anywhere in the tree afterwards.
+ */
+void
+fs_apfs_stream_selftest(uint64_t now)
+{
+	struct stream_probe	 sp;
+	uint8_t			*scratch;
+	uint64_t		 parent;
+	uint64_t		 ino;
+	uint64_t		 skey;
+	uint64_t		 bno;
+	uint64_t		 ino_leaf;
+	uint64_t		 ds_leaf;
+	uint32_t		 nkeys;
+	uint32_t		 at;
+	int			 is_dir;
+	int			 rv;
+	bool			 stopped;
+
+	if (!g_apfs.ac_mounted || !g_apfs.ac_ip_valid) {
+		kprintf("apfs-strm: nothing writable -- skipped\n");
+		return;
+	}
+	if (fs_apfs_lookup("/etc", &parent, &is_dir) != FS_APFS_E_OK ||
+	    !is_dir) {
+		kprintf("apfs-strm: /etc is not there -- skipped\n");
+		return;
+	}
+
+	/* Whatever an interrupted run left, so this starts from nothing. */
+	(void)fs_apfs_unlink(parent, "strm.txt", now);
+	(void)fs_apfs_checkpoint();
+
+	rv = fs_apfs_create(parent, "strm.txt", now, 0644, &ino);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-strm: FAIL cannot make the file this needs "
+		    "(%d)\n", rv);
+		return;
+	}
+	if (fs_apfs_checkpoint() != FS_APFS_E_OK) {
+		kprintf("apfs-strm: FAIL the checkpoint after making it was "
+		    "refused\n");
+		return;
+	}
+	skey = (ino & APFS_J_OBJ_ID_MASK) |
+	    ((uint64_t)APFS_TYPE_DSTREAM_ID << APFS_J_OBJ_TYPE_SHIFT);
+
+	scratch = kmalloc(APFS_BLOCK_SIZE);
+	if (scratch == NULL) {
+		kprintf("apfs-strm: no memory -- skipped\n");
+		goto clean;
+	}
+	if (!inode_slot_of(ino, scratch, &bno, &at, &nkeys)) {
+		kprintf("apfs-strm: FAIL inode %llu is not in the tree\n",
+		    (unsigned long long)ino);
+		kfree(scratch);
+		return;
+	}
+	/*
+	 * The stream record is the one after it, and the cut goes there.  A cut
+	 * at zero is refused and a record that is already last has nothing
+	 * after it to cut before, so both are honest reasons to leave this
+	 * boot alone rather than to fail.
+	 */
+	if (at == 0 || at + 1 >= nkeys || bno == g_apfs.ac_root_tree_bno) {
+		kprintf("apfs-strm: inode %llu is at slot %u of %u in the node "
+		    "at %llu, which cannot be cut after -- skipped\n",
+		    (unsigned long long)ino, (unsigned)at, (unsigned)nkeys,
+		    (unsigned long long)bno);
+		kfree(scratch);
+		goto clean;
+	}
+	rv = node_split_at(bno, at + 1, g_apfs.ac_xid + 1, scratch);
+	kfree(scratch);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-strm: the node at %llu would not split at %u "
+		    "(%d) -- skipped\n", (unsigned long long)bno,
+		    (unsigned)(at + 1), rv);
+		goto clean;
+	}
+	if (fs_apfs_checkpoint() != FS_APFS_E_OK) {
+		kprintf("apfs-strm: FAIL the checkpoint after the split was "
+		    "refused\n");
+		return;
+	}
+
+	/*
+	 * And the arrangement is CHECKED before it is used.  A split that put
+	 * them back in the same node would leave this test passing on the very
+	 * writer it exists to catch.
+	 */
+	if (inode_where(ino, &ino_leaf) != FS_APFS_E_OK ||
+	    leaf_home((const uint8_t *)&skey, (uint32_t)sizeof(skey),
+	    &ds_leaf) != FS_APFS_E_OK) {
+		kprintf("apfs-strm: FAIL the tree will not say where inode "
+		    "%llu's records are\n", (unsigned long long)ino);
+		goto clean;
+	}
+	if (ino_leaf == ds_leaf) {
+		kprintf("apfs-strm: FAIL the cut at slot %u left the inode and "
+		    "its stream both in the node at %llu\n", (unsigned)(at + 1),
+		    (unsigned long long)ino_leaf);
+		goto clean;
+	}
+
+	rv = fs_apfs_unlink(parent, "strm.txt", now);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-strm: FAIL cannot unlink a file whose stream "
+		    "record is in another node (%d)\n", rv);
+		goto clean;
+	}
+	if (fs_apfs_checkpoint() != FS_APFS_E_OK) {
+		kprintf("apfs-strm: FAIL the checkpoint after the unlink was "
+		    "refused\n");
+		return;
+	}
+
+	/*
+	 * The whole claim: not that the unlink said yes -- it always did -- but
+	 * that nothing of the stream is left.  Asked of the tree by descending
+	 * on the record's own key, which is where it would be if it were there.
+	 */
+	sp.sp_id    = ino;
+	sp.sp_found = false;
+	stopped     = false;
+	if (!btree_scan(g_apfs.ac_root_tree_bno, (const uint8_t *)&skey,
+	    (uint32_t)sizeof(skey), stream_see, &sp, 0, &stopped)) {
+		kprintf("apfs-strm: FAIL the tree will not walk after the "
+		    "unlink\n");
+		return;
+	}
+	if (sp.sp_found) {
+		kprintf("apfs-strm: FAIL inode %llu is gone and its data "
+		    "stream record is still in the tree -- apfsck calls that "
+		    "\"Data stream: has no references\"\n",
+		    (unsigned long long)ino);
+		return;
+	}
+	if (!index_check(g_apfs.ac_root_tree_bno, 0)) {
+		kprintf("apfs-strm: FAIL the index is wrong after an unlink "
+		    "spanning two nodes\n");
+		return;
+	}
+
+	kprintf("apfs-strm: PASS -- inode %llu kept its stream record in the "
+	    "node at %llu while its own was at %llu, and unlinking it took "
+	    "both\n", (unsigned long long)ino, (unsigned long long)ds_leaf,
+	    (unsigned long long)ino_leaf);
+	return;
+
+clean:
+	(void)fs_apfs_unlink(parent, "strm.txt", now);
+	(void)fs_apfs_checkpoint();
+}
+
+/*
+ * A CREATE MAKES ITS OWN ROOM
+ *
+ * Every writer here could once refuse for a reason that had nothing to do with
+ * what it was asked: the leaf a record belonged in was full, and a full leaf
+ * was somebody else's rung.  Growing a file stopped answering that way when it
+ * learned to split and start over.  Making a name is the same answer to a
+ * harder question, because a name's records do not all go in one place -- the
+ * entry sorts under the DIRECTORY's object id and the inode under its OWN -- so
+ * there are two leaves that can be the full one and splitting the first can be
+ * answered by the second.
+ *
+ * WAITING FOR A FULL LEAF IS NOT A TEST.  Whether one turns up depends on how
+ * many names an image happens to carry and on where earlier splits fell; the
+ * make test skipped on it for a rung and a half, which is exactly as much
+ * evidence as never having run.  So this fills one, honestly: names go into a
+ * directory one at a time, each with its own checkpoint, the way an ordinary
+ * caller makes them -- and around eighteen inode records fill a leaf of this
+ * volume, so the bound below is generous rather than tight.
+ *
+ * WHAT IS CHECKED is what a split can get wrong and a create cannot notice.
+ * Every name made before the split has to still be there afterwards under the
+ * inode it was given: a record carried into the wrong half reads back as a
+ * missing file, and the create that caused it has already reported success.
+ * And every node has to still start where its parent says it does, which is the
+ * invariant apfsck states as "index key absent from child node" and which no
+ * amount of reading the volume from in here would notice.
+ *
+ * WHAT IT DOES NOT ARRANGE, and the honest limit of it: the leaf that fills
+ * here is the one holding INODES, because an inode record is nine times the
+ * size of an entry and the names all sort together under one directory.  A
+ * create that finds BOTH of its leaves full in the same breath is handled by
+ * construction -- the writer asks again after each split rather than once --
+ * and is not reached by any arrangement here.
+ *
+ * They are all taken away again, so the volume ends the boot as it began.  The
+ * nodes the splits made stay, and that is not untidiness: this tree does not
+ * give a level back, and a node with room in it is what the next boot fills.
+ */
+/*
+ * APFS_ROOM_LEAF is where the name starts in the path; APFS_ROOM_NAMES is a
+ * bound and not an expectation (a leaf takes about eighteen inodes); and
+ * APFS_ROOM_AFTER is how many creates have to work once one has split.
+ */
+#define	APFS_ROOM_DIR		"/etc"
+#define	APFS_ROOM_LEAF		5
+#define	APFS_ROOM_NAMES		32
+#define	APFS_ROOM_AFTER		2
+
+/*
+ * "/etc/roomNN.txt", written out a byte at a time rather than formatted: there
+ * is no snprintf in here, and the name is wanted both whole, for a lookup by
+ * path, and from the slash, for the calls that take a parent and a leaf.
+ */
+static void
+room_path(char *buf, uint32_t i)
+{
+
+	buf[0]  = '/';
+	buf[1]  = 'e';
+	buf[2]  = 't';
+	buf[3]  = 'c';
+	buf[4]  = '/';
+	buf[5]  = 'r';
+	buf[6]  = 'o';
+	buf[7]  = 'o';
+	buf[8]  = 'm';
+	buf[9]  = (char)('0' + (i / 10u) % 10u);
+	buf[10] = (char)('0' + i % 10u);
+	buf[11] = '.';
+	buf[12] = 't';
+	buf[13] = 'x';
+	buf[14] = 't';
+	buf[15] = '\0';
+}
+
+void
+fs_apfs_room_selftest(uint64_t now)
+{
+	char		 path[16];
+	uint64_t	*ino;
+	uint64_t	 parent;
+	uint64_t	 splits;
+	uint64_t	 got;
+	uint32_t	 made;
+	uint32_t	 after;
+	uint32_t	 i;
+	int		 is_dir;
+	int		 rv;
+
+	if (!g_apfs.ac_mounted || !g_apfs.ac_ip_valid) {
+		kprintf("apfs-room: nothing writable -- skipped\n");
+		return;
+	}
+	if (fs_apfs_lookup(APFS_ROOM_DIR, &parent, &is_dir) != FS_APFS_E_OK ||
+	    !is_dir) {
+		kprintf("apfs-room: %s is not there -- skipped\n",
+		    APFS_ROOM_DIR);
+		return;
+	}
+	ino = kmalloc(APFS_ROOM_NAMES * (uint32_t)sizeof(*ino));
+	if (ino == NULL) {
+		kprintf("apfs-room: no memory -- skipped\n");
+		return;
+	}
+
+	/* Whatever an interrupted run left, so this starts from nothing. */
+	for (i = 0; i < APFS_ROOM_NAMES; i++) {
+		room_path(path, i);
+		(void)fs_apfs_unlink(parent, path + APFS_ROOM_LEAF, now);
+	}
+	(void)fs_apfs_checkpoint();
+
+	splits = split_n;
+	made   = 0;
+	after  = 0;
+	for (i = 0; i < APFS_ROOM_NAMES; i++) {
+		room_path(path, i);
+		ino[i] = 0;
+		rv = fs_apfs_create(parent, path + APFS_ROOM_LEAF, now, 0644,
+		    &ino[i]);
+		if (rv != FS_APFS_E_OK) {
+			kprintf("apfs-room: FAIL %s was refused (%d) -- name "
+			    "%u, with %llu split(s) behind it\n", path, rv,
+			    (unsigned)(i + 1),
+			    (unsigned long long)(split_n - splits));
+			goto clean;
+		}
+		made++;
+		if (fs_apfs_checkpoint() != FS_APFS_E_OK) {
+			kprintf("apfs-room: FAIL the checkpoint after making "
+			    "%s was refused\n", path);
+			goto out;
+		}
+		/*
+		 * Stop a couple of names PAST the first split rather than at
+		 * it: a writer that split and then refused the very record it
+		 * had made room for would otherwise leave with a clean sheet.
+		 */
+		if (split_n == splits)
+			continue;
+		after++;
+		if (after > APFS_ROOM_AFTER)
+			break;
+	}
+
+	if (split_n == splits) {
+		kprintf("apfs-room: FAIL %u name(s) went into %s and no leaf "
+		    "ever ran out of room -- nothing here was proved\n",
+		    (unsigned)made, APFS_ROOM_DIR);
+		goto clean;
+	}
+	if (after <= APFS_ROOM_AFTER) {
+		kprintf("apfs-room: FAIL the first split came on the last name "
+		    "there was room to try -- %u is too low a bound to show "
+		    "the writer carrying on\n", (unsigned)APFS_ROOM_NAMES);
+		goto clean;
+	}
+
+	/* Every one of them, still there and still its own inode. */
+	for (i = 0; i < made; i++) {
+		room_path(path, i);
+		got = 0;
+		if (fs_apfs_lookup(path, &got, &is_dir) != FS_APFS_E_OK) {
+			kprintf("apfs-room: FAIL %s does not resolve, and it "
+			    "did when it was made -- a split carried it "
+			    "somewhere the descent does not look\n", path);
+			goto clean;
+		}
+		if (got != ino[i] || is_dir) {
+			kprintf("apfs-room: FAIL %s was made as inode %llu and "
+			    "resolves to %llu%s\n", path,
+			    (unsigned long long)ino[i], (unsigned long long)got,
+			    is_dir ? ", as a directory" : "");
+			goto clean;
+		}
+	}
+	if (!index_check(g_apfs.ac_root_tree_bno, 0)) {
+		kprintf("apfs-room: FAIL the index is wrong after a create "
+		    "made room for itself\n");
+		goto out;
+	}
+
+	/* And away again, all of them. */
+	for (i = 0; i < made; i++) {
+		room_path(path, i);
+		rv = fs_apfs_unlink(parent, path + APFS_ROOM_LEAF, now);
+		if (rv == FS_APFS_E_OK && fs_apfs_checkpoint() != FS_APFS_E_OK)
+			rv = FS_APFS_E_IO;
+		if (rv != FS_APFS_E_OK) {
+			kprintf("apfs-room: FAIL cannot take %s back out "
+			    "(%d)\n", path, rv);
+			goto out;
+		}
+	}
+	room_path(path, 0);
+	if (fs_apfs_lookup(path, &got, &is_dir) != FS_APFS_E_NOTFOUND) {
+		kprintf("apfs-room: FAIL %s still resolves after being "
+		    "unlinked\n", path);
+		goto out;
+	}
+
+	kprintf("apfs-room: PASS -- %u name(s) into %s filled a leaf, the "
+	    "writer split %llu of them and carried on, every one of them was "
+	    "still under the inode it was given, and the volume ends as it "
+	    "began\n", (unsigned)made, APFS_ROOM_DIR,
+	    (unsigned long long)(split_n - splits));
+out:
+	kfree(ino);
+	return;
+
+clean:
+	for (i = 0; i < made; i++) {
+		room_path(path, i);
+		(void)fs_apfs_unlink(parent, path + APFS_ROOM_LEAF, now);
+	}
+	(void)fs_apfs_checkpoint();
+	kfree(ino);
+}
+
 /*
  * A DESCENT FINDS WHAT A WALK FINDS
  *

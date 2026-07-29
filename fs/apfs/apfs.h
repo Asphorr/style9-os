@@ -1052,6 +1052,25 @@ void	fs_apfs_index_selftest(uint64_t now);
 void	fs_apfs_drop_selftest(uint64_t now);
 
 /*
+ * Put a file's inode record and its data stream record in DIFFERENT nodes on
+ * purpose -- by splitting the leaf that holds both between them -- and prove
+ * that unlinking it takes both.  Checked by asking the tree for the stream
+ * record afterwards, because the unlink that left one behind reported success.
+ * Takes the wall clock in nanoseconds.
+ */
+void	fs_apfs_stream_selftest(uint64_t now);
+
+/*
+ * Fill a leaf on purpose and prove a create makes its own room.  Names go into
+ * a directory one at a time until the writer has had to split, and a couple
+ * more afterwards; then every one of them has to still resolve to the inode it
+ * was made as, and every node has to still start where its parent says it does.
+ * All of them are removed again.  Takes the wall clock in nanoseconds, for the
+ * same reason the two tests above do.
+ */
+void	fs_apfs_room_selftest(uint64_t now);
+
+/*
  * Prove that descending on a key finds what reading every record finds.  Every
  * record on the volume is sought by its own key and has to come back out of
  * the leaf it lives in with the rest of the tree behind it, in order; keys

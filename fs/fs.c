@@ -1714,20 +1714,13 @@ fs_make_selftest(void)
 	ino   = 0;
 	rv = fs_create(SELFTEST_MADE, 0644, &ino);
 	/*
-	 * A leaf with no room refuses, and a create does not split and retry
-	 * the way growing a file does -- it puts records into two leaves at
-	 * once, and a split would move both of them and everything above.  That
-	 * is the create rung's own documented edge, and it clears itself: the
-	 * split test runs after this one and makes room, so the next boot gets
-	 * on with it.  Reporting a refusal the writer explains as FAIL is how a
-	 * suite teaches its reader to stop believing the word.
+	 * A full leaf used to be answered here rather than by the writer, and
+	 * this test skipped on it.  It does not any more: a create splits the
+	 * leaf that has no room and starts over, so FS_E_NOALLOC has stopped
+	 * being a thing that happens to a create on a volume with free blocks
+	 * and gets no branch of its own.  What arranges a full leaf on purpose
+	 * and proves the split happens is apfs-room.
 	 */
-	if (rv == FS_E_NOALLOC) {
-		kprintf("apfs-make: the leaf that would hold %s is full, and a "
-		    "create that splits and retries is a different rung; "
-		    "skipped\n", SELFTEST_MADE);
-		return;
-	}
 	if (rv != FS_E_OK || ino == 0) {
 		kprintf("apfs-make: FAIL cannot make %s (rv=%d ino=%llu)\n",
 		    SELFTEST_MADE, rv, (unsigned long long)ino);
@@ -1966,16 +1959,10 @@ fs_dirs_selftest(void)
 		    SELFTEST_DIRS);
 	}
 
-	/* And make one.  A full leaf refuses here exactly as a create does. */
+	/* And make one.  A full leaf is the writer's business here as well. */
 	count = fs_apfs_dirmakes();
 	ino   = 0;
 	rv = fs_mkdir(SELFTEST_DIRS, 0755, &ino);
-	if (rv == FS_E_NOALLOC) {
-		kprintf("apfs-dirs: the leaf that would hold %s is full, and a "
-		    "mkdir that splits and retries is the same rung a create "
-		    "is waiting on; skipped\n", SELFTEST_DIRS);
-		return;
-	}
 	if (rv != FS_E_OK || ino == 0) {
 		kprintf("apfs-dirs: FAIL cannot make %s (rv=%d ino=%llu)\n",
 		    SELFTEST_DIRS, rv, (unsigned long long)ino);
@@ -2288,6 +2275,30 @@ fs_drop_selftest(void)
 		return;
 	mutex_lock(&fs_lock);
 	fs_apfs_drop_selftest((uint64_t)clock_walltime_us() * 1000ULL);
+	mutex_unlock(&fs_lock);
+}
+
+/* And about a file whose two records a split has put in different nodes. */
+void
+fs_stream_selftest(void)
+{
+
+	if (!fs_apfs_ready())
+		return;
+	mutex_lock(&fs_lock);
+	fs_apfs_stream_selftest((uint64_t)clock_walltime_us() * 1000ULL);
+	mutex_unlock(&fs_lock);
+}
+
+/* And about a node a create is asked to make room in for itself. */
+void
+fs_room_selftest(void)
+{
+
+	if (!fs_apfs_ready())
+		return;
+	mutex_lock(&fs_lock);
+	fs_apfs_room_selftest((uint64_t)clock_walltime_us() * 1000ULL);
 	mutex_unlock(&fs_lock);
 }
 
