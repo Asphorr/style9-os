@@ -104,6 +104,7 @@ OBJS	= \
 	$(OBJDIR)/cpu.o		\
 	$(OBJDIR)/gdt.o		\
 	$(OBJDIR)/idt.o		\
+	$(OBJDIR)/lapic.o	\
 	$(OBJDIR)/pic.o		\
 	$(OBJDIR)/isr.o		\
 	$(OBJDIR)/intr.o	\

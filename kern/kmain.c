@@ -28,6 +28,7 @@
 #include "idt.h"
 #include "intr.h"
 #include "kbd.h"
+#include "lapic.h"
 #include "kbd_drv.h"
 #include "kmem.h"
 #include "kprintf.h"
@@ -122,6 +123,18 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 
 	kmain_memory(mb_magic, mb_info);
 
+	/*
+	 * After the memory system, because the APIC's registers have to be
+	 * MAPPED, and while interrupts are still off, because the interrupt
+	 * path is what is being rewired: software-enabling the APIC routes
+	 * the 8259's output through its LINT0 pin, and until that pin is
+	 * programmed the legacy controller reaches nobody at all.
+	 */
+	if (lapic_init())
+		tty_puts("  [ok] local apic (legacy pins wired through)\n");
+	else
+		tty_puts("  [--] local apic absent -- 8259 alone\n");
+
 	kbd_init();
 	tty_puts("  [ok] kbd (IRQ1 unmasked)\n");
 
@@ -130,6 +143,12 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 
 	clock_init();
 	tty_puts("  [ok] clock\n");
+
+	/*
+	 * Needs the PIT ticking to be measured against, and interrupts on to
+	 * be caught arriving, so it cannot happen beside lapic_init.
+	 */
+	lapic_timer_probe();
 
 	kmain_memory_smoke();
 	kmain_run_tests();

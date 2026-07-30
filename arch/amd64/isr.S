@@ -96,6 +96,25 @@ ISR_NOERR 46
 ISR_NOERR 47
 
 /*
+ * Vectors 48-255: everything the local APIC delivers -- its timer, its
+ * spurious vector, and the inter-processor interrupts that will start and
+ * steer other CPUs.  None push an error code.
+ *
+ * Generated rather than written out, unlike the 48 above, because two
+ * hundred and eight identical lines say nothing the loop does not.  The
+ * .altmacro directive is what lets %vecno be substituted into the macro
+ * argument; it is turned off again immediately, since it also changes how
+ * the assembler reads strings for the rest of the file.
+ */
+	.altmacro
+	.set	vecno, 48
+	.rept	208
+	ISR_NOERR %vecno
+	.set	vecno, vecno + 1
+	.endr
+	.noaltmacro
+
+/*
  * Common dispatcher tail (x86_64).
  *
  * Stack on entry (low -> high):
@@ -192,8 +211,16 @@ trapframe_iretq:
 
 /*
  * Vector-number -> stub-address table.  idt_init() reads this when
- * populating the IDT so each gate calls the right normalising stub.
+ * populating the IDT so each gate calls the right normalising stub.  All
+ * 256 entries, so every vector the APIC can be told to use lands somewhere
+ * deliberate; a vector with nothing installed behind it is ignored by
+ * intr_dispatch, which is a different thing from a vector with no gate at
+ * all -- that one is a #GP.
  */
+	.macro ISR_TABLE_ENTRY n
+	.quad	isr_\n
+	.endm
+
 	.section .rodata
 	.globl	isr_table
 	.type	isr_table, @object
@@ -205,4 +232,11 @@ isr_table:
 	.quad	isr_24, isr_25, isr_26, isr_27, isr_28, isr_29, isr_30, isr_31
 	.quad	isr_32, isr_33, isr_34, isr_35, isr_36, isr_37, isr_38, isr_39
 	.quad	isr_40, isr_41, isr_42, isr_43, isr_44, isr_45, isr_46, isr_47
+	.altmacro
+	.set	tvecno, 48
+	.rept	208
+	ISR_TABLE_ENTRY %tvecno
+	.set	tvecno, tvecno + 1
+	.endr
+	.noaltmacro
 	.size	isr_table, . - isr_table

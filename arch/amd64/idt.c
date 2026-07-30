@@ -29,10 +29,19 @@ struct idt_ptr {
 static struct idt_entry	idt[IDT_NENTRIES] __attribute__((aligned(16)));
 static struct idt_ptr	idtr;
 
-/* Generated in isr.S; one entry per CPU exception + IRQ stub (0..47). */
+/*
+ * Generated in isr.S: one stub per architectural vector, all 256 of them.
+ *
+ * It used to stop at 48, the end of the 8259's remapped window, and every
+ * vector above that had NO GATE -- so an interrupt delivered there would not
+ * be ignored, it would be a general-protection fault with an obscure error
+ * code.  That was fine while the 8259 was the only thing that could deliver
+ * one; the local APIC's timer, its spurious vector and its inter-processor
+ * interrupts all live above 48, and want somewhere deliberate to land.
+ */
 extern uintptr_t	isr_table[];
 
-#define	IDT_NSTUBS	48
+#define	IDT_NSTUBS	IDT_NENTRIES
 
 void
 idt_set_gate(unsigned int vec, uintptr_t handler, uint16_t selector,

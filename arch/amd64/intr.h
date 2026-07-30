@@ -57,6 +57,26 @@ void	intr_dispatch(struct trapframe *);
 void	irq_install(unsigned int irq, irq_handler_t);
 
 /*
+ * The first vector above the 8259's remapped window, and so the first that
+ * belongs to the local APIC rather than to the machine's one shared
+ * interrupt controller.
+ */
+#define	INTR_LOCAL_BASE		48
+
+/*
+ * Install a handler for a vector the LOCAL APIC delivers -- its timer, an
+ * inter-processor interrupt -- as opposed to irq_install's 8259 lines.  The
+ * two are different in a way that matters at the end of the handler: an
+ * 8259 interrupt is acknowledged to the 8259, an APIC one to the APIC, and
+ * the dispatcher writes the right one because it knows which table the
+ * handler came out of.
+ *
+ * A vector left with NO handler is ignored quietly and acknowledged to
+ * NOBODY, which is exactly what the spurious vector requires.
+ */
+void	intr_install_local(unsigned int vec, irq_handler_t);
+
+/*
  * Resume ring 3 through a hand-built trapframe (isr.S).  Restores all 15
  * GPRs and RFLAGS via IRETQ, so unlike a SYSRET it can return a context
  * whose %rcx and %r11 must survive -- the asynchronous sigreturn path.

@@ -705,10 +705,82 @@ single-CPU is everything above this: no APIC, no second processor started,
 and `spin_lock` still spins without disabling interrupts, which is safe only
 because no interrupt handler takes a lock the mainline can hold.
 
+## The interrupt controller each CPU has of its own
+
+The 8259 and the PIT are one chip each for the whole machine. The PIT can
+tick one interrupt line, so it can debit one CPU's slice -- which makes the
+per-CPU quantum above a quantum only the boot processor would ever spend.
+Every CPU needs a timer of its own, and needs a way to be *told* something by
+another CPU: a reschedule, a TLB invalidation, the startup sequence itself.
+All of that is the local APIC, so it comes next.
+
+**Software-enabling it can disconnect every legacy interrupt at once, and
+that is the whole difficulty of the step.** On a PC the 8259's output does
+not reach the CPU directly; it arrives at the local APIC's LINT0 pin and
+passes through only if that pin's LVT entry says ExtINT and is unmasked.
+Every LVT entry comes out of reset *masked*. A firmware boot has the BIOS set
+"virtual wire mode" up before the kernel looks, but we are loaded by QEMU
+with no BIOS in the path, so nobody has -- and enabling the APIC without
+programming LINT0 would take the timer, the keyboard and the disk away in one
+instruction. So the two legacy pins are programmed in the same breath as the
+enable, and the failure mode if that is wrong is loud rather than subtle: the
+boot stops at the first thing that waits.
+
+The vectors above the 8259's 32..47 window used to have **no IDT gate at
+all**, which is not the same as being ignored -- an interrupt delivered there
+was a general-protection fault with an obscure error code. There are now
+stubs and gates for all 256, generated rather than written out, and a second
+handler table for the ones the APIC delivers, because the two kinds are
+acknowledged to different chips and the table a handler came out of is how
+the dispatcher knows which. A vector with nothing installed is ignored and
+acknowledged to *nobody* -- which is what the spurious vector requires, since
+there is no in-service bit behind it and an EOI would retire somebody else's
+interrupt.
+
+Proving the chip works is one measurement in two halves: the timer's counting
+rate against the PIT, then the timer left running while its interrupts are
+counted. The second half is the one that cannot be argued -- the mapping, the
+enable, the LVT, the vector, the IDT gate, the dispatcher and the EOI all
+have to be right for a single interrupt to be counted. Four boots:
+
+	lapic: id=0 version=0x14, 6 LVT entries, regs at 0xfee00000
+	       (uncached), legacy pins wired
+	lapic: timer counts at 62085 kHz (input / 16), measured over 100 ms
+	lapic: timer delivered 20 interrupt(s) at 100 Hz, want about 20
+
+61.6 to 63.2 MHz at divide-16 across the four, so a ~1 GHz input clock, and
+19 or 20 delivered every time. The count is reported as a **gauge, not an
+assertion**, and the spread says why: the ruler is the PIT, and this host's
+PIT delivery wanders by several percent. What *would* be a defect is zero,
+and that alone is called out.
+
+### What the APIC broke on the way in, and what that says
+
+Mapping the APIC's registers cost a **page-table double-free**, and the bug
+was older than the APIC. `pmap_create` copies the whole kernel PDPT-0 into
+each task's private one -- deliberately, so kernel mappings stay reachable
+while that pmap is loaded -- and its comment had even anticipated "a future
+caller adding e.g. a high-MMIO mapping under PML4[0]". But `pmap_destroy`
+freed everything from PDPT slot 1 upward on the theory that only slot 0 could
+be shared, which was true only for as long as slot 0 was the kernel's only
+mapping there. The APIC at `0xFEE00000` lands in slot 3; every task copied
+that PD and PT, and the first task to die handed both back to the page
+allocator while the kernel was still reading the APIC through them.
+
+The second task to die is what made a noise -- pmm's double-free assertion --
+and **the noise was luck**. Had a freed frame been handed out and written
+before that second death, the symptom would have been an interrupt controller
+quietly answering out of somebody else's memory. The rule is now one sentence
+instead of two: an entry the kernel's own PDPT-0 still names is not ours to
+free, whatever slot it is in.
+
 Next on the roadmap: **replacing an existing name** with a rename, which
 POSIX requires and this refuses out loud; a **torn-write stand**, which
 would make the checkpoint's promise that an interruption anywhere leaves the
-old transaction a measurement rather than a claim; and real SMP.
+old transaction a measurement rather than a claim; and the rest of SMP --
+the APIC timer taking preemption over from the PIT, an MADT to count the
+processors, a trampoline to start them, and interrupt-safe locks before any
+of them runs kernel code.
 
 Reading the tree stopped being O(volume) per question along the way.  The
 same boot that read **54434 records over 6381 nodes** to answer its 1718

@@ -12,8 +12,10 @@
 #include "darwin.h"
 #include "ddb.h"
 #include "intr.h"
+#include "idt.h"
 #include "kprintf.h"
 #include "ksym.h"
+#include "lapic.h"
 #include "panic.h"
 #include "pic.h"
 #include "port.h"
@@ -27,6 +29,14 @@
 #include "vm.h"
 
 static irq_handler_t	irq_handlers[16];
+
+/*
+ * Handlers for the vectors the local APIC delivers, indexed by
+ * vector - INTR_LOCAL_BASE.  Separate from irq_handlers because the two
+ * kinds are acknowledged to different chips, and the table a handler came
+ * out of is how the dispatcher knows which.
+ */
+static irq_handler_t	local_handlers[IDT_NENTRIES - INTR_LOCAL_BASE];
 
 static const char *const exception_names[32] = {
 	"#DE divide-by-zero",
@@ -112,6 +122,15 @@ irq_install(unsigned int irq, irq_handler_t handler)
 
 	if (irq < 16)
 		irq_handlers[irq] = handler;
+}
+
+void
+intr_install_local(unsigned int vec, irq_handler_t handler)
+{
+
+	if (vec < INTR_LOCAL_BASE || vec >= IDT_NENTRIES)
+		return;
+	local_handlers[vec - INTR_LOCAL_BASE] = handler;
 }
 
 /*
@@ -242,7 +261,29 @@ intr_dispatch(struct trapframe *tf)
 		return;
 	}
 
-	/* Vector >= 48: spurious / not installed -- ignore quietly. */
+	/*
+	 * Vector >= 48: delivered by this CPU's own local APIC.
+	 *
+	 * The EOI goes to the APIC, not the 8259, and ONLY when a handler
+	 * was installed -- a vector nobody claimed is ignored and
+	 * acknowledged to nothing, which is what the architecture requires
+	 * of the spurious vector: there is no in-service bit behind it, so
+	 * an EOI would retire some other interrupt that really is pending.
+	 *
+	 * No preempt point here yet.  The APIC timer does not drive
+	 * preemption in this rung -- the PIT still does -- and a schedule
+	 * point on a path nothing schedules from is untested code.  It
+	 * arrives with the timer that needs it.
+	 */
+	if (tf->tf_trapno < IDT_NENTRIES) {
+		unsigned int	vec;
+
+		vec = (unsigned int)(tf->tf_trapno - INTR_LOCAL_BASE);
+		if (local_handlers[vec] != NULL) {
+			local_handlers[vec](tf);
+			lapic_eoi();
+		}
+	}
 	intr_check_async_kill_on_user_return(tf);
 }
 
