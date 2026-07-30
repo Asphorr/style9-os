@@ -17,6 +17,7 @@
 #include "klog.h"
 #include "kmem.h"
 #include "kprintf.h"
+#include "lapic.h"
 #include "memmap.h"
 #include "panic.h"
 #include "pmap.h"
@@ -377,6 +378,7 @@ cmd_cpu(int argc, char *argv[])
 	(void)argc;
 	(void)argv;
 	cpu_dump();
+	lapic_timer_report();
 	return (0);
 }
 

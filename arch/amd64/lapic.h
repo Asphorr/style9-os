@@ -64,13 +64,48 @@
 bool		lapic_init(void);
 
 /*
- * Measure the APIC timer's counting rate against the PIT, then prove the
+ * Measure the APIC timer's counting rate against the TSC, then prove the
  * timer actually delivers by running it briefly and counting what arrives.
- * Needs the PIT ticking and interrupts ON, so it runs well after
- * lapic_init.  Leaves the timer masked: which clock drives preemption is a
- * separate decision, taken in a later rung and measured there.
+ * Needs the TSC calibrated and interrupts ON, so it runs well after
+ * lapic_init.  Leaves the timer masked and spends nobody's slice while it
+ * runs; starting it for real is the separate call below.
+ *
+ * ⚠ The ruler here used to be the PIT and that was WRONG, in a way only a
+ * measurement caught: ten delivered PIT interrupts can arrive in ninety
+ * milliseconds on this host, and a window that short comes out ten percent
+ * fast, which lands directly in the timer's reload count and shortens every
+ * slice by the same ten percent.  A counter the CPU reads cannot be hurried;
+ * an interrupt that has to be delivered can.
  */
 void		lapic_timer_probe(void);
+
+/*
+ * Hand preemption over from the PIT to this CPU's own timer: relieve the PIT
+ * of the slice debit, then run this timer periodic at the rate the PIT was
+ * keeping, so that PREEMPT_QUANTUM_TICKS still means the milliseconds it was
+ * measured to mean.  Must run after lapic_timer_probe, which is what supplies
+ * the counting rate.
+ *
+ * Returns false and leaves preemption with the PIT if there is no APIC, no
+ * measured rate, or no PIT rate to match -- a kernel where this fails is a
+ * kernel that preempts exactly as it did before.
+ */
+bool		lapic_timer_start(void);
+
+/*
+ * Whether the slice is being debited by this CPU's timer rather than by the
+ * one PIT the machine has.
+ */
+bool		lapic_timer_preempting(void);
+
+/*
+ * Print what the timer has actually delivered since it took over: its rate
+ * over TSC time, and the slice length that rate implies.  The slice is the
+ * number that matters -- PREEMPT_QUANTUM_TICKS means 20 ms only while the
+ * ticks arrive at the rate they were asked for.  The PIT's count over the same
+ * span is printed beside it, where its delivery deficit shows.
+ */
+void		lapic_timer_report(void);
 
 /*
  * End-of-interrupt.  Written by intr_dispatch after any handler for a

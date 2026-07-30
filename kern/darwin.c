@@ -18,6 +18,7 @@
 #include "intr.h"
 #include "kmem.h"
 #include "kprintf.h"
+#include "lapic.h"
 #include "macho.h"
 #include "panic.h"
 #include "pmap.h"
@@ -1200,6 +1201,7 @@ darwin_cons_release(struct task *t)
 	darwin_wait_stats();
 	sched_wake_latency_print();
 	cpu_dump();
+	lapic_timer_report();
 }
 
 /*

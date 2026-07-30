@@ -243,7 +243,10 @@ intr_dispatch(struct trapframe *tf)
 		 * Preempt point.  Two pieces of deferred work may have
 		 * been queued by the IRQ handler that just ran: any
 		 * wake requests posted via sched_post_irq_wake, and a
-		 * possible need_resched from PIT.  Service both only
+		 * need_resched owed from a timer tick -- the PIT's while it
+		 * is still the chip debiting the slice, and afterwards one
+		 * the APIC timer left pending across a critical section
+		 * that ended here.  Service both only
 		 * when preempt is enabled (no caller held a spinlock
 		 * across the IRQ -- otherwise the deferred work fires
 		 * at the next spin_unlock that drops the count to
@@ -269,11 +272,6 @@ intr_dispatch(struct trapframe *tf)
 	 * acknowledged to nothing, which is what the architecture requires
 	 * of the spurious vector: there is no in-service bit behind it, so
 	 * an EOI would retire some other interrupt that really is pending.
-	 *
-	 * No preempt point here yet.  The APIC timer does not drive
-	 * preemption in this rung -- the PIT still does -- and a schedule
-	 * point on a path nothing schedules from is untested code.  It
-	 * arrives with the timer that needs it.
 	 */
 	if (tf->tf_trapno < IDT_NENTRIES) {
 		unsigned int	vec;
@@ -282,6 +280,32 @@ intr_dispatch(struct trapframe *tf)
 		if (local_handlers[vec] != NULL) {
 			local_handlers[vec](tf);
 			lapic_eoi();
+
+			/*
+			 * Preempt point, and AFTER the EOI for the reason the
+			 * 8259 path learned the hard way.  An interrupt in
+			 * service blocks everything of its priority and below
+			 * on this CPU until it is acknowledged, and the timer
+			 * sits at the top -- so a yield taken before the EOI
+			 * would carry the unacknowledged interrupt away with
+			 * the outgoing thread's stack, and this CPU would get
+			 * no further timer ticks until that thread was
+			 * scheduled again by the ticks it is holding up.
+			 *
+			 * sched_check_timeouts is NOT repeated here.  The PIT
+			 * still ticks at the same rate it always did and the
+			 * 8259 tail above still runs it, so deadlines are
+			 * looked at exactly as often as before; doing it twice
+			 * would only add a lock acquisition to every tick.
+			 */
+			if (preempt_is_enabled()) {
+				sched_drain_irq_wakes();
+				if (preempt_resched_wanted()) {
+					preempt_resched_clear();
+					sched_count_preempt();
+					thread_yield();
+				}
+			}
 		}
 	}
 	intr_check_async_kill_on_user_return(tf);

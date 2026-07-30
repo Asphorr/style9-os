@@ -150,6 +150,19 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	 */
 	lapic_timer_probe();
 
+	/*
+	 * And now the reason the chip was worth turning on: the slice stops
+	 * being debited by the machine's one PIT and starts being debited by
+	 * the timer belonging to the CPU whose slice it is.  At the PIT's own
+	 * rate, so that the quantum keeps the length it was measured to have.
+	 * If this declines -- no APIC, nothing measured -- the PIT keeps the
+	 * job and the kernel preempts exactly as it did before.
+	 */
+	if (lapic_timer_start())
+		tty_puts("  [ok] apic timer debits the slice\n");
+	else
+		tty_puts("  [--] preemption stays on the PIT\n");
+
 	kmain_memory_smoke();
 	kmain_run_tests();
 

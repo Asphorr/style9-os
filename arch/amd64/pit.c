@@ -38,6 +38,13 @@
 static volatile uint64_t	pit_tick_count;		/* (a) */
 static unsigned int		pit_actual_hz;		/* (c) */
 
+/*
+ * True until a per-CPU timer takes the job over (pit_release_preempt), and
+ * true forever on a machine that has no local APIC.  Written once, before
+ * that timer is unmasked, so the ISR reading it cannot race the writer.
+ */
+static bool			pit_debits_slice = true;
+
 static void	pit_isr(struct trapframe *tf);
 
 void
@@ -81,6 +88,13 @@ pit_hz(void)
 	return (pit_actual_hz);
 }
 
+void
+pit_release_preempt(void)
+{
+
+	pit_debits_slice = false;
+}
+
 static void
 pit_isr(struct trapframe *tf)
 {
@@ -98,8 +112,14 @@ pit_isr(struct trapframe *tf)
 	 * actual schedule point, not at the flag-set point, so that
 	 * a critical section ending later still has the resched
 	 * pending.
+	 *
+	 * ONLY while this is still the machine's only timer.  There is one
+	 * PIT and it interrupts one CPU, so the slice it can debit is that
+	 * one CPU's; a local APIC timer takes the job per-processor and this
+	 * gate is how it is handed over.  Both debiting would halve every
+	 * quantum, which no test asserts and no message reports.
 	 */
-	if (preempt_quantum_tick())
+	if (pit_debits_slice && preempt_quantum_tick())
 		preempt_resched_request();
 
 	/*

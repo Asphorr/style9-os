@@ -968,12 +968,19 @@ out:
  *
  * In a cooperative scheduler, exactly one worker -- whichever ran
  * first -- would have a non-zero counter; the others would be
- * stranded in the runqueue.  Under preemption, the PIT interrupt
+ * stranded in the runqueue.  Under preemption, the timer interrupt
  * forcibly rotates between them and every counter is non-zero.
  *
  * Pass conditions: every worker's counter > 0 AND we observed at
  * least a few IRQ-driven preempts.  Counter VALUES are reported but
  * not gated -- ratios depend heavily on host scheduling jitter.
+ *
+ * This is also what checks that the slice has an owner at all.  Exactly
+ * one timer debits it -- the local APIC's where there is one, and the PIT
+ * only until that hand-over -- so a hand-over that relieved the PIT
+ * without arming the APIC would show up here as zero preempts and
+ * starving workers, which is the same thing a cooperative scheduler looks
+ * like.
  */
 
 #define	STRESS_PREEMPT_MAX_WORKERS	16

@@ -774,13 +774,81 @@ quietly answering out of somebody else's memory. The rule is now one sentence
 instead of two: an entry the kernel's own PDPT-0 still names is not ours to
 free, whatever slot it is in.
 
+## The slice changes hands
+
+The APIC was worth turning on for this. Preemption now comes from the timer
+belonging to the CPU whose slice is being spent, not from the one PIT the
+machine has -- and the PIT keeps ticking, because it is still the clock:
+timeouts, busy-sleeps and the uptime everything else is counted in.  It stops
+debiting, not ticking.
+
+**Exactly one timer may debit the slice**, so the hand-over relieves the PIT
+*before* it arms the APIC. Getting that order backwards costs nothing
+visible: two timers debiting means every quantum is spent twice as fast, which
+raises no assertion and prints no line -- it just silently halves the number
+the scheduler was tuned around. A gap costs one tick of one thread's slice; an
+overlap costs the tuning.
+
+For the same reason the new timer runs at **the rate the PIT was running**.
+The quantum is a count of ticks, and that count was chosen off a measured
+curve with a knee at two; a timer at some other rate would change the slice
+without touching the constant that is supposed to express it.
+
+The EOI is written *before* the schedule point, not after. An interrupt in
+service blocks everything of its priority and below on that CPU until it is
+acknowledged, and the timer sits at the top -- so a yield taken first would
+carry the unacknowledged interrupt away with the outgoing thread's stack, and
+the CPU would get no more timer ticks until that thread was scheduled again by
+the ticks it is holding up. The 8259 path learned this the same way, as an
+outright boot hang.
+
+### The ruler was wrong, and the report is what said so
+
+The first measurement of the new arrangement reported a slice of **18.1 ms**
+where the constant says 20, on two boots out of four. Not noise: those two
+boots had calibrated the APIC's counting rate at 56.4 MHz where the other two
+read 61.8 and 62.3, and 62.3/56.4 is exactly the 10% by which their slices
+were short. The calibration went straight into the timer's reload count, so a
+rate measured 10% low is a timer that ticks 10% fast for ever.
+
+The fault was in the ruler. Calibration waited for **ten PIT interrupts** and
+called it 100 ms -- but a delivered interrupt can be late and can arrive in a
+burst, and ten of them on this host sometimes land inside ninety milliseconds
+of real time. The window was not the length it was assumed to be, and every
+error in it is multiplied into the quantum.
+
+The TSC is *read*, not delivered. Nothing can hurry a counter the CPU
+increments itself, and its own calibration is checkable by eye: it prints
+~3.53 GHz on a part sold as 3.6. So both halves of the probe are now timed by
+the TSC, and the PIT is counted alongside instead of being trusted -- the gap
+between them is precisely the PIT's delivery deficit, which is the thing that
+was hiding in the middle of the measurement. Across four boots the calibration
+now spans 61.3 to 62.3 MHz where it used to span 56.4 to 62.3, and the slice
+comes out **20.1 ms**.
+
+**Printing the two side by side turned out to be the useful part**, because it
+separates the two ways this number can go wrong. One boot of the four reported
+86 Hz and a slice of 23 ms -- and the PIT on that boot reported 86 Hz too, the
+two counts within 0.2% of each other while the boot took 44 seconds where the
+others took 25. Both chips falling behind together by the same amount is the
+host stalling the guest, which is a thing to know and not a thing to fix here.
+The earlier defect looked nothing like it: there the APIC ran 10% *ahead* of
+the PIT, and a disagreement between the two clocks is what a mis-programmed
+timer looks like. Agreement means the host; disagreement means us.
+
+What makes this a check rather than a gauge is that the ladder already had a
+test that cannot pass without it. `stress_preempt` spawns CPU-bound threads
+that never yield and requires that every one of them made progress and that
+preemptions were observed; with the PIT relieved, only the APIC timer can
+satisfy it, and a hand-over that relieved one chip without arming the other
+looks exactly like a cooperative scheduler.
+
 Next on the roadmap: **replacing an existing name** with a rename, which
 POSIX requires and this refuses out loud; a **torn-write stand**, which
 would make the checkpoint's promise that an interruption anywhere leaves the
-old transaction a measurement rather than a claim; and the rest of SMP --
-the APIC timer taking preemption over from the PIT, an MADT to count the
-processors, a trampoline to start them, and interrupt-safe locks before any
-of them runs kernel code.
+old transaction a measurement rather than a claim; and the rest of SMP -- an
+MADT to count the processors, a trampoline to start them, and interrupt-safe
+locks and TLB-shootdown IPIs before any of them runs kernel code.
 
 Reading the tree stopped being O(volume) per question along the way.  The
 same boot that read **54434 records over 6381 nodes** to answer its 1718

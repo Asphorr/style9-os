@@ -33,4 +33,16 @@ void		pit_init(unsigned int hz);
 uint64_t	pit_ticks(void);
 unsigned int	pit_hz(void);
 
+/*
+ * Stop debiting the running thread's slice; keep ticking.  Called once, by
+ * lapic_timer_start, when a per-CPU timer takes preemption over -- because
+ * this chip interrupts one CPU and so can only ever spend one CPU's slice,
+ * while the tick count, the timeouts and the busy-sleeps that are measured in
+ * PIT ticks all stay exactly where they were.
+ *
+ * One-way on purpose.  The alternative to a hand-over is two timers debiting
+ * the same quantum, which halves it in silence.
+ */
+void		pit_release_preempt(void);
+
 #endif /* !_MACHINE_PIT_H_ */

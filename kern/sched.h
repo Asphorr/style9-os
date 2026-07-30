@@ -15,13 +15,18 @@
 struct thread;
 
 /*
- * Round-robin scheduler with PIT-driven preemption.  Threads also
+ * Round-robin scheduler with timer-driven preemption.  Threads also
  * yield explicitly via thread_yield, or implicitly via thread_block
- * (e.g. mach_msg_recv_block on an empty port).  The PIT IRQ debits
+ * (e.g. mach_msg_recv_block on an empty port).  A timer interrupt debits
  * the current thread's PREEMPT_QUANTUM_TICKS slice and sets
  * preempt_need_resched on expiry; the reschedule fires either inline
  * at the end of intr_dispatch, or deferred until the next
  * preempt_enable that drops the count to zero.
+ *
+ * WHICH timer is a machine question, not a scheduler one: this CPU's local
+ * APIC where there is one, and the machine's single PIT where there is not.
+ * The rate is the same either way, which is what lets the quantum below stay
+ * a number of ticks.
  *
  * Lock order: anywhere that takes sched_lock, take it last.
  */
@@ -180,7 +185,8 @@ void		sched_count_preempt(void);
  * thread that releases it is not the one that took it and per-thread
  * accounting underflows.  Per-CPU survives that, because a switch hands
  * over between two threads standing on the same CPU, and it answers the
- * question the PIT actually has: "may I take away the CPU I am on".
+ * question a timer interrupt actually has: "may I take away the CPU I am
+ * on".
  *
  * The resched request and the quantum tally are per-CPU for the same
  * reason and reached only through the five calls below, rather than being
@@ -188,7 +194,7 @@ void		sched_count_preempt(void);
  * other CPU's slice has expired is none of its business, and while there
  * was one CPU there was no way to tell the two apart.
  *
- * preempt_quantum_tick debits one PIT tick against whatever is running
+ * preempt_quantum_tick debits one timer tick against whatever is running
  * here and returns true when the slice is spent; preempt_resched_request
  * is then the ask.  The ask is honoured elsewhere -- inline at the end of
  * intr_dispatch, or deferred to the next preempt_enable that drops the
@@ -204,7 +210,7 @@ bool		preempt_resched_wanted(void);
 void		preempt_resched_clear(void);
 
 /*
- * How long a thread may hold the CPU before the PIT takes it away.
+ * How long a thread may hold the CPU before a timer takes it away.
  *
  * THE SLICE IS ALSO SOMEBODY ELSE'S WAITING TIME.  Whoever is behind this
  * thread in the queue waits out the whole of it, and a thread near the front
@@ -228,6 +234,13 @@ void		preempt_resched_clear(void);
  * worst of the three at reaping, because a slice that short cannot hold a
  * task teardown: the dying child is preempted in the middle of it and has to
  * queue again to finish, so the parent waits for two turns instead of one.
+ *
+ * The table above was measured with the PIT debiting the slice.  It still
+ * describes the kernel with the APIC timer doing it, because the hand-over
+ * kept the rate: the new timer is programmed at whatever the PIT was
+ * programmed at, precisely so that this constant does not silently change
+ * meaning.  lapic_timer_report prints the slice the delivered ticks actually
+ * imply, which is where a rate that drifted would show up.
  */
 #define	PREEMPT_QUANTUM_TICKS	2	/* ~20 ms at 100 Hz */
 
