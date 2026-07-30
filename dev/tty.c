@@ -9,11 +9,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "cpu.h"
 #include "dbgcon.h"
+#include "intr.h"
 #include "io.h"
 #include "kprintf.h"
 #include "panic.h"
-#include "spinlock.h"
 #include "tty.h"
 #include "uart.h"
 
@@ -222,7 +223,116 @@ static uint8_t		csi_nparam;
 static bool		csi_have_param;	/* current slot has digits */
 static bool		csi_private;	/* leading '?' DEC-private */
 
-static struct spinlock	tty_lock = SPINLOCK_INIT("tty");
+/*
+ * THE CONSOLE LOCK, AND WHY IT IS NOT A struct spinlock.
+ *
+ * This console's only primitive is one character at a time, and the lock it
+ * had was taken and dropped around each of them -- because spin_lock panics
+ * on a same-CPU re-acquire, so a run of output could not hold it across the
+ * run.  With one processor that was invisible.  With four it is the first
+ * thing anybody sees: the first four-processor boot printed
+ *
+ *	parkmp:ed with interrupt 3 s off
+ *
+ * which is two processors' lines woven together BYTE BY BYTE.  Every
+ * character was correctly serialised; nothing was lost or corrupted.  What
+ * was lost is the only property a log has, which is that a line means one
+ * thing said by one CPU.
+ *
+ * So the unit of exclusion moves from the character to the WRITE.  That
+ * needs a lock a CPU may take while it already holds it, since kprintf
+ * brackets a run and then calls tty_putc for every byte inside it, and since
+ * a kprintf reached from inside another one is ordinary here.  A recursive
+ * lock is not a struct spinlock with the check removed: it needs an owner
+ * and a depth, and the check that stays is a DIFFERENT one -- a second CPU
+ * still waits, and only the CPU that already holds it walks through.
+ *
+ * Interrupts go off with the acquire, as they do for a spinlock and for the
+ * same reason: an interrupt handler that printed while its own CPU held the
+ * console would wait for a lock only it could release.
+ *
+ * ⚠ WHAT THIS COSTS, stated rather than discovered later.  Interrupts are
+ * off for a whole line rather than for a character, and a line is up to
+ * eighty of uart_send_raw's polled waits on the transmitter.  Under an
+ * emulator that is free -- the transmitter is always ready -- but on a real
+ * 115200-baud line eighty characters is seven milliseconds, which would be
+ * seven milliseconds of deferred interrupts per printed line.  The answer to
+ * that is an output ring the UART drains from its own interrupt, which is a
+ * rung of its own and not this one; what is owed here is saying so.
+ */
+#define	CONS_NOBODY		0xFFFFFFFFu
+
+static volatile uint32_t	cons_owner = CONS_NOBODY;	/* (a) cpu id  */
+static uint32_t			cons_depth;	/* (cons) nested brackets  */
+static bool			cons_saved_if;	/* (cons) IF at the outer  */
+static uint64_t			cons_waits;	/* (a) found it held       */
+
+static void	cons_enter(void);
+static void	cons_exit(void);
+
+/*
+ * Take the console, wait for it, or notice that this CPU already has it.
+ *
+ * The panic path takes nothing at all, which is the discipline this file
+ * already had: whoever is panicking may be the holder, and a debugger that
+ * waits for a lock held by the code it was called to examine says nothing
+ * ever again.  cons_exit is written so that the bypass needs no flag passed
+ * between the two -- it releases only what this CPU owns.
+ */
+static void
+cons_enter(void)
+{
+	uint32_t	me;
+	uint32_t	vacant;
+	bool		was_on;
+
+	if (panic_in_progress)
+		return;
+
+	was_on = intr_save_disable();
+	me = (uint32_t)cpu_id();
+
+	if (__atomic_load_n(&cons_owner, __ATOMIC_RELAXED) == me) {
+		cons_depth++;
+		return;
+	}
+
+	vacant = CONS_NOBODY;
+	if (!__atomic_compare_exchange_n(&cons_owner, &vacant, me, false,
+	    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+		__atomic_fetch_add(&cons_waits, 1, __ATOMIC_RELAXED);
+		do {
+			__asm__ __volatile__ ("pause");
+			vacant = CONS_NOBODY;
+		} while (!__atomic_compare_exchange_n(&cons_owner, &vacant, me,
+		    false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED));
+	}
+
+	cons_depth    = 1;
+	cons_saved_if = was_on;
+}
+
+static void
+cons_exit(void)
+{
+	bool	was_on;
+
+	/*
+	 * Not ours means nothing to give back: the panic bypass took nothing,
+	 * and an unbalanced end has nothing to end.  Reading the owner without
+	 * holding it is safe because the only value that can equal this CPU's
+	 * id is one this CPU wrote -- a holder never lets go of the console to
+	 * go anywhere else, so if the answer is us, it is still us.
+	 */
+	if (__atomic_load_n(&cons_owner, __ATOMIC_RELAXED) != (uint32_t)cpu_id())
+		return;
+	if (--cons_depth != 0)
+		return;
+
+	was_on = cons_saved_if;
+	__atomic_store_n(&cons_owner, CONS_NOBODY, __ATOMIC_RELEASE);
+	intr_restore(was_on);
+}
 
 /*
  * What the CRTC was last told, and how often it had to be told.
@@ -342,18 +452,13 @@ tty_set_attr(uint8_t attr)
 void
 tty_putc(char ch)
 {
-	bool	locked;
 
 	/*
-	 * Bypass the lock while we are in the panic / debugger path:
-	 * the offending code may already hold tty_lock, and re-entering
-	 * spin_lock would self-deadlock.  Standard BSD discipline.
+	 * A lone character is its own write and is serialised as one; a
+	 * character inside a batch finds the console already held by this CPU
+	 * and costs a compare and a counter.
 	 */
-	locked = false;
-	if (!panic_in_progress) {
-		spin_lock(&tty_lock);
-		locked = true;
-	}
+	cons_enter();
 
 	/*
 	 * Mirrors get the byte stream RAW -- a terminal hooked to COM1
@@ -368,8 +473,7 @@ tty_putc(char ch)
 	tty_chars++;
 	tty_cursor_sync();
 
-	if (locked)
-		spin_unlock(&tty_lock);
+	cons_exit();
 }
 
 /* ---- hardware cursor ------------------------------------------------- */
@@ -421,52 +525,45 @@ tty_cursor_program(uint16_t off)
 }
 
 /*
- * Open and close a run of output.
+ * Open and close a run of output, AND OWN THE CONSOLE FOR ITS DURATION.
  *
- * The lock is taken for the counter rather than held across the run:
- * spin_lock panics on a same-CPU re-acquire, and every tty_putc inside
- * the bracket takes it itself.  Two acquisitions per kprintf against
- * the thousands it was already making per boot is not a cost worth
- * restructuring the console to avoid.
+ * The bracket existed for the hardware cursor -- program it once per write
+ * rather than once per byte -- and it turns out to be exactly the span a
+ * second processor must not be allowed inside.  So it now carries both: the
+ * console is held from the first character of a write to the last, and every
+ * tty_putc within finds it already held by this CPU.
+ *
+ * Everything the blitter keeps -- the cursor position, the parser state, the
+ * attribute, the counters -- is under it now for the first time.  Those were
+ * never protected by the per-character lock in any useful sense: two CPUs
+ * could interleave inside one escape sequence and leave the parser holding
+ * half of each.
  *
  * Unbalanced brackets are survivable by construction -- the depth only
  * ever gates a cursor update, so the worst a leaked tty_batch_begin can
  * do is leave the underline one position stale until the next write
- * closes a bracket.
+ * closes a bracket.  A leaked cons_enter would be worse, which is why the
+ * two are opened and closed together and nowhere else.
  */
 void
 tty_batch_begin(void)
 {
-	bool	locked;
 
-	locked = false;
-	if (!panic_in_progress) {
-		spin_lock(&tty_lock);
-		locked = true;
-	}
+	cons_enter();
 	tty_batch_depth++;
 	tty_batches++;
-	if (locked)
-		spin_unlock(&tty_lock);
 }
 
 void
 tty_batch_end(void)
 {
-	bool	locked;
 
-	locked = false;
-	if (!panic_in_progress) {
-		spin_lock(&tty_lock);
-		locked = true;
-	}
 	if (tty_batch_depth > 0)
 		tty_batch_depth--;
 	if (tty_batch_depth == 0 && tty_cursor_dirty)
 		tty_cursor_program((uint16_t)((size_t)tty_row * TTY_COLS +
 		    tty_col));
-	if (locked)
-		spin_unlock(&tty_lock);
+	cons_exit();
 }
 
 /* ---- palette --------------------------------------------------------- */
@@ -600,6 +697,15 @@ tty_stats(void)
 	    (unsigned long long)tty_cursor_pokes,
 	    (unsigned long long)(tty_chars == 0 ? 0 :
 	    tty_cursor_pokes * 100 / tty_chars));
+	/*
+	 * How often a write had to wait for another CPU's.  Zero on a machine
+	 * running one processor, and on a machine running four it is the count
+	 * of lines that would have come out woven together before.
+	 */
+	kprintf("tty: %llu write(s) waited for the console -- %llu per 1000\n",
+	    (unsigned long long)cons_waits,
+	    (unsigned long long)(tty_batches == 0 ? 0 :
+	    cons_waits * 1000 / tty_batches));
 }
 
 /* ---- ANSI/VT state machine ------------------------------------------- */
