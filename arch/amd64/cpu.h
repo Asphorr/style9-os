@@ -132,6 +132,29 @@ struct cpu {
 	volatile int		 cp_preempt_count;	/* (i) see sched.h  */
 	volatile int		 cp_need_resched;	/* (i)              */
 	volatile unsigned int	 cp_quantum_used;	/* (i) timer ticks  */
+
+	/*
+	 * Ticks this CPU's own APIC timer has delivered, and the TSC reading
+	 * at which it was armed.  Per-CPU because the rate they imply is a
+	 * per-CPU fact: one counter for the machine would read N times too
+	 * fast with N processors ticking into it, which is exactly what it
+	 * used to do.
+	 */
+	volatile uint64_t	 cp_timer_ticks;	/* (a)              */
+	uint64_t		 cp_timer_start;	/* (c) TSC at arm   */
+
+	/* Context switches performed here.  Where the work actually went. */
+	volatile uint64_t	 cp_switches;		/* (i)              */
+
+	/*
+	 * Set by the boot processor when the machine is finished enough for
+	 * this one to be allowed into the scheduler, and read by this one in
+	 * its parking loop.  The gap exists because a processor has to be
+	 * STARTED early -- the trampoline needs a page of low memory that
+	 * boot-time allocations would otherwise take -- and must not RUN
+	 * anything until the per-CPU state it will inherit is settled.
+	 */
+	volatile int		 cp_release;		/* (a)              */
 } __attribute__((aligned(64)));
 
 _Static_assert(offsetof(struct cpu, cp_self) == CPU_SELF,
@@ -209,6 +232,15 @@ cpu_set_kernel_rsp(uint64_t rsp)
 void		cpu_bsp_init(void);
 
 /*
+ * Every control register and MSR that is per-processor and that this kernel
+ * depends on: CR0.WP, the FPU's CR0/CR4 bits, CR4.SMAP, and the four SYSCALL
+ * registers.  The boot processor collected them one at a time through kmain;
+ * a processor arriving later inherits none of them, and every one of them
+ * fails silently and somewhere else.  See cpu.c for the list of symptoms.
+ */
+void		cpu_state_init(void);
+
+/*
  * Prove the mechanism and say so: read this CPU's block back through the
  * segment base and compare it with the address the C side knows.  A boot
  * where the two disagree has a working kernel right up until the first
@@ -222,6 +254,15 @@ void		cpu_print(void);
  * falls back on, and how much of its slice is gone.  Backs the shell's `cpu'.
  */
 void		cpu_dump(void);
+
+/*
+ * The same question asked of a machine that cannot answer it the usual way:
+ * one line naming what is running on every processor and how many switches it
+ * has performed, written byte by byte straight at the UART.  No lock, no
+ * console, no formatting -- so it still speaks when the thing being diagnosed
+ * is the console or the lock in front of it.
+ */
+void		cpu_census_uart(void);
 
 /*
  * Claim a block for a processor the firmware described but nobody has started.

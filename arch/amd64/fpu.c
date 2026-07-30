@@ -20,12 +20,20 @@
  */
 static uint8_t	fpu_template[FPU_XSAVE_AREA_SIZE] __attribute__((aligned(16)));
 
+/*
+ * The half of this that is a property of a PROCESSOR rather than of the
+ * kernel: four control-register bits, which every CPU has its own copy of and
+ * which come out of reset saying the wrong thing.  An application processor
+ * whose OSFXSR is clear takes a #UD on the first FXRSTOR the scheduler does
+ * for it -- that is, on its first context switch -- so this is not optional
+ * bring-up, it is the difference between a processor that can run a thread
+ * and one that cannot.
+ */
 void
-fpu_init(void)
+fpu_init_cpu(void)
 {
 	uint64_t	cr0;
 	uint64_t	cr4;
-	uint32_t	mxcsr;
 
 	__asm __volatile("mov %%cr0, %0" : "=r"(cr0));
 	cr0 &= ~(1ULL << 2);	/* EM = 0: execute x87/SSE, do not emulate    */
@@ -37,6 +45,14 @@ fpu_init(void)
 	cr4 |= (1ULL << 9);	/* OSFXSR: SSE + FXSAVE/FXRSTOR enabled       */
 	cr4 |= (1ULL << 10);	/* OSXMMEXCPT: SIMD FP faults reported as #XM */
 	__asm __volatile("mov %0, %%cr4" : : "r"(cr4));
+}
+
+void
+fpu_init(void)
+{
+	uint32_t	mxcsr;
+
+	fpu_init_cpu();
 
 	/*
 	 * Bring the x87 + SSE state to a known-good baseline, then snapshot it

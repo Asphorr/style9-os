@@ -14,6 +14,7 @@
 #include "gdt.h"
 #include "kmem.h"
 #include "kprintf.h"
+#include "mp.h"
 #include "panic.h"
 #include "pmap.h"
 #include "port_internal.h"
@@ -23,6 +24,7 @@
 #include "syscall.h"
 #include "task.h"
 #include "thread.h"
+#include "tsc.h"
 
 /*
  * Scheduler locking discipline.
@@ -39,7 +41,18 @@
  * waker spinning on sched_lock cannot observe us as both not-RUNNING
  * (so eligible to be woken) and still executing past our save point.
  *
- * Cooperative only -- the PIT IRQ touches no scheduler state.
+ * ⚠ AND IT IS WHAT MAKES ONE RUNQUEUE SAFE FOR SEVERAL PROCESSORS, which
+ * was not why it was written that way.  A yielding thread puts ITSELF back
+ * on the runqueue and then switches off its own stack, so between those two
+ * moments there is a thread on the queue that another CPU must not pick --
+ * it is still executing.  That window is exactly the span sched_lock is
+ * held for: the lock is taken before the enqueue and released only after
+ * the switch, by the thread that arrives.  A second processor spinning for
+ * it cannot see the queue until the stack has been left.
+ *
+ * The same argument covers th_rsp_save, which the switch asm writes during
+ * that window and the picking CPU reads after acquiring the lock -- so the
+ * release/acquire pair on sched_lock is what publishes it.
  */
 
 static struct spinlock	sched_lock = SPINLOCK_INIT("sched");
@@ -159,6 +172,8 @@ static uint64_t		wake_slow_lines;	/* (a) ...of them, printed */
 
 static void	idle_loop(void *) __attribute__((noreturn));
 static struct thread *pick_next_locked(struct thread *self);
+static bool	thread_is_idle(const struct thread *th);
+static void	poke_an_idle_cpu_locked(void);
 static void	enqueue_locked(struct thread *th);
 static void	switch_pmap_if_needed(struct thread *self, struct thread *next);
 static void	switch_user_kstack(struct thread *next);
@@ -263,13 +278,152 @@ sched_init(void)
 	    (unsigned long long)idle_thread->th_id);
 }
 
+/*
+ * WHERE AN APPLICATION PROCESSOR JOINS THE SCHEDULER.
+ *
+ * Two things have to exist before a CPU can be given work, and the first is
+ * the reason the second is possible: a thread of its own, because a processor
+ * cannot switch AWAY from a thread that does not exist and so cannot take the
+ * first one off the queue; and an idle thread, because a CPU with nothing
+ * runnable still has to be executing something, on a stack that is not shared
+ * with anybody.
+ *
+ * Both are the same thread here.  The context this processor is already
+ * running -- the trampoline's stack, which is a per-CPU allocation and has
+ * been since the rung that started it -- is adopted as the thread, and that
+ * thread is this CPU's idler.  It is never on the runqueue; pick_next_locked
+ * falls through to it whenever the queue is empty, exactly as on the boot
+ * processor.
+ *
+ * The boot CPU does it the other way round -- its idle thread is created,
+ * because the context it was already running is the boot thread and that one
+ * has work to finish.  Two shapes, one invariant: every CPU owns an idle
+ * thread and no CPU shares one.
+ */
+void
+sched_cpu_attach(void)
+{
+	static const char *const	idle_names[MAXCPU] = {
+		"idle", "idle1", "idle2", "idle3",
+		"idle4", "idle5", "idle6", "idle7",
+	};
+	struct cpu			*cp;
+	struct thread			*idle;
+
+	cp = curcpu();
+
+	idle = thread_adopt_current(kernel_task, idle_names[cp->cp_id]);
+	if (idle == NULL)
+		panic("sched_cpu_attach: cpu %u has no idle thread",
+		    (unsigned int)cp->cp_id);
+
+	cp->cp_idle_thread = idle;
+
+	/*
+	 * A fresh slice and no debts.  The block was zeroed in the image, so
+	 * this is saying it rather than doing it -- and saying it is what
+	 * keeps the statement true if the block ever stops being fresh.
+	 */
+	preempt_resched_clear();
+	preempt_quantum_reset();
+}
+
+void
+sched_cpu_idle(void)
+{
+
+	idle_loop(NULL);
+	/* NOTREACHED */
+}
+
+/*
+ * Is this ANY processor's idle thread?
+ *
+ * The question used to be `th == idle_thread', which reads this CPU's block
+ * and so answers about one of them.  A CPU asking whether some other CPU's
+ * idler belongs on the runqueue would have been told yes, and an idle thread
+ * on the runqueue is a thread two processors can end up standing on: its own
+ * CPU falls through to it whenever the queue is empty, whether or not
+ * somebody else has just picked it up.
+ *
+ * A scan rather than a flag on the thread, because the list is at most eight
+ * long and a flag is one more field that can disagree with the truth.
+ */
+static bool
+thread_is_idle(const struct thread *th)
+{
+	unsigned int	i;
+
+	for (i = 0; i < cpu_present_count(); i++) {
+		if (cpus[i].cp_idle_thread == th)
+			return (true);
+	}
+	return (false);
+}
+
+/*
+ * MAKING A THREAD READY IS NOT MAKING IT RUN, and on one processor the
+ * distinction was only about latency: need_resched, and this CPU gets to it
+ * when it next can.  With several processors it is also about WHERE.  A CPU
+ * sitting in idle's hlt has nothing to do and will not notice a new thread
+ * until its own timer wakes it, which is a whole tick -- so the queue would
+ * fill up in front of a busy CPU while an idle one slept through it.
+ *
+ * So the CPU that queues the work tells one that has none.  Exactly one, and
+ * only if it is genuinely idle: a busy CPU will reach the queue at its next
+ * schedule point without being asked, and telling two of them about one
+ * thread only buys a race for it.
+ *
+ * ⚠ AND ONLY IF THERE IS MORE THAN ONE THREAD WAITING, which is the whole
+ * difference between a hint and a tax.  The caller has just set need_resched
+ * on ITSELF, and the spin_unlock that follows honours it at once -- so for a
+ * single woken thread this CPU is already going to run it, and a message to
+ * anybody else is work done to lose a race.  The message is four accesses to
+ * the APIC's registers, every one of them a trap out of the guest on the
+ * machines this is developed on, performed while holding the one lock the
+ * whole scheduler serialises on.  Sending it on every wake was measurable and
+ * bought nothing.
+ *
+ * Called with sched_lock held, which the ICR wait is bounded inside (see
+ * lapic_icr_idle).  Deciding here and sending after the unlock would be
+ * tidier and would act on a queue that had already moved on.
+ */
+static void
+poke_an_idle_cpu_locked(void)
+{
+	struct cpu	*me;
+	unsigned int	 i;
+
+	if (cpu_online_count() < 2)
+		return;
+	if (runq_len < 2)
+		return;
+
+	me = curcpu();
+	for (i = 0; i < cpu_present_count(); i++) {
+		if (&cpus[i] == me || cpus[i].cp_online == 0)
+			continue;
+		/*
+		 * No idle thread means that processor has not joined the
+		 * scheduler at all -- it is parked, and a reschedule there
+		 * would mean nothing.
+		 */
+		if (cpus[i].cp_idle_thread == NULL)
+			continue;
+		if (cpus[i].cp_curthread != cpus[i].cp_idle_thread)
+			continue;
+		mp_resched(&cpus[i]);
+		return;
+	}
+}
+
 void
 sched_enqueue(struct thread *th)
 {
 
 	if (th == NULL)
 		return;
-	if (th == idle_thread)
+	if (thread_is_idle(th))
 		return;	/* idle dispatched only by pick_next_locked */
 
 	spin_lock(&sched_lock);
@@ -284,6 +438,7 @@ sched_enqueue(struct thread *th)
 	spin_unlock(&th->th_lock);
 
 	enqueue_locked(th);
+	poke_an_idle_cpu_locked();
 	spin_unlock(&sched_lock);
 }
 
@@ -385,7 +540,7 @@ pick_next_locked(struct thread *self)
 	return (NULL);
 }
 
-void
+bool
 thread_yield(void)
 {
 	struct thread	*self, *next;
@@ -405,8 +560,16 @@ thread_yield(void)
 
 	next = pick_next_locked(self);
 	if (next == NULL || next == self) {
+		/*
+		 * Nobody to hand it to.  The caller asked to be put behind
+		 * whatever else wanted the CPU and there was nothing else, so
+		 * no time has passed and nothing has moved on this processor --
+		 * which is exactly what a poll loop needs to be told, and what
+		 * it could not be told while there was only one CPU to be
+		 * empty.
+		 */
 		spin_unlock(&sched_lock);
-		return;
+		return (false);
 	}
 
 	if (self != idle_thread) {
@@ -422,6 +585,7 @@ thread_yield(void)
 
 	current_thread = next;
 	ctx_switches++;
+	curcpu()->cp_switches++;
 
 	switch_pmap_if_needed(self, next);
 	switch_user_kstack(next);
@@ -444,6 +608,8 @@ thread_yield(void)
 	 * common (zombie-list-empty) case.
 	 */
 	sched_reap_zombies();
+
+	return (true);
 }
 
 void
@@ -451,6 +617,56 @@ thread_block(int reason, void *target)
 {
 
 	thread_block_release(reason, target, NULL);
+}
+
+/*
+ * SLEEP FOR A WHILE, BECAUSE POLLING BY YIELDING STOPPED BEING SLEEPING.
+ *
+ * A loop of the shape `while (something somebody else owns) thread_yield()'
+ * was a way of waiting on one processor: the yield handed the CPU to that
+ * somebody, so a turn round the loop cost a slice of real time.  With four
+ * processors it costs nothing -- the thread being waited for is RUNNING
+ * elsewhere rather than queued here -- and the loop becomes a spin at the
+ * speed of the scheduler.
+ *
+ * ⚠ WHICH IS NOT MERELY WASTEFUL, IT IS FATAL, and this is what it looked
+ * like: the boot thread's one such loop turned into 350,000 context switches
+ * a second, every one of them taking the scheduler's global lock with
+ * interrupts disabled.  The processor spent so much of its life with
+ * interrupts off that it MISSED MOST OF ITS TIMER TICKS, so the clock stopped
+ * advancing; and once the clock stops, every deadline in the system stops
+ * expiring, so the timed waits that everything else was parked on never
+ * returned.  Four processors at a hundred percent, a log frozen mid-line, and
+ * nothing wrong with any lock -- the spinlock watchdog written to catch this
+ * had nothing to say, because nobody was waiting for a lock.
+ *
+ * So a poll waits in TIME.  One millisecond asked for, one timer tick given,
+ * because the tick is what deadlines are checked from; asking for the
+ * smallest thing and being handed the resolution keeps that number in the
+ * clock where it belongs.
+ */
+void
+sched_nap_ms(uint64_t ms)
+{
+	struct thread	*self;
+
+	self = current_thread;
+	if (self == NULL || ms == 0)
+		return;
+
+	self->th_wake_deadline_ms = clock_uptime_ms() + ms;
+	self->th_timed_out        = 0;
+	sched_add_timed_waiter(self);
+
+	/*
+	 * The channel is the thread itself, which is an address no other
+	 * piece of code names -- so nothing can wake this but the deadline,
+	 * or a kill, which is exactly the pair of things that should.
+	 */
+	thread_block(THREAD_BLOCK_SLEEP, self);
+
+	sched_remove_timed_waiter(self);
+	self->th_timed_out = 0;
 }
 
 void
@@ -486,6 +702,26 @@ thread_block_release(int reason, void *target, struct spinlock *external)
 			spin_unlock(external);
 		thread_exit();
 		/* NOTREACHED */
+	}
+
+	/*
+	 * A WAKE THAT ARRIVED BEFORE THIS SLEEP.  Left by thread_wake when it
+	 * found this thread still running -- which, with a second processor,
+	 * is what a wake racing a park looks like.  Reading it here is the
+	 * only place it can be read safely: under sched_lock, which is the
+	 * same lock the waker held when it wrote the note, and before the
+	 * commit to BLOCKED that the note says has already been answered.
+	 *
+	 * Declining to sleep is a spurious wakeup and nothing worse.  Every
+	 * caller of this parks inside for (;;) and re-tests, because waking
+	 * has always been a hint here rather than a promise.
+	 */
+	if (self->th_wake_pending != 0) {
+		self->th_wake_pending = 0;
+		if (external != NULL)
+			spin_unlock(external);
+		spin_unlock(&sched_lock);
+		return;
 	}
 
 	spin_lock(&self->th_lock);
@@ -524,6 +760,7 @@ thread_block_release(int reason, void *target, struct spinlock *external)
 
 	current_thread = next;
 	ctx_switches++;
+	curcpu()->cp_switches++;
 
 	switch_pmap_if_needed(self, next);
 	switch_user_kstack(next);
@@ -580,10 +817,39 @@ thread_wake(struct thread *th)
 	spin_lock(&sched_lock);
 	spin_lock(&th->th_lock);
 	if (th->th_state != THREAD_BLOCKED) {
+		/*
+		 * ⚠ NOT ASLEEP IS NOT THE SAME AS NOT LISTENING, and telling
+		 * the two apart is what a second processor made necessary.
+		 *
+		 * A thread that is READY or RUNNING has not missed anything --
+		 * it will look again on its own.  But a thread can also be
+		 * BETWEEN: it has decided to sleep and has not yet committed,
+		 * and on one processor that state had no duration, because
+		 * deciding and committing happen with nothing else able to run
+		 * on that CPU in between.  With four it lasts as long as
+		 * anybody likes.
+		 *
+		 * The ATA driver is where it showed.  A thread installs itself
+		 * as the channel's waiter and drops toward THREAD_BLOCKED; the
+		 * disk's interrupt lands on another processor and posts the
+		 * wake; the wake finds a RUNNING thread and, before this, did
+		 * nothing at all.  The thread then slept for ever -- one boot
+		 * in four, always inside a filesystem write, with the rest of
+		 * the machine perfectly healthy and nothing to look at.
+		 *
+		 * So the wake leaves a note instead of evaporating, and the
+		 * next attempt to sleep reads it and declines to.  The caller
+		 * re-tests its condition and finds whatever the wake was about
+		 * -- which is the contract every sleeper here already keeps.
+		 */
+		if (th->th_state == THREAD_READY ||
+		    th->th_state == THREAD_RUNNING)
+			th->th_wake_pending = 1;
 		spin_unlock(&th->th_lock);
 		spin_unlock(&sched_lock);
 		return;
 	}
+	th->th_wake_pending = 0;
 	th->th_state        = THREAD_READY;
 	th->th_block_reason = THREAD_NOT_BLOCKED;
 	th->th_block_target = NULL;
@@ -615,6 +881,7 @@ thread_wake(struct thread *th)
 	 * which the spin_unlock below reaches at once.
 	 */
 	preempt_need_resched = 1;
+	poke_an_idle_cpu_locked();
 	spin_unlock(&sched_lock);
 }
 
@@ -692,8 +959,10 @@ sched_wake_sleepers_of(struct task *task)
 		enqueue_first_locked(th);
 		n++;
 	}
-	if (n != 0)
+	if (n != 0) {
 		preempt_need_resched = 1;
+		poke_an_idle_cpu_locked();
+	}
 	spin_unlock(&sched_lock);
 	return (n);
 }
@@ -737,8 +1006,10 @@ sched_wakeup(void *chan)
 		n++;
 	}
 	/* Same reasoning as thread_wake: a wake without one is a wake late. */
-	if (n != 0)
+	if (n != 0) {
 		preempt_need_resched = 1;
+		poke_an_idle_cpu_locked();
+	}
 	spin_unlock(&sched_lock);
 	return (n);
 }
@@ -870,6 +1141,7 @@ sched_handoff_zombie(struct thread *self)
 
 	current_thread = next;
 	ctx_switches++;
+	curcpu()->cp_switches++;
 
 	switch_pmap_if_needed(self, next);
 	switch_user_kstack(next);
@@ -953,6 +1225,107 @@ idle_loop(void *arg)
 
 		__asm__ __volatile__ ("sti; hlt; cli");
 	}
+}
+
+/* ---- proving the work goes to more than one processor ---------------- */
+
+/*
+ * Eight threads, a tenth of a second each, and one question: did any of them
+ * run anywhere but here?
+ *
+ * The evidence is a bit set by the thread itself out of its own CPU's block,
+ * which no amount of bookkeeping on the queueing side can fake -- the bit for
+ * processor three can only be set by code executing on processor three.  What
+ * would pass this test on a kernel that had gone wrong is nothing: a scheduler
+ * that quietly kept everything on the boot CPU sets one bit, and a processor
+ * that joined and then wedged never sets its own.
+ *
+ * The probes measure their own life in TSC time rather than in iterations, so
+ * eight of them cost a tenth of a second of wall clock between them however
+ * many processors there turn out to be.
+ */
+#define	SMP_TEST_THREADS	8
+#define	SMP_TEST_US		100000
+#define	SMP_TEST_WAIT_MS	5000
+
+static volatile uint32_t	smp_seen;	/* (a) cpu ids, as bits    */
+static volatile uint32_t	smp_done;	/* (a) probes that ended   */
+
+static void
+smp_probe(void *arg)
+{
+	uint64_t	t0;
+
+	(void)arg;
+
+	t0 = tsc_read();
+	while (tsc_to_us(tsc_read() - t0) < SMP_TEST_US) {
+		__atomic_fetch_or(&smp_seen, 1u << cpu_id(), __ATOMIC_RELAXED);
+		__asm__ __volatile__ ("pause");
+	}
+	__atomic_fetch_add(&smp_done, 1, __ATOMIC_RELAXED);
+}
+
+void
+sched_smp_selftest(void)
+{
+	struct thread	*th;
+	uint64_t	 deadline;
+	uint32_t	 seen;
+	unsigned int	 nbits;
+	unsigned int	 done;
+	unsigned int	 i;
+
+	if (cpu_online_count() < 2) {
+		kprintf("sched-smp: one processor is running -- there is "
+		    "nowhere else for the work to go\n");
+		return;
+	}
+
+	__atomic_store_n(&smp_seen, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&smp_done, 0, __ATOMIC_RELAXED);
+
+	for (i = 0; i < SMP_TEST_THREADS; i++) {
+		th = thread_create(kernel_task, smp_probe, NULL, "smp-probe");
+		if (th == NULL) {
+			kprintf("sched-smp: FAIL no memory for probe %u\n", i);
+			return;
+		}
+		thread_start(th);
+	}
+
+	deadline = clock_uptime_ms() + SMP_TEST_WAIT_MS;
+	for (;;) {
+		done = __atomic_load_n(&smp_done, __ATOMIC_RELAXED);
+		if (done >= SMP_TEST_THREADS)
+			break;
+		if (clock_uptime_ms() > deadline) {
+			kprintf("sched-smp: FAIL only %u of %u probes finished "
+			    "in %u ms\n", done, (unsigned int)SMP_TEST_THREADS,
+			    (unsigned int)SMP_TEST_WAIT_MS);
+			return;
+		}
+		thread_yield();
+	}
+
+	seen  = __atomic_load_n(&smp_seen, __ATOMIC_RELAXED);
+	nbits = 0;
+	for (i = 0; i < MAXCPU; i++) {
+		if ((seen & (1u << i)) != 0)
+			nbits++;
+	}
+
+	if (nbits < 2) {
+		kprintf("sched-smp: FAIL %u thread(s) all ran on one "
+		    "processor (mask 0x%x)\n", (unsigned int)SMP_TEST_THREADS,
+		    (unsigned int)seen);
+		return;
+	}
+
+	kprintf("sched-smp: PASS -- %u thread(s) ran on %u of the %u "
+	    "processor(s) that are up (mask 0x%x), and each of them said so "
+	    "out of its own CPU's block\n", (unsigned int)SMP_TEST_THREADS,
+	    nbits, cpu_online_count(), (unsigned int)seen);
 }
 
 /* ---- introspection --------------------------------------------------- */
@@ -1076,7 +1449,21 @@ preempt_enable(void)
 	 */
 	sched_drain_irq_wakes();
 
-	if (preempt_resched_wanted()) {
+	/*
+	 * ⚠ AND ONLY IF THIS CPU HAS A THREAD TO SWITCH AWAY FROM.
+	 *
+	 * There is a window, once per processor, in which a CPU is running
+	 * kernel code and is not yet in the scheduler: an application processor
+	 * released from its parking loop takes locks -- kmalloc's, on the way
+	 * to allocating its own idle thread -- before it has a current thread
+	 * at all.  The message that released it set need_resched on it, so the
+	 * very first spin_unlock of its life arrived here owing a reschedule to
+	 * nowhere, and thread_yield asserted on the way in.
+	 *
+	 * The same test guards the dispatcher's tail, for the same reason and
+	 * about the same window.
+	 */
+	if (preempt_resched_wanted() && current_thread != NULL) {
 		sched_count_preempt();
 		thread_yield();
 	}

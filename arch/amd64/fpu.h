@@ -34,6 +34,14 @@
 #define	FPU_XSAVE_AREA_SIZE	512
 
 void	fpu_init(void);
+
+/*
+ * Just the control-register bits, for a processor that arrives after the
+ * template has already been captured.  Every CPU owns its own CR0 and CR4,
+ * and one that comes up without OSFXSR faults on the first FXRSTOR the
+ * scheduler performs for it.
+ */
+void	fpu_init_cpu(void);
 void	fpu_clean_state(void *area);
 
 #endif /* !_AMD64_FPU_H_ */

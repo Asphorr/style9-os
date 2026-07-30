@@ -93,17 +93,33 @@ void		lapic_timer_probe(void);
 bool		lapic_timer_start(void);
 
 /*
+ * The same timer on a processor that arrived after the hand-over, at the rate
+ * the boot processor measured.  There is nothing to hand over on an
+ * application processor -- the PIT was never debiting its slice, because it
+ * had no slice -- so this is only the arming half.
+ *
+ * Returns false if the boot processor never made the hand-over, in which case
+ * the PIT is still debiting and no second CPU can be preempted at all.
+ */
+bool		lapic_timer_start_ap(void);
+
+/*
  * Whether the slice is being debited by this CPU's timer rather than by the
  * one PIT the machine has.
  */
 bool		lapic_timer_preempting(void);
 
 /*
- * Print what the timer has actually delivered since it took over: its rate
- * over TSC time, and the slice length that rate implies.  The slice is the
- * number that matters -- PREEMPT_QUANTUM_TICKS means 20 ms only while the
+ * Print what the timers have actually delivered since they took over: their
+ * rate over TSC time, and the slice length that rate implies.  The slice is
+ * the number that matters -- PREEMPT_QUANTUM_TICKS means 20 ms only while the
  * ticks arrive at the rate they were asked for.  The PIT's count over the same
- * span is printed beside it, where its delivery deficit shows.
+ * span is printed beside them, where its delivery deficit shows.
+ *
+ * ONE LINE PER PROCESSOR, because the slice is a per-CPU fact and this is the
+ * only place it is visible: a CPU whose timer never started, or started at the
+ * wrong rate, or stopped being delivered, differs from its neighbours here and
+ * nowhere else.
  */
 void		lapic_timer_report(void);
 

@@ -83,6 +83,16 @@ struct syscall_frame {
 /* Install MSRs (EFER.SCE, STAR, LSTAR, FMASK).  Call once per CPU. */
 void	syscall_init(void);
 
+/*
+ * Every one of the four registers syscall_init writes is per-processor: STAR,
+ * LSTAR and FMASK say where a SYSCALL lands and what it does to RFLAGS, and
+ * EFER.SCE is what makes the instruction legal at all.  A processor that
+ * missed them takes a #UD on the first system call a thread makes there --
+ * not on the CPU that set them up, and so nowhere near the code that looks
+ * responsible.
+ */
+void	syscall_init_cpu(void);
+
 /* C dispatcher invoked from syscall_entry. */
 long	syscall_dispatch(struct syscall_frame *);
 

@@ -105,15 +105,6 @@ static volatile uint8_t	*lapic_va;		/* (c) NULL until mapped   */
 static uint64_t		 lapic_pa;		/* (c) 0 until mapped      */
 static bool		 lapic_ok;		/* (c)                     */
 static uint32_t		 lapic_hz;		/* (c) ticks/s at DIV16    */
-/*
- * Ticks this timer has delivered.  One counter for the machine, which is
- * right while there is one CPU delivering into it and WRONG the moment there
- * are two: lapic_timer_report divides it by elapsed time to get one CPU's tick
- * rate, and N processors ticking would read as N times too fast.  It belongs
- * in struct cpu with the rest of what a CPU owns, and moves there in the rung
- * that starts a second one.
- */
-static volatile uint64_t lapic_timer_count;	/* (a) ISR tally           */
 
 /*
  * Set once, by lapic_timer_start, while the timer is still masked -- so the
@@ -124,7 +115,8 @@ static volatile uint64_t lapic_timer_count;	/* (a) ISR tally           */
 static bool		 lapic_preempting;	/* (c) after timer_start   */
 static unsigned int	 lapic_tick_hz;		/* (c) rate it now keeps   */
 static uint64_t		 lapic_start_pit;	/* (c) PIT at the handover */
-static uint64_t		 lapic_start_tsc;	/* (c) TSC at the handover */
+
+static bool	lapic_timer_arm(unsigned int hz);
 
 static inline uint32_t
 lapic_read(unsigned int reg)
@@ -277,7 +269,14 @@ lapic_timer_isr(struct trapframe *tf)
 {
 
 	(void)tf;
-	__atomic_add_fetch(&lapic_timer_count, 1, __ATOMIC_RELAXED);
+
+	/*
+	 * Counted in THIS CPU's block.  A single counter for the machine was
+	 * right while one processor delivered into it and became a lie the
+	 * moment a second did: the report divides the tally by elapsed time to
+	 * get a tick rate, and N processors ticking read as N times too fast.
+	 */
+	__atomic_add_fetch(&curcpu()->cp_timer_ticks, 1, __ATOMIC_RELAXED);
 
 	/*
 	 * The slice, from the moment this timer owns it.  Charged to whatever
@@ -502,7 +501,7 @@ lapic_timer_probe(void)
 	 * LVT, the vector, the IDT gate and the dispatcher all have to be
 	 * right for a single one of these to be counted.
 	 */
-	__atomic_store_n(&lapic_timer_count, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&curcpu()->cp_timer_ticks, 0, __ATOMIC_RELAXED);
 	intr_install_local(LAPIC_VEC_TIMER, lapic_timer_isr);
 
 	lapic_write(LAPIC_TIMER_ICR, lapic_hz / LAPIC_PROBE_HZ);
@@ -521,7 +520,7 @@ lapic_timer_probe(void)
 
 	preempt_enable();
 
-	fired = __atomic_load_n(&lapic_timer_count, __ATOMIC_RELAXED);
+	fired = __atomic_load_n(&curcpu()->cp_timer_ticks, __ATOMIC_RELAXED);
 	want  = (uint32_t)((probe_us * LAPIC_PROBE_HZ) / 1000000);
 
 	kprintf("lapic: timer counts at %u kHz (input / %u), "
@@ -543,11 +542,66 @@ lapic_timer_probe(void)
 	    fired == 0 ? "  *** NOTHING ARRIVED ***" : "");
 }
 
+/*
+ * Arm THIS CPU's timer periodic at `hz', and start its clock running for the
+ * report.  Everything below the hand-over: the divisor, the vector and the
+ * count, in that order, because writing the count is what starts the timer and
+ * everything it will be delivered as has to be true before it can fire.
+ */
+static bool
+lapic_timer_arm(unsigned int hz)
+{
+	struct cpu	*cp;
+	uint32_t	 icr;
+
+	if (!lapic_ok || lapic_hz == 0 || hz == 0)
+		return (false);
+
+	icr = lapic_hz / hz;
+	if (icr == 0) {
+		kprintf("lapic: %u Hz is faster than this timer can count "
+		    "(%u ticks/s)\n", hz, (unsigned int)lapic_hz);
+		return (false);
+	}
+
+	cp = curcpu();
+	__atomic_store_n(&cp->cp_timer_ticks, 0, __ATOMIC_RELAXED);
+	cp->cp_timer_start = tsc_read();
+
+	intr_install_local(LAPIC_VEC_TIMER, lapic_timer_isr);
+
+	lapic_write(LAPIC_TIMER_DCR, LAPIC_DCR_DIV16);
+	lapic_write(LAPIC_LVT_TIMER,
+	    LAPIC_VEC_TIMER | LVT_DELIVERY_FIXED | LVT_TIMER_PERIODIC);
+	lapic_write(LAPIC_TIMER_ICR, icr);
+
+	return (true);
+}
+
+/*
+ * The same timer, on a processor that arrived after the hand-over.
+ *
+ * ⚠ AT THE RATE MEASURED ON THE BOOT PROCESSOR, which is an assumption and is
+ * stated as one: the APIC timer counts off the bus clock, which is one clock
+ * for the package, so all of these should count at the same speed.  It is not
+ * asserted here because it is CHECKED elsewhere and better -- lapic_timer_report
+ * prints every CPU's delivered rate separately, so an APIC counting at a
+ * different speed shows up as that CPU's Hz being wrong rather than as
+ * nothing at all.
+ */
+bool
+lapic_timer_start_ap(void)
+{
+
+	if (!lapic_preempting)
+		return (false);
+	return (lapic_timer_arm(lapic_tick_hz));
+}
+
 bool
 lapic_timer_start(void)
 {
 	unsigned int	hz;
-	uint32_t	icr;
 
 	if (!lapic_ok || lapic_hz == 0)
 		return (false);
@@ -565,8 +619,12 @@ lapic_timer_start(void)
 	if (hz == 0)
 		return (false);
 
-	icr = lapic_hz / hz;
-	if (icr == 0) {
+	/*
+	 * Asked before anything is given up, because the hand-over below is
+	 * one-way: a rate this timer cannot count would relieve the PIT of a
+	 * job nobody then does.
+	 */
+	if (lapic_hz / hz == 0) {
 		kprintf("lapic: %u Hz is faster than this timer can count "
 		    "(%u ticks/s) -- preemption stays with the PIT\n",
 		    hz, (unsigned int)lapic_hz);
@@ -590,25 +648,19 @@ lapic_timer_start(void)
 
 	lapic_tick_hz = hz;
 	lapic_preempting = true;
-	__atomic_store_n(&lapic_timer_count, 0, __ATOMIC_RELAXED);
 	lapic_start_pit = pit_ticks();
-	lapic_start_tsc = tsc_read();
 
-	intr_install_local(LAPIC_VEC_TIMER, lapic_timer_isr);
-
-	/*
-	 * Divisor, then the LVT, then the count -- in that order, because
-	 * writing the initial count is what starts the timer, and everything
-	 * it will be delivered as has to be true before it can fire.
-	 */
-	lapic_write(LAPIC_TIMER_DCR, LAPIC_DCR_DIV16);
-	lapic_write(LAPIC_LVT_TIMER,
-	    LAPIC_VEC_TIMER | LVT_DELIVERY_FIXED | LVT_TIMER_PERIODIC);
-	lapic_write(LAPIC_TIMER_ICR, icr);
+	if (!lapic_timer_arm(hz)) {
+		lapic_preempting = false;
+		kprintf("lapic: could not arm the timer -- preemption stays "
+		    "with the PIT\n");
+		return (false);
+	}
 
 	kprintf("lapic: timer periodic at %u Hz (count %u per tick), "
 	    "this CPU debits its own slice now -- %u tick(s), %u ms\n",
-	    hz, (unsigned int)icr, (unsigned int)PREEMPT_QUANTUM_TICKS,
+	    hz, (unsigned int)(lapic_hz / hz),
+	    (unsigned int)PREEMPT_QUANTUM_TICKS,
 	    (unsigned int)(PREEMPT_QUANTUM_TICKS * 1000 / hz));
 
 	return (true);
@@ -624,45 +676,64 @@ lapic_timer_preempting(void)
 void
 lapic_timer_report(void)
 {
-	uint64_t	ticks;
-	uint64_t	pit;
-	uint64_t	us;
-	uint64_t	rate;
-	uint64_t	slice_us;
+	struct cpu	*cp;
+	uint64_t	 now;
+	uint64_t	 ticks;
+	uint64_t	 pit;
+	uint64_t	 us;
+	uint64_t	 rate;
+	uint64_t	 slice_us;
+	unsigned int	 i;
 
 	if (!lapic_preempting)
 		return;
 
-	ticks = __atomic_load_n(&lapic_timer_count, __ATOMIC_RELAXED);
-	pit   = pit_ticks() - lapic_start_pit;
-	us    = tsc_to_us(tsc_read() - lapic_start_tsc);
-	if (us == 0)
-		return;
+	now = tsc_read();
+	pit = pit_ticks() - lapic_start_pit;
 
 	/*
-	 * The oracle that runs for the whole session rather than a window,
-	 * and the one that has to be right: the SLICE, in microseconds, taken
-	 * from the rate this timer has actually delivered over however long
-	 * the machine has been up.  PREEMPT_QUANTUM_TICKS is a count of ticks
-	 * and only means 20 ms while the ticks arrive at the rate they were
-	 * asked for, so this is the number that says the hand-over kept the
-	 * quantum it promised to keep.
-	 *
-	 * Against the TSC, and not against the PIT, for the reason written up
-	 * at LAPIC_CAL_US: the PIT is delivered and can fall behind, so a
-	 * disagreement between the two would leave us unable to say which of
-	 * them was wrong.  The PIT's own count is printed beside it because
-	 * the gap IS that deficit, and seeing it is how the wrong ruler was
-	 * found in the first place.
+	 * ONE LINE PER PROCESSOR, and that is the point of the line rather
+	 * than a tidier way of printing one number.  The slice is what
+	 * PREEMPT_QUANTUM_TICKS actually means, and it means it separately on
+	 * every CPU: a processor whose timer never started, or started at the
+	 * wrong rate, or stopped being delivered, differs from its neighbours
+	 * here and nowhere else in this kernel.
 	 */
-	rate     = ticks * 1000000 / us;
-	slice_us = ticks == 0 ? 0 :
-	    (uint64_t)PREEMPT_QUANTUM_TICKS * us / ticks;
+	for (i = 0; i < cpu_present_count(); i++) {
+		cp = &cpus[i];
+		if (cp->cp_timer_start == 0)
+			continue;
+		ticks = __atomic_load_n(&cp->cp_timer_ticks,
+		    __ATOMIC_RELAXED);
+		us = tsc_to_us(now - cp->cp_timer_start);
+		if (us == 0)
+			continue;
+		rate     = ticks * 1000000 / us;
+		slice_us = ticks == 0 ? 0 :
+		    (uint64_t)PREEMPT_QUANTUM_TICKS * us / ticks;
+		kprintf("lapic: cpu %u ticked %llu in %llu ms -- %llu Hz "
+		    "of %u asked, slice %llu us%s\n", i,
+		    (unsigned long long)ticks,
+		    (unsigned long long)(us / 1000),
+		    (unsigned long long)rate, lapic_tick_hz,
+		    (unsigned long long)slice_us,
+		    ticks == 0 ? "  *** THE SLICE IS UNCHARGED ***" : "");
+	}
 
-	kprintf("lapic: timer ticked %llu in %llu ms -- %llu Hz of %u asked, "
-	    "slice %llu us (the PIT ticked %llu)%s\n",
-	    (unsigned long long)ticks, (unsigned long long)(us / 1000),
-	    (unsigned long long)rate, lapic_tick_hz,
-	    (unsigned long long)slice_us, (unsigned long long)pit,
-	    ticks == 0 ? "  *** THE SLICE IS UNCHARGED ***" : "");
+	/*
+	 * And the PIT beside them, which is the check that survives from the
+	 * rung where the ruler turned out to be wrong.  Measured against the
+	 * TSC and not against the PIT, for the reason written up at
+	 * LAPIC_CAL_US: the PIT is DELIVERED and can fall behind, so a
+	 * disagreement between the two would leave us unable to say which of
+	 * them was at fault.  Its count is printed anyway because the gap IS
+	 * that deficit, and seeing it is how the wrong ruler was found.
+	 */
+	us = tsc_to_us(now - cpus[0].cp_timer_start);
+	if (us == 0)
+		return;
+	kprintf("lapic: the PIT ticked %llu over the same %llu ms -- %llu Hz "
+	    "of the %u it keeps\n", (unsigned long long)pit,
+	    (unsigned long long)(us / 1000),
+	    (unsigned long long)(pit * 1000000 / us), lapic_tick_hz);
 }

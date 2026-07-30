@@ -20,6 +20,7 @@
 #include "lapic.h"
 #include "memmap.h"
 #include "panic.h"
+#include "pit.h"
 #include "pmap.h"
 #include "pmm.h"
 #include "port.h"
@@ -80,7 +81,7 @@ const struct shell_cmd	shell_cmds[] = {
 	{ "task",   "list tasks",                             cmd_task   },
 	{ "thread", "list threads",                           cmd_thread },
 	{ "sched",  "scheduler state + ctx switches",         cmd_sched  },
-	{ "cpu",    "per-cpu state, one line per cpu",        cmd_cpu    },
+	{ "cpu",    "per-cpu state; `cpu census N' for a UART census", cmd_cpu    },
 	{ "yield",  "yield to next thread (then return)",     cmd_yield  },
 	{ "stress", "stress <mem|boundary|timer|port|thread|preempt>", cmd_stress },
 	{ "mach",   "mach <ls|clock|stats|tasks> (bootstrap-served RPCs)",
@@ -374,9 +375,30 @@ cmd_sched(int argc, char *argv[])
 static int
 cmd_cpu(int argc, char *argv[])
 {
+	unsigned int	n;
 
-	(void)argc;
-	(void)argv;
+	/*
+	 * `cpu census N' arms the instrument of last resort: every N timer
+	 * ticks, one line per processor written straight at the UART -- what is
+	 * running there, how many switches it has done, and, asked of each
+	 * processor by interrupt because nothing else can ask it, the address
+	 * it is executing.  No lock, no console.
+	 *
+	 * It exists because a machine that is busy and getting nothing done
+	 * takes away every other instrument here: they all print, and printing
+	 * is what stops working.  `cpu census 0' puts it away again.
+	 */
+	if (argc >= 3 && streq(argv[1], "census")) {
+		if (parse_uint(argv[2], &n) != 0) {
+			kprintf("cpu: census wants a tick count\n");
+			return (1);
+		}
+		pit_census_ticks = n;
+		kprintf("cpu: census %s\n", n == 0 ? "off" :
+		    "armed -- one line per processor at the UART");
+		return (0);
+	}
+
 	cpu_dump();
 	lapic_timer_report();
 	return (0);

@@ -434,7 +434,7 @@ main(void)
 	 * service registered but the daemon not yet in mach_msg_recv.
 	 */
 	for (i = 0; i < 16; i++)
-		(void)yield();
+		(void)poll_turn();
 
 	poke_echo(ECHO_RPC_ROUNDS);
 
@@ -491,11 +491,11 @@ main(void)
 		 */
 		alive = 1;
 		for (i = 0; i < 64 && alive; i++) {
-			(void)yield();
+			(void)poll_turn();
 			alive = task_alive(child_task_id);
 		}
 		printf("  task_alive(%llu) after unload: %s (waited %d "
-		    "yields) [poll fallback]\n",
+		    "turns) [poll fallback]\n",
 		    (unsigned long long)child_task_id,
 		    alive ? "yes (kill failed)" : "no (kill landed)", i);
 	}
@@ -544,7 +544,7 @@ main(void)
 			(void)mach_port_deallocate(ka_taskport);
 			/* Let the worker observe DEAD_NAME + respawn. */
 			for (i = 0; i < 128; i++)
-				(void)yield();
+				(void)poll_turn();
 			(void)do_list(launchd,
 			    "after crash (expect running, NEW task_id)");
 			(void)do_unload(launchd, KA_LABEL);
@@ -564,7 +564,7 @@ main(void)
 	if (do_load(launchd, THR_LABEL, THR_PROGRAM,
 	    LAUNCHD_LOAD_FLAG_KEEPALIVE, NULL, NULL) == MACH_MSG_OK) {
 		for (i = 0; i < 256; i++)
-			(void)yield();
+			(void)poll_turn();
 		(void)do_list(launchd, "after crash loop (expect throttled)");
 		(void)do_unload(launchd, THR_LABEL);
 	}

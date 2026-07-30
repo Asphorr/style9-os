@@ -106,6 +106,70 @@ yield(void)
 	return (syscall0(SYS_YIELD));
 }
 
+/*
+ * ONE TURN OF A POLL LOOP, AND WHY yield() ALONE STOPPED BEING ONE.
+ *
+ * Every "wait for the child to get somewhere" in this tree was written as a
+ * bounded run of yields: give somebody else a turn, look again, and give up
+ * after N.  That was a way of WAITING, because a yield with work queued
+ * behind it does not come back until that work has had the CPU -- so N turns
+ * bought N slices of real time.
+ *
+ * With four processors it buys nothing.  The task being waited for is not
+ * queued behind this one, it is RUNNING on another processor, so the yield
+ * finds an empty runqueue here and returns at once; sixty-four turns are
+ * spent in microseconds and the loop reports a failure that is only the
+ * budget being denominated in the wrong unit.  That is not a worry, it is the
+ * first thing the first four-processor boot of this kernel got wrong:
+ *
+ *	loopchild.tport lookup failed after 64 yields
+ *
+ * ⚠ AND ASKING THE KERNEL WHETHER THE YIELD SWITCHED IS NOT ENOUGH, which
+ * took a second four-processor boot to learn.  A yield that switches to
+ * another poll-spinner comes straight back, so it reports "yes, somebody had
+ * the CPU" and still buys almost no time -- the budgets ran out anyway, and
+ * `dash /bin/demo.sh' was abandoned after 8192 turns that a single processor
+ * spends in 33.
+ *
+ * So a turn is measured in TIME and in nothing else: park for about one tick
+ * on a port nobody can send to.  That makes a turn mean the same thing on any
+ * number of processors -- roughly one scheduling quantum -- which is what it
+ * meant on one processor by accident, because a yield there did not come back
+ * until the queue had gone round.  Every budget already written in this tree
+ * keeps the meaning it was chosen with.
+ *
+ * The port is allocated on first use rather than at start-up, so a program
+ * that never polls never spends a name on this, and the names printed by the
+ * early scenes of the test programs do not shift.  A program that cannot get
+ * one falls back to the bare yield, which is what it had before.
+ */
+#define	POLL_TURN_MS	1
+
+long
+poll_turn(void)
+{
+	static mach_port_name_t	nap;
+	struct mach_msg_header	buf;
+
+	if (nap == MACH_PORT_NULL) {
+		nap = mach_port_allocate(MACH_PORT_RIGHT_RECEIVE);
+		if (nap == MACH_PORT_NULL)
+			return (syscall0(SYS_YIELD));
+	}
+
+	/*
+	 * Nobody holds a SEND right on this port, so nothing can ever arrive:
+	 * the only way out is the timeout, which is the point.  One millisecond
+	 * asked for, one timer tick given -- the kernel's deadlines are checked
+	 * from the tick, and that is the finest grain of waiting this machine
+	 * has.  Asking for the smallest thing and being handed the resolution
+	 * is more honest than naming the resolution here, where it would be a
+	 * second copy of a number that lives in the clock.
+	 */
+	(void)mach_msg_recv_timed(nap, &buf, sizeof(buf), POLL_TURN_MS);
+	return (0);
+}
+
 long
 spawn(const char *name)
 {

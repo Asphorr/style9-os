@@ -27,6 +27,84 @@ static uint64_t		next_thread_id;
 
 static void	thread_trampoline(void);
 
+/*
+ * Give the CONTEXT THAT IS ALREADY RUNNING a thread structure, and make it
+ * this CPU's current thread.
+ *
+ * A processor cannot switch away from a thread that does not exist, so
+ * whatever is executing when a CPU joins the scheduler has to be given a name
+ * and a place to save its registers first.  That is true of the boot
+ * processor inside kmain, and equally true of an application processor
+ * standing on the stack its trampoline handed it -- one function, called
+ * twice, rather than the second one written from memory of the first.
+ *
+ * The stack is not ours: it is the one the caller is standing on, and
+ * th_kstack_base stays NULL so the reaper never frees it.  th_rsp_save is
+ * meaningless until the first switch AWAY from this thread, at which point
+ * the switch asm fills it in.
+ */
+struct thread *
+thread_adopt_current(struct task *t, const char *name)
+{
+	struct thread	*th;
+
+	if (t == NULL)
+		return (NULL);
+
+	th = kmalloc(sizeof(*th));
+	if (th == NULL)
+		return (NULL);
+
+	spin_init(&th->th_lock, "thread");
+	spin_lock(&threads_lock);
+	th->th_id = next_thread_id++;
+	spin_unlock(&threads_lock);
+
+	th->th_name            = name != NULL ? name : "(anon)";
+	th->th_task            = t;
+	th->th_state           = THREAD_RUNNING;
+	th->th_block_reason    = THREAD_NOT_BLOCKED;
+	th->th_block_target    = NULL;
+	th->th_rsp_save        = 0;
+	th->th_kstack_base     = NULL;	/* the caller's stack -- not ours   */
+	th->th_kstack_size     = 0;
+	th->th_kstack_owned    = false;
+	th->th_entry           = NULL;
+	th->th_arg             = NULL;
+	/*
+	 * This thread is the context already running, which is holding no
+	 * lock at the moment it acquires a name -- unlike a created thread,
+	 * whose first act is to release one it never took (see thread_create).
+	 */
+	th->th_spin_depth      = 0;
+	th->th_spin_saved_if   = false;
+	th->th_runq_link       = NULL;
+	th->th_task_link       = NULL;
+	th->th_sleep_link      = NULL;
+	th->th_wake_ms         = 0;
+	th->th_wake_pending    = 0;
+	th->th_wake_hog        = NULL;
+	th->th_wake_qlen       = 0;
+	th->th_trusted_send    = false;
+	th->th_wake_deadline_ms = 0;
+	th->th_timed_out       = 0;
+	th->th_timed_link      = NULL;
+	th->th_held_count      = 0;
+	{
+		unsigned	exi;
+
+		for (exi = 0; exi < EXC_TYPE_COUNT; exi++)
+			th->th_exc_ports[exi] = NULL;
+	}
+
+	fpu_clean_state(th->th_fpu);
+
+	current_thread = th;
+	task_attach_thread(t, th);
+
+	return (th);
+}
+
 void
 thread_subsystem_init(void)
 {
@@ -37,62 +115,9 @@ thread_subsystem_init(void)
 	if (kernel_task == NULL)
 		panic("thread_subsystem_init: kernel_task not created");
 
-	/*
-	 * Synthesise a thread structure for whoever is running kmain
-	 * right now -- the boot CPU, and an application processor will
-	 * need the same favour done for it before it can be scheduled,
-	 * since a CPU cannot switch away from a thread that does not
-	 * exist.  It re-uses the boot stack (no kmalloc here), and
-	 * its rsp_save is meaningless until the first context switch
-	 * AWAY from this thread -- at that point the switch asm fills
-	 * it in.
-	 */
-	boot = kmalloc(sizeof(*boot));
+	boot = thread_adopt_current(kernel_task, "boot");
 	if (boot == NULL)
 		panic("thread_subsystem_init: kmalloc(boot thread) failed");
-
-	spin_init(&boot->th_lock, "thread");
-	boot->th_id              = next_thread_id++;
-	boot->th_name            = "boot";
-	boot->th_task            = kernel_task;
-	boot->th_state           = THREAD_RUNNING;
-	boot->th_block_reason    = THREAD_NOT_BLOCKED;
-	boot->th_block_target    = NULL;
-	boot->th_rsp_save        = 0;
-	boot->th_kstack_base     = NULL;	/* boot stack -- not ours to free */
-	boot->th_kstack_size     = 0;
-	boot->th_kstack_owned    = false;
-	boot->th_entry           = NULL;
-	boot->th_arg             = NULL;
-	/*
-	 * This thread is the context already running, which is holding no
-	 * lock at the moment it acquires a name -- unlike a created thread,
-	 * whose first act is to release one it never took (see thread_create).
-	 */
-	boot->th_spin_depth      = 0;
-	boot->th_spin_saved_if   = false;
-	boot->th_runq_link       = NULL;
-	boot->th_task_link       = NULL;
-	boot->th_sleep_link      = NULL;
-	boot->th_wake_ms         = 0;
-	boot->th_wake_hog        = NULL;
-	boot->th_wake_qlen       = 0;
-	boot->th_trusted_send    = false;
-	boot->th_wake_deadline_ms = 0;
-	boot->th_timed_out       = 0;
-	boot->th_timed_link      = NULL;
-	boot->th_held_count      = 0;
-	{
-		unsigned	exi;
-
-		for (exi = 0; exi < EXC_TYPE_COUNT; exi++)
-			boot->th_exc_ports[exi] = NULL;
-	}
-
-	fpu_clean_state(boot->th_fpu);
-
-	current_thread = boot;
-	task_attach_thread(kernel_task, boot);
 
 	kprintf("thread: boot thread id=%llu attached to task %s\n",
 	    (unsigned long long)boot->th_id, kernel_task->t_name);
@@ -172,6 +197,7 @@ thread_create(struct task *t, void (*entry)(void *), void *arg,
 	th->th_task_link         = NULL;
 	th->th_sleep_link        = NULL;
 	th->th_wake_ms           = 0;
+	th->th_wake_pending      = 0;
 	th->th_wake_hog          = NULL;
 	th->th_wake_qlen         = 0;
 	th->th_trusted_send      = false;

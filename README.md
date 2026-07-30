@@ -1052,12 +1052,246 @@ timer's own report is where that would show, since it prints the rate actually
 delivered against elapsed TSC time -- so the slice figure is a lock-hold-time
 measurement now, as well as everything else it was.
 
+## The console is held for a write, not for a character
+
+The first four-processor boot printed
+
+```
+parkmp:ed with interrupt 3 s off
+```
+
+which is two processors' lines woven together **byte by byte**. Nothing was
+lost and nothing was corrupted -- every character went through the lock. What
+was lost is the only property a log has, which is that a line means one thing
+said by one CPU.
+
+The cause was not a missing lock but a lock at the wrong granularity.
+`tty_putc` took `tty_lock` around each character, because `spin_lock` panics on
+a same-CPU re-acquire and so a run of output could not hold it across the run.
+On one processor that was invisible; it had been wrong the whole time and had
+nothing to be wrong in front of.
+
+So the unit of exclusion moves from the character to the **write** -- a span
+this file already had, since `kprintf`, `tty_puts` and `tty_write` bracket
+themselves so the hardware cursor is programmed once per write. That bracket
+carries the lock now, and every `tty_putc` inside finds the console already
+held by its own CPU. Which is why it is **not** a `struct spinlock`: a
+recursive lock is not a spinlock with the check removed, it needs an owner and
+a depth, and the check that remains is a different one -- a second CPU still
+waits, and only the CPU that already holds it walks through.
+
+The cost was measured rather than assumed, because the assumption was that
+there would be one: interrupts are now off for a whole line instead of a
+character, and the timer's own report says **98 Hz of 100 delivered and a
+20.4 ms slice before, 98 Hz and 20.2 ms after** -- the same number twice, and
+a difference smaller than the spread between two boots of the unchanged
+kernel. What is *not* free is a real serial line: eighty characters at 115200
+baud is seven milliseconds of polling the transmitter, free only because an
+emulated one is always ready. The answer there is an output ring the UART
+drains from its own interrupt, which is a rung of its own.
+
+## An invalidation reaches the other processors
+
+`invlpg` empties one entry out of the TLB of the processor that executes it
+and says nothing to any other, and every other processor's TLB is a private
+cache of the **same** page tables. So a mapping this CPU has just removed goes
+on being used elsewhere, with no fault and no bound -- a store landing in a
+page that now belongs to somebody else, discovered later and somewhere else.
+
+There is no instruction that invalidates another processor's TLB. The only way
+is to ask it to do so itself, which means an interrupt -- **and every spinlock
+in this kernel now turns interrupts off**, which the rung before this one did
+deliberately. That is a deadlock rather than a delay:
+
+> CPU A takes a pmap's lock, changes a mapping, sends the request and waits
+> for the acknowledgement. CPU B is spinning for that same lock with
+> interrupts off. A waits for B to answer; B waits for A to let go. Neither
+> is doing anything wrong.
+
+So the request is not delivered only by interrupt. It is published as a serial
+number, and every loop in this kernel that spins with interrupts off carries it
+out from inside the spin -- `spin_lock`'s acquire above all. The interrupt is
+then an optimisation for processors that are not spinning, and the correctness
+lives in the poll. **The answer is a number stored, not a counter decremented**:
+a processor may notice the same request twice, once each way, and storing the
+same value twice is nothing where a second decrement would let the sender leave
+while a CPU still held the stale entry.
+
+The evidence is the acknowledgement, and a thousand of them run at boot: each
+can only be written by the far processor and only after it has run our handler,
+so the test covers the APIC, the IDT, the vector, the handler and the barriers
+rather than this file's bookkeeping. **1000 invalidations, every one
+acknowledged by all three others, 18 us each and 460 us at worst.**
+
+Two numbers say what state this is really in, and both are worth more than the
+test. **1002 shootdowns in a whole boot**, a thousand of which are the test --
+this pmap only invalidates when it replaces or removes a live entry, and almost
+every mapping made during a boot is a fresh one. And **3005 answered by the
+interrupt, 0 from inside a spin loop**, which is exactly right while the other
+processors are parked, since nothing there ever spins for a lock. That second
+number staying zero for ever would mean the deadlock argument above is a story
+about something that never happens, so it is printed rather than asserted.
+
+## Four processors, one runqueue
+
+A processor cannot switch **away** from a thread that does not exist, so it
+cannot take the first one off the queue either; and a CPU with nothing runnable
+still has to be executing something, on a stack it does not share. Both wants
+are met by the same thread: the context an application processor is already
+running -- the trampoline's stack -- is adopted as a thread, and that thread is
+this CPU's idler. The boot processor does it the other way round, creating its
+idler, because the context it is running has work left to do. Two shapes, one
+invariant: every CPU owns an idle thread and no CPU shares one.
+
+**What made one runqueue safe for four processors was already there**, and not
+for this reason. `sched_lock` is held across every context switch -- taken by
+the outgoing thread, released by the incoming one -- which was written so a
+waker could never see a thread as both eligible and still executing. That same
+span is exactly the window in which a yielding thread is on the queue and still
+on its own stack, so a second processor spinning for the lock cannot see the
+queue until the stack has been left.
+
+Processors are **started early and released late**, and the gap is the point.
+Early because the trampoline needs a page of conventional memory that later
+boot-time allocation would be entitled to take. Late because `CR4.SMAP` is
+turned on near the end of boot and the `SYSCALL` registers with it -- and a
+control register is per CPU, so an application processor inherits *none* of
+them. It inherits the page tables, the GDT layout, the IDT and the kernel's
+opinions, which is why the omission never looks like one:
+
+| missing | what it looks like instead |
+| --- | --- |
+| `CR0.WP` | ring 0 writes straight through a read-only page, so the copy-on-write fault the kernel arranged on purpose does not happen **on that CPU**, and two processes quietly share a page each believes is private |
+| `CR4.OSFXSR` | `#UD` on the first `FXRSTOR`, which is this processor's first context switch |
+| `CR4.SMAP` | kernel code dereferences user pointers without faulting, on that CPU only |
+| `EFER.SCE` | `#UD` on the first system call a thread happens to make there |
+
+A newly ready thread also has to reach a processor that is asleep: an idle CPU
+in `hlt` would not notice until its own timer woke it a tick later, while the
+queue grew in front of a busy one. So the CPU that queues the work tells one
+that has none -- exactly one, only if it is genuinely idle, and only when more
+than one thread is waiting, since for a single wake the waker is about to run
+it itself and a message to anybody else is four APIC register accesses spent to
+lose a race.
+
+The evidence is a bit each thread sets out of its own CPU's block, which no
+bookkeeping on the queueing side could fake: **eight threads ran on four of the
+four processors that are up**, and the bit for processor three can only be set
+by code executing on processor three.
+
+### Counting yields is not waiting
+
+Then the boot stopped finishing, in a way none of the above explains.
+
+Every "wait for the other task to get somewhere" in this tree was a bounded run
+of yields -- give somebody else a turn, look again, give up after N. That was a
+way of **waiting**, because a yield with work queued behind it does not come
+back until that work has had the CPU, so N turns bought N slices of real time.
+With four processors it buys nothing: the task being waited for is not queued
+behind this one, it is running beside it, so the yield finds an empty runqueue
+and returns at once. Sixty-four turns are spent in microseconds, and the first
+symptom was a test reporting a failure that was only a budget denominated in
+the wrong unit:
+
+```
+loopchild.tport lookup failed after 64 yields
+```
+
+**And in the kernel the same shape was fatal rather than merely wrong.** The
+boot thread waits for `hello.elf` the same way, and that one loop became
+**350,000 context switches a second**, every one of them taking the scheduler's
+global lock with interrupts disabled. The processor spent so much of its life
+with interrupts off that it *missed most of its timer ticks* -- so the clock
+stopped advancing, and once the clock stops every deadline in the system stops
+expiring, so the timed waits everything else was parked on never returned. Four
+processors at a hundred percent, a log frozen mid-line, and nothing wrong with
+any lock.
+
+Two instruments were built to find it and the second one did. A **spin
+watchdog** reports a lock waited on for pathologically long, naming the lock,
+the holder's CPU and both sites by symbol -- and it said nothing, which was
+itself the finding: nobody was waiting for a lock. What answered was a
+**census written straight at the UART**: no lock, no formatting, no console,
+one byte at a time, because every other way this kernel has of saying what a
+CPU is doing goes through the thing a wedge takes away.
+
+```
+[census] cpu0=boot/0040a947 cpu1=user-elf/001b983d cpu2=idle2/00124326 ...
+[census] cpu0=boot/005576ee cpu1=user-elf/0024446c cpu2=idle2/00180df2 ...
+```
+
+Those are switch counts, and they answered the question in one line.
+
+So a poll waits in **time**. `sched_nap_ms` in the kernel and `poll_turn` in
+libstyle9 both ask for one millisecond and are given one timer tick, because
+the tick is when deadlines are looked at -- asking for the smallest thing and
+being handed the resolution keeps that number in the clock where it belongs. A
+turn now means the same on any number of processors, which is what it meant on
+one by accident. The same boot: **63,857 switches instead of 5.6 million**, and
+`dash /bin/demo.sh` finishing in 38 turns where it had been abandoned after
+8192.
+
+`thread_yield` returns whether it actually switched, and the two callers that
+are waiting for a *runnable* peer rather than for a device use it: a yield that
+switched is still a wait and costs nothing extra, so the nap is the fallback
+and not the rule.
+
+### Not asleep is not the same as not listening
+
+One boot in four still stopped, and always in the same place: a thread inside a
+filesystem write that never came back, with the rest of the machine perfectly
+healthy and nothing to look at. No panic, no failing test, no lock held.
+
+`thread_wake` on a thread that is not `BLOCKED` returned doing nothing, and
+that was right. A thread that is `READY` or `RUNNING` has not missed the news
+-- it will look again on its own. But a thread can also be **between**: it has
+decided to sleep and has not yet committed. On one processor that state had no
+duration, because deciding and committing happen with nothing else able to run
+on that CPU in between. On four it lasts as long as anybody likes.
+
+The ATA driver is where it showed. A thread installs itself as the channel's
+waiter and drops toward `THREAD_BLOCKED`; the disk's interrupt lands on
+**another** processor and posts the wake; the wake finds a running thread and
+evaporates. The thread then sleeps for ever.
+
+So a wake that finds nobody asleep leaves a note, and the next attempt to sleep
+reads it and declines to sleep. The caller re-tests its condition and finds
+whatever the wake was about -- which is the contract every sleeper here already
+keeps, since waking has always been a hint rather than a promise and everybody
+parks inside `for (;;)`.
+
+### ⚠ And one that is still open
+
+Roughly **one four-processor boot in four still stalls**, and this is what is
+known about it rather than a claim that it is fixed.
+
+Nothing fails and nothing panics: the boots that finish report 91-92 checks
+passing and a clean `apfsck`. The ones that do not stop at a **spawned Apple
+binary, always just after its first `mmap`** -- the `256 KiB` malloc arena --
+and before its first real system call. The parent gives up on it after its
+budget, spawns the next one, and that one hangs the same way, so whatever
+breaks stays broken for the tasks that follow.
+
+The census says the machine is otherwise healthy: three processors idle in
+`hlt`, one running a ring-3 thread, no lock waited on long enough for the
+watchdog to speak. The where-probe puts that thread at **`0x40001a00` -- inside
+the heap it has just been given**, which is a wild control transfer rather than
+a loop that will not end.
+
+The most likely place to look next is the shared image mapping. Every Darwin
+task gets `libSystem.B.dylib` mapped from one backing store, and "it breaks
+once and stays broken" is what corrupting a shared page looks like -- so the
+copy-on-write path, under concurrent readers on several processors, is the
+first suspect. The tools to catch it in the act are in the tree: `cpu census N`
+arms the UART census and the where-probe together.
+
 Next on the roadmap: **replacing an existing name** with a rename, which
 POSIX requires and this refuses out loud; a **torn-write stand**, which
 would make the checkpoint's promise that an interruption anywhere leaves the
-old transaction a measurement rather than a claim; and the rest of SMP -- an
-MADT to count the processors, a trampoline to start them, and interrupt-safe
-locks and TLB-shootdown IPIs before any of them runs kernel code.
+old transaction a measurement rather than a claim; and the SMP work these
+rungs make possible -- narrowing a shootdown to the processors that actually
+have the pmap, a runqueue per CPU with work stealing, and an output ring so
+the console stops holding interrupts off for a line.
 
 Reading the tree stopped being O(volume) per question along the way.  The
 same boot that read **54434 records over 6381 nodes** to answer its 1718

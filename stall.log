@@ -1,0 +1,1572 @@
+[8;13Hstyle
+[25;1H
+[12;34Hbatched output.[12;49Htty-cursor: PASS -- the CRTC followed the text through positioning, typing, a newline, a scroll and a clear; a 23-byte write cost one programming and a move to where it already was cost none
+[6;1Hxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+[9;1HyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyZ[12;1HwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwW[25;1Hbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbtty-wrap: PASS -- a full row leaves the cursor in the last column, the newline after it costs one row, the character after it wraps without being lost, a carriage return cancels the wrap, and a full bottom row does not scroll on its own
+[1;1HHHHH[3;25r[25;1H
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[3;1Hmark[25;1H
+
+
+[2;1HGGGG[25;1H
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[r[25;1H
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[?25l[?25htty-region: PASS -- rows above the top margin survived two screenfuls of scrolling while the region underneath moved, resetting the margins thawed them, and DECTCEM reached the CRTC disable bit
+[20;1H[107m#[0m[20;1H[31m#[0m[20;1H[34m#[0m[20;1H[7m#[0m[20;1H[91;48;2;0;0;0m#[0m[20;1H[38;5;196m#[0mtty-colour: PASS -- the DAC holds this kernel's sixteen colours, blink is off so all sixteen backgrounds are colours, reverse video swaps, and 256-colour and 24-bit sequences are consumed whole instead of read as commands
+style9-os: kernel up
+----------------------------------------
+  boot magic      : 0x00000000  (PVH)
+  boot info ptr   : 0x00001580
+  kernel range    : 0x0000000000100000 .. 0x0000000000376860
+  kernel size     : 2582624 bytes
+
+bringing CPU tables online...
+cpu: boot cpu id=0, per-cpu block at 0x000000000035b080 via gs base
+  [ok] per-cpu block (gs base)
+  [ok] gdt + tss (this cpu's own)
+  [ok] idt
+  [ok] pic (8259 remapped to 0x20/0x28)
+
+bringing memory subsystem online...
+memory map (6 entries, max_pa=0x100000000):
+  [ 0] 0x0000000000000000 .. 0x000000000009fc00  free     (639 KiB)
+  [ 1] 0x000000000009fc00 .. 0x00000000000a0000  reserved (1 KiB)
+  [ 2] 0x00000000000f0000 .. 0x0000000000100000  reserved (64 KiB)
+  [ 3] 0x0000000000100000 .. 0x0000000007fe0000  free     (129920 KiB)
+  [ 4] 0x0000000007fe0000 .. 0x0000000008000000  reserved (128 KiB)
+  [ 5] 0x00000000fffc0000 .. 0x0000000100000000  reserved (256 KiB)
+  total RAM (any type): 131008 KiB
+  usable RAM:           130559 KiB
+pmm: bitmap at 0x377000 (4096 bytes) + 65472 bytes of owner counts, 32736 managed pages, 31832 free
+pmap: kernel CR3 = 0x364000 (PML4 at 0x0000000000364000), CR0.WP on
+kmem: 8 buckets, sizes 16..2048 bytes
+port: kernel_space id=1, cap=16, qmax=1024, max_msg=4096
+bootstrap: ready, capacity=16 services
+task: kernel_task id=1 name=kernel, 1 initial tasks
+fpu: SSE enabled for ring 3 (CR4.OSFXSR|OSXMMEXCPT), FXSAVE template captured
+thread: boot thread id=1 attached to task kernel
+sched: cooperative round-robin, idle id=2
+  [ok] memory subsystem ready
+lapic: id=0 version=0x14, 6 LVT entries, regs at 0xfee00000 (uncached), legacy pins wired
+  [ok] local apic (legacy pins wired through)
+acpi: rsdp at 0x00000000000f5260, revision 0, oem 'BOCHS '
+acpi: madt at 0x0000000007fe235c, 144 bytes, lapic regs 0xfee00000, 8259 present
+acpi:   lapic id 0 (acpi id 0) -- this processor
+acpi:   lapic id 1 (acpi id 1)
+acpi:   lapic id 2 (acpi id 2)
+acpi:   lapic id 3 (acpi id 3)
+acpi:   io apic id 0 at 0xfec00000, gsi base 0
+acpi: 4 processor(s) present, 1 running
+  [ok] acpi madt (processors counted)
+  [ok] kbd (IRQ1 unmasked)
+  [ok] interrupts enabled
+pit: 100 Hz requested, 100 Hz programmed (divisor=11931)
+tsc: 3576782084 Hz (~3576 MHz) over 25 PIT ticks (894195521 cycles)
+clock: 100 Hz tick, TSC anchor calibrated
+clock: RTC 2026-07-30 16:32:05 UTC (epoch 1785429125)
+  [ok] clock
+lapic: timer counts at 62094 kHz (input / 16), measured against the TSC over 100177 us
+lapic: timer delivered 20 interrupt(s) at 100 Hz, want about 20 (the PIT delivered 20)
+lapic: timer periodic at 100 Hz (count 620949 per tick), this CPU debits its own slice now -- 2 tick(s), 20 ms
+  [ok] apic timer debits the slice
+mp: trampoline installed at 0x8000, 134 bytes, parameters at 0x8f00
+lapic: id=1 version=0x14, 6 LVT entries, regs at 0xfee00000 (uncached), legacy pins wired
+cpu 1: online, lapic 1, stack at 0x398000 -- parked, answering invalidations
+lapic: id=2 version=0x14, 6 LVT entries, regs at 0xfee00000 (uncached), legacy pins wired
+cpu 2: online, lapic 2, stack at 0x39c000 -- parked, answering invalidations
+lapic: id=3 version=0x14, 6 LVT entries, regs at 0xfee00000 (uncached), legacy pins wired
+cpu 3: online, lapic 3, stack at 0x3a0000 -- parked, answering invalidations
+mp: 3 of 3 application processor(s) running kernel code, 4 cpu(s) online
+  [ok] application processors up (parked)
+tlb-shootdown: PASS -- 1000 invalidations, every one acknowledged by all 3 other processor(s), 31 us each on average and 2380 us at worst
+
+memory subsystem smoke test...
+  kmalloc(16)   = 0x00000000003a0ff0
+  kmalloc(256)  = 0x0000000000389c10
+  kmalloc(2000) = 0x000000000038b010
+  kmalloc(8192) = 0x00000000003a1010
+  pmm_alloc_page = 0x3a1000
+pmm: 32736 pages managed, 929 used (3716 KiB), 31807 free (127228 KiB)
+pmm: 0 frames shared now, 0 extra owners taken, 6 frames released by their last owner
+pmap: 1 leaf mappings, 2 intermediate tables, kernel CR3 = 0x364000
+pmap: 1002 shootdown(s), 3005 message(s) sent, 32 ms waiting -- 32 us each, 2380 us at worst
+pmap: 3005 answered by the interrupt, 0 from inside a spin loop
+kmem stats:
+  bucket  0     16 B  inuse=0 free=0 alloc=0
+  bucket  1     32 B  inuse=0 free=128 alloc=128
+  bucket  2     64 B  inuse=0 free=0 alloc=0
+  bucket  3    128 B  inuse=2 free=30 alloc=32
+  bucket  4    256 B  inuse=2 free=14 alloc=16
+  bucket  5    512 B  inuse=1 free=7 alloc=8
+  bucket  6   1024 B  inuse=2 free=2 alloc=4
+  bucket  7   2048 B  inuse=1 free=1 alloc=2
+  large allocs: 1 live, 5 pages
+  bucket inuse total: 5376 bytes
+  [ok] smoke test passed
+
+--- boot-time stress pass ---
+
+[1/15] stress mem 10000
+stress_mem: 10000 iterations, 256 tracking slots
+stress_mem: 3477 alloc, 3477 free (delta=0)
+stress_mem: pmm used 929 -> 965 (peak 988)
+stress_mem: kmem cached 6 -> 42 pages
+stress_mem: conserved (pmm-cached) 923 -> 923, elapsed 51739 us
+stress_mem: 0 pattern corruptions
+stress_mem: PASS
+
+[2/15] stress mem boundary
+stress_mem_boundary: 39 sizes
+stress_mem_boundary: pmm used 965 -> 965, cached 42 -> 42
+stress_mem_boundary: conserved 923 -> 923, 0 corruptions
+stress_mem_boundary: PASS
+
+[3/15] stress timer 2s
+stress_timer: 2 s, hz=100, tsc_hz=3576782084
+stress_timer: 200 ticks elapsed, 7204475327 cycles measured
+stress_timer: expected 7153564168 cycles, drift 50911159 cycles (TSC ahead)
+stress_timer: drift 7116 ppm, 255831 kmem ops during run
+stress_timer: PASS
+
+[4/15] stress port 1000
+stress_port: 1000 rounds
+stress_port: kernel_space inuse 2 -> 2
+stress_port: pmm used 965 -> 965, cached 42 -> 42
+stress_port: conserved 923 -> 923, elapsed 27537 us
+stress_port: PASS
+
+[5/15] stress thread 200
+stress_thread: 200 rounds (RPC over blocking recv)
+stress_thread: 9971 us, 410 context switches, 1 PIT ticks
+stress_thread: ports 2 -> 2, pmm 965 -> 965, cached 42 -> 42
+stress_thread: conserved 923 -> 923
+stress_thread: PASS
+
+[6/15] stress preempt 4 workers, 1 s
+stress_preempt: 4 workers, 1000 ms wall window
+stress_preempt: 996008 us elapsed, ctx switches 50, preempts 50
+  worker  0 counter 53394635
+  worker  1 counter 51990008
+  worker  2 counter 51697323
+  worker  3 counter 52643397
+stress_preempt: total 209725363, min 51697323, max 53394635, ratio max/min = 1
+stress_preempt: PASS
+
+[7/15] stress sendonce 500
+stress_sendonce: 500 rounds (MAKE_SEND_ONCE / MOVE_SEND_ONCE)
+stress_sendonce: ports 2 -> 2, conserved 923 -> 923
+stress_sendonce: PASS
+
+[8/15] stress portset 4 members x 100
+stress_portset: 1 set, 4 members, 100 msgs each
+stress_portset: server saw 400 total
+  member 0: 100 msgs (expected 100)
+  member 1: 100 msgs (expected 100)
+  member 2: 100 msgs (expected 100)
+  member 3: 100 msgs (expected 100)
+stress_portset: ports 2 -> 2, conserved 923 -> 923
+stress_portset: PASS
+
+[9/15] stress intertask 200 (parent <-> worker task)
+stress_intertask: 200 rounds across 2 tasks
+stress_intertask: kernel names 2 -> 2, worker names 2 -> 2
+stress_intertask: conserved 923 -> 923
+stress_intertask: PASS
+
+[10/15] stress moverecv 200
+stress_moverecv: 200 rounds (transfer RECV right in flight)
+stress_moverecv: names 2 -> 2, conserved 923 -> 923
+stress_moverecv: PASS
+
+[11/15] stress nosenders 100
+stress_nosenders: 100 rounds (last sender drops, recv must wake with DEAD)
+stress_nosenders: names 2 -> 2, conserved 923 -> 923
+stress_nosenders: PASS
+
+[12/15] stress sendblock 2000
+stress_sendblock: 2000 rounds (producer blocks on full queue, slow consumer)
+stress_sendblock: names 2 -> 2, conserved 923 -> 923
+stress_sendblock: PASS
+
+[13/15] stress rpc 200
+stress_rpc: 200 rounds + 1 timeout probe
+stress_rpc: timeout probe slept 50 ms
+stress_rpc: names 2 -> 2, conserved 923 -> 923
+stress_rpc: PASS
+
+[14/15] stress ool 4 (parent <-> worker OOL transfer)
+stress_ool: 4 rounds x 8 sizes, max payload 65535 bytes
+stress_ool: kernel inuse 2 -> 2, conserved 923 -> 923
+stress_ool: PASS
+
+[15/15] stress mutex 4 workers x 200 (sleeping lock)
+stress_mutex: 4 workers x 200 rounds, yielding inside the critical section
+stress_mutex: counter 800 (want 800), max threads inside: 1, 799 acquisitions had to sleep
+stress_mutex: PASS
+
+--- stress pass summary ---
+  stress mem 10000     : PASS (rv=0)
+  stress mem boundary  : PASS (rv=0)
+  stress timer 2s      : PASS (rv=0)
+  stress port 1000     : PASS (rv=0)
+  stress thread 200    : PASS (rv=0)
+  stress preempt 4/1s  : PASS (rv=0)
+  stress sendonce 500  : PASS (rv=0)
+  stress portset 4x100 : PASS (rv=0)
+  stress intertask 200 : PASS (rv=0)
+  stress moverecv 200  : PASS (rv=0)
+  stress nosenders 100 : PASS (rv=0)
+  stress sendblock 2000: PASS (rv=0)
+  stress rpc 200       : PASS (rv=0)
+  stress ool 4         : PASS (rv=0)
+  stress mutex 4x200   : PASS (rv=0)
+stress_sendonce_notify: PASS (MACH_NOTIFY_SEND_ONCE on unused destroy)
+  sendonce-notify      : PASS (rv=0)
+stress_deadname_multi: names 2 -> 2, conserved 923 -> 923
+stress_deadname_multi: PASS (multi-registrant DEAD_NAME + name flip)
+  deadname-multi       : PASS (rv=0)
+dev: registered dev/kbd -> kernel name 4
+kbd_drv: stream_port=3 thread=118
+mouse: aux up cfg=0x43 defaults=0xfa id=0x00 stream=0xfa
+dev: registered dev/mouse -> kernel name 6
+mouse_drv: stream_port=5 thread=119
+mouse_drv: self-test event btn=L dx=5 dy=-3 (feed->ring->thread->port OK)
+dev: registered dev/uart -> kernel name 8
+uart_drv: stream_port=7 thread=120
+ata: disk0 = QEMU HARDDISK (LBA28=1048576, LBA48=1048576, ext=yes)
+dev: registered dev/disk0 -> kernel name 9
+ata: channel 0 IRQ14 -- interrupt-driven (1 seen at probe)
+ata: channel 1 IRQ15 -- interrupt-driven (1 seen at probe)
+bio: 64 x 4096 B block cache (256 KiB)
+fs_fat: not a FAT12/16 volume (bps=0 spc=0 nfat=131 fatsz=0 root=1) -- FS unavailable
+apfs: container 131072 blocks x 4096 B (512 MiB), feat=0x0 incompat=0x2
+apfs: checkpoint ring @1 (64 blocks): 32 superblock(s)
+apfs: container xid 387, omap oid 98392, volume oid 1026
+apfs: checkpoint xid 387 -- 1 map block(s), 4 ephemeral object(s)
+apfs: holding the chunk @0 -- 26670 free of 32768, bitmap at 21016
+apfs: internal pool 21016+15, bitmap ring @21000 (16 slots), slot 2 live for xid 387
+apfs: volume "style9" @98390 -- 14 files, 13 dirs
+apfs: holding the chunk @98304 -- 32685 free of 32768, bitmap at 21021
+apfs: metadata comes from the chunk @98304 that holds the volume's own
+apfs: mounted -- fs B-tree root @98335, volume omap @98388, hashed dirent keys
+apfs:   usr/
+apfs:     local/
+apfs:       Cellar/
+apfs:   bin/
+apfs:     echo  35208 bytes
+apfs:   etc/
+apfs:     notes.txt  58 bytes
+apfs:     made.txt  36 bytes
+apfs:     madedir/
+apfs:     hello.txt  36 bytes
+apfs:   var/
+apfs:     db/
+apfs:       big.txt  180224 bytes
+apfs: read "/bin/echo" -- 35208 bytes, byte sum 0x00232898
+bio: 358 requests, 358 page lookups -- 265 hit (74%), 93 read from disk, 29 evicted, 64/64 buffers live
+ata: channel 0 -- 745 interrupts, 744 blocking waits
+ata: channel 1 -- 1 interrupts, 0 blocking waits
+apfs-write: PASS -- and the marker at /var/db/big.txt:0 is still there from an earlier boot
+apfs-alloc: PASS -- took 8 blocks at 98406, the live checkpoint saw nothing, the release held them for 4 checkpoints, then the queue let them go
+apfs-alloc: and 8 more at 5970, in the chunk @0 rather than the chunk @98304 metadata comes from -- two bitmaps, taken and returned apart
+apfs-alloc: metadata moved -- bitmap 21018 -> 21019, chunk-info 21029 -> 21020, pool bitmap in ring slot 0
+apfs-spine: PASS -- from block 6: omap 98405 -> tree 98404 -> volume 98403 -> omap 98343 -> tree 98342 -> fs root 98335
+apfs-ckpt: PASS -- xid 417 -> 419, 4 ephemeral objects re-emitted each time, block zero follows, xid 417 still reads
+apfs-data: PASS -- /var/db/big.txt moved 6192 -> 6060, the new run has the write, and the run the live checkpoint still names is unchanged
+apfs: inode 29 cut to 155648 bytes -- 1 run(s) shortened, 0 dropped, 6 block(s) queued for release, 3 leaf(s) moved
+apfs: inode 29 cut to 159744 bytes -- 1 run(s) shortened, 0 dropped, 1 block(s) queued for release, 3 leaf(s) moved
+apfs: inode 29 cut to 159744 bytes -- 0 run(s) shortened, 1 dropped, 1 block(s) queued for release, 3 leaf(s) moved
+apfs: inode 29 cut to 155648 bytes -- 0 run(s) shortened, 1 dropped, 1 block(s) queued for release, 3 leaf(s) moved
+apfs-trunc: PASS -- /var/db/big.txt cut 180224 -> 155648 bytes, a run shortened in place and a run dropped out of both trees, the 32 bytes below the cut untouched
+apfs-grow: PASS -- /var/db/big.txt grew 155648 -> 180224 bytes over 6 appends, 6 of them lengthening the run already there rather than adding a record, and a reboot should still find it
+apfs: inode 92 cut to 0 bytes -- 0 run(s) shortened, 1 dropped, 1 block(s) queued for release, 3 leaf(s) moved
+apfs: "made.txt" taken out of inode 17 -- inode 92 is gone with 3 record(s), 5 leaves moved
+apfs: "made.txt" made in inode 17 as inode 131 -- 5 leaves moved
+apfs: "etc" is a directory, and unlink does not take those out
+apfs-make: PASS -- /etc/made.txt made as inode 131, 36 bytes written into a file that had none, 4 names in /etc, the one the boot before left having been read and removed first
+apfs-dirs: /etc/madedir came back wearing 0711 -- a chmod from the boot before survived the machine being switched off
+apfs: directory "madedir" taken out of inode 17 -- inode 93 is gone with 2 record(s), 5 leaves moved
+apfs: directory "madedir" made in inode 17 as inode 132 -- 5 leaves moved
+apfs: "madedir" is a directory, and unlink does not take those out
+apfs: "big.txt" is not a directory, and rmdir takes out nothing else
+apfs: "etc" still holds a name -- a directory taken out from over its children leaves entries whose parent is gone
+apfs: "inside.txt" made in inode 132 as inode 133 -- 3 leaves moved
+apfs: "madedir" still holds a name -- a directory taken out from over its children leaves entries whose parent is gone
+apfs: "inside.txt" taken out of inode 132 -- inode 133 is gone with 3 record(s), 3 leaves moved
+apfs-dirs: PASS -- /etc/madedir made as inode 132, a name made inside it and taken back out, removal refused while it held one, 4 names in /etc, the directory the boot before left having been read and removed first
+apfs-shell: PASS -- 58 bytes a REAL Apple shell redirected into /etc/notes.txt in an earlier boot are still there, byte for byte
+apfs: node 98345 split -- 7 records stay as oid 1134 at 98310, 8 move to a new oid 1147 at 98343, under the node at 98353
+apfs-split: PASS -- leaf 98345 split in two, 86 records before and after, every separator at every level matching the child it names, and /var/db/big.txt still resolves to 180224 bytes
+apfs: "idxa.txt" made in inode 17 as inode 134 -- 5 leaves moved
+apfs: "idxb.txt" made in inode 17 as inode 135 -- 5 leaves moved
+apfs: node 98362 split -- 9 records stay as oid 1141 at 98313, 4 move to a new oid 1148 at 98315, under the node at 98324
+apfs: "idxa.txt" taken out of inode 17 -- inode 134 is gone with 3 record(s), 5 leaves moved
+apfs: the node at 98322 lost its last record and left the tree -- oid 1148 names nothing now, and the node at 98334 holds 3
+apfs: "idxb.txt" taken out of inode 17 -- inode 135 is gone with 3 record(s), 5 leaves moved
+apfs-index: PASS -- a node was made to start at inode 134's record, that record was deleted, and 1 index key(s) were corrected so that every node still starts where its parent says it does
+apfs: "drop.txt" made in inode 17 as inode 136 -- 5 leaves moved
+apfs: node 98314 split -- 9 records stay as oid 1141 at 98304, 2 move to a new oid 1149 at 98305, under the node at 98306
+apfs: node 98306 split -- 3 records stay as oid 1131 at 98323, 1 move to a new oid 1150 at 98326, under the node at 98340
+apfs: the node at 98305 lost its last record and left the tree -- oid 1149 names nothing now, and the node at 98326 holds 0
+apfs: the node at 98326 lost its last record and left the tree -- oid 1150 names nothing now, and the node at 98340 holds 2
+apfs: "drop.txt" taken out of inode 17 -- inode 136 is gone with 3 record(s), 5 leaves moved
+apfs-drop: PASS -- inode 136 was alone in the node at 98305, which was alone under the node above it, and taking it away took 2 node(s) with it: 11 where there were 13, and every one of them still starts where its parent says it does
+apfs: "strm.txt" made in inode 17 as inode 137 -- 5 leaves moved
+apfs: node 98316 split -- 10 records stay as oid 1141 at 98314, 1 move to a new oid 1151 at 98328, under the node at 98342
+apfs: the node at 98328 lost its last record and left the tree -- oid 1151 names nothing now, and the node at 98342 holds 3
+apfs: "strm.txt" taken out of inode 17 -- inode 137 is gone with 3 record(s), 6 leaves moved
+apfs-strm: PASS -- inode 137 kept its stream record in the node at 98328 while its own was at 98314, and unlinking it took both
+apfs: "room00.txt" made in inode 17 as inode 138 -- 5 leaves moved
+apfs: "room01.txt" made in inode 17 as inode 139 -- 5 leaves moved
+apfs: "room02.txt" made in inode 17 as inode 140 -- 5 leaves moved
+apfs: "room03.txt" made in inode 17 as inode 141 -- 5 leaves moved
+apfs: "room04.txt" made in inode 17 as inode 142 -- 5 leaves moved
+apfs: "room05.txt" made in inode 17 as inode 143 -- 5 leaves moved
+apfs: "room06.txt" made in inode 17 as inode 144 -- 5 leaves moved
+apfs: "room07.txt" made in inode 17 as inode 145 -- 5 leaves moved
+apfs: "room08.txt" made in inode 17 as inode 146 -- 5 leaves moved
+apfs: "room09.txt" made in inode 17 as inode 147 -- 5 leaves moved
+apfs: "room10.txt" made in inode 17 as inode 148 -- 5 leaves moved
+apfs: "room11.txt" made in inode 17 as inode 149 -- 5 leaves moved
+apfs: "room12.txt" made in inode 17 as inode 150 -- 5 leaves moved
+apfs: "room13.txt" made in inode 17 as inode 151 -- 5 leaves moved
+apfs: "room14.txt" made in inode 17 as inode 152 -- 5 leaves moved
+apfs: "room15.txt" made in inode 17 as inode 153 -- 5 leaves moved
+apfs: the node at level 0 has 104 bytes free and the record needs 168 -- whoever asked has to make room and ask again
+apfs: node 98314 split -- 20 records stay as oid 1141 at 98350, 21 move to a new oid 1152 at 98362, under the node at 98363
+apfs: "room16.txt" made in inode 17 as inode 154 -- 5 leaves moved
+apfs: "room17.txt" made in inode 17 as inode 155 -- 5 leaves moved
+apfs: "room18.txt" made in inode 17 as inode 156 -- 6 leaves moved
+apfs: "room00.txt" taken out of inode 17 -- inode 138 is gone with 3 record(s), 5 leaves moved
+apfs: "room01.txt" taken out of inode 17 -- inode 139 is gone with 3 record(s), 5 leaves moved
+apfs: "room02.txt" taken out of inode 17 -- inode 140 is gone with 3 record(s), 5 leaves moved
+apfs: "room03.txt" taken out of inode 17 -- inode 141 is gone with 3 record(s), 5 leaves moved
+apfs: "room04.txt" taken out of inode 17 -- inode 142 is gone with 3 record(s), 5 leaves moved
+apfs: "room05.txt" taken out of inode 17 -- inode 143 is gone with 3 record(s), 6 leaves moved
+apfs: "room06.txt" taken out of inode 17 -- inode 144 is gone with 3 record(s), 5 leaves moved
+apfs: "room07.txt" taken out of inode 17 -- inode 145 is gone with 3 record(s), 5 leaves moved
+apfs: "room08.txt" taken out of inode 17 -- inode 146 is gone with 3 record(s), 5 leaves moved
+apfs: "room09.txt" taken out of inode 17 -- inode 147 is gone with 3 record(s), 5 leaves moved
+apfs: "room10.txt" taken out of inode 17 -- inode 148 is gone with 3 record(s), 5 leaves moved
+apfs: "room11.txt" taken out of inode 17 -- inode 149 is gone with 3 record(s), 5 leaves moved
+apfs: "room12.txt" taken out of inode 17 -- inode 150 is gone with 3 record(s), 5 leaves moved
+apfs: "room13.txt" taken out of inode 17 -- inode 151 is gone with 3 record(s), 5 leaves moved
+apfs: "room14.txt" taken out of inode 17 -- inode 152 is gone with 3 record(s), 5 leaves moved
+apfs: "room15.txt" taken out of inode 17 -- inode 153 is gone with 3 record(s), 5 leaves moved
+apfs: "room16.txt" taken out of inode 17 -- inode 154 is gone with 3 record(s), 5 leaves moved
+apfs: "room17.txt" taken out of inode 17 -- inode 155 is gone with 3 record(s), 5 leaves moved
+apfs: the node at 98340 lost its last record and left the tree -- oid 1152 names nothing now, and the node at 98352 holds 3
+apfs: "room18.txt" taken out of inode 17 -- inode 156 is gone with 3 record(s), 6 leaves moved
+apfs-room: PASS -- 19 name(s) into /etc filled a leaf, the writer split 1 of them and carried on, every one of them was still under the inode it was given, and the volume ends as it began
+apfs: "mvone.txt" made in inode 17 as inode 157 -- 5 leaves moved
+apfs: "mvone.txt" in inode 17 is now "mvtwo.txt" in inode 17 -- inode 157, 5 leaves moved
+apfs: "mvtwo.txt" in inode 17 is now "mvconsiderablylongername.txt" in inode 17 -- inode 157, 5 leaves moved
+apfs: "mvconsiderablylongername.txt" in inode 17 is now "mvs" in inode 17 -- inode 157, 5 leaves moved
+apfs: "mvs" in inode 17 is now "mvone.txt" in inode 18 -- inode 157, 6 leaves moved
+apfs: directory "mvdir" made in inode 17 as inode 158 -- 5 leaves moved
+apfs: "inner.txt" made in inode 158 as inode 159 -- 3 leaves moved
+apfs: "mvdir" in inode 17 is now "mvdir2" in inode 17 -- inode 158, 5 leaves moved
+apfs: "mvdir2" in inode 17 is now "mvdir2" in inode 18 -- inode 158, 6 leaves moved
+apfs: inode 158 is inside "mvdir2" -- a directory moved under itself takes every name in it out of the volume
+apfs: directory "deeper" made in inode 158 as inode 160 -- 3 leaves moved
+apfs: inode 160 is inside "mvdir2" -- a directory moved under itself takes every name in it out of the volume
+apfs: inode 157 is not a directory -- nothing can be moved into it
+apfs-move: PASS -- 6 move(s): a file to a longer name and a shorter one with its 9000 bytes intact, into another directory, a directory with a child in it moved twice, five refusals that left no mark
+apfs: directory "deeper" taken out of inode 158 -- inode 160 is gone with 2 record(s), 3 leaves moved
+apfs: "inner.txt" taken out of inode 158 -- inode 159 is gone with 3 record(s), 3 leaves moved
+apfs: directory "mvdir2" taken out of inode 18 -- inode 158 is gone with 2 record(s), 5 leaves moved
+apfs: inode 157 cut to 0 bytes -- 0 run(s) shortened, 1 dropped, 3 block(s) queued for release, 3 leaf(s) moved
+apfs: "mvone.txt" taken out of inode 18 -- inode 157 is gone with 3 record(s), 5 leaves moved
+apfs: "orphan.txt" made in inode 17 as inode 161 -- 5 leaves moved
+apfs: "orphan.txt" is gone from inode 17 -- inode 161 waits in the private directory as "0xa1-dead", 7000 byte(s) still there, 5 leaves moved
+apfs: inode 17 still has a name -- it is not waiting to be let go
+apfs: inode 161 cut to 0 bytes -- 0 run(s) shortened, 1 dropped, 2 block(s) queued for release, 3 leaf(s) moved
+apfs: "0xa1-dead" taken out of inode 3 -- inode 161 is gone with 3 record(s), 5 leaves moved
+apfs-orphan: PASS -- 1 file(s) kept whole with no name at all (7000 bytes each), 1 let go, 0 found waiting from an earlier run, two refusals
+fs-open: PASS -- of 32 rows, every file the self-tests opened was given back
+apfs-seek: PASS -- each of 86 records answers to its own key out of the leaf it lives in, with the rest of the tree behind it in order; 41 key(s) that are not there land on the record after them; and the leaf an insert would use is the one the walk names (checking it cost 388 tree reads, 3050 nodes and 20166 records of the totals below)
+svc: clock -> kernel name 10
+svc: stats -> kernel name 11
+svc: tasks -> kernel name 12
+svc: echool -> kernel name 13
+svc: man -> kernel name 14
+svc: progreg -> kernel name 15
+svc: launchd -> kernel name 16
+launchd: keep_alive worker up (death port=17)
+host: host -> kernel name 18 (page_size=4096)
+[12460 INF klog] ring + service up
+[12460 INF boot] stress pass complete
+[12470 INF boot] drivers + services up
+[12470 DBG boot] entering shell
+syscall: enabled, entry=0x000000000010583a
+smap: not supported by this CPU
+cpu 1: in the scheduler, idle thread id=122, its own timer debiting its own slice
+mp: 3 application processor(s) in the scheduler, 4 cpu(s) serving one runqueue
+cpu 2: in the scheduler, idle thread id=123, its own timer debiting its own slice
+cpu 3: in the scheduler, idle thread id=124, its own timer debiting its own slice
+sched-smp: PASS -- 8 thread(s) ran on 4 of the 4 processor(s) that are up (mask 0xf), and each of them said so out of its own CPU's block
+progreg: 44 programs registered
+launchd: catalog loaded 'com.style9.heartbeat' (heartbeatd) -> task 4 [keepalive]
+usermode: spawn 'heartbeatd' entry=0x40000000 (image=16032 bytes), rsp=0x40fffff0 argc=0
+launchd: catalog registered 'com.style9.ondemand' (heartbeatd) [stopped]
+heartbeatd: up, parking on idle port 0x3 (kill-to-stop)
+usermode: spawn 'hello' entry=0x40000000 (image=42040 bytes), rsp=0x40fffff0 argc=0
+hello from hello.elf (libstyle9, ring 3)
+  allocated port = 0x3
+  self-send queued
+  mach_msg round-trip via SYSCALL: OK
+  recv_timed returned E_TIMEOUT after 50 ms: OK
+  task_self GET_INFO ok: name='hello' tir_task_id=5
+  bootstrap_lookup('kernel_task') -> name=0x4
+  GET_INFO via bootstrap name: ok, tir_task_id=1
+  OOL round-trip 512 bytes via echool: fnv1a=0x86a2b1c5 OK
+  vm_allocate(8192) -> 0x4000b000
+  vm_deallocate: OK (zero-filled, writable, released)
+  OOL+deallocate=1 4 KiB: checksum OK, post-send vm_deallocate refused (rv=-3): OK
+  NO_SENDERS notification: id=70 tag=0xdeadbeef OK
+  port_set_extract: both members report set=0x3 OK
+  port_set recv: tags 0xb2b2b2b2 0xa1a1a1a1 via set name 0x3 OK
+  DEAD_NAME notification: id=72 tag=0xcafe0dea OK
+  spawned child hello.elf, task_id=6, work_port=0x4
+usermode: spawn 'hello' entry=0x40000000 (image=42040 bytes), rsp=0x40fffff0 argc=0, parent port injected
+  spawn_with_port + child ping: tag=0xcafec417 OK
+[user thread exited, code=0]
+usermode: spawn 'oolchild' entry=0x40000000 (image=16000 bytes), rsp=0x40fffff0 argc=0, parent port injected
+[user thread exited, code=0]
+  OOL 12288 bytes from a ring-3 child: intact at send time, writable after: OK
+  spawned excchild, task_id=8, watch=0x4
+usermode: spawn 'excchild' entry=0x40000000 (image=15928 bytes), rsp=0x40fffff0 argc=0, parent port injected
+
+*** user fault: #PF page fault (vec 14, err=0x7)
+  cr2 = 0x0 (faulting VA)
+  err: protection-violation | write | user-mode
+  rip=0x00000000400019c8 <__bss_end+0x3fc92168>
+  rsp=0x40ffffe0  rbp=0x0
+  rax=0x0  rdi=0x3  rsi=0x40fffff8  rdx=0x0
+code @rip: 89 04 25 00 00 00 00 0f 0b 0f 1f 80 00 00 00 00
+user fault posted to exception port
+  exception: vec=14 rip=0x400019c8 cr2=0x0 task_id=8 OK
+user thread retired by kernel
+  spawned excchild_ud, task_id=9, watch=0x4
+usermode: spawn 'excchild_ud' entry=0x40000000 (image=15928 bytes), rsp=0x40fffff0 argc=0, parent port injected
+
+*** user fault: #UD invalid opcode (vec 6, err=0x0)
+  rip=0x00000000400019cb <__bss_end+0x3fc9216b>
+  rsp=0x40ffffe0  rbp=0x0
+  rax=0x0  rdi=0x2  rsi=0x3  rdx=0x0
+code @rip: 0f 0b 48 83 c4 08 c3 b8 01 00 00 00 eb f4 00 00
+  per-type exception: vec=6 rip=0x400019cb task_id=9 OK
+user fault posted to exception port
+  spawned excchild_thr, task_id=10, watch=0x4
+user thread retired by kernel
+usermode: spawn 'excchild_thr' entry=0x40000000 (image=15928 bytes), rsp=0x40fffff0 argc=0, parent port injected
+
+*** user fault: #UD invalid opcode (vec 6, err=0x0)
+  rip=0x00000000400019ea <__bss_end+0x3fc9218a>
+  rsp=0x40ffffe0  rbp=0x0
+  rax=0x0  rdi=0x2  rsi=0x3  rdx=0x0
+code @rip: 0f 0b eb e4 b8 02 00 00 00 eb dd 00 00 00 00 00
+user fault posted to exception port
+user thread retired by kernel
+  thread-level precedence: one MACH_EXC_FAULT, task-level bypassed: OK
+  spawned excchild_resume, task_id=11, watch=0x4
+usermode: spawn 'excchild_resume' entry=0x40000000 (image=15936 bytes), rsp=0x40fffff0 argc=0, parent port injected
+
+*** user fault: #UD invalid opcode (vec 6, err=0x0)
+  rip=0x00000000400019d3 <__bss_end+0x3fc92173>
+  rsp=0x40ffffc0  rbp=0x0
+  rax=0x0  rdi=0x10002  rsi=0x3  rdx=0x0
+code @rip: 0f 0b 48 b8 13 00 00 00 18 00 00 00 48 8d 7c 24
+user fault verdict=1 advance=2
+user fault resumed past faulting insn
+  resume: RESUME verdict applied, child ran past ud2 and posted survive tag 0xc0deba5e OK
+[user thread exited, code=0]
+  registered 'hello.demo' -> svc=0x4
+  lookup 'hello.demo' -> cli=0x6 (distinct from svc)
+  publish round-trip: tag=0xfeedface via registered name OK
+  deregister + post-lookup miss: OK
+  msg strictness: voucher + reserved bits rejected, clean OK
+
+lsmp demo:
+usermode: spawn 'lsmp' entry=0x40000000 (image=16576 bytes), rsp=0x40fffff0 argc=0
+lsmp: 6 populated names in calling task's port_space
+  name       obj_id     kind   rights   refs  send  sonce qlimit   qlen  description
+  ---------- ---------- ------ ------- ----- ----- ------ ------ ------  -----------
+  0x00000001 0x0000026d port   -S----      2     1      0   1024      0  task-self
+  0x00000002 0x00000001 port   -S----      6     5      0   1024      0  bootstrap
+  0x00000003 0x0000026f port   RS----      3     2      0   1024      0  parent
+  0x00000004 0x00000270 port   -S----      1     1      0   1024      0   DEAD
+  0x00000005 0x00000271 set    ---P--      1     -      -      -      -  port-set (members=1)
+  0x00000006 0x00000272 port   R-----      1     0      0   1024      0  
+[user thread exited, code=0]
+
+vmmap demo:
+usermode: spawn 'vmmap' entry=0x40000000 (image=16360 bytes), rsp=0x40fffff0 argc=0
+vmmap: 7 live regions in calling task's vm_map
+  region      start             end                    size   prot  flg  details
+  ----------  ----------------- -----------------  --------  -----  ---  -------
+  TEXT        0000000040000000- 0000000040001000       4 K  r-x/-  ---
+  EXEC        0000000040001000- 0000000040002000       4 K  r-x/-  A--
+  ANON_R      0000000040002000- 0000000040003000       4 K  r--/-  A--
+  ANON_RW     0000000040003000- 0000000040005000       8 K  rw-/-  A--
+  ANON_RW     0000000040005000- 0000000040006000       4 K  rw-/-  A--
+  ANON_RW     0000000040006000- 0000000040016000      64 K  rw-/-  A--
+  ANON_RW     0000000040fff000- 0000000041000000       4 K  rw-/-  A--
+  ----------
+  TOTAL                                                   92 K
+[user thread exited, code=0]
+
+launchctl demo:
+usermode: spawn 'launchctl' entry=0x40000000 (image=22032 bytes), rsp=0x40fffff0 argc=0
+launchctl: connected to 'launchd' (port=0x4)
+  initial -- 2 services loaded:
+    label                    program      state        task_id
+    com.style9.heartbeat     heartbeatd   running      4
+    com.style9.ondemand      heartbeatd   stopped      0
+  load 'com.style9.echod' (program=echod) -> running task_id=15 taskport=0x5
+usermode: spawn 'echod' entry=0x40000000 (image=16120 bytes), rsp=0x40fffff0 argc=0
+  armed DEAD_NAME on taskport=0x5 (notify=0x3)
+echod: serving 'echo' (svc=0x3, kill-to-stop)
+  after-load -- 3 services loaded:
+    label                    program      state        task_id
+    com.style9.heartbeat     heartbeatd   running      4
+    com.style9.ondemand      heartbeatd   stopped      0
+    com.style9.echod         echod        running      15
+
+*** user fault: #PF page fault (vec 14, err=0x15)
+  echo round 0 tag mismatch (sent 0xe0e0 got 0x0)
+  cr2 = 0x4 (faulting VA)
+  poke 'echo' x 0 rounds: ok
+  err: protection-violation | read | user-mode | instruction-fetch
+  after-poke -- 3 services loaded:
+  rip=    label                    program      state        task_id
+0x0000000000000004
+  rsp=0x40ffff90  rbp=0x0
+    com.style9.heartbeat     heartbeatd   running      4
+  rax=0x0  rdi=0x40ffffa0  rsi=0x40ffffa0  rdx=0x18
+    com.style9.ondemand      heartbeatd   stopped      0
+code @rip:    com.style9.echod         echod        running      15
+ 53 ff 00 f0 c3 e2 00 f0 53 ff 00 f0 53 ff 00 f0
+  unload 'com.style9.echod' -> ok (was running, task_id=15)
+user thread retired by kernel
+  after-unload -- 2 services loaded:
+    label                    program      state        task_id
+    com.style9.heartbeat     heartbeatd   running      4
+    com.style9.ondemand      heartbeatd   stopped      0
+  DEAD_NAME for task_id=15: notified (death by notification, no poll)
+  task_alive(15) confirm: no (consistent)
+
+launchctl v2 STOP/START demo:
+  load 'com.style9.spinner' (program=loopchild) -> running task_id=16 taskport=0x5
+usermode: spawn 'loopchild' entry=0x40000000 (image=16208 bytes), rsp=0x40fffff0 argc=0
+  spinner loaded -- 3 services loaded:
+loopchild: about to publish task-self port at 'loopchild.tport'
+    label                    program      state        task_id
+loopchild: registered 'loopchild.tport' under bootstrap
+    com.style9.heartbeat     heartbeatd   running      4
+loopchild: entering syscall-free compute loop
+    com.style9.ondemand      heartbeatd   stopped      0
+    com.style9.spinner       loopchild    running      16
+  stop 'com.style9.spinner' -> stopped (was task_id=16)
+  after stop -- 3 services loaded:
+    label                    program      state        task_id
+    com.style9.heartbeat     heartbeatd   running      4
+    com.style9.ondemand      heartbeatd   stopped      0
+    com.style9.spinner       loopchild    stopped      0
+  start 'com.style9.spinner' -> running (task_id=17)
+usermode: spawn 'loopchild' entry=0x40000000 (image=16208 bytes), rsp=0x40fffff0 argc=0
+  after start -- 3 services loaded:
+loopchild: about to publish task-self port at 'loopchild.tport'
+    label                    program      state        task_id
+loopchild: bootstrap_register rv=1 (continuing, parent must hold taskport)
+    com.style9.heartbeat     heartbeatd   running      4
+loopchild: entering syscall-free compute loop
+    com.style9.ondemand      heartbeatd   stopped      0
+    com.style9.spinner       loopchild    running      17
+  unload 'com.style9.spinner' -> ok (was running, task_id=17)
+
+launchctl keep_alive demo:
+  load 'com.style9.guardian' (program=loopchild) -> running task_id=18 taskport=0x7
+usermode: spawn 'loopchild' entry=0x40000000 (image=16208 bytes), rsp=0x40fffff0 argc=0
+  guardian task_id=18; simulating crash via task_kill(taskport=0x7)
+loopchild: about to publish task-self port at 'loopchild.tport'
+launchd: keep_alive respawned 'loopchild' -> task 19
+usermode: spawn 'loopchild' entry=0x40000000 (image=16208 bytes), rsp=0x40fffff0 argc=0
+loopchild: about to publish task-self port at 'loopchild.tport'
+loopchild: bootstrap_register rv=1 (continuing, parent must hold taskport)
+loopchild: entering syscall-free compute loop
+
+[census] cpu0=idle/0000c384 cpu1=idle1/00000294 cpu2=idle2/00000023 cpu3=user-elf/00000034
+
+[where] cpu0 ring0 rip=0000000000118773
+
+
+[where] cpu2 ri[where] ng0 rip=cpu1 ri
+[where] cpu0000003n000 rg0 rip=000001001877300001187
+73in
+g3 rip=0000000040001a00
+  after crash (expect running, NEW task_id) -- 3 services loaded:
+    label                    program      state        task_id
+    com.style9.heartbeat     heartbeatd   running      4
+    com.style9.ondemand      heartbeatd   stopped      0
+    com.style9.guardian      loopchild    running      19
+  unload 'com.style9.guardian' -> ok (was running, task_id=19)
+
+launchctl respawn-throttle demo:
+  load 'com.style9.flaky' (program=crasher) -> running task_id=20 taskport=0x7
+usermode: spawn 'crasher' entry=0x40000000 (image=15984 bytes), rsp=0x40fffff0 argc=0
+crasher: immediate exit (keep_alive throttle target)
+[user thread exited, code=1]
+launchd: keep_alive respawned 'crasher' -> task 21
+usermode: spawn 'crasher' entry=0x40000000 (image=15984 bytes), rsp=0x40fffff0 argc=0
+crasher: immediate exit (keep_alive throttle target)
+[user thread exited, code=1]
+launchd: keep_alive respawned 'crasher' -> task 22
+usermode: spawn 'crasher' entry=0x40000000 (image=15984 bytes), rsp=0x40fffff0 argc=0
+crasher: immediate exit (keep_alive throttle target)
+[user thread exited, code=1]
+launchd: keep_alive 'crasher' respawning too fast (3 crashes under 1000ms) -- throttled, START to revive
+
+selfkill demo:
+usermode: spawn 'selfkill' entry=0x40000000 (image=16048 bytes), rsp=0x40fffff0 argc=0
+selfkill: about to call task_kill(MACH_PORT_TASK_SELF=1)
+  task_alive(23) after self-kill: no (kill landed) (waited 2 turns)
+
+compute-loop kill demo:
+usermode: spawn 'loopchild' entry=0x40000000 (image=16208 bytes), rsp=0x40fffff0 argc=0
+  loopchild.tport = 0x6 (after 1 lookup turns)
+  task_kill(loopchild) -> 0
+loopchild: about to publish task-self port at 'loopchild.tport'
+loopchild: bootstrap_register rv=1 (continuing, parent must hold taskport)
+loopchild: entering syscall-free compute loop
+
+[census] cpu0=idle/0000c9c6 cpu1=idle1/00000323 cpu2=user-elf/0000008a cpu3=idle3/000000c8
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[wher
+[whe] cpuere] cpu3 ring0 rip=0000000000118773
+2 ring3 rip=0000000040001a00
+
+[where] cpu1 ring0 rip=0000000000118773
+  task_alive(24) after task_kill: yes (IRQ-return MISSED) (waited 128 turns)
+
+parent-managed kill demo (spawn_returns_taskport):
+  spawned task_id=25 with taskport=0x5 in our space
+usermode: spawn 'loopchild' entry=0x40000000 (image=16208 bytes), rsp=0x40fffff0 argc=0
+loopchild: about to publish task-self port at 'loopchild.tport'
+loopchild: bootstrap_register rv=1 (continuing, parent must hold taskport)
+loopchild: entering syscall-free compute loop
+  task_kill(taskport) -> 0
+  task_alive(25) after parent-managed kill: no (capability path OK) (waited 1 turns)
+
+top demo:
+usermode: spawn 'top' entry=0x40000000 (image=16200 bytes), rsp=0x40fffff0 argc=0
+top -- sample 1/3: 6 tasks, 14 threads, 41 ports, 27 regions
+  task_id   name                  thr   ports  vmregs
+         1  kernel                   9     22       0
+         4  heartbeatd               1      3       5
+         5  hello                    1      4       7
+        14  launchctl                1      6       5
+        24  loopchild                1      2       5
+        26  top                      1      4       5
+top -- sample 2/3: 6 tasks, 14 threads, 42 ports, 27 regions
+  task_id   name                  thr   ports  vmregs
+         1  kernel                   9     22       0
+         4  heartbeatd               1      3       5
+         5  hello                    1      4       7
+        14  launchctl                1      6       5
+        24  loopchild                1      2       5
+        26  top                      1      5       5
+  after crash loop (expect throttled) -- 3 services loaded:
+    label                    program      state        task_id
+    com.style9.heartbeat     heartbeatd   running      4
+    com.style9.ondemand      heartbeatd   stopped      0
+    com.style9.flaky         crasher      throttled    0
+  unload 'com.style9.flaky' -> ok (was throttled, task_id=0)
+[user thread exited, code=0]
+top -- sample 3/3: 5 tasks, 13 threads, 36 ports, 22 regions
+  task_id   name                  thr   ports  vmregs
+         1  kernel                   9     22       0
+         4  heartbeatd               1      3       5
+         5  hello                    1      4       7
+        24  loopchild                1      2       5
+        26  top                      1      5       5
+[user thread exited, code=0]
+
+stale taskport demo (UAF guard):
+  spawned loopchild id=27 taskport=0x5
+  live taskport GET_INFO ok: name='loopchild' id=27
+usermode: spawn 'loopchild' entry=0x40000000 (image=16208 bytes), rsp=0x40fffff0 argc=0
+  child reaped; taskport 0x5 is now stale
+  stale taskport GET_INFO correctly refused: MACH_E_DEAD
+  task_kill(stale taskport) safely no-op'd
+
+spawn argv demo (SYS_SPAWN_ARGS):
+  spawned argecho id=28 taskport=0x5 with 4 args
+usermode: spawn 'argecho' entry=0x40000000 (image=15968 bytes), rsp=0x40ffffb0 argc=4
+argecho: argc=4
+  argv[0]="argecho"
+  argv[1]="alpha"
+  argv[2]="bravo"
+  argv[3]="charlie"
+[user thread exited, code=0]
+  argecho retired after 5 turns
+
+Mach-O loader demo (kern/macho.c):
+usermode: spawn 'machotest' entry=0x40000000 (image=7490 bytes), rsp=0x40ffffc0 argc=3
+machotest: hello from a Mach-O binary (loaded by macho_load, ran through crt0)
+machotest: argc=3
+  argv[0]="machotest"
+  argv[1]="thin"
+  argv[2]="slice"
+[user thread exited, code=0]
+  thin Mach-O retired after 5 turns
+macho: fat archive, 1 slices -- selected x86_64 at off=16384 size=7490
+usermode: spawn 'machotest_fat' entry=0x40000000 (image=23874 bytes), rsp=0x40fffff0 argc=0
+machotest: hello from a Mach-O binary (loaded by macho_load, ran through crt0)
+machotest: argc=0
+[user thread exited, code=0]
+  fat Mach-O (x86_64 slice) retired after 4 turns
+
+Darwin syscall personality demo (kern/darwin.c):
+usermode: spawn 'darwinhello' entry=0x40000000 (image=702 bytes), rsp=0x40fffff0 argc=0
+darwinhello: I think I'm on macOS -- issuing Darwin class-encoded syscalls
+darwin: UNIX getpid() -> 31
+darwin: MACH task_self_trap() -> name=1
+darwin: MACH mach_reply_port() -> name=3
+darwin: unimplemented BSD syscall 255
+darwinhello: unimplemented call returned errno+carry, as Darwin expects
+darwin: UNIX exit(0)
+  darwinhello (Darwin ABI) retired after 5 turns
+usermode: spawn 'darwinmsg' entry=0x40000000 (image=844 bytes), rsp=0x40fffff0 argc=0
+darwinmsg: Darwin task doing a real mach_msg() round-trip on its own port
+darwin: MACH mach_reply_port() -> name=3
+darwin: MACH mach_msg(option=0x3) -> KERN_SUCCESS
+darwinmsg: mach_msg send+recv OK -- KERN_SUCCESS, msgh_id survived the queue
+darwin: UNIX exit(0)
+  darwinmsg (Darwin mach_msg) retired after 4 turns
+usermode: spawn 'dyldhello' entry=0x600003c0 (image=12624 bytes), rsp=0x4fffffd0 argc=0
+dyld: link main_mh=0x0000000050000000
+darwin: s9 map_image '/usr/lib/libSystem.B.dylib' -> base=0x70000000 span=0x10000
+dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070000000
+dyld: enter main @ 0x0000000050000490
+dyldhello: bound through our dyld + libSystem, ran my LC_MAIN entry
+darwin: UNIX exit(0)
+  dyldhello (dyld + libSystem) retired after 7 turns
+usermode: spawn 'dyldbig' entry=0x600003c0 (image=12624 bytes), rsp=0x4fffffd0 argc=0
+dyld: link main_mh=
+[census] cpu0=user-elf/0000ced7 cpu1=idle1/000003a0 cpu2=idle2/00000100 cpu3=user-elf/00000150
+
+[where] cpu0 ring3 rip=0000000060000436
+
+[where] cpu1 ring0 rip=00000000001187
+[where] cpu2 ring0 rip=0000000000118773
+73
+
+[where] cpu3 ring3 rip=0000000040001a00
+0x0000000050000000
+darwin: s9 map_image '/usr/lib/libSystem.B.dylib' -> base=0x70000000 span=0x10000
+dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070000000
+dyld: enter main @ 0x0000000050000490
+dyldhello: bound through our dyld + libSystem, ran my LC_MAIN entry
+darwin: UNIX exit(0)
+  dyldbig (real-Apple base 0x100000000, relocated low) retired after 5 turns
+usermode: spawn 'dirlist' entry=0x600003c0 (image=12992 bytes), rsp=0x4fffffd0 argc=0
+dyld: link main_mh=0x0000000050000000
+darwin: s9 map_image '/usr/lib/libSystem.B.dylib' -> base=0x70000000 span=0x10000
+dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070000000
+dyld: enter main @ 0x0000000050000490
+dirlist: walking the volume via opendir/readdir + stat
+darwin: UNIX mmap(256 KiB, prot=3, anon) -> 0x40000000
+    usr/
+      local/
+        Cellar/
+    bin/
+      echo
+      hello
+      clock
+      tasks
+      sh
+      excchild
+      excchild_ud
+      excchild_thr
+      excchild_resume
+      lsmp
+      vmmap
+      echod
+      launchctl
+      loopchild
+      oolchild
+      selfkill
+      top
+      heartbeatd
+      argecho
+      crasher
+      machotest
+      machotest_fat
+      darwinhello
+      darwinmsg
+      dyldhello
+      dyldbig
+      figlet
+      dirlist
+      tree
+      guname
+      gcat
+      gls
+      timeprobe
+      mmaptest
+      filewrite
+      ttyprobe
+      gstty
+      gmkdir
+      grmdir
+      gfactor
+      pipefork
+      genv
+      gtimeout
+      dash
+      demo.sh
+    etc/
+      notes.txt
+      made.txt
+      madedir/
+      hello.txt
+    var/
+      db/
+        big.txt
+dirlist: stat(/usr) -> mode=040755 size=0 ino=20
+dirlist: done
+darwin: UNIX exit(0)
+  dirlist (opendir/readdir probe) retired after 31 turns
+  >>> host port: mach_host_self + host_page_size + host_info <<<
+  host: page_size=4096 cpus=1/1 mem=127MiB free=123MiB cpu_type=0x1000007 sub=3
+  >>> task port: task_vm_allocate + write + task_vm_deallocate <<<
+  task vm: VA=0x40011000 (zero-filled, writable, freed via task port)
+  >>> task port: task_get_special_port(HOST, BOOTSTRAP) <<<
+  task get_special_port: HOST live (page_size=4096) + BOOTSTRAP resolved
+  >>> spawning figlet -- a REAL Apple x86-64 macOS binary <<<
+usermode: spawn 'figlet' entry=0x600003c0 (image=72032 bytes), rsp=0x4fffffb0 argc=2
+dyld: link main_mh=0x0000000050000000
+darwin: s9 map_image '/usr/lib/libSystem.B.dylib' -> base=0x70000000 span=0x10000
+dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070000000
+dyld: enter main @ 0x0000000050004308
+darwin: UNIX mmap(256 KiB, prot=3, anon) -> 0x40000000
+darwin: UNIX open('/usr/local/Cellar/figlet/2.2.5/share/figlet/fonts/standard.flf') -> fd=3 (28335 bytes, on the volume)
+ _     _ 
+| |__ (_)
+| '_ \| |
+| | | | |
+|_| |_|_|
+         
+darwin: UNIX exit(0)
+  figlet retired after 10 turns
+  >>> spawning tree -- a REAL Apple x86-64 macOS binary <<<
+usermode: spawn 'tree' entry=0x600003c0 (image=73472 bytes), rsp=0x4fffffc0 argc=2
+dyld: link main_mh=0x0000000050000000
+darwin: s9 map_image '/usr/lib/libSystem.B.dylib' -> base=0x70000000 span=0x10000
+dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070000000
+dyld: enter main @ 0x0000000050005b64
+darwin: UNIX mmap(256 KiB, prot=3, anon) -> 0x40000000
+/
+|-- bin
+|   |-- argecho
+|   |-- clock
+|   |-- crasher
+|   |-- darwinhello
+|   |-- darwinmsg
+|   |-- dash
+|   |-- demo.sh
+|   |-- dirlist
+|   |-- dyldbig
+|   |-- dyldhello
+|   |-- echo
+|   |-- echod
+|   |-- excchild
+|   |-- excchild_resume
+|   |-- excchild_thr
+|   |-- excchild_ud
+|   |-- figlet
+|   |-- filewrite
+|   |-- gcat
+|   |-- genv
+|   |-- gfactor
+|   |-- gls
+|   |-- gmkdir
+|   |-- grmdir
+|   |-- gstty
+|   |-- gtimeout
+|   |-- guname
+|   |-- heartbeatd
+|   |-- hello
+|   |-- launchctl
+|   |-- loopchild
+|   |-- lsmp
+|   |-- machotest
+|   |-- machotest_fat
+|   |-- mmaptest
+|   |-- oolchild
+|   |-- pipefork
+|   |-- selfkill
+|   |-- sh
+|   |-- tasks
+|   |-- timeprobe
+|   |-- top
+|   |-- tree
+|   |-- ttyprobe
+|   `-- vmmap
+|-- etc
+|   |-- hello.txt
+|   |-- made.txt
+|   |-- madedir
+|   `-- notes.txt
+|-- usr
+|   `-- local
+|       `-- Cellar
+|           `-- figlet
+|               `-- 2.2.5
+|                   `-- share
+|                       `-- figlet
+|                           `-- fonts
+|                               |-- banner.flf
+|                               |-- big.flf
+|                               |-- mini.flf
+|                               |-- script.flf
+|                               |-- shadow.flf
+|                               |-- slant.flf
+|                               |-- small.flf
+|                               |-- standard.flf
+|                               `-- term.flf
+`-- var
+    `-- db
+        `-- big.txt
+
+14 directories, 58 files
+darwin: UNIX exit(0)
+  tree retired after 41 turns
+  >>> spawning gcat -- a REAL Apple x86-64 macOS binary reading a file off the volume <<<
+usermode: spawn 'gcat' entry=0x600003c0 (image=47176 bytes), rsp=0x4fffff90 argc=3
+dyld: link main_mh=0x0000000050000000
+darwin: s9 map_image '/usr/lib/libSystem.B.dylib' -> base=0x70000000 span=0x10000
+dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070000000
+dyld: enter main @ 0x0000000050001350
+darwin: UNIX open('/etc/hello.txt') -> fd=3 (36 bytes, on the volume)
+darwin: UNIX mmap(264 KiB, prot=3, anon) -> 0x40000000
+style9-os reads a real APFS volume.
+darwin: open('/docs/readme.txt') -- nothing of that name on the volume or in /bin
+gcat: /docs/readme.txt: No such file or directory
+darwin: UNIX exit(1)
+  gcat retired after 6 turns
+  >>> spawning gls -l -- a REAL Apple x86-64 macOS binary printing what the inodes say <<<
+usermode: spawn 'gls' entry=0x600003c0 (image=165000 bytes), rsp=0x4fffffa0 argc=4
+dyld: link main_mh=0x0000000050000000
+darwin: s9 map_image '/usr/lib/libSystem.B.dylib' -> base=0x70000000 span=0x10000
+dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070000000
+dyld: enter main @ 0x0000000050001260
+darwin: UNIX mmap(256 KiB, prot=3, anon) -> 0x40000000
+/:
+total 0
+dr-xr-xr-x 1 0 0 0 Jul 30 16:32 bin
+drwxr-xr-x 1 0 0 0 Jul 30 16:32 etc
+drwxr-xr-x 1 0 0 0 Jul 24 19:54 usr
+drwxr-xr-x 1 0 0 0 Jul 30 16:32 var
+
+/bin:
+total 36
+-r-xr-xr-x 1 0 0  15968 Jul 30 16:32 argecho
+-r-xr-xr-x 1 0 0  16032 Jul 30 16:32 clock
+-r-xr-xr-x 1 0 0  15984 Jul 30 16:32 crasher
+-r-xr-xr-x 1 0 0    702 Jul 30 16:32 darwinhello
+-r-xr-xr-x 1 0 0    844 Jul 30 16:32 darwinmsg
+-r-xr-xr-x 1 0 0 116744 Jul 30 16:32 dash
+-r-xr-xr-x 1 0 0   1093 Jul 30 16:32 demo.sh
+-r-xr-xr-x 1 0 0  12992 Jul 30 16:32 dirlist
+-r-xr-xr-x 1 0 0  12624 Jul 30 16:32 dyldbig
+-r-xr-xr-x 1 0 0  12624 Jul 30 16:32 dyldhello
+-rwxr-xr-x 1 0 0  35208 Jul 24 19:54 echo
+-r-xr-xr-x 1 0 0  16120 Jul 30 16:32 echod
+-r-xr-xr-x 1 0 0  15928 Jul 30 16:32 excchild
+-r-xr-xr-x 1 0 0  15936 Jul 30 16:32 excchild_resume
+-r-xr-xr-x 1 0 0  15928 Jul 30 16:32 excchild_thr
+-r-xr-xr-x 1 0 0  15928 Jul 30 16:32 excchild_ud
+-r-xr-xr-x 1 0 0  72032 Jul 30 16:32 figlet
+-r-xr-xr-x 1 0 0  17280 Jul 30 16:32 filewrite
+-r-xr-xr-x 1 0 0  47176 Jul 30 16:32 gcat
+-r-xr-xr-x 1 0 0  52280 Jul 30 16:32 genv
+-r-xr-xr-x 1 0 0  69144 Jul 30 16:32 gfactor
+-r-xr-xr-x 1 0 0 165000 Jul 30 16:32 gls
+-r-xr-xr-x 1 0 0  52080 Jul 30 16:32 gmkdir
+-r-xr-xr-x 1 0 0  42424 Jul 30 16:32 grmdir
+-r-xr-xr-x 1 0 0 103288 Jul 30 16:32 gstty
+-r-xr-xr-x 1 0 0  47384 Jul 30 16:32 gtimeout
+-r-xr-xr-x 1 0 0  41304 Jul 30 16:32 guname
+-r-xr-xr-x 1 0 0  16032 Jul 30 16:32 heartbeatd
+-r-xr-xr-x 1 0 0  42040 Jul 30 16:32 hello
+-r-xr-xr-x 1 0 0  22032 Jul 30 16:32 launchctl
+-r-xr-xr-x 1 0 0  16208 Jul 30 16:32 loopchild
+-r-xr-xr-x 1 0 0  16576 Jul 30 16:32 lsmp
+-r-xr-xr-x 1 0 0   7490 Jul 30 16:32 machotest
+-r-xr-xr-x 1 0 0  23874 Jul 30 16:32 machotest_fat
+-r-xr-xr-x 1 0 0  17104 Jul 30 16:32 mmaptest
+-r-xr-xr-x 1 0 0  16000 Jul 30 16:32 oolchild
+-r-xr-xr-x 1 0 0  21864 Jul 30 16:32 pipefork
+-r-xr-xr-x 1 0 0  16048 Jul 30 16:32 selfkill
+-r-xr-xr-x 1 0 0  37424 Jul 30 16:32 sh
+-r-xr-xr-x 1 0 0  16080 Jul 30 16:32 tasks
+-r-xr-xr-x 1 0 0  12760 Jul 30 16:32 timeprobe
+-r-xr-xr-x 1 0 0  16200 Jul 30 16:32 top
+-r-xr-xr-x 1 0 0  73472 Jul 30 16:32 tree
+-r-xr-xr-x 1 0 0  17360 Jul 30 16:32 ttyprobe
+-r-xr-xr-x 1 0 0  16360 Jul 30 16:32 vmmap
+darwin: UNIX exit(0)
+  gls retired after 27 turns
+  >>> spawning timeprobe -- wall-clock probe (gettimeofday / clock_gettime / time) <<<
+usermode: spawn 'timeprobe' entry=0x600003c0 (image=12760 bytes), rsp=0x4fffffd0 argc=0
+dyld: link main_mh=0x0000000050000000
+darwin: s9 map_image '/usr/lib/libSystem.B.dylib' -> base=0x70000000 span=0x10000
+dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070000000
+dyld: enter main @ 0x0000000050000490
+timeprobe: 2026-07-30T16:32:27Z (epoch 1785429147.529218)
+timeprobe: advanced 52402 us across a busy loop
+timeprobe: all checks passed
+darwin: UNIX exit(0)
+  timeprobe retired after 10 turns
+  >>> spawning mmaptest -- demand-paging probe (mmap / munmap / the pager) <<<
+usermode: spawn 'mmaptest' entry=0x600003c0 (image=17104 bytes), rsp=0x4fffffd0 argc=0
+dyld: link main_mh=0x0000000050000000
+darwin: s9 map_image '/usr/lib/libSystem.B.dylib' -> base=0x70000000 span=0x10000
+dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070000000
+dyld: enter main @ 0x0000000050000580
+darwin: UNIX open('/var/db/big.txt') -> fd=3 (180224 bytes, on the volume)
+darwin: UNIX mmap(64 KiB, prot=3, anon) -> 0x40000000
+mmaptest: anonymous 64 KiB -- zeroed, writable, returned
+darwin: UNIX mmap(65536 KiB, prot=3, anon) -> 0x40010000
+mmaptest: 64 MiB reserved, 3 pages touched, released
+darwin: UNIX mmap(8 KiB, prot=3, anon) -> 0x44010000
+mmaptest: MAP_FIXED, zero length, stray munmap and munmap across a hole refused
+darwin: UNIX mmap(32 KiB, prot=3, anon) -> 0x44012000
+darwin: UNIX open('/var/db/big.txt') -> fd=3 (180224 bytes, on the volume)
+mmaptest: read(2) filled a page the program never touched
+darwin: UNIX open('/var/db/big.txt') -> fd=3 (180224 bytes, on the volume)
+darwin: UNIX mmap(180 KiB, prot=1, /var/db/big.txt) -> 0x4401a000
+mmaptest: mapped /var/db/big.txt (180224 bytes) at 0x4401a000
+mmaptest: byte 90112 matches through a second fault
+mmaptest: 4096 bytes past EOF read as zero
+darwin: UNIX open('/var/db/big.txt') -> fd=3 (180224 bytes, on the volume)
+darwin: UNIX mmap(176 KiB, prot=1, /var/db/big.txt) -> 0x44047000
+mmaptest: cut a page out of the middle -- both halves still hold their own part of the file
+mmaptest: all checks passed
+darwin: UNIX exit(0)
+  mmaptest retired after 13 turns
+  >>> spawning filewrite -- the volume, from ring 3 (open O_CREAT / write / append / truncate / unlink) <<<
+usermode: spawn 'filewrite' entry=0x600003c0 (image=17280 bytes), rsp=0x4fffffd0 argc=0
+dyld: link main_mh=0x0000000050000000
+darwin: s9 map_image '/usr/lib/libSystem.B.dylib' -> base=0x70000000 span=0x10000
+dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070000000
+dyld: enter main @ 0x0000000050000530
+filewrite: the volume, from ring 3
+apfs: "filewrite.txt" made in inode 17 as inode 162 -- 5 leaves moved
+darwin: UNIX open('/etc/filewrite.txt') -> fd=3 (0 bytes, on the volume, for writing)
+darwin: UNIX open('/etc/filewrite.txt') -> fd=3 (41 bytes, on the volume)
+filewrite: PASS 41 bytes made it to /etc/filewrite.txt and back
+darwin: UNIX open('/etc/filewrite.txt') -> fd=3 (41 bytes, on the volume, for writing)
+darwin: UNIX open('/etc/filewrite.txt') -> fd=3 (41 bytes, on the volume)
+filewrite: PASS an overwrite at offset 8 changed 5 bytes and nothing else
+darwin: UNIX open('/etc/filewrite.txt') -> fd=3 (41 bytes, on the volume, for writing)
+darwin: UNIX open('/etc/filewrite.txt') -> fd=3 (72 bytes, on the volume)
+filewrite: PASS an append landed at the end, 72 bytes now
+apfs: inode 162 cut to 0 bytes -- 0 run(s) shortened, 1 dropped, 1 block(s) queued for release, 3 leaf(s) moved
+darwin: UNIX open('/etc/filewrite.txt') -> fd=3 (0 bytes, on the volume, for writing)
+darwin: UNIX open('/etc/filewrite.txt') -> fd=3 (0 bytes, on the volume)
+filewrite: PASS O_TRUNC emptied the file without anything being written
+apfs: "filewrite.txt" taken out of inode 17 -- inode 162 is gone with 3 record(s), 5 leaves moved
+darwin: UNIX unlink('/etc/filewrite.txt') -- the name is gone
+darwin: open('/etc/filewrite.txt') -- nothing of that name on the volume or in /bin
+filewrite: PASS unlink removed /etc/filewrite.txt
+filewrite: PASS /bin/gcat is still read-only
+apfs: directory "ring3dir" made in inode 17 as inode 163 -- 5 leaves moved
+darwin: UNIX mkdir('/etc/ring3dir') -- the directory is there
+filewrite: PASS mkdir made /etc/ring3dir, and would not make it again
+apfs: "inside.txt" made in inode 163 as inode 164 -- 3 leaves moved
+darwin: UNIX open('/etc/ring3dir/inside.txt') -> fd=3 (0 bytes, on the volume, for writing)
+apfs: "ring3dir" still holds a name -- a directory taken out from over its children leaves entries whose parent is gone
+darwin: rmdir('/etc/ring3dir') refused (rv=-12)
+apfs: inode 164 cut to 0 bytes -- 0 run(s) shortened, 1 dropped, 1 block(s) queued for release, 3 leaf(s) moved
+apfs: "inside.txt" taken out of inode 163 -- inode 164 is gone with 3 record(s), 3 leaves moved
+darwin: UNIX unlink('/etc/ring3dir/inside.txt') -- the name is gone
+apfs: directory "ring3dir" taken out of inode 17 -- inode 163 is gone with 2 record(s), 5 leaves moved
+darwin: UNIX rmdir('/etc/ring3dir') -- the directory is gone
+darwin: open('/etc/ring3dir/inside.txt') -- nothing of that name on the volume or in /bin
+filewrite: PASS /etc/ring3dir took a name, refused to go while it held one, and went when it did not
+apfs: "hello.txt" is not a directory, and rmdir takes out nothing else
+darwin: rmdir('/etc/hello.txt') refused (rv=-11)
+apfs: "etc" is a directory, and unlink does not take those out
+darwin: unlink('/etc') refused (rv=-9)
+filewrite: PASS rmdir refuses a file and unlink refuses a directory
+apfs: "filewrite.txt" made in inode 17 as inode 165 -- 5 leaves moved
+darwin: UNIX open('/etc/filewrite.txt') -> fd=3 (0 bytes, on the volume, for writing)
+apfs: "filewrite.txt" in inode 17 is now "moved.txt" in inode 19 -- inode 165, 6 leaves moved
+darwin: UNIX rename('/etc/filewrite.txt', '/var/db/moved.txt') -- one name, moved
+darwin: open('/etc/filewrite.txt') -- nothing of that name on the volume or in /bin
+darwin: UNIX open('/var/db/moved.txt') -> fd=3 (41 bytes, on the volume)
+filewrite: PASS rename moved /etc/filewrite.txt to /var/db/moved.txt with all 41 of its bytes
+darwin: rename('/var/db/moved.txt', '/etc/hello.txt') refused (rv=-8)
+filewrite: PASS rename refuses a destination that is taken and a source that is not there
+apfs: inode 165 cut to 0 bytes -- 0 run(s) shortened, 1 dropped, 1 block(s) queued for release, 3 leaf(s) moved
+apfs: "moved.txt" taken out of inode 19 -- inode 165 is gone with 3 record(s), 5 leaves moved
+darwin: UNIX unlink('/var/db/moved.txt') -- the name is gone
+apfs: "filewrite.txt" made in inode 17 as inode 166 -- 5 leaves moved
+darwin: UNIX open('/etc/filewrite.txt') -> fd=3 (0 bytes, on the volume, for writing)
+darwin: UNIX open('/etc/filewrite.txt') -> fd=3 (41 bytes, on the volume)
+apfs: "filewrite.txt" is gone from inode 17 -- inode 166 waits in the private directory as "0xa6-dead", 41 byte(s) still there, 5 leaves moved
+darwin: UNIX unlink('/etc/filewrite.txt') -- the name is gone
+
+[census] cpu0=user-elf/0000e657 cpu1=user-elf/00000472 cpu2=idle2/000001c5 cpu3=idle3/000001df
+
+[where] cpu0 ring3 rip=0000000070007dcf
+
+[where] cpu1 ring3 r
+[wip=here] c0pu002 ring0 rip=0000040001a00
+
+0000[where] cp00000011877u3 ring0 rip=3
+0000000000118773
+darwin: open('/etc/filewrite.txt') -- nothing of that name on the volume or in /bin
+filewrite: PASS /etc/filewrite.txt read 33 byte(s) through a descriptor after its only name was unlinked
+apfs: inode 166 cut to 0 bytes -- 0 run(s) shortened, 1 dropped, 1 block(s) queued for release, 3 leaf(s) moved
+apfs: "0xa6-dead" taken out of inode 3 -- inode 166 is gone with 3 record(s), 5 leaves moved
+
+[census] cpu0=user-elf/0000ec63 cpu1=idle1/000004f1 cpu2=idle2/0000021e cpu3=idle3/0000024e
+
+[where] cpu0 ring3 rip=0000000040001a00
+
+
+[where] cpu3 ring0[w rip=00
+000000[00118773where]he
+ crepu1 r] cpu2 ring0 rip=00ing0 rip=00000000000118773
+0000000118773
+
+[census] cpu0=idle/0000f09f cpu1=idle1/0000056e cpu2=user-elf/00000299 cpu3=idle3/000002e4
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[wher
+e] cpu[where] cp2 ringu3 ring0 rip=0000000000118773
+3 rip=
+[where] cpu001 ring0 rip=00000040000000000000118773
+1a00
+
+[census] cpu0=idle/0000f4de cpu1=idle1/000005e5 cpu2=user-elf/00000321 cpu3=idle3/0000035e
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[where] cpu1 ring0 rip=0000000000118773
+
+[where] cpu2 ring3 rip=0000000040001a00
+
+[where] cpu3 ring0 rip=0000000000118773
+
+[census] cpu0=idle/0000f915 cpu1=idle1/0000067f cpu2=idle2/00000391 cpu3=user-elf/000003e6
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[where] cpu1 ring0 rip=0000000000118773
+
+[where] cpu3 ring3 rip=0000000040001a00
+
+[where] cpu2 ring0 rip=0000000000118773
+
+[census] cpu0=idle/0000fd71 cpu1=idle1/0000070b cpu2=user-elf/00000413 cpu3=idle3/00000462
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[where] cpu
+[where] cpu2 ring3 rip=0000000040001a00
+1 ring0 rip=0000000000118773
+
+[where] cpu3 ring0 rip=0000000000118773
+
+[census] cpu0=idle/000101ac cpu1=idle1/00000792 cpu2=user-elf/0000048a cpu3=idle3/000004d9
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[where] cpu
+[where] cp1 ru
+[where] ingcpu0 rip=00000000002 ring313 ring0  rip=0ri000000040001a00
+p=0000000000118773
+18773
+
+[census] cpu0=idle/000105b6 cpu1=idle1/000007fd cpu2=user-elf/000004ef cpu3=idle3/0000053c
+
+[where] cpu0 ring0 rip=0000000000118773
+
+
+[where] c[where] cpu2 ring3 rip=0000000040001a00
+
+[where] cppu3 ring0 ru1 ring0 rip=0000000000118773
+ip=0000000000118773
+
+[census] cpu0=idle/000109fe cpu1=user-elf/00000884 cpu2=idle2/0000057d cpu3=idle3/000005a8
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[w
+[wherhere] cpu3
+[ ring0 rip=0000000000118773
+e] cpu2 ring0 rip=0000000000118773
+where] cpu1 ring3 rip=0000000040001a00
+
+[census] cpu0=idle/00010e25 cpu1=idle1/000008f7 cpu2=idle2/000005e3 cpu3=user-elf/00000611
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[where] cpu1 ring0 rip=0000000000118773
+
+[where] cpu3 ring3 rip=0000000040001a00
+
+[where] cpu2 ring0 rip=0000000000118773
+
+[census] cpu0=idle/00011262 cpu1=idle1/000009ab cpu2=idle2/0000064c cpu3=user-elf/00000680
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[where] cpu1 ring0 rip=0000000000118773
+
+[where] cpu2 ring0 rip=0000000000118773
+
+[where] cpu3 ring3 rip=0000000040001a00
+
+[census] cpu0=idle/000116b1 cpu1=user-elf/00000a4e cpu2=idle2/000006c1 cpu3=idle3/000006e4
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[where] cpu2 ring0 rip=000000
+[w0000118773
+
+[whehere] cpu3 ringre] cpu1 ring3 rip=0000000040001a00
+0 rip=0000000000118773
+
+[census] cpu0=idle/00011ad3 cpu1=idle1/00000acb cpu2=idle2/0000072a cpu3=user-elf/0000076e
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[where] cpu1 ring0 rip=0000000000118773
+
+[where] cpu2 ring0 rip=0000000000118773
+
+[where] cpu3 ring3 rip=0000000040001a00
+
+[census] cpu0=user-elf/00011f1c cpu1=idle1/00000b40 cpu2=idle2/000007b2 cpu3=idle3/000007de
+
+[where] cpu0 ring3 rip=0000000040001a00
+
+[whe
+re][wh
+[where]  ere]cpu2 cpuring0 rip=0001 ring000 rip=000000000000 cp11u3 ring80001180 rip=7737703
+
+000000000118773
+
+[census] cpu0=idle/00012353 cpu1=user-elf/00000bb0 cpu2=idle2/0000080a cpu3=idle3/0000083d
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[where] cp
+[whereu3 ring0 rip=00000000001] cp
+[whu2 riere18773
+] ngcp0 rip=u1 rin0000g3 rip=00000000000000118773
+40001a00
+
+[census] cpu0=idle/000127a1 cpu1=idle1/00000c3e cpu2=idle2/0000087a cpu3=user-elf/000008bd
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[whe
+[wre] cpu3 ring3 rip=0000000040001a00
+
+[where] cpu1 ring0 rip=0000000000118773
+here] cpu2 ring0 rip=0000000000118773
+
+[census] cpu0=user-elf/00012bb4 cpu1=idle1/00000ca2 cpu2=idle2/000008d8 cpu3=idle3/00000921
+
+[where] cpu0 ring3 rip=0000000040001a00
+
+[where] cpu1 ring0 rip=0000000000118773
+
+[where] cpu2 ring0 rip=000
+[where] cpu3 ring0 rip=0000000000000118773
+0000118773
+
+[census] cpu0=idle/00012ff6 cpu1=user-elf/00000d31 cpu2=idle2/00000950 cpu3=idle3/000009a7
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[where] cpu1 ring3 rip=0000000040001a00
+
+[where] cpu2 ring0 rip=0000000000118773
+
+[where] cpu3 ring0 rip=0000000000118773
+
+[census] cpu0=idle/00013421 cpu1=user-elf/00000dce cpu2=idle2/000009cc cpu3=idle3/00000a20
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[where] cpu1 ring3 rip=000000004
+[where]0001a00
+ cpu
+[where] cpu2 ring0 rip=0000000000118773
+3 ring0 rip=0000000000118773
+
+[census] cpu0=idle/0001387c cpu1=user-elf/00000e3f cpu2=idle2/00000a26 cpu3=idle3/00000a76
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[where] cpu2 ring
+[w
+[where] ch0 rip=0puere] cp3 ring0 rip=0000000000118773
+u1 ring3 rip=0000000040001a00
+000000000118773
+
+[census] cpu0=idle/00013ca4 cpu1=user-elf/00000edb cpu2=idle2/00000aa1 cpu3=idle3/00000b00
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[where] cpu1
+[where] cpu2 ring0 rip=0000000000118773
+
+[where] cpu3 ring0 rip=0000000000118773
+ ring3 rip=0000000040001a00
+
+[census] cpu0=idle/000140dc cpu1=idle1/00000f63 cpu2=user-elf/00000b1c cpu3=idle3/00000b7b
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[where] cpu3
+[where] cpu2 ring3 rip=0000000040001a00 ring0 rip
+=0
+[where] cpu1 ring0 rip=0000000000118773
+000000000118773
+
+[census] cpu0=idle/0001452b cpu1=user-elf/00000fd4 cpu2=idle2/00000b81 cpu3=idle3/00000bf3
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[where] cpu1
+[ whering3 rrip=e] cp000u2 ring0 rip=0000000000118773
+00000
+[where] cpu3 r40ing0 rip=001a00
+0000000000118773
+
+[census] cpu0=idle/00014964 cpu1=user-elf/00001042 cpu2=idle2/00000bfa cpu3=idle3/00000c90
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[
+[
+[wherwhere] cpe] cpuwhere] cpu1 ring3 rip=2 ring0 rip=000000000000000040000118773
+01a00
+u3 ring0 rip=0000000000118773
+
+[census] cpu0=idle/00014db6 cpu1=user-elf/000010d0 cpu2=idle2/00000c64 cpu3=idle3/00000d0c
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[where] cpu1 ring3 rip=0000000040001a00
+
+[wh
+[where] cpu3 ring0 rip=0000000000118773
+ere] cpu2 ring0 rip=0000000000118773
+
+[census] cpu0=idle/000151e7 cpu1=idle1/0000116a cpu2=user-elf/00000ceb cpu3=idle3/00000d98
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[wher
+[where] cpu2 ring3 rip=0000000e] cpu1 r
+[wing0 rip=0000000000118773
+here] cpu3 ring0 rip=0000000000118773
+040001a00
+
+[census] cpu0=idle/00015618 cpu1=idle1/000011ec cpu2=idle2/00000d80 cpu3=user-elf/00000e0f
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[where] cpu1 ring0 rip=0000000000118773
+
+[where] cpu2 ring0 rip=0000000000118773
+
+[where] cpu3 ring3 rip=0000000040001a00
+
+[census] cpu0=user-elf/00015a72 cpu1=idle1/00001254 cpu2=idle2/00000df8 cpu3=idle3/00000e94
+
+[where] cpu0 ring3 rip=0000000040001a00
+
+[where] cpu1 ring0 rip=0000000000118773
+
+[where] cpu2 ring0 rip=0000000000118773
+
+[where] cpu3 ring0 rip=0000000000118773
+  filewrite retired after 8192 turns
+  >>> spawning ttyprobe -- the terminal, from ring 3 (tcgetattr / tcsetattr / TIOCGWINSZ / raw) <<<
+usermode: spawn 'ttyprobe' entry=0x600003c0 (image=17360 bytes), rsp=0x4fffffd0 argc=0
+dyld: link main_mh=0x0000000050000000
+darwin: s9 map_image '/usr/lib/libSystem.B.dylib' -> base=0x70000000 span=0x10000
+dyld: mapped /usr/lib/libSystem.B.dylib @ 0x0000000070000000
+dyld: enter main @ 0x0000000050000530
+ttyprobe: the terminal, from ring 3
+ttyprobe: PASS a fresh terminal is canonical, echo on, 38400 baud in and 38400 out
+ttyprobe: PASS the window is 25 rows by 80 columns, 0 by 0 pixels
+
+[census] cpu0=idle/00015ec0 cpu1=idle1/000012dc cpu2=user-elf/00000e6c cpu3=idle3/00000f1f
+
+[where] cpu0 ring0 rip=0000000000118773
+
+
+[whe
+[where] cpu2[where]  rre] cpui1ng ring0 rip=00000003 rip=000118773
+cpu0000000040001a003 rin
+g0 rip=0000000000118773
+
+[census] cpu0=user-elf/00016335 cpu1=idle1/0000135f cpu2=idle2/00000ed4 cpu3=idle3/00000f9c
+
+[where] cpu0 ring3 rip=0000000040001a00
+
+[where] cpu2 ring0 rip
+=0000000000
+[wh118773
+[where] cpu1 ring0 rip=0ere] cpu3 ring0 rip=0000000000118773
+000000000118773
+
+[census] cpu0=idle/00016778 cpu1=idle1/000013d0 cpu2=idle2/00000f4c cpu3=user-elf/00000ff5
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[w
+[where]here] cpu
+[wher e] cpu3 ring3 rip=0000000cpu04001 rin2 ring0 rip=0000000g0 rip=1a000000000000118773
+
+0000118773
+
+[census] cpu0=user-elf/00016b86 cpu1=idle1/0000145b cpu2=idle2/00000fc3 cpu3=idle3/0000107b
+
+[where] cpu0 ring3 rip=0000000040001a00
+
+[where] cpu
+[where]2
+[w rihere] cpu cpu1 ring0 rip=3 ring0 rip=00000000001187730000
+ng0 rip=000000000000000118773
+0118773
+
+[census] cpu0=idle/00016fa5 cpu1=user-elf/000014dc cpu2=idle2/00001020 cpu3=idle3/000010f0
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[where] cpu1 ring3 rip=0000000040001a00
+
+[where] cpu2 ring0 rip
+[where] cpu3 ring0 rip=0000000000118773
+=0000000000118773
+
+[census] cpu0=idle/000173f4 cpu1=user-elf/00001560 cpu2=idle2/0000109e cpu3=idle3/0000116a
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[where] c
+[where] pu1 ring3 rip=000
+[where] cpu3 ring0 rip=0000000000040001a00
+0000118773
+cpu2 ring0 rip=0000000000118773
+
+[census] cpu0=idle/0001782e cpu1=user-elf/0000160d cpu2=idle2/00001123 cpu3=idle3/000011d0
+
+[where] cpu0 ring0 rip=0000000000118773
+
+[whe
+[wh
+[were] chre] puecp3re ring0 ri] p=000000u2c rin00g0pu1 r0011ing8773 rip=3 
+rip=0000000040001a00
+0000000000118773

@@ -77,6 +77,8 @@ void	irq_install(unsigned int irq, irq_handler_t);
  * something to disagree with.
  */
 #define	INTR_VEC_TLB		0xE0	/* forget these translations       */
+#define	INTR_VEC_RESCHED	0xE1	/* look at the runqueue            */
+#define	INTR_VEC_WHERE		0xE2	/* say where you are               */
 
 /*
  * Install a handler for a vector the LOCAL APIC delivers -- its timer, an

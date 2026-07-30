@@ -9,11 +9,15 @@
 
 #include "cpu.h"
 #include "cpuid.h"
+#include "fpu.h"
 #include "kprintf.h"
 #include "msr.h"
 #include "panic.h"
 #include "sched.h"
+#include "smap.h"
+#include "syscall.h"
 #include "thread.h"
+#include "uart.h"
 
 /*
  * The blocks themselves.
@@ -64,6 +68,56 @@ cpu_bsp_init(void)
 	 */
 	cpuid_count(1, 0, &eax, &ebx, &ecx, &edx);
 	cpus[0].cp_lapic_id = CPUID_1_EBX_APICID(ebx);
+}
+
+/*
+ * EVERYTHING A PROCESSOR HAS TO BE TOLD ABOUT ITSELF BEFORE IT CAN RUN A
+ * THREAD, in one place because the list is not obvious and every item on it
+ * fails silently and somewhere else.
+ *
+ * The boot processor got all of this from boot.S and from the bring-up in
+ * kmain, and none of it from the copy in the image: a control register is per
+ * CPU and an MSR is per CPU, so an application processor arriving later
+ * inherits exactly nothing.  What it does inherit is the page tables, the GDT
+ * layout, the IDT, and the kernel's opinions -- so the omission never looks
+ * like an omission.  It looks like:
+ *
+ *	no CR0.WP	-- ring 0 writes straight through a read-only page, so
+ *			   the copy-on-write fault that the kernel arranges on
+ *			   purpose simply does not happen ON THAT CPU, and two
+ *			   processes quietly share a page they each believe is
+ *			   private.
+ *	no CR4.OSFXSR	-- #UD on the first FXRSTOR, which is the first context
+ *			   switch this processor performs.
+ *	no CR4.SMAP	-- kernel code dereferences user pointers without
+ *			   faulting, on that CPU only.
+ *	no EFER.SCE	-- #UD on the first system call made by a thread that
+ *			   happened to be scheduled there.
+ *
+ * The boot processor does not call this -- it got CR0.WP from boot.S and the
+ * rest from kmain, one at a time and each with a line of log.  What keeps the
+ * two from drifting is that fpu_init, smap_enable_runtime and syscall_init are
+ * now split, and the halves this calls are the same functions they call: there
+ * is one copy of each fact, and this is the list of which facts there are.
+ */
+void
+cpu_state_init(void)
+{
+	uint64_t	cr0;
+
+	/*
+	 * Ring 0 obeys the read-only bit.  boot.S sets this beside CR0.PG for
+	 * the boot processor; the trampoline that starts an application
+	 * processor deliberately sets nothing it does not have to, so it
+	 * arrives without it.
+	 */
+	__asm__ __volatile__ ("mov %%cr0, %0" : "=r" (cr0));
+	cr0 |= ((uint64_t)1 << 16);
+	__asm__ __volatile__ ("mov %0, %%cr0" : : "r" (cr0));
+
+	fpu_init_cpu();
+	smap_init_cpu();
+	syscall_init_cpu();
 }
 
 void
@@ -173,6 +227,44 @@ cpu_online_count(void)
  * lock would buy consistency between fields nobody compares and cost the
  * ability to run this from a wedged CPU, which is when it is wanted most.
  */
+/*
+ * WHO IS ON EACH PROCESSOR, SAID WITHOUT THE CONSOLE.
+ *
+ * Everything else this kernel can say goes through kprintf, and kprintf goes
+ * through a lock that every processor shares -- so the one machine state
+ * where you most want to be told what is happening is the one state where
+ * nothing can tell you.  This writes bytes at the UART directly: no lock, no
+ * formatting, no cursor, nothing that can be held by the CPU being described.
+ *
+ * The numbers are printed a nibble at a time for the same reason.  It is
+ * ugly, it is meant to be, and it works when the pretty one cannot.
+ */
+void
+cpu_census_uart(void)
+{
+	static const char	 hex[] = "0123456789abcdef";
+	struct cpu		*cp;
+	struct thread		*th;
+	unsigned int		 i;
+	int			 sh;
+
+	uart_puts("\r\n[census]");
+	for (i = 0; i < ncpu_present; i++) {
+		cp = &cpus[i];
+		th = cp->cp_curthread;
+
+		uart_puts(" cpu");
+		uart_putc((char)('0' + (i % 10)));
+		uart_putc('=');
+		uart_puts(th != NULL && th->th_name != NULL ? th->th_name :
+		    (cp->cp_online != 0 ? "(parked)" : "(down)"));
+		uart_putc('/');
+		for (sh = 28; sh >= 0; sh -= 4)
+			uart_putc(hex[(cp->cp_switches >> sh) & 0xF]);
+	}
+	uart_puts("\r\n");
+}
+
 void
 cpu_dump(void)
 {
@@ -203,8 +295,15 @@ cpu_dump(void)
 			    (unsigned long long)cp->cp_kernel_rsp);
 			continue;
 		}
+		/*
+		 * The switch count is the line's reason for existing now that
+		 * there is more than one CPU: `running' is a snapshot and can
+		 * be idle on a processor that has done half the machine's
+		 * work, while this is the tally that says where the work went.
+		 */
 		kprintf("cpu %u: lapic %u, running %s, idle id=%llu, "
-		    "preempt %d%s, quantum %u/%u, kstack 0x%llx\n",
+		    "preempt %d%s, quantum %u/%u, %llu switches, "
+		    "kstack 0x%llx\n",
 		    (unsigned int)cp->cp_id, (unsigned int)cp->cp_lapic_id,
 		    th != NULL && th->th_name != NULL ? th->th_name : "-",
 		    cp->cp_idle_thread != NULL ?
@@ -212,6 +311,7 @@ cpu_dump(void)
 		    cp->cp_preempt_count,
 		    cp->cp_need_resched != 0 ? " (resched owed)" : "",
 		    cp->cp_quantum_used, (unsigned int)PREEMPT_QUANTUM_TICKS,
+		    (unsigned long long)cp->cp_switches,
 		    (unsigned long long)cp->cp_kernel_rsp);
 	}
 }

@@ -81,6 +81,52 @@
  */
 unsigned int	mp_start_aps(void);
 
+/*
+ * Let the started processors into the scheduler.
+ *
+ * SEPARATE FROM STARTING THEM, and the gap is deliberate.  A processor has to
+ * be started EARLY: the trampoline needs a page of conventional memory that
+ * later boot-time allocation would be entitled to take, and the messages that
+ * start it need the APIC, which comes up long before the rest of the machine.
+ * But it must not RUN anything until the per-CPU state it will inherit is
+ * settled -- CR4.SMAP is turned on near the end of boot and the SYSCALL
+ * registers with it, and a processor that missed either fails silently and
+ * somewhere else (see cpu_state_init).
+ *
+ * So they arrive, park answering invalidations, and are released here.
+ * Returns how many are now in the scheduler.
+ */
+unsigned int	mp_release_aps(void);
+
+/*
+ * Ask another processor to look at the runqueue.  Used by the scheduler when
+ * it queues a thread and finds a CPU sitting in idle's hlt -- that CPU would
+ * otherwise not notice until its own timer woke it a whole tick later, while
+ * the queue grew in front of a busy one.
+ *
+ * Sends and returns.  Whether the far processor took the hint is its business
+ * and costs nothing if it did not: the message only sets a flag it was going
+ * to look at anyway.
+ */
+struct cpu;
+void		mp_resched(struct cpu *cp);
+
+/*
+ * Ask every other processor where it is, and have each one answer for itself
+ * at the UART: ring and instruction pointer, out of the trapframe the
+ * question lands in.  Nothing else can answer it -- a program counter is not
+ * readable from another CPU, and every other instrument here reports the
+ * scheduler's opinion of a processor rather than the processor.
+ *
+ * For a machine that is busy and getting nothing done.  Takes no lock and
+ * touches no console, since that is the state it exists for.
+ */
+void		mp_where_all(void);
+
+/* The same answer for the CALLING processor, out of the frame it is in. */
+struct trapframe;
+void		mp_where(struct trapframe *tf);
+
 #endif /* !__ASSEMBLER__ */
 
 #endif /* !_MACHINE_MP_H_ */

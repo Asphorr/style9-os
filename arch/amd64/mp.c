@@ -12,6 +12,7 @@
 #include "cpu.h"
 #include "gdt.h"
 #include "idt.h"
+#include "intr.h"
 #include "kprintf.h"
 #include "lapic.h"
 #include "memmap.h"
@@ -19,6 +20,9 @@
 #include "msr.h"
 #include "pmap.h"
 #include "pmm.h"
+#include "sched.h"
+#include "thread.h"
+#include "uart.h"
 #include "tsc.h"
 
 /*
@@ -39,6 +43,14 @@
 #define	AP_ARRIVAL_WAIT_US	100000
 
 /*
+ * And how long to wait for a released processor to be standing in its own
+ * idle thread.  Generous for the same reason as ARRIVAL: what it has to do is
+ * a page of control-register writes and one kmalloc, which is nothing, so a
+ * processor still absent after a tenth of a second is absent.
+ */
+#define	AP_RELEASE_WAIT_US	100000
+
+/*
  * A stack per processor, in the same size the scheduler gives a thread, and
  * for the same reason: what runs on it is kernel code with an interrupt frame
  * possibly on top.  This one is only the BOOTSTRAP stack -- what an AP stands
@@ -55,6 +67,8 @@ static void	mp_wait_us(uint64_t us);
 static bool	mp_install_trampoline(void);
 static bool	mp_page_is_ram(uint64_t pa);
 static bool	mp_start_one(struct cpu *cp);
+static void	mp_resched_ipi(struct trapframe *tf);
+static void	mp_where_ipi(struct trapframe *tf);
 
 /*
  * Real-time wait, measured rather than counted.
@@ -218,6 +232,83 @@ mp_start_one(struct cpu *cp)
 	return (true);
 }
 
+/*
+ * "Look at the runqueue."  The whole message is the interrupt itself: the
+ * handler sets the flag the dispatcher's tail already consults, and the tail
+ * does the rest -- so there is nothing here that has to agree with anything
+ * in the scheduler beyond a flag it owns.
+ *
+ * Also what wakes a parked processor out of its hlt at release time, where
+ * the flag it sets is never looked at and the interrupt IS the message.
+ */
+static void
+mp_resched_ipi(struct trapframe *tf)
+{
+
+	(void)tf;
+	preempt_resched_request();
+}
+
+void
+mp_resched(struct cpu *cp)
+{
+
+	if (cp == NULL || cp->cp_online == 0)
+		return;
+	(void)lapic_ipi_vector(cp->cp_lapic_id, INTR_VEC_RESCHED);
+}
+
+/*
+ * "WHERE ARE YOU?" -- THE ONE QUESTION NO OTHER PROCESSOR CAN ANSWER FOR YOU.
+ *
+ * A CPU's program counter is not readable from anywhere else.  Everything
+ * this kernel can say about another processor -- what thread it holds, how
+ * many switches it has done -- describes the scheduler's opinion of it, and a
+ * processor stuck in a loop that never reaches the scheduler is invisible to
+ * all of it.  The only instrument that works is an interrupt: the far CPU
+ * takes it, and the trapframe it lands in IS its answer.
+ *
+ * Written at the UART with no lock and no console, like the census it belongs
+ * to, because the state worth asking this in is the state where the console
+ * is not answering.  The ring matters as much as the address: cs & 3 says
+ * whether that processor is spinning in the kernel or in a user program, and
+ * those are different bugs.
+ */
+void
+mp_where(struct trapframe *tf)
+{
+	static const char	hex[] = "0123456789abcdef";
+	int			sh;
+
+	uart_puts("\r\n[where] cpu");
+	uart_putc((char)('0' + (cpu_id() % 10)));
+	uart_puts((tf->tf_cs & 3) == 3 ? " ring3 rip=" : " ring0 rip=");
+	for (sh = 60; sh >= 0; sh -= 4)
+		uart_putc(hex[(tf->tf_rip >> sh) & 0xF]);
+	uart_puts("\r\n");
+}
+
+static void
+mp_where_ipi(struct trapframe *tf)
+{
+
+	mp_where(tf);
+}
+
+void
+mp_where_all(void)
+{
+	struct cpu	*me;
+	unsigned int	 i;
+
+	me = curcpu();
+	for (i = 0; i < cpu_present_count(); i++) {
+		if (&cpus[i] == me || cpus[i].cp_online == 0)
+			continue;
+		(void)lapic_ipi_vector(cpus[i].cp_lapic_id, INTR_VEC_WHERE);
+	}
+}
+
 unsigned int
 mp_start_aps(void)
 {
@@ -228,6 +319,13 @@ mp_start_aps(void)
 	present = cpu_present_count();
 	if (present <= 1)
 		return (0);
+
+	/*
+	 * Before the first processor exists, because the message that releases
+	 * it from its parking loop is this one.
+	 */
+	intr_install_local(INTR_VEC_RESCHED, mp_resched_ipi);
+	intr_install_local(INTR_VEC_WHERE, mp_where_ipi);
 
 	if (!lapic_present()) {
 		kprintf("mp: %u processor(s) described and no local APIC to "
@@ -250,6 +348,64 @@ mp_start_aps(void)
 	return (started);
 }
 
+unsigned int
+mp_release_aps(void)
+{
+	struct cpu	*me;
+	struct cpu	*cp;
+	uint64_t	 t0;
+	unsigned int	 present;
+	unsigned int	 joined;
+	unsigned int	 i;
+
+	me      = curcpu();
+	present = cpu_present_count();
+	joined  = 0;
+
+	for (i = 0; i < present; i++) {
+		cp = &cpus[i];
+		if (cp == me || cp->cp_online == 0)
+			continue;
+
+		/*
+		 * The flag first and the interrupt second: the flag is what is
+		 * read, and the interrupt is only what stops the hlt.  A
+		 * message that arrived before the flag was set would wake a
+		 * processor that then looked, saw nothing, and slept again --
+		 * and the next one is not coming.
+		 */
+		__atomic_store_n(&cp->cp_release, 1, __ATOMIC_RELEASE);
+		mp_resched(cp);
+
+		/*
+		 * Waited for one at a time, which serialises the bring-up the
+		 * same way starting them was serialised -- and for a better
+		 * reason: each of them allocates its idle thread, so letting
+		 * four into kmalloc at once would make the first exercise of
+		 * that lock a four-way race during boot, at the one moment
+		 * nothing has been tested yet.
+		 */
+		t0 = tsc_read();
+		while (cp->cp_curthread == NULL) {
+			if (tsc_to_us(tsc_read() - t0) > AP_RELEASE_WAIT_US) {
+				kprintf("mp: cpu %u was released and did not "
+				    "reach the scheduler in %u us\n",
+				    (unsigned int)cp->cp_id,
+				    (unsigned int)AP_RELEASE_WAIT_US);
+				break;
+			}
+			__asm__ __volatile__ ("pause");
+		}
+		if (cp->cp_curthread != NULL)
+			joined++;
+	}
+
+	kprintf("mp: %u application processor(s) in the scheduler, %u cpu(s) "
+	    "serving one runqueue\n", joined, joined + 1);
+
+	return (joined);
+}
+
 /*
  * WHERE AN APPLICATION PROCESSOR BECOMES ONE OF THIS KERNEL'S CPUS.
  *
@@ -260,18 +416,21 @@ mp_start_aps(void)
  * reference in this kernel reads physical page zero, and spin_lock is a
  * per-CPU reference.
  *
- * ⚠ AND THEN IT PARKS -- but no longer with interrupts off, and the change is
- * the point of this rung rather than a detail of it.  A processor that cannot
- * take an interrupt cannot be told to forget a page translation, and this one
- * caches translations from tables the boot processor is editing all the time.
- * Parked with interrupts ON it answers that one message and nothing else: its
- * timer is masked, its LINT0 carries nothing, and no runqueue has ever heard
- * of it.  It is asleep, and it can be woken to say "yes, I forgot it".
+ * THEN IT PARKS, and then it is let go -- two states rather than one, because
+ * a processor has to be STARTED early and must not RUN anything until late.
+ * Early, because the trampoline needs a page of conventional memory that boot
+ * would otherwise be entitled to hand out.  Late, because CR4.SMAP and the
+ * SYSCALL registers are turned on near the end of boot, and a processor that
+ * had already taken a thread would be running it with neither.
  *
- * What is still missing before it can be allowed to RUN anything is an idle
- * thread of its own, and a scheduler that knows a runqueue can be served by
- * more than one CPU.  Until then it sits here, where it can do no harm, and
- * says so in `cpu'.
+ * Parked, it answers exactly one thing: an invalidation.  Its timer is masked,
+ * its LINT0 carries nothing, no runqueue has heard of it.  It is asleep and
+ * wakeable to say "yes, I forgot it".
+ *
+ * Released, it collects the per-CPU state it inherited none of, adopts the
+ * stack it is standing on as a thread, becomes its own idle thread, arms its
+ * own timer, and joins the one runqueue.  From that point everything below is
+ * an ordinary CPU and nothing in this file is special about it.
  */
 void
 ap_entry(struct cpu *cp)
@@ -331,15 +490,48 @@ ap_entry(struct cpu *cp)
 	cpu_mark_online();
 
 	/*
+	 * PARKED UNTIL THE MACHINE IS READY FOR THIS PROCESSOR, answering
+	 * invalidations and nothing else.  What it is waiting for is the state
+	 * it will inherit: CR4.SMAP goes on near the end of boot, the SYSCALL
+	 * registers with it, and a processor that joined the scheduler before
+	 * them would run threads with neither.
+	 *
 	 * sti and hlt in one instruction pair, and in that order: hlt with
 	 * interrupts off is a processor that never wakes again, and an
 	 * interrupt arriving between an sti and a separate hlt would be
 	 * serviced and then slept through.  The pair is the idiom because the
 	 * architecture defers the effect of sti by one instruction for exactly
-	 * this reason.  cli on the way back so the next round is entered the
-	 * way this one was.
+	 * this reason.  cli on the way back so the flag is read, and everything
+	 * below it done, with interrupts off.
 	 */
-	for (;;) {
+	while (__atomic_load_n(&cp->cp_release, __ATOMIC_ACQUIRE) == 0)
 		__asm__ __volatile__ ("sti; hlt; cli");
-	}
+
+	/*
+	 * Every control register and MSR this kernel depends on and that a
+	 * processor owns a private copy of.  Before the scheduler, because the
+	 * first thing the scheduler will do for this CPU is an FXRSTOR, which
+	 * needs CR4.OSFXSR -- and because the first thing it may do after that
+	 * is run a user thread, which needs the other three.
+	 */
+	cpu_state_init();
+
+	/*
+	 * A thread of its own, an idle thread of its own, and a timer of its
+	 * own -- in that order, because the timer's interrupt debits a slice
+	 * and a slice belongs to a thread.  Announced before the timer starts
+	 * so the line cannot land in the middle of a preemption.
+	 */
+	sched_cpu_attach();
+
+	if (!lapic_timer_start_ap())
+		kprintf("cpu %u: *** no timer of its own -- nothing will "
+		    "preempt what runs here ***\n", cpu_id());
+
+	kprintf("cpu %u: in the scheduler, idle thread id=%llu, its own "
+	    "timer debiting its own slice\n", cpu_id(),
+	    (unsigned long long)cp->cp_idle_thread->th_id);
+
+	sched_cpu_idle();
+	/* NOTREACHED */
 }

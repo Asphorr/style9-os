@@ -32,6 +32,51 @@
  * thing that changes which one is in use is a thread coming into existence,
  * and that does not happen with a lock held.
  */
+/*
+ * A SPIN THAT DOES NOT END IS NOT SLOWNESS, AND IT SHOULD SAY SO.
+ *
+ * On one processor a contended spinlock was nearly a contradiction: the
+ * holder could not be preempted, so the wait was as long as the critical
+ * section and no longer.  With four, a wait can be unbounded -- two CPUs each
+ * holding what the other wants -- and the symptom is not a panic or a hang
+ * but a machine that is busy and gets nothing done, which is the hardest kind
+ * of failure to attribute.  The first four-processor boot of the scheduler
+ * had exactly that, and there was nothing in the kernel able to name it.
+ *
+ * So a wait long enough to be pathological reports itself: which lock, which
+ * CPU is holding it and from where, and who is waiting and from where.  Both
+ * sites by symbol, because the pair is the answer -- one address alone names
+ * a victim and not a cause.
+ *
+ * Reported and then waited on anyway.  A panic here would be a panic taken
+ * with interrupts off on a machine whose other processors are also spinning,
+ * and the report is worth more than the corpse.  Once per boot: the second
+ * report would be the same deadlock seen by the next CPU to arrive, and a
+ * console the wedged CPUs are queueing for is not one to flood.
+ */
+#define	SPIN_WATCHDOG_SPINS	(1u << 28)
+
+static volatile int	spin_watchdog_said;	/* (a) */
+
+static void
+spin_watchdog(const struct spinlock *sl, uintptr_t ra)
+{
+	int	expected;
+
+	expected = 0;
+	if (!__atomic_compare_exchange_n(&spin_watchdog_said, &expected, 1,
+	    false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+		return;
+
+	kprintf("\n*** spin_lock(%s): cpu %u has been waiting a very long "
+	    "time\n", sl->sl_name != NULL ? sl->sl_name : "?", cpu_id());
+	kprintf("  waiting from ");
+	ksym_print((uint64_t)ra);
+	kprintf("\n  held by cpu %d, taken at ", sl->sl_holder_cpu);
+	ksym_print((uint64_t)sl->sl_holder_rip);
+	kprintf("\n");
+}
+
 static inline int *
 spin_depth_slot(void)
 {
@@ -65,6 +110,7 @@ void
 spin_lock(struct spinlock *sl)
 {
 	uintptr_t	ra;
+	uint32_t	spins;
 	bool		was_on;
 
 	ra = (uintptr_t)__builtin_return_address(0);
@@ -135,9 +181,12 @@ spin_lock(struct spinlock *sl)
 	 * and a compare when there is nothing outstanding, which is every time
 	 * but the one that would otherwise be fatal.
 	 */
+	spins = 0;
 	while (__atomic_exchange_n(&sl->sl_state, 1u, __ATOMIC_ACQUIRE) != 0) {
 		pmap_tlb_poll();
 		__asm__ __volatile__ ("pause");
+		if (++spins == SPIN_WATCHDOG_SPINS)
+			spin_watchdog(sl, ra);
 	}
 
 	sl->sl_holder_rip = ra;

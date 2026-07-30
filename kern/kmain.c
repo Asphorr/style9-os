@@ -36,6 +36,7 @@
 #include "memmap.h"
 #include "mp.h"
 #include "mutex.h"
+#include "pit.h"
 #include "mouse.h"
 #include "mouse_drv.h"
 #include "panic.h"
@@ -424,6 +425,16 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	smap_init();
 	(void)smap_enable_runtime();
 
+	/*
+	 * AND NOW THE OTHER PROCESSORS, which have been parked since they
+	 * arrived.  Here rather than beside mp_start_aps because the two lines
+	 * above are the last of the per-CPU state a thread depends on: CR4.SMAP
+	 * and the SYSCALL registers.  A processor released before them would
+	 * run user threads with neither, and would say nothing about it.
+	 */
+	if (mp_release_aps() != 0)
+		sched_smp_selftest();
+
 	progreg_init();
 
 	/*
@@ -448,8 +459,18 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 
 		hello_id = progreg_spawn("hello");
 		if (hello_id > 0) {
+			/*
+			 * ⚠ NAPPING RATHER THAN YIELDING, and the difference is
+			 * not politeness.  A yield here waited for hello.elf
+			 * only while hello.elf was queued behind this thread;
+			 * with the other processors in the scheduler it runs
+			 * beside it, so the yield returned at once and this
+			 * loop became 350,000 context switches a second, which
+			 * cost this CPU its timer ticks and the machine its
+			 * clock.  See sched_nap_ms.
+			 */
 			while (task_is_alive((uint64_t)hello_id))
-				thread_yield();
+				sched_nap_ms(1);
 			sched_reap_zombies();
 		} else {
 			kprintf("kmain: spawn(hello) failed rv=%ld\n",

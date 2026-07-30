@@ -122,6 +122,34 @@ struct thread {
 	uint64_t		 th_wake_ms;		/* (sched_lock)     */
 
 	/*
+	 * ⚠ A WAKE THAT ARRIVED BEFORE THE SLEEP, WHICH ONLY A SECOND
+	 * PROCESSOR CAN DO.
+	 *
+	 * thread_wake on a thread that is not BLOCKED used to return doing
+	 * nothing, and that was right: the thread was READY or RUNNING, so
+	 * the news it was being woken for could not be missed.  With one
+	 * processor the third possibility -- that it is BETWEEN, having
+	 * decided to sleep and not yet committed -- could not arise, because
+	 * deciding and committing happen with no window in which anything
+	 * else on that CPU could run.
+	 *
+	 * With four it arises constantly, and the ATA driver is where it
+	 * showed: a thread installs itself as the channel's waiter, and the
+	 * disk's interrupt lands on ANOTHER processor and posts the wake
+	 * before this one has reached THREAD_BLOCKED.  The wake found a
+	 * RUNNING thread, did nothing, and the thread then slept for ever --
+	 * one boot in four, always inside a filesystem write, always with the
+	 * machine otherwise healthy.
+	 *
+	 * So a wake that finds nobody asleep leaves a note, and the next
+	 * attempt to sleep reads it and does not sleep.  The caller's loop
+	 * re-tests its condition and finds what the wake was about, which is
+	 * the contract every sleeper in this kernel already keeps -- waking is
+	 * a hint, never a promise, and everyone parks inside for (;;).
+	 */
+	volatile int		 th_wake_pending;	/* (sched_lock)     */
+
+	/*
 	 * ...and the two facts that explain a slow one, recorded at the same
 	 * moment: how many threads were already queued ahead of this one, and
 	 * who held the CPU while it waited.  A duration alone says a wake was
@@ -207,6 +235,19 @@ struct thread {
 #define	THREAD_DEFAULT_KSTACK	(16 * 1024)	/* 4 pages */
 
 void		thread_subsystem_init(void);
+
+/*
+ * Give the context that is ALREADY RUNNING a thread structure and make it this
+ * CPU's current thread.  A processor cannot switch away from a thread that
+ * does not exist, so this is what a CPU does before it joins the scheduler --
+ * the boot processor inside kmain, and every application processor standing on
+ * the stack its trampoline handed it.
+ *
+ * The stack belongs to the caller and is never freed by the reaper.  Returns
+ * NULL only if there is no memory for the structure.
+ */
+struct thread	*thread_adopt_current(struct task *, const char *name);
+
 struct thread	*thread_create(struct task *,
 		    void (*entry)(void *), void *arg, const char *name);
 void		thread_start(struct thread *);

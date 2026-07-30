@@ -32,14 +32,70 @@ struct thread;
  */
 
 void		sched_init(void);
+
+/*
+ * Bring the CALLING processor into the scheduler: adopt the context it is
+ * already running as its idle thread, so it has somewhere to switch away
+ * from and somewhere to stand when the queue is empty.  For application
+ * processors -- the boot processor gets both from sched_init, in the other
+ * order, because the context it is running has work left to do.
+ */
+void		sched_cpu_attach(void);
+
+/*
+ * ...and then never come back.  Runs this CPU's idle thread, which reaps,
+ * yields when there is work, and sleeps when there is not.
+ */
+void		sched_cpu_idle(void) __attribute__((noreturn));
+
+/*
+ * Eight threads for a tenth of a second each, and a bit set by each one out
+ * of its own CPU's block.  Proof that a thread queued anywhere can run
+ * anywhere, which no bookkeeping on the queueing side could fake.
+ */
+void		sched_smp_selftest(void);
 void		sched_enqueue(struct thread *);
 
 /*
  * thread_yield: put current at the tail of the runqueue and switch
  * to whoever's at the head.  If the runqueue is empty the idle thread
  * runs.  Returns when the caller is rescheduled.
+ *
+ * ⚠ RETURNS WHETHER IT ACTUALLY SWITCHED, and that answer is the whole
+ * difference between a yield on one processor and a yield on four.
+ *
+ * A poll loop counted in yields -- "give somebody else a turn, then look
+ * again" -- was a way of waiting, because a yield with work queued behind it
+ * did not come back until that work had had the CPU.  With several
+ * processors the work being waited for is usually RUNNING somewhere else
+ * rather than queued here, so the yield finds an empty runqueue and returns
+ * at once, and a budget of sixty-four turns is spent in microseconds.  That
+ * is not a hypothetical: it is what broke the first four-processor boot of
+ * this kernel, in userspace, sixty-four times faster than it used to.
+ *
+ * So a caller that is polling can tell the two apart.  True means somebody
+ * else got the CPU and something may have changed; false means there was
+ * nobody to give it to, and the caller should wait in TIME instead --
+ * see poll_turn in lib/style9_sys.c, which is what every such loop calls now.
  */
-void		thread_yield(void);
+bool		thread_yield(void);
+
+/*
+ * Give up the CPU for about `ms' of real time.
+ *
+ * ⚠ WHAT EVERY `while (not yet) thread_yield()' LOOP IN THIS KERNEL MUST USE
+ * once more than one processor runs threads.  A yield is a way of waiting
+ * only while the thing being waited for is queued BEHIND the waiter; with
+ * several processors it is running beside it, the yield returns at once, and
+ * the loop becomes a spin that takes the scheduler's global lock hundreds of
+ * thousands of times a second with interrupts off -- which costs the CPU its
+ * timer ticks, which stops the clock, which stops every deadline in the
+ * system.  See sched_nap_ms in sched.c for the boot that did exactly that.
+ *
+ * Resolution is one timer tick: a request for one millisecond gets one tick,
+ * because a tick is when deadlines are looked at.
+ */
+void		sched_nap_ms(uint64_t ms);
 
 /*
  * thread_block: mark current BLOCKED, record reason and target, then

@@ -86,3 +86,24 @@ smap_enable_runtime(void)
 	kprintf("smap: enabled (CR4.SMAP=1)\n");
 	return (true);
 }
+
+/*
+ * CR4.SMAP is per-processor, and smap_enabled is not.
+ *
+ * A processor brought up after the bit was turned on would otherwise run with
+ * it clear -- and the failure that follows is the quiet kind: kernel code
+ * would dereference a user pointer without faulting, on that CPU only, which
+ * is the exact protection this exists to provide reading as "works".
+ */
+void
+smap_init_cpu(void)
+{
+	uint64_t	cr4;
+
+	if (!smap_enabled)
+		return;
+
+	__asm __volatile("mov %%cr4, %0" : "=r"(cr4));
+	cr4 |= (1ull << 21);
+	__asm __volatile("mov %0, %%cr4" : : "r"(cr4));
+}

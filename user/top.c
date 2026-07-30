@@ -100,7 +100,7 @@ main(void)
 		}
 		if (s != TOP_SAMPLES) {
 			for (i = 0; i < TOP_YIELD_GAP; i++)
-				(void)yield();
+				(void)poll_turn();
 		}
 	}
 

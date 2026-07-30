@@ -119,9 +119,21 @@ page_get(unsigned drive, uint64_t page, bool *retry)
 		if (bio_bufs[i].bb_page != page || bio_bufs[i].bb_drive != drive)
 			continue;
 		if (bio_bufs[i].bb_busy) {
-			/* Someone else is fetching it; wait outside the lock. */
+			/*
+			 * Someone else is fetching it; wait outside the lock.
+			 *
+			 * ⚠ AND WAIT IN TIME IF THERE WAS NOBODY TO YIELD TO.
+			 * The fetching thread is asleep on the disk, so with
+			 * several processors this CPU's runqueue can be empty
+			 * and the yield returns at once -- turning a wait for
+			 * a device into a spin that hammers the very lock the
+			 * fetcher needs to finish.  A yield that DID switch is
+			 * still a wait and costs nothing extra, which is why
+			 * the nap is the fallback and not the rule.
+			 */
 			spin_unlock(&bio_lock);
-			thread_yield();
+			if (!thread_yield())
+				sched_nap_ms(1);
 			spin_lock(&bio_lock);
 			*retry = true;
 			return (NULL);
@@ -147,7 +159,8 @@ page_get(unsigned drive, uint64_t page, bool *retry)
 	}
 	if (victim == NULL) {			/* every buffer is in flight */
 		spin_unlock(&bio_lock);
-		thread_yield();
+		if (!thread_yield())
+			sched_nap_ms(1);
 		spin_lock(&bio_lock);
 		*retry = true;
 		return (NULL);

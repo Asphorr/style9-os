@@ -40,6 +40,12 @@ extern bool	smap_supported;	/* (c) const after smap_init           */
 void		smap_init(void);
 bool		smap_enable_runtime(void);
 
+/*
+ * Set CR4.SMAP on the CALLING processor, if the kernel has turned SMAP on.
+ * The flag is kernel-wide; the register bit is one per CPU.
+ */
+void		smap_init_cpu(void);
+
 static inline void
 smap_user_access_begin(void)
 {

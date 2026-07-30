@@ -1255,7 +1255,7 @@ demo_launchctl_spawn(void)
 	}
 	(void)child_id;
 	for (i = 0; i < 256; i++)
-		(void)yield();
+		(void)poll_turn();
 	return (0);
 }
 
@@ -1282,10 +1282,10 @@ demo_selfkill_spawn(void)
 	}
 	alive = 1;
 	for (i = 0; i < 128 && alive; i++) {
-		(void)yield();
+		(void)poll_turn();
 		alive = task_alive((uint64_t)child_id);
 	}
-	printf("  task_alive(%ld) after self-kill: %s (waited %d yields)\n",
+	printf("  task_alive(%ld) after self-kill: %s (waited %d turns)\n",
 	    child_id, alive ? "yes (kill failed)" : "no (kill landed)", i);
 	return (0);
 }
@@ -1330,18 +1330,18 @@ demo_parent_managed_kill(void)
 	 * correctness issue but a cleaner narrative in the boot log.
 	 */
 	for (i = 0; i < 16; i++)
-		(void)yield();
+		(void)poll_turn();
 
 	rv = task_kill(taskport);
 	printf("  task_kill(taskport) -> %d\n", rv);
 
 	alive = 1;
 	for (i = 0; i < 64 && alive; i++) {
-		(void)yield();
+		(void)poll_turn();
 		alive = task_alive((uint64_t)child_id);
 	}
 	printf("  task_alive(%ld) after parent-managed kill: %s "
-	    "(waited %d yields)\n",
+	    "(waited %d turns)\n",
 	    child_id,
 	    alive ? "yes (capability path BROKEN)" : "no (capability path OK)",
 	    i);
@@ -1378,19 +1378,28 @@ demo_compute_kill_spawn(void)
 	/*
 	 * Wait for loopchild to register its task-self under bootstrap.
 	 * Polling on bootstrap_lookup is cheap (a single RPC); a handful
-	 * of yields lets the child reach the register-then-enter-loop
+	 * of turns lets the child reach the register-then-enter-loop
 	 * point.
+	 *
+	 * ⚠ TURNS, NOT YIELDS, and this loop is the one that found out why.
+	 * On one processor a yield handed the CPU to the child, so sixty-four
+	 * of them were sixty-four chances for it to get somewhere.  On four,
+	 * the child is already running elsewhere, this CPU's runqueue is empty,
+	 * and sixty-four yields are spent in microseconds -- so this printed
+	 * "lookup failed after 64 yields" on the first boot that had other
+	 * processors in the scheduler.  poll_turn waits when the yield had
+	 * nobody to yield to; see lib/style9_sys.c.
 	 */
 	tport = MACH_PORT_NULL;
 	for (i = 0; i < 64 && tport == MACH_PORT_NULL; i++) {
-		(void)yield();
+		(void)poll_turn();
 		tport = bootstrap_lookup("loopchild.tport");
 	}
 	if (tport == MACH_PORT_NULL) {
-		printf("  loopchild.tport lookup failed after %d yields\n", i);
+		printf("  loopchild.tport lookup failed after %d turns\n", i);
 		return (79);
 	}
-	printf("  loopchild.tport = 0x%x (after %d lookup yields)\n",
+	printf("  loopchild.tport = 0x%x (after %d lookup turns)\n",
 	    (unsigned)tport, i);
 
 	rv = task_kill(tport);
@@ -1403,10 +1412,10 @@ demo_compute_kill_spawn(void)
 	 */
 	alive = 1;
 	for (i = 0; i < 128 && alive; i++) {
-		(void)yield();
+		(void)poll_turn();
 		alive = task_alive((uint64_t)child_id);
 	}
-	printf("  task_alive(%ld) after task_kill: %s (waited %d yields)\n",
+	printf("  task_alive(%ld) after task_kill: %s (waited %d turns)\n",
 	    child_id, alive ? "yes (IRQ-return MISSED)" : "no (IRQ-return OK)",
 	    i);
 
@@ -1433,7 +1442,7 @@ demo_vmmap_spawn(void)
 	}
 	(void)child_id;
 	for (i = 0; i < 64; i++)
-		(void)yield();
+		(void)poll_turn();
 	return (0);
 }
 
@@ -1469,7 +1478,7 @@ demo_lsmp_spawn(void)
 	 * which is harmless.
 	 */
 	for (i = 0; i < 64; i++)
-		(void)yield();
+		(void)poll_turn();
 	return (0);
 }
 
@@ -1495,7 +1504,7 @@ demo_top_spawn(void)
 	}
 	(void)child_id;
 	for (i = 0; i < 160; i++)
-		(void)yield();
+		(void)poll_turn();
 	return (0);
 }
 
@@ -1573,9 +1582,9 @@ demo_stale_taskport(void)
 
 	/* Wait for the task to leave the live list (struct task freed). */
 	for (i = 0; i < 256 && task_alive((uint64_t)child_id); i++)
-		(void)yield();
+		(void)poll_turn();
 	if (task_alive((uint64_t)child_id)) {
-		printf("  child still alive after 256 yields; "
+		printf("  child still alive after 256 turns; "
 		    "skipping stale assertion\n");
 		(void)mach_port_deallocate(tport);
 		return (0);
@@ -1652,10 +1661,10 @@ demo_spawn_argv(void)
 
 	/* Give argecho the CPU to run + print, then confirm it retired. */
 	for (i = 0; i < 64 && task_alive((uint64_t)child_id); i++)
-		(void)yield();
+		(void)poll_turn();
 
 	(void)mach_port_deallocate(taskport);
-	printf("  argecho retired after %d yields\n", i);
+	printf("  argecho retired after %d turns\n", i);
 	return (0);
 }
 
@@ -1690,10 +1699,10 @@ demo_macho_spawn(void)
 		return (86);
 	}
 	for (i = 0; i < 64 && task_alive((uint64_t)child_id); i++)
-		(void)yield();
+		(void)poll_turn();
 	if (taskport != MACH_PORT_NULL)
 		(void)mach_port_deallocate(taskport);
-	printf("  thin Mach-O retired after %d yields\n", i);
+	printf("  thin Mach-O retired after %d turns\n", i);
 
 	child_id = spawn("machotest_fat");
 	if (child_id < 0) {
@@ -1701,8 +1710,8 @@ demo_macho_spawn(void)
 		return (87);
 	}
 	for (i = 0; i < 64 && task_alive((uint64_t)child_id); i++)
-		(void)yield();
-	printf("  fat Mach-O (x86_64 slice) retired after %d yields\n", i);
+		(void)poll_turn();
+	printf("  fat Mach-O (x86_64 slice) retired after %d turns\n", i);
 	return (0);
 }
 
@@ -1735,8 +1744,8 @@ demo_darwin_spawn(void)
 		return (88);
 	}
 	for (i = 0; i < 64 && task_alive((uint64_t)child_id); i++)
-		(void)yield();
-	printf("  darwinhello (Darwin ABI) retired after %d yields\n", i);
+		(void)poll_turn();
+	printf("  darwinhello (Darwin ABI) retired after %d turns\n", i);
 
 	child_id = spawn("darwinmsg");
 	if (child_id < 0) {
@@ -1744,8 +1753,8 @@ demo_darwin_spawn(void)
 		return (89);
 	}
 	for (i = 0; i < 64 && task_alive((uint64_t)child_id); i++)
-		(void)yield();
-	printf("  darwinmsg (Darwin mach_msg) retired after %d yields\n", i);
+		(void)poll_turn();
+	printf("  darwinmsg (Darwin mach_msg) retired after %d turns\n", i);
 
 	child_id = spawn("dyldhello");
 	if (child_id < 0) {
@@ -1753,8 +1762,8 @@ demo_darwin_spawn(void)
 		return (90);
 	}
 	for (i = 0; i < 64 && task_alive((uint64_t)child_id); i++)
-		(void)yield();
-	printf("  dyldhello (dyld + libSystem) retired after %d yields\n", i);
+		(void)poll_turn();
+	printf("  dyldhello (dyld + libSystem) retired after %d turns\n", i);
 
 	child_id = spawn("dyldbig");
 	if (child_id < 0) {
@@ -1762,9 +1771,9 @@ demo_darwin_spawn(void)
 		return (91);
 	}
 	for (i = 0; i < 64 && task_alive((uint64_t)child_id); i++)
-		(void)yield();
+		(void)poll_turn();
 	printf("  dyldbig (real-Apple base 0x100000000, relocated low) retired "
-	    "after %d yields\n", i);
+	    "after %d turns\n", i);
 
 	/*
 	 * dirlist: a self-authored Darwin-ABI probe that walks the FAT volume
@@ -1779,9 +1788,9 @@ demo_darwin_spawn(void)
 		return (93);
 	}
 	for (i = 0; i < 256 && task_alive((uint64_t)child_id); i++)
-		(void)yield();
+		(void)poll_turn();
 	printf("  dirlist (opendir/readdir probe) retired after %d "
-	    "yields\n", i);
+	    "turns\n", i);
 
 	/*
 	 * The host port: the kernel object behind mach_host_self().  A pure
@@ -1947,8 +1956,8 @@ demo_darwin_spawn(void)
 			return (92);
 		}
 		for (i = 0; i < 256 && task_alive((uint64_t)child_id); i++)
-			(void)yield();
-		printf("  figlet retired after %d yields\n", i);
+			(void)poll_turn();
+		printf("  figlet retired after %d turns\n", i);
 	}
 
 	/*
@@ -1973,8 +1982,8 @@ demo_darwin_spawn(void)
 			return (94);
 		}
 		for (i = 0; i < 512 && task_alive((uint64_t)child_id); i++)
-			(void)yield();
-		printf("  tree retired after %d yields\n", i);
+			(void)poll_turn();
+		printf("  tree retired after %d turns\n", i);
 	}
 
 	/*
@@ -2008,8 +2017,8 @@ demo_darwin_spawn(void)
 			return (95);
 		}
 		for (i = 0; i < 512 && task_alive((uint64_t)child_id); i++)
-			(void)yield();
-		printf("  gcat retired after %d yields\n", i);
+			(void)poll_turn();
+		printf("  gcat retired after %d turns\n", i);
 	}
 
 	/*
@@ -2043,8 +2052,8 @@ demo_darwin_spawn(void)
 			return (96);
 		}
 		for (i = 0; i < 4096 && task_alive((uint64_t)child_id); i++)
-			(void)yield();
-		printf("  gls retired after %d yields\n", i);
+			(void)poll_turn();
+		printf("  gls retired after %d turns\n", i);
 	}
 
 	/*
@@ -2066,8 +2075,8 @@ demo_darwin_spawn(void)
 			return (95);
 		}
 		for (i = 0; i < 512 && task_alive((uint64_t)child_id); i++)
-			(void)yield();
-		printf("  timeprobe retired after %d yields\n", i);
+			(void)poll_turn();
+		printf("  timeprobe retired after %d turns\n", i);
 	}
 
 	/*
@@ -2090,8 +2099,8 @@ demo_darwin_spawn(void)
 			return (95);
 		}
 		for (i = 0; i < 4096 && task_alive((uint64_t)child_id); i++)
-			(void)yield();
-		printf("  mmaptest retired after %d yields\n", i);
+			(void)poll_turn();
+		printf("  mmaptest retired after %d turns\n", i);
 	}
 
 	/*
@@ -2115,8 +2124,8 @@ demo_darwin_spawn(void)
 			return (96);
 		}
 		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
-			(void)yield();
-		printf("  filewrite retired after %d yields\n", i);
+			(void)poll_turn();
+		printf("  filewrite retired after %d turns\n", i);
 	}
 
 	/*
@@ -2145,8 +2154,8 @@ demo_darwin_spawn(void)
 			return (97);
 		}
 		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
-			(void)yield();
-		printf("  ttyprobe retired after %d yields\n", i);
+			(void)poll_turn();
+		printf("  ttyprobe retired after %d turns\n", i);
 	}
 
 	/*
@@ -2174,8 +2183,8 @@ demo_darwin_spawn(void)
 			return (98);
 		}
 		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
-			(void)yield();
-		printf("  gstty[-a] retired after %d yields\n", i);
+			(void)poll_turn();
+		printf("  gstty[-a] retired after %d turns\n", i);
 
 		stty_argv[1] = "-echo";
 		stty_tp = MACH_PORT_NULL;
@@ -2187,8 +2196,8 @@ demo_darwin_spawn(void)
 			return (98);
 		}
 		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
-			(void)yield();
-		printf("  gstty[-echo] retired after %d yields\n", i);
+			(void)poll_turn();
+		printf("  gstty[-echo] retired after %d turns\n", i);
 
 		stty_argv[1] = "sane";
 		stty_tp = MACH_PORT_NULL;
@@ -2199,8 +2208,8 @@ demo_darwin_spawn(void)
 			return (98);
 		}
 		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
-			(void)yield();
-		printf("  gstty[sane] retired after %d yields\n", i);
+			(void)poll_turn();
+		printf("  gstty[sane] retired after %d turns\n", i);
 	}
 
 	/*
@@ -2231,8 +2240,8 @@ demo_darwin_spawn(void)
 			return (99);
 		}
 		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
-			(void)yield();
-		printf("  gmkdir retired after %d yields\n", i);
+			(void)poll_turn();
+		printf("  gmkdir retired after %d turns\n", i);
 
 		dir_argv[0] = "gls";
 		dir_argv[1] = "-ld";
@@ -2243,7 +2252,7 @@ demo_darwin_spawn(void)
 		if (child_id >= 0)
 			for (i = 0; i < 8192 &&
 			    task_alive((uint64_t)child_id); i++)
-				(void)yield();
+				(void)poll_turn();
 
 		dir_argv[0] = "grmdir";
 		dir_argv[1] = "/etc/appledir";
@@ -2256,8 +2265,8 @@ demo_darwin_spawn(void)
 			return (99);
 		}
 		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
-			(void)yield();
-		printf("  grmdir retired after %d yields\n", i);
+			(void)poll_turn();
+		printf("  grmdir retired after %d turns\n", i);
 	}
 
 	/*
@@ -2284,8 +2293,8 @@ demo_darwin_spawn(void)
 			return (95);
 		}
 		for (i = 0; i < 512 && task_alive((uint64_t)child_id); i++)
-			(void)yield();
-		printf("  guname retired after %d yields\n", i);
+			(void)poll_turn();
+		printf("  guname retired after %d turns\n", i);
 	}
 
 	/*
@@ -2324,8 +2333,8 @@ demo_darwin_spawn(void)
 			}
 			for (i = 0; i < 4096 &&
 			    task_alive((uint64_t)child_id); i++)
-				(void)yield();
-			printf("  gfactor[%d] retired after %d yields\n", t, i);
+				(void)poll_turn();
+			printf("  gfactor[%d] retired after %d turns\n", t, i);
 		}
 	}
 
@@ -2351,8 +2360,8 @@ demo_darwin_spawn(void)
 			return (97);
 		}
 		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
-			(void)yield();
-		printf("  pipefork retired after %d yields\n", i);
+			(void)poll_turn();
+		printf("  pipefork retired after %d turns\n", i);
 
 		printf("  >>> genv /bin/gfactor 42 -- a REAL Apple binary "
 		    "exec(2)ing another <<<\n");
@@ -2368,8 +2377,8 @@ demo_darwin_spawn(void)
 			return (98);
 		}
 		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
-			(void)yield();
-		printf("  genv retired after %d yields\n", i);
+			(void)poll_turn();
+		printf("  genv retired after %d turns\n", i);
 
 		printf("  >>> gtimeout 10 /bin/gfactor 42 -- a REAL Apple "
 		    "binary fork+exec+waiting another <<<\n");
@@ -2386,8 +2395,8 @@ demo_darwin_spawn(void)
 			return (99);
 		}
 		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
-			(void)yield();
-		printf("  gtimeout retired after %d yields\n", i);
+			(void)poll_turn();
+		printf("  gtimeout retired after %d turns\n", i);
 	}
 
 	/*
@@ -2417,8 +2426,8 @@ demo_darwin_spawn(void)
 			return (100);
 		}
 		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
-			(void)yield();
-		printf("  dash[builtin] retired after %d yields\n", i);
+			(void)poll_turn();
+		printf("  dash[builtin] retired after %d turns\n", i);
 
 		printf("  >>> dash -c 'echo 600851475143 | gfactor' -- a "
 		    "shell pipeline <<<\n");
@@ -2431,8 +2440,8 @@ demo_darwin_spawn(void)
 			return (101);
 		}
 		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
-			(void)yield();
-		printf("  dash[pipeline] retired after %d yields\n", i);
+			(void)poll_turn();
+		printf("  dash[pipeline] retired after %d turns\n", i);
 
 		/*
 		 * REDIRECTION, which is a shell writing to the disk.
@@ -2463,8 +2472,8 @@ demo_darwin_spawn(void)
 			return (103);
 		}
 		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
-			(void)yield();
-		printf("  dash[redirect] retired after %d yields\n", i);
+			(void)poll_turn();
+		printf("  dash[redirect] retired after %d turns\n", i);
 
 		printf("  >>> dash /bin/demo.sh -- a shell SCRIPT from the "
 		    "synthetic /bin <<<\n");
@@ -2478,8 +2487,8 @@ demo_darwin_spawn(void)
 			return (102);
 		}
 		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
-			(void)yield();
-		printf("  dash[script] retired after %d yields\n", i);
+			(void)poll_turn();
+		printf("  dash[script] retired after %d turns\n", i);
 
 		printf("  >>> dash -i  -- a REAL Apple shell, INTERACTIVE "
 		    "over a scripted console feed <<<\n");
@@ -2503,8 +2512,8 @@ demo_darwin_spawn(void)
 			return (103);
 		}
 		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
-			(void)yield();
-		printf("  dash[interactive] retired after %d yields\n", i);
+			(void)poll_turn();
+		printf("  dash[interactive] retired after %d turns\n", i);
 	}
 	return (0);
 }

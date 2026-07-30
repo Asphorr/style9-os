@@ -96,7 +96,7 @@ static bool	user_range_ok(uint64_t addr, size_t len);
  * direction.
  */
 void
-syscall_init(void)
+syscall_init_cpu(void)
 {
 	uint64_t	star;
 
@@ -108,6 +108,13 @@ syscall_init(void)
 
 	wrmsr(MSR_LSTAR, (uint64_t)(uintptr_t)&syscall_entry);
 	wrmsr(MSR_FMASK, RFLAGS_IF | RFLAGS_DF);
+}
+
+void
+syscall_init(void)
+{
+
+	syscall_init_cpu();
 
 	kprintf("syscall: enabled, entry=%p\n",
 	    (void *)(uintptr_t)&syscall_entry);
@@ -378,8 +385,15 @@ static long
 sys_yield(void)
 {
 
-	thread_yield();
-	return (0);
+	/*
+	 * 1 if somebody else got the CPU, 0 if there was nobody to give it to.
+	 * Ring 3 needs the difference for the same reason the kernel does: a
+	 * poll loop counted in yields stops being a way of waiting the moment
+	 * the thing being waited for runs on another processor instead of
+	 * queueing behind this one.  See thread_yield's comment, and poll_turn
+	 * in libstyle9, which is what the loops call.
+	 */
+	return (thread_yield() ? 1 : 0);
 }
 
 /*

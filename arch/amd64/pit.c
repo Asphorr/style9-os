@@ -8,9 +8,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "cpu.h"
 #include "intr.h"
 #include "io.h"
 #include "kprintf.h"
+#include "mp.h"
 #include "panic.h"
 #include "pic.h"
 #include "pit.h"
@@ -46,6 +48,12 @@ static unsigned int		pit_actual_hz;		/* (c) */
 static bool			pit_debits_slice = true;
 
 static void	pit_isr(struct trapframe *tf);
+
+/*
+ * How often to print the census, in ticks; zero for never.  Set from the
+ * shell (`cpu census N') or from a boot that is being chased.
+ */
+uint64_t	pit_census_ticks;
 
 void
 pit_init(unsigned int hz)
@@ -101,6 +109,25 @@ pit_isr(struct trapframe *tf)
 
 	(void)tf;
 	__atomic_add_fetch(&pit_tick_count, 1, __ATOMIC_RELEASE);
+
+	/*
+	 * A CENSUS OF THE PROCESSORS, WRITTEN STRAIGHT AT THE SERIAL PORT.
+	 *
+	 * The tool of last resort, and the one that was missing.  A machine
+	 * whose processors are all busy and whose log has stopped is telling
+	 * you nothing at all, and every instrument this kernel has for saying
+	 * what a CPU is doing goes through the console -- which is exactly
+	 * what a wedge takes away.  So this one goes nowhere near it: no lock,
+	 * no formatting, no tty, one byte at a time at the UART.
+	 *
+	 * It is not free and it is not pretty, so it is off unless asked for.
+	 */
+	if (pit_census_ticks != 0 &&
+	    (pit_tick_count % pit_census_ticks) == 0) {
+		cpu_census_uart();
+		mp_where(tf);
+		mp_where_all();
+	}
 
 	/*
 	 * Track quantum usage for whatever is running on THIS CPU -- the

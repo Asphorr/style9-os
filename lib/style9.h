@@ -97,7 +97,25 @@ long	syscall4(long nr, long a0, long a1, long a2, long a3);
 /* ---- process ------------------------------------------------------- */
 
 void	exit(int code) __attribute__((noreturn));
+/*
+ * Give up the CPU.  Returns 1 if somebody else took it, 0 if there was nobody
+ * to give it to -- which on a machine with more than one processor is the
+ * common answer and does not mean the machine is idle, only that this CPU's
+ * runqueue is.
+ */
 long	yield(void);
+
+/*
+ * One turn of a poll loop: yield, and if that yielded to nobody, wait a
+ * moment of real time instead.
+ *
+ * ⚠ EVERY BOUNDED "wait for the other task" LOOP MUST USE THIS RATHER THAN
+ * yield().  A budget counted in yields was a budget counted in time only
+ * while there was one processor: with several, the task being waited for runs
+ * elsewhere instead of queueing behind this one, so the yields return at once
+ * and sixty-four of them are spent in microseconds.  See style9_sys.c.
+ */
+long	poll_turn(void);
 
 /*
  * Spawn the named program (looks up in the kernel's progreg).  Returns

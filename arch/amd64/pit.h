@@ -45,4 +45,11 @@ unsigned int	pit_hz(void);
  */
 void		pit_release_preempt(void);
 
+/*
+ * How often the per-processor census is written straight at the UART, in
+ * ticks; zero for never, which is the default.  See cpu_census_uart -- this
+ * is the instrument for a machine whose console has stopped answering.
+ */
+extern uint64_t	pit_census_ticks;
+
 #endif /* !_MACHINE_PIT_H_ */
