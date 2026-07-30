@@ -10,6 +10,20 @@
 # looking set of tests against nothing at all, which reads as a pass.  That has
 # happened twice, so this checks the kernel found a drive and throws if it did
 # not.
+#
+# ...AND THE CHECK ITSELF READ THE WRONG WAY ROUND FOR A WHILE.  It matched
+# /ata: .*drive/, which the failure line "ata: no drives detected" satisfies as
+# happily as the success line does, so the one boot in this run that came up
+# with no disk sailed past the guard and was tallied at 56 PASS / 4 FAIL -- the
+# exact outcome the guard was written to make impossible.  It now matches the
+# line that names a drive, "ata: disk0 = ...", which no diskless boot prints.
+#
+# A boot that loses the drive is a HOST symptom, not a kernel one: the same
+# "no drives detected" appears in logs from campaigns days apart that touched
+# nothing near ATA, roughly one boot in eight.  So it is retried once and only
+# once, loudly, and only for this one condition -- a diskless boot is never a
+# plausible symptom of a kernel change, which is what makes retrying it honest
+# rather than a way of grinding until the answer is nice.
 
 [CmdletBinding()]
 param(
@@ -77,7 +91,9 @@ function Stop-Wsl {
     Start-Sleep -Seconds 2
 }
 
-for ($b = 1; $b -le $Boots; $b++) {
+$b = 1
+$retried = $false
+while ($b -le $Boots) {
     Kill-Qemu
     Stop-Wsl
     Remove-Item $log -ErrorAction SilentlyContinue
@@ -127,9 +143,15 @@ for ($b = 1; $b -le $Boots; $b++) {
     if (-not $done) { Write-Host "[accept] boot ${b}: TIMED OUT before the boot went quiet" }
 
     $lines = Get-Content $log -ErrorAction SilentlyContinue
-    if (-not ($lines | Select-String -Pattern 'ata: .*drive' -Quiet)) {
-        throw "boot ${b}: the kernel never reported a drive -- it ran against nothing"
+    if (-not ($lines | Select-String -Pattern 'ata: disk0 =' -Quiet)) {
+        if (-not $retried) {
+            $retried = $true
+            Write-Host "[accept] boot ${b}: no drive -- known host flake, retrying once"
+            continue
+        }
+        throw "boot ${b}: the kernel never reported a drive TWICE -- it ran against nothing"
     }
+    $retried = $false
     $pass  = ($lines | Select-String -Pattern 'PASS' ).Count
     $fail  = ($lines | Select-String -Pattern 'FAIL' ).Count
     $panic = ($lines | Select-String -Pattern 'panic').Count
@@ -152,5 +174,6 @@ for ($b = 1; $b -le $Boots; $b++) {
     $ErrorActionPreference = 'Stop'
     if ($rc -eq 0) { Write-Host "[accept] boot ${b}: apfsck exit 0" }
     else { Write-Host "[accept] boot ${b}: apfsck exit ${rc}:"; $ck | ForEach-Object { "    $_" } }
+    $b++
 }
 Write-Host '[accept] done'
