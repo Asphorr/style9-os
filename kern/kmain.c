@@ -36,7 +36,6 @@
 #include "memmap.h"
 #include "mp.h"
 #include "mutex.h"
-#include "pit.h"
 #include "mouse.h"
 #include "mouse_drv.h"
 #include "panic.h"
@@ -434,6 +433,13 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	 */
 	if (mp_release_aps() != 0)
 		sched_smp_selftest();
+
+	/*
+	 * After the processors are running, because that is the machine the
+	 * list this checks gets corrupted on -- though the corruption itself
+	 * is arranged rather than raced for, so it would show on one CPU too.
+	 */
+	port_wait_selftest();
 
 	progreg_init();
 

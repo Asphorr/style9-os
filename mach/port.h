@@ -939,4 +939,11 @@ size_t			 port_space_snapshot(struct port_space *ps,
 			    struct mach_port_snapshot_entry *out,
 			    size_t max_entries);
 
+/*
+ * Check that a port's waiter list is empty once everybody who parked on it
+ * has left, in the two ways of leaving that used to forget to say so.  Both
+ * are arranged rather than waited for, so this is a test and not a hope.
+ */
+void			 port_wait_selftest(void);
+
 #endif /* !_SYS_PORT_H_ */

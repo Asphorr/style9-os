@@ -92,9 +92,13 @@ static uint64_t		 preempts;	/* (s) IRQ-driven yields            */
 
 /*
  * Lock-free LIFO of threads queued for thread_wake by an interrupt
- * handler.  Chained through th_runq_link, which is otherwise unused
- * while the thread is BLOCKED.  Pushed atomically from any context;
- * drained in the safe windows of preempt_enable / intr_dispatch.
+ * handler.  Chained through a field of its own, because the thread on
+ * this list is BLOCKED and somebody else is entitled to wake it before
+ * the drain gets to it -- and the wake puts it on the runqueue.  While
+ * this list shared th_runq_link with the runqueue, that enqueue cut the
+ * LIFO in half and every wake behind it was never delivered.  Pushed
+ * atomically from any context; drained in the safe windows of
+ * preempt_enable / intr_dispatch.
  */
 static struct thread	*irq_wake_head;		/* (a) */
 
@@ -915,13 +919,14 @@ thread_wake(struct thread *th)
  * being interruptible, which POSIX requires it to be, and which a scene in
  * pipefork tests and duly failed.
  *
- * WHY ONLY CHANNEL SLEEPERS.  A thread waiting on a Mach port is linked into
- * that port's waiter list through th_runq_link -- the same field the runqueue
- * uses -- so making it READY while it is still on the port's list overwrites
- * the link and truncates the list.  Waking one "just in case" is therefore not
- * a harmless spurious wake but corruption, and the block reason is what tells
- * the two apart: a channel sleeper is on the scheduler's own list and can be
- * woken by anyone at any time, which is the whole reason that list exists.
+ * WHY ONLY CHANNEL SLEEPERS.  It used to be that waking a Mach-port waiter was
+ * not a spurious wake but CORRUPTION: the port held it on a list threaded
+ * through th_runq_link, and making it READY wrote the runqueue's link over the
+ * port's and truncated both.  That is no longer true -- an object's queue has
+ * a field of its own now (th_wait_link) -- so what is left is a design
+ * question rather than a hazard: a Mach receive here is not interruptible, and
+ * waking one would only make it re-check an empty queue and park again.  The
+ * block reason is still what tells the two apart.
  */
 uint32_t
 sched_wake_sleepers_of(struct task *task)
@@ -1024,7 +1029,7 @@ sched_post_irq_wake(struct thread *th)
 
 	old = __atomic_load_n(&irq_wake_head, __ATOMIC_RELAXED);
 	do {
-		th->th_runq_link = old;
+		th->th_irq_link = old;
 	} while (!__atomic_compare_exchange_n(&irq_wake_head, &old, th,
 	    false, __ATOMIC_RELEASE, __ATOMIC_RELAXED));
 }
@@ -1036,11 +1041,23 @@ sched_drain_irq_wakes(void)
 
 	list = __atomic_exchange_n(&irq_wake_head, NULL, __ATOMIC_ACQUIRE);
 	while (list != NULL) {
-		next = list->th_runq_link;
-		list->th_runq_link = NULL;
+		next = list->th_irq_link;
+		list->th_irq_link = NULL;
 		thread_wake(list);
 		list = next;
 	}
+}
+
+/* Is `th` already on the deadline list?  Caller holds timed_lock. */
+static bool
+timed_present_locked(const struct thread *th)
+{
+	const struct thread	*cur;
+
+	for (cur = timed_head; cur != NULL; cur = cur->th_timed_link)
+		if (cur == th)
+			return (true);
+	return (false);
 }
 
 /*
@@ -1059,6 +1076,17 @@ sched_add_timed_waiter(struct thread *th)
 		return;
 
 	spin_lock(&timed_lock);
+	/*
+	 * ⚠ TWICE ON THIS LIST IS NOT TWICE AS PATIENT, it is the end of the
+	 * list.  The push overwrites the forward pointer the thread is already
+	 * holding, and everything behind it stops having a deadline -- which
+	 * nothing reports, because a thread that is merely never woken looks
+	 * exactly like a thread that is still waiting.  The walk is over a list
+	 * that is a handful of entries long and it turns a silent wedge into a
+	 * panic that names the thread.
+	 */
+	KASSERT(!timed_present_locked(th),
+	    "sched_add_timed_waiter: already on the deadline list");
 	th->th_timed_out  = 0;
 	th->th_timed_link = timed_head;
 	timed_head        = th;

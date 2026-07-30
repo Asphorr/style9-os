@@ -410,11 +410,28 @@ task_print(struct task *t)
 	kprintf("task id=%llu name=%s threads=%u refs=%u\n",
 	    (unsigned long long)t->t_id, t->t_name,
 	    t->t_nthreads, t->t_refs);
-	for (cur = t->t_threads; cur != NULL; cur = cur->th_task_link)
-		kprintf("  thread id=%llu name=%s state=%s\n",
-		    (unsigned long long)cur->th_id,
-		    cur->th_name,
-		    thread_state_name(cur->th_state));
+	/*
+	 * BLOCKED IS NOT AN ANSWER, it is the question.  This line used to stop
+	 * at the state, so a wedged machine's ps said every thread was blocked
+	 * and nothing at all about what any of them was waiting for -- which is
+	 * the one fact a stall consists of.  The reason and the object are two
+	 * words each and they are what turns the list into a diagnosis.
+	 */
+	for (cur = t->t_threads; cur != NULL; cur = cur->th_task_link) {
+		if (cur->th_state != THREAD_BLOCKED) {
+			kprintf("  thread id=%llu name=%s state=%s\n",
+			    (unsigned long long)cur->th_id, cur->th_name,
+			    thread_state_name(cur->th_state));
+			continue;
+		}
+		kprintf("  thread id=%llu name=%s blocked on %s %p, "
+		    "deadline %llu%s\n",
+		    (unsigned long long)cur->th_id, cur->th_name,
+		    thread_block_reason_name(cur->th_block_reason),
+		    cur->th_block_target,
+		    (unsigned long long)cur->th_wake_deadline_ms,
+		    cur->th_wake_pending != 0 ? ", wake owed" : "");
+	}
 	spin_unlock(&t->t_lock);
 }
 

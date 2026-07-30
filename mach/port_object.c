@@ -324,15 +324,15 @@ port_deref(struct port *p, uint8_t rights)
 	}
 
 	while (wake_head != NULL) {
-		struct thread *next = wake_head->th_runq_link;
-		wake_head->th_runq_link = NULL;
+		struct thread *next = wake_head->th_wait_link;
+		wake_head->th_wait_link = NULL;
 		thread_wake(wake_head);
 		wake_head = next;
 	}
 
 	while (send_wake_head != NULL) {
-		struct thread *next = send_wake_head->th_runq_link;
-		send_wake_head->th_runq_link = NULL;
+		struct thread *next = send_wake_head->th_wait_link;
+		send_wake_head->th_wait_link = NULL;
 		thread_wake(send_wake_head);
 		send_wake_head = next;
 	}
@@ -440,8 +440,8 @@ port_set_deref(struct port_set *ps)
 	}
 
 	while (wake_head != NULL) {
-		struct thread *next = wake_head->th_runq_link;
-		wake_head->th_runq_link = NULL;
+		struct thread *next = wake_head->th_wait_link;
+		wake_head->th_wait_link = NULL;
 		thread_wake(wake_head);
 		wake_head = next;
 	}

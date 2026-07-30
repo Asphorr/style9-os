@@ -1260,30 +1260,191 @@ whatever the wake was about -- which is the contract every sleeper here already
 keeps, since waking has always been a hint rather than a promise and everybody
 parks inside `for (;;)`.
 
-### ⚠ And one that is still open
+### An empty buffer said it held the superblock
 
-Roughly **one four-processor boot in four still stalls**, and this is what is
-known about it rather than a claim that it is fixed.
+The rung before this one left a defect written down rather than fixed: **one
+four-processor boot in four stopped**, with nothing failing, nothing panicking,
+and no lock held long enough for the watchdog to say so. It turned out to be
+several things wearing one symptom, and the largest of them was not in the
+scheduler at all.
 
-Nothing fails and nothing panics: the boots that finish report 91-92 checks
-passing and a clean `apfsck`. The ones that do not stop at a **spawned Apple
-binary, always just after its first `mmap`** -- the `256 KiB` malloc arena --
-and before its first real system call. The parent gives up on it after its
-budget, spawns the next one, and that one hangs the same way, so whatever
-breaks stays broken for the tasks that follow.
+**The first thing that had to be corrected was the description.** The machine
+was never wedged. It reaches its shell prompt every time; what stops is a
+spawned program, and `hello` gives up on it after its budget and carries on --
+so the boot ends with fewer checks passed and no complaint. Reading "the log
+stopped" as "the kernel stopped" cost a long time, and it was the hypervisor
+that said otherwise: three processors halted in the idle loop, one in ring 3
+running a service whose entire job is to spin, the clock ticking, the runqueue
+empty. That is a picture of a machine asleep at a prompt, not a machine stuck.
 
-The census says the machine is otherwise healthy: three processors idle in
-`hlt`, one running a ring-3 thread, no lock waited on long enough for the
-watchdog to speak. The where-probe puts that thread at **`0x40001a00` -- inside
-the heap it has just been given**, which is a wild control transfer rather than
-a loop that will not end.
+**What the failing programs had in common was a file they could not open.**
 
-The most likely place to look next is the shared image mapping. Every Darwin
-task gets `libSystem.B.dylib` mapped from one backing store, and "it breaks
-once and stays broken" is what corrupting a shared page looks like -- so the
-copy-on-write path, under concurrent readers on several processors, is the
-first suspect. The tools to catch it in the act are in the tree: `cpu census N`
-arms the UART census and the where-probe together.
+```
+darwin: open('/bin/demo.sh') -> apfs rv=-3
+dash: 0: cannot open /bin/demo.sh: Input/output error
+```
+
+`bio_bufs` is a static array, so an untouched buffer says it holds **page 0 of
+drive 0** -- and page 0 of an APFS container is the anchor superblock, the one
+block this kernel rewrites at the end of every checkpoint. Everything that
+looks a buffer up by `(drive, page)` therefore matched an empty buffer while
+searching for the busiest block on the volume.
+
+The read path survived that by accident: it keeps scanning past a match that is
+not valid. The write path did not. It stopped at the *first* buffer claiming
+the page, and stopping at an empty one means the write never reaches the buffer
+that really holds it -- so the cache went on serving the previous superblock
+for as long as it stayed resident. What comes out the far end is a checksum
+that does not match, a lookup that answers "the disk or the tree lied", and a
+program that cannot open a file that is plainly there.
+
+One processor hid it because the order buffers get claimed in was the same
+every boot. Four made that order a race. An empty buffer now says it holds a
+page number no disk has, and the write loop no longer reads "nothing to patch
+here" as "nowhere else to look".
+
+### A thread that left the CPU without leaving the list
+
+Three more were found on the way there, all of one family, and all of them real
+whatever else was wrong.
+
+**They were found by asking the hypervisor, not the kernel.** Every instrument
+in this tree runs *inside* the machine being examined, and a wedge is exactly
+the state where that is worth least. QEMU's monitor already knows every
+register of every processor, so `info registers -a` on a stalled guest is a
+census nothing in the guest has to still be working for:
+
+```
+CPU#0  RIP=00000000001187d3  CPL=0  HLT=1
+CPU#1  RIP=0000000040001a00  CPL=3  HLT=0
+CPU#2  RIP=00000000001187d3  CPL=0  HLT=1
+CPU#3  RIP=00000000001187d3  CPL=0  HLT=1
+```
+
+**One field, four lists.** A thread here can be on a queue for several reasons
+at once, and `struct thread` had one link field, `th_runq_link`, serving the
+runqueue, the interrupt-deferred wake LIFO, the mutex waiter lists and the Mach
+port waiter lists. The comment beside it said the four never overlap. They do,
+and here is the one that mattered:
+
+A thread doing a `mach_msg_recv_timed` is held on the port's waiter list by
+`th_runq_link` for the whole of its park. Its deadline expires. The PIT posts
+it, the drain wakes it, and the scheduler puts it on the runqueue -- **through
+the very field the port is holding it by**. Now the two lists are one list. A
+sender that pops the port's head writes NULL into the field and truncates the
+*runqueue*; the next enqueue writes the runqueue's head into the *port's* list
+and the message after that is handed to a thread that was never waiting for it.
+Threads stop being on any list at all.
+
+So an object's queue has a field of its own now (`th_wait_link`), and so does
+the deferred-wake LIFO (`th_irq_link`), for the same reason one level up: the
+thread sitting on that LIFO is `BLOCKED` and somebody else is entitled to wake
+it before the drain arrives. Eight bytes each. The sleep queue had already been
+given its own field for exactly this reason, and its comment had already
+written the rule down; nobody applied it to the other three.
+
+**A park that does not park still has to leave the list.** Same family, found
+first. A thread puts itself on the port's list and calls
+`thread_block_release`, and there are three ways back out of that call. A
+sender that woke it took it off the list on the way past. A deadline that woke
+it did not, and the caller knew that and tidied up. And a park that read the
+note from the section above and **returned without ever blocking** did not
+either -- and said nothing, so the loop went round and put the thread on the
+list a *second* time, writing the tail's forward pointer to the tail itself: a
+one-element cycle nothing can ever be extracted from. From then on every wake
+the port hands out goes to that phantom instead of to whoever is actually
+asleep.
+
+The detach is now unconditional, which is also the only version of this that
+does not have to be re-reasoned every time somebody invents a new way out of a
+park. It costs a walk of a list that is nearly always empty.
+
+**And the tail was not the head.** Taking a thread off one of these lists said
+"if the link I just wrote is NULL then the list is empty", which is true only
+when the thread being removed was also the head. Remove the *tail* of a
+two-deep list and the head is still there, but the tail pointer said NULL -- so
+the next thread to park took the "nobody is waiting" branch and wrote itself
+over the head, and the thread already waiting there was never woken by anybody
+again. One waiter is the common case, which is why this survived: it needs two
+threads on one port and the second one to give up first.
+
+Two things guard it now, and the first one is what proved the diagnosis rather
+than argued for it. A **tripwire** at each of the three places a thread puts
+itself on one of these lists asserts that it is not already on it; built
+against the unfixed tree it fires on an ordinary boot, in `stress_ool`, naming
+the branch:
+
+```
+*** kernel panic: KASSERT(self->th_runq_link == NULL && p->p_waiters_tail != self)
+    at mach/port_msg.c:1720: recv: already on this port's waiter list
+```
+
+And a **selftest** (`port-wait`) arranges both scenes instead of waiting for
+them. The race that produces the first one needs a wake to arrive against a
+thread that has decided to sleep and not yet committed -- a window of a few
+instructions on another processor -- but the note that wake leaves is a value a
+test can simply set, so what was one boot in four is now deterministic on any
+number of processors. The second scene parks a helper thread, times out behind
+it twice, and then sends a message that the helper has to receive.
+
+**And a thread that dies still owes the deadline list an answer.** A timed wait
+is put on that list by its caller before the park and taken off by the same
+caller after it -- and a thread killed *mid-park* never comes back to do the
+second half, because `thread_block_release` retires it from inside the block,
+above the layer that registered it. What is left behind is a pointer to a
+thread about to be reaped, on the one list the timer walks on every tick. Like
+everything else here it truncates rather than crashing: `sched_add_timed_waiter`
+pushes at the head without asking whether the thread is already there, so once
+the corpse's memory is handed to a new thread that registers a deadline of its
+own, the push overwrites a forward pointer the list was still using, and every
+waiter behind it stops having a deadline at all. `thread_exit` now takes itself
+off, and the push asserts that it is not already on.
+
+**⚠ And one of the same family is left**, named here rather than fixed. The same
+kill-mid-park exit leaves the thread on the *port's* waiter list, because that
+one cannot be undone from `thread_exit` without knowing which object is holding
+it. The port's teardown drains that list later and wakes a thread that may
+already have been reaped. Closing it means the waiting thread recording *what*
+it is waiting on so the exit path can undo it, which is a rung of its own; what
+is owed here is saying so.
+
+### One more thing the hypervisor said
+
+The same register dump answered a question nobody had asked. Read down the CR0
+column: `80010013` on the boot processor and `e0010013` on the other three. The
+difference is `CD` and `NW` -- **the caches, which come out of reset turned
+off**. Every write to `CR0` in the trampoline was an `orl`, so the two bits
+survived into long mode and every application processor had been running the
+whole kernel uncached.
+
+Nothing says so. The processor is correct, it boots, it passes; it is simply an
+order of magnitude slower than the one that started it, and only on real
+hardware, because an emulator ignores the bits entirely. It is the same shape
+as the list in `cpu_state_init` -- a per-CPU register nobody inherits -- except
+that it has to be fixed before there is anywhere to report it from, so it lives
+in the trampoline beside `PG`.
+
+### ⚠ Where this leaves it, measured rather than claimed
+
+Six four-processor boots from a pristine volume: **five of them 92 or 93 checks
+passing with nothing failing, and `apfsck` clean on all six**. Before these
+fixes the same run put two boots in three at 70-76 checks with the tail of the
+work missing.
+
+The sixth still fails, and it fails the same way the block cache did:
+
+```
+apfs-ckpt: superblock at 54 unreadable
+filewrite: FAIL nothing can be made inside a directory ring 3 just made
+```
+
+That is a block coming back with a checksum that does not match -- not a stale
+block, which would be self-consistent, but a torn one. So there is a second
+reader-writer overlap under the one that has been fixed, and the place to look
+is the ATA channel: `ata_pio_xfer` holds `ch_lock` across a multi-sector
+transfer, but the per-sector wait for the drive's interrupt *releases* it in
+order to sleep, so the channel is not actually owned for the length of a
+command. It is written down here rather than guessed at.
 
 Next on the roadmap: **replacing an existing name** with a rename, which
 POSIX requires and this refuses out loud; a **torn-write stand**, which

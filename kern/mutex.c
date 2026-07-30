@@ -28,18 +28,19 @@ static uint64_t	mutex_n_acquire;	/* (g) successful mutex_lock calls */
 static uint64_t	mutex_n_slept;		/* (g) ...that had to block first  */
 
 /*
- * Waiters are linked through th_runq_link, which is free while a thread is
- * blocked -- the same field and the same reasoning the port waiter lists use
- * (mach/port_msg.c).  A thread is on exactly one of the two at a time, and
- * being on a waiter list is precisely the state of not being runnable.
+ * Waiters are linked through th_wait_link -- the field an OBJECT'S queue owns,
+ * shared with the port waiter lists in mach/port_msg.c because a thread is on
+ * exactly one of them at a time.  Not through th_runq_link, which it used to
+ * be: see the field's own comment in kern/thread.h for what the scheduler does
+ * to a list it does not know it is holding.
  */
 static void
 waiter_push(struct mutex *m, struct thread *th)
 {
 
-	th->th_runq_link = NULL;
+	th->th_wait_link = NULL;
 	if (m->mtx_waiters_tail != NULL)
-		m->mtx_waiters_tail->th_runq_link = th;
+		m->mtx_waiters_tail->th_wait_link = th;
 	else
 		m->mtx_waiters_head = th;
 	m->mtx_waiters_tail = th;
@@ -53,10 +54,10 @@ waiter_pop(struct mutex *m)
 	th = m->mtx_waiters_head;
 	if (th == NULL)
 		return (NULL);
-	m->mtx_waiters_head = th->th_runq_link;
+	m->mtx_waiters_head = th->th_wait_link;
 	if (m->mtx_waiters_head == NULL)
 		m->mtx_waiters_tail = NULL;
-	th->th_runq_link = NULL;
+	th->th_wait_link = NULL;
 	return (th);
 }
 

@@ -98,7 +98,24 @@ ap_tramp_pm32:
 	orl	$0x900, %eax			/* LME (8) | NXE (11)    */
 	wrmsr
 
+	/*
+	 * ⚠ AND THE CACHES, WHICH COME OUT OF RESET TURNED OFF.
+	 *
+	 * CR0.CD and CR0.NW are both SET after INIT, and every write to CR0 in
+	 * this file until now was an `orl' -- so the two survived into long
+	 * mode and every application processor ran the whole kernel with its
+	 * caches disabled.  Nothing says so: the processor is correct, it
+	 * boots, it passes, it is simply an order of magnitude slower than the
+	 * one that started it, and only on real hardware, because an emulator
+	 * ignores the bits entirely.  The boot processor is spared because the
+	 * firmware cleared them long before boot.S ran.
+	 *
+	 * Found by asking the hypervisor for all four processors' registers at
+	 * once and reading down the column: 80010013 on cpu0 and e0010013 on
+	 * the other three.
+	 */
 	movl	%cr0, %eax
+	andl	$0x9FFFFFFF, %eax		/* CD, NW: caches on     */
 	orl	$0x80000000, %eax		/* PG: long mode is live */
 	movl	%eax, %cr0
 

@@ -121,10 +121,10 @@ msg_enqueue(struct port *p, struct port_msg *m, struct thread **waiter_out)
 		spin_lock(&set->ps_lock);
 		w = set->ps_waiters_head;
 		if (w != NULL) {
-			set->ps_waiters_head = w->th_runq_link;
+			set->ps_waiters_head = w->th_wait_link;
 			if (set->ps_waiters_head == NULL)
 				set->ps_waiters_tail = NULL;
-			w->th_runq_link = NULL;
+			w->th_wait_link = NULL;
 		}
 		spin_unlock(&set->ps_lock);
 	}
@@ -133,10 +133,10 @@ msg_enqueue(struct port *p, struct port_msg *m, struct thread **waiter_out)
 		spin_lock(&p->p_lock);
 		w = p->p_waiters_head;
 		if (w != NULL) {
-			p->p_waiters_head = w->th_runq_link;
+			p->p_waiters_head = w->th_wait_link;
 			if (p->p_waiters_head == NULL)
 				p->p_waiters_tail = NULL;
-			w->th_runq_link = NULL;
+			w->th_wait_link = NULL;
 		}
 		spin_unlock(&p->p_lock);
 	}
@@ -158,56 +158,95 @@ port_extract_send_waiter_locked(struct port *p)
 
 	w = p->p_send_waiters_head;
 	if (w != NULL) {
-		p->p_send_waiters_head = w->th_runq_link;
+		p->p_send_waiters_head = w->th_wait_link;
 		if (p->p_send_waiters_head == NULL)
 			p->p_send_waiters_tail = NULL;
-		w->th_runq_link = NULL;
+		w->th_wait_link = NULL;
 	}
 	return (w);
 }
 
 /*
- * Remove a specific thread from the port's recv-waiter list if it is
- * still on it.  Used by recv_timed cleanup: a thread woken because its
- * deadline expired (rather than because a sender extracted it) is
- * still on the list and must detach itself before returning E_TIMEOUT.
- * Caller holds p_lock.  Idempotent if the thread is already gone.
+ * Take a specific thread off the port's recv-waiter list if it is still on
+ * it.  Every thread that puts itself on this list calls this on the way out,
+ * whatever woke it -- see the recv loop for why that has to be unconditional.
+ * Caller holds p_lock.  Idempotent if the thread is already gone, because the
+ * sender wake path may have extracted it first.
+ *
+ * ⚠ THE TAIL IS THE PREDECESSOR, NOT NULL.  This used to say "if the link I
+ * just wrote is NULL then the list is empty", which is true only when the
+ * thread being removed was also the head.  Remove the tail of a two-deep list
+ * and the head is still there, but the tail pointer said NULL -- so the next
+ * thread to park took the "empty list" branch and wrote itself over the head,
+ * and the thread that was already waiting there was never woken by anybody
+ * again.  One waiter is the common case, which is why this survived: it needs
+ * two threads on one port and the second one to time out.
  */
 static void
 port_unbind_waiter_locked(struct port *p, struct thread *th)
 {
 	struct thread	**pp;
+	struct thread	 *prev;
 
-	pp = &p->p_waiters_head;
+	prev = NULL;
+	pp   = &p->p_waiters_head;
 	while (*pp != NULL) {
 		if (*pp == th) {
-			*pp = th->th_runq_link;
-			if (*pp == NULL)
-				p->p_waiters_tail = NULL;
-			th->th_runq_link = NULL;
+			*pp = th->th_wait_link;
+			if (p->p_waiters_tail == th)
+				p->p_waiters_tail = prev;
+			th->th_wait_link = NULL;
 			return;
 		}
-		pp = &(*pp)->th_runq_link;
+		prev = *pp;
+		pp   = &(*pp)->th_wait_link;
 	}
-	/* Fall through silently if not present -- the sender wake path
-	   may have already extracted us. */
 }
 
 static void
 port_set_unbind_waiter_locked(struct port_set *set, struct thread *th)
 {
 	struct thread	**pp;
+	struct thread	 *prev;
 
-	pp = &set->ps_waiters_head;
+	prev = NULL;
+	pp   = &set->ps_waiters_head;
 	while (*pp != NULL) {
 		if (*pp == th) {
-			*pp = th->th_runq_link;
-			if (*pp == NULL)
-				set->ps_waiters_tail = NULL;
-			th->th_runq_link = NULL;
+			*pp = th->th_wait_link;
+			if (set->ps_waiters_tail == th)
+				set->ps_waiters_tail = prev;
+			th->th_wait_link = NULL;
 			return;
 		}
-		pp = &(*pp)->th_runq_link;
+		prev = *pp;
+		pp   = &(*pp)->th_wait_link;
+	}
+}
+
+/*
+ * And the same for the list a BLOCKED SENDER parks on when the destination
+ * queue is full.  That list had no way off it at all except being extracted
+ * by a receiver, which was fine while a park could not end any other way.
+ */
+static void
+port_unbind_send_waiter_locked(struct port *p, struct thread *th)
+{
+	struct thread	**pp;
+	struct thread	 *prev;
+
+	prev = NULL;
+	pp   = &p->p_send_waiters_head;
+	while (*pp != NULL) {
+		if (*pp == th) {
+			*pp = th->th_wait_link;
+			if (p->p_send_waiters_tail == th)
+				p->p_send_waiters_tail = prev;
+			th->th_wait_link = NULL;
+			return;
+		}
+		prev = *pp;
+		pp   = &(*pp)->th_wait_link;
 	}
 }
 
@@ -1313,17 +1352,30 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 				continue;
 			}
 			self = current_thread;
-			self->th_runq_link = NULL;
+			KASSERT(self->th_wait_link == NULL &&
+			    dest->p_send_waiters_tail != self,
+			    "send: already on this port's send-waiter list");
+			self->th_wait_link = NULL;
 			if (dest->p_send_waiters_tail == NULL) {
 				dest->p_send_waiters_head = self;
 				dest->p_send_waiters_tail = self;
 			} else {
-				dest->p_send_waiters_tail->th_runq_link =
+				dest->p_send_waiters_tail->th_wait_link =
 				    self;
 				dest->p_send_waiters_tail = self;
 			}
 			thread_block_release(THREAD_BLOCK_PORT, dest,
 			    &dest->p_lock);
+			/*
+			 * And off the list before going round again, for the
+			 * same reason and with the same failure if it is left
+			 * out -- see the recv loop below.  A receiver that
+			 * extracted us already did it; a park that declined to
+			 * park did not.
+			 */
+			spin_lock(&dest->p_lock);
+			port_unbind_send_waiter_locked(dest, self);
+			spin_unlock(&dest->p_lock);
 			/* Loop and retry. */
 		}
 		if (waiter != NULL)
@@ -1665,13 +1717,16 @@ mach_msg_recv_timed(struct port_space *to, mach_port_name_t recv_name,
 			}
 
 			self = current_thread;
-			self->th_runq_link = NULL;
+			KASSERT(self->th_wait_link == NULL &&
+			    p->p_waiters_tail != self,
+			    "recv: already on this port's waiter list");
+			self->th_wait_link = NULL;
 			self->th_timed_out = 0;
 			if (p->p_waiters_tail == NULL) {
 				p->p_waiters_head = self;
 				p->p_waiters_tail = self;
 			} else {
-				p->p_waiters_tail->th_runq_link = self;
+				p->p_waiters_tail->th_wait_link = self;
 				p->p_waiters_tail = self;
 			}
 
@@ -1684,23 +1739,45 @@ mach_msg_recv_timed(struct port_space *to, mach_port_name_t recv_name,
 			    &p->p_lock);
 
 			/*
-			 * Woken.  Detach from the timed-waiters list
-			 * unconditionally; the call is idempotent if the
-			 * PIT already pulled us off.
+			 * OFF BOTH LISTS, WHATEVER IT WAS THAT ENDED THE PARK.
+			 *
+			 * A sender that woke us took us off the port's list on
+			 * its way past; a deadline that woke us did not; and a
+			 * park that DECLINED TO PARK -- because a wake had
+			 * already been posted against this thread and
+			 * thread_block_release read the note and returned
+			 * without ever blocking -- did not either, and does not
+			 * say so.  Three ways out and only one of them tidied
+			 * up, so the other two left this thread on the list and
+			 * the loop above put it there a SECOND time.
+			 *
+			 * The second link is written through the tail, so the
+			 * tail's forward pointer is made to point at the tail:
+			 * a one-element cycle.  From then on the port has a
+			 * waiter that can never be removed by being extracted,
+			 * and every wake the port hands out goes to that
+			 * phantom instead of to whoever is actually asleep --
+			 * so the thread that IS waiting waits for ever, and so
+			 * does everything waiting on it.
+			 *
+			 * So the detach is unconditional, which is also the
+			 * only version of this that does not have to be
+			 * re-reasoned every time a new way out of a park is
+			 * invented.  It costs a walk of a list that is nearly
+			 * always empty.
 			 */
 			sched_remove_timed_waiter(self);
+
+			spin_lock(&p->p_lock);
+			port_unbind_waiter_locked(p, self);
 
 			if (self->th_timed_out) {
 				self->th_timed_out = 0;
 				/*
-				 * The PIT woke us, not a sender, so we are
-				 * still on p->p_waiters.  Unbind, then check
-				 * the queue one last time in case a sender
-				 * raced in between the PIT wake and our
-				 * reacquire of p_lock.
+				 * The deadline woke us, not a sender -- but
+				 * look at the queue once more before giving
+				 * up, in case one landed in the window.
 				 */
-				spin_lock(&p->p_lock);
-				port_unbind_waiter_locked(p, self);
 				if (p->p_qhead != NULL) {
 					m = p->p_qhead;
 					p->p_qhead = m->m_next;
@@ -1719,6 +1796,7 @@ mach_msg_recv_timed(struct port_space *to, mach_port_name_t recv_name,
 				spin_unlock(&p->p_lock);
 				return (MACH_E_TIMEOUT);
 			}
+			spin_unlock(&p->p_lock);
 			/* Real wake from a sender; loop to dequeue. */
 		}
 	}
@@ -1764,13 +1842,16 @@ mach_msg_recv_timed(struct port_space *to, mach_port_name_t recv_name,
 
 		/* No member has a message -- block on set's waiter list. */
 		self = current_thread;
-		self->th_runq_link = NULL;
+		KASSERT(self->th_wait_link == NULL &&
+		    set->ps_waiters_tail != self,
+		    "recv: already on this port set's waiter list");
+		self->th_wait_link = NULL;
 		self->th_timed_out = 0;
 		if (set->ps_waiters_tail == NULL) {
 			set->ps_waiters_head = self;
 			set->ps_waiters_tail = self;
 		} else {
-			set->ps_waiters_tail->th_runq_link = self;
+			set->ps_waiters_tail->th_wait_link = self;
 			set->ps_waiters_tail = self;
 		}
 
@@ -1782,13 +1863,15 @@ mach_msg_recv_timed(struct port_space *to, mach_port_name_t recv_name,
 		thread_block_release(THREAD_BLOCK_PORT, set,
 		    &set->ps_lock);
 
+		/* Off both lists unconditionally -- see the port case above. */
 		sched_remove_timed_waiter(self);
+
+		spin_lock(&set->ps_lock);
+		port_set_unbind_waiter_locked(set, self);
+		spin_unlock(&set->ps_lock);
 
 		if (self->th_timed_out) {
 			self->th_timed_out = 0;
-			spin_lock(&set->ps_lock);
-			port_set_unbind_waiter_locked(set, self);
-			spin_unlock(&set->ps_lock);
 			/*
 			 * Loop back: a sender may have placed a message
 			 * on one of the members in the race window.  The
@@ -1933,4 +2016,190 @@ mach_msg_rpc(struct port_space *space, struct mach_msg_header *req,
 	    reply_buf_size, timeout_ms);
 	(void)port_deallocate(space, reply_name);
 	return (rv);
+}
+
+/* ---- selftest -------------------------------------------------------- */
+
+/*
+ * WHAT A PORT'S WAITER LIST LOOKS LIKE AFTER EVERYBODY HAS LEFT IT.
+ *
+ * The bug this exists for cost four processors a whole boot roughly one time
+ * in four, and left nothing to look at: three CPUs halted, no lock waited on,
+ * no failure printed, the log simply stopping.  It is a leak of ONE POINTER --
+ * a thread that took itself off the CPU without taking itself off the list --
+ * and the only honest way to test for it is to look at the list.
+ *
+ * Both scenes are arranged, not waited for.  The race that produced it needs a
+ * wake to arrive against a thread that has decided to sleep and not yet
+ * committed, which is a window of a few instructions on another processor; the
+ * note that wake leaves (th_wake_pending) is a value this can simply set, so
+ * the test is deterministic on one processor and on four.
+ */
+#define	PW_TIMEOUT_MS	20u	/* long enough to be a real park */
+#define	PW_HELPER_MS	3000u	/* the helper always leaves, pass or fail */
+#define	PW_WAIT_MS	4000u	/* ...and this outlasts it, so it is gone */
+
+struct pw_helper {
+	mach_port_name_t	 ph_name;
+	volatile int		 ph_got;	/* the message arrived  */
+	volatile int		 ph_done;	/* and the thread is out */
+	struct thread		*ph_thread;
+};
+
+static struct pw_helper	pw;	/* static: the helper outlives the frame */
+
+static void
+pw_helper_entry(void *arg)
+{
+	struct mach_msg_header	 buf;
+	struct pw_helper	*h;
+	int			 rv;
+
+	h = arg;
+	rv = mach_msg_recv_timed(kernel_space, h->ph_name, &buf, sizeof(buf),
+	    PW_HELPER_MS);
+	if (rv == MACH_MSG_OK)
+		h->ph_got = 1;
+	h->ph_done = 1;
+	thread_exit();
+}
+
+void
+port_wait_selftest(void)
+{
+	struct mach_msg_header	 hdr;
+	struct mach_msg_header	 buf;
+	struct port		*p;
+	mach_port_name_t	 name;
+	unsigned int		 i;
+	uint8_t			 rights;
+	int			 rv;
+
+	name = port_allocate(kernel_space,
+	    MACH_PORT_RIGHT_RECEIVE | MACH_PORT_RIGHT_SEND);
+	if (name == MACH_PORT_NULL) {
+		kprintf("port-wait: FAIL no port to test with\n");
+		return;
+	}
+	p = space_lookup(kernel_space, name, MACH_PORT_RIGHT_RECEIVE, &rights);
+	if (p == NULL) {
+		kprintf("port-wait: FAIL the port just made cannot be found\n");
+		return;
+	}
+
+	/*
+	 * 1. A PARK THAT DECLINED TO PARK.  The note says a wake has already
+	 *    been posted against this thread, so thread_block_release reads it
+	 *    and returns without ever blocking -- and the recv loop, told
+	 *    nothing, goes round and puts itself on the port's list a second
+	 *    time.  The second link is written through the tail, so the tail's
+	 *    forward pointer is made to point at the tail: a one-element cycle
+	 *    that nothing can ever be extracted from again.
+	 */
+	current_thread->th_wake_pending = 1;
+	rv = mach_msg_recv_timed(kernel_space, name, &buf, sizeof(buf),
+	    PW_TIMEOUT_MS);
+	if (rv != MACH_E_TIMEOUT) {
+		kprintf("port-wait: FAIL a recv on an empty port answered %s, "
+		    "not a timeout\n", mach_msg_strerror(rv));
+		goto out;
+	}
+	if (p->p_waiters_head != NULL || p->p_waiters_tail != NULL) {
+		kprintf("port-wait: FAIL the port still names a waiter after "
+		    "its only waiter gave up\n");
+		goto out;
+	}
+
+	/*
+	 * 2. AND A SECOND WAITER, which is what makes the tail matter.  The
+	 *    helper parks first and stays; this thread parks behind it and
+	 *    times out.  Taking the tail off a list whose head is somebody
+	 *    else used to set the tail to NULL rather than to the head -- and
+	 *    the next thread to park then took the "nobody is waiting" branch
+	 *    and wrote itself over the head, so the helper was off the list
+	 *    without ever being told and no message could reach it again.
+	 */
+	pw.ph_name   = name;
+	pw.ph_got    = 0;
+	pw.ph_done   = 0;
+	pw.ph_thread = thread_create(kernel_task, pw_helper_entry, &pw,
+	    "port-wait");
+	if (pw.ph_thread == NULL) {
+		kprintf("port-wait: FAIL no thread to wait with\n");
+		goto out;
+	}
+	thread_start(pw.ph_thread);
+
+	for (i = 0; i < PW_TIMEOUT_MS * 10; i++) {
+		if (p->p_waiters_head == pw.ph_thread)
+			break;
+		sched_nap_ms(1);
+	}
+	if (p->p_waiters_head != pw.ph_thread) {
+		kprintf("port-wait: FAIL the helper never reached the port's "
+		    "waiter list\n");
+		goto drain;
+	}
+
+	rv = mach_msg_recv_timed(kernel_space, name, &buf, sizeof(buf),
+	    PW_TIMEOUT_MS);
+	if (rv != MACH_E_TIMEOUT) {
+		kprintf("port-wait: FAIL the second waiter answered %s, not a "
+		    "timeout\n", mach_msg_strerror(rv));
+		goto drain;
+	}
+	if (p->p_waiters_tail != pw.ph_thread) {
+		kprintf("port-wait: FAIL leaving the list from behind the "
+		    "helper left the tail naming somebody else\n");
+		goto drain;
+	}
+
+	/*
+	 *    Park and leave once more.  With the tail wrong this is the trip
+	 *    that overwrites the head, so the damage is done here and shows up
+	 *    at the send below rather than at either park.
+	 */
+	rv = mach_msg_recv_timed(kernel_space, name, &buf, sizeof(buf),
+	    PW_TIMEOUT_MS);
+	if (rv != MACH_E_TIMEOUT) {
+		kprintf("port-wait: FAIL the third park answered %s, not a "
+		    "timeout\n", mach_msg_strerror(rv));
+		goto drain;
+	}
+
+	hdr.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	hdr.msgh_size    = sizeof(hdr);
+	hdr.msgh_remote  = name;
+	hdr.msgh_local   = MACH_PORT_NULL;
+	hdr.msgh_voucher = 0;
+	hdr.msgh_id      = 0x9317;
+	rv = mach_msg_send(kernel_space, &hdr);
+	if (rv != MACH_MSG_OK) {
+		kprintf("port-wait: FAIL the send answered %s\n",
+		    mach_msg_strerror(rv));
+		goto drain;
+	}
+
+drain:
+	for (i = 0; i < PW_WAIT_MS && pw.ph_done == 0; i++)
+		sched_nap_ms(1);
+	if (pw.ph_done == 0) {
+		kprintf("port-wait: FAIL the helper is still parked\n");
+		goto out;
+	}
+	if (pw.ph_got == 0) {
+		kprintf("port-wait: FAIL the message never reached the thread "
+		    "that was waiting for it\n");
+		goto out;
+	}
+	if (p->p_waiters_head != NULL || p->p_waiters_tail != NULL) {
+		kprintf("port-wait: FAIL the port still names a waiter with "
+		    "nobody left waiting\n");
+		goto out;
+	}
+	kprintf("port-wait: PASS -- a park that never slept left the list "
+	    "empty, and a waiter behind it was still reachable after the one "
+	    "in front of it timed out twice\n");
+out:
+	(void)port_deallocate(kernel_space, name);
 }

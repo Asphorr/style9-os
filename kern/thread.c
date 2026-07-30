@@ -80,6 +80,8 @@ thread_adopt_current(struct task *t, const char *name)
 	th->th_spin_saved_if   = false;
 	th->th_runq_link       = NULL;
 	th->th_task_link       = NULL;
+	th->th_wait_link       = NULL;
+	th->th_irq_link        = NULL;
 	th->th_sleep_link      = NULL;
 	th->th_wake_ms         = 0;
 	th->th_wake_pending    = 0;
@@ -195,6 +197,8 @@ thread_create(struct task *t, void (*entry)(void *), void *arg,
 	th->th_spin_saved_if     = true;
 	th->th_runq_link         = NULL;
 	th->th_task_link         = NULL;
+	th->th_wait_link         = NULL;
+	th->th_irq_link          = NULL;
 	th->th_sleep_link        = NULL;
 	th->th_wake_ms           = 0;
 	th->th_wake_pending      = 0;
@@ -265,6 +269,27 @@ thread_exit(void)
 	me = current_thread;
 	KASSERT(me != NULL, "thread_exit: no current thread");
 
+	/*
+	 * OFF THE DEADLINE LIST BEFORE GOING ANYWHERE ELSE.
+	 *
+	 * A timed wait is put on that list by its caller before the park and
+	 * taken off by the same caller after it.  A thread killed mid-park
+	 * never comes back to do the second half: thread_block_release retires
+	 * it from inside the block, above the layer that registered it.  What
+	 * is left behind is a pointer to a thread about to be reaped, on the
+	 * one list the timer walks on every tick.
+	 *
+	 * ⚠ AND IT TRUNCATES RATHER THAN CRASHING, which is why it was so hard
+	 * to see.  sched_add_timed_waiter pushes at the head without asking
+	 * whether the thread is already there -- so when the corpse's memory is
+	 * handed to a NEW thread and that thread registers a deadline, the push
+	 * overwrites a forward pointer the list was still using, and every
+	 * waiter behind it stops having a deadline at all.  Nothing fails,
+	 * nothing is reported: they simply never wake, and the machine goes
+	 * quiet with every processor idle and every thread blocked.
+	 */
+	sched_remove_timed_waiter(me);
+
 	spin_lock(&me->th_lock);
 	me->th_state = THREAD_ZOMBIE;
 	spin_unlock(&me->th_lock);
@@ -331,6 +356,19 @@ thread_state_name(enum thread_state s)
 	case THREAD_BLOCKED:	return ("blocked");
 	case THREAD_ZOMBIE:	return ("zombie");
 	default:		return ("?");
+	}
+}
+
+const char *
+thread_block_reason_name(enum thread_block_reason r)
+{
+
+	switch (r) {
+	case THREAD_NOT_BLOCKED:	return ("nothing");
+	case THREAD_BLOCK_PORT:		return ("port");
+	case THREAD_BLOCK_SLEEP:	return ("channel");
+	case THREAD_BLOCK_JOIN:		return ("join");
+	default:			return ("?");
 	}
 }
 

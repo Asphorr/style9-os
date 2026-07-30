@@ -16,6 +16,7 @@
 #include "sched.h"
 #include "smap.h"
 #include "syscall.h"
+#include "task.h"
 #include "thread.h"
 #include "uart.h"
 
@@ -93,6 +94,13 @@ cpu_bsp_init(void)
  *			   faulting, on that CPU only.
  *	no EFER.SCE	-- #UD on the first system call made by a thread that
  *			   happened to be scheduled there.
+ *
+ * One more of the same shape is NOT here, because it has to be done before
+ * this can be reached: CR0.CD and CR0.NW come out of reset set, and an
+ * application processor that keeps them runs with its caches off.  The
+ * trampoline clears them in the same write that turns paging on -- see
+ * aptramp.S, which is the last place this processor executes before it has
+ * anywhere to report from.
  *
  * The boot processor does not call this -- it got CR0.WP from boot.S and the
  * rest from kmain, one at a time and each with a line of log.  What keeps the
@@ -258,6 +266,15 @@ cpu_census_uart(void)
 		uart_putc('=');
 		uart_puts(th != NULL && th->th_name != NULL ? th->th_name :
 		    (cp->cp_online != 0 ? "(parked)" : "(down)"));
+		/*
+		 * The task, because the name does not distinguish them: every
+		 * ring-3 thread here is called "user-elf", and "which program
+		 * is that" is the whole question when one of them is spinning.
+		 */
+		uart_putc('.');
+		for (sh = 12; sh >= 0; sh -= 4)
+			uart_putc(hex[((th != NULL && th->th_task != NULL ?
+			    th->th_task->t_id : 0) >> sh) & 0xF]);
 		uart_putc('/');
 		for (sh = 28; sh >= 0; sh -= 4)
 			uart_putc(hex[(cp->cp_switches >> sh) & 0xF]);

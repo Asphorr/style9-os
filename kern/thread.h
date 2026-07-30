@@ -94,22 +94,50 @@ struct thread {
 	int			 th_spin_depth;		/* (i) locks held   */
 	bool			 th_spin_saved_if;	/* (i) IF at depth 1 */
 
-	struct thread		*th_runq_link;		/* runqueue / waitq */
+	struct thread		*th_runq_link;		/* (sched_lock)     */
 	struct thread		*th_task_link;		/* task->t_threads  */
 	SLIST_ENTRY(thread)	 th_zombie_link;	/* zombie SLIST     */
+
+	/*
+	 * Parked on an OBJECT that keeps its own queue of who is waiting: a
+	 * Mach port's receivers, its blocked senders, a port set's receivers,
+	 * a mutex's waiters.  A thread is on at most one of those at a time,
+	 * which is what makes one field enough for all of them.
+	 *
+	 * ⚠ AND WHY IT IS NOT ANOTHER TENANT OF th_runq_link, which is what it
+	 * was.  Those lists are held by the object across the whole park, and
+	 * a park can end WITHOUT THE OBJECT BEING TOLD: a deadline expires,
+	 * and the thread is put on the runqueue -- through th_runq_link --
+	 * while the port still names it.  From then on the two lists are one
+	 * list.  A sender that pops the port's head writes NULL into the field
+	 * and truncates the RUNQUEUE; the scheduler's next enqueue writes the
+	 * runqueue's head into the port's list and hands the next message to a
+	 * thread that was never waiting for it.  What it looks like from
+	 * outside is a machine that goes quiet with three processors idle,
+	 * because threads have stopped being on any list at all.
+	 *
+	 * The field costs eight bytes per thread.  Sharing it cost one boot in
+	 * four.
+	 */
+	struct thread		*th_wait_link;		/* (the object's)   */
+
+	/*
+	 * Queued for a wake an interrupt handler could not perform itself.
+	 * Its own field for the third time and the same reason: the thread
+	 * sitting on this list is BLOCKED and somebody else is entitled to
+	 * wake it -- a deadline, a sender, a kill -- and the moment they do,
+	 * the scheduler puts it on the runqueue.  Through th_runq_link, which
+	 * this list used to be threaded on, that write truncated the LIFO and
+	 * every wake queued behind it was simply never delivered.
+	 */
+	struct thread		*th_irq_link;		/* (a) irq_wake_head */
 
 	/*
 	 * Sleep-queue link: threads parked on a CHANNEL, i.e. those that
 	 * called thread_block with a non-NULL target, so sched_wakeup can
 	 * find them by what they are waiting for rather than by a pointer
-	 * the waited-on object had to keep.
-	 *
-	 * A field of its own rather than another tenant of th_runq_link,
-	 * which already serves the runqueue, the mutex waiter lists and the
-	 * IRQ-wake LIFO.  Those three never overlap; this one WOULD -- a
-	 * thread parked on a channel and then woken by sched_post_irq_wake
-	 * or by the kill fan-out is linked in two lists at once, and the
-	 * one that reuses the field silently truncates the other.
+	 * the waited-on object had to keep.  Its own field for the same
+	 * reason as above, and it was the first one to need it.
 	 */
 	struct thread		*th_sleep_link;		/* (sched_lock)     */
 
@@ -254,6 +282,7 @@ void		thread_start(struct thread *);
 void		thread_exit(void) __attribute__((noreturn));
 
 const char	*thread_state_name(enum thread_state);
+const char	*thread_block_reason_name(enum thread_block_reason);
 void		thread_print(struct thread *);
 
 /*

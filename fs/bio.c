@@ -79,8 +79,33 @@ bio_init(void)
 		    (unsigned)BIO_NBUFS);
 		return;
 	}
+	/*
+	 * ⚠ AND A PAGE NUMBER NO DISK HAS, which is not decoration.
+	 *
+	 * bio_bufs is static, so an untouched buffer says it holds page 0 of
+	 * drive 0 -- and page 0 of drive 0 is the APFS container's anchor
+	 * superblock, the one block this kernel rewrites at the end of every
+	 * checkpoint.  Everything that looks a buffer up by (drive, page)
+	 * therefore MATCHED an empty buffer while looking for the busiest
+	 * block on the volume.
+	 *
+	 * The read path survived it by accident: it keeps scanning past a
+	 * match that is not valid.  The write path did not -- it stops at the
+	 * first buffer that claims the page, and stopping at an empty one
+	 * means the write never reaches the buffer that really holds it.  The
+	 * cache then serves the PREVIOUS superblock for as long as it stays
+	 * resident, and what comes back is a checksum that does not match, a
+	 * lookup that answers "the disk or the tree lied", and a program that
+	 * cannot open a file that is plainly there.
+	 *
+	 * One processor hid it because the order buffers get claimed in was
+	 * the same every boot; four made the order a race, and the answer
+	 * changed about one boot in three.
+	 */
 	for (i = 0; i < BIO_NBUFS; i++) {
 		bio_bufs[i].bb_data  = bio_arena + i * BIO_PAGE_BYTES;
+		bio_bufs[i].bb_page  = (uint64_t)-1;
+		bio_bufs[i].bb_drive = (unsigned)-1;
 		bio_bufs[i].bb_valid = false;
 	}
 	bio_ready = true;
@@ -307,8 +332,16 @@ bio_write(unsigned drive, uint64_t lba, uint32_t nsec, const void *buf)
 				bio_bufs[i].bb_stale = true;
 				break;
 			}
+			/*
+			 * Not "stop looking" -- "nothing to patch HERE".  A
+			 * buffer that claims the page without holding it is
+			 * not evidence that no other buffer holds it, which is
+			 * the assumption that made an empty cache serve stale
+			 * superblocks.  Keeping the scan going costs a handful
+			 * of compares and cannot be wrong.
+			 */
 			if (!bio_bufs[i].bb_valid)
-				break;
+				continue;
 			mem_copy(bio_bufs[i].bb_data +
 			    (size_t)within * BIO_SECTOR_BYTES,
 			    in + (size_t)done * BIO_SECTOR_BYTES,
