@@ -260,20 +260,18 @@ mp_start_aps(void)
  * reference in this kernel reads physical page zero, and spin_lock is a
  * per-CPU reference.
  *
- * ⚠ AND THEN IT PARKS, WITH INTERRUPTS OFF, which is the honest end of this
- * step rather than a shortcut.  Three things are missing before this processor
- * can be allowed to run anything:
+ * ⚠ AND THEN IT PARKS -- but no longer with interrupts off, and the change is
+ * the point of this rung rather than a detail of it.  A processor that cannot
+ * take an interrupt cannot be told to forget a page translation, and this one
+ * caches translations from tables the boot processor is editing all the time.
+ * Parked with interrupts ON it answers that one message and nothing else: its
+ * timer is masked, its LINT0 carries nothing, and no runqueue has ever heard
+ * of it.  It is asleep, and it can be woken to say "yes, I forgot it".
  *
- *	- Locks that close interrupts.  spin_lock spins without disabling
- *	  them, which is safe on the boot processor only because no handler
- *	  there takes a lock the mainline can hold -- an argument about which
- *	  handlers exist, and not one that survives a second CPU.
- *	- An idle thread of its own, and a scheduler that knows a runqueue can
- *	  be served by more than one CPU.
- *	- TLB shootdown.  This processor would cache translations that the
- *	  boot processor changes, and nothing tells it to forget them.
- *
- * Until then it sits here, where it can do no harm, and says so in `cpu'.
+ * What is still missing before it can be allowed to RUN anything is an idle
+ * thread of its own, and a scheduler that knows a runqueue can be served by
+ * more than one CPU.  Until then it sits here, where it can do no harm, and
+ * says so in `cpu'.
  */
 void
 ap_entry(struct cpu *cp)
@@ -320,8 +318,9 @@ ap_entry(struct cpu *cp)
 	 * is a bring-up message.  It is not a substitute for serialising the
 	 * console, which is owed the day these processors run anything.
 	 */
-	kprintf("cpu %u: online, lapic %u, stack at 0x%llx -- parked with "
-	    "interrupts off\n", cpu_id(), (unsigned int)cp->cp_lapic_id,
+	kprintf("cpu %u: online, lapic %u, stack at 0x%llx -- parked, "
+	    "answering invalidations\n", cpu_id(),
+	    (unsigned int)cp->cp_lapic_id,
 	    (unsigned long long)cp->cp_kernel_rsp);
 
 	/*
@@ -331,7 +330,16 @@ ap_entry(struct cpu *cp)
 	 */
 	cpu_mark_online();
 
+	/*
+	 * sti and hlt in one instruction pair, and in that order: hlt with
+	 * interrupts off is a processor that never wakes again, and an
+	 * interrupt arriving between an sti and a separate hlt would be
+	 * serviced and then slept through.  The pair is the idiom because the
+	 * architecture defers the effect of sti by one instruction for exactly
+	 * this reason.  cli on the way back so the next round is entered the
+	 * way this one was.
+	 */
 	for (;;) {
-		__asm__ __volatile__ ("cli; hlt");
+		__asm__ __volatile__ ("sti; hlt; cli");
 	}
 }

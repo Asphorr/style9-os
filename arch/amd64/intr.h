@@ -65,6 +65,20 @@ void	irq_install(unsigned int irq, irq_handler_t);
 #define	INTR_LOCAL_BASE		48
 
 /*
+ * The vectors one processor uses to say something to another.
+ *
+ * Below the timer's 0xF0, which the APIC's priority scheme makes a real
+ * choice -- it serves the highest-numbered pending vector first -- and which
+ * is nevertheless not an important one: both handlers are a few microseconds
+ * long, so whichever loses waits for the other to finish.  What actually
+ * bounds how long a shootdown can be ignored is not the vector number but
+ * pmap_tlb_poll, which is called from every loop that spins with interrupts
+ * off; the ordering here is written down mainly so a later measurement has
+ * something to disagree with.
+ */
+#define	INTR_VEC_TLB		0xE0	/* forget these translations       */
+
+/*
  * Install a handler for a vector the LOCAL APIC delivers -- its timer, an
  * inter-processor interrupt -- as opposed to irq_install's 8259 lines.  The
  * two are different in a way that matters at the end of the handler: an

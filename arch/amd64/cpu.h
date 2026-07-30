@@ -118,6 +118,17 @@ struct cpu {
 	int			 cp_spin_depth;		/* (i)              */
 	bool			 cp_spin_saved_if;	/* (i)              */
 
+	/*
+	 * The last TLB-invalidation request this CPU has carried out, as a
+	 * serial number.  Written by this CPU only, read by whichever CPU is
+	 * waiting for it -- see pmap_tlb_poll for why a serial number rather
+	 * than a count of outstanding acknowledgements: the same request may
+	 * be noticed twice, once by the interrupt and once by a spin loop
+	 * polling for it, and a number that is merely re-stored is harmless
+	 * where a second decrement would be a rout.
+	 */
+	volatile uint64_t	 cp_tlb_gen;		/* (a)              */
+
 	volatile int		 cp_preempt_count;	/* (i) see sched.h  */
 	volatile int		 cp_need_resched;	/* (i)              */
 	volatile unsigned int	 cp_quantum_used;	/* (i) timer ticks  */

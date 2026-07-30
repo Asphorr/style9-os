@@ -186,6 +186,16 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	if (mp_start_aps() != 0)
 		tty_puts("  [ok] application processors up (parked)\n");
 
+	/*
+	 * And the first thing the other processors are ever asked to do: forget
+	 * a page translation.  It runs here, immediately after they arrive,
+	 * because every mapping this kernel changes from now on depends on that
+	 * message getting through -- so if it does not, the boot should say so
+	 * at the point the mechanism was switched on rather than as a
+	 * corruption somewhere downstream.
+	 */
+	pmap_tlb_selftest();
+
 	kmain_memory_smoke();
 	kmain_run_tests();
 

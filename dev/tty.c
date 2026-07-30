@@ -15,6 +15,7 @@
 #include "io.h"
 #include "kprintf.h"
 #include "panic.h"
+#include "pmap.h"
 #include "tty.h"
 #include "uart.h"
 
@@ -302,6 +303,13 @@ cons_enter(void)
 	    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
 		__atomic_fetch_add(&cons_waits, 1, __ATOMIC_RELAXED);
 		do {
+			/*
+			 * Interrupts are off here, so this CPU cannot take the
+			 * message asking it to forget a page translation --
+			 * and the sender is waiting for it.  Answered from
+			 * inside the wait, for the same reason spin_lock does.
+			 */
+			pmap_tlb_poll();
 			__asm__ __volatile__ ("pause");
 			vacant = CONS_NOBODY;
 		} while (!__atomic_compare_exchange_n(&cons_owner, &vacant, me,

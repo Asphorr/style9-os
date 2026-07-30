@@ -9,12 +9,16 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "cpu.h"
+#include "intr.h"
 #include "kmem.h"
 #include "kprintf.h"
+#include "lapic.h"
 #include "panic.h"
 #include "pmap.h"
 #include "pmm.h"
 #include "spinlock.h"
+#include "tsc.h"
 
 /*
  * x86_64 page-table entry bits.
@@ -78,7 +82,71 @@ static struct pmap	 kernel_pmap_store = {
 
 struct pmap		*kernel_pmap = &kernel_pmap_store;
 
+/*
+ * TLB SHOOTDOWN: TELLING THE OTHER PROCESSORS TO FORGET A TRANSLATION.
+ *
+ * invlpg is a local instruction.  It empties one entry out of the TLB of the
+ * processor that executes it and says nothing to any other, and every other
+ * processor's TLB is a private cache of the SAME page tables -- so a mapping
+ * this CPU has just removed or changed can go on being used elsewhere, with
+ * no fault, no message and no bound on how long.  That is not a race that
+ * shows up as a crash; it is a stale translation, which is a store landing in
+ * a page that now belongs to somebody else.
+ *
+ * The architecture provides no way to invalidate another processor's TLB.
+ * The only way is to ask it to do so itself, which means an interrupt, which
+ * means the far processor has to be in a state where it can take one --
+ * AND EVERY SPINLOCK IN THIS KERNEL NOW TURNS INTERRUPTS OFF.  That is the
+ * whole difficulty of this rung, and it is a deadlock, not a delay:
+ *
+ *	CPU A takes a pmap's lock, changes a mapping, sends the request and
+ *	waits for an acknowledgement.  CPU B is spinning for that same pmap's
+ *	lock with interrupts off.  A waits for B to answer; B waits for A to
+ *	let go.  Neither is doing anything wrong.
+ *
+ * So the request is not delivered ONLY by interrupt.  It is published as a
+ * serial number, and every loop in this kernel that spins with interrupts off
+ * calls pmap_tlb_poll -- kern/spinlock.c's acquire above all.  The interrupt
+ * is then an optimisation for processors that are not spinning, and the
+ * correctness comes from the poll.  A processor may notice the same request
+ * twice, once each way, which is why the answer is a NUMBER IT STORES rather
+ * than a counter it decrements: storing the same value twice is nothing, and
+ * a second decrement would let the sender leave while a CPU still held the
+ * stale entry.
+ *
+ * One request at a time, under one lock.  A per-CPU queue of pending
+ * invalidations would let several proceed at once and would need each entry
+ * to be acknowledged separately; with a handful of processors and a shootdown
+ * measured in microseconds, the queue is not yet worth the state it takes to
+ * be wrong about.
+ *
+ * ⚠ WHAT IS NOT DONE HERE: narrowing the audience.  Every online processor is
+ * asked, including ones that have never had this pmap in CR3 and cannot
+ * possibly be holding a translation from it.  Doing better means tracking
+ * which CPUs have a pmap active, which is a bitmask maintained by
+ * pmap_activate and by the scheduler's switch -- worth doing when the
+ * measurement below says it is, and dishonest to claim before then.
+ */
+#define	TLB_WAIT_US		100000	/* absent, not merely slow          */
+#define	TLB_LATE_MAX_LINES	8	/* say so, but do not flood         */
+
+static struct spinlock	 tlb_lock = SPINLOCK_INIT("tlb-shootdown");
+static volatile uint64_t tlb_gen;	/* (tlb_lock) request serial number */
+static volatile uint64_t tlb_va;	/* (tlb_lock) the page to forget    */
+static uint64_t		 tlb_requests;	/* (tlb_lock) shootdowns sent       */
+static uint64_t		 tlb_ipis;	/* (tlb_lock) messages that left    */
+static uint64_t		 tlb_wait_us;	/* (tlb_lock) total spent waiting   */
+static uint64_t		 tlb_wait_max_us; /* (tlb_lock) the worst one       */
+static uint64_t		 tlb_late;	/* (tlb_lock) never acknowledged    */
+static uint64_t		 tlb_late_lines;/* (tlb_lock) ...of them, printed   */
+static uint64_t		 tlb_by_ipi;	/* (a) answered by the interrupt    */
+static uint64_t		 tlb_by_poll;	/* (a) answered from a spin loop    */
+
 static uint64_t	*table_va(uint64_t pte);
+static bool	 pmap_tlb_apply(void);
+static void	 pmap_invlpg_local(uint64_t va);
+static void	 pmap_shootdown(uint64_t va);
+static void	 pmap_tlb_ipi(struct trapframe *tf);
 static uint64_t	*ensure_table(struct pmap *pm, uint64_t *parent, size_t idx,
 		    bool user);
 static uint64_t	 leaf_flags(uint32_t prot);
@@ -139,6 +207,8 @@ pmap_bootstrap(void)
 	__asm__ __volatile__ ("mov %%cr0, %0" : "=r"(cr0));
 	KASSERT((cr0 & CR0_WP) != 0,
 	    "pmap_bootstrap: CR0.WP is clear -- ring 0 ignores read-only");
+
+	pmap_tlb_init();
 
 	kprintf("pmap: kernel CR3 = 0x%llx (PML4 at %p), CR0.WP on\n",
 	    (unsigned long long)kernel_pmap->pm_pml4_pa,
@@ -420,11 +490,254 @@ pmap_kextract(uint64_t va)
 	return (pmap_extract(kernel_pmap, va));
 }
 
+static void
+pmap_invlpg_local(uint64_t va)
+{
+
+	__asm__ __volatile__ ("invlpg (%0)" :: "r"((uintptr_t)va) : "memory");
+}
+
+/*
+ * Carry out whatever invalidation is outstanding, if this CPU has not already.
+ *
+ * ⚠ MUST BE CALLED WITH INTERRUPTS OFF, which every one of its callers has by
+ * construction: the interrupt handler is entered through a gate that clears
+ * IF, and the spin loops that call it have just disabled them to take a lock.
+ * With interrupts on, curcpu() is a question whose answer can change between
+ * the read and the store, and this would credit the wrong processor.
+ *
+ * Cheap enough to sit in a spin loop: two loads and a compare when there is
+ * nothing to do, which is the case every time but the one that matters.
+ */
+static bool
+pmap_tlb_apply(void)
+{
+	struct cpu	*cp;
+	uint64_t	 gen;
+
+	gen = __atomic_load_n(&tlb_gen, __ATOMIC_ACQUIRE);
+	cp  = curcpu();
+	if (cp->cp_tlb_gen == gen)
+		return (false);
+
+	/*
+	 * The acquire above is what makes the address safe to read: the sender
+	 * wrote it before publishing the number, so a processor that can see
+	 * this number can see the address that came with it.
+	 */
+	pmap_invlpg_local(tlb_va);
+
+	/*
+	 * Released last, and with a barrier, because the sender is spinning on
+	 * it: it means "the entry is gone from this processor", and the entry
+	 * has to actually be gone before it can mean that.
+	 */
+	__atomic_store_n(&cp->cp_tlb_gen, gen, __ATOMIC_RELEASE);
+	return (true);
+}
+
+/*
+ * The two ways in, counted apart -- because which one does the work is the
+ * only evidence there is that the poll is load-bearing rather than
+ * decorative.  A processor sitting idle answers by interrupt; a processor
+ * spinning for a lock with interrupts off can only answer from the spin, and
+ * that is precisely the case that would otherwise deadlock.  If the second
+ * number is zero for ever, the argument in the block comment above is a story
+ * about a thing that never happens.
+ */
+void
+pmap_tlb_poll(void)
+{
+
+	if (pmap_tlb_apply())
+		__atomic_fetch_add(&tlb_by_poll, 1, __ATOMIC_RELAXED);
+}
+
+static void
+pmap_tlb_ipi(struct trapframe *tf)
+{
+
+	(void)tf;
+	if (pmap_tlb_apply())
+		__atomic_fetch_add(&tlb_by_ipi, 1, __ATOMIC_RELAXED);
+}
+
+/*
+ * Ask every other online processor to forget `va', and wait until they all
+ * say they have.
+ *
+ * The wait is the point.  Returning before the acknowledgements would leave
+ * the caller free to hand the physical page to somebody else while a
+ * processor could still reach it through the mapping being removed, which is
+ * the exact corruption this whole mechanism exists to prevent.
+ */
+static void
+pmap_shootdown(uint64_t va)
+{
+	struct cpu	*me;
+	uint64_t	 gen;
+	uint64_t	 t0;
+	uint64_t	 us;
+	unsigned int	 present;
+	unsigned int	 sent;
+	unsigned int	 i;
+
+	spin_lock(&tlb_lock);
+
+	me      = curcpu();
+	present = cpu_present_count();
+
+	/*
+	 * The sender counts itself as done before publishing, because it is:
+	 * pmap_invlpg has already run the instruction locally.  Doing it in
+	 * this order also keeps the invariant the poll relies on -- no CPU is
+	 * ever behind on a generation it has already carried out.
+	 */
+	tlb_va = va;
+	gen = tlb_gen + 1;
+	me->cp_tlb_gen = gen;
+	__atomic_store_n(&tlb_gen, gen, __ATOMIC_RELEASE);
+
+	sent = 0;
+	for (i = 0; i < present; i++) {
+		if (&cpus[i] == me || cpus[i].cp_online == 0)
+			continue;
+		if (lapic_ipi_vector(cpus[i].cp_lapic_id, INTR_VEC_TLB))
+			sent++;
+	}
+
+	t0 = tsc_read();
+	for (i = 0; i < present; i++) {
+		if (&cpus[i] == me || cpus[i].cp_online == 0)
+			continue;
+		while (__atomic_load_n(&cpus[i].cp_tlb_gen,
+		    __ATOMIC_ACQUIRE) != gen) {
+			if (tsc_to_us(tsc_read() - t0) > TLB_WAIT_US) {
+				/*
+				 * Giving up leaves a stale translation on that
+				 * processor, which is the very thing this is
+				 * for -- so it is counted and named rather
+				 * than absorbed.  The alternative is waiting
+				 * for ever for a CPU that is not going to
+				 * answer, which turns one wrong mapping into a
+				 * dead machine.
+				 */
+				tlb_late++;
+				if (tlb_late_lines < TLB_LATE_MAX_LINES) {
+					tlb_late_lines++;
+					kprintf("pmap: cpu %u did not "
+					    "acknowledge the invalidation of "
+					    "0x%llx in %u us -- it may still "
+					    "hold it\n", (unsigned int)i,
+					    (unsigned long long)va,
+					    (unsigned int)TLB_WAIT_US);
+				}
+				break;
+			}
+			__asm__ __volatile__ ("pause");
+		}
+	}
+	us = tsc_to_us(tsc_read() - t0);
+
+	tlb_requests++;
+	tlb_ipis += sent;
+	tlb_wait_us += us;
+	if (us > tlb_wait_max_us)
+		tlb_wait_max_us = us;
+
+	spin_unlock(&tlb_lock);
+}
+
 void
 pmap_invlpg(uint64_t va)
 {
 
-	__asm__ __volatile__ ("invlpg (%0)" :: "r"((uintptr_t)va) : "memory");
+	pmap_invlpg_local(va);
+
+	/*
+	 * Nobody to tell.  True for the whole of boot up to the rung that
+	 * starts the other processors, and true for ever on a machine with one
+	 * -- so the everyday cost of having a shootdown at all is this load.
+	 */
+	if (cpu_online_count() < 2)
+		return;
+
+	pmap_shootdown(va);
+}
+
+void
+pmap_tlb_init(void)
+{
+
+	/*
+	 * Installed here rather than beside the other processors' bring-up,
+	 * because the vector has to be answerable before the first processor
+	 * that could be asked exists -- and because a handler installed by the
+	 * code that owns the mechanism is one fewer thing to keep in step.
+	 */
+	intr_install_local(INTR_VEC_TLB, pmap_tlb_ipi);
+}
+
+/*
+ * Prove the round trip, and say what it costs.
+ *
+ * Every acknowledgement is evidence: it can only be stored by the far
+ * processor, and only after it has run our handler or our poll, so a
+ * processor that had never left the trampoline, or whose IDT was wrong, or
+ * whose APIC was not accepting, would show up here as a timeout rather than
+ * as a mystery three subsystems later.
+ *
+ * The address is a page of the kernel's own identity map.  Invalidating a
+ * live translation is harmless -- the next access walks the tables and finds
+ * the same entry -- and what is being tested is the message, not the mapping.
+ */
+#define	TLB_TEST_ROUNDS		1000
+
+void
+pmap_tlb_selftest(void)
+{
+	uint64_t	req0;
+	uint64_t	us0;
+	uint64_t	late0;
+	uint64_t	us;
+	uint64_t	va;
+	unsigned int	i;
+
+	if (cpu_online_count() < 2) {
+		kprintf("tlb-shootdown: only one processor is running -- "
+		    "nothing to tell\n");
+		return;
+	}
+
+	req0  = tlb_requests;
+	us0   = tlb_wait_us;
+	late0 = tlb_late;
+	va    = (uint64_t)(uintptr_t)&kernel_pmap_store & ~(uint64_t)PAGE_MASK;
+
+	for (i = 0; i < TLB_TEST_ROUNDS; i++)
+		pmap_invlpg(va);
+
+	us = tlb_wait_us - us0;
+
+	if (tlb_requests - req0 != TLB_TEST_ROUNDS) {
+		kprintf("tlb-shootdown: FAIL %llu of %u rounds were sent\n",
+		    (unsigned long long)(tlb_requests - req0),
+		    (unsigned int)TLB_TEST_ROUNDS);
+		return;
+	}
+	if (tlb_late != late0) {
+		kprintf("tlb-shootdown: FAIL %llu round(s) went unanswered\n",
+		    (unsigned long long)(tlb_late - late0));
+		return;
+	}
+
+	kprintf("tlb-shootdown: PASS -- %u invalidations, every one "
+	    "acknowledged by all %u other processor(s), %llu us each on "
+	    "average and %llu us at worst\n",
+	    (unsigned int)TLB_TEST_ROUNDS,
+	    (unsigned int)(cpu_online_count() - 1),
+	    (unsigned long long)(us / TLB_TEST_ROUNDS),
+	    (unsigned long long)tlb_wait_max_us);
 }
 
 void
@@ -442,6 +755,30 @@ pmap_stats(void)
 	    (unsigned long long)leafs,
 	    (unsigned long long)inters,
 	    (unsigned long long)kernel_pmap->pm_pml4_pa);
+
+	/*
+	 * And what talking to the other processors has cost.  The total is the
+	 * number that decides whether narrowing the audience is worth doing:
+	 * every microsecond here is a processor standing still inside a page
+	 * table change, and this is the only place it is visible.
+	 */
+	spin_lock(&tlb_lock);
+	kprintf("pmap: %llu shootdown(s), %llu message(s) sent, %llu ms "
+	    "waiting -- %llu us each, %llu us at worst%s\n",
+	    (unsigned long long)tlb_requests,
+	    (unsigned long long)tlb_ipis,
+	    (unsigned long long)(tlb_wait_us / 1000),
+	    (unsigned long long)(tlb_requests == 0 ? 0 :
+	    tlb_wait_us / tlb_requests),
+	    (unsigned long long)tlb_wait_max_us,
+	    tlb_late != 0 ? "  *** SOME WENT UNANSWERED ***" : "");
+	spin_unlock(&tlb_lock);
+
+	kprintf("pmap: %llu answered by the interrupt, %llu from inside a "
+	    "spin loop\n",
+	    (unsigned long long)__atomic_load_n(&tlb_by_ipi, __ATOMIC_RELAXED),
+	    (unsigned long long)__atomic_load_n(&tlb_by_poll,
+	    __ATOMIC_RELAXED));
 }
 
 /* ---- internals ---------------------------------------------------------- */

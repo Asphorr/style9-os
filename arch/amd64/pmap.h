@@ -72,7 +72,41 @@ bool		pmap_kenter(uint64_t va, uint64_t pa, uint32_t flags);
 bool		pmap_kremove(uint64_t va);
 uint64_t	pmap_kextract(uint64_t va);
 
+/*
+ * Drop one page's translation -- HERE AND ON EVERY OTHER ONLINE PROCESSOR,
+ * and not until they have all said they have dropped it.
+ *
+ * invlpg is a local instruction and every processor's TLB is a private cache
+ * of the same page tables, so a mapping changed on one CPU goes on being used
+ * on the others with no fault and no bound.  That is why this waits: a caller
+ * that removes a mapping and then frees the page is entitled to assume the
+ * page is unreachable when this returns.
+ *
+ * Costs one load on a machine running one processor.  See pmap.c for how a
+ * request reaches a processor whose interrupts are off, which is every
+ * processor holding any spinlock in this kernel.
+ */
 void		pmap_invlpg(uint64_t va);
+
+/*
+ * Carry out an outstanding invalidation on THIS processor, if there is one.
+ *
+ * Called from the inter-processor interrupt, and -- the half that makes the
+ * mechanism deadlock-free rather than merely fast -- from every loop in this
+ * kernel that spins with interrupts off.  Must be called with interrupts off.
+ */
+void		pmap_tlb_poll(void);
+
+/* Claim the vector.  Before any processor that could be asked exists. */
+void		pmap_tlb_init(void);
+
+/*
+ * Send a thousand invalidations and check that every processor answered every
+ * one of them.  An acknowledgement can only be written by the far processor,
+ * so this is a test of the whole path -- APIC, IDT, handler, barriers -- and
+ * not of this file's bookkeeping.
+ */
+void		pmap_tlb_selftest(void);
 
 /*
  * Physical address of the kernel's top-level table -- the value CR3 wants.

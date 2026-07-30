@@ -256,6 +256,22 @@ lapic_ipi_startup(uint32_t apic_id, uint64_t tramp_pa)
 	    ICR_MODE_STARTUP | ICR_LEVEL_ASSERT | vec));
 }
 
+bool
+lapic_ipi_vector(uint32_t apic_id, uint8_t vec)
+{
+
+	/*
+	 * Fixed delivery, physical destination, edge triggered -- which is
+	 * every field at zero except the vector and the assert bit, so the
+	 * command is almost the vector itself.  Spelled out anyway, because a
+	 * command word made of defaults is one nobody can check.
+	 */
+	if (vec < INTR_LOCAL_BASE)
+		return (false);
+
+	return (lapic_ipi_send(apic_id, ICR_LEVEL_ASSERT | (uint32_t)vec));
+}
+
 static void
 lapic_timer_isr(struct trapframe *tf)
 {

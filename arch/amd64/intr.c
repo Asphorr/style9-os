@@ -297,8 +297,16 @@ intr_dispatch(struct trapframe *tf)
 			 * 8259 tail above still runs it, so deadlines are
 			 * looked at exactly as often as before; doing it twice
 			 * would only add a lock acquisition to every tick.
+			 *
+			 * ⚠ AND ONLY ON A CPU THAT HAS A THREAD.  This is the
+			 * one path an application processor reaches before it
+			 * is in the scheduler at all: a parked CPU answers
+			 * inter-processor interrupts and has no current
+			 * thread, no idle thread and no runqueue -- so a
+			 * reschedule owed there is a reschedule to nowhere,
+			 * and thread_yield would assert on the way in.
 			 */
-			if (preempt_is_enabled()) {
+			if (current_thread != NULL && preempt_is_enabled()) {
 				sched_drain_irq_wakes();
 				if (preempt_resched_wanted()) {
 					preempt_resched_clear();

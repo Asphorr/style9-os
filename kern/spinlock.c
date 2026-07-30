@@ -14,6 +14,7 @@
 #include "kprintf.h"
 #include "ksym.h"
 #include "panic.h"
+#include "pmap.h"
 #include "sched.h"
 #include "spinlock.h"
 #include "thread.h"
@@ -120,8 +121,24 @@ spin_lock(struct spinlock *sl)
 		    sl->sl_name != NULL ? sl->sl_name : "?");
 	}
 
-	while (__atomic_exchange_n(&sl->sl_state, 1u, __ATOMIC_ACQUIRE) != 0)
+	/*
+	 * ⚠ AND WHILE WAITING, ANSWER THE OTHER PROCESSORS.
+	 *
+	 * Interrupts are off from here to the release, so this CPU cannot take
+	 * the inter-processor interrupt that asks it to drop a stale page
+	 * translation -- and the CPU that sent it is waiting for the answer,
+	 * possibly while holding the very lock being waited for here.  Each is
+	 * waiting for the other, and neither is doing anything wrong.
+	 *
+	 * So the request is carried out from inside the wait.  It needs no
+	 * lock, touches nothing this CPU is in the middle of, and is two loads
+	 * and a compare when there is nothing outstanding, which is every time
+	 * but the one that would otherwise be fatal.
+	 */
+	while (__atomic_exchange_n(&sl->sl_state, 1u, __ATOMIC_ACQUIRE) != 0) {
+		pmap_tlb_poll();
 		__asm__ __volatile__ ("pause");
+	}
 
 	sl->sl_holder_rip = ra;
 	sl->sl_holder_cpu = (int)cpu_id();

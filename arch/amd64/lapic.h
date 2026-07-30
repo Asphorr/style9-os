@@ -140,6 +140,23 @@ bool		lapic_ipi_init(uint32_t apic_id);
 bool		lapic_ipi_startup(uint32_t apic_id, uint64_t tramp_pa);
 
 /*
+ * And the everyday one: raise `vec' on the processor with this APIC id, as an
+ * ordinary interrupt it will take through the IDT like any other.
+ *
+ * Returns false only if the message could not be handed to the APIC.  As with
+ * the two above, that is the whole of what is knowable here -- whether the far
+ * processor has ACTED on it is a question only the far processor can answer,
+ * and every caller of this needs an acknowledgement of its own.
+ *
+ * ⚠ THE SENDER MUST NOT WAIT FOR A REPLY WHILE HOLDING ANYTHING THE RECEIVER
+ * COULD WANT, unless the wait services incoming requests -- a processor with
+ * interrupts off cannot answer, and every spinlock in this kernel turns them
+ * off.  pmap_tlb_poll is that service, and kern/spinlock.c calls it from the
+ * acquire spin for exactly this reason.
+ */
+bool		lapic_ipi_vector(uint32_t apic_id, uint8_t vec);
+
+/*
  * Counting rate of this CPU's APIC timer, in ticks per second, at the
  * divisor lapic_timer_probe measured with.  Zero until it has run.
  */
