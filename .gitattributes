@@ -1,0 +1,18 @@
+# Line endings for the files the BUILD reads, which is not the same set as the
+# files a person reads.
+#
+# Everything that compiles this kernel runs inside WSL, where a carriage return
+# is a character rather than whitespace.  This repository is developed with
+# core.autocrlf on, so a fresh clone -- or, as it happened here, a second
+# worktree checked out to verify a commit -- gets CRLF in every text file, and
+# then "#!/bin/sh\r" names an interpreter that does not exist.  The build dies
+# with "tools/gen_ksyms.sh: not found" pointing at a file that is right there,
+# which is a diagnosis nobody would arrive at from the message.
+#
+# So the shell scripts, the makefiles and the python helpers are pinned to LF
+# regardless of what the checkout would otherwise do.  PowerShell is run by
+# Windows and is deliberately left alone.
+*.sh		text eol=lf
+*.py		text eol=lf
+*.mk		text eol=lf
+Makefile	text eol=lf
