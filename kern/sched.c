@@ -86,6 +86,47 @@ static struct thread	*irq_wake_head;		/* (a) */
 static struct spinlock	timed_lock = SPINLOCK_INIT("sched-timed");
 static struct thread	*timed_head;		/* (timed_lock)            */
 
+/*
+ * Sleep queue: every thread currently BLOCKED on a CHANNEL, threaded through
+ * th_sleep_link.  A channel is any address two pieces of code agree to name --
+ * classically a field of the object being waited on -- and sched_wakeup wakes
+ * whoever is parked on one.
+ *
+ * WHY THE SCHEDULER OWNS THIS LIST rather than each object keeping its own
+ * waiter pointer: a waiter can be woken by things that know nothing about what
+ * it was waiting for.  A kill fan-out wakes every thread of a task; a driver
+ * IRQ wakes one by name; a thread whose task is killed while it is parked
+ * retires without the object ever hearing about it.  An object holding a
+ * thread pointer has to be told about all three, and the console's single
+ * waiter slot -- which needed an explicit hook in task teardown to avoid
+ * calling thread_wake on freed memory -- is what that costs.  Here the only
+ * two moments a thread enters or leaves the list are the two the scheduler
+ * already owns: committing to BLOCKED, and leaving it.  Nothing else can get
+ * it wrong, because nothing else touches the list.
+ *
+ * A single list, walked per wakeup, rather than a hash of queues.  The whole
+ * system has a handful of threads and at most a couple of them are parked at
+ * once, so a scan is cheaper than the buckets it would take to avoid it; when
+ * that stops being true the fix is a hash keyed on the channel, and nothing
+ * outside these three functions would have to change.
+ */
+static struct thread	*sleepq_head;		/* (sched_lock)            */
+
+/*
+ * How long a wake takes to become a RUN.  Making a thread READY is not making
+ * it run: it goes to the tail of the runqueue and waits for whoever holds the
+ * CPU to give it up.  A waiter that polls is always in that queue already and
+ * so is never far from its turn; one that sleeps rejoins from the back, and
+ * whether that is cheaper depends on numbers rather than on argument.
+ *
+ * Measured here rather than reasoned about because the reasoning was wrong
+ * once: parking three waits made the news arrive TEN TIMES LATER, and nothing
+ * short of this counter said so.
+ */
+static uint64_t		wake_lat_n;		/* (a) wakes measured      */
+static uint64_t		wake_lat_sum_ms;	/* (a) total delay         */
+static uint64_t		wake_lat_max_ms;	/* (a) worst one           */
+
 static void	idle_loop(void *) __attribute__((noreturn));
 static struct thread *pick_next_locked(struct thread *self);
 static void	enqueue_locked(struct thread *th);
@@ -214,6 +255,34 @@ sched_enqueue(struct thread *th)
 
 	enqueue_locked(th);
 	spin_unlock(&sched_lock);
+}
+
+/*
+ * Put `th` on the sleep queue / take it off again.  Both require sched_lock.
+ * The unlink is idempotent -- a thread that was never on the list, or has
+ * already been taken off it by sched_wakeup, is left alone -- because the
+ * callers cannot all tell which case they are in.
+ */
+static void
+sleepq_link_locked(struct thread *th)
+{
+
+	th->th_sleep_link = sleepq_head;
+	sleepq_head = th;
+}
+
+static void
+sleepq_unlink_locked(struct thread *th)
+{
+	struct thread	**pp;
+
+	for (pp = &sleepq_head; *pp != NULL; pp = &(*pp)->th_sleep_link) {
+		if (*pp == th) {
+			*pp = th->th_sleep_link;
+			th->th_sleep_link = NULL;
+			return;
+		}
+	}
 }
 
 static void
@@ -363,6 +432,16 @@ thread_block_release(int reason, void *target, struct spinlock *external)
 	spin_unlock(&self->th_lock);
 
 	/*
+	 * On the sleep queue now, and only now: after the pre-park kill check
+	 * above, which is the one path out of here that does NOT go through
+	 * thread_wake and so would leave a linked thread behind to be woken
+	 * after it had been freed.  A NULL target names no channel and cannot
+	 * be woken by one, so it stays off the list.
+	 */
+	if (target != NULL)
+		sleepq_link_locked(self);
+
+	/*
 	 * Drop the caller's lock with sched_lock held.  Any thread_wake
 	 * fired now must first acquire sched_lock; by that time we have
 	 * already committed to BLOCKED so the wake observes a real
@@ -390,6 +469,18 @@ thread_block_release(int reason, void *target, struct spinlock *external)
 
 	/* Woken by thread_wake; release sched_lock and return. */
 	spin_unlock(&sched_lock);
+
+	/* How long that wake took to reach the CPU.  See wake_lat_*. */
+	if (self->th_wake_ms != 0) {
+		uint64_t	delay;
+
+		delay = clock_uptime_ms() - self->th_wake_ms;
+		self->th_wake_ms = 0;
+		wake_lat_n++;
+		wake_lat_sum_ms += delay;
+		if (delay > wake_lat_max_ms)
+			wake_lat_max_ms = delay;
+	}
 
 	/*
 	 * Post-wake kill check.  If task_request_terminate ran while we
@@ -420,10 +511,151 @@ thread_wake(struct thread *th)
 	th->th_state        = THREAD_READY;
 	th->th_block_reason = THREAD_NOT_BLOCKED;
 	th->th_block_target = NULL;
+	th->th_wake_ms      = clock_uptime_ms();
 	spin_unlock(&th->th_lock);
 
+	sleepq_unlink_locked(th);
 	enqueue_locked(th);
+	/*
+	 * ASK FOR A RESCHEDULE.  Making a thread READY is not making it run:
+	 * without this it waits in the queue until whoever holds the CPU gives
+	 * it up voluntarily or the quantum expires -- and the quantum is five
+	 * ticks, so news can arrive fifty milliseconds after it happened.
+	 *
+	 * This line is here because that was MEASURED, twice over.  Across a
+	 * whole boot, 24074 wakes spent 154 seconds between being made ready
+	 * and running, a mean of 6 ms each; with this, 530 ms, a mean of 0.
+	 * And it is what makes sleeping better than polling rather than worse:
+	 * parking three waits that used to poll made them ten times SLOWER to
+	 * notice anything, because a poller gets a fresh look every time it is
+	 * scheduled while a sleeper gets one look and must be given the CPU to
+	 * take it.
+	 *
+	 * Honoured at the next point it is safe to honour -- the tail of
+	 * intr_dispatch, or the preempt_enable that drops the count to zero,
+	 * which the spin_unlock below reaches at once.
+	 */
+	preempt_need_resched = 1;
 	spin_unlock(&sched_lock);
+}
+
+/*
+ * sched_wakeup: make ready every thread parked on `chan`.
+ *
+ * The caller's contract is the one every sleep/wakeup pair has ever had, and
+ * getting it wrong is the classic lost wakeup: the waiter must test the
+ * condition and park under ONE lock, handing that lock to
+ * thread_block_release so the drop happens with sched_lock held.  The waker
+ * changes the condition, then calls this -- in either order with respect to
+ * dropping its own lock, since a waiter is already on the queue by the time it
+ * has let go of the lock the waker needs.
+ *
+ * Waking is a HINT and never a promise that the condition holds: a woken
+ * thread must re-test in a loop.  Another thread may take the bytes first, a
+ * kill may have arrived, or the channel may be shared by waiters wanting
+ * different things.  Every caller in this kernel parks inside `for (;;)`.
+ *
+ * Returns the number woken, which is what lets a caller count its own
+ * fruitless trips honestly rather than guessing.
+ */
+/*
+ * Wake every thread of `task` that is asleep on a CHANNEL, and no others.
+ * Returns how many there were.
+ *
+ * For posting a signal.  A signal in this kernel sets a bit in the target and
+ * returns; a thread already asleep inside a syscall never sees it, and before
+ * anything here parked, that did not matter -- the waits polled, so the bit was
+ * noticed on the next trip round.  Parking them made read(2) on a pipe stop
+ * being interruptible, which POSIX requires it to be, and which a scene in
+ * pipefork tests and duly failed.
+ *
+ * WHY ONLY CHANNEL SLEEPERS.  A thread waiting on a Mach port is linked into
+ * that port's waiter list through th_runq_link -- the same field the runqueue
+ * uses -- so making it READY while it is still on the port's list overwrites
+ * the link and truncates the list.  Waking one "just in case" is therefore not
+ * a harmless spurious wake but corruption, and the block reason is what tells
+ * the two apart: a channel sleeper is on the scheduler's own list and can be
+ * woken by anyone at any time, which is the whole reason that list exists.
+ */
+uint32_t
+sched_wake_sleepers_of(struct task *task)
+{
+	struct thread	*th;
+	struct thread	*next;
+	uint32_t	 n;
+
+	if (task == NULL)
+		return (0);
+
+	n = 0;
+	spin_lock(&sched_lock);
+	for (th = sleepq_head; th != NULL; th = next) {
+		next = th->th_sleep_link;
+		if (th->th_task != task)
+			continue;
+		if (th->th_block_reason != THREAD_BLOCK_SLEEP)
+			continue;
+		spin_lock(&th->th_lock);
+		if (th->th_state != THREAD_BLOCKED) {
+			spin_unlock(&th->th_lock);
+			continue;
+		}
+		th->th_state        = THREAD_READY;
+		th->th_block_reason = THREAD_NOT_BLOCKED;
+		th->th_block_target = NULL;
+		th->th_wake_ms      = clock_uptime_ms();
+		spin_unlock(&th->th_lock);
+
+		sleepq_unlink_locked(th);
+		enqueue_locked(th);
+		n++;
+	}
+	if (n != 0)
+		preempt_need_resched = 1;
+	spin_unlock(&sched_lock);
+	return (n);
+}
+
+uint32_t
+sched_wakeup(void *chan)
+{
+	struct thread	*th;
+	struct thread	*next;
+	uint32_t	 n;
+
+	KASSERT(chan != NULL, "sched_wakeup: NULL channel would wake nobody");
+
+	n = 0;
+	spin_lock(&sched_lock);
+	/*
+	 * Read the link BEFORE waking: making a thread ready takes it off
+	 * this list, so walking through the entry after the fact would follow
+	 * a pointer that the unlink has already cleared.
+	 */
+	for (th = sleepq_head; th != NULL; th = next) {
+		next = th->th_sleep_link;
+		if (th->th_block_target != chan)
+			continue;
+		spin_lock(&th->th_lock);
+		if (th->th_state != THREAD_BLOCKED) {
+			spin_unlock(&th->th_lock);
+			continue;
+		}
+		th->th_state        = THREAD_READY;
+		th->th_block_reason = THREAD_NOT_BLOCKED;
+		th->th_block_target = NULL;
+		th->th_wake_ms      = clock_uptime_ms();
+		spin_unlock(&th->th_lock);
+
+		sleepq_unlink_locked(th);
+		enqueue_locked(th);
+		n++;
+	}
+	/* Same reasoning as thread_wake: a wake without one is a wake late. */
+	if (n != 0)
+		preempt_need_resched = 1;
+	spin_unlock(&sched_lock);
+	return (n);
 }
 
 void
@@ -671,6 +903,20 @@ sched_runq_len(void)
 	n = runq_len;
 	spin_unlock(&sched_lock);
 	return (n);
+}
+
+void
+sched_wake_latency_print(void)
+{
+
+	if (wake_lat_n == 0)
+		return;
+	kprintf("sched: %llu wake(s) reached the CPU in %llu ms total, "
+	    "mean %llu ms, worst %llu ms\n",
+	    (unsigned long long)wake_lat_n,
+	    (unsigned long long)wake_lat_sum_ms,
+	    (unsigned long long)(wake_lat_sum_ms / wake_lat_n),
+	    (unsigned long long)wake_lat_max_ms);
 }
 
 uint64_t

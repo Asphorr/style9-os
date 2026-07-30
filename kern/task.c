@@ -296,6 +296,16 @@ task_deref(struct task *t)
 	spin_unlock(&tasks_lock);
 
 	/*
+	 * The task has left the live list, so a parent counting its children
+	 * will now count one fewer.  That is the news a parked wait4 needs and
+	 * this is the one place every route out of a task passes through --
+	 * told here rather than at each of the eight places a Darwin exit
+	 * records a status, because "every one of those was remembered" is a
+	 * claim to re-check whenever a ninth appears, and this is not.
+	 */
+	darwin_child_news(t->t_darwin_ppid);
+
+	/*
 	 * Order: drop the per-space SEND on task_self BEFORE releasing
 	 * the kernel-side RECEIVE.  port_space_destroy walks every entry
 	 * (incl. our well-known name 1) and port_dereps each one, so by

@@ -468,6 +468,15 @@ bool	darwin_cons_sink(char c);
 void	darwin_cons_feed(const char *buf, size_t n);
 void	darwin_cons_release(struct task *t);
 void	darwin_cons_stats(void);
+void	darwin_wait_stats(void);
+
+/*
+ * Wake a parent parked in wait4(2) for the pid `ppid`.  Called wherever a
+ * child's fate changes: where a zombie is recorded, and from task teardown,
+ * where the change is that the child no longer exists at all.  A no-op for
+ * ppid 0, which names no Darwin parent.
+ */
+void	darwin_child_news(unsigned long long ppid);
 
 /*
  * Zombie bookkeeping (kern/darwin.c).  Records {pid, ppid, wait4-format

@@ -577,6 +577,21 @@ scene_signal_interrupts_read(void)
 		(void)close(sync[1]);
 		byte = 0;
 		(void)read(sync[0], &byte, 1);	/* parent is about to block */
+		/*
+		 * ABOUT TO is not IN.  The sync byte says the parent has
+		 * written it, not that it has reached read(2) on the other
+		 * pipe -- and the signal has to land while it is parked
+		 * there, or there is no blocking read for it to end and the
+		 * scene proves nothing.  This burn is the gap between those
+		 * two, and it did not used to exist: the parent's write here
+		 * did not preempt it, so it stayed on the CPU long enough to
+		 * reach the read before this child ever ran.  Once a wake
+		 * carried a reschedule with it, that stopped being true and
+		 * this scene started passing its signal to a task sitting in
+		 * ring 3, where it was delivered harmlessly and the read that
+		 * followed was never interrupted at all.
+		 */
+		burn(EINTR_DELAY / 4);
 		kill(getppid(), EINTR_SIG);
 		/*
 		 * Long enough that a kernel which honours the signal answered
@@ -627,6 +642,195 @@ scene_signal_interrupts_read(void)
 	(void)close(sync[1]);
 }
 
+/*
+ * G. What WAITING costs.
+ *
+ * Every scene above asks whether a wait ENDS correctly.  This one asks what it
+ * costs while it lasts, which is a different question and one that a polling
+ * implementation passes every other test on: a parent that polls for its child
+ * instead of sleeping still gets the status back, still gets the exit code
+ * right, still fails nothing.
+ */
+struct pf_timeval {
+	long	tv_sec;
+	int	tv_usec;
+	int	tv_pad;
+};
+
+extern int	gettimeofday(struct pf_timeval *tv, void *tz);
+
+/* Wall clock in microseconds, or -1 if the clock will not answer. */
+static long
+pf_now_us(void)
+{
+	struct pf_timeval	tv;
+
+	if (gettimeofday(&tv, NULL) != 0)
+		return (-1);
+	return (tv.tv_sec * 1000000L + (long)tv.tv_usec);
+}
+
+/*
+ * How long after a child is ready to die does its parent's wait4(2) hear about
+ * it?  The child stamps the clock and _exits immediately; the parent stamps it
+ * again the instant wait4 returns.  The difference is the kernel's reap
+ * LATENCY, and it is the thing this rung actually changes.
+ *
+ * This is the third instrument this scene has had, and the first that can tell
+ * the two kernels apart.  What it replaced tried to measure THROUGHPUT -- the
+ * share of the machine a child gets while its parent waits -- on the theory
+ * that a polling parent must be eating half of it.  It is not: thread_yield
+ * hands the CPU back at once, so a parent polling that way does not get it
+ * again until the child has used a whole quantum, and it therefore looks
+ * around two or three times over a child's entire life.  Measured with the
+ * counters in the kernel: 22 fruitless trips against 14, for the same work.
+ * The theory was wrong, and two versions of a throughput test agreed the
+ * defect was absent because the defect was never a throughput defect.
+ *
+ * Latency is where a coarse poll shows: the news is a quantum old before
+ * anybody looks.  At 100 Hz with a five-tick slice that is tens of
+ * milliseconds per command, paid by every shell that runs one.  A parked
+ * parent is woken by the exit itself and sees it at once.
+ */
+#define	LAT_ROUNDS	5
+
+/*
+ * The bound is a HANG DETECTOR and deliberately nothing finer.
+ *
+ * What this scene measures is real, but it is not a quantity ring 3 can hold
+ * the kernel to: the number includes however long the parent waits its turn
+ * behind every other runnable thread, and this test controls none of them.  A
+ * tight bound of 10 ms passed on a quiet boot and failed on a busy one, with
+ * the kernel behaving correctly both times -- an assertion that depends on
+ * what else the machine happens to be doing is not an assertion.
+ *
+ * The load-independent statement of the same property lives in the kernel and
+ * is checked there: "0 explained by a lost wake" in the wait counters, which
+ * says every wait that ended was ended by the news itself and not by the
+ * deadline underneath it.  That is the invariant.  This is the gauge.
+ */
+#define	LAT_MAX_US	1000000L	/* 1 s: only a real hang trips this */
+
+static long
+reap_latency_once(int read_first)
+{
+	long	stamp;
+	long	after;
+	int	fd[2];
+	int	status;
+	int	pid;
+
+	if (pipe(fd) != 0)
+		return (-1);
+	pid = fork();
+	if (pid == 0) {
+		(void)close(fd[0]);
+		stamp = pf_now_us();
+		(void)write(fd[1], &stamp, sizeof(stamp));
+		_exit(0);
+	}
+	(void)close(fd[1]);
+	if (pid < 0) {
+		(void)close(fd[0]);
+		return (-1);
+	}
+	/*
+	 * WHICH WAKE IS BEING TIMED depends on the order, and the two are
+	 * different paths worth separating.  Reading first parks on the PIPE
+	 * and is woken by the child's write; waiting first parks on the WAIT
+	 * channel and is woken by its exit.  Whichever comes second finds its
+	 * answer already there and does not park at all, so each order times
+	 * exactly one of the two.
+	 */
+	stamp  = -1;
+	status = -1;
+	if (read_first) {
+		if (read(fd[0], &stamp, sizeof(stamp)) !=
+		    (long)sizeof(stamp)) {
+			(void)close(fd[0]);
+			return (-1);
+		}
+		(void)wait4(pid, &status, 0, NULL);
+	} else {
+		(void)wait4(pid, &status, 0, NULL);
+		if (read(fd[0], &stamp, sizeof(stamp)) !=
+		    (long)sizeof(stamp)) {
+			(void)close(fd[0]);
+			return (-1);
+		}
+	}
+	after = pf_now_us();
+	(void)close(fd[0]);
+	if (stamp < 0 || after < stamp)
+		return (-1);
+	return (after - stamp);
+}
+
+static void
+scene_wait_cost(void)
+{
+	long	lat;
+	long	best;
+	long	worst;
+	long	total;
+	int	order;
+	int	i;
+	int	n;
+
+	printf("[pipefork] --- what waiting costs ---\n");
+	if (pf_now_us() < 0) {
+		printf("[pipefork] no wall clock -- skipping the reap-latency "
+		    "measurement rather than reporting a number it did not "
+		    "measure\n");
+		return;
+	}
+
+	for (order = 0; order < 2; order++) {
+		best  = -1;
+		worst = -1;
+		total = 0;
+		n     = 0;
+		for (i = 0; i < LAT_ROUNDS; i++) {
+			lat = reap_latency_once(order);
+			if (lat < 0)
+				continue;
+			if (best < 0 || lat < best)
+				best = lat;
+			if (lat > worst)
+				worst = lat;
+			total += lat;
+			n++;
+		}
+		if (n == 0) {
+			printf("[pipefork] FAIL no %s round completed\n",
+			    order ? "pipe-wake" : "reap");
+			failures++;
+			continue;
+		}
+		printf("[pipefork] %s over %d round(s): best %ld us, "
+		    "worst %ld us, mean %ld us\n",
+		    order ? "pipe-then-reap latency" : "reap latency",
+		    n, best, worst, total / n);
+		if (worst > LAT_MAX_US)
+			printf("[pipefork] that is long enough to be a wake "
+			    "that never came rather than one that queued\n");
+		/*
+		 * Only the reap order is judged.  The other one parks TWICE --
+		 * on the pipe, and then on the child, which has not exited yet
+		 * because the write that woke this task happened before it got
+		 * there -- so its number is two wakes and a fork's worth of
+		 * scheduling, which is worth PRINTING and not worth asserting
+		 * a threshold against.  Labelling it "pipe-wake" and holding
+		 * it to one wake's budget was a measurement error of mine, and
+		 * the doubled figure it produced very nearly got read as a
+		 * defect in the pipe.
+		 */
+		if (!order)
+			check(worst <= LAT_MAX_US,
+			    "a parent hears about its child when it exits");
+	}
+}
+
 int
 entry(void)
 {
@@ -640,6 +844,7 @@ entry(void)
 	scene_async_sigint();
 	scene_cow();
 	scene_signal_interrupts_read();
+	scene_wait_cost();
 	if (failures == 0)
 		printf("[pipefork] ALL TESTS PASSED\n");
 	else

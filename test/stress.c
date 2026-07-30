@@ -129,6 +129,50 @@ verify_pattern(const uint8_t *p, size_t n, uint8_t seed)
 	return (true);
 }
 
+/*
+ * Wait for the machine to finish putting itself away.
+ *
+ * Every test below states a CONSERVATION LAW: the pages in use, less what the
+ * slab is holding in reserve, must read the same after the test as before it.
+ * The law is true; sampling it is what is hard, because a thread that has
+ * called thread_exit still owns its kernel stack until somebody reaps it, and
+ * a task still owns its address space until its last reference goes.  Both of
+ * those finish AFTER the message that told this test it was done.
+ *
+ * So a bare reap before the closing sample is not enough, and a missing one
+ * before the OPENING sample is worse: it folds whatever the previous test left
+ * in flight into this test's baseline, which then reads as a NEGATIVE leak
+ * when this test's own reap collects it.  Both mistakes were live here and
+ * both were invisible until a scheduler change altered the order things
+ * happened in -- +5 pages in one test, -7 in another, neither a leak.
+ *
+ * Waiting for the page count to STOP MOVING is the honest way to say "there is
+ * nothing still being put away".  Bounded, because a test that hangs here
+ * would be worse than one that samples early.
+ */
+static void
+stress_settle(void)
+{
+	size_t	seen;
+	size_t	now;
+	int	quiet;
+	int	i;
+
+	seen  = 0;
+	quiet = 0;
+	for (i = 0; i < 400 && quiet < 3; i++) {
+		sched_reap_zombies();
+		thread_yield();
+		now = pmm_used_pages();
+		if (now == seen) {
+			quiet++;
+			continue;
+		}
+		quiet = 0;
+		seen  = now;
+	}
+}
+
 /* ---- stress_mem -------------------------------------------------------- */
 
 int
@@ -764,6 +808,7 @@ stress_thread(unsigned int rounds)
 	    rounds);
 
 	inuse0  = port_space_inuse(kernel_space);
+	stress_settle();
 	cached0 = kmem_cached_pages();
 	pmm0    = pmm_used_pages();
 	cons0   = pmm0 - cached0;
@@ -871,7 +916,7 @@ out:
 	 * before the conservation check so the kstack is returned to
 	 * the same baseline we measured at entry.
 	 */
-	sched_reap_zombies();
+	stress_settle();
 
 	inuse1  = port_space_inuse(kernel_space);
 	cached1 = kmem_cached_pages();
@@ -1052,7 +1097,7 @@ stress_preempt(unsigned int n_workers, unsigned int sleep_ms)
 
 out:
 	port_deallocate(kernel_space, done_port);
-	sched_reap_zombies();
+	stress_settle();
 
 	kprintf("stress_preempt: %llu us elapsed, ctx switches %llu, "
 	    "preempts %llu\n",
@@ -1191,6 +1236,7 @@ stress_sendonce(unsigned int rounds)
 	    "MOVE_SEND_ONCE)\n", rounds);
 
 	inuse0  = port_space_inuse(kernel_space);
+	stress_settle();
 	cached0 = kmem_cached_pages();
 	pmm0    = pmm_used_pages();
 	cons0   = pmm0 - cached0;
@@ -1285,7 +1331,7 @@ out:
 	port_deallocate(kernel_space, ctx.req_port);
 	port_deallocate(kernel_space, ctx.done_port);
 	port_deallocate(kernel_space, reply_port);
-	sched_reap_zombies();
+	stress_settle();
 
 	inuse1  = port_space_inuse(kernel_space);
 	cached1 = kmem_cached_pages();
@@ -1510,6 +1556,7 @@ stress_portset(unsigned int n_members, unsigned int per_member)
 	    n_members, per_member);
 
 	inuse0  = port_space_inuse(kernel_space);
+	stress_settle();
 	cached0 = kmem_cached_pages();
 	pmm0    = pmm_used_pages();
 	cons0   = pmm0 - cached0;
@@ -1599,7 +1646,7 @@ out:
 		port_deallocate(kernel_space, members[i]);
 	port_deallocate(kernel_space, ctx.sps_set);
 	port_deallocate(kernel_space, ctx.sps_done);
-	sched_reap_zombies();
+	stress_settle();
 
 	inuse1  = port_space_inuse(kernel_space);
 	cached1 = kmem_cached_pages();
@@ -1744,6 +1791,7 @@ stress_intertask(unsigned int rounds)
 
 	kprintf("stress_intertask: %u rounds across 2 tasks\n", rounds);
 
+	stress_settle();
 	cached0 = kmem_cached_pages();
 	pmm0    = pmm_used_pages();
 	cons0   = pmm0 - cached0;
@@ -1869,7 +1917,7 @@ out:
 	port_deallocate(worker->t_port_space, service_worker);
 	port_deallocate(worker->t_port_space, done_worker);
 
-	sched_reap_zombies();
+	stress_settle();
 
 	inuse_w1 = port_space_inuse(worker->t_port_space);
 	inuse_k1 = port_space_inuse(kernel_space);
@@ -1967,6 +2015,7 @@ stress_moverecv(unsigned int rounds)
 	    rounds);
 
 	inuse0  = port_space_inuse(kernel_space);
+	stress_settle();
 	cached0 = kmem_cached_pages();
 	pmm0    = pmm_used_pages();
 	cons0   = pmm0 - cached0;
@@ -2180,6 +2229,7 @@ stress_nosenders(unsigned int rounds)
 	    "must wake with DEAD)\n", rounds);
 
 	inuse0  = port_space_inuse(kernel_space);
+	stress_settle();
 	cached0 = kmem_cached_pages();
 	pmm0    = pmm_used_pages();
 	cons0   = pmm0 - cached0;
@@ -2241,14 +2291,14 @@ stress_nosenders(unsigned int rounds)
 			goto out;
 		}
 
-		sched_reap_zombies();
+		stress_settle();
 		port_deallocate(kernel_space, name);
 	}
 
 	rv = MACH_MSG_OK;
 
 out:
-	sched_reap_zombies();
+	stress_settle();
 
 	inuse1  = port_space_inuse(kernel_space);
 	cached1 = kmem_cached_pages();
@@ -2312,6 +2362,7 @@ stress_deadname_multi(void)
 	int				rv;
 
 	inuse0  = port_space_inuse(kernel_space);
+	stress_settle();
 	cached0 = kmem_cached_pages();
 	pmm0    = pmm_used_pages();
 	cons0   = pmm0 - cached0;
@@ -2550,6 +2601,7 @@ stress_sendblock(unsigned int rounds)
 	    "queue, slow consumer)\n", rounds);
 
 	inuse0  = port_space_inuse(kernel_space);
+	stress_settle();
 	cached0 = kmem_cached_pages();
 	pmm0    = pmm_used_pages();
 	cons0   = pmm0 - cached0;
@@ -2619,7 +2671,7 @@ stress_sendblock(unsigned int rounds)
 	rv = MACH_MSG_OK;
 
 out:
-	sched_reap_zombies();
+	stress_settle();
 	port_deallocate(kernel_space, name);
 
 	inuse1  = port_space_inuse(kernel_space);
@@ -2741,6 +2793,7 @@ stress_rpc(unsigned int rounds)
 	kprintf("stress_rpc: %u rounds + 1 timeout probe\n", rounds);
 
 	inuse0  = port_space_inuse(kernel_space);
+	stress_settle();
 	cached0 = kmem_cached_pages();
 	pmm0    = pmm_used_pages();
 	cons0   = pmm0 - cached0;
@@ -2819,7 +2872,7 @@ stress_rpc(unsigned int rounds)
 		rv = ctx.src_rv;
 		goto out;
 	}
-	sched_reap_zombies();
+	stress_settle();
 
 	/*
 	 * Timeout probe.  Fresh empty port, 50 ms deadline.  The PIT scan
@@ -2860,7 +2913,7 @@ stress_rpc(unsigned int rounds)
 	rv = MACH_MSG_OK;
 
 out:
-	sched_reap_zombies();
+	stress_settle();
 	port_deallocate(kernel_space, srv);
 
 	inuse1  = port_space_inuse(kernel_space);
@@ -3030,6 +3083,7 @@ stress_ool(unsigned int rounds)
 	kprintf("stress_ool: %u rounds x %u sizes, max payload %u bytes\n",
 	    rounds, n_sizes, (unsigned)max_size);
 
+	stress_settle();
 	cached0  = kmem_cached_pages();
 	pmm0     = pmm_used_pages();
 	cons0    = pmm0 - cached0;
@@ -3158,7 +3212,7 @@ stop_server:
 
 	(void)port_deallocate(kernel_space, service_kernel);
 
-	sched_reap_zombies();
+	stress_settle();
 
 	/*
 	 * Drop the worker task.  The server thread already exited and was
@@ -3306,7 +3360,7 @@ stress_mutex(unsigned int n_workers, unsigned int rounds)
 		    "a waiter was not woken\n", mtx_test_live);
 		return (3);
 	}
-	sched_reap_zombies();
+	stress_settle();
 
 	want  = (unsigned long)n_workers * rounds;
 	slept = mutex_blocks() - slept0;

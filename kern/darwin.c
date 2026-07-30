@@ -256,13 +256,6 @@ static uint64_t	darwin_cons_n_key;	/* (c) characters typed          */
 static uint64_t	darwin_cons_n_script;	/* (c) characters scripted       */
 
 /*
- * The one thread parked in darwin_cons_read, or NULL.  Single-consumer: the
- * console has one foreground task and that task has one thread in read(2).
- * Registered and cleared under the lock, woken outside it.
- */
-static struct thread *darwin_cons_waiter;	/* (c) */
-
-/*
  * The clean-room libSystem.B.dylib (user/libsystem.c), embedded as a Mach-O
  * blob.  The dyld backchannel maps it by path on demand -- it is the only
  * dependency the S4 programs name.  objcopy derives these symbols from the
@@ -419,9 +412,65 @@ darwin_pipe_drop(struct darwin_pipe *p, bool writer)
 	}
 	dead = (p->p_readers == 0 && p->p_writers == 0);
 	spin_unlock(&p->p_lock);
-	if (dead)
+	if (dead) {
 		kfree(p);
+		return;
+	}
+	/*
+	 * An end going away is news to whoever is parked on the other one, and
+	 * it is the news they can never learn by waiting longer: a reader with
+	 * no writers left has reached EOF, a writer with no readers left has
+	 * an EPIPE coming.  Missing this wake is the shape of hang that looks
+	 * like a deadlock and is really nobody having said the last word --
+	 * a shell reading a pipeline whose producer has exited would sit there
+	 * for ever with the answer already decided.
+	 *
+	 * Both channels are woken rather than only the one that changed: which
+	 * count reached zero is known here, but each side re-tests everything
+	 * anyway, and one extra trip round a loop is cheaper than the reasoning
+	 * needed to be sure the narrower wake is right.
+	 */
+	(void)sched_wakeup(&p->p_count);
+	(void)sched_wakeup(&p->p_rpos);
 }
+
+/*
+ * What waiting costs, counted the way the console's counters are counted and
+ * for the same reason: a trip round a wait loop that produced nothing is the
+ * one number that means the same thing in either implementation, so it is the
+ * honest way to compare a reader that sleeps against a reader that spins.
+ *
+ * A parked waiter takes one trip per wake.  A spinning one takes one per
+ * timeslice it is handed, for as long as it has to wait -- which is to say
+ * the counter measures the machine the wait is stealing.
+ */
+static uint64_t	darwin_pipe_n_read;	/* pipe read(2) calls served    */
+static uint64_t	darwin_pipe_n_rwait;	/* fruitless trips, empty ring  */
+static uint64_t	darwin_pipe_n_write;	/* pipe write(2) calls served   */
+static uint64_t	darwin_pipe_n_wwait;	/* fruitless trips, full ring   */
+static uint64_t	darwin_wait_n_call;	/* wait4(2) calls that reaped   */
+static uint64_t	darwin_wait_n_wait;	/* fruitless trips, no zombie   */
+static uint64_t	darwin_wait_n_net;	/* trips the safety net woke    */
+static uint64_t	darwin_wait_n_lost;	/* ...that a lost wake explains */
+static uint64_t	darwin_wait_n_told;	/* child-news calls that woke   */
+static uint64_t	darwin_wait_n_woke;	/* ...and threads they woke     */
+
+/*
+ * How long a parked wait4 lets pass before looking again of its own accord.
+ *
+ * The net exists because the wakes for this one wait are not all in this file:
+ * every route out of a Darwin task is supposed to say so, and if one ever
+ * forgets, the price without a net is a shell that never returns -- the least
+ * diagnosable failure a kernel has.
+ *
+ * IT FIRING IS NOT A BUG, and the first version of this said it was.  A child
+ * that takes longer than the interval trips it while doing nothing wrong;
+ * there is simply no news yet, which is the correct answer to have been given.
+ * What distinguishes a lost wake is not the net firing but what the re-check
+ * FINDS: if the answer was already sitting there, nobody had told the parent,
+ * and only the deadline did.  That is the counter worth reading.
+ */
+#define	DARWIN_WAIT_NET_MS	500
 
 static long
 darwin_pipe_read(struct syscall_frame *f, struct darwin_pipe *p,
@@ -447,6 +496,9 @@ darwin_pipe_read(struct syscall_frame *f, struct darwin_pipe *p,
 			}
 			p->p_count -= take;
 			spin_unlock(&p->p_lock);
+			/* Room in the ring now: a blocked writer wants it. */
+			(void)sched_wakeup(&p->p_rpos);
+			darwin_pipe_n_read++;
 			if (syscall_copyout(ubuf, bounce, take) != 0)
 				return (darwin_err(f, DARWIN_EFAULT));
 			return (darwin_ok(f, (long)take));
@@ -455,7 +507,6 @@ darwin_pipe_read(struct syscall_frame *f, struct darwin_pipe *p,
 			spin_unlock(&p->p_lock);
 			return (darwin_ok(f, 0));	/* EOF */
 		}
-		spin_unlock(&p->p_lock);
 		/*
 		 * Two different reasons to stop waiting, and for a long time
 		 * only the first was asked about: the task has been killed, or
@@ -463,11 +514,27 @@ darwin_pipe_read(struct syscall_frame *f, struct darwin_pipe *p,
 		 * second, a reader blocked on a pipe nobody is writing to
 		 * ignores SIGINT and SIGTERM entirely -- the signal sits
 		 * pending, delivered only if the read happens to finish.
+		 *
+		 * Asked with p_lock still held, because the park below needs
+		 * it: a signal that arrives after this test but before the
+		 * park is not missed, since posting one wakes the thread.
 		 */
 		if (task_kill_pending(current_thread->th_task) ||
-		    darwin_signal_pending(current_thread->th_task))
+		    darwin_signal_pending(current_thread->th_task)) {
+			spin_unlock(&p->p_lock);
 			return (darwin_err(f, DARWIN_EINTR));
-		thread_yield();
+		}
+		/*
+		 * Sleep until a writer says there are bytes.  This used to
+		 * spin on thread_yield, which is correct and costs the
+		 * machine: a reader waiting on a slow producer took every
+		 * timeslice it was offered to discover the ring was still
+		 * empty, and on one CPU the only thread it could take them
+		 * from was the producer it was waiting for.
+		 */
+		darwin_pipe_n_rwait++;
+		thread_block_release(THREAD_BLOCK_SLEEP, &p->p_count,
+		    &p->p_lock);
 	}
 }
 
@@ -522,14 +589,24 @@ darwin_pipe_write(struct syscall_frame *f, struct darwin_pipe *p,
 			}
 			space = DARWIN_PIPE_BUF - p->p_count;
 			if (space == 0) {
-				spin_unlock(&p->p_lock);
 				/* Same pair of reasons as the read side. */
 				if (task_kill_pending(
 				    current_thread->th_task) ||
 				    darwin_signal_pending(
-				    current_thread->th_task))
+				    current_thread->th_task)) {
+					spin_unlock(&p->p_lock);
 					return (darwin_err(f, DARWIN_EINTR));
-				thread_yield();
+				}
+				/*
+				 * Sleep until a reader makes room, on the
+				 * read position rather than the byte count:
+				 * two waits on one pipe want opposite things
+				 * and a shared channel would wake each side
+				 * for the other's news.
+				 */
+				darwin_pipe_n_wwait++;
+				thread_block_release(THREAD_BLOCK_SLEEP,
+				    &p->p_rpos, &p->p_lock);
 				continue;
 			}
 			put = (uint32_t)(chunk - off) < space ?
@@ -541,10 +618,13 @@ darwin_pipe_write(struct syscall_frame *f, struct darwin_pipe *p,
 			}
 			p->p_count += put;
 			spin_unlock(&p->p_lock);
+			/* Bytes in the ring: a blocked reader wants them. */
+			(void)sched_wakeup(&p->p_count);
 			off  += put;
 			done += put;
 		}
 	}
+	darwin_pipe_n_write++;
 	return (darwin_ok(f, (long)n));
 }
 
@@ -871,14 +951,23 @@ darwin_cons_deliver_locked(void)
  * -- programs use all four combinations, and a "raw mode" boolean would have
  * tied echo to editing to signals and served none of them exactly.
  *
- * Returns with the wake, if one is owed, left to the caller: a reader is
+ * Returns whether a wake is owed, and leaves it to the caller: a reader is
  * woken outside the lock, never under it.
+ *
+ * WHETHER, not WHOM.  This used to hand back the parked thread out of a slot
+ * that held exactly one -- which was true of the console and false of the
+ * kernel around it.  A second reader overwrote the first, and the first was
+ * then never woken by anything; task teardown needed a hook of its own to
+ * clear the slot, or a keystroke after the reader's task died would have
+ * called thread_wake on freed memory.  Both problems were the object holding
+ * a thread pointer.  It holds a CHANNEL now -- see sched_wakeup -- and the
+ * scheduler keeps the list, so there is no count to be wrong about and
+ * nothing for a dying task to clean up.
  */
-static struct thread *
+static bool
 darwin_cons_input_locked(char c, bool *intr_out)
 {
 	struct darwin_termios	*tio;
-	struct thread		*w;
 
 	*intr_out = false;
 	tio = darwin_cons_tio_locked();
@@ -899,9 +988,7 @@ darwin_cons_input_locked(char c, bool *intr_out)
 		    (uint8_t)c == tio->c_cc[DARWIN_VINTR]) {
 			darwin_cons_line_len = 0;
 			*intr_out = true;
-			w = darwin_cons_waiter;
-			darwin_cons_waiter = NULL;
-			return (w);
+			return (true);
 		}
 		if (darwin_cons_line_len >= DARWIN_CONS_LINE)
 			darwin_cons_deliver_locked();
@@ -909,9 +996,7 @@ darwin_cons_input_locked(char c, bool *intr_out)
 		darwin_cons_deliver_locked();
 		if ((tio->c_lflag & DARWIN_ECHO) != 0)
 			tty_putc(c);
-		w = darwin_cons_waiter;
-		darwin_cons_waiter = NULL;
-		return (w);
+		return (true);
 	}
 
 	/*
@@ -972,14 +1057,14 @@ darwin_cons_input_locked(char c, bool *intr_out)
 		 * that reaches it.
 		 */
 		if (darwin_cons_line_len == 0)
-			return (NULL);		/* nothing to rub out */
+			return (false);		/* nothing to rub out */
 		darwin_cons_line_len--;
 		if ((tio->c_lflag & DARWIN_ECHOE) != 0) {
 			tty_putc('\b');
 			tty_putc(' ');
 			tty_putc('\b');
 		}
-		return (NULL);
+		return (false);
 	} else if ((uint8_t)c == tio->c_cc[DARWIN_VKILL]) {
 		/* Ctrl-U: the whole line goes, and is seen to go. */
 		while (darwin_cons_line_len > 0) {
@@ -990,7 +1075,7 @@ darwin_cons_input_locked(char c, bool *intr_out)
 				tty_putc('\b');
 			}
 		}
-		return (NULL);
+		return (false);
 	} else if (c == '\n') {
 		if (darwin_cons_line_len < DARWIN_CONS_LINE)
 			darwin_cons_line[darwin_cons_line_len++] = '\n';
@@ -999,7 +1084,7 @@ darwin_cons_input_locked(char c, bool *intr_out)
 		darwin_cons_deliver_locked();
 	} else {
 		if (c < 0x20 && c != '\t')
-			return (NULL);		/* not a key we render */
+			return (false);		/* not a key we render */
 		if (darwin_cons_line_len >= DARWIN_CONS_LINE) {
 			/*
 			 * A line longer than the buffer is delivered rather
@@ -1012,12 +1097,10 @@ darwin_cons_input_locked(char c, bool *intr_out)
 		darwin_cons_line[darwin_cons_line_len++] = c;
 		if ((tio->c_lflag & DARWIN_ECHO) != 0)
 			tty_putc(c);
-		return (NULL);
+		return (false);
 	}
 
-	w = darwin_cons_waiter;
-	darwin_cons_waiter = NULL;
-	return (w);
+	return (true);
 }
 
 /*
@@ -1027,19 +1110,19 @@ darwin_cons_input_locked(char c, bool *intr_out)
 bool
 darwin_cons_input(char c)
 {
-	struct thread	*w;
-	bool		 intr;
+	bool	owed;
+	bool	intr;
 
 	spin_lock(&darwin_cons_lock);
 	darwin_cons_n_key++;
-	w = darwin_cons_input_locked(c, &intr);
+	owed = darwin_cons_input_locked(c, &intr);
 	spin_unlock(&darwin_cons_lock);
 
 	/* Both of these can sleep or take other locks; neither may run above. */
 	if (intr)
 		darwin_cons_signal_fg(DARWIN_SIGINT);
-	if (w != NULL)
-		thread_wake(w);
+	if (owed)
+		(void)sched_wakeup(&darwin_cons_head);
 	return (true);
 }
 
@@ -1085,14 +1168,12 @@ darwin_cons_release(struct task *t)
 	darwin_cons_fg_id = 0;
 	spin_lock(&darwin_cons_lock);
 	/*
-	 * A parked reader belonging to a dying task cannot be woken -- and
-	 * must not be, since the thread is on its way out.  Dropping the
-	 * pointer here is what keeps a later keystroke from calling
-	 * thread_wake on freed memory.
+	 * A parked reader of a dying task used to need forgetting here, or a
+	 * later keystroke would have called thread_wake on freed memory.  It
+	 * needs nothing now: the console keeps no thread pointer, and a thread
+	 * leaves the scheduler's sleep queue as part of being woken, which
+	 * every route out of a task goes through.
 	 */
-	if (darwin_cons_waiter != NULL &&
-	    darwin_cons_waiter->th_task == t)
-		darwin_cons_waiter = NULL;
 	darwin_cons_line_len   = 0;
 	darwin_cons_tail       = darwin_cons_head;  /* discard unread input */
 	darwin_cons_eof        = false;	/* the next claimant starts fresh */
@@ -1115,6 +1196,8 @@ darwin_cons_release(struct task *t)
 	 * types.  The waits figure is the interesting one -- see the counters.
 	 */
 	darwin_cons_stats();
+	darwin_wait_stats();
+	sched_wake_latency_print();
 }
 
 /*
@@ -1267,9 +1350,13 @@ darwin_cons_read(struct syscall_frame *f, void *ubuf, size_t n)
 		 * cannot be lost.  Doing it by hand -- unlock, then block --
 		 * is the classic missed-wakeup, and here it would hang a
 		 * shell at its prompt until the next keystroke.
+		 *
+		 * The registration is the block target itself now: the ring's
+		 * head is the CHANNEL, and the scheduler holds the list of who
+		 * is on it.  There is nowhere left to put a second reader
+		 * wrongly, which is what the console's own slot did.
 		 */
 		darwin_cons_n_wait++;
-		darwin_cons_waiter = current_thread;
 		thread_block_release(THREAD_BLOCK_SLEEP,
 		    (void *)&darwin_cons_head, &darwin_cons_lock);
 	}
@@ -1436,6 +1523,48 @@ darwin_cons_stats(void)
 	    (unsigned long long)darwin_cons_n_wait,
 	    (unsigned long long)darwin_cons_n_key,
 	    (unsigned long long)darwin_cons_n_script);
+}
+
+/*
+ * The same line for the other two things a Darwin task waits on.  Read it the
+ * same way: the waits column against the calls column is what waiting costs.
+ * A pipe reader or a shell in wait4 that shows thousands of waits against a
+ * handful of calls is not waiting, it is spinning, and every one of those
+ * trips is a timeslice taken from the process it is waiting FOR.
+ */
+void
+darwin_wait_stats(void)
+{
+
+	if (darwin_pipe_n_read == 0 && darwin_pipe_n_write == 0 &&
+	    darwin_wait_n_call == 0)
+		return;
+	kprintf("pipe: %llu reads (%llu waits), %llu writes (%llu waits)\n",
+	    (unsigned long long)darwin_pipe_n_read,
+	    (unsigned long long)darwin_pipe_n_rwait,
+	    (unsigned long long)darwin_pipe_n_write,
+	    (unsigned long long)darwin_pipe_n_wwait);
+	kprintf("wait: %llu wait4(2) reaped, %llu waits, %llu on the deadline "
+	    "(a slow child, not a fault), %llu explained by a lost wake "
+	    "(want 0)\n",
+	    (unsigned long long)darwin_wait_n_call,
+	    (unsigned long long)darwin_wait_n_wait,
+	    (unsigned long long)darwin_wait_n_net,
+	    (unsigned long long)darwin_wait_n_lost);
+	kprintf("wait: %llu news told, %llu parent(s) actually woken by it\n",
+	    (unsigned long long)darwin_wait_n_told,
+	    (unsigned long long)darwin_wait_n_woke);
+	/*
+	 * Said as a FAIL rather than reported, because it is exact now and it
+	 * does not depend on how busy the machine was -- which is what an
+	 * assertion has to be.  Non-zero means some path out of a Darwin task
+	 * does not call darwin_child_news, and a shell waiting on that path
+	 * would sit there until the deadline underneath it fired.
+	 */
+	if (darwin_wait_n_lost != 0)
+		kprintf("wait: FAIL %llu answer(s) reached a parent only "
+		    "because of the deadline -- a wake is missing\n",
+		    (unsigned long long)darwin_wait_n_lost);
 }
 
 /* ---- the working directory ----------------------------------------------- */
@@ -1761,6 +1890,17 @@ darwin_signal_post(struct task *t, int signo)
 	if (t == NULL || bit == 0)
 		return;
 	__atomic_fetch_or(&t->t_sig_pending, bit, __ATOMIC_RELEASE);
+	/*
+	 * And WAKE anything of the target's that is asleep on a channel, or the
+	 * bit just set will not be looked at until whatever that thread was
+	 * waiting for happens on its own -- which for a read on a pipe nobody
+	 * is writing to means never.  Woken unconditionally rather than only
+	 * for signals that will be delivered: whether this one is deliverable
+	 * depends on a mask that only the target's own thread may read without
+	 * racing, and a sleeper that wakes to find nothing for it simply parks
+	 * again, which every sleep here is written to do.
+	 */
+	(void)sched_wake_sleepers_of(t);
 }
 
 bool
@@ -2146,6 +2286,87 @@ darwin_sigreturn_full(uint64_t uctx)
 
 /* ---- zombies -------------------------------------------------------------- */
 
+/*
+ * The channels a parent in wait4(2) parks on, hashed by its own pid.
+ *
+ * A parent waits for news about ITS children, so the channel has to be
+ * something the child's side can name without holding a pointer to the
+ * parent -- a pointer would mean a lookup and a reference on every task
+ * death, and dropping that reference can itself be the death that starts
+ * another one, which is a recursion no wake needs to be inside.  An address
+ * derived from the pid needs neither.
+ *
+ * Collisions are not a correctness problem and that is the point of naming
+ * the table small: two parents that hash together wake each other's waits,
+ * each re-tests, finds nothing of its own and parks again.  Every sleeper in
+ * this kernel is in a re-testing loop already, because a wake has never been
+ * a promise that the thing waited for happened.
+ */
+#define	DARWIN_WAIT_CHANS	16
+static char	darwin_wait_chan[DARWIN_WAIT_CHANS];
+
+/*
+ * One counter per channel, bumped every time a parent on it is told something.
+ *
+ * This is what makes "a wake went missing" an exact statement rather than a
+ * guess.  The deadline under a parked wait4 fires on a slow child, which is
+ * ordinary; the interesting case is a deadline that fires and finds the answer
+ * ALREADY THERE, because that means nobody said so.  But those two can happen
+ * at the same instant -- a child that takes just over the interval records its
+ * zombie exactly as the timer goes off -- and a test that reported the pair as
+ * a fault did exactly that, once in four boots.
+ *
+ * So the parent reads this counter before parking and again after a deadline
+ * wake.  Changed means somebody told it, however the wake and the timer raced;
+ * unchanged, with an answer waiting, means the news never came at all.
+ */
+static uint32_t	darwin_wait_gen[DARWIN_WAIT_CHANS];
+
+static uint32_t
+darwin_wait_generation(unsigned long long pid)
+{
+
+	return (__atomic_load_n(&darwin_wait_gen[pid % DARWIN_WAIT_CHANS],
+	    __ATOMIC_ACQUIRE));
+}
+
+static void *
+darwin_wait_channel(unsigned long long pid)
+{
+
+	return (&darwin_wait_chan[pid % DARWIN_WAIT_CHANS]);
+}
+
+/*
+ * Tell a parent that something happened to one of its children.  Called both
+ * where a zombie is recorded -- the news a wait4 is hoping for -- and from
+ * task teardown, where the news is that a child has left the live list and a
+ * wait for it can now only ever answer ECHILD.
+ *
+ * Both, rather than only the first, and the reason is worth stating: while
+ * wait4 spun, it re-counted the caller's live children on every trip, so a
+ * child that disappeared by ANY route eventually produced an answer.  A
+ * parked parent has no such second chance -- it wakes when it is told to and
+ * not otherwise -- so the teardown call is what keeps the sleeping version as
+ * forgiving as the spinning one was.  Missing it would turn an exotic exit
+ * path into a shell that never returns.
+ */
+void
+darwin_child_news(unsigned long long ppid)
+{
+
+	if (ppid == 0)
+		return;			/* no Darwin parent to tell */
+	darwin_wait_n_told++;
+	/*
+	 * Bumped BEFORE the wake, so a parent that is woken by this call and
+	 * one that was already awake both see the new value.
+	 */
+	(void)__atomic_fetch_add(&darwin_wait_gen[ppid % DARWIN_WAIT_CHANS], 1,
+	    __ATOMIC_RELEASE);
+	darwin_wait_n_woke += sched_wakeup(darwin_wait_channel(ppid));
+}
+
 void
 darwin_zombie_record(unsigned long long pid, unsigned long long ppid,
     int status)
@@ -2182,6 +2403,7 @@ darwin_zombie_record(unsigned long long pid, unsigned long long ppid,
 		kprintf("darwin: zombie table full, status of pid %llu "
 		    "dropped\n", pid);
 		darwin_signal_notify_parent(ppid);
+		darwin_child_news(ppid);
 		return;
 	}
 	darwin_zombies[slot].z_pid    = pid;
@@ -2190,6 +2412,14 @@ darwin_zombie_record(unsigned long long pid, unsigned long long ppid,
 	darwin_zombies[slot].z_used   = true;
 	spin_unlock(&darwin_zombie_lock);
 	darwin_signal_notify_parent(ppid);
+	/*
+	 * Woken with the zombie lock DROPPED, which is safe because a waiter
+	 * registers itself on the channel while holding that same lock: by the
+	 * time this thread could take it, anyone waiting is already findable.
+	 * The wake cannot arrive too late, only too early -- and too early is
+	 * a re-test.
+	 */
+	darwin_child_news(ppid);
 }
 
 /*
@@ -2218,6 +2448,34 @@ darwin_zombie_reap(uint64_t ppid, uint64_t pid, int *status_out,
 		return (true);
 	}
 	spin_unlock(&darwin_zombie_lock);
+	return (false);
+}
+
+/*
+ * Is there a zombie here for `ppid` (optionally a particular `pid`)?  Asks
+ * without taking one, and REQUIRES the zombie lock already held.
+ *
+ * This exists so wait4 can make its last look and its decision to sleep under
+ * one lock.  Looking with the reaper above, letting the lock go and then
+ * parking is the lost wakeup in its textbook form: a child that dies in the
+ * gap records its zombie, finds nobody on the channel, and the parent parks
+ * afterwards with the answer already sitting in the table.  Nothing wakes it
+ * again -- that child has only one death to report.
+ */
+static bool
+darwin_zombie_present_locked(uint64_t ppid, uint64_t pid)
+{
+	size_t	i;
+
+	for (i = 0; i < DARWIN_NZOMBIE; i++) {
+		if (!darwin_zombies[i].z_used)
+			continue;
+		if (darwin_zombies[i].z_ppid != ppid)
+			continue;
+		if (pid != 0 && darwin_zombies[i].z_pid != pid)
+			continue;
+		return (true);
+	}
 	return (false);
 }
 
@@ -2830,10 +3088,14 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		long		 pid;
 		int		 options;
 		int		 status;
+		uint32_t	 gen;
+		bool		 by_net;
 
 		t       = current_thread->th_task;
 		pid     = (long)f->sf_arg0;
 		options = (int)f->sf_arg2;
+		by_net  = false;
+		gen     = 0;
 		for (;;) {
 			if (darwin_zombie_reap(t->t_id,
 			    pid > 0 ? (uint64_t)pid : 0, &status, &got)) {
@@ -2845,6 +3107,21 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 				    "status 0x%x\n",
 				    (unsigned long long)got,
 				    (unsigned)status);
+				darwin_wait_n_call++;
+				/*
+				 * The answer was already here when the deadline
+				 * woke us, so nobody had said so: a wake went
+				 * missing.  Named out loud with the pid, since
+				 * the fix is always a darwin_child_news that
+				 * some exit path does not make.
+				 */
+				if (by_net) {
+					darwin_wait_n_lost++;
+					kprintf("darwin: wait4 for pid %llu "
+					    "was told by its deadline, not by "
+					    "the child -- a wake is missing\n",
+					    (unsigned long long)got);
+				}
 				return (darwin_ok(f, (long)got));
 			}
 			/*
@@ -2856,8 +3133,17 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			 * next iteration, never lost.
 			 */
 			if (task_count_darwin_children(t->t_id,
-			    pid > 0 ? (uint64_t)pid : 0) == 0)
+			    pid > 0 ? (uint64_t)pid : 0) == 0) {
+				/* Same reasoning as the reap above. */
+				if (by_net) {
+					darwin_wait_n_lost++;
+					kprintf("darwin: wait4 found its last "
+					    "child already gone when the "
+					    "deadline woke it -- a wake is "
+					    "missing\n");
+				}
 				return (darwin_err(f, DARWIN_ECHILD));
+			}
 			if (options & DARWIN_WNOHANG)
 				return (darwin_ok(f, 0));
 			/*
@@ -2870,7 +3156,47 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			 */
 			if (task_kill_pending(t) || darwin_signal_pending(t))
 				return (darwin_err(f, DARWIN_EINTR));
-			thread_yield();
+
+			/*
+			 * Sleep until a child has news.  The look above used
+			 * the reaper, which lets the lock go; this one is made
+			 * with the lock we are about to park with still held,
+			 * so a child that dies between the two cannot report
+			 * to an empty channel.
+			 */
+			spin_lock(&darwin_zombie_lock);
+			if (darwin_zombie_present_locked(t->t_id,
+			    pid > 0 ? (uint64_t)pid : 0)) {
+				spin_unlock(&darwin_zombie_lock);
+				continue;
+			}
+			/*
+			 * Park with a deadline -- see DARWIN_WAIT_NET_MS for
+			 * why this one wait has a net under it and the others
+			 * do not.  Waking on it is ordinary; the loop simply
+			 * looks again.  Whether anything was WRONG is decided
+			 * at the top, by whether the answer turns out to have
+			 * been waiting there all along.
+			 */
+			current_thread->th_wake_deadline_ms =
+			    clock_uptime_ms() + DARWIN_WAIT_NET_MS;
+			sched_add_timed_waiter(current_thread);
+			darwin_wait_n_wait++;
+			gen = darwin_wait_generation(t->t_id);
+			thread_block_release(THREAD_BLOCK_SLEEP,
+			    darwin_wait_channel(t->t_id),
+			    &darwin_zombie_lock);
+			sched_remove_timed_waiter(current_thread);
+			if (current_thread->th_timed_out != 0) {
+				darwin_wait_n_net++;
+				/*
+				 * Only blame a lost wake if nothing was said
+				 * while we slept.  See darwin_wait_gen.
+				 */
+				by_net = darwin_wait_generation(t->t_id) == gen;
+			} else
+				by_net = false;
+			current_thread->th_wake_deadline_ms = 0;
 		}
 	}
 	case DARWIN_SYS_pipe: {

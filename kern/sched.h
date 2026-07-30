@@ -63,6 +63,42 @@ void		thread_block_release(int reason, void *target,
 void		thread_wake(struct thread *);
 
 /*
+ * sched_wakeup: wake every thread parked on the channel `chan` -- that is,
+ * every thread that passed `chan` as thread_block's target and has not been
+ * woken since.  Returns how many there were.
+ *
+ * A channel is just an agreed address, conventionally a field of the object
+ * being waited on: the pipe's byte count for readers waiting on data, its read
+ * position for writers waiting on room.  Two waits on the same object want
+ * different fields, so that they are separate channels is the point.
+ *
+ * The waiter's half of the contract is the whole difficulty.  Test the
+ * condition and park under one lock, and hand that lock to
+ * thread_block_release rather than dropping it first:
+ *
+ *	for (;;) {
+ *		spin_lock(&obj->lock);
+ *		if (ready(obj)) { ...; spin_unlock(&obj->lock); break; }
+ *		thread_block_release(THREAD_BLOCK_SLEEP, &obj->field,
+ *		    &obj->lock);
+ *	}
+ *
+ * Unlock-then-block is the lost wakeup: an event in the gap wakes nobody and
+ * the sleeper is never woken again.  A wake is also only a hint -- re-test in
+ * the loop, since the bytes may be gone by the time this thread runs.
+ */
+uint32_t	sched_wakeup(void *chan);
+
+/*
+ * sched_wake_sleepers_of: wake every thread of `task` that is asleep on a
+ * channel, leaving anything blocked on a port alone.  What makes a posted
+ * signal reach a thread that is already inside a blocking syscall.  See the
+ * definition for why the distinction is not optional.
+ */
+struct task;
+uint32_t	sched_wake_sleepers_of(struct task *task);
+
+/*
  * IRQ-safe deferred wake.
  *
  * `sched_post_irq_wake` is callable from interrupt context: it appends
@@ -122,6 +158,7 @@ void		sched_print(void);
 size_t		sched_runq_len(void);
 uint64_t	sched_context_switches(void);
 uint64_t	sched_preempts(void);
+void		sched_wake_latency_print(void);
 
 /*
  * Tally one preempt event.  Called from both the inline path

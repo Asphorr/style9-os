@@ -547,6 +547,57 @@ to be the kernel's job -- so one was fabricated with the host runner and
 booted, and the mount said "1 file(s) were left waiting in the private
 directory by an earlier boot and have been let go."
 
+## A wake reaches the CPU
+
+Three waits in the Darwin layer polled with `thread_yield` -- a pipe read, a
+pipe write, and `wait4` -- and the rung that set out to park them found the
+premise wrong.  `thread_yield` hands the CPU back at once, so a waiter
+looping on it is not re-scheduled until the other side has used a whole
+quantum: with the same counters compiled into both builds and the same work
+in front of them, polling took **22** fruitless trips round `wait4`'s loop
+and parking took **14**.  Nothing was eating the machine.
+
+What was costing something sat underneath all three: **a wake did not
+preempt**.  Making a thread READY asked for nothing further, so news waited
+for whoever held the CPU to give it up or for the five-tick quantum to
+expire.  Across one boot, **24074 wakes spent 154 seconds between ready and
+running**, a mean of six milliseconds each; asking for a reschedule where a
+thread is made ready brings that to **450 ms, a mean of zero** -- for every
+blocking wait in the system, the twenty-odd thousand Mach receives included.
+
+It is also what decides whether sleeping beats polling.  Parked without it
+the three waits were **ten times slower** to notice anything (reap latency
+5.6 ms polling, 52 ms parked), because a poller gets a fresh look every time
+it is scheduled and a sleeper gets one and must be given the CPU to take it.
+Parked with it: 3.9 ms.
+
+The sleep queue belongs to the **scheduler**, not to the objects waited on:
+`sched_wakeup(chan)` wakes whoever passed `chan` to `thread_block`, and the
+list lives in `sched.c` on a link of its own.  An object holding a channel
+cannot get its waiters wrong.  The console, which held a thread *pointer*,
+could and did -- its slot had room for one, so a second reader overwrote the
+first and the first was never woken again, and task teardown needed a hook
+to stop a later keystroke waking freed memory.  Both are deleted rather than
+fixed; they were the pointer.
+
+A posted signal now reaches a sleeping thread, which stopped being optional
+the moment these waits slept: `read(2)` on a pipe nobody was writing to had
+become uninterruptible.  The wake is narrow on purpose -- a thread waiting on
+a Mach port is linked into that port's list through the field the runqueue
+uses, so waking one "just in case" is not a spurious wake but corruption.
+
+Five instruments were wrong before one was right, and that is the part worth
+keeping.  A throughput ratio *passed on the broken kernel*, because this
+program's own parent is also a waiter and the theft was already in the
+baseline.  97 ms of fork and reap got reported as stolen CPU.  A latency
+figure was labelled for one wake and measured two.  A 10 ms bound passed on
+a quiet boot and failed on a busy one with the kernel correct both times.
+And the lost-wake check itself cried once in four boots, because a deadline
+and the real news can land together.  **An absolute number under
+uncontrolled load is a gauge, not an assertion**; the assertion here is the
+load-independent one -- a `wait4` answered only because the deadline under it
+fired, with a per-channel generation counter to prove nobody had spoken.
+
 Next on the roadmap: **replacing an existing name** with a rename, which
 POSIX requires and this refuses out loud; a **torn-write stand**, which
 would make the checkpoint's promise that an interruption anywhere leaves the

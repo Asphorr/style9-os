@@ -80,6 +80,29 @@ struct thread {
 	SLIST_ENTRY(thread)	 th_zombie_link;	/* zombie SLIST     */
 
 	/*
+	 * Sleep-queue link: threads parked on a CHANNEL, i.e. those that
+	 * called thread_block with a non-NULL target, so sched_wakeup can
+	 * find them by what they are waiting for rather than by a pointer
+	 * the waited-on object had to keep.
+	 *
+	 * A field of its own rather than another tenant of th_runq_link,
+	 * which already serves the runqueue, the mutex waiter lists and the
+	 * IRQ-wake LIFO.  Those three never overlap; this one WOULD -- a
+	 * thread parked on a channel and then woken by sched_post_irq_wake
+	 * or by the kill fan-out is linked in two lists at once, and the
+	 * one that reuses the field silently truncates the other.
+	 */
+	struct thread		*th_sleep_link;		/* (sched_lock)     */
+
+	/*
+	 * When this thread was last made READY out of BLOCKED, in
+	 * clock_uptime_ms().  Read once by the thread itself when it resumes,
+	 * to report how long a wake took to become a run -- the number that
+	 * says whether parking a waiter made it hear news sooner or later.
+	 */
+	uint64_t		 th_wake_ms;		/* (sched_lock)     */
+
+	/*
 	 * Trusted-send flag.  Toggled by mach_msg_send_trusted around a
 	 * send call that originates from kernel code shipping kernel-rodata
 	 * bytes through an OOL descriptor (e.g. the "man" service replying
