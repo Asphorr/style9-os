@@ -8,6 +8,7 @@
 #ifndef _MACHINE_INTR_H_
 #define	_MACHINE_INTR_H_
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /*
@@ -96,6 +97,38 @@ intr_disable(void)
 {
 
 	__asm__ __volatile__ ("cli");
+}
+
+/*
+ * Disable interrupts and report whether they had been enabled, so that a
+ * caller can put them back the way it found them rather than the way it
+ * wishes they were.  The pair below is what makes a critical section nest:
+ * two of them one inside the other leave interrupts off until the OUTER one
+ * ends, because the inner one restores "off", which is what it saw.
+ *
+ * The read and the clear are one asm block on purpose.  Between a pushfq and
+ * a cli there is room for an interrupt, and a caller that took one there would
+ * be told interrupts were on -- true when it asked, and no longer true by the
+ * time it acts on the answer.
+ */
+static inline bool
+intr_save_disable(void)
+{
+	uint64_t	rf;
+
+	__asm__ __volatile__ ("pushfq; popq %0; cli"
+	    : "=r" (rf)
+	    :
+	    : "memory");
+	return ((rf & (1u << 9)) != 0);		/* RFLAGS.IF */
+}
+
+static inline void
+intr_restore(bool enabled)
+{
+
+	if (enabled)
+		__asm__ __volatile__ ("sti");
 }
 
 #endif /* !_MACHINE_INTR_H_ */

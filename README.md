@@ -998,6 +998,60 @@ own handler wait for the lock it is holding. So the rung that makes locks
 interrupt-safe is the rung that lets these three into the scheduler, and until
 then they sit at `cli; hlt` where they can do no harm.
 
+## A lock that survives an interrupt
+
+The acquire has always been a real atomic exchange, so two processors could
+never both hold a lock. What was missing was one processor against **itself**:
+take a lock, be interrupted, and have the handler ask for the same lock. On a
+single CPU that could not happen -- not because of anything about the lock, but
+because no interrupt handler in this kernel took a lock the mainline could
+hold. That is an argument about which handlers exist, and it stops being
+available the moment a second processor runs kernel code with interrupts on.
+
+So `spin_lock` now disables interrupts, and `spin_unlock` puts them back the
+way it found them. **Saved and restored, not cleared and set**: nested critical
+sections have to stay closed until the outermost one ends, and code that was
+already running with interrupts off must not have them turned on underneath it.
+
+**Where that saved state lives is the whole difficulty, and the answer is: in
+the thread.** `sched_lock` is held *across* a context switch -- the outgoing
+thread takes it and the incoming thread releases it -- so a per-CPU answer
+would be restored by a thread that never saved it. Concretely: a thread that
+yielded voluntarily with interrupts on can be resumed by one that entered the
+scheduler from an interrupt with them off, and would then run kernel code with
+interrupts disabled until something else happened to enable them. Not a crash.
+Preemption quietly stopping on that CPU.
+
+Per-thread balances because each thread performs exactly one acquire and one
+release of its own; it is only the lock *object* that changes hands. With one
+exception, and it is the exception that makes this look impossible until you
+find it:
+
+> **A brand-new thread releases a lock it never took.** The switch into it
+> happens with `sched_lock` held by whoever switched, and the trampoline's
+> first act is to drop it. A count starting at zero goes negative there.
+
+So a created thread is initialised as though it already held one lock -- and
+the state that release will restore is *interrupts on*, which is how a thread
+has to start, since nothing else will enable them for it. The boot thread,
+which is the context already running when it acquires a name, starts at zero.
+
+No such deadlock has ever been observed here, and it is worth saying that
+plainly rather than inventing a war story: every interrupt handler in this tree
+is deliberately lock-free, and `sched_post_irq_wake` exists precisely so the
+one thing a handler needs from the scheduler can be done by appending to a
+lock-free list. This rung does not fix a bug that bit. It removes a
+precondition -- "no handler takes a lock the mainline holds" -- that nobody
+would be able to keep once four processors are running kernel code, and which
+nothing checks.
+
+Interrupts are now off for as long as any lock is held, which is a cost as well
+as a fix: a long critical section is now a long stretch of deferred interrupts,
+and the timer ticks that arrive during one are lost rather than late. The
+timer's own report is where that would show, since it prints the rate actually
+delivered against elapsed TSC time -- so the slice figure is a lock-hold-time
+measurement now, as well as everything else it was.
+
 Next on the roadmap: **replacing an existing name** with a rename, which
 POSIX requires and this refuses out loud; a **torn-write stand**, which
 would make the checkpoint's promise that an interruption anywhere leaves the

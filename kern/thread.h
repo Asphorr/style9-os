@@ -76,6 +76,24 @@ struct thread {
 	void			(*th_entry)(void *);
 	void			*th_arg;
 
+	/*
+	 * Spinlocks this thread holds, and whether interrupts were enabled
+	 * when it took the first of them.  PER-THREAD, and that is the
+	 * interesting part: sched_lock is held ACROSS a context switch, so
+	 * the lock object changes hands -- but each thread still performs
+	 * exactly one acquire and one release of its own, and the interrupt
+	 * state that has to be put back is the state THAT THREAD found.
+	 *
+	 * Per-CPU would balance too and would restore the wrong answer: a
+	 * thread that yielded voluntarily with interrupts on can be resumed
+	 * by a thread that entered the scheduler from an interrupt with them
+	 * off, and would then run kernel code with interrupts disabled until
+	 * something else happened to enable them.  Which is not a crash; it
+	 * is preemption quietly stopping on that CPU.
+	 */
+	int			 th_spin_depth;		/* (i) locks held   */
+	bool			 th_spin_saved_if;	/* (i) IF at depth 1 */
+
 	struct thread		*th_runq_link;		/* runqueue / waitq */
 	struct thread		*th_task_link;		/* task->t_threads  */
 	SLIST_ENTRY(thread)	 th_zombie_link;	/* zombie SLIST     */

@@ -107,6 +107,17 @@ struct cpu {
 	 */
 	volatile int		 cp_online;	/* (a) it got here          */
 
+	/*
+	 * The same two facts as th_spin_depth / th_spin_saved_if, for the
+	 * stretch of boot before there is a thread to keep them in.  Locks
+	 * are taken from pmm, pmap and kmem long before the scheduler
+	 * exists, and no context switch can happen while that is true -- so
+	 * the CPU is the right owner exactly as long as it is the only
+	 * candidate.
+	 */
+	int			 cp_spin_depth;		/* (i)              */
+	bool			 cp_spin_saved_if;	/* (i)              */
+
 	volatile int		 cp_preempt_count;	/* (i) see sched.h  */
 	volatile int		 cp_need_resched;	/* (i)              */
 	volatile unsigned int	 cp_quantum_used;	/* (i) timer ticks  */

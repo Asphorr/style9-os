@@ -64,6 +64,13 @@ thread_subsystem_init(void)
 	boot->th_kstack_owned    = false;
 	boot->th_entry           = NULL;
 	boot->th_arg             = NULL;
+	/*
+	 * This thread is the context already running, which is holding no
+	 * lock at the moment it acquires a name -- unlike a created thread,
+	 * whose first act is to release one it never took (see thread_create).
+	 */
+	boot->th_spin_depth      = 0;
+	boot->th_spin_saved_if   = false;
 	boot->th_runq_link       = NULL;
 	boot->th_task_link       = NULL;
 	boot->th_sleep_link      = NULL;
@@ -145,6 +152,22 @@ thread_create(struct task *t, void (*entry)(void *), void *arg,
 	th->th_kstack_owned      = true;
 	th->th_entry             = entry;
 	th->th_arg               = arg;
+
+	/*
+	 * ⚠ PRE-LOADED AS THOUGH IT ALREADY HELD ONE LOCK, because it does --
+	 * or rather, it will release one it never took.  The switch into a
+	 * brand-new thread happens with sched_lock held by the thread doing
+	 * the switching, and thread_trampoline's first act is to release it.
+	 * A count that started at zero would go negative there, which is the
+	 * asymmetry that makes per-thread lock accounting look impossible
+	 * until this line.
+	 *
+	 * And the state that release will restore is interrupts ON, which is
+	 * how a thread has to start: it must be preemptible from its first
+	 * instruction, since nothing else will turn them on for it.
+	 */
+	th->th_spin_depth        = 1;
+	th->th_spin_saved_if     = true;
 	th->th_runq_link         = NULL;
 	th->th_task_link         = NULL;
 	th->th_sleep_link        = NULL;
