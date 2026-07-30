@@ -60,8 +60,26 @@ if ($Fresh) {
 }
 if (-not (Test-Path $disk)) { throw "no disk image at $disk" }
 
+# WSL AND QEMU DO NOT SHARE THE VIRTUALISATION STACK ON THIS HOST.  A running
+# WSL VM makes the next qemu-system-x86_64 exit before it opens the serial
+# port, so the boot produces an EMPTY log -- which the drive check below then
+# reports as "the kernel never reported a drive", blaming the kernel for a
+# build tool.  It cost three runs before it was recognised.
+#
+# EVERY boot needs this, not just the first: -Fresh rebuilds the image with
+# wsl, and apfsck runs under wsl after each boot, so the VM is back up by the
+# time the next one starts.  Shutting it down is instantaneous when it is not
+# running.
+function Stop-Wsl {
+    $ErrorActionPreference = 'Continue'
+    wsl --shutdown 2>&1 | Out-Null
+    $ErrorActionPreference = 'Stop'
+    Start-Sleep -Seconds 2
+}
+
 for ($b = 1; $b -le $Boots; $b++) {
     Kill-Qemu
+    Stop-Wsl
     Remove-Item $log -ErrorAction SilentlyContinue
     Write-Host "[accept] boot $b/$Boots"
     & (Join-Path $Root 'tools\run.ps1') -Disk $disk | Out-Null

@@ -598,6 +598,58 @@ uncontrolled load is a gauge, not an assertion**; the assertion here is the
 load-independent one -- a `wait4` answered only because the deadline under it
 fired, with a per-channel generation counter to prove nobody had spoken.
 
+## ...and where a wake stands in the queue
+
+The rung above left one figure unexplained and said so: a parent that read a
+pipe and then reaped the child that wrote it took **103 ms**, stable to
+within three, where two wakes of four milliseconds should not have cost that.
+Asking for a reschedule had made the wake *arrive*; it had not decided where
+the woken thread arrived *in the queue*.
+
+It arrived at the back.  A thread that has just been woken is by construction
+one that gave its slice up unused -- it asked for something, it was not
+there, it slept -- and putting it behind the threads that have been running
+means the news it was woken for waits out their slices.  So wake latency was
+never one switch: it was *however many runnable threads are ahead of me*
+times a quantum, and the quantum was five ticks.  Measured, with the delay
+and its cause recorded at the same moment: **122 wakes over 20 ms in one
+boot, every one of them with two to four threads queued ahead, delayed by a
+whole quantum apiece** -- and a hundred milliseconds when two of the queue
+wanted the CPU rather than one.  Both halves of that line matter; a duration
+alone says a wake was late, and the queue depth beside it says why.
+
+Wakes now go to the **front**.  The boost is worth exactly one slice and is
+spent by taking it: the thread runs, and the moment it is preempted or yields
+it rejoins the tail like everybody else, so nothing accumulates priority by
+sleeping.  Sleeping buys the CPU for the first look, which is the entire
+point of having been woken.
+
+That took the pipe wake from a quantum to **89 microseconds** and the boot's
+total wake delay from **5860 ms to 100**, worst case 100 ms to one PIT
+period.  It also left the rest of the 103 ms standing, and correctly: what
+remained was the *child* queueing for the CPU it needed to reach `_exit`,
+which is not a wake at all and no wake fix could touch.  That is the quantum,
+so the quantum was measured rather than argued about:
+
+| slice | pipe-then-reap | reap alone | wake delay per boot |
+| --- | --- | --- | --- |
+| 5 ticks | 48.4 ms | 3.6 ms | 100 ms |
+| **2 ticks** | **19.9 ms** | **5.1 ms** | **50 ms** |
+| 1 tick | 18.5 ms | 8.9 ms | 40 ms |
+
+Two ticks is the knee.  One buys nothing on the figure that motivated the
+change and is the worst of the three at reaping, because a slice that short
+cannot hold a task teardown: the dying child is preempted in the middle of it
+and queues again to finish, so its parent waits two turns instead of one.  A
+slice is always somebody else's waiting time, and the somebody is usually the
+thread the others are waiting *for*.
+
+The test that reported the 103 ms now reports its two legs apart -- the wake,
+which the kernel owns end to end, and the queueing behind it, which it does
+not -- because a single number there is what made a scheduling cost look like
+a defect in the pipe.  End state: **24362 wakes reached the CPU in 30 ms, none
+of them over 20**, and four boots of 89/90/90/90 with nothing failing.
+
 Next on the roadmap: **replacing an existing name** with a rename, which
 POSIX requires and this refuses out loud; a **torn-write stand**, which
 would make the checkpoint's promise that an interruption anywhere leaves the

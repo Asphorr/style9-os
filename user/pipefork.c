@@ -691,6 +691,18 @@ pf_now_us(void)
  * anybody looks.  At 100 Hz with a five-tick slice that is tens of
  * milliseconds per command, paid by every shell that runs one.  A parked
  * parent is woken by the exit itself and sees it at once.
+ *
+ * EACH ROUND IS TIMED IN TWO LEGS, because the whole is not one quantity and
+ * reporting it as one wasted an afternoon.  The WAKE leg ends when the syscall
+ * the parent parked in returns: that is a wake, and the kernel owns it end to
+ * end.  Whatever remains is the parent waiting for the child to reach a place
+ * it has not reached yet -- for the read-first order, a child that wrote its
+ * byte but has not called _exit, and so has to be given the CPU again before
+ * there is anything to reap.  That is a QUEUEING cost, it scales with the
+ * quantum and with what else is runnable, and reading it as a wake is what made
+ * this look like a defect in the pipe: 103 ms, of which the actual pipe wake
+ * turned out to be 89 MICROseconds once the wake went to the front of the
+ * runqueue and the rest stayed exactly where it was.
  */
 #define	LAT_ROUNDS	5
 
@@ -712,14 +724,16 @@ pf_now_us(void)
 #define	LAT_MAX_US	1000000L	/* 1 s: only a real hang trips this */
 
 static long
-reap_latency_once(int read_first)
+reap_latency_once(int read_first, long *wake_leg)
 {
 	long	stamp;
 	long	after;
+	long	first;
 	int	fd[2];
 	int	status;
 	int	pid;
 
+	*wake_leg = -1;
 	if (pipe(fd) != 0)
 		return (-1);
 	pid = fork();
@@ -750,9 +764,11 @@ reap_latency_once(int read_first)
 			(void)close(fd[0]);
 			return (-1);
 		}
+		first = pf_now_us();
 		(void)wait4(pid, &status, 0, NULL);
 	} else {
 		(void)wait4(pid, &status, 0, NULL);
+		first = pf_now_us();
 		if (read(fd[0], &stamp, sizeof(stamp)) !=
 		    (long)sizeof(stamp)) {
 			(void)close(fd[0]);
@@ -763,6 +779,8 @@ reap_latency_once(int read_first)
 	(void)close(fd[0]);
 	if (stamp < 0 || after < stamp)
 		return (-1);
+	if (first >= stamp)
+		*wake_leg = first - stamp;
 	return (after - stamp);
 }
 
@@ -770,12 +788,16 @@ static void
 scene_wait_cost(void)
 {
 	long	lat;
+	long	leg;
 	long	best;
 	long	worst;
 	long	total;
+	long	wake_total;
+	long	wake_worst;
 	int	order;
 	int	i;
 	int	n;
+	int	wake_n;
 
 	printf("[pipefork] --- what waiting costs ---\n");
 	if (pf_now_us() < 0) {
@@ -786,12 +808,15 @@ scene_wait_cost(void)
 	}
 
 	for (order = 0; order < 2; order++) {
-		best  = -1;
-		worst = -1;
-		total = 0;
-		n     = 0;
+		best       = -1;
+		worst      = -1;
+		total      = 0;
+		n          = 0;
+		wake_total = 0;
+		wake_worst = -1;
+		wake_n     = 0;
 		for (i = 0; i < LAT_ROUNDS; i++) {
-			lat = reap_latency_once(order);
+			lat = reap_latency_once(order, &leg);
 			if (lat < 0)
 				continue;
 			if (best < 0 || lat < best)
@@ -800,6 +825,12 @@ scene_wait_cost(void)
 				worst = lat;
 			total += lat;
 			n++;
+			if (leg >= 0) {
+				wake_total += leg;
+				if (leg > wake_worst)
+					wake_worst = leg;
+				wake_n++;
+			}
 		}
 		if (n == 0) {
 			printf("[pipefork] FAIL no %s round completed\n",
@@ -811,19 +842,33 @@ scene_wait_cost(void)
 		    "worst %ld us, mean %ld us\n",
 		    order ? "pipe-then-reap latency" : "reap latency",
 		    n, best, worst, total / n);
+		/*
+		 * The wake leg on its own, which is the part the kernel decides
+		 * and the only part worth comparing between two kernels.  For
+		 * the reap order it is nearly the whole figure; for the other
+		 * one it is the pipe wake, and the remainder is the child
+		 * queueing for the CPU it needs to reach _exit.  Printing them
+		 * apart is the difference between "the pipe takes 100 ms" and
+		 * "the pipe takes 89 us and the quantum is 20".
+		 */
+		if (wake_n != 0)
+			printf("[pipefork]   the wake itself: worst %ld us, "
+			    "mean %ld us -- the rest is %s\n",
+			    wake_worst, wake_total / wake_n,
+			    order ? "the child waiting its turn to exit" :
+			    "the trailing read, which never parks");
 		if (worst > LAT_MAX_US)
 			printf("[pipefork] that is long enough to be a wake "
 			    "that never came rather than one that queued\n");
 		/*
-		 * Only the reap order is judged.  The other one parks TWICE --
-		 * on the pipe, and then on the child, which has not exited yet
-		 * because the write that woke this task happened before it got
-		 * there -- so its number is two wakes and a fork's worth of
-		 * scheduling, which is worth PRINTING and not worth asserting
-		 * a threshold against.  Labelling it "pipe-wake" and holding
-		 * it to one wake's budget was a measurement error of mine, and
-		 * the doubled figure it produced very nearly got read as a
-		 * defect in the pipe.
+		 * Only the reap order is judged, and only against the hang
+		 * bound.  The other order's total is a wake PLUS a queueing
+		 * cost this test controls nothing about, so holding it to one
+		 * wake's budget was a measurement error of mine -- the doubled
+		 * figure it produced very nearly got read as a defect in the
+		 * pipe.  Its wake leg is now reported separately and is the
+		 * number to compare; it is still not asserted on, for the
+		 * reason in LAT_MAX_US above.
 		 */
 		if (!order)
 			check(worst <= LAT_MAX_US,

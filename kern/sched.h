@@ -57,8 +57,11 @@ void		thread_block_release(int reason, void *target,
 		    struct spinlock *external);
 
 /*
- * thread_wake: transition `th` from BLOCKED to READY and enqueue it.
- * Safe to call on a not-blocked thread (no-op).
+ * thread_wake: transition `th` from BLOCKED to READY and enqueue it AHEAD of
+ * the queue, since a thread that blocked gave its slice up unused.  Also asks
+ * for a reschedule, so the wake reaches the CPU at the next tick rather than
+ * when whoever is running happens to stop.  Safe to call on a not-blocked
+ * thread (no-op).
  */
 void		thread_wake(struct thread *);
 
@@ -172,9 +175,11 @@ void		sched_count_preempt(void);
  *
  * preempt_disable / preempt_enable bracket critical sections that
  * must not be preempted -- spin_lock / spin_unlock call them
- * automatically.  Tracking is per-thread (the count lives in
- * struct thread), so a thread switched in mid-critical-section
- * resumes with its own count intact.
+ * automatically.  The count is kernel-wide rather than per-thread, and
+ * deliberately: sched_lock is held ACROSS a context switch, so the
+ * thread that releases it is not the one that took it and per-thread
+ * accounting underflows.  What the counter answers is "is the kernel
+ * inside any critical section", which is the question the PIT has.
  *
  * need_resched is set by PIT when the current thread's quantum is
  * exhausted.  It is honoured either inline at the end of
@@ -185,7 +190,33 @@ void		sched_count_preempt(void);
 extern volatile int		preempt_need_resched;	/* (a) */
 extern volatile unsigned int	preempt_quantum_used;	/* (a) */
 
-#define	PREEMPT_QUANTUM_TICKS	5	/* ~50 ms at 100 Hz */
+/*
+ * How long a thread may hold the CPU before the PIT takes it away.
+ *
+ * THE SLICE IS ALSO SOMEBODY ELSE'S WAITING TIME.  Whoever is behind this
+ * thread in the queue waits out the whole of it, and a thread near the front
+ * of the queue is often one the others are waiting FOR -- a child that has to
+ * reach _exit before its parent's wait4 can return, a writer that has to reach
+ * write before a reader sees a byte.  At five ticks, measured: a parent that
+ * read a pipe and then waited for the child that wrote it took 104 ms to get
+ * both answers, of which one whole quantum was the child queueing for the CPU
+ * it needed to finish dying.
+ *
+ * Two ticks rather than one because the curve has a knee there and going
+ * further costs the other direction.  Same measurement, same boot, all with
+ * wakes going to the front of the queue:
+ *
+ *	quantum   pipe-then-reap   reap alone   total wake delay per boot
+ *	5 ticks       48.4 ms         3.6 ms          100 ms
+ *	2 ticks       19.9 ms         5.1 ms           50 ms
+ *	1 tick        18.5 ms         8.9 ms           40 ms
+ *
+ * One tick buys nothing on the number that motivated the change and is the
+ * worst of the three at reaping, because a slice that short cannot hold a
+ * task teardown: the dying child is preempted in the middle of it and has to
+ * queue again to finish, so the parent waits for two turns instead of one.
+ */
+#define	PREEMPT_QUANTUM_TICKS	2	/* ~20 ms at 100 Hz */
 
 void		preempt_disable(void);
 void		preempt_enable(void);

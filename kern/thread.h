@@ -103,6 +103,17 @@ struct thread {
 	uint64_t		 th_wake_ms;		/* (sched_lock)     */
 
 	/*
+	 * ...and the two facts that explain a slow one, recorded at the same
+	 * moment: how many threads were already queued ahead of this one, and
+	 * who held the CPU while it waited.  A duration alone says a wake was
+	 * late; these say why, and the difference is a diagnosis in one line
+	 * instead of a rebuild with a new print in it.  Read by the woken
+	 * thread itself, next to th_wake_ms.
+	 */
+	const char		*th_wake_hog;		/* (sched_lock)     */
+	uint32_t		 th_wake_qlen;		/* (sched_lock)     */
+
+	/*
 	 * Trusted-send flag.  Toggled by mach_msg_send_trusted around a
 	 * send call that originates from kernel code shipping kernel-rodata
 	 * bytes through an OOL descriptor (e.g. the "man" service replying

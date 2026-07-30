@@ -67,6 +67,8 @@ thread_subsystem_init(void)
 	boot->th_task_link       = NULL;
 	boot->th_sleep_link      = NULL;
 	boot->th_wake_ms         = 0;
+	boot->th_wake_hog        = NULL;
+	boot->th_wake_qlen       = 0;
 	boot->th_trusted_send    = false;
 	boot->th_wake_deadline_ms = 0;
 	boot->th_timed_out       = 0;
@@ -146,6 +148,8 @@ thread_create(struct task *t, void (*entry)(void *), void *arg,
 	th->th_task_link         = NULL;
 	th->th_sleep_link        = NULL;
 	th->th_wake_ms           = 0;
+	th->th_wake_hog          = NULL;
+	th->th_wake_qlen         = 0;
 	th->th_trusted_send      = false;
 	th->th_wake_deadline_ms  = 0;
 	th->th_timed_out         = 0;

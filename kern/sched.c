@@ -114,10 +114,11 @@ static struct thread	*sleepq_head;		/* (sched_lock)            */
 
 /*
  * How long a wake takes to become a RUN.  Making a thread READY is not making
- * it run: it goes to the tail of the runqueue and waits for whoever holds the
- * CPU to give it up.  A waiter that polls is always in that queue already and
- * so is never far from its turn; one that sleeps rejoins from the back, and
- * whether that is cheaper depends on numbers rather than on argument.
+ * it run: something else holds the CPU, and where in the queue the woken thread
+ * lands decides how long it waits.  A waiter that polls is always in that queue
+ * already and so is never far from its turn; one that sleeps rejoins from
+ * wherever it is put, and whether that is cheaper depends on numbers rather
+ * than on argument.
  *
  * Measured here rather than reasoned about because the reasoning was wrong
  * once: parking three waits made the news arrive TEN TIMES LATER, and nothing
@@ -126,6 +127,26 @@ static struct thread	*sleepq_head;		/* (sched_lock)            */
 static uint64_t		wake_lat_n;		/* (a) wakes measured      */
 static uint64_t		wake_lat_sum_ms;	/* (a) total delay         */
 static uint64_t		wake_lat_max_ms;	/* (a) worst one           */
+
+/*
+ * ...and WHY, for the ones that were slow, which the totals above cannot say.
+ *
+ * A mean of zero over twenty thousand wakes hides the handful that took fifty
+ * milliseconds, and the handful is the interesting part: what a slow wake needs
+ * naming is not its duration but what stood in front of it.  Each of these
+ * lines carries the two facts that identify the cause -- how many threads were
+ * queued ahead of the woken one, and who held the CPU at that moment -- and
+ * printing them is what turned a whole afternoon of theories into one
+ * measurement: 122 slow wakes in a boot, every single one with two to four
+ * threads queued ahead, delayed by a whole quantum each.  It reads zero now.
+ *
+ * Bounded so a boot that goes wrong floods nothing; the counter keeps counting
+ * after the printing stops, so the tally stays honest.
+ */
+#define	WAKE_SLOW_MS		20	/* two quanta: not queueing, standing */
+#define	WAKE_SLOW_MAX_LINES	20
+static uint64_t		wake_slow_n;		/* (a) wakes over the bar  */
+static uint64_t		wake_slow_lines;	/* (a) ...of them, printed */
 
 static void	idle_loop(void *) __attribute__((noreturn));
 static struct thread *pick_next_locked(struct thread *self);
@@ -297,6 +318,39 @@ enqueue_locked(struct thread *th)
 		runq_tail->th_runq_link = th;
 		runq_tail = th;
 	}
+	runq_len++;
+}
+
+/*
+ * Ready, and ahead of the queue.
+ *
+ * WHAT THE TAIL COSTS A WAKE.  A thread that has just been woken is, by
+ * construction, a thread that gave the CPU up before its slice was over: it
+ * asked for something, it was not there, it slept.  Putting it behind the
+ * threads that have been running means the news it was woken for waits for
+ * their slices, and a slice here is five ticks -- so wake latency is not one
+ * switch but "however many runnable threads are ahead of me" times fifty
+ * milliseconds.  That was measured rather than reasoned about: in one boot,
+ * 122 wakes waited 20 ms or longer, every one of them with two to four threads
+ * queued ahead of it, and the delay was a whole quantum almost every time
+ * (a hundred milliseconds when two of the queue wanted the CPU, not one).
+ *
+ * WHY THIS DOES NOT STARVE THE QUEUE.  The boost is worth exactly one slice
+ * and is spent by taking it: a thread put here runs, and the moment it is
+ * preempted -- or yields, or blocks and is woken having ALREADY had its turn --
+ * it goes back through enqueue_locked like everybody else.  Nothing accumulates
+ * priority by sleeping; sleeping only buys the CPU for the first look, which is
+ * the whole point of having been woken.  A thread that wants the machine cannot
+ * get it this way, because wanting the machine is not what puts a thread here.
+ */
+static void
+enqueue_first_locked(struct thread *th)
+{
+
+	th->th_runq_link = runq_head;
+	runq_head = th;
+	if (runq_tail == NULL)
+		runq_tail = th;
 	runq_len++;
 }
 
@@ -476,6 +530,19 @@ thread_block_release(int reason, void *target, struct spinlock *external)
 
 		delay = clock_uptime_ms() - self->th_wake_ms;
 		self->th_wake_ms = 0;
+		if (delay >= WAKE_SLOW_MS) {
+			wake_slow_n++;
+			if (wake_slow_lines < WAKE_SLOW_MAX_LINES) {
+				wake_slow_lines++;
+				kprintf("sched: slow wake -- %s waited %llu ms "
+				    "behind %u thread(s), %s had the CPU\n",
+				    self->th_name != NULL ? self->th_name : "?",
+				    (unsigned long long)delay,
+				    (unsigned int)self->th_wake_qlen,
+				    self->th_wake_hog != NULL ?
+				    self->th_wake_hog : "?");
+			}
+		}
 		wake_lat_n++;
 		wake_lat_sum_ms += delay;
 		if (delay > wake_lat_max_ms)
@@ -512,10 +579,13 @@ thread_wake(struct thread *th)
 	th->th_block_reason = THREAD_NOT_BLOCKED;
 	th->th_block_target = NULL;
 	th->th_wake_ms      = clock_uptime_ms();
+	th->th_wake_hog     = current_thread != NULL ?
+	    current_thread->th_name : "?";
+	th->th_wake_qlen    = runq_len;
 	spin_unlock(&th->th_lock);
 
 	sleepq_unlink_locked(th);
-	enqueue_locked(th);
+	enqueue_first_locked(th);
 	/*
 	 * ASK FOR A RESCHEDULE.  Making a thread READY is not making it run:
 	 * without this it waits in the queue until whoever holds the CPU gives
@@ -604,10 +674,13 @@ sched_wake_sleepers_of(struct task *task)
 		th->th_block_reason = THREAD_NOT_BLOCKED;
 		th->th_block_target = NULL;
 		th->th_wake_ms      = clock_uptime_ms();
+		th->th_wake_hog     = current_thread != NULL ?
+		    current_thread->th_name : "?";
+		th->th_wake_qlen    = runq_len;
 		spin_unlock(&th->th_lock);
 
 		sleepq_unlink_locked(th);
-		enqueue_locked(th);
+		enqueue_first_locked(th);
 		n++;
 	}
 	if (n != 0)
@@ -645,10 +718,13 @@ sched_wakeup(void *chan)
 		th->th_block_reason = THREAD_NOT_BLOCKED;
 		th->th_block_target = NULL;
 		th->th_wake_ms      = clock_uptime_ms();
+		th->th_wake_hog     = current_thread != NULL ?
+		    current_thread->th_name : "?";
+		th->th_wake_qlen    = runq_len;
 		spin_unlock(&th->th_lock);
 
 		sleepq_unlink_locked(th);
-		enqueue_locked(th);
+		enqueue_first_locked(th);
 		n++;
 	}
 	/* Same reasoning as thread_wake: a wake without one is a wake late. */
@@ -917,6 +993,9 @@ sched_wake_latency_print(void)
 	    (unsigned long long)wake_lat_sum_ms,
 	    (unsigned long long)(wake_lat_sum_ms / wake_lat_n),
 	    (unsigned long long)wake_lat_max_ms);
+	kprintf("sched: %llu of them waited %d ms or more%s\n",
+	    (unsigned long long)wake_slow_n, WAKE_SLOW_MS,
+	    wake_slow_n > wake_slow_lines ? " (not all named above)" : "");
 }
 
 uint64_t
