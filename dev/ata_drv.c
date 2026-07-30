@@ -11,6 +11,7 @@
 
 #include "ata_drv.h"
 #include "bio.h"
+#include "clock.h"
 #include "dev_proto.h"
 #include "dev_subsystem.h"
 #include "intr.h"
@@ -22,6 +23,7 @@
 #include "sched.h"
 #include "spinlock.h"
 #include "thread.h"
+#include "tsc.h"
 
 extern struct port	*port_create_kernel_owned(uint8_t kind, void *arg);
 
@@ -99,6 +101,21 @@ extern struct port	*port_create_kernel_owned(uint8_t kind, void *arg);
 #define	ATA_SECTOR_BYTES	512u
 
 /*
+ * How long one park waits for the drive's interrupt before going and LOOKING
+ * at the drive, and how long the whole wait may run before the command is
+ * declared dead.
+ *
+ * A wait for an interrupt that never arrives is not a slow read, it is a
+ * filesystem that never answers again: the thread holds fs_lock across the
+ * whole operation, so everything else that touches the volume queues behind
+ * it and the machine goes quiet with nothing to say.  That is not a
+ * hypothetical -- it is what this kernel did, roughly one boot in six, and it
+ * is why the wait now has an end.
+ */
+#define	ATA_INTR_SLICE_MS	100
+#define	ATA_INTR_LIMIT_MS	5000
+
+/*
  * Up to two channels, each with master + slave.  Probed at init; only
  * drives that respond to IDENTIFY get an entry in `drives`.
  */
@@ -122,6 +139,10 @@ extern struct port	*port_create_kernel_owned(uint8_t kind, void *arg);
  * preemption is enabled.  A waiter blocks with ch_lock held, hence with
  * preemption disabled, so the drain cannot run until after the switch has
  * happened and the thread really is BLOCKED.
+ *
+ * A lost INTERRUPT is a different thing from a lost wake and nothing above
+ * helps with it: no wake was ever posted, because the handler never ran.  That
+ * one is answered by the deadline in ata_wait_intr.
  */
 struct ata_channel {
 	struct spinlock	 ch_lock;
@@ -134,6 +155,18 @@ struct ata_channel {
 	volatile uint8_t	  ch_irq_status;/* status latched by the ISR */
 	volatile uint32_t	  ch_n_irq;	/* diagnostics */
 	volatile uint32_t	  ch_n_block;	/* diagnostics */
+	/*
+	 * Who has a command in flight, and how often somebody else started one
+	 * anyway.  ch_lock says nothing about this: a transfer that sleeps for
+	 * the drive's interrupt RELEASES the lock to do it, so the channel is
+	 * unowned for most of the time a command is running on it.  Whether
+	 * that window is ever actually entered is a fact, not an argument, so
+	 * it is counted.
+	 */
+	struct thread	*volatile ch_cmd_owner;		/* (l) */
+	volatile uint32_t	  ch_n_overlap;		/* (l) */
+	volatile uint32_t	  ch_n_lost;	/* waits the deadline ended */
+	volatile uint32_t	  ch_n_drained;	/* sectors left in the port */
 };
 
 struct ata_drive {
@@ -148,8 +181,10 @@ struct ata_drive {
 };
 
 static struct ata_channel	channels[2] = {
-	{ SPINLOCK_INIT("ata-ch0"), 0x1F0, 0x3F6, 14, false, NULL, 0, 0, 0, 0 },
-	{ SPINLOCK_INIT("ata-ch1"), 0x170, 0x376, 15, false, NULL, 0, 0, 0, 0 },
+	{ SPINLOCK_INIT("ata-ch0"), 0x1F0, 0x3F6, 14, false, NULL, 0, 0, 0, 0,
+	    NULL, 0, 0, 0 },
+	{ SPINLOCK_INIT("ata-ch1"), 0x170, 0x376, 15, false, NULL, 0, 0, 0, 0,
+	    NULL, 0, 0, 0 },
 };
 
 static struct ata_drive		drives[ATA_NDRIVES_MAX];
@@ -182,6 +217,9 @@ static int	ata_wait_intr(struct ata_channel *ch, uint8_t want,
 static void	ata_irq14(struct trapframe *tf);
 static void	ata_irq15(struct trapframe *tf);
 static void	ata_400ns(struct ata_channel *ch);
+static int	ata_wait_idle(struct ata_channel *ch);
+static void	ata_cmd_claim(struct ata_channel *ch);
+static void	ata_cmd_release(struct ata_channel *ch);
 static const char *ata_decode_err(uint8_t er);
 
 /* ---- init ---------------------------------------------------------- */
@@ -635,6 +673,13 @@ ata_read(struct ata_drive *d, uint64_t lba, uint32_t count, void *buf)
 	p  = (uint8_t *)buf;
 
 	spin_lock(&ch->ch_lock);
+	ata_cmd_claim(ch);
+
+	if (ata_wait_idle(ch) != 0) {
+		ata_cmd_release(ch);
+		spin_unlock(&ch->ch_lock);
+		return (MACH_E_INVAL);
+	}
 
 	if (use_lba48) {
 		ata_select_drive(d, ATA_DRV_LBA);
@@ -698,6 +743,7 @@ ata_read(struct ata_drive *d, uint64_t lba, uint32_t count, void *buf)
 			    d->d_devname, (unsigned long long)(lba + s),
 			    ata_decode_err(er),
 			    (unsigned)sr, (unsigned)er);
+			ata_cmd_release(ch);
 			spin_unlock(&ch->ch_lock);
 			return (MACH_E_INVAL);
 		}
@@ -714,6 +760,7 @@ ata_read(struct ata_drive *d, uint64_t lba, uint32_t count, void *buf)
 		    p + s * ATA_SECTOR_BYTES, ATA_SECTOR_BYTES / 2);
 	}
 
+	ata_cmd_release(ch);
 	spin_unlock(&ch->ch_lock);
 	return (MACH_MSG_OK);
 }
@@ -747,6 +794,13 @@ ata_write(struct ata_drive *d, uint64_t lba, uint32_t count, const void *buf)
 	p  = (const uint8_t *)buf;
 
 	spin_lock(&ch->ch_lock);
+	ata_cmd_claim(ch);
+
+	if (ata_wait_idle(ch) != 0) {
+		ata_cmd_release(ch);
+		spin_unlock(&ch->ch_lock);
+		return (MACH_E_INVAL);
+	}
 
 	if (use_lba48) {
 		ata_select_drive(d, ATA_DRV_LBA);
@@ -798,6 +852,7 @@ ata_write(struct ata_drive *d, uint64_t lba, uint32_t count, const void *buf)
 			    d->d_devname, (unsigned long long)(lba + s),
 			    ata_decode_err(er),
 			    (unsigned)sr, (unsigned)er);
+			ata_cmd_release(ch);
 			spin_unlock(&ch->ch_lock);
 			return (MACH_E_INVAL);
 		}
@@ -811,7 +866,19 @@ ata_write(struct ata_drive *d, uint64_t lba, uint32_t count, const void *buf)
 	 * this a power loss could leave previously-written bytes only in
 	 * the drive's RAM.  The flush command is its own command + status
 	 * cycle, so we wait BSY=0 once more.
+	 *
+	 * ⚠ AND BEFORE IT, NOT ONLY AFTER.  The drive is still committing the
+	 * last sector when the loop above ends -- BSY is set -- and a command
+	 * written into that is a command that never happens.  A flush that is
+	 * quietly dropped reports success and leaves the bytes where a power
+	 * cut can still take them, which is the one thing the flush exists to
+	 * prevent.
 	 */
+	if (ata_wait_idle(ch) != 0) {
+		ata_cmd_release(ch);
+		spin_unlock(&ch->ch_lock);
+		return (MACH_E_INVAL);
+	}
 	outb(ch->ch_io_base + ATA_REG_COMMAND,
 	    use_lba48 ? ATA_CMD_FLUSH_CACHE_EXT : ATA_CMD_FLUSH_CACHE);
 
@@ -819,10 +886,12 @@ ata_write(struct ata_drive *d, uint64_t lba, uint32_t count, const void *buf)
 		er = inb(ch->ch_io_base + ATA_REG_ERROR);
 		kprintf("ata: %s flush after write failed: %s\n",
 		    d->d_devname, ata_decode_err(er));
+		ata_cmd_release(ch);
 		spin_unlock(&ch->ch_lock);
 		return (MACH_E_INVAL);
 	}
 
+	ata_cmd_release(ch);
 	spin_unlock(&ch->ch_lock);
 	return (MACH_MSG_OK);
 }
@@ -837,6 +906,13 @@ ata_sync(struct ata_drive *d)
 	ch = d->d_ch;
 
 	spin_lock(&ch->ch_lock);
+	ata_cmd_claim(ch);
+
+	if (ata_wait_idle(ch) != 0) {
+		ata_cmd_release(ch);
+		spin_unlock(&ch->ch_lock);
+		return (MACH_E_INVAL);
+	}
 
 	ata_select_drive(d, d->d_lba48 ? ATA_DRV_LBA : 0);
 	ata_400ns(ch);
@@ -848,10 +924,12 @@ ata_sync(struct ata_drive *d)
 		er = inb(ch->ch_io_base + ATA_REG_ERROR);
 		kprintf("ata: %s sync failed: %s\n",
 		    d->d_devname, ata_decode_err(er));
+		ata_cmd_release(ch);
 		spin_unlock(&ch->ch_lock);
 		return (MACH_E_INVAL);
 	}
 
+	ata_cmd_release(ch);
 	spin_unlock(&ch->ch_lock);
 	return (MACH_MSG_OK);
 }
@@ -906,6 +984,92 @@ ata_400ns(struct ata_channel *ch)
 	(void)inb(ch->ch_ctrl_base + ATA_CTL_ALT_STATUS);
 	(void)inb(ch->ch_ctrl_base + ATA_CTL_ALT_STATUS);
 	(void)inb(ch->ch_ctrl_base + ATA_CTL_ALT_STATUS);
+}
+
+/*
+ * THE CHANNEL HAS TO BE IDLE BEFORE ITS REGISTERS ARE TOUCHED, and nothing
+ * here used to check.  Every command began by writing the drive-select, the
+ * sector count and the three LBA bytes, and only then the command -- with no
+ * question asked about what the drive was still doing.  The spec is explicit
+ * that a host writes a command-block register only with BSY=0 and DRQ=0, and
+ * the reason is not pedantry: a drive that is still finishing the previous
+ * command either DISCARDS the write outright (which is what an emulator does,
+ * and the command that follows is then never issued at all -- a read that
+ * waits for an interrupt no one will send) or latches part of it into the
+ * command already running.
+ *
+ * Both were reachable here.  The previous command did not have to be far
+ * away: WRITE SECTORS leaves the drive busy committing its last sector while
+ * this code is already writing FLUSH CACHE into the command register.
+ *
+ * A stuck DRQ gets its sector drained rather than waited on -- that is the
+ * only thing that clears it, and it means the previous command was abandoned
+ * with data still in the port, which is worth saying out loud.
+ */
+static uint16_t	ata_sink[ATA_SECTOR_BYTES / 2];	/* thrown away by definition */
+
+static int
+ata_wait_idle(struct ata_channel *ch)
+{
+	uint64_t	give_up;
+	uint64_t	hz;
+	uint8_t		sr;
+
+	/*
+	 * ⚠ TIMED BY THE TSC AND NOT BY THE CLOCK, because this spins with
+	 * ch_lock held and spin_lock turns interrupts OFF.  clock_uptime_ms is
+	 * counted out of the PIT's interrupt, which reaches the boot
+	 * processor -- so on that processor the clock this loop was waiting
+	 * for would be a clock this loop had itself stopped, and a bounded
+	 * wait would be an unbounded one.  rdtsc needs nobody's permission.
+	 */
+	hz = tsc_hz();
+	if (hz == 0)				/* before calibration */
+		hz = 1000000000ull;
+	give_up = tsc_read() + hz * (ATA_INTR_LIMIT_MS / 1000);
+	for (;;) {
+		sr = inb(ch->ch_ctrl_base + ATA_CTL_ALT_STATUS);
+		if ((sr & (ATA_SR_BSY | ATA_SR_DRQ)) == 0)
+			return (0);
+		if ((sr & ATA_SR_BSY) == 0 && (sr & ATA_SR_DRQ) != 0) {
+			ch->ch_n_drained++;
+			insw(ch->ch_io_base + ATA_REG_DATA, ata_sink,
+			    ATA_SECTOR_BYTES / 2);
+			continue;
+		}
+		if (tsc_read() >= give_up) {
+			kprintf("ata: channel at 0x%x will not go idle -- "
+			    "status 0x%02x\n", (unsigned)ch->ch_io_base,
+			    (unsigned)sr);
+			return (-1);
+		}
+	}
+}
+
+/*
+ * The two ends of a command, both called with ch_lock held.
+ *
+ * Claiming cannot fail and does not exclude anybody: it only records who is
+ * mid-command and counts the times somebody else began one anyway.  The lock
+ * this runs under is not enough to prevent that, because ata_wait_intr hands
+ * it back in order to sleep for the drive's interrupt -- so the answer to "is
+ * the channel ever actually shared inside a transfer" has to be measured
+ * rather than reasoned about.
+ */
+static void
+ata_cmd_claim(struct ata_channel *ch)
+{
+
+	if (ch->ch_cmd_owner != NULL && ch->ch_cmd_owner != current_thread)
+		ch->ch_n_overlap++;
+	ch->ch_cmd_owner = current_thread;
+}
+
+static void
+ata_cmd_release(struct ata_channel *ch)
+{
+
+	ch->ch_cmd_owner = NULL;
 }
 
 /*
@@ -966,14 +1130,28 @@ ata_irq15(struct trapframe *tf)
  * path on a channel whose INTRQ did not prove itself at probe time -- a
  * driver that can only ever wait for an interrupt is a driver that hangs the
  * machine on hardware that does not send one.
+ *
+ * ...AND ON A CHANNEL THAT PROVED ITSELF AND THEN DROPPED ONE.  Proving INTRQ
+ * once at probe answers "does this hardware interrupt at all", which is not
+ * the same question as "did it interrupt THIS time".  IRQ14 arrives at the
+ * 8259 as an EDGE: a drive that releases and re-asserts INTRQ while the
+ * previous one is still in service presents an edge nobody is looking at, and
+ * that interrupt is simply gone.  The park therefore has an end -- and when it
+ * ends, this asks the drive itself, which is the only participant that always
+ * knows.
  */
 static int
 ata_wait_intr(struct ata_channel *ch, uint8_t want, uint8_t *sr_out)
 {
-	uint8_t	sr;
+	struct thread	*self;
+	uint64_t	 give_up;
+	uint8_t		 sr;
 
 	if (!ch->ch_irq_ok)
 		return (ata_wait_ready(ch, want, sr_out));
+
+	self    = current_thread;
+	give_up = clock_uptime_ms() + ATA_INTR_LIMIT_MS;
 
 	for (;;) {
 		if (__atomic_load_n(&ch->ch_irq_seen, __ATOMIC_ACQUIRE) != 0)
@@ -984,8 +1162,7 @@ ata_wait_intr(struct ata_channel *ch, uint8_t want, uint8_t *sr_out)
 		 * landed in the gap.  If it did, drop the slot again -- an
 		 * interrupt for the NEXT sector must not find a stale waiter.
 		 */
-		__atomic_store_n(&ch->ch_waiter, current_thread,
-		    __ATOMIC_RELEASE);
+		__atomic_store_n(&ch->ch_waiter, self, __ATOMIC_RELEASE);
 		if (__atomic_load_n(&ch->ch_irq_seen, __ATOMIC_ACQUIRE) != 0) {
 			__atomic_store_n(&ch->ch_waiter, NULL,
 			    __ATOMIC_RELAXED);
@@ -993,8 +1170,58 @@ ata_wait_intr(struct ata_channel *ch, uint8_t want, uint8_t *sr_out)
 		}
 
 		ch->ch_n_block++;
+		self->th_wake_deadline_ms = clock_uptime_ms() +
+		    ATA_INTR_SLICE_MS;
+		sched_add_timed_waiter(self);
 		thread_block_release(THREAD_BLOCK_SLEEP, ch, &ch->ch_lock);
+		sched_remove_timed_waiter(self);
 		spin_lock(&ch->ch_lock);
+
+		if (__atomic_load_n(&ch->ch_irq_seen, __ATOMIC_ACQUIRE) != 0)
+			continue;
+
+		/*
+		 * THE DEADLINE WOKE US, SO ASK THE DRIVE INSTEAD OF THE
+		 * INTERRUPT.  Alt-status is the right register for the
+		 * question: it carries the same bits and, unlike the regular
+		 * status register, reading it does not acknowledge anything,
+		 * so a look that finds nothing costs nothing.
+		 *
+		 * If the drive is standing at the boundary we were waiting
+		 * for, the interrupt for it was lost -- and the read that
+		 * follows IS the acknowledgement, which is why it is the
+		 * regular register and not the alternate one.
+		 */
+		sr = inb(ch->ch_ctrl_base + ATA_CTL_ALT_STATUS);
+		if ((sr & ATA_SR_BSY) == 0 &&
+		    ((sr & (ATA_SR_ERR | ATA_SR_DF)) != 0 || want == 0 ||
+		    (sr & want) == want)) {
+			__atomic_store_n(&ch->ch_waiter, NULL,
+			    __ATOMIC_RELAXED);
+			ch->ch_n_lost++;
+			sr = inb(ch->ch_io_base + ATA_REG_STATUS);
+			*sr_out = sr;
+			return ((sr & (ATA_SR_ERR | ATA_SR_DF)) != 0 ? -1 : 0);
+		}
+
+		/*
+		 * Still busy, or still not at the boundary.  That is a slow
+		 * drive rather than a lost interrupt, and it gets to be slow
+		 * until the outer limit -- after which the command is dead and
+		 * saying so is far better than waiting on it for ever.
+		 */
+		if (clock_uptime_ms() >= give_up) {
+			__atomic_store_n(&ch->ch_waiter, NULL,
+			    __ATOMIC_RELAXED);
+			ch->ch_n_lost++;
+			kprintf("ata: channel at 0x%x gave up after %u ms -- "
+			    "status 0x%02x, waiting for 0x%02x\n",
+			    (unsigned)ch->ch_io_base,
+			    (unsigned)ATA_INTR_LIMIT_MS, (unsigned)sr,
+			    (unsigned)want);
+			*sr_out = sr;
+			return (-1);
+		}
 	}
 	__atomic_store_n(&ch->ch_waiter, NULL, __ATOMIC_RELAXED);
 
@@ -1004,12 +1231,22 @@ ata_wait_intr(struct ata_channel *ch, uint8_t want, uint8_t *sr_out)
 		return (-1);
 	}
 	/*
-	 * The interrupt says the command reached a boundary, not that it
-	 * reached the one we asked about.  If the bits we need are not set
-	 * yet, settle it against the live register rather than the latched
-	 * copy -- cheap, since the device is already at that boundary.
+	 * The interrupt says the command reached A boundary, not that it
+	 * reached the one we asked about -- and the latch may not even be
+	 * this command's.  So when specific bits are wanted, the live
+	 * register decides, ALWAYS, and not merely when the latched copy
+	 * happens to disagree.
+	 *
+	 * ⚠ THE DIFFERENCE IS THE WHOLE THING.  Trusting a latch that says
+	 * DRQ means draining the data port on somebody else's say-so: an
+	 * interrupt that arrived late, or one belonging to the sector just
+	 * finished, leaves DRQ standing in the copy while the drive is still
+	 * fetching.  What comes out of the port then is not this sector, and
+	 * the block that results is the right object with the wrong body --
+	 * which is exactly the shape of the checksum failures this was found
+	 * by.  Five port reads against a 256-word transfer is not a cost.
 	 */
-	if (want != 0 && (sr & want) != want)
+	if (want != 0)
 		return (ata_wait_ready(ch, want, sr_out));
 	*sr_out = sr;
 	return (0);
@@ -1018,7 +1255,23 @@ ata_wait_intr(struct ata_channel *ch, uint8_t want, uint8_t *sr_out)
 static int
 ata_wait_ready(struct ata_channel *ch, uint8_t want, uint8_t *sr_out)
 {
-	uint8_t	sr;
+	uint64_t	give_up;
+	uint64_t	hz;
+	uint8_t		sr;
+
+	/*
+	 * ⚠ AND THIS ONE HAS AN END TOO, for the reason ata_wait_idle does.
+	 * It spins with ch_lock held, so interrupts are off on this
+	 * processor -- and since ata_wait_intr now settles EVERY sector
+	 * against the live register, this is on the path of every transfer
+	 * rather than of the odd one.  A drive that never asserts what is
+	 * being waited for used to take the CPU with it, silently and for
+	 * good; now the command dies and says which bits never arrived.
+	 */
+	hz = tsc_hz();
+	if (hz == 0)
+		hz = 1000000000ull;
+	give_up = tsc_read() + hz * (ATA_INTR_LIMIT_MS / 1000);
 
 	/* Burn the 400 ns settle first; first status read is unreliable. */
 	ata_400ns(ch);
@@ -1029,22 +1282,30 @@ ata_wait_ready(struct ata_channel *ch, uint8_t want, uint8_t *sr_out)
 			*sr_out = sr;
 			return (-1);
 		}
-		if (sr & ATA_SR_BSY)
-			continue;
-		if ((sr & want) == want) {
-			*sr_out = sr;
-			return (0);
+		if ((sr & ATA_SR_BSY) == 0) {
+			if ((sr & want) == want) {
+				*sr_out = sr;
+				return (0);
+			}
+			/*
+			 * BSY=0, DRQ=0, no error: command finished without
+			 * DRQ.  If the caller wanted DRQ, that's a failure;
+			 * if they wanted "just done" (want=0), succeed.
+			 */
+			if (want == 0) {
+				*sr_out = sr;
+				return (0);
+			}
+			/* Some drives delay DRQ briefly.  Keep looking. */
 		}
-		/*
-		 * BSY=0, DRQ=0, no error: command finished without DRQ.
-		 * If the caller wanted DRQ, that's a failure; if they
-		 * wanted "just done" (want=0), succeed.
-		 */
-		if (want == 0) {
+		if (tsc_read() >= give_up) {
+			kprintf("ata: channel at 0x%x stopped answering -- "
+			    "status 0x%02x, waiting for 0x%02x\n",
+			    (unsigned)ch->ch_io_base, (unsigned)sr,
+			    (unsigned)want);
 			*sr_out = sr;
-			return (0);
+			return (-1);
 		}
-		/* Spin until DRQ asserts; some drives delay it briefly. */
 	}
 }
 
@@ -1068,13 +1329,32 @@ ata_decode_err(uint8_t er)
  * actually delivered is the fact that decides whether waiting for one is a
  * design or a hang.
  */
+uint32_t
+ata_overlaps(void)
+{
+
+	return (channels[0].ch_n_overlap + channels[1].ch_n_overlap);
+}
+
+uint32_t
+ata_lost_intrs(void)
+{
+
+	return (channels[0].ch_n_lost + channels[1].ch_n_lost);
+}
+
 void
 ata_irq_stats(void)
 {
 	size_t	ci;
 
 	for (ci = 0; ci < 2; ci++)
-		kprintf("ata: channel %u -- %u interrupts, %u blocking waits\n",
+		kprintf("ata: channel %u -- %u interrupts, %u blocking waits, "
+		    "%u begun on a busy channel, %u interrupt(s) never came, "
+		    "%u sector(s) drained from a port left full\n",
 		    (unsigned)ci, (unsigned)channels[ci].ch_n_irq,
-		    (unsigned)channels[ci].ch_n_block);
+		    (unsigned)channels[ci].ch_n_block,
+		    (unsigned)channels[ci].ch_n_overlap,
+		    (unsigned)channels[ci].ch_n_lost,
+		    (unsigned)channels[ci].ch_n_drained);
 }

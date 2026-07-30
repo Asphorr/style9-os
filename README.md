@@ -1424,27 +1424,145 @@ as the list in `cpu_state_init` -- a per-CPU register nobody inherits -- except
 that it has to be fixed before there is anywhere to report it from, so it lives
 in the trampoline beside `PG`.
 
-### ⚠ Where this leaves it, measured rather than claimed
+### Where that left it, and what the sixth boot turned out to be
 
 Six four-processor boots from a pristine volume: **five of them 92 or 93 checks
-passing with nothing failing, and `apfsck` clean on all six**. Before these
-fixes the same run put two boots in three at 70-76 checks with the tail of the
-work missing.
-
-The sixth still fails, and it fails the same way the block cache did:
+passing with nothing failing, and `apfsck` clean on all six**, against two boots
+in three at 70-76 before. The sixth failed the same way the block cache had:
 
 ```
 apfs-ckpt: superblock at 54 unreadable
-filewrite: FAIL nothing can be made inside a directory ring 3 just made
 ```
 
-That is a block coming back with a checksum that does not match -- not a stale
-block, which would be self-consistent, but a torn one. So there is a second
-reader-writer overlap under the one that has been fixed, and the place to look
-is the ATA channel: `ata_pio_xfer` holds `ch_lock` across a multi-sector
-transfer, but the per-sector wait for the drive's interrupt *releases* it in
-order to sleep, so the channel is not actually owned for the length of a
-command. It is written down here rather than guessed at.
+and this rung wrote down a suspect for it -- the channel lock being released
+mid-transfer. That suspect was wrong, and the next section is how it was
+cleared and what was actually there.
+
+## The status register said yes, and it was answering an older question
+
+A stale block would have been self-consistent: it was sealed when it was
+written, so its checksum matches its own body whatever else is true of it. A
+block that fails its own checksum **while its header still names the right
+object, the right type and a plausible transaction** is neither stale nor
+random. It is two versions at once, and the only interesting question about it
+is which half is wrong.
+
+Nothing in this kernel could answer that, so the failure path was given an
+autopsy: read the block back once through the cache and once straight at the
+device, and say whether the two agree. It ended the argument in one boot.
+
+```
+apfs-autopsy: block 98398 -- stored cksum 246efc718bfbdc5a,
+    computed 245b95cf8c10e3ab; the bytes claim oid 98398 xid 257 type 40000002
+apfs-autopsy:   not among the last 512 writes (now at #0)
+apfs-autopsy: read back through the cache  -- identical, cksum bad
+apfs-autopsy: read straight off the device -- DIFFERENT, cksum good
+apfs-autopsy:   first difference at byte 4045
+```
+
+**The block on the platter was perfect.** What was wrong was the copy of it in
+memory, and it was wrong only at the end -- inside the last of the eight
+sectors that make up a page. `#0` in the second line is the write counter,
+which had not moved: this boot had not written a single block yet, so the copy
+was mangled on its way *off* a disk that was holding the right bytes all along.
+
+The write path had nothing to do with it, and that is measured rather than
+assumed: every sealed write of a whole boot was read straight back off the
+device, around the cache, and compared byte for byte, and **2779 out of 2779
+were identical**.
+
+So the corruption happens on the way *in*, in the driver, in one sector of a
+transfer.
+
+`ata_read` waits for the drive's interrupt once per sector and then drains 256
+words out of the data port. The wait ended on the status the interrupt handler
+had **latched** -- and the code's own comment already said what is wrong with
+that: *the interrupt says the command reached a boundary, not that it reached
+the one we asked about.* It acted on that only half way. If the latched copy
+showed the bits it wanted, it drained the port on the strength of the copy;
+only if the copy disagreed did it go and look at the drive.
+
+A latch that says DRQ is not the drive saying DRQ. It is what the drive said at
+some earlier instant, and there are ways for that instant to belong to the
+sector before this one. Draining then reads a buffer the drive has not refilled
+yet, and what comes out is the tail of what was there before -- one sector of a
+4 KiB page, inside a block that is otherwise exactly right, which is the
+signature this started from. The rule is now the whole rule: **when specific
+bits are wanted, the live register decides, always.** Five port reads against a
+256-word transfer is not a cost.
+
+### A wait for an interrupt that never comes is not a slow read
+
+The autopsy hung the machine the first three times it ran, which was not a bug
+in the autopsy. It asked the device for a block, and the device never answered:
+
+```
+ata: channel at 0x1f0 gave up after 5000 ms -- status 0x50, waiting for 0x08
+```
+
+`0x50` is a drive that is ready and has nothing to give: **the command was
+never executed**. And the driver had no way to survive that. `ata_wait_intr`
+parked for an interrupt with no deadline at all, so a dropped command meant a
+thread parked for ever -- holding `fs_lock` across the whole operation, so
+everything else that touches the volume queued behind it and the machine went
+quiet with nothing to say. That is what "the boot stalls" was.
+
+**The command was dropped because the channel was not idle when it was
+issued.** Every command here began by writing the drive-select, the sector
+count and the three LBA bytes, then the command register, with no question
+asked about what the drive was still doing. The specification is explicit that
+a host writes a command-block register only with `BSY` and `DRQ` clear, and the
+reason is not pedantry: a drive still finishing the previous command either
+discards the write outright -- which is what an emulator does, so the command
+that follows is never issued at all -- or latches part of it into the command
+already running. The previous command did not have to be far away: `ata_write`
+leaves the drive busy committing its last sector while the same function is
+already writing `FLUSH CACHE` into the command register. **A flush that is
+quietly dropped reports success** and leaves the bytes exactly where a power
+cut can still take them, which is the one thing a flush exists to prevent.
+
+**And every wait now has an end.** Proving `INTRQ` once at probe answers "does
+this hardware interrupt at all", which is not the question "did it interrupt
+this time". IRQ14 reaches the 8259 as an *edge*, and a drive that releases and
+re-asserts it while the previous one is still in service presents an edge
+nobody is looking at. So the park is bounded, and when it ends the driver asks
+the drive itself -- the one participant that always knows. If the drive is
+standing at the boundary that was waited for, the interrupt was lost and the
+transfer carries on; if not, the wait resumes; and after five seconds the
+command is called dead and *said so*, which is strictly better than a
+filesystem that never answers again.
+
+Those deadlines are counted in **TSC cycles and not in milliseconds**, and that
+is not a detail. The spinning waits run with `ch_lock` held, and `spin_lock`
+turns interrupts off; `clock_uptime_ms` is counted out of the PIT's interrupt,
+which arrives at the boot processor. On that processor a wait bounded by the
+clock would be bounded by a clock it had itself stopped. `rdtsc` needs nobody's
+permission.
+
+### The suspect the last rung named, cleared by counting
+
+That rung wrote down `ch_lock` being released mid-transfer, so that the channel
+is not owned for the length of a command. It is a true statement and a real
+hazard -- and it was not what was happening. Rather than argue, the driver was
+made to count: each command records who owns the channel, and how many commands
+begin while somebody else still does.
+
+Across eight four-processor boots the answer was **zero, every time**. Nobody
+has ever entered that window: every writer of a block holds `fs_lock` above it,
+so the serialisation the channel lock was suspected of failing to provide was
+already being provided a layer up. The counter stays, because a hazard that is
+real and merely unreached is worth knowing about on the day somebody reaches
+it.
+
+### ⚠ Where this leaves it, measured rather than claimed
+
+Eight four-processor boots from a pristine volume: **93 checks passing on seven
+of them and 92 on the first, nothing failing on any, `apfsck` clean on all
+eight**, with zero lost interrupts, zero channel overlaps and zero sectors
+found waiting in a port that should have been empty.
+
+For contrast, on the same harness: before the block-cache fix, two boots in
+three finished at 70-76 checks; after it, one boot in six still failed.
 
 Next on the roadmap: **replacing an existing name** with a rename, which
 POSIX requires and this refuses out loud; a **torn-write stand**, which

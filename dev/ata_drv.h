@@ -28,8 +28,12 @@
  *	- error-register decoding on ERR; status discipline with
  *	  400 ns alt-status reads.
  *
- * Polled (no IRQ wiring yet); a follow-up commit can swap the wait
- * loops for IRQ14/15-driven completion ports.
+ * Interrupt-driven where the channel proved at probe that it actually
+ * raises INTRQ, and polled where it did not -- decided from observed
+ * behaviour rather than from a table.  Both waits are bounded, and both
+ * settle what the drive is doing against the LIVE status register: an
+ * interrupt says a boundary was reached, not which one, and a command
+ * that was never accepted raises nothing at all.
  */
 
 void	ata_drv_init(void);
@@ -59,5 +63,22 @@ int	ata_kwrite(unsigned drive_idx, uint64_t lba, uint32_t count,
 
 /* Interrupt accounting, for the boot banner. */
 void	ata_irq_stats(void);
+
+/*
+ * How many commands have been started on a channel that already had one in
+ * flight, across both channels.  A transfer sleeps for the drive's interrupt
+ * and gives ch_lock back to do it, so the channel is genuinely unowned in the
+ * middle of a command; this counts whether anybody has ever walked into that
+ * window.  Readable at any time, because the interesting moment is usually
+ * long after the boot banner.
+ */
+uint32_t	ata_overlaps(void);
+
+/*
+ * How many waits for a drive interrupt ended at their deadline instead, across
+ * both channels -- each one a command that would have waited for ever under
+ * the previous shape of ata_wait_intr.
+ */
+uint32_t	ata_lost_intrs(void);
 
 #endif /* !_SYS_ATA_DRV_H_ */

@@ -283,6 +283,8 @@ read_block_raw(uint64_t bno, void *buf)
 	return (FS_APFS_E_OK);
 }
 
+static void	wlog_note(uint64_t bno, bool sealed);
+
 /*
  * Write one APFS block back with no checksum work.
  *
@@ -291,6 +293,9 @@ read_block_raw(uint64_t bno, void *buf)
  * block is 4096 bytes of file with nowhere to record a sum of them.  It is
  * also why overwriting file bytes is the cheapest thing this writer does --
  * there is nothing to reseal and nothing else that has to agree.
+ *
+ * Every write in this file funnels through here, which is why the write log
+ * below is noted from here and nowhere else.
  */
 static int
 write_block_raw(uint64_t bno, const void *buf)
@@ -299,8 +304,89 @@ write_block_raw(uint64_t bno, const void *buf)
 	if (bio_write(0, bno * APFS_SECTORS_PER_BLOCK, APFS_SECTORS_PER_BLOCK,
 	    buf) != 0)
 		return (FS_APFS_E_IO);
+	wlog_note(bno, false);
 	return (FS_APFS_E_OK);
 }
+
+/*
+ * ⚠ DIAGNOSTIC, not a feature.  The last few hundred block writes, and whether
+ * each was SEALED (a metadata block, whose checksum was recomputed over it) or
+ * RAW (file bytes, or a bitmap -- no header, nothing to reseal).
+ *
+ * The question it answers is the one the failure signature raises.  A block
+ * that comes back claiming the right oid, the right type and a plausible xid,
+ * and fails only its checksum, is not a stale block and not a random one: it is
+ * a block whose first eight bytes belong to one version and whose body belongs
+ * to another.  A raw write over live metadata makes exactly that -- it replaces
+ * the body and leaves the header's checksum standing.  So if the failing block
+ * appears in this log as sealed and then again as raw, the allocator handed one
+ * block to two owners, and the argument is over.
+ */
+#define	WLOG_N		512
+
+struct wlog_ent {
+	uint64_t	w_bno;
+	uint64_t	w_seq;		/* 0 == this slot never used  */
+	bool		w_sealed;
+};
+
+static struct wlog_ent	wlog[WLOG_N];
+static unsigned		wlog_next;
+static uint64_t		wlog_seq;
+
+static void
+wlog_note(uint64_t bno, bool sealed)
+{
+
+	wlog[wlog_next].w_bno    = bno;
+	wlog[wlog_next].w_seq    = ++wlog_seq;
+	wlog[wlog_next].w_sealed = sealed;
+	wlog_next = (wlog_next + 1) % WLOG_N;
+}
+
+/*
+ * Every write goes through write_block_raw, so the note is made there and the
+ * one caller that sealed it says so afterwards -- nothing runs in between,
+ * because every writer holds fs_lock.
+ */
+static void
+wlog_seal_last(void)
+{
+	unsigned	prev;
+
+	prev = (wlog_next + WLOG_N - 1) % WLOG_N;
+	wlog[prev].w_sealed = true;
+}
+
+static void
+wlog_report(uint64_t bno)
+{
+	unsigned	i;
+	unsigned	found;
+
+	found = 0;
+	for (i = 0; i < WLOG_N; i++) {
+		if (wlog[i].w_seq == 0 || wlog[i].w_bno != bno)
+			continue;
+		kprintf("apfs-autopsy:   written at #%llu, %s\n",
+		    (unsigned long long)wlog[i].w_seq,
+		    wlog[i].w_sealed ? "sealed" : "RAW");
+		found++;
+	}
+	if (found == 0)
+		kprintf("apfs-autopsy:   not among the last %u writes "
+		    "(now at #%llu)\n", (unsigned)WLOG_N,
+		    (unsigned long long)wlog_seq);
+}
+
+/*
+ * ⚠ A READ-BACK-AND-COMPARE AFTER EVERY SEALED WRITE LIVED HERE, and what it
+ * measured is why it does not any more: across a whole boot, 2779 metadata
+ * blocks were written, read straight back off the device around the cache, and
+ * compared byte for byte -- and 2779 of them were identical.  The write path
+ * was never the one lying.  It doubles the device I/O of a boot, so the number
+ * is kept and the check is not.
+ */
 
 /*
  * Write one METADATA block back, sealing it first.
@@ -315,11 +401,15 @@ int
 fs_apfs_write_block(uint64_t bno, void *buf)
 {
 	struct apfs_obj_phys	*o;
+	int			 rv;
 
 	o = (struct apfs_obj_phys *)buf;
 	o->o_cksum = fs_apfs_fletcher64((const uint8_t *)buf + 8,
 	    APFS_BLOCK_SIZE - 8);
-	return (write_block_raw(bno, buf));
+	rv = write_block_raw(bno, buf);
+	if (rv == FS_APFS_E_OK)
+		wlog_seal_last();
+	return (rv);
 }
 
 int
@@ -336,6 +426,113 @@ fs_apfs_write_block_raw(uint64_t bno, const void *buf)
 	return (write_block_raw(bno, buf));
 }
 
+/*
+ * A block that does not check out is worth an autopsy rather than a return
+ * code, because the return code cannot distinguish the three things it might
+ * mean and they need different fixes.  The block may be wrong on the platter
+ * (a torn write); it may be right on the platter and wrong in the cache (a
+ * page this layer mangled); or the bytes handed back may belong to some other
+ * block entirely (a driver that answered the wrong question).
+ *
+ * One read back through the cache and one read straight at the device separate
+ * all three, and both are cheap here because this path has already failed.
+ */
+static void
+block_autopsy(uint64_t bno, const void *got)
+{
+	const struct apfs_obj_phys	*o;
+	const uint8_t			*g;
+	uint8_t				*again;
+	uint8_t				*raw;
+	uint64_t			 sum;
+	size_t				 i;
+	size_t				 first_cache;
+	size_t				 first_disk;
+	size_t				 ndiff_disk;
+	int				 rv_cache;
+	int				 rv_disk;
+
+	o   = (const struct apfs_obj_phys *)got;
+	g   = (const uint8_t *)got;
+	sum = fs_apfs_fletcher64(g + 8, APFS_BLOCK_SIZE - 8);
+	kprintf("apfs-autopsy: block %llu -- stored cksum %llx, computed %llx; "
+	    "the bytes claim oid %llu xid %llu type %x; %u channel overlap(s), "
+	    "%u lost interrupt(s) so far\n",
+	    (unsigned long long)bno, (unsigned long long)o->o_cksum,
+	    (unsigned long long)sum, (unsigned long long)o->o_oid,
+	    (unsigned long long)o->o_xid, (unsigned)o->o_type,
+	    (unsigned)ata_overlaps(), (unsigned)ata_lost_intrs());
+	wlog_report(bno);
+
+	again = kmalloc(APFS_BLOCK_SIZE);
+	raw   = kmalloc(APFS_BLOCK_SIZE);
+	if (again == NULL || raw == NULL) {
+		kprintf("apfs-autopsy: no memory to read it back\n");
+		goto out;
+	}
+
+	rv_cache = bio_read(0, bno * APFS_SECTORS_PER_BLOCK,
+	    APFS_SECTORS_PER_BLOCK, again);
+	rv_disk  = ata_kread(0, bno * APFS_SECTORS_PER_BLOCK,
+	    APFS_SECTORS_PER_BLOCK, raw);
+
+	first_cache = APFS_BLOCK_SIZE;
+	first_disk  = APFS_BLOCK_SIZE;
+	ndiff_disk  = 0;
+	for (i = 0; i < APFS_BLOCK_SIZE; i++) {
+		if (rv_cache == 0 && first_cache == APFS_BLOCK_SIZE &&
+		    again[i] != g[i])
+			first_cache = i;
+		if (rv_disk == 0 && raw[i] != g[i]) {
+			if (first_disk == APFS_BLOCK_SIZE)
+				first_disk = i;
+			ndiff_disk++;
+		}
+	}
+
+	if (rv_cache != 0)
+		kprintf("apfs-autopsy: the cache would not answer (rv=%d)\n",
+		    rv_cache);
+	else
+		kprintf("apfs-autopsy: read back through the cache -- %s, "
+		    "cksum %s\n",
+		    first_cache == APFS_BLOCK_SIZE ? "identical" : "DIFFERENT",
+		    fs_apfs_fletcher64(again + 8, APFS_BLOCK_SIZE - 8) ==
+		    ((const struct apfs_obj_phys *)again)->o_cksum ?
+		    "good" : "bad");
+	if (rv_cache == 0 && first_cache != APFS_BLOCK_SIZE)
+		kprintf("apfs-autopsy:   first difference at byte %u\n",
+		    (unsigned)first_cache);
+
+	if (rv_disk != 0) {
+		kprintf("apfs-autopsy: the device would not answer (rv=%d)\n",
+		    rv_disk);
+		goto out;
+	}
+	kprintf("apfs-autopsy: read straight off the device -- %s, "
+	    "cksum %s\n",
+	    first_disk == APFS_BLOCK_SIZE ? "identical" : "DIFFERENT",
+	    fs_apfs_fletcher64(raw + 8, APFS_BLOCK_SIZE - 8) ==
+	    ((const struct apfs_obj_phys *)raw)->o_cksum ? "good" : "bad");
+	if (first_disk != APFS_BLOCK_SIZE)
+		kprintf("apfs-autopsy:   %u byte(s) differ, first at %u "
+		    "(sector %u of 8) -- device says oid %llu xid %llu "
+		    "type %x\n",
+		    (unsigned)ndiff_disk, (unsigned)first_disk,
+		    (unsigned)(first_disk / 512),
+		    (unsigned long long)
+		    ((const struct apfs_obj_phys *)raw)->o_oid,
+		    (unsigned long long)
+		    ((const struct apfs_obj_phys *)raw)->o_xid,
+		    (unsigned)((const struct apfs_obj_phys *)raw)->o_type);
+
+out:
+	if (again != NULL)
+		kfree(again);
+	if (raw != NULL)
+		kfree(raw);
+}
+
 int
 fs_apfs_read_block(uint64_t bno, void *buf)
 {
@@ -347,8 +544,10 @@ fs_apfs_read_block(uint64_t bno, void *buf)
 		return (rv);
 	o = (const struct apfs_obj_phys *)buf;
 	if (fs_apfs_fletcher64((const uint8_t *)buf + 8, APFS_BLOCK_SIZE - 8) !=
-	    o->o_cksum)
+	    o->o_cksum) {
+		block_autopsy(bno, buf);
 		return (FS_APFS_E_CKSUM);
+	}
 	return (FS_APFS_E_OK);
 }
 
