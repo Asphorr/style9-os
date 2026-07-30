@@ -86,7 +86,7 @@ cpu_print(void)
 	if (seen->cp_id != 0)
 		panic("cpu: block 0 claims id %u", (unsigned int)seen->cp_id);
 
-	seen->cp_online = 1;
+	seen->cp_online = 1;	/* it is executing; that is the evidence */
 
 	kprintf("cpu: boot cpu id=%u, per-cpu block at %p via gs base\n",
 	    cpu_id(), (void *)seen);
@@ -124,6 +124,25 @@ cpu_register(uint32_t lapic_id, uint32_t acpi_id)
 
 	ncpu_present++;
 	return ((int)cp->cp_id);
+}
+
+void
+cpu_mark_online(void)
+{
+	struct cpu	*cp;
+
+	cp = curcpu();
+
+	/*
+	 * The flag is released and the count is added to, in that order, and
+	 * both with barriers: whoever started this CPU is spinning on the flag
+	 * in its block, and whoever asks how many CPUs are up wants a number
+	 * that never counts one twice.  A CPU announces only itself, which is
+	 * why this takes no argument -- the alternative is an interface where
+	 * one CPU can declare another one running.
+	 */
+	__atomic_store_n(&cp->cp_online, 1, __ATOMIC_RELEASE);
+	__atomic_add_fetch(&ncpu_online, 1, __ATOMIC_ACQ_REL);
 }
 
 unsigned int
@@ -169,6 +188,19 @@ cpu_dump(void)
 			    (unsigned int)cp->cp_id,
 			    (unsigned int)cp->cp_lapic_id,
 			    (unsigned int)cp->cp_acpi_id);
+			continue;
+		}
+		/*
+		 * Online but holding no thread is not an idle CPU, it is a
+		 * parked one -- it has never been in the scheduler and has no
+		 * idle thread to fall back on.  Printing it like an idle CPU
+		 * would invite exactly the wrong conclusion from `cpu'.
+		 */
+		if (th == NULL && cp->cp_idle_thread == NULL) {
+			kprintf("cpu %u: lapic %u, online and PARKED, "
+			    "stack 0x%llx\n", (unsigned int)cp->cp_id,
+			    (unsigned int)cp->cp_lapic_id,
+			    (unsigned long long)cp->cp_kernel_rsp);
 			continue;
 		}
 		kprintf("cpu %u: lapic %u, running %s, idle id=%llu, "

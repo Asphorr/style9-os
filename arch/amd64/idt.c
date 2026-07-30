@@ -74,5 +74,19 @@ idt_init(void)
 	idtr.ip_limit = (uint16_t)(sizeof(idt) - 1);
 	idtr.ip_base  = (uint64_t)(uintptr_t)&idt;
 
+	idt_load();
+}
+
+void
+idt_load(void)
+{
+
+	/*
+	 * The table is one for the machine; the REGISTER pointing at it is one
+	 * per processor and comes up holding zero.  So every CPU runs this,
+	 * and an application processor runs it before anything that could
+	 * fault -- an exception with no IDT is not a panic, it is a triple
+	 * fault and a reset, with nothing printed.
+	 */
 	__asm__ __volatile__ ("lidt %0" : : "m"(idtr));
 }

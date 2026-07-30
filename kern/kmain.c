@@ -34,6 +34,7 @@
 #include "kmem.h"
 #include "kprintf.h"
 #include "memmap.h"
+#include "mp.h"
 #include "mutex.h"
 #include "mouse.h"
 #include "mouse_drv.h"
@@ -174,6 +175,16 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 		tty_puts("  [ok] apic timer debits the slice\n");
 	else
 		tty_puts("  [--] preemption stays on the PIT\n");
+
+	/*
+	 * And the other processors, last of the machine bring-up: starting one
+	 * needs the APIC (two interrupts), the page allocator (a stack each)
+	 * and the TSC (the sequence has real microseconds in it).  They arrive
+	 * and PARK -- see ap_entry for why they are not let into the scheduler
+	 * until spinlocks are interrupt-safe.
+	 */
+	if (mp_start_aps() != 0)
+		tty_puts("  [ok] application processors up (parked)\n");
 
 	kmain_memory_smoke();
 	kmain_run_tests();

@@ -74,6 +74,15 @@ uint64_t	pmap_kextract(uint64_t va);
 
 void		pmap_invlpg(uint64_t va);
 
+/*
+ * Physical address of the kernel's top-level table -- the value CR3 wants.
+ * Exists for the code that starts an application processor: that processor has
+ * to be handed a page table before it can execute anything at a kernel
+ * address, and it cannot read CR3 to find out, because the processor asking is
+ * not the one that will use the answer.
+ */
+uint64_t	pmap_kernel_root_pa(void);
+
 void		pmap_stats(void);
 
 #endif /* !_MACHINE_PMAP_H_ */

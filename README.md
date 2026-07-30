@@ -916,6 +916,88 @@ about the interrupt routing changed: the IO APIC's address is recorded because
 the MADT is where it is written down, and not one interrupt goes through it
 yet.
 
+## Starting the others
+
+An application processor comes out of reset in **real mode**, at a physical
+address the startup message names, with no page tables, no stack, no segment
+base and no idea which processor it is. Everything the rest of this kernel
+takes for granted has to be built for it, in dependency order, by code that
+runs in three addressing modes before it can call a C function.
+
+The startup message carries a **page number in one byte**, which is why the
+trampoline lives in the first megabyte -- there is no room in that field for an
+address above `0xFF000`. It is copied to `0x8000`: conventional memory the
+firmware is finished with, and a page `pmm` never offers because the whole
+first megabyte is marked used at startup. The install checks the firmware
+memory map anyway, since "never" is a property of today's allocator.
+
+Nothing in the trampoline is patched at runtime. It is assembled knowing the
+address it will run at, so the temporary GDT's base and the far-jump targets
+are ordinary link-time constants -- the alternative is the same code plus a
+table of offsets that has to agree with it, and the failure mode of a
+disagreement is a processor jumping into the middle of nowhere with no way to
+say so. Only the parameter block is written, and it is data: a CR3, a stack
+top, and which `struct cpu` this one is.
+
+Two far jumps, because a far jump is the only instruction that reloads CS and
+therefore the only way to change what mode the next instruction is decoded in.
+Real mode sets `CR0.PE` and jumps to 32-bit code; 32-bit code sets `CR4.PAE`,
+`CR3`, `EFER.LME` and `CR0.PG` and jumps to **long mode at a kernel symbol** --
+not one in the blob, because by then paging is on and the kernel's identity map
+makes its own addresses mean what they say. So the copied part ends the moment
+there is a page table, and the rest is ordinary kernel text a debugger can
+find.
+
+**`EFER.NXE` is not optional there, and finding that out the hard way would
+have been silent.** This kernel's page tables set the no-execute bit, and while
+`NXE` is clear, bit 63 of a PTE is not a permission but a *reserved bit
+violation*: the first instruction fetched through those tables faults. On a
+processor that has not loaded an IDT yet, a fault is not a panic — it is a
+triple fault and a reset, with nothing printed and nothing to read.
+
+What arrives in C does so with a stack and nothing else, and the order of the
+first four things it does is the order of what depends on what:
+
+1. **The GS base**, before anything at all. Every per-CPU reference in this
+   kernel reads through it, and `spin_lock` is a per-CPU reference -- until
+   this is installed, taking a lock writes to physical page zero.
+2. **Its own GDT and TSS.** The TSS above all: it carries the stack a ring
+   transition lands on, so two processors pointing at one would fault onto the
+   same stack and overwrite each other's frame.
+3. **The IDT register.** One table for the machine, but the register that
+   points at it is per-processor and comes up holding zero.
+4. **Its own APIC.** The registers are already mapped and the mapping is
+   shared, but the enable bit, the task priority and every LVT entry are
+   per-processor state that comes out of reset masked.
+
+`LINT0` is where the 8259 arrives, and it is programmed as ExtINT **on the boot
+processor only**. There is one 8259 wired to one CPU's pin; an AP that also
+claimed it would be offering to answer legacy interrupts that were never routed
+to it.
+
+	mp: trampoline installed at 0x8000, 134 bytes, parameters at 0x8f00
+	lapic: id=1 version=0x14, 6 LVT entries, regs at 0xfee00000 ...
+	cpu 1: online, lapic 1, stack at 0x395000 -- parked, interrupts off
+	lapic: id=2 version=0x14, ...
+	cpu 2: online, lapic 2, stack at 0x399000 -- parked, interrupts off
+	lapic: id=3 version=0x14, ...
+	cpu 3: online, lapic 3, stack at 0x39d000 -- parked, interrupts off
+	mp: 3 of 3 application processor(s) running kernel code, 4 cpu(s) online
+
+Those `id=` numbers are each processor reading **its own** APIC id register and
+printing it -- not the starter saying what it asked for. A CPU that came up
+with the wrong identity, or on the wrong stack, or with the boot CPU's block,
+would say so in that line.
+
+And then each one **parks with interrupts off**, which is the honest end of
+this rung rather than a shortcut. `spin_lock` spins without disabling
+interrupts; that is safe on the boot processor only because no interrupt
+handler there takes a lock the mainline can hold. On a second processor the
+argument is not available -- it could take a lock, be interrupted, and have its
+own handler wait for the lock it is holding. So the rung that makes locks
+interrupt-safe is the rung that lets these three into the scheduler, and until
+then they sit at `cli; hlt` where they can do no harm.
+
 Next on the roadmap: **replacing an existing name** with a rename, which
 POSIX requires and this refuses out loud; a **torn-write stand**, which
 would make the checkpoint's promise that an interruption anywhere leaves the

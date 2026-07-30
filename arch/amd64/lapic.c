@@ -35,6 +35,8 @@
 #define	LAPIC_LVT_LINT0		0x350
 #define	LAPIC_LVT_LINT1		0x360
 #define	LAPIC_LVT_ERROR		0x370
+#define	LAPIC_ICR_LO		0x300	/* write sends the message         */
+#define	LAPIC_ICR_HI		0x310	/* destination, in the top byte    */
 #define	LAPIC_TIMER_ICR		0x380	/* initial count                   */
 #define	LAPIC_TIMER_CCR		0x390	/* current count                   */
 #define	LAPIC_TIMER_DCR		0x3E0	/* divide configuration            */
@@ -47,6 +49,24 @@
 #define	LVT_DELIVERY_EXTINT	(7u << 8)
 #define	LVT_MASKED		(1u << 16)
 #define	LVT_TIMER_PERIODIC	(1u << 17)
+
+/*
+ * Interrupt-command fields.  DELIVERY_PENDING is the one that has to be
+ * waited on: the ICR is a single register for the whole APIC, so writing a
+ * second message while the first is still going out loses one of them.
+ */
+#define	ICR_DELIVERY_PENDING	(1u << 12)
+#define	ICR_MODE_INIT		(5u << 8)
+#define	ICR_MODE_STARTUP	(6u << 8)
+#define	ICR_LEVEL_ASSERT	(1u << 14)
+
+/*
+ * How long to wait for a message to leave.  Generous by two orders of
+ * magnitude -- delivery to a processor on the same die is measured in
+ * nanoseconds -- because the point of the bound is to return with an answer
+ * instead of hanging the boot if the message never goes out at all.
+ */
+#define	LAPIC_ICR_WAIT_US	100
 
 /*
  * Divide the APIC's input clock by 16 before it reaches the counter.  Any
@@ -157,6 +177,83 @@ lapic_base_pa(void)
 {
 
 	return (lapic_pa);
+}
+
+/*
+ * Wait for the last interrupt command to leave, with a bound.  Returns false
+ * if it never did, which the caller reports rather than retries: a message
+ * still pending after a hundred microseconds is not a message that is about
+ * to be sent.
+ */
+static bool
+lapic_icr_idle(void)
+{
+	uint64_t	t0;
+
+	if ((lapic_read(LAPIC_ICR_LO) & ICR_DELIVERY_PENDING) == 0)
+		return (true);
+
+	t0 = tsc_read();
+	while ((lapic_read(LAPIC_ICR_LO) & ICR_DELIVERY_PENDING) != 0) {
+		if (tsc_to_us(tsc_read() - t0) > LAPIC_ICR_WAIT_US)
+			return (false);
+		__asm__ __volatile__ ("pause");
+	}
+	return (true);
+}
+
+/*
+ * Send one interrupt command to one processor, named by its APIC id.  The
+ * destination goes in the high half FIRST -- writing the low half is what
+ * sends the message, so the order is not a preference.
+ */
+static bool
+lapic_ipi_send(uint32_t apic_id, uint32_t cmd)
+{
+
+	if (!lapic_ok)
+		return (false);
+	if (!lapic_icr_idle())
+		return (false);
+
+	lapic_write(LAPIC_ICR_HI, apic_id << 24);
+	lapic_write(LAPIC_ICR_LO, cmd);
+
+	return (lapic_icr_idle());
+}
+
+bool
+lapic_ipi_init(uint32_t apic_id)
+{
+
+	/*
+	 * Assert only.  The de-assert half of the sequence is for the discrete
+	 * 82489DX, which had no way to tell an INIT from the level it arrived
+	 * at; every integrated APIC since treats INIT as edge-triggered and
+	 * ignores the de-assert, and the machines this runs on have never seen
+	 * that chip.
+	 */
+	return (lapic_ipi_send(apic_id, ICR_MODE_INIT | ICR_LEVEL_ASSERT));
+}
+
+bool
+lapic_ipi_startup(uint32_t apic_id, uint64_t tramp_pa)
+{
+	uint32_t	vec;
+
+	/*
+	 * The startup message carries a PAGE NUMBER in its low byte, which is
+	 * the whole reason the trampoline lives in the first megabyte: there is
+	 * no room in this field for an address above 0xFF000.  A caller that
+	 * hands over something else gets a refusal rather than a processor
+	 * started at a rounded-down address.
+	 */
+	if ((tramp_pa & 0xFFF) != 0 || (tramp_pa >> 12) > 0xFF)
+		return (false);
+	vec = (uint32_t)(tramp_pa >> 12);
+
+	return (lapic_ipi_send(apic_id,
+	    ICR_MODE_STARTUP | ICR_LEVEL_ASSERT | vec));
 }
 
 static void
@@ -272,7 +369,19 @@ lapic_init(void)
 	 * this comment claimed: the ACPI tables the MADT probe reads are put
 	 * in low memory by it, and they say 'BOCHS'.)
 	 */
-	lapic_write(LAPIC_LVT_LINT0, LVT_DELIVERY_EXTINT);
+	/*
+	 * And only on the BOOT processor.  There is one 8259 and its output is
+	 * wired to one CPU's LINT0; an application processor that also claimed
+	 * ExtINT would be offering to answer legacy interrupts that were never
+	 * routed to it, and the day interrupts are enabled over there the same
+	 * IRQ0 could be taken by either -- which is not a race this kernel
+	 * needs to have an opinion about yet.  The NMI pin is per-processor and
+	 * every CPU wants it.
+	 */
+	if (cpu_id() == 0)
+		lapic_write(LAPIC_LVT_LINT0, LVT_DELIVERY_EXTINT);
+	else
+		lapic_write(LAPIC_LVT_LINT0, LVT_MASKED);
 	lapic_write(LAPIC_LVT_LINT1, LVT_DELIVERY_NMI);
 
 	/* Nothing to run yet: the timer stays masked until it is measured. */

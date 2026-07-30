@@ -27,6 +27,14 @@
 	(uint8_t)(((present) << 7) | (((dpl) & 3) << 5) | ((type) & 0xF))
 
 void	idt_init(void);
+
+/*
+ * Point THIS processor's IDTR at the table idt_init built.  Separate from
+ * building it because the table is shared and the register is not: a CPU that
+ * skips this has no handler for anything, and its first exception is a triple
+ * fault rather than a message.
+ */
+void	idt_load(void);
 void	idt_set_gate(unsigned int vec, uintptr_t handler,
 	    uint16_t selector, uint8_t ist, uint8_t attr);
 

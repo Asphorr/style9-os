@@ -109,7 +109,9 @@ VPATH	= $(ARCH):kern:vm:fs:fs/apfs:fs/fat:dev:mach:test
 OBJS	= \
 	$(OBJDIR)/boot.o	\
 	$(OBJDIR)/acpi.o	\
+	$(OBJDIR)/aptramp.o	\
 	$(OBJDIR)/cpu.o		\
+	$(OBJDIR)/mp.o		\
 	$(OBJDIR)/gdt.o		\
 	$(OBJDIR)/idt.o		\
 	$(OBJDIR)/lapic.o	\

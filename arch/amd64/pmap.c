@@ -392,6 +392,13 @@ pmap_activate(struct pmap *pm)
 	    : "memory");
 }
 
+uint64_t
+pmap_kernel_root_pa(void)
+{
+
+	return (kernel_pmap->pm_pml4_pa);
+}
+
 bool
 pmap_kenter(uint64_t va, uint64_t pa, uint32_t flags)
 {

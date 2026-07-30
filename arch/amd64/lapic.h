@@ -126,6 +126,20 @@ uint32_t	lapic_id(void);
 uint64_t	lapic_base_pa(void);
 
 /*
+ * The two messages that start a processor, sent to one destination named by
+ * its APIC id.  INIT puts it in a known state; STARTUP tells it where to begin
+ * executing, as a page number -- which is why the trampoline has to live in
+ * the first megabyte.
+ *
+ * Both return false if the message could not be handed to the APIC, and
+ * NEITHER says anything about whether the far processor did something with it.
+ * That is not knowable from here: the only evidence a start worked is the
+ * started processor saying so, which is what cp_online is for.
+ */
+bool		lapic_ipi_init(uint32_t apic_id);
+bool		lapic_ipi_startup(uint32_t apic_id, uint64_t tramp_pa);
+
+/*
  * Counting rate of this CPU's APIC timer, in ticks per second, at the
  * divisor lapic_timer_probe measured with.  Zero until it has run.
  */

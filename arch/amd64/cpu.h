@@ -215,6 +215,13 @@ void		cpu_dump(void);
 int		cpu_register(uint32_t lapic_id, uint32_t acpi_id);
 
 /*
+ * Say that the CALLING processor is now running kernel code: set the flag its
+ * starter is waiting on and add it to the online count.  Takes no argument on
+ * purpose -- a CPU announces itself and cannot be announced by somebody else.
+ */
+void		cpu_mark_online(void);
+
+/*
  * Two different questions.  PRESENT is how many the firmware described and the
  * kernel has blocks for; ONLINE is how many are running kernel code.  They are
  * equal on a machine where every processor started, and the gap between them
