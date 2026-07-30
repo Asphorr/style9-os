@@ -26,6 +26,13 @@ param(
     [string] $LogFile      = 'D:\style9\os\serial.log',
     [string] $Qemu         = 'C:\Program Files\qemu\qemu-system-x86_64.exe',
     [string] $Cpu          = 'Nehalem',  # measured: gls needs SSE4.2 (pcmpgtq), nothing needs AVX -- see QEMU_CPU in the Makefile
+    # Four processors because a machine with one has no MADT worth reading and
+    # no application processor to start.  The kernel brings up as many as it
+    # can and reports the ones it did not, so a guest with more vCPUs than the
+    # kernel's MAXCPU is a tested case rather than a broken boot.  The three
+    # extra vCPUs sit in the firmware's halt loop until the kernel starts them,
+    # which costs the host nothing.
+    [int]    $Smp          = 4,
     [int]    $MonitorPort  = 0,
     [switch] $NoDisk,
     [switch] $KillExisting
@@ -52,6 +59,7 @@ $logFwd = $LogFile.Replace('\','/')
 
 $qemuArgs = @(
     '-cpu',     $Cpu,
+    '-smp',     $Smp,
     '-kernel',  $Kernel,
     '-no-reboot',
     '-serial',  "file:$logFwd"

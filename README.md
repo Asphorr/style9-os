@@ -718,13 +718,20 @@ All of that is the local APIC, so it comes next.
 that is the whole difficulty of the step.** On a PC the 8259's output does
 not reach the CPU directly; it arrives at the local APIC's LINT0 pin and
 passes through only if that pin's LVT entry says ExtINT and is unmasked.
-Every LVT entry comes out of reset *masked*. A firmware boot has the BIOS set
-"virtual wire mode" up before the kernel looks, but we are loaded by QEMU
-with no BIOS in the path, so nobody has -- and enabling the APIC without
-programming LINT0 would take the timer, the keyboard and the disk away in one
-instruction. So the two legacy pins are programmed in the same breath as the
-enable, and the failure mode if that is wrong is loud rather than subtle: the
-boot stops at the first thing that waits.
+Every LVT entry comes out of reset *masked*, and this kernel software-enables
+the APIC itself -- so what LINT0 carries is this kernel's business, and
+enabling the APIC without programming it would take the timer, the keyboard
+and the disk away in one instruction. Whether the firmware had already set
+"virtual wire mode" up is not known here and deliberately not relied on: the
+two legacy pins are programmed in the same breath as the enable, which makes
+the question moot. The failure mode if that is wrong is loud rather than
+subtle: the boot stops at the first thing that waits.
+
+(An earlier version of this section asserted there was *no* firmware in the
+path, on the grounds that QEMU is loading the kernel directly. That was wrong,
+and the MADT below is the thing that disproved it -- the ACPI tables it reads
+are placed in low memory by a BIOS, and they identify themselves as `BOCHS`.
+The conclusion did not change, only the reason it is right.)
 
 The vectors above the 8259's 32..47 window used to have **no IDT gate at
 all**, which is not the same as being ignored -- an interrupt delivered there
@@ -842,6 +849,72 @@ that never yield and requires that every one of them made progress and that
 preemptions were observed; with the PIT relieved, only the APIC timer can
 satisfy it, and a hand-over that relieved one chip without arming the other
 looks exactly like a cooperative scheduler.
+
+## Counting the processors
+
+A kernel that wants to start a second CPU has to be told there is one, and
+CPUID will not tell it. CPUID describes the *part* -- how many logical
+processors a package can have -- and says nothing about how many the firmware
+brought out of reset or what APIC id each answers to. Only ACPI's MADT has
+that list, so counting processors is an ACPI job on this architecture whether
+one likes ACPI or not.
+
+What is here is as much ACPI as that sentence requires and no more: a
+signature scan of the EBDA and the BIOS region for the RSDP, a walk of the
+XSDT (preferred, because its entries are 64 bits wide and a machine can put
+its tables above four gigabytes) or the RSDT, and one table parsed. No AML,
+no interpreter, no namespace.
+
+Every step is checked, and the checks are the point. The RSDP's checksum,
+because the eight bytes `RSD PTR ` appear in the middle of other things and
+following one of those leads to a walk over nonsense. Each table's checksum,
+because firmware has bugs too. Each entry's length before it is used to
+advance, because a zero-length entry makes the walk stand still and a long one
+makes it read past the table -- and a length nobody can trust means the
+position of every following entry is a guess, so the walk stops there and says
+where. Any failure at all ends the probe with a printed reason and a kernel
+that keeps running on one processor: a machine that cannot describe itself is
+not a machine to start extra CPUs on.
+
+	acpi: rsdp at 0x00000000000f5260, revision 0, oem 'BOCHS '
+	acpi: madt at 0x0000000007fe235c, 144 bytes, lapic regs 0xfee00000,
+	      8259 present
+	acpi:   lapic id 0 (acpi id 0) -- this processor
+	acpi:   lapic id 1 (acpi id 1)
+	acpi:   lapic id 2 (acpi id 2)
+	acpi:   lapic id 3 (acpi id 3)
+	acpi:   io apic id 0 at 0xfec00000, gsi base 0
+	acpi: 4 processor(s) present, 1 running
+
+**The address on the second line is a cross-check, not a printout.** It is
+where firmware says this machine's local APIC lives; `0xfee00000` on the line
+above it is where the MSR on this processor said it lives. Two independent
+sources agreeing is evidence, where one source is a claim -- so a disagreement
+gets a line of its own with both numbers in it.
+
+Recognising *itself* in that list is the one thing the probe cannot get wrong
+quietly, and it does it by APIC id rather than by position: the order is the
+firmware's business and the boot processor is not obliged to be first. Which
+means the boot CPU has to know its own id before ACPI is read, and it does --
+from CPUID leaf 1, which answers with no APIC mapped, no MSR touched and no
+page table in place. That is not a convenience; it is the position an
+application processor wakes up in.
+
+Two counts now exist and they are different questions. **Present** is how many
+the firmware described and the kernel has blocks for; **online** is how many
+are running kernel code. Equal on a machine where everyone started, and the
+gap is the interesting number on a machine where one did not:
+
+	cpu 0: lapic 0, running user-elf, idle id=2, preempt 0, quantum 0/2
+	cpu 1: lapic 1, acpi id 1, NOT STARTED
+	cpu 2: lapic 2, acpi id 2, NOT STARTED
+	cpu 3: lapic 3, acpi id 3, NOT STARTED
+
+The guest is booted with four processors from here on, because a guest with
+one has no MADT worth reading and no application processor to start. Nothing
+about the interrupt routing changed: the IO APIC's address is recorded because
+the MADT is where it is written down, and not one interrupt goes through it
+yet.
 
 Next on the roadmap: **replacing an existing name** with a rename, which
 POSIX requires and this refuses out loud; a **torn-write stand**, which

@@ -8,6 +8,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "cpuid.h"
 #include "kprintf.h"
 #include "smap.h"
 
@@ -33,16 +34,6 @@
 
 bool	smap_enabled;
 bool	smap_supported;
-
-static inline void
-cpuid_count(uint32_t leaf, uint32_t subleaf,
-    uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx)
-{
-
-	__asm __volatile("cpuid"
-	    : "=a"(*eax), "=b"(*ebx), "=c"(*ecx), "=d"(*edx)
-	    : "0"(leaf), "2"(subleaf));
-}
 
 void
 smap_init(void)

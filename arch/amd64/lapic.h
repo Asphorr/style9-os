@@ -26,14 +26,14 @@
  * difficulty of this step.  On a PC the 8259's output does not reach the CPU
  * directly; it arrives at the local APIC's LINT0 pin, and passes through
  * only if that pin's LVT entry says ExtINT and is unmasked.  Every LVT entry
- * comes out of reset MASKED.  A firmware boot has the BIOS set "virtual wire
- * mode" up before the kernel ever looks, but we are loaded by QEMU with no
- * BIOS in the path, so nobody has done it -- software-enabling the APIC
- * without programming LINT0 would silently disconnect the timer, the
- * keyboard and the disk all at once.  lapic_init therefore programs the two
- * legacy pins in the same breath as the enable, and the failure mode if it
- * gets that wrong is loud: the boot stops dead at the first thing that waits
- * for an interrupt.
+ * comes out of reset MASKED, and this kernel software-enables the APIC
+ * itself -- so it is this kernel's business to say what LINT0 carries.
+ * Whether the firmware had already set "virtual wire mode" up is not known
+ * here and deliberately not relied on: lapic_init programs the two legacy
+ * pins in the same breath as the enable, which makes the question moot.  The
+ * failure mode if that is wrong is loud rather than subtle -- the boot stops
+ * dead at the first thing that waits for an interrupt -- which is what made
+ * it safe to write and try.
  *
  * Registers are memory-mapped (xAPIC).  x2APIC would reach the same
  * registers through MSRs and is deliberately not used: MMIO works on
@@ -117,6 +117,13 @@ void		lapic_eoi(void);
 
 bool		lapic_present(void);
 uint32_t	lapic_id(void);
+
+/*
+ * Physical address of the register page, as the MSR gave it, or zero if the
+ * APIC was never mapped.  Exists so the ACPI probe can compare firmware's
+ * description of this chip against the chip's own answer.
+ */
+uint64_t	lapic_base_pa(void);
 
 /*
  * Counting rate of this CPU's APIC timer, in ticks per second, at the

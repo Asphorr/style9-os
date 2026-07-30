@@ -10,6 +10,7 @@
 #include <stdint.h>
 
 #include "cpu.h"
+#include "cpuid.h"
 #include "intr.h"
 #include "kprintf.h"
 #include "lapic.h"
@@ -81,6 +82,7 @@
 #define	LAPIC_PROBE_HZ		100	/* rate the timer is asked to keep  */
 
 static volatile uint8_t	*lapic_va;		/* (c) NULL until mapped   */
+static uint64_t		 lapic_pa;		/* (c) 0 until mapped      */
 static bool		 lapic_ok;		/* (c)                     */
 static uint32_t		 lapic_hz;		/* (c) ticks/s at DIV16    */
 /*
@@ -103,16 +105,6 @@ static bool		 lapic_preempting;	/* (c) after timer_start   */
 static unsigned int	 lapic_tick_hz;		/* (c) rate it now keeps   */
 static uint64_t		 lapic_start_pit;	/* (c) PIT at the handover */
 static uint64_t		 lapic_start_tsc;	/* (c) TSC at the handover */
-
-static inline void
-cpuid_count(uint32_t leaf, uint32_t subleaf,
-    uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx)
-{
-
-	__asm__ __volatile__ ("cpuid"
-	    : "=a" (*eax), "=b" (*ebx), "=c" (*ecx), "=d" (*edx)
-	    : "0" (leaf), "2" (subleaf));
-}
 
 static inline uint32_t
 lapic_read(unsigned int reg)
@@ -158,6 +150,13 @@ lapic_timer_hz(void)
 {
 
 	return (lapic_hz);
+}
+
+uint64_t
+lapic_base_pa(void)
+{
+
+	return (lapic_pa);
 }
 
 static void
@@ -243,6 +242,7 @@ lapic_init(void)
 		return (false);
 	}
 	lapic_va = (volatile uint8_t *)(uintptr_t)pa;
+	lapic_pa = pa;
 	lapic_ok = true;
 
 	ver = lapic_read(LAPIC_VERSION);
@@ -264,6 +264,13 @@ lapic_init(void)
 	 * disk in one instruction.  ExtINT means "the vector comes from the
 	 * 8259, go and ask it", which is what makes the existing interrupt
 	 * path keep working unchanged.
+	 *
+	 * Written unconditionally rather than after checking what the
+	 * firmware left, because the state a previous owner of this register
+	 * left it in is exactly the thing that is not worth depending on.
+	 * (There IS a firmware in the path, whatever an earlier version of
+	 * this comment claimed: the ACPI tables the MADT probe reads are put
+	 * in low memory by it, and they say 'BOCHS'.)
 	 */
 	lapic_write(LAPIC_LVT_LINT0, LVT_DELIVERY_EXTINT);
 	lapic_write(LAPIC_LVT_LINT1, LVT_DELIVERY_NMI);
@@ -283,6 +290,18 @@ lapic_init(void)
 	 */
 	lapic_write(LAPIC_SVR, LAPIC_VEC_SPURIOUS | LAPIC_SVR_ENABLE);
 
+	/*
+	 * The id, now from the register, over the one CPUID gave cpu_bsp_init
+	 * before any of this existed.  They are the same field read two ways
+	 * and a machine where they differ has renumbered its APICs behind us,
+	 * so the disagreement is worth a line of its own rather than a silent
+	 * overwrite.
+	 */
+	if (curcpu()->cp_lapic_id != (lapic_read(LAPIC_ID) >> 24))
+		kprintf("lapic: *** cpuid called this processor %u, the APIC's "
+		    "own register says %u ***\n",
+		    (unsigned int)curcpu()->cp_lapic_id,
+		    (unsigned int)(lapic_read(LAPIC_ID) >> 24));
 	curcpu()->cp_lapic_id = lapic_read(LAPIC_ID) >> 24;
 
 	kprintf("lapic: id=%u version=0x%02x, %u LVT entries, "

@@ -96,10 +96,20 @@ struct cpu {
 
 	uint32_t		 cp_id;		/* (c) dense kernel index   */
 	uint32_t		 cp_lapic_id;	/* (c) hardware id          */
+	uint32_t		 cp_acpi_id;	/* (c) as the MADT names it */
+
+	/*
+	 * Set by this CPU itself once it is running kernel code, and read by
+	 * whoever started it to find out whether it arrived.  Volatile
+	 * because that reader spins on it, and written last of everything the
+	 * arriving CPU sets up, so a starter that sees it can trust the rest
+	 * of the block.
+	 */
+	volatile int		 cp_online;	/* (a) it got here          */
 
 	volatile int		 cp_preempt_count;	/* (i) see sched.h  */
 	volatile int		 cp_need_resched;	/* (i)              */
-	volatile unsigned int	 cp_quantum_used;	/* (i) PIT ticks    */
+	volatile unsigned int	 cp_quantum_used;	/* (i) timer ticks  */
 } __attribute__((aligned(64)));
 
 _Static_assert(offsetof(struct cpu, cp_self) == CPU_SELF,
@@ -186,12 +196,32 @@ void		cpu_bsp_init(void);
 void		cpu_print(void);
 
 /*
- * One line per CPU that is up: what is running on it, what it falls back
- * on, and how much of its slice is gone.  Backs the shell's `cpu'.
+ * One line per CPU the kernel knows about: what is running on it, what it
+ * falls back on, and how much of its slice is gone.  Backs the shell's `cpu'.
  */
 void		cpu_dump(void);
 
-unsigned int	cpu_count(void);
+/*
+ * Claim a block for a processor the firmware described but nobody has started.
+ * Called once per usable entry in the MADT, with the ids that table gives.
+ * Fills the block far enough that the code which eventually starts this CPU
+ * has somewhere to point its GS base -- cp_self above all, since a block whose
+ * self-pointer is wrong is a CPU that cannot find itself.
+ *
+ * Returns the dense index claimed, or -1 if this is the processor already
+ * running (matched by APIC id) or there is no room left.  It does NOT start
+ * anything: cp_online stays zero until the CPU itself says otherwise.
+ */
+int		cpu_register(uint32_t lapic_id, uint32_t acpi_id);
+
+/*
+ * Two different questions.  PRESENT is how many the firmware described and the
+ * kernel has blocks for; ONLINE is how many are running kernel code.  They are
+ * equal on a machine where every processor started, and the gap between them
+ * is the interesting number on a machine where one did not.
+ */
+unsigned int	cpu_present_count(void);
+unsigned int	cpu_online_count(void);
 
 #endif /* !__ASSEMBLER__ */
 

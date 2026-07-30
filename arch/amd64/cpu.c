@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 #include "cpu.h"
+#include "cpuid.h"
 #include "kprintf.h"
 #include "msr.h"
 #include "panic.h"
@@ -28,11 +29,22 @@ struct cpu	cpus[MAXCPU] = {
 	[0] = { .cp_self = &cpus[0], .cp_id = 0 },
 };
 
-static unsigned int	ncpu = 1;	/* (c) brought up, not present  */
+/*
+ * Both start at one, and the one they start at is this processor: it is
+ * present because it is here, and online because it is executing.  Everything
+ * else has to be described (cpu_register) and then started (which sets
+ * cp_online on the CPU that arrives) before either number moves.
+ */
+static unsigned int	ncpu_present = 1;	/* (c) blocks filled in */
+static unsigned int	ncpu_online = 1;	/* (a) running kernel   */
 
 void
 cpu_bsp_init(void)
 {
+	uint32_t	eax;
+	uint32_t	ebx;
+	uint32_t	ecx;
+	uint32_t	edx;
 
 	/*
 	 * The whole per-CPU mechanism is this one register: write a block's
@@ -40,6 +52,18 @@ cpu_bsp_init(void)
 	 * to index and nothing to look up.
 	 */
 	wrmsr(MSR_GS_BASE, (uint64_t)(uintptr_t)&cpus[0]);
+
+	/*
+	 * And which processor this is, from CPUID rather than from the APIC.
+	 * The APIC's ID register would say the same thing, but only once the
+	 * APIC has been found, mapped and enabled -- three subsystems away
+	 * from here.  CPUID answers now, which matters because the MADT
+	 * arrives naming processors by APIC id and has to be able to recognise
+	 * the one already running.  lapic_init writes the same value again
+	 * from the register, and the two agreeing is checked there.
+	 */
+	cpuid_count(1, 0, &eax, &ebx, &ecx, &edx);
+	cpus[0].cp_lapic_id = CPUID_1_EBX_APICID(ebx);
 }
 
 void
@@ -62,15 +86,58 @@ cpu_print(void)
 	if (seen->cp_id != 0)
 		panic("cpu: block 0 claims id %u", (unsigned int)seen->cp_id);
 
-	kprintf("cpu: %u cpu, boot cpu id=%u, per-cpu block at %p "
-	    "via gs base\n", ncpu, cpu_id(), (void *)seen);
+	seen->cp_online = 1;
+
+	kprintf("cpu: boot cpu id=%u, per-cpu block at %p via gs base\n",
+	    cpu_id(), (void *)seen);
+}
+
+int
+cpu_register(uint32_t lapic_id, uint32_t acpi_id)
+{
+	struct cpu	*cp;
+	unsigned int	i;
+
+	/*
+	 * The processor doing the registering is already in block 0, and the
+	 * MADT lists it like any other.  Matching by APIC id rather than by
+	 * position is the only reliable way to recognise it: the table's order
+	 * is the firmware's business and the boot processor is not obliged to
+	 * be first in it.
+	 */
+	for (i = 0; i < ncpu_present; i++) {
+		if (cpus[i].cp_lapic_id == lapic_id) {
+			cpus[i].cp_acpi_id = acpi_id;
+			return (-1);
+		}
+	}
+
+	if (ncpu_present >= MAXCPU)
+		return (-1);
+
+	cp = &cpus[ncpu_present];
+	cp->cp_self     = cp;
+	cp->cp_id       = ncpu_present;
+	cp->cp_lapic_id = lapic_id;
+	cp->cp_acpi_id  = acpi_id;
+	cp->cp_online   = 0;
+
+	ncpu_present++;
+	return ((int)cp->cp_id);
 }
 
 unsigned int
-cpu_count(void)
+cpu_present_count(void)
 {
 
-	return (ncpu);
+	return (ncpu_present);
+}
+
+unsigned int
+cpu_online_count(void)
+{
+
+	return (__atomic_load_n(&ncpu_online, __ATOMIC_ACQUIRE));
 }
 
 /*
@@ -94,9 +161,16 @@ cpu_dump(void)
 	struct thread	*th;
 	unsigned int	i;
 
-	for (i = 0; i < ncpu; i++) {
+	for (i = 0; i < ncpu_present; i++) {
 		cp = &cpus[i];
 		th = cp->cp_curthread;
+		if (cp->cp_online == 0) {
+			kprintf("cpu %u: lapic %u, acpi id %u, NOT STARTED\n",
+			    (unsigned int)cp->cp_id,
+			    (unsigned int)cp->cp_lapic_id,
+			    (unsigned int)cp->cp_acpi_id);
+			continue;
+		}
 		kprintf("cpu %u: lapic %u, running %s, idle id=%llu, "
 		    "preempt %d%s, quantum %u/%u, kstack 0x%llx\n",
 		    (unsigned int)cp->cp_id, (unsigned int)cp->cp_lapic_id,

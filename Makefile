@@ -59,6 +59,13 @@ QEMU	= /mnt/c/Program\ Files/qemu/qemu-system-x86_64.exe
 # would quietly invalidate (YMM state FXSAVE does not save).
 QEMU_CPU = Nehalem
 
+# Four processors, because a guest with one has no MADT worth reading and no
+# application processor to start.  The extras sit in the firmware's halt loop
+# until the kernel starts them, so they cost the host nothing while it is still
+# only the boot processor that runs kernel code.  tools/run.ps1 keeps the same
+# default; override with `make run QEMU_SMP=1' to boot as a uniprocessor.
+QEMU_SMP ?= 4
+
 # Directories that contain sources and their public headers.  Listed in
 # include-search order: arch first so e.g. machine/io.h-style headers
 # would shadow generic, then kern, vm, fs, dev, mach, test.  mach/ holds
@@ -101,6 +108,7 @@ VPATH	= $(ARCH):kern:vm:fs:fs/apfs:fs/fat:dev:mach:test
 
 OBJS	= \
 	$(OBJDIR)/boot.o	\
+	$(OBJDIR)/acpi.o	\
 	$(OBJDIR)/cpu.o		\
 	$(OBJDIR)/gdt.o		\
 	$(OBJDIR)/idt.o		\
@@ -750,7 +758,8 @@ $(DISKIMG): $(DISKFIX) | $(OBJDIR)
 	@printf 'disk: %s\n' $@
 
 run: kernel.elf $(DISKIMG)
-	$(QEMU) -cpu $(QEMU_CPU) -kernel kernel.elf -no-reboot		\
+	$(QEMU) -cpu $(QEMU_CPU) -smp $(QEMU_SMP) -kernel kernel.elf	\
+	    -no-reboot							\
 	    -drive file=$(DISKIMG),format=raw,if=ide,index=0,media=disk
 
 # `make log` boots the kernel headlessly with debugcon routed to QEMU's
@@ -763,7 +772,8 @@ LOGSEC	?= 2
 log: kernel.elf $(DISKIMG)
 	@mkdir -p $(OBJDIR)
 	@rm -f $(LOGFILE)
-	@($(QEMU) -cpu $(QEMU_CPU) -kernel kernel.elf -no-reboot -display none	\
+	@($(QEMU) -cpu $(QEMU_CPU) -smp $(QEMU_SMP) -kernel kernel.elf		\
+	    -no-reboot -display none						\
 	    -drive file=$(DISKIMG),format=raw,if=ide,index=0,media=disk		\
 	    -serial file:$$PWD/$(LOGFILE) 2>/dev/null &);			\
 	  sleep $(LOGSEC);							\

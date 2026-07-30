@@ -22,6 +22,7 @@
 #include "progreg.h"
 #include "services.h"
 #include "vm.h"
+#include "acpi.h"
 #include "cpu.h"
 #include "fpu.h"
 #include "gdt.h"
@@ -134,6 +135,17 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 		tty_puts("  [ok] local apic (legacy pins wired through)\n");
 	else
 		tty_puts("  [--] local apic absent -- 8259 alone\n");
+
+	/*
+	 * After the APIC, so that the processor reading the table already
+	 * knows its own APIC id from the register and can recognise itself in
+	 * the list -- and so the address the table gives for the APIC can be
+	 * compared against the one the MSR gave.
+	 */
+	if (acpi_madt_probe())
+		tty_puts("  [ok] acpi madt (processors counted)\n");
+	else
+		tty_puts("  [--] no acpi madt -- one processor\n");
 
 	kbd_init();
 	tty_puts("  [ok] kbd (IRQ1 unmasked)\n");
