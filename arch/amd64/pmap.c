@@ -245,18 +245,41 @@ pmap_create(void)
 }
 
 /*
- * Tear down a per-task pmap.  Walks the PRIVATE PDPT under PML4[0],
- * frees the PD/PT pages reachable from PDPT[1..511] (PDPT[0] is the
- * shared boot_pd chain -- leave alone), then frees the PDPT and PML4
- * pages themselves.  Refusing to destroy kernel_pmap is a hard panic;
- * we never want to be one stray pointer away from unmapping the world.
+ * Tear down a per-task pmap.  Walks the PRIVATE PDPT under PML4[0], frees
+ * the PD/PT pages below it that BELONG TO THIS TASK, then frees the PDPT
+ * and PML4 pages themselves.  Refusing to destroy kernel_pmap is a hard
+ * panic; we never want to be one stray pointer away from unmapping the
+ * world.
+ *
+ * ⚠ WHICH ENTRIES ARE THIS TASK'S IS NOT "ALL BUT SLOT 0".  pmap_create
+ * copies the whole kernel PDPT-0 into the private one, deliberately, so a
+ * kernel mapping under PML4[0] stays reachable while this pmap is loaded --
+ * and every entry it copied names a page table the KERNEL allocated and is
+ * still using.  This used to free everything from slot 1 up on the theory
+ * that only slot 0 could be shared, which was true only while slot 0 was
+ * the only kernel mapping under PML4[0].
+ *
+ * The local APIC ended that: mapping its registers at 0xFEE00000 puts a PD
+ * and a PT under slot 3, every task copied them, and the first task to die
+ * handed both back to the page allocator while the kernel was still reading
+ * the APIC through them.  The SECOND task to die is what made a noise --
+ * pmm's double-free assertion -- and it is worth being clear that the noise
+ * was luck.  Had a frame been handed out and written before the second
+ * death, the symptom would have been an interrupt controller quietly
+ * answering from somebody else's memory.
+ *
+ * So the rule is one sentence instead of two: an entry the kernel's own
+ * PDPT-0 still names is not ours to free, whatever slot it is in.  That
+ * also covers slot 0 without a special case.
  */
 void
 pmap_destroy(struct pmap *pm)
 {
 	uint64_t	*pdpt;
 	uint64_t	*pd;
+	uint64_t	*kern_pdpt0;
 	uint64_t	 pml4_e, pdpt_e, pd_e;
+	uint64_t	 kern_pml4_e;
 	uint64_t	 pdpt_pa;
 	size_t		 i, j;
 
@@ -265,19 +288,29 @@ pmap_destroy(struct pmap *pm)
 	if (pm->pm_is_kernel)
 		panic("pmap_destroy: attempt to destroy kernel_pmap");
 
+	kern_pdpt0  = NULL;
+	kern_pml4_e = kernel_pmap->pm_pml4[0];
+	if ((kern_pml4_e & PTE_P) != 0 && (kern_pml4_e & PTE_PS) == 0)
+		kern_pdpt0 = (uint64_t *)
+		    pmm_kva_from_pa(kern_pml4_e & PTE_PA_MASK);
+
 	pml4_e = pm->pm_pml4[0];
 	if ((pml4_e & PTE_P) != 0 && (pml4_e & PTE_PS) == 0) {
 		pdpt_pa = pml4_e & PTE_PA_MASK;
 		pdpt    = (uint64_t *)pmm_kva_from_pa(pdpt_pa);
 
-		/*
-		 * Skip slot 0 -- that's a copy of kern_pdpt0[0], which points
-		 * at boot_pd (boot identity huge pages).  Freeing that would
-		 * unmap the world from under every other task and the kernel.
-		 */
-		for (i = 1; i < 512; i++) {
+		for (i = 0; i < 512; i++) {
 			pdpt_e = pdpt[i];
 			if ((pdpt_e & PTE_P) == 0 || (pdpt_e & PTE_PS) != 0)
+				continue;
+			/*
+			 * Still the kernel's.  Note this compares the whole
+			 * entry, not just the address: an entry the kernel has
+			 * since REPLACED would not match and would be freed,
+			 * which is only safe because intermediate tables here
+			 * are created and never swapped out.
+			 */
+			if (kern_pdpt0 != NULL && kern_pdpt0[i] == pdpt_e)
 				continue;
 			pd = (uint64_t *)pmm_kva_from_pa(pdpt_e & PTE_PA_MASK);
 			for (j = 0; j < 512; j++) {
