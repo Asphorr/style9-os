@@ -155,12 +155,11 @@ long	syscall_vm_allocate(struct task *t, uint64_t size, uint32_t prot,
 long	syscall_vm_deallocate(struct task *t, uint64_t va, uint64_t size);
 
 /*
- * Per-thread bookkeeping the scheduler keeps in sync with the entry
- * stub: each time a ring-3 thread is about to run, sched stores that
- * thread's kernel-stack top into `syscall_kernel_rsp` so the stub
- * knows where to switch on the next syscall.  Also stamped into the
- * TSS (for IRQ/exception ring-transition).
+ * The stack the entry stub switches to is per-CPU state, not a global:
+ * each time a ring-3 thread is about to run, the scheduler stores that
+ * thread's kernel-stack top with cpu_set_kernel_rsp (machine/cpu.h) so the
+ * stub finds it at %gs:CPU_KERNEL_RSP on the next syscall.  Also stamped
+ * into that CPU's TSS, for the IRQ/exception ring transition.
  */
-extern uint64_t	syscall_kernel_rsp;
 
 #endif /* !_SYS_SYSCALL_H_ */

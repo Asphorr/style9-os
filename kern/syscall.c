@@ -12,6 +12,7 @@
 #include "darwin.h"
 #include "kmem.h"
 #include "kprintf.h"
+#include "msr.h"
 #include "pmap.h"
 #include "pmm.h"
 #include "port.h"
@@ -24,13 +25,6 @@
 #include "thread.h"
 #include "tty.h"
 #include "vm.h"
-
-#define	MSR_EFER	0xC0000080u
-#define	MSR_STAR	0xC0000081u
-#define	MSR_LSTAR	0xC0000082u
-#define	MSR_FMASK	0xC0000084u
-
-#define	EFER_SCE	(1u << 0)
 
 #define	RFLAGS_IF	(1u << 9)
 #define	RFLAGS_DF	(1u << 10)
@@ -87,31 +81,6 @@ static long	sys_spawn_args(const char *uname, char *const *uargv,
 static long	sys_cons_feed(const char *ubuf, size_t len);
 
 static bool	user_range_ok(uint64_t addr, size_t len);
-
-static inline uint64_t
-rdmsr(uint32_t msr)
-{
-	uint32_t	lo;
-	uint32_t	hi;
-
-	__asm__ __volatile__("rdmsr"
-	    : "=a"(lo), "=d"(hi)
-	    : "c"(msr));
-	return (((uint64_t)hi << 32) | lo);
-}
-
-static inline void
-wrmsr(uint32_t msr, uint64_t val)
-{
-	uint32_t	lo;
-	uint32_t	hi;
-
-	lo = (uint32_t)(val & 0xFFFFFFFFu);
-	hi = (uint32_t)(val >> 32);
-	__asm__ __volatile__("wrmsr"
-	    :
-	    : "c"(msr), "a"(lo), "d"(hi));
-}
 
 /*
  * Enable SYSCALL/SYSRET and wire it to our entry stub.

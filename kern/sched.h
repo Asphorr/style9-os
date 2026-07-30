@@ -175,20 +175,33 @@ void		sched_count_preempt(void);
  *
  * preempt_disable / preempt_enable bracket critical sections that
  * must not be preempted -- spin_lock / spin_unlock call them
- * automatically.  The count is kernel-wide rather than per-thread, and
+ * automatically.  The count is PER-CPU rather than per-thread, and
  * deliberately: sched_lock is held ACROSS a context switch, so the
  * thread that releases it is not the one that took it and per-thread
- * accounting underflows.  What the counter answers is "is the kernel
- * inside any critical section", which is the question the PIT has.
+ * accounting underflows.  Per-CPU survives that, because a switch hands
+ * over between two threads standing on the same CPU, and it answers the
+ * question the PIT actually has: "may I take away the CPU I am on".
  *
- * need_resched is set by PIT when the current thread's quantum is
- * exhausted.  It is honoured either inline at the end of
- * intr_dispatch, or deferred until the next preempt_enable that
- * drops the count to zero.  thread_yield clears both need_resched
- * and quantum_used so the new thread gets a fresh slice.
+ * The resched request and the quantum tally are per-CPU for the same
+ * reason and reached only through the five calls below, rather than being
+ * globals the PIT pokes.  A CPU owes its own reschedule; whether some
+ * other CPU's slice has expired is none of its business, and while there
+ * was one CPU there was no way to tell the two apart.
+ *
+ * preempt_quantum_tick debits one PIT tick against whatever is running
+ * here and returns true when the slice is spent; preempt_resched_request
+ * is then the ask.  The ask is honoured elsewhere -- inline at the end of
+ * intr_dispatch, or deferred to the next preempt_enable that drops the
+ * count to zero -- because the gate belongs at the schedule point and not
+ * at the flag-set point, so a critical section that ends later still owes
+ * the reschedule.  thread_yield clears both, so a thread that gave the CPU
+ * up voluntarily hands its successor a whole fresh slice.
  */
-extern volatile int		preempt_need_resched;	/* (a) */
-extern volatile unsigned int	preempt_quantum_used;	/* (a) */
+bool		preempt_quantum_tick(void);
+void		preempt_quantum_reset(void);
+void		preempt_resched_request(void);
+bool		preempt_resched_wanted(void);
+void		preempt_resched_clear(void);
 
 /*
  * How long a thread may hold the CPU before the PIT takes it away.

@@ -10,6 +10,7 @@
 #include <stdint.h>
 
 #include "clock.h"
+#include "cpu.h"
 #include "darwin.h"
 #include "fs.h"
 #include "gdt.h"
@@ -1198,6 +1199,7 @@ darwin_cons_release(struct task *t)
 	darwin_cons_stats();
 	darwin_wait_stats();
 	sched_wake_latency_print();
+	cpu_dump();
 }
 
 /*

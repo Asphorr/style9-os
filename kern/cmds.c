@@ -12,6 +12,7 @@
 #include "bio.h"
 #include "bootstrap.h"
 #include "clock.h"
+#include "cpu.h"
 #include "dev_subsystem.h"
 #include "klog.h"
 #include "kmem.h"
@@ -45,6 +46,7 @@ static int	cmd_port(int, char **);
 static int	cmd_task(int, char **);
 static int	cmd_thread(int, char **);
 static int	cmd_sched(int, char **);
+static int	cmd_cpu(int, char **);
 static int	cmd_yield(int, char **);
 static int	cmd_stress(int, char **);
 static int	cmd_crash(int, char **);
@@ -77,6 +79,7 @@ const struct shell_cmd	shell_cmds[] = {
 	{ "task",   "list tasks",                             cmd_task   },
 	{ "thread", "list threads",                           cmd_thread },
 	{ "sched",  "scheduler state + ctx switches",         cmd_sched  },
+	{ "cpu",    "per-cpu state, one line per cpu",        cmd_cpu    },
 	{ "yield",  "yield to next thread (then return)",     cmd_yield  },
 	{ "stress", "stress <mem|boundary|timer|port|thread|preempt>", cmd_stress },
 	{ "mach",   "mach <ls|clock|stats|tasks> (bootstrap-served RPCs)",
@@ -364,6 +367,16 @@ cmd_sched(int argc, char *argv[])
 	kprintf("context switches: %llu, runq len: %zu\n",
 	    (unsigned long long)sched_context_switches(),
 	    sched_runq_len());
+	return (0);
+}
+
+static int
+cmd_cpu(int argc, char *argv[])
+{
+
+	(void)argc;
+	(void)argv;
+	cpu_dump();
 	return (0);
 }
 

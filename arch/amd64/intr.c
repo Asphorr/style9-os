@@ -232,10 +232,8 @@ intr_dispatch(struct trapframe *tf)
 		 */
 		if (preempt_is_enabled()) {
 			sched_drain_irq_wakes();
-			if (__atomic_load_n(&preempt_need_resched,
-			    __ATOMIC_RELAXED)) {
-				__atomic_store_n(&preempt_need_resched,
-				    0, __ATOMIC_RELAXED);
+			if (preempt_resched_wanted()) {
+				preempt_resched_clear();
 				sched_count_preempt();
 				thread_yield();
 			}

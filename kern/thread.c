@@ -22,8 +22,6 @@
 /* Defined in sched.c; released by trampoline on first dispatch. */
 extern void	sched_post_switch_unlock(void);
 
-struct thread		*current_thread;
-
 static struct spinlock	threads_lock = SPINLOCK_INIT("threads-global");
 static uint64_t		next_thread_id;
 
@@ -41,7 +39,10 @@ thread_subsystem_init(void)
 
 	/*
 	 * Synthesise a thread structure for whoever is running kmain
-	 * right now.  It re-uses the boot stack (no kmalloc here), and
+	 * right now -- the boot CPU, and an application processor will
+	 * need the same favour done for it before it can be scheduled,
+	 * since a CPU cannot switch away from a thread that does not
+	 * exist.  It re-uses the boot stack (no kmalloc here), and
 	 * its rsp_save is meaningless until the first context switch
 	 * AWAY from this thread -- at that point the switch asm fills
 	 * it in.

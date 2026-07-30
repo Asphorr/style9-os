@@ -84,24 +84,23 @@ pit_hz(void)
 static void
 pit_isr(struct trapframe *tf)
 {
-	unsigned int	q;
 
 	(void)tf;
 	__atomic_add_fetch(&pit_tick_count, 1, __ATOMIC_RELEASE);
 
 	/*
-	 * Track quantum usage for the currently-running thread.  When
-	 * the quantum is exhausted, set need_resched -- intr_dispatch
-	 * (or the next spin_unlock-to-zero) honours it.  We do NOT
+	 * Track quantum usage for whatever is running on THIS CPU -- the
+	 * tick is charged to the CPU that took it, which is the CPU whose
+	 * slice is being spent.  When the quantum is exhausted, ask for a
+	 * reschedule; intr_dispatch (or the next spin_unlock-to-zero)
+	 * honours it.  We do NOT
 	 * gate on preempt_is_enabled here: the gate lives at the
 	 * actual schedule point, not at the flag-set point, so that
 	 * a critical section ending later still has the resched
 	 * pending.
 	 */
-	q = __atomic_add_fetch(&preempt_quantum_used, 1, __ATOMIC_RELAXED);
-	if (q >= PREEMPT_QUANTUM_TICKS)
-		__atomic_store_n(&preempt_need_resched, 1,
-		    __ATOMIC_RELAXED);
+	if (preempt_quantum_tick())
+		preempt_resched_request();
 
 	/*
 	 * Deadline-driven wakes (sched_check_timeouts) do NOT belong

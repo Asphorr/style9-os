@@ -14,11 +14,20 @@
  *	  interrupts disabled)
  *	- NOT switched the stack -- %rsp still points at user space
  *
- * Single-CPU model: we stash the user %rsp in a global scratch slot
- * and load the kernel stack from `syscall_kernel_rsp`, which the
- * scheduler installs as part of every user-thread dispatch.  Once
- * SMP arrives this moves to per-CPU via GS-base, but the structure
- * of the entry stays the same.
+ * There is no register to spare on entry -- %rsp still points into ring 3
+ * and every GPR holds either an argument or something the ABI promises to
+ * give back -- so the kernel stack has to come out of memory, and the
+ * address of that memory has to come from somewhere that needs no register
+ * to find.  That is what the GS base is for: %gs:CPU_KERNEL_RSP is this
+ * CPU's kernel stack top, installed by the scheduler on every dispatch into
+ * a user thread, and %gs:CPU_USER_RSP is this CPU's one-slot parking space
+ * for the ring-3 %rsp we are about to overwrite.
+ *
+ * BOTH USED TO BE GLOBALS, which was correct for exactly as long as there
+ * was one CPU: two CPUs entering a syscall at once would each stash their
+ * user stack in the same word, and the second one home would return the
+ * first one's ring-3 %rsp to both.  The structure of the entry is unchanged
+ * -- only where the two words live.
  *
  * Argument convention follows real Mach / Linux:
  *	%rax	syscall number
@@ -28,24 +37,23 @@
  * Return value goes back in %rax.
  */
 
+#include "cpu.h"
+
 .section .text
 
 .global	syscall_entry
 .type	syscall_entry, @function
 
-.global	syscall_kernel_rsp
-.global	syscall_user_rsp_scratch
-
 syscall_entry:
-	movq	%rsp, syscall_user_rsp_scratch(%rip)
-	movq	syscall_kernel_rsp(%rip), %rsp
+	movq	%rsp, %gs:CPU_USER_RSP
+	movq	%gs:CPU_KERNEL_RSP, %rsp
 
 	/*
 	 * Build a struct syscall_frame on the kernel stack, in field
 	 * order.  Matches the layout in kern/syscall.h exactly so the
 	 * C dispatcher can use ->arg0 / ->nr / ->user_rip naming.
 	 */
-	pushq	syscall_user_rsp_scratch(%rip)	/* +72 user_rsp     */
+	pushq	%gs:CPU_USER_RSP		/* +72 user_rsp     */
 	pushq	%rcx				/* +64 user_rip     */
 	pushq	%r11				/* +56 user_rflags  */
 	pushq	%rax				/* +48 nr           */
@@ -69,13 +77,12 @@ syscall_entry:
 	 * here: arg registers come back as the user saw them on the
 	 * way in.
 	 *
-	 * Order: stash user RSP via syscall_user_rsp_scratch first
-	 * (we cannot park it in a register, since all the ones we
-	 * could use are either return-related or about to be
-	 * restored).
+	 * Order: stash user RSP in the per-CPU slot first (we cannot
+	 * park it in a register, since all the ones we could use are
+	 * either return-related or about to be restored).
 	 */
 	movq	72(%rsp), %rdx
-	movq	%rdx, syscall_user_rsp_scratch(%rip)
+	movq	%rdx, %gs:CPU_USER_RSP
 
 	movq	56(%rsp), %r11			/* user RFLAGS */
 	movq	64(%rsp), %rcx			/* user RIP    */
@@ -89,17 +96,8 @@ syscall_entry:
 
 	addq	$80, %rsp			/* tear down frame */
 
-	movq	syscall_user_rsp_scratch(%rip), %rsp
+	movq	%gs:CPU_USER_RSP, %rsp
 
 	sysretq
 
 .size	syscall_entry, .-syscall_entry
-
-.section .data
-.align	8
-
-syscall_kernel_rsp:
-	.quad	0
-
-syscall_user_rsp_scratch:
-	.quad	0

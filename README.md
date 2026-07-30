@@ -650,6 +650,61 @@ not -- because a single number there is what made a scheduling cost look like
 a defect in the pipe.  End state: **24362 wakes reached the CPU in 30 ms, none
 of them over 20**, and four boots of 89/90/90/90 with nothing failing.
 
+## What a CPU knows about itself
+
+Everything a CPU needed to know about itself was a plain global: which thread
+is running, which stack a `SYSCALL` lands on, how deep it is inside critical
+sections, whether it owes a reschedule, which thread to fall back on when
+nothing is runnable, and its own GDT and TSS. Every one of those is a
+*per-CPU* quantity that was correct as a global only because there is one
+CPU, and each was cheap to move today and dearer tomorrow. So they moved
+first, before anything can run on a second processor, where the right answer
+is known in advance: **nothing about the system's behaviour may change, and
+the whole boot has to say so.**
+
+A CPU finds its own block through the **GS segment base** rather than by
+indexing an array, because getting an index is the problem being solved --
+reading the local APIC needs the APIC mapped, and a processor coming up needs
+its stack and its current thread before it has mapped anything. The base is a
+register, written once per CPU, after which `%gs:0` is the block with nothing
+to look up. That is what the `SYSCALL` stub needs: on entry `%rsp` still
+points into ring 3 and every register holds either an argument or something
+the ABI promises to give back, so the kernel stack has to come out of memory
+that can be found without spending a register to find it.
+
+Two traps came with it, both worth naming:
+
+* **Loading a segment register zeroes its base.** In long mode the base of
+  `%fs`/`%gs` lives only in its MSR, and writing the register loads the
+  *descriptor's* base -- zero, for every flat descriptor in our GDT. The GDT
+  setup used to reload all five segment registers, which was free while
+  nothing used `%gs` and would now be the single instruction that points a
+  CPU's per-CPU block at physical address zero. It reloads three.
+* **The boundary is the first spinlock, not the first CPU-flavoured call.**
+  `spin_lock` counts preemption, the count is per-CPU, so per-CPU state has to
+  work before any lock is taken -- which puts the setup at the top of `kmain`,
+  before the console exists. The check that it worked therefore has to happen
+  later, and does: the block is read back through the segment base and
+  compared with the address the linker chose.
+
+The preempt count was documented as kernel-wide *and deliberately so*,
+because `sched_lock` is held across a context switch and the thread that
+releases it is not the one that took it, so a per-thread count underflows.
+Per-CPU keeps that property -- a switch hands over between two threads
+standing on the same CPU -- while answering the question the PIT actually
+has, which was never "is the kernel busy" but "may I take away the CPU I am
+standing on". Same for the quantum: a tick is charged to the CPU that took
+it. `cpu` in the shell prints one line per processor, and the end of every
+console session prints the same line, so what each CPU was doing is on the
+record next to what the wakes cost.
+
+Ten boots, four of them the acceptance ladder from a pristine volume:
+**89/90/90/90 pass, nothing failing, `apfsck` clean on every one** -- the same
+tally, wake for wake, as the kernel before the move. What is still
+single-CPU is everything above this: no APIC, no second processor started,
+and `spin_lock` still spins without disabling interrupts, which is safe only
+because no interrupt handler takes a lock the mainline can hold.
+
 Next on the roadmap: **replacing an existing name** with a rename, which
 POSIX requires and this refuses out loud; a **torn-write stand**, which
 would make the checkpoint's promise that an interruption anywhere leaves the

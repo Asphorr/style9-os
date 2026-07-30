@@ -22,6 +22,7 @@
 #include "progreg.h"
 #include "services.h"
 #include "vm.h"
+#include "cpu.h"
 #include "fpu.h"
 #include "gdt.h"
 #include "idt.h"
@@ -78,6 +79,17 @@ void
 kmain(uint32_t mb_magic, uint32_t mb_info)
 {
 
+	/*
+	 * FIRST, before anything at all.  Per-CPU state is reached through
+	 * the GS base and the base is zero until this runs, so any earlier
+	 * code that touched it would read and write physical page zero
+	 * instead -- and spin_lock touches it, by way of the preempt count,
+	 * which puts the boundary before the first lock rather than before
+	 * the first obviously CPU-flavoured call.  There is no console yet;
+	 * cpu_print checks the result out loud once there is one.
+	 */
+	cpu_bsp_init();
+
 	uart_init();
 	tty_init();
 	/*
@@ -96,8 +108,11 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 
 	tty_puts("\nbringing CPU tables online...\n");
 
-	gdt_init();
-	tty_puts("  [ok] gdt\n");
+	cpu_print();
+	tty_puts("  [ok] per-cpu block (gs base)\n");
+
+	gdt_init_cpu();
+	tty_puts("  [ok] gdt + tss (this cpu's own)\n");
 
 	idt_init();
 	tty_puts("  [ok] idt\n");

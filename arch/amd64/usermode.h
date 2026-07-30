@@ -18,8 +18,8 @@
  *	- allocates user code + stack pages and maps them U=1,
  *	- copies the inline user_blob (arch/amd64/user_blob.S) into
  *	  the code page,
- *	- installs the per-thread kernel-stack top in the TSS and
- *	  in syscall_kernel_rsp,
+ *	- installs the per-thread kernel-stack top in this CPU's TSS
+ *	  and in its per-CPU block (cpu_set_kernel_rsp),
  *	- iretq's to the user RIP with user CS/SS/RSP.
  *
  * The blob makes two syscalls (SYS_PRINT, SYS_EXIT) and exits.  The

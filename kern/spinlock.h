@@ -21,9 +21,19 @@
  *
  * The holder fields are purely diagnostic; spin_lock records the call
  * site so that a hang or a SPINLOCK_ASSERT_HELD failure can pinpoint
- * which routine last touched it.  Single-CPU.  The struct is shaped
- * so a per-CPU id is additive; the WITNESS-style lock-order check
- * itself has already landed in kern/witness.h.
+ * which routine last touched it.  sl_holder_cpu is a real CPU id
+ * (machine/cpu.h) rather than the constant zero it used to be, which is
+ * what makes the recursive-acquire check and "unlock by non-owner CPU"
+ * mean what they say.  The WITNESS-style lock-order check itself has
+ * already landed in kern/witness.h.
+ *
+ * ⚠ STILL NOT AN SMP LOCK.  Acquire spins without disabling interrupts, so
+ * on a machine with more than one CPU running there is a lock this CPU's
+ * interrupt handler must not take while this CPU's mainline holds it -- the
+ * handler would spin for a lock only the interrupted code can release.  The
+ * kernel dodges that today by never taking sched_lock from an IRQ (see
+ * sched_post_irq_wake) rather than by making the lock safe; the fix, when
+ * APs actually run, is to save-and-disable IF across the hold.
  *
  * Static initialiser:  static struct spinlock x = SPINLOCK_INIT("x");
  * Dynamic init:        spin_init(&lock, "name");

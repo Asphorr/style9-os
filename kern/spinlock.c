@@ -9,24 +9,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "cpu.h"
 #include "kprintf.h"
 #include "ksym.h"
 #include "panic.h"
 #include "sched.h"
 #include "spinlock.h"
 #include "witness.h"
-
-/*
- * Single-CPU placeholder; once an SMP boot exists this becomes the
- * per-CPU LAPIC id.  Centralised so every reference reads from the
- * same source of truth.
- */
-static inline int
-cpu_id(void)
-{
-
-	return (0);
-}
 
 void
 spin_init(struct spinlock *sl, const char *name)
@@ -53,7 +42,7 @@ spin_lock(struct spinlock *sl)
 	 */
 	preempt_disable();
 
-	if (sl->sl_state != 0 && sl->sl_holder_cpu == cpu_id()) {
+	if (sl->sl_state != 0 && sl->sl_holder_cpu == (int)cpu_id()) {
 		/*
 		 * Spell out both sites with ksym_print BEFORE calling panic,
 		 * because panic's %lx formatter has no hook for symbol
@@ -77,7 +66,7 @@ spin_lock(struct spinlock *sl)
 		__asm__ __volatile__ ("pause");
 
 	sl->sl_holder_rip = ra;
-	sl->sl_holder_cpu = cpu_id();
+	sl->sl_holder_cpu = (int)cpu_id();
 
 	witness_acquired(sl, ra);
 }
@@ -87,7 +76,7 @@ spin_unlock(struct spinlock *sl)
 {
 
 	KASSERT(sl->sl_state == 1, "spin_unlock of unheld lock");
-	KASSERT(sl->sl_holder_cpu == cpu_id(),
+	KASSERT(sl->sl_holder_cpu == (int)cpu_id(),
 	    "spin_unlock by non-owner CPU");
 
 	witness_released(sl);
@@ -110,7 +99,7 @@ bool
 spin_held(const struct spinlock *sl)
 {
 
-	return (sl->sl_state == 1 && sl->sl_holder_cpu == cpu_id());
+	return (sl->sl_state == 1 && sl->sl_holder_cpu == (int)cpu_id());
 }
 
 bool
@@ -127,7 +116,7 @@ spin_trylock(struct spinlock *sl)
 	}
 
 	sl->sl_holder_rip = ra;
-	sl->sl_holder_cpu = cpu_id();
+	sl->sl_holder_cpu = (int)cpu_id();
 
 	witness_acquired(sl, ra);
 	return (true);

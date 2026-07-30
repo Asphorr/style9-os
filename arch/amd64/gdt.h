@@ -40,10 +40,25 @@
 
 #define	GDT_RPL3		0x03	/* OR'd into user selectors at use */
 
-void	gdt_init(void);
+/*
+ * Build and load the GDT and TSS belonging to the CPU that calls this, and
+ * make the CPU use them.  ONE PER CPU, not one for the machine: the table
+ * is all shared descriptors except the TSS, and a TSS is exactly the thing
+ * that cannot be shared -- it carries the stack a ring transition lands on,
+ * so two CPUs pointing at one TSS would take a fault each onto the same
+ * stack and overwrite each other's frame.  Sharing the six flat
+ * descriptors would save a page and cost a second table to keep in step;
+ * one table per CPU is smaller than the bookkeeping.
+ *
+ * Reads its own identity out of the per-CPU block rather than taking it as
+ * an argument, so a CPU cannot be told it is somebody else.  That means the
+ * GS base must already be installed -- cpu_bsp_init, kmain's first
+ * statement.
+ */
+void	gdt_init_cpu(void);
 
 /*
- * Install `rsp` in the TSS as the ring-0 stack to use on the next
+ * Install `rsp` in this CPU's TSS as the ring-0 stack to use on the next
  * ring-3 -> ring-0 transition.  The scheduler calls this on every
  * context switch into a user-mode thread so exceptions land on that
  * thread's kernel stack rather than a stale one.

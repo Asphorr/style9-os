@@ -12,6 +12,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "cpu.h"
 #include "port.h"
 #include "queue.h"
 #include "spinlock.h"
@@ -177,7 +178,13 @@ struct thread {
 	uint8_t			 th_fpu[512] __attribute__((aligned(16)));
 };
 
-extern struct thread		*current_thread;	/* per-CPU later    */
+/*
+ * `current_thread' is not a variable any more -- it is this CPU's
+ * cp_curthread, reached through the GS base (machine/cpu.h), and it is
+ * still an lvalue so the scheduler assigns to it exactly as before.  Every
+ * file that uses it gets the definition from here, which is where it always
+ * came from.
+ */
 
 #define	THREAD_DEFAULT_KSTACK	(16 * 1024)	/* 4 pages */
 

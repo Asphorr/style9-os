@@ -10,6 +10,7 @@
 #include <stdint.h>
 
 #include "clock.h"
+#include "cpu.h"
 #include "gdt.h"
 #include "kmem.h"
 #include "kprintf.h"
@@ -49,24 +50,32 @@ static size_t		 runq_len;	/* (s)                              */
 
 SLIST_HEAD(zombie_list, thread);
 static struct zombie_list zombie_head;	/* (s) waiting for idle to reap    */
-static struct thread	*idle_thread;	/* (c)                              */
 static uint64_t		 ctx_switches;	/* (s) printable counter            */
 static uint64_t		 preempts;	/* (s) IRQ-driven yields            */
 
-volatile int		 preempt_need_resched;	/* (a) */
-volatile unsigned int	 preempt_quantum_used;	/* (a) */
-
 /*
- * Preempt-disable nesting count.  Global, not per-thread: when
- * sched_lock is held across a context switch the unlock happens in a
- * different thread, so per-thread accounting underflows.  What the
- * counter conceptually represents is "is the kernel currently inside
- * any critical section" -- which is exactly the kernel-wide invariant
- * we want the PIT to consult.
+ * The idle thread, and the three words of preemption state, are PER-CPU
+ * (machine/cpu.h) -- named here so the rest of this file reads as it did.
  *
- * Per-CPU when we go SMP; until then a single int is fine.
+ * Idle is per-CPU because it is not a policy but a place to stand: a CPU
+ * with nothing runnable has to be executing something, and that something
+ * has to have its own stack.  One shared idle thread would mean two CPUs
+ * running one stack.
+ *
+ * The preempt count is per-CPU rather than per-THREAD, which is the same
+ * conclusion the single-CPU kernel reached for a different reason.  It was
+ * kernel-wide because sched_lock is held ACROSS a context switch: the
+ * thread that releases it is not the one that took it, so a per-thread
+ * count underflows.  Per-CPU keeps that property -- the acquiring and
+ * releasing threads are on the same CPU by construction, since the switch
+ * is what hands over -- while giving the honest answer to the question the
+ * PIT actually asks, which was never "is the kernel busy" but "may I take
+ * the CPU I am standing on away from what is running on it".
  */
-static volatile int	preempt_count;		/* (a) */
+#define	idle_thread		(curcpu()->cp_idle_thread)
+#define	preempt_need_resched	(curcpu()->cp_need_resched)
+#define	preempt_quantum_used	(curcpu()->cp_quantum_used)
+#define	preempt_count		(curcpu()->cp_preempt_count)
 
 /*
  * Lock-free LIFO of threads queued for thread_wake by an interrupt
@@ -188,8 +197,8 @@ switch_pmap_if_needed(struct thread *self, struct thread *next)
 /*
  * Re-arm the ring-transition kstack pointers for the incoming thread.
  *
- * Both tss.rsp0 (used by IRQ-from-ring-3 entry) and syscall_kernel_rsp
- * (used by the SYSCALL stub) are read by hardware at the next ring-3
+ * Both this CPU's tss.rsp0 (used by IRQ-from-ring-3 entry) and its
+ * cp_kernel_rsp (used by the SYSCALL stub) are read at the next ring-3
  * -> ring-0 transition, so they must always point at the CURRENT
  * thread's own kstack -- otherwise a syscall taken from sh.elf after
  * we just dispatched away from clock.elf would land on clock's freed
@@ -197,8 +206,8 @@ switch_pmap_if_needed(struct thread *self, struct thread *next)
  * to a garbage RIP.
  *
  * usermode_elf_launcher sets these once when a new user task starts,
- * but the value is global -- without this re-arm on every context
- * switch the MSRs are stale the moment the scheduler picks a
+ * but one CPU holds one pair of them -- without this re-arm on every
+ * context switch they are stale the moment the scheduler picks a
  * different user thread.
  *
  * Threads without a kstack of their own (only the synthesised boot
@@ -215,7 +224,7 @@ switch_user_kstack(struct thread *next)
 	ksp = (uint64_t)(uintptr_t)next->th_kstack_base +
 	    next->th_kstack_size;
 	tss_set_rsp0(ksp);
-	syscall_kernel_rsp = ksp;
+	cpu_set_kernel_rsp(ksp);
 }
 
 /*
@@ -234,8 +243,8 @@ sched_init(void)
 	SLIST_INIT(&zombie_head);
 	ctx_switches = 0;
 	preempts     = 0;
-	preempt_need_resched = 0;
-	preempt_quantum_used = 0;
+	preempt_resched_clear();
+	preempt_quantum_reset();
 
 	idle_thread = thread_create(kernel_task, idle_loop, NULL, "idle");
 	if (idle_thread == NULL)
@@ -391,8 +400,8 @@ thread_yield(void)
 	 * thread_yield discharges any pending resched request and
 	 * earns the caller a fresh quantum.
 	 */
-	__atomic_store_n(&preempt_need_resched, 0, __ATOMIC_RELAXED);
-	__atomic_store_n(&preempt_quantum_used, 0, __ATOMIC_RELAXED);
+	preempt_resched_clear();
+	preempt_quantum_reset();
 
 	next = pick_next_locked(self);
 	if (next == NULL || next == self) {
@@ -1067,7 +1076,7 @@ preempt_enable(void)
 	 */
 	sched_drain_irq_wakes();
 
-	if (__atomic_load_n(&preempt_need_resched, __ATOMIC_RELAXED)) {
+	if (preempt_resched_wanted()) {
 		sched_count_preempt();
 		thread_yield();
 	}
@@ -1078,4 +1087,50 @@ preempt_is_enabled(void)
 {
 
 	return (__atomic_load_n(&preempt_count, __ATOMIC_RELAXED) == 0);
+}
+
+/*
+ * The quantum and the resched request.
+ *
+ * Still atomic now that they are per-CPU, and for the reason they always
+ * were: the PIT interrupt and the thread it interrupted are two writers on
+ * ONE CPU.  Going per-CPU removes the cross-CPU race and leaves that one
+ * untouched -- an interrupt lands between a load and a store just as
+ * happily on a machine with one processor as on a machine with sixteen.
+ */
+bool
+preempt_quantum_tick(void)
+{
+	unsigned int	q;
+
+	q = __atomic_add_fetch(&preempt_quantum_used, 1, __ATOMIC_RELAXED);
+	return (q >= PREEMPT_QUANTUM_TICKS);
+}
+
+void
+preempt_quantum_reset(void)
+{
+
+	__atomic_store_n(&preempt_quantum_used, 0, __ATOMIC_RELAXED);
+}
+
+void
+preempt_resched_request(void)
+{
+
+	__atomic_store_n(&preempt_need_resched, 1, __ATOMIC_RELAXED);
+}
+
+bool
+preempt_resched_wanted(void)
+{
+
+	return (__atomic_load_n(&preempt_need_resched, __ATOMIC_RELAXED) != 0);
+}
+
+void
+preempt_resched_clear(void)
+{
+
+	__atomic_store_n(&preempt_need_resched, 0, __ATOMIC_RELAXED);
 }

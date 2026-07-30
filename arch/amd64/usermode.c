@@ -8,6 +8,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "cpu.h"
 #include "darwin.h"
 #include "elf.h"
 #include "gdt.h"
@@ -563,7 +564,7 @@ usermode_elf_launcher(void *arg)
 	ksp = (uint64_t)current_thread->th_kstack_base +
 	    current_thread->th_kstack_size;
 	tss_set_rsp0(ksp);
-	syscall_kernel_rsp = ksp;
+	cpu_set_kernel_rsp(ksp);
 
 	/*
 	 * Inject the parent's port into the child's port_space at the
@@ -671,10 +672,11 @@ usermode_launcher(void *arg)
 
 	/*
 	 * Park the kernel-stack top for both the IRQ-ring-transition
-	 * path (TSS.rsp0) and the syscall fast path
-	 * (syscall_kernel_rsp).  Both ultimately need the same value;
-	 * keeping the syscall path in its own MSR-adjacent global is
-	 * deliberate because syscall does not go through the TSS.
+	 * path (this CPU's TSS.rsp0) and the syscall fast path (this
+	 * CPU's cp_kernel_rsp).  Both ultimately need the same value;
+	 * the syscall path keeps its own copy because SYSCALL goes
+	 * nowhere near the TSS -- it switches no stack at all, which is
+	 * why the stub has to.
 	 */
 	{
 		uint64_t	ksp;
@@ -682,7 +684,7 @@ usermode_launcher(void *arg)
 		ksp = (uint64_t)current_thread->th_kstack_base +
 		    current_thread->th_kstack_size;
 		tss_set_rsp0(ksp);
-		syscall_kernel_rsp = ksp;
+		cpu_set_kernel_rsp(ksp);
 	}
 
 	kprintf("usermode: entering ring 3 (rip=0x%llx rsp=0x%llx, "
@@ -799,7 +801,7 @@ darwin_fork_child_launcher(void *arg)
 	ksp = (uint64_t)current_thread->th_kstack_base +
 	    current_thread->th_kstack_size;
 	tss_set_rsp0(ksp);
-	syscall_kernel_rsp = ksp;
+	cpu_set_kernel_rsp(ksp);
 
 	usermode_enter_forked(rip, rsp);
 }
