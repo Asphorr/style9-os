@@ -122,6 +122,30 @@ struct thread {
 	struct thread		*th_wait_link;		/* (the object's)   */
 
 	/*
+	 * ⚠ AND WHERE THAT LIST LIVES, because the link alone is a link with
+	 * amnesia: it says this thread is on somebody's queue and not whose.
+	 * The three fields below are that memory -- the queue's head, tail
+	 * and lock, noted by the thread itself just before it parks on an
+	 * object's list and forgotten by the same thread when it takes
+	 * itself off.  Nobody else touches them: an extractor that pops this
+	 * thread leaves the note alone, because the popped thread wakes,
+	 * runs its caller's unconditional detach, finds nothing, and
+	 * forgets on its own.
+	 *
+	 * What the note is FOR is the one exit that never comes back.
+	 * thread_block_release retires a killed thread from inside the
+	 * block, above the caller that enqueued it, so the caller's detach
+	 * never runs and the object keeps a pointer to a thread about to be
+	 * reaped.  The deadline list had this same defect and thread_exit
+	 * could settle it by name, because there is exactly one deadline
+	 * list; there is no walking every port in the system, so for the
+	 * object lists the thread has to know where it is.
+	 */
+	struct thread		**th_wait_qhead;	/* (th_wait_qlock)  */
+	struct thread		**th_wait_qtail;	/* (th_wait_qlock)  */
+	struct spinlock		 *th_wait_qlock;	/* (self only)      */
+
+	/*
 	 * Queued for a wake an interrupt handler could not perform itself.
 	 * Its own field for the third time and the same reason: the thread
 	 * sitting on this list is BLOCKED and somebody else is entitled to
@@ -280,6 +304,20 @@ struct thread	*thread_create(struct task *,
 		    void (*entry)(void *), void *arg, const char *name);
 void		thread_start(struct thread *);
 void		thread_exit(void) __attribute__((noreturn));
+
+/*
+ * The waiter-list note (see the th_wait_qhead comment in struct thread).
+ * note: record the object list this thread is about to park on -- called
+ * with the list's lock held, right after linking in.  forget: clear it --
+ * called by the thread itself after its unconditional detach.
+ * unbind_locked: take the thread off the noted list and forget, with the
+ * noted lock already held -- the pre-park kill exit's case, where the lock
+ * the caller parked under IS the list's lock and has not been dropped yet.
+ */
+void		thread_wait_note(struct thread *, struct thread **qhead,
+		    struct thread **qtail, struct spinlock *qlock);
+void		thread_wait_forget(struct thread *);
+void		thread_wait_unbind_locked(struct thread *);
 
 const char	*thread_state_name(enum thread_state);
 const char	*thread_block_reason_name(enum thread_block_reason);

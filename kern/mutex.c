@@ -61,6 +61,31 @@ waiter_pop(struct mutex *m)
 	return (th);
 }
 
+/*
+ * Take a specific thread off the waiter list if it is still on it, exactly
+ * as the port layer's port_unbind_waiter_locked does and for the same
+ * caller: the unconditional detach after a park, whatever ended it.
+ */
+static void
+waiter_unbind(struct mutex *m, struct thread *th)
+{
+	struct thread	**pp;
+	struct thread	 *prev;
+
+	prev = NULL;
+	for (pp = &m->mtx_waiters_head; *pp != NULL;
+	    pp = &(*pp)->th_wait_link) {
+		if (*pp == th) {
+			*pp = th->th_wait_link;
+			if (m->mtx_waiters_tail == th)
+				m->mtx_waiters_tail = prev;
+			th->th_wait_link = NULL;
+			break;
+		}
+		prev = *pp;
+	}
+}
+
 void
 mutex_init(struct mutex *m, const char *name)
 {
@@ -93,6 +118,8 @@ mutex_lock(struct mutex *m)
 		    "recursive mutex_lock");
 		mutex_n_slept++;
 		waiter_push(m, current_thread);
+		thread_wait_note(current_thread, &m->mtx_waiters_head,
+		    &m->mtx_waiters_tail, &m->mtx_guard);
 		/*
 		 * Drops the guard under sched_lock, so an unlock racing this
 		 * park has to spin on sched_lock and cannot slip its wake in
@@ -100,6 +127,17 @@ mutex_lock(struct mutex *m)
 		 */
 		thread_block_release(THREAD_BLOCK_SLEEP, m, &m->mtx_guard);
 		spin_lock(&m->mtx_guard);
+		/*
+		 * Off the list unconditionally, whatever it was that ended
+		 * the park -- the lesson the port's recv loop wrote down and
+		 * this loop had not yet learned.  An unlock that woke us
+		 * already popped us; a park that DECLINED TO PARK (a wake
+		 * was pending) did not, and the push above would then link
+		 * the tail into itself: a one-element cycle, and every wake
+		 * the unlock hands out goes to the phantom for ever.
+		 */
+		waiter_unbind(m, current_thread);
+		thread_wait_forget(current_thread);
 		/*
 		 * Re-check rather than assume.  Being woken means the lock was
 		 * free at that moment, not that it is ours: a thread that never

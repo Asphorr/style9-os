@@ -1400,13 +1400,35 @@ own, the push overwrites a forward pointer the list was still using, and every
 waiter behind it stops having a deadline at all. `thread_exit` now takes itself
 off, and the push asserts that it is not already on.
 
-**⚠ And one of the same family is left**, named here rather than fixed. The same
-kill-mid-park exit leaves the thread on the *port's* waiter list, because that
-one cannot be undone from `thread_exit` without knowing which object is holding
-it. The port's teardown drains that list later and wakes a thread that may
-already have been reaped. Closing it means the waiting thread recording *what*
-it is waiting on so the exit path can undo it, which is a rung of its own; what
-is owed here is saying so.
+**And the last of the family, closed the way the deadline list was.** The same
+kill-mid-park exit used to leave the thread on the *port's* waiter list --
+that one could not be undone from `thread_exit` without knowing which object
+was holding it, and there is no walking every port in the system. So the
+thread now knows: beside `th_wait_link` it notes the list's head, tail and
+lock just before parking, forgets the note when it takes itself off, and
+`thread_exit` settles whatever the note still owes. The pre-park kill exit
+settles even earlier, while it is still holding the very lock the list lives
+under, where no sender can be mid-extraction. The same discipline went into
+the mutex's wait loop, which had never learned the recv loop's lesson -- a
+park that declines to park returns still linked, and the next push threads
+the tail into itself. `port-wait` grew two scenes for it: a thread that dies
+on the list by hand, and a task killed for real while its thread is parked in
+the recv path. What is still owed is narrower and written down where it
+lives, in `thread_wait_unbind`: an extractor that has popped a thread and not
+yet woken it races the corpse's reap -- closing that means a reference the
+waker holds, which is a rung of its own.
+
+**⚠ And two siblings are named here rather than fixed**, the way the last one
+was. The ATA channel's waiter is a slot, not a list (`ch_waiter`), and the
+same kill-mid-park exit leaves it stale: the interrupt for the command still
+in flight exchanges the slot and posts a wake against a thread that may by
+then be reaped. And a thread killed while parked *under a mutex* -- every
+disk-touching path sleeps holding `fs_lock` -- retires without releasing it,
+leaving `mtx_owner` naming a corpse and every later acquirer parked behind a
+lock nobody holds. The honest shape of that fix is a held-mutex count that
+makes the kill checks decline to retire, letting the thread run out to its
+syscall boundary, where it holds nothing; both are the same rung and it is
+not this one.
 
 ### One more thing the hypervisor said
 

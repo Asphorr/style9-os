@@ -81,6 +81,9 @@ thread_adopt_current(struct task *t, const char *name)
 	th->th_runq_link       = NULL;
 	th->th_task_link       = NULL;
 	th->th_wait_link       = NULL;
+	th->th_wait_qhead      = NULL;
+	th->th_wait_qtail      = NULL;
+	th->th_wait_qlock      = NULL;
 	th->th_irq_link        = NULL;
 	th->th_sleep_link      = NULL;
 	th->th_wake_ms         = 0;
@@ -198,6 +201,9 @@ thread_create(struct task *t, void (*entry)(void *), void *arg,
 	th->th_runq_link         = NULL;
 	th->th_task_link         = NULL;
 	th->th_wait_link         = NULL;
+	th->th_wait_qhead        = NULL;
+	th->th_wait_qtail        = NULL;
+	th->th_wait_qlock        = NULL;
 	th->th_irq_link          = NULL;
 	th->th_sleep_link        = NULL;
 	th->th_wake_ms           = 0;
@@ -262,6 +268,83 @@ thread_start(struct thread *th)
 }
 
 void
+thread_wait_note(struct thread *th, struct thread **qhead,
+    struct thread **qtail, struct spinlock *qlock)
+{
+
+	/*
+	 * A second note before the first was paid is the same defect that
+	 * cycled the port's waiter list: a thread linked into two places
+	 * through one field.  Catching it here names the enqueuer that
+	 * forgot its detach, instead of wedging whoever parks next.
+	 */
+	KASSERT(th->th_wait_qlock == NULL,
+	    "thread_wait_note: still noted on another list");
+	th->th_wait_qhead = qhead;
+	th->th_wait_qtail = qtail;
+	th->th_wait_qlock = qlock;
+}
+
+void
+thread_wait_forget(struct thread *th)
+{
+
+	th->th_wait_qhead = NULL;
+	th->th_wait_qtail = NULL;
+	th->th_wait_qlock = NULL;
+}
+
+void
+thread_wait_unbind_locked(struct thread *th)
+{
+	struct thread	**pp;
+	struct thread	 *prev;
+
+	KASSERT(th->th_wait_qlock != NULL,
+	    "thread_wait_unbind_locked: nothing noted");
+	prev = NULL;
+	for (pp = th->th_wait_qhead; *pp != NULL;
+	    pp = &(*pp)->th_wait_link) {
+		if (*pp == th) {
+			*pp = th->th_wait_link;
+			if (*th->th_wait_qtail == th)
+				*th->th_wait_qtail = prev;
+			th->th_wait_link = NULL;
+			break;
+		}
+		prev = *pp;
+	}
+	thread_wait_forget(th);
+}
+
+/*
+ * Settle the note from an exiting thread's own context: take the noted
+ * lock, take the thread off the noted list if it is still there, forget.
+ *
+ * Finding the thread already gone is legitimate -- an extractor popped it
+ * and its wake is what brought the thread here.  ⚠ WHAT IS STILL OWED, and
+ * written down rather than fixed: an extractor that has popped this thread
+ * and NOT YET woken it races the reap.  The window needs the extractor to
+ * stall between two adjacent lines -- the pop under the object's lock and
+ * the thread_wake after it -- for as long as it takes this thread to
+ * finish exiting AND a third party to reap the zombie; the wake then
+ * touches freed memory, which the kmem poison check would name.  Closing
+ * it means a reference the waker holds, which is a rung of its own.
+ */
+static void
+thread_wait_unbind(struct thread *th)
+{
+	struct spinlock	*ql;
+
+	ql = th->th_wait_qlock;
+	if (ql == NULL)
+		return;
+	spin_lock(ql);
+	thread_wait_unbind_locked(th);
+	spin_unlock(ql);
+}
+
+void
 thread_exit(void)
 {
 	struct thread	*me;
@@ -289,6 +372,19 @@ thread_exit(void)
 	 * quiet with every processor idle and every thread blocked.
 	 */
 	sched_remove_timed_waiter(me);
+
+	/*
+	 * AND OFF THE OBJECT'S WAITER LIST, which is the same debt one layer
+	 * up.  A port's recv loop, a port set's, a blocked sender's, a
+	 * mutex's -- each links this thread into an object's queue before
+	 * parking and unlinks it after, and a kill-mid-park exit ran neither
+	 * the "after" nor could this function do it for them, because
+	 * th_wait_link does not say whose list it is threading.  Now the
+	 * thread notes where it parks (th_wait_qhead and friends), and this
+	 * settles whatever the note still owes -- so the port teardown drain
+	 * no longer wakes a thread that was reaped out from under the list.
+	 */
+	thread_wait_unbind(me);
 
 	spin_lock(&me->th_lock);
 	me->th_state = THREAD_ZOMBIE;

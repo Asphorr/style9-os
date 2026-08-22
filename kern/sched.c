@@ -701,6 +701,22 @@ thread_block_release(int reason, void *target, struct spinlock *external)
 	 */
 	if (self->th_task != kernel_task &&
 	    task_kill_pending(self->th_task)) {
+		/*
+		 * Off the object's waiter list before the locks go, if the
+		 * caller linked us onto one.  The caller's own detach runs
+		 * only after this returns -- and this path does not return,
+		 * so the object would keep naming a thread about to be
+		 * reaped.  Settled HERE rather than left to thread_exit
+		 * because here the list's lock is still held: `external'
+		 * IS the lock the list lives under, so no extractor can be
+		 * mid-pop against this thread while it leaves.
+		 */
+		if (self->th_wait_qlock != NULL) {
+			KASSERT(self->th_wait_qlock == external,
+			    "thread_block_release: noted on one lock's "
+			    "list, parking under another");
+			thread_wait_unbind_locked(self);
+		}
 		spin_unlock(&sched_lock);
 		if (external != NULL)
 			spin_unlock(external);
@@ -1219,6 +1235,16 @@ sched_reap_zombies(void)
 				z->th_exc_ports[exi] = NULL;
 			}
 		}
+
+		/*
+		 * The comment above says thread_exit already detached us
+		 * from any waitq; this is where that claim is checked
+		 * rather than believed, because the memory below is about
+		 * to be reused and a pointer left on an object's list
+		 * outlives every other trace of the defect.
+		 */
+		KASSERT(z->th_wait_qlock == NULL,
+		    "reap: thread still noted on an object's waiter list");
 
 		if (z->th_kstack_owned && z->th_kstack_base != NULL)
 			kfree(z->th_kstack_base);

@@ -1364,6 +1364,8 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 				    self;
 				dest->p_send_waiters_tail = self;
 			}
+			thread_wait_note(self, &dest->p_send_waiters_head,
+			    &dest->p_send_waiters_tail, &dest->p_lock);
 			thread_block_release(THREAD_BLOCK_PORT, dest,
 			    &dest->p_lock);
 			/*
@@ -1375,6 +1377,7 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 			 */
 			spin_lock(&dest->p_lock);
 			port_unbind_send_waiter_locked(dest, self);
+			thread_wait_forget(self);
 			spin_unlock(&dest->p_lock);
 			/* Loop and retry. */
 		}
@@ -1729,6 +1732,8 @@ mach_msg_recv_timed(struct port_space *to, mach_port_name_t recv_name,
 				p->p_waiters_tail->th_wait_link = self;
 				p->p_waiters_tail = self;
 			}
+			thread_wait_note(self, &p->p_waiters_head,
+			    &p->p_waiters_tail, &p->p_lock);
 
 			if (timeout_ms != MACH_TIMEOUT_FOREVER) {
 				self->th_wake_deadline_ms = deadline;
@@ -1770,6 +1775,7 @@ mach_msg_recv_timed(struct port_space *to, mach_port_name_t recv_name,
 
 			spin_lock(&p->p_lock);
 			port_unbind_waiter_locked(p, self);
+			thread_wait_forget(self);
 
 			if (self->th_timed_out) {
 				self->th_timed_out = 0;
@@ -1854,6 +1860,8 @@ mach_msg_recv_timed(struct port_space *to, mach_port_name_t recv_name,
 			set->ps_waiters_tail->th_wait_link = self;
 			set->ps_waiters_tail = self;
 		}
+		thread_wait_note(self, &set->ps_waiters_head,
+		    &set->ps_waiters_tail, &set->ps_lock);
 
 		if (timeout_ms != MACH_TIMEOUT_FOREVER) {
 			self->th_wake_deadline_ms = deadline;
@@ -1868,6 +1876,7 @@ mach_msg_recv_timed(struct port_space *to, mach_port_name_t recv_name,
 
 		spin_lock(&set->ps_lock);
 		port_set_unbind_waiter_locked(set, self);
+		thread_wait_forget(self);
 		spin_unlock(&set->ps_lock);
 
 		if (self->th_timed_out) {
@@ -2040,6 +2049,7 @@ mach_msg_rpc(struct port_space *space, struct mach_msg_header *req,
 #define	PW_WAIT_MS	4000u	/* ...and this outlasts it, so it is gone */
 
 struct pw_helper {
+	struct port		*ph_port;
 	mach_port_name_t	 ph_name;
 	volatile int		 ph_got;	/* the message arrived  */
 	volatile int		 ph_done;	/* and the thread is out */
@@ -2047,6 +2057,8 @@ struct pw_helper {
 };
 
 static struct pw_helper	pw;	/* static: the helper outlives the frame */
+static struct pw_helper	pw_corpse;	/* scene 3: dies on the list    */
+static struct pw_helper	pw_victim;	/* scene 4: killed mid-park     */
 
 static void
 pw_helper_entry(void *arg)
@@ -2064,12 +2076,63 @@ pw_helper_entry(void *arg)
 	thread_exit();
 }
 
+/*
+ * Scene 3's helper: link onto the port's waiter list exactly as the recv
+ * loop does -- including the note the recv loop now takes -- then die with
+ * the link still in place.  thread_exit owes the list an unbind; the
+ * scene's assert is that it paid.
+ */
+static void
+pw_corpse_entry(void *arg)
+{
+	struct pw_helper	*h;
+	struct port		*p;
+
+	h = arg;
+	p = h->ph_port;
+	spin_lock(&p->p_lock);
+	current_thread->th_wait_link = NULL;
+	if (p->p_waiters_tail == NULL) {
+		p->p_waiters_head = current_thread;
+		p->p_waiters_tail = current_thread;
+	} else {
+		p->p_waiters_tail->th_wait_link = current_thread;
+		p->p_waiters_tail = current_thread;
+	}
+	thread_wait_note(current_thread, &p->p_waiters_head,
+	    &p->p_waiters_tail, &p->p_lock);
+	spin_unlock(&p->p_lock);
+	h->ph_done = 1;
+	thread_exit();
+}
+
+/*
+ * Scene 4's victim: park in the REAL recv path, for ever.  Only a kill
+ * ends this wait, and the kill retires the thread inside
+ * thread_block_release -- so reaching the lines after the recv at all is
+ * itself a failure, which is what ph_got reports.
+ */
+static void
+pw_victim_entry(void *arg)
+{
+	struct mach_msg_header	 buf;
+	struct pw_helper	*h;
+
+	h = arg;
+	(void)mach_msg_recv_block(kernel_space, h->ph_name, &buf,
+	    sizeof(buf));
+	h->ph_got  = 1;
+	h->ph_done = 1;
+	thread_exit();
+}
+
 void
 port_wait_selftest(void)
 {
 	struct mach_msg_header	 hdr;
 	struct mach_msg_header	 buf;
 	struct port		*p;
+	struct task		*victim_task;
 	mach_port_name_t	 name;
 	unsigned int		 i;
 	uint8_t			 rights;
@@ -2167,6 +2230,83 @@ port_wait_selftest(void)
 		goto drain;
 	}
 
+	/*
+	 * 3. A THREAD THAT DIES ON THE LIST.  A kill retires its target from
+	 *    inside thread_block_release, above the recv loop that linked it
+	 *    onto the port -- so the loop's unconditional detach never runs,
+	 *    and the port used to keep naming a thread the reaper had
+	 *    already freed; the teardown drain then woke poisoned memory.
+	 *    Arranged like everything here: the helper links itself in
+	 *    exactly as the recv loop does, notes the list as the recv loop
+	 *    now does, and dies with the link in place.  thread_exit owes
+	 *    the list an unbind, and it parks BEHIND the scene-2 helper, so
+	 *    paying also has to fix the tail.
+	 */
+	pw_corpse.ph_port   = p;
+	pw_corpse.ph_done   = 0;
+	pw_corpse.ph_thread = thread_create(kernel_task, pw_corpse_entry,
+	    &pw_corpse, "port-corpse");
+	if (pw_corpse.ph_thread == NULL) {
+		kprintf("port-wait: FAIL no thread to die with\n");
+		goto drain;
+	}
+	thread_start(pw_corpse.ph_thread);
+	for (i = 0; i < PW_WAIT_MS && pw_corpse.ph_done == 0; i++)
+		sched_nap_ms(1);
+	for (i = 0; i < PW_WAIT_MS &&
+	    p->p_waiters_tail == pw_corpse.ph_thread; i++)
+		sched_nap_ms(1);
+	if (p->p_waiters_head != pw.ph_thread ||
+	    p->p_waiters_tail != pw.ph_thread) {
+		kprintf("port-wait: FAIL a thread that died on the list is "
+		    "still on it\n");
+		goto drain;
+	}
+
+	/*
+	 * 4. AND THE REAL THING: a task killed while its thread is parked in
+	 *    the real recv path.  The kill's wake fan-out breaks the thread
+	 *    out of the park, the post-wake check retires it inside
+	 *    thread_block_release, and the note the recv loop took when it
+	 *    linked the thread in is what lets thread_exit take it back off.
+	 */
+	victim_task = task_create("port-victim");
+	if (victim_task == NULL) {
+		kprintf("port-wait: FAIL no task to kill\n");
+		goto drain;
+	}
+	pw_victim.ph_name   = name;
+	pw_victim.ph_got    = 0;
+	pw_victim.ph_thread = thread_create(victim_task, pw_victim_entry,
+	    &pw_victim, "port-victim");
+	if (pw_victim.ph_thread == NULL) {
+		kprintf("port-wait: FAIL no thread to kill\n");
+		task_deref(victim_task);
+		goto drain;
+	}
+	thread_start(pw_victim.ph_thread);
+	for (i = 0; i < PW_WAIT_MS &&
+	    p->p_waiters_tail != pw_victim.ph_thread; i++)
+		sched_nap_ms(1);
+	if (p->p_waiters_tail != pw_victim.ph_thread) {
+		kprintf("port-wait: FAIL the victim never reached the "
+		    "port's waiter list\n");
+		task_deref(victim_task);
+		goto drain;
+	}
+	task_request_terminate(victim_task->t_id);
+	for (i = 0; i < PW_WAIT_MS &&
+	    p->p_waiters_tail == pw_victim.ph_thread; i++)
+		sched_nap_ms(1);
+	if (p->p_waiters_head != pw.ph_thread ||
+	    p->p_waiters_tail != pw.ph_thread || pw_victim.ph_got != 0) {
+		kprintf("port-wait: FAIL a thread killed mid-park is still "
+		    "on the port's waiter list\n");
+		task_deref(victim_task);
+		goto drain;
+	}
+	task_deref(victim_task);
+
 	hdr.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
 	hdr.msgh_size    = sizeof(hdr);
 	hdr.msgh_remote  = name;
@@ -2198,8 +2338,8 @@ drain:
 		goto out;
 	}
 	kprintf("port-wait: PASS -- a park that never slept left the list "
-	    "empty, and a waiter behind it was still reachable after the one "
-	    "in front of it timed out twice\n");
+	    "empty, a waiter was still reachable behind two timeouts, and "
+	    "two threads that died on the list took themselves off\n");
 out:
 	(void)port_deallocate(kernel_space, name);
 }
