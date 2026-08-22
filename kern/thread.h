@@ -94,6 +94,25 @@ struct thread {
 	int			 th_spin_depth;		/* (i) locks held   */
 	bool			 th_spin_saved_if;	/* (i) IF at depth 1 */
 
+	/*
+	 * Sleep mutexes this thread holds (kern/mutex.c moves it, nobody
+	 * else reads another thread's copy -- so it needs no lock).
+	 *
+	 * ⚠ WHAT IT GATES: a kill may not retire a thread while this is
+	 * nonzero.  A mutex dies with its owner -- there is no unlock by
+	 * proxy, mutex_unlock asserts the caller IS the owner -- so a
+	 * thread retired mid-park with a mutex held would take it to the
+	 * grave locked.  And the mutex most often held across a park is
+	 * `fs_lock`, which every disk-touching path sleeps under: one
+	 * killed writer and the machine's next disk touch parks for ever
+	 * behind a corpse.  So the kill checks in thread_block_release
+	 * decline while this is up; the thread finishes what the lock was
+	 * for and dies at the first check it reaches empty-handed -- the
+	 * syscall boundary for a user thread (which asserts the count is
+	 * zero there), the next bare park for a kernel one.
+	 */
+	int			 th_mutex_depth;	/* (self only)      */
+
 	struct thread		*th_runq_link;		/* (sched_lock)     */
 	struct thread		*th_task_link;		/* task->t_threads  */
 	SLIST_ENTRY(thread)	 th_zombie_link;	/* zombie SLIST     */

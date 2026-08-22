@@ -13,6 +13,7 @@
 #include "kmem.h"
 #include "kprintf.h"
 #include "msr.h"
+#include "panic.h"
 #include "pmap.h"
 #include "pmm.h"
 #include "port.h"
@@ -257,6 +258,18 @@ syscall_dispatch(struct syscall_frame *f)
 		rv = darwin_dispatch(f);
 	else
 		rv = syscall_dispatch_body(f);
+
+	/*
+	 * Every mutex taken inside a syscall must have been given back by
+	 * here: ring 3 cannot unlock what it cannot name.  This is also
+	 * the promise that makes the kill deferral finite -- a killed
+	 * holder is allowed to run on exactly BECAUSE this boundary is
+	 * ahead of it, holding nothing (kern/sched.c, the mutex clause in
+	 * the kill checks).  A leak caught here names the syscall that
+	 * forgot, on the very return that forgot it.
+	 */
+	KASSERT(current_thread->th_mutex_depth == 0,
+	    "syscall returning to ring 3 with a mutex still held");
 
 	/*
 	 * Detection point #5: syscall-exit kill check.  Catches the

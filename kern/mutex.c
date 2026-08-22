@@ -14,6 +14,7 @@
 #include "panic.h"
 #include "sched.h"
 #include "spinlock.h"
+#include "task.h"
 #include "thread.h"
 
 /* See mutex.h for what this is and why it had to exist. */
@@ -148,6 +149,13 @@ mutex_lock(struct mutex *m)
 		 */
 	}
 	m->mtx_owner = current_thread;
+	/*
+	 * The count the kill checks read (see th_mutex_depth in
+	 * kern/thread.h): while it is up, a kill declines to retire this
+	 * thread, because a mutex dies with its owner.  Moved only by its
+	 * own thread, here and in unlock, so it needs no lock of its own.
+	 */
+	current_thread->th_mutex_depth++;
 	mutex_n_acquire++;
 	spin_unlock(&m->mtx_guard);
 }
@@ -177,8 +185,10 @@ mutex_trylock(struct mutex *m)
 
 	spin_lock(&m->mtx_guard);
 	got = m->mtx_owner == NULL;
-	if (got)
+	if (got) {
 		m->mtx_owner = current_thread;
+		current_thread->th_mutex_depth++;
+	}
 	spin_unlock(&m->mtx_guard);
 	return (got);
 }
@@ -191,7 +201,10 @@ mutex_unlock(struct mutex *m)
 	spin_lock(&m->mtx_guard);
 	KASSERT(m->mtx_owner == current_thread,
 	    "mutex_unlock by a thread that does not hold it");
+	KASSERT(current_thread->th_mutex_depth > 0,
+	    "mutex_unlock: the held-mutex count is already zero");
 	m->mtx_owner = NULL;
+	current_thread->th_mutex_depth--;
 	w = waiter_pop(m);
 	spin_unlock(&m->mtx_guard);
 
@@ -215,4 +228,145 @@ mutex_held(const struct mutex *m)
 	 * thread asking, because only the owner releases it.
 	 */
 	return (m->mtx_owner == current_thread);
+}
+
+/* ---- selftest -------------------------------------------------------- */
+
+/*
+ * WHAT A KILL DOES TO A THREAD HOLDING ONE LOCK AND WAITING FOR ANOTHER --
+ * which is every disk write in this kernel, seen from close up: the outer
+ * lock is fs_lock, the inner wait is the drive's interrupt, and a kill that
+ * landed there used to retire the thread on the spot, taking the outer lock
+ * to the grave with it.  Every later acquirer then parks behind a corpse,
+ * which for fs_lock means the machine never touches the disk again.
+ *
+ * The scene is that shape with the driver taken out, so it is deterministic:
+ * the victim takes an outer lock and parks acquiring an inner one this test
+ * is holding.  The kill lands mid-park and DECLINES -- th_mutex_depth is up
+ * -- so the victim stays parked, still owning what it owned.  Then the inner
+ * lock is released, and a thread the kernel has already agreed to kill
+ * finishes the walk: takes the inner lock, gives both back, and only then
+ * retires.  The asserts are on what it leaves behind: two locks anyone can
+ * take, and a flag proving it lived past its own death warrant.
+ */
+#define	MK_WAIT_MS	4000u
+
+static struct mutex	mk_outer = MUTEX_INIT("mk-outer");
+static struct mutex	mk_inner = MUTEX_INIT("mk-inner");
+
+static struct {
+	volatile int	 mk_holding;	/* victim owns the outer lock  */
+	volatile int	 mk_done;	/* ...and gave both back alive */
+	struct thread	*mk_thread;
+} mk;
+
+static void
+mutex_kill_entry(void *arg)
+{
+
+	(void)arg;
+	mutex_lock(&mk_outer);
+	mk.mk_holding = 1;
+	mutex_lock(&mk_inner);
+	mutex_unlock(&mk_inner);
+	mutex_unlock(&mk_outer);
+	mk.mk_done = 1;
+	/* The trampoline's thread_exit retires us at last, empty-handed. */
+}
+
+void
+mutex_kill_selftest(void)
+{
+	struct task	*vt;
+	unsigned int	 i;
+
+	mutex_lock(&mk_inner);
+
+	vt = task_create("mutex-kill");
+	if (vt == NULL) {
+		kprintf("mutex-kill: FAIL no task to kill\n");
+		mutex_unlock(&mk_inner);
+		return;
+	}
+	mk.mk_holding = 0;
+	mk.mk_done    = 0;
+	mk.mk_thread  = thread_create(vt, mutex_kill_entry, NULL,
+	    "mutex-kill");
+	if (mk.mk_thread == NULL) {
+		kprintf("mutex-kill: FAIL no thread to kill\n");
+		mutex_unlock(&mk_inner);
+		task_deref(vt);
+		return;
+	}
+	thread_start(mk.mk_thread);
+
+	for (i = 0; i < MK_WAIT_MS && mk.mk_holding == 0; i++)
+		sched_nap_ms(1);
+	for (i = 0; i < MK_WAIT_MS &&
+	    mk_inner.mtx_waiters_head != mk.mk_thread; i++)
+		sched_nap_ms(1);
+	if (mk.mk_holding == 0 ||
+	    mk_inner.mtx_waiters_head != mk.mk_thread) {
+		kprintf("mutex-kill: FAIL the victim never parked on the "
+		    "inner lock\n");
+		mutex_unlock(&mk_inner);
+		task_deref(vt);
+		return;
+	}
+
+	task_request_terminate(vt->t_id);
+
+	/*
+	 * Let the kill's wake fan-out land and be declined.  The victim
+	 * wakes, reads its own death warrant, sees the outer lock in its
+	 * hand, and parks again -- so nothing here may have changed: the
+	 * victim has not moved past a lock this test still holds, and the
+	 * outer lock still has a living owner.  (A kill that retired it
+	 * anyway would leave the outer lock latched for ever, which is
+	 * exactly what the trylock probes.)
+	 */
+	sched_nap_ms(50);
+	if (mk.mk_done != 0) {
+		kprintf("mutex-kill: FAIL the victim got past a lock this "
+		    "test is still holding\n");
+		mutex_unlock(&mk_inner);
+		task_deref(vt);
+		return;
+	}
+	if (mutex_trylock(&mk_outer)) {
+		mutex_unlock(&mk_outer);
+		kprintf("mutex-kill: FAIL the kill tore the outer lock out "
+		    "of the victim's hand\n");
+		mutex_unlock(&mk_inner);
+		task_deref(vt);
+		return;
+	}
+
+	mutex_unlock(&mk_inner);
+
+	for (i = 0; i < MK_WAIT_MS && mk.mk_done == 0; i++)
+		sched_nap_ms(1);
+	if (mk.mk_done == 0) {
+		kprintf("mutex-kill: FAIL the victim never came back for "
+		    "the inner lock\n");
+		task_deref(vt);
+		return;
+	}
+	if (!mutex_trylock(&mk_outer)) {
+		kprintf("mutex-kill: FAIL the outer lock did not come home\n");
+		task_deref(vt);
+		return;
+	}
+	mutex_unlock(&mk_outer);
+	if (!mutex_trylock(&mk_inner)) {
+		kprintf("mutex-kill: FAIL the inner lock did not come home\n");
+		task_deref(vt);
+		return;
+	}
+	mutex_unlock(&mk_inner);
+	task_deref(vt);
+
+	kprintf("mutex-kill: PASS -- a thread killed holding one lock and "
+	    "waiting for another was left to finish the walk, gave both "
+	    "locks back, and retired empty-handed\n");
 }

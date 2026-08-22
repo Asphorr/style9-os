@@ -15,6 +15,9 @@
 #include "kmem.h"
 #include "kprintf.h"
 #include "mutex.h"
+#include "sched.h"
+#include "task.h"
+#include "thread.h"
 
 /*
  * One lock for the volume, and it lives here rather than in either backend.
@@ -2736,5 +2739,170 @@ fs_seek_selftest(void)
 	mutex_lock(&fs_lock);
 	fs_apfs_seek_selftest();
 	mutex_unlock(&fs_lock);
+}
+
+/*
+ * WHAT A KILL DOES TO A TASK THAT IS WRITING TO THE DISK -- the scene the
+ * mutex-kill selftest (kern/mutex.c) plays with the driver taken out, played
+ * here with the driver in.  The victim hammers pwrites at a scratch file, so
+ * at any given moment it is probably parked inside ata_wait_intr holding
+ * fs_lock; the kill's wake fan-out breaks it out of that park, and before
+ * th_mutex_depth the post-wake check retired it right there -- fs_lock died
+ * with it, the ATA channel's ch_waiter slot kept its name, and the next
+ * thing to touch the volume parked for ever.  Now the kill declines while
+ * the lock is held: the victim surfaces from the write it was killed in,
+ * reads its own death warrant between operations, and leaves with the lock
+ * returned.  The proof is that the volume still answers afterwards.
+ */
+#define	FK_FILE		"/var/db/kill-arena"
+#define	FK_SIZE		(64u * 1024u)
+#define	FK_PASSES	6u
+#define	FK_WAIT_MS	8000u
+
+static volatile uint32_t	fk_ops;		/* pwrites completed  */
+static volatile int		fk_finished;	/* ...and surfaced    */
+
+static void
+fs_kill_entry(void *arg)
+{
+	struct fs_handle	 h;
+	uint64_t		 off;
+	uint32_t		 put;
+	unsigned int		 pass, i;
+	uint8_t			 blk[4096];
+
+	(void)arg;
+	for (pass = 0; pass < FK_PASSES; pass++) {
+		if (fs_open(FK_FILE, &h) != FS_E_OK)
+			break;
+		for (off = 0; off + sizeof(blk) <= FK_SIZE;
+		    off += sizeof(blk)) {
+			for (i = 0; i < sizeof(blk); i++)
+				blk[i] = (uint8_t)(pass * 7u + i);
+			if (fs_pwrite(&h, off, blk, sizeof(blk),
+			    &put) != FS_E_OK || put != sizeof(blk))
+				break;
+			fk_ops++;
+			/*
+			 * A kernel-side worker has no syscall boundary, so
+			 * it reads its own death warrant where it holds
+			 * nothing -- between operations, with fs_lock
+			 * given back by the pwrite that took it.
+			 */
+			if (task_kill_pending(current_thread->th_task))
+				break;
+		}
+		(void)fs_close(&h);
+		if (task_kill_pending(current_thread->th_task))
+			break;
+	}
+	fk_finished = 1;
+	/* The trampoline's thread_exit retires us, empty-handed. */
+}
+
+void
+fs_kill_selftest(void)
+{
+	struct fs_handle	 h;
+	struct task		*vt;
+	struct thread		*th;
+	uint64_t		 ino;
+	uint32_t		 got;
+	unsigned int		 i;
+	uint8_t			 probe[64];
+	bool			 lock_free;
+	int			 rv;
+
+	if (!fs_apfs_ready())
+		return;
+
+	rv = fs_create(FK_FILE, 0644, &ino);
+	if (rv != FS_E_OK && rv != FS_E_EXIST) {
+		kprintf("fs-kill: FAIL the arena cannot be made (rv=%d)\n",
+		    rv);
+		return;
+	}
+	if (fs_open(FK_FILE, &h) != FS_E_OK) {
+		kprintf("fs-kill: FAIL the arena cannot be opened\n");
+		return;
+	}
+	if (h.fh_size < FK_SIZE && fs_truncate(&h, FK_SIZE) != FS_E_OK) {
+		(void)fs_close(&h);
+		(void)fs_unlink(FK_FILE);
+		kprintf("fs-kill: FAIL the arena cannot be sized\n");
+		return;
+	}
+	(void)fs_close(&h);
+
+	vt = task_create("fs-kill");
+	if (vt == NULL) {
+		kprintf("fs-kill: FAIL no task to kill\n");
+		return;
+	}
+	fk_ops      = 0;
+	fk_finished = 0;
+	th = thread_create(vt, fs_kill_entry, NULL, "fs-kill");
+	if (th == NULL) {
+		kprintf("fs-kill: FAIL no thread to kill\n");
+		task_deref(vt);
+		return;
+	}
+	thread_start(th);
+
+	/* Let it get well into the write storm, then kill it mid-stride. */
+	for (i = 0; i < FK_WAIT_MS && fk_ops < 4 && fk_finished == 0; i++)
+		sched_nap_ms(1);
+	if (fk_ops < 4 && fk_finished == 0) {
+		kprintf("fs-kill: FAIL the victim never started writing\n");
+		task_deref(vt);
+		return;
+	}
+	task_request_terminate(vt->t_id);
+
+	for (i = 0; i < FK_WAIT_MS && fk_finished == 0; i++)
+		sched_nap_ms(1);
+	if (fk_finished == 0) {
+		kprintf("fs-kill: FAIL the victim never surfaced from the "
+		    "write it was killed in\n");
+		task_deref(vt);
+		return;
+	}
+
+	/* The lock came home rather than to the grave... */
+	lock_free = false;
+	for (i = 0; i < FK_WAIT_MS && !lock_free; i++) {
+		if (mutex_trylock(&fs_lock)) {
+			mutex_unlock(&fs_lock);
+			lock_free = true;
+		} else
+			sched_nap_ms(1);
+	}
+	if (!lock_free) {
+		kprintf("fs-kill: FAIL fs_lock is in a dead thread's hand\n");
+		task_deref(vt);
+		return;
+	}
+
+	/* ...and the volume answers as though nothing had happened. */
+	if (fs_open(FK_FILE, &h) != FS_E_OK ||
+	    fs_pread(&h, 0, probe, sizeof(probe), &got) != FS_E_OK ||
+	    got != sizeof(probe)) {
+		kprintf("fs-kill: FAIL the volume stopped answering after "
+		    "the kill\n");
+		task_deref(vt);
+		return;
+	}
+	(void)fs_close(&h);
+	if (fs_unlink(FK_FILE) != FS_E_OK) {
+		kprintf("fs-kill: FAIL the arena cannot be unlinked\n");
+		task_deref(vt);
+		return;
+	}
+	task_deref(vt);
+
+	kprintf("fs-kill: PASS -- a task killed %u pwrites into a write "
+	    "storm surfaced with the volume lock returned, and the volume "
+	    "answered a read and an unlink as though nothing had happened\n",
+	    (unsigned)fk_ops);
 }
 

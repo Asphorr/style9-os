@@ -441,6 +441,15 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	 */
 	port_wait_selftest();
 
+	/*
+	 * The two kill-vs-lock scenes, here for the same reason: both spawn
+	 * a task and kill it, and one of them kills it in the middle of real
+	 * disk I/O, which wants the volume mounted and the write path
+	 * already proven by the fs battery above.
+	 */
+	mutex_kill_selftest();
+	fs_kill_selftest();
+
 	progreg_init();
 
 	/*

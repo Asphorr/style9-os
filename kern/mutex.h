@@ -104,6 +104,13 @@ bool	mutex_held(const struct mutex *);
 uint64_t	mutex_blocks(void);
 void		mutex_stats(void);
 
+/*
+ * Boot scene for the kill-vs-held-mutex contract (th_mutex_depth in
+ * kern/thread.h): a thread killed while holding one lock and parked on
+ * another must be left to give both back before it is allowed to die.
+ */
+void		mutex_kill_selftest(void);
+
 #define	MUTEX_ASSERT_HELD(m)						\
 	KASSERT(mutex_held(m), "mutex not held where expected")
 

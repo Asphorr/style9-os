@@ -22,6 +22,7 @@
 #include "port.h"
 #include "sched.h"
 #include "spinlock.h"
+#include "task.h"
 #include "thread.h"
 #include "tsc.h"
 
@@ -1152,6 +1153,22 @@ ata_wait_intr(struct ata_channel *ch, uint8_t want, uint8_t *sr_out)
 
 	self    = current_thread;
 	give_up = clock_uptime_ms() + ATA_INTR_LIMIT_MS;
+
+	/*
+	 * ⚠ THE SLOT BELOW IS ONLY SAFE BECAUSE OF WHO MAY STAND IN IT.
+	 * ch_waiter names this thread while it parks, and the wake the ISR
+	 * posts against that name has no way to know whether the thread
+	 * still exists.  What keeps the name fresh is not the driver: a
+	 * kernel_task thread cannot be killed at all, and every other
+	 * thread reaches this wait holding fs_lock, which makes the kill
+	 * checks decline to retire it mid-park (th_mutex_depth, in
+	 * kern/thread.h) -- so a thread the slot names cannot die out from
+	 * under it.  A caller parking here from a killable task with no
+	 * mutex held would reopen the stale-slot grave, and is refused at
+	 * the door.
+	 */
+	KASSERT(self->th_task == kernel_task || self->th_mutex_depth > 0,
+	    "ata_wait_intr: a killable thread is waiting with nothing held");
 
 	for (;;) {
 		if (__atomic_load_n(&ch->ch_irq_seen, __ATOMIC_ACQUIRE) != 0)

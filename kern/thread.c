@@ -78,6 +78,7 @@ thread_adopt_current(struct task *t, const char *name)
 	 */
 	th->th_spin_depth      = 0;
 	th->th_spin_saved_if   = false;
+	th->th_mutex_depth     = 0;
 	th->th_runq_link       = NULL;
 	th->th_task_link       = NULL;
 	th->th_wait_link       = NULL;
@@ -198,6 +199,7 @@ thread_create(struct task *t, void (*entry)(void *), void *arg,
 	 */
 	th->th_spin_depth        = 1;
 	th->th_spin_saved_if     = true;
+	th->th_mutex_depth       = 0;
 	th->th_runq_link         = NULL;
 	th->th_task_link         = NULL;
 	th->th_wait_link         = NULL;
@@ -351,6 +353,17 @@ thread_exit(void)
 
 	me = current_thread;
 	KASSERT(me != NULL, "thread_exit: no current thread");
+
+	/*
+	 * No exit may carry a mutex out of the world: there is no unlock by
+	 * proxy, so a lock held here stays held for ever and everything that
+	 * ever wants it parks behind a corpse.  The kill checks decline to
+	 * retire a thread whose th_mutex_depth is up (kern/sched.c), and the
+	 * syscall boundary asserts the count is zero -- this is the last
+	 * tripwire, the one every exit path passes through.
+	 */
+	KASSERT(me->th_mutex_depth == 0,
+	    "thread_exit: dying with a mutex still held");
 
 	/*
 	 * OFF THE DEADLINE LIST BEFORE GOING ANYWHERE ELSE.

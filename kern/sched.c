@@ -698,8 +698,25 @@ thread_block_release(int reason, void *target, struct spinlock *external)
 	 * of sched_lock.  kernel_task threads cannot be killed so skip
 	 * the check for them entirely; t_killed is permanently false
 	 * there.
+	 *
+	 * ⚠ AND NOT WHILE A MUTEX IS HELD.  A thread that dies owning one
+	 * takes it to the grave locked -- mutex_unlock is owner-only, so
+	 * nobody can give it back for the corpse -- and the mutex most
+	 * often slept under is fs_lock, which every disk path holds
+	 * across its ATA waits.  Retiring here used to leave the whole
+	 * filesystem parked behind a dead owner (and the ATA channel's
+	 * ch_waiter slot naming reaped memory, which is the same defect
+	 * seen from the driver).  So a kill found while th_mutex_depth
+	 * is up DECLINES: the thread parks normally, finishes the
+	 * operation the lock was for, and retires at the first check it
+	 * reaches holding nothing -- the syscall boundary for a user
+	 * thread, the next bare park for a kernel one.  The wait it
+	 * re-enters is finite because every park under a mutex in this
+	 * kernel is: the ATA waits carry deadlines, and a mutex it is
+	 * still acquiring is released by a live owner.
 	 */
 	if (self->th_task != kernel_task &&
+	    self->th_mutex_depth == 0 &&
 	    task_kill_pending(self->th_task)) {
 		/*
 		 * Off the object's waiter list before the locks go, if the
@@ -820,8 +837,15 @@ thread_block_release(int reason, void *target, struct spinlock *external)
 	 * were parked, the wake it fired broke us out of the BLOCKED
 	 * state and we resumed here; t_killed is set, so retire instead
 	 * of returning to the caller (whose RPC the user will never read).
+	 *
+	 * Same mutex clause as the pre-park check: a holder returns to
+	 * its caller instead, gives the lock back in the ordinary course
+	 * of the operation, and dies at the boundary.  The kill fan-out's
+	 * wake is then just a spurious one, which every park here already
+	 * absorbs.
 	 */
 	if (current_thread->th_task != kernel_task &&
+	    current_thread->th_mutex_depth == 0 &&
 	    task_kill_pending(current_thread->th_task))
 		thread_exit();
 	/* NOTREACHED if killed */

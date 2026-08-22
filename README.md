@@ -1418,17 +1418,27 @@ lives, in `thread_wait_unbind`: an extractor that has popped a thread and not
 yet woken it races the corpse's reap -- closing that means a reference the
 waker holds, which is a rung of its own.
 
-**⚠ And two siblings are named here rather than fixed**, the way the last one
-was. The ATA channel's waiter is a slot, not a list (`ch_waiter`), and the
-same kill-mid-park exit leaves it stale: the interrupt for the command still
-in flight exchanges the slot and posts a wake against a thread that may by
-then be reaped. And a thread killed while parked *under a mutex* -- every
-disk-touching path sleeps holding `fs_lock` -- retires without releasing it,
-leaving `mtx_owner` naming a corpse and every later acquirer parked behind a
-lock nobody holds. The honest shape of that fix is a held-mutex count that
-makes the kill checks decline to retire, letting the thread run out to its
-syscall boundary, where it holds nothing; both are the same rung and it is
-not this one.
+**And the two siblings named there are now fixed with one number.** A thread
+killed while parked *under a mutex* -- every disk-touching path sleeps holding
+`fs_lock` -- used to retire without releasing it, leaving `mtx_owner` naming a
+corpse and every later acquirer parked behind a lock nobody holds; and the ATA
+channel's waiter slot (`ch_waiter`) kept the corpse's name, so the interrupt
+for the command still in flight posted a wake against reaped memory. The fix
+is the count both defects were asking for: `th_mutex_depth`, moved only by its
+own thread in `mutex_lock`/`mutex_unlock`, and read by the kill checks in
+`thread_block_release` -- **a kill found while the count is up declines**. The
+thread parks on, finishes the operation the lock was for, and dies at the
+first check it reaches empty-handed: the syscall boundary for a user thread
+(which now *asserts* the count is zero, so a syscall that leaks a mutex is
+named on the very return that leaks it), the next bare park for a kernel one.
+The deferral is finite because every park under a mutex here is: the ATA
+waits carry deadlines, and a mutex still being acquired has a live owner.
+`thread_exit` asserts the count is zero as the last tripwire every exit path
+crosses, `ata_wait_intr` refuses a killable caller that arrives holding
+nothing, and two scenes prove the contract from both ends: `mutex-kill`
+(kern/mutex.c) kills a thread that holds one lock and is parked on another,
+deterministically, and `fs-kill` (fs/fs.c) kills a task mid-write-storm and
+then asks the volume whether it noticed.
 
 ### One more thing the hypervisor said
 

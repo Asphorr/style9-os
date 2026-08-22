@@ -530,6 +530,15 @@ void		fs_open_check(void);
 void		fs_seek_selftest(void);
 
 /*
+ * fs-kill: a task killed in the middle of a disk write must surface with
+ * fs_lock returned rather than taking it to the grave (th_mutex_depth in
+ * kern/thread.h), and the volume must answer afterwards.  Spawns and kills a
+ * throwaway task, so it runs late in boot, after the scheduler and tasks are
+ * proven.  Silently does nothing when the volume is not APFS.
+ */
+void		fs_kill_selftest(void);
+
+/*
  * The volume generation, and what it has caught: how many handles were older
  * than the volume when used, and how many of those had a length that really
  * had moved.  The first number moving proves the check is alive; the second
