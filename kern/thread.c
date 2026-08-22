@@ -85,6 +85,7 @@ thread_adopt_current(struct task *t, const char *name)
 	th->th_wait_qhead      = NULL;
 	th->th_wait_qtail      = NULL;
 	th->th_wait_qlock      = NULL;
+	th->th_wait_slot       = NULL;
 	th->th_irq_link        = NULL;
 	th->th_sleep_link      = NULL;
 	th->th_wake_ms         = 0;
@@ -95,6 +96,8 @@ thread_adopt_current(struct task *t, const char *name)
 	th->th_wake_deadline_ms = 0;
 	th->th_timed_out       = 0;
 	th->th_timed_link      = NULL;
+	th->th_wake_hold       = 0;
+	th->th_irq_queued      = 0;
 	th->th_held_count      = 0;
 	{
 		unsigned	exi;
@@ -206,6 +209,7 @@ thread_create(struct task *t, void (*entry)(void *), void *arg,
 	th->th_wait_qhead        = NULL;
 	th->th_wait_qtail        = NULL;
 	th->th_wait_qlock        = NULL;
+	th->th_wait_slot         = NULL;
 	th->th_irq_link          = NULL;
 	th->th_sleep_link        = NULL;
 	th->th_wake_ms           = 0;
@@ -216,6 +220,8 @@ thread_create(struct task *t, void (*entry)(void *), void *arg,
 	th->th_wake_deadline_ms  = 0;
 	th->th_timed_out         = 0;
 	th->th_timed_link        = NULL;
+	th->th_wake_hold         = 0;
+	th->th_irq_queued        = 0;
 	th->th_held_count        = 0;
 	{
 		unsigned	exi;
@@ -296,6 +302,52 @@ thread_wait_forget(struct thread *th)
 	th->th_wait_qlock = NULL;
 }
 
+/*
+ * The waker's claim against reap -- see th_wake_hold in thread.h for the
+ * window it closes and the liveness rule for taking it.  Atomic because the
+ * claims come from anywhere: thread context under an object's lock, the PIT
+ * walk under timed_lock, a device ISR that just exchanged its waiter slot.
+ */
+/*
+ * The slot note -- the waiter-list note's little sibling, for the drivers
+ * whose "list" is one cell an ISR exchanges (th_wait_slot in thread.h).
+ * note: taken around the whole wait loop, not per install, because the
+ * cell may name this thread at any point inside it.  forget: before every
+ * return from the loop, by which time the loop's own discipline has
+ * emptied the cell.
+ */
+void
+thread_slot_note(struct thread *th, struct thread *volatile *slot)
+{
+
+	KASSERT(th->th_wait_slot == NULL,
+	    "thread_slot_note: still noted on another slot");
+	th->th_wait_slot = slot;
+}
+
+void
+thread_slot_forget(struct thread *th)
+{
+
+	th->th_wait_slot = NULL;
+}
+
+void
+thread_hold(struct thread *th)
+{
+
+	__atomic_add_fetch(&th->th_wake_hold, 1, __ATOMIC_ACQ_REL);
+}
+
+void
+thread_unhold(struct thread *th)
+{
+	uint32_t	was;
+
+	was = __atomic_fetch_sub(&th->th_wake_hold, 1, __ATOMIC_ACQ_REL);
+	KASSERT(was != 0, "thread_unhold: releasing a hold never taken");
+}
+
 void
 thread_wait_unbind_locked(struct thread *th)
 {
@@ -324,14 +376,12 @@ thread_wait_unbind_locked(struct thread *th)
  * lock, take the thread off the noted list if it is still there, forget.
  *
  * Finding the thread already gone is legitimate -- an extractor popped it
- * and its wake is what brought the thread here.  ⚠ WHAT IS STILL OWED, and
- * written down rather than fixed: an extractor that has popped this thread
- * and NOT YET woken it races the reap.  The window needs the extractor to
- * stall between two adjacent lines -- the pop under the object's lock and
- * the thread_wake after it -- for as long as it takes this thread to
- * finish exiting AND a third party to reap the zombie; the wake then
- * touches freed memory, which the kmem poison check would name.  Closing
- * it means a reference the waker holds, which is a rung of its own.
+ * and its wake is what brought the thread here.  The window that used to
+ * be written down at this spot rather than fixed -- an extractor that has
+ * popped this thread and NOT YET woken it races the reap -- is paid now:
+ * every extractor takes a hold on what it pops, under the same lock this
+ * function will have to take, and the reaper leaves a held body alone
+ * until the wake has landed (th_wake_hold, thread_hold/thread_unhold).
  */
 static void
 thread_wait_unbind(struct thread *th)
@@ -398,6 +448,25 @@ thread_exit(void)
 	 * no longer wakes a thread that was reaped out from under the list.
 	 */
 	thread_wait_unbind(me);
+
+	/*
+	 * AND OUT OF THE DRIVER'S SLOT, the third and last place a name can
+	 * outlive its thread.  The cell has no lock to settle under -- the
+	 * ISR takes it with a bare exchange -- so this is settled the same
+	 * way: one compare-and-swap of our own name for NULL.  Exactly one
+	 * side gets the pointer.  If the exit wins, the interrupt finds the
+	 * cell empty and wakes nobody; if the interrupt wins, the wake it
+	 * posts went through sched_post_irq_wake, whose hold keeps this
+	 * body on the zombie list until that wake has landed.
+	 */
+	if (me->th_wait_slot != NULL) {
+		struct thread	*expect;
+
+		expect = me;
+		(void)__atomic_compare_exchange_n(me->th_wait_slot, &expect,
+		    NULL, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+		me->th_wait_slot = NULL;
+	}
 
 	spin_lock(&me->th_lock);
 	me->th_state = THREAD_ZOMBIE;

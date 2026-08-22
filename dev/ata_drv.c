@@ -1170,6 +1170,14 @@ ata_wait_intr(struct ata_channel *ch, uint8_t want, uint8_t *sr_out)
 	KASSERT(self->th_task == kernel_task || self->th_mutex_depth > 0,
 	    "ata_wait_intr: a killable thread is waiting with nothing held");
 
+	/*
+	 * And noted anyway, belt beside braces: if a killable thread ever
+	 * does stand here, its exit takes the name back out of the slot
+	 * (th_wait_slot, kern/thread.h) instead of leaving it for the
+	 * in-flight command's interrupt to wake.
+	 */
+	thread_slot_note(self, &ch->ch_waiter);
+
 	for (;;) {
 		if (__atomic_load_n(&ch->ch_irq_seen, __ATOMIC_ACQUIRE) != 0)
 			break;
@@ -1215,6 +1223,7 @@ ata_wait_intr(struct ata_channel *ch, uint8_t want, uint8_t *sr_out)
 		    (sr & want) == want)) {
 			__atomic_store_n(&ch->ch_waiter, NULL,
 			    __ATOMIC_RELAXED);
+			thread_slot_forget(self);
 			ch->ch_n_lost++;
 			sr = inb(ch->ch_io_base + ATA_REG_STATUS);
 			*sr_out = sr;
@@ -1236,11 +1245,13 @@ ata_wait_intr(struct ata_channel *ch, uint8_t want, uint8_t *sr_out)
 			    (unsigned)ch->ch_io_base,
 			    (unsigned)ATA_INTR_LIMIT_MS, (unsigned)sr,
 			    (unsigned)want);
+			thread_slot_forget(self);
 			*sr_out = sr;
 			return (-1);
 		}
 	}
 	__atomic_store_n(&ch->ch_waiter, NULL, __ATOMIC_RELAXED);
+	thread_slot_forget(self);
 
 	sr = ch->ch_irq_status;
 	if ((sr & (ATA_SR_ERR | ATA_SR_DF)) != 0) {

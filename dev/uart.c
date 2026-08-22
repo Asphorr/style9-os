@@ -151,11 +151,14 @@ uart_getc_block(void)
 	char		 c;
 
 	self = current_thread;
+	/* Noted for the length of the loop -- see kbd_getc_block. */
+	thread_slot_note(self, &uart_waiter);
 
 	for (;;) {
 		if (uart_buf_head != uart_buf_tail) {
 			c = uart_buf[uart_buf_tail & UART_BUF_MASK];
 			uart_buf_tail++;
+			thread_slot_forget(self);
 			return ((unsigned char)c);
 		}
 
@@ -167,6 +170,7 @@ uart_getc_block(void)
 			    __ATOMIC_RELAXED);
 			c = uart_buf[uart_buf_tail & UART_BUF_MASK];
 			uart_buf_tail++;
+			thread_slot_forget(self);
 			return ((unsigned char)c);
 		}
 

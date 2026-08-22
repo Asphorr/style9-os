@@ -327,11 +327,23 @@ kbd_getc_block(void)
 	int		 c;
 
 	self = current_thread;
+	/*
+	 * Noted for the length of the loop: kbd_waiter may carry our name
+	 * anywhere inside it, and an exit mid-park would leave that name
+	 * for the next keystroke's ISR to wake.  Today's only caller is
+	 * the kernel_task kbd-drv thread, which cannot be killed -- the
+	 * note is what keeps that from being a load-bearing coincidence
+	 * (thread_exit CASes the name back out; th_wait_slot in
+	 * kern/thread.h).
+	 */
+	thread_slot_note(self, &kbd_waiter);
 
 	for (;;) {
 		c = kbd_getc();
-		if (c >= 0)
+		if (c >= 0) {
+			thread_slot_forget(self);
 			return (c);
+		}
 
 		/*
 		 * Empty: register, clear the pending flag, then recheck
@@ -347,6 +359,7 @@ kbd_getc_block(void)
 		if (c >= 0) {
 			__atomic_store_n(&kbd_waiter, NULL,
 			    __ATOMIC_RELAXED);
+			thread_slot_forget(self);
 			return (c);
 		}
 

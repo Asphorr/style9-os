@@ -165,6 +165,26 @@ struct thread {
 	struct spinlock		 *th_wait_qlock;	/* (self only)      */
 
 	/*
+	 * ⚠ AND THE SAME MEMORY FOR A SLOT, because four drivers keep not
+	 * a list but a single cell: ata's ch_waiter, kbd_waiter,
+	 * mouse_waiter, uart_waiter.  A consumer installs itself in the
+	 * cell and parks; the ISR exchanges the cell and posts a wake
+	 * against whatever name it got.  A thread killed mid-park used to
+	 * leave its name in the cell, and the next interrupt woke reaped
+	 * memory.  So the thread notes WHICH cell may name it
+	 * (thread_slot_note, around the whole wait loop), and thread_exit
+	 * compare-and-swaps its own name out -- atomically against the
+	 * ISR's exchange, so exactly one of them gets the pointer: the
+	 * exit clears it and the interrupt finds the cell empty, or the
+	 * interrupt wins and the wake it posts is pinned by
+	 * sched_post_irq_wake's hold before the exit can finish becoming
+	 * reapable.  Strictly the thread's own: nobody else reads or
+	 * writes the note, and the cell itself keeps its existing
+	 * discipline untouched.
+	 */
+	struct thread	*volatile *th_wait_slot;	/* (self only)      */
+
+	/*
 	 * Queued for a wake an interrupt handler could not perform itself.
 	 * Its own field for the third time and the same reason: the thread
 	 * sitting on this list is BLOCKED and somebody else is entitled to
@@ -174,6 +194,33 @@ struct thread {
 	 * every wake queued behind it was simply never delivered.
 	 */
 	struct thread		*th_irq_link;		/* (a) irq_wake_head */
+
+	/*
+	 * ⚠ A WAKE IS A POINTER, AND A POINTER CAN OUTLIVE ITS THREAD.
+	 * Every waker in this kernel pops a thread from some list or slot
+	 * and calls thread_wake on it a few lines later, with the list's
+	 * lock already dropped -- and in those few lines the thread can be
+	 * woken by somebody else (a kill fan-out), retire, and be REAPED,
+	 * so the wake lands on freed memory.  th_wake_hold is the claim
+	 * that closes the window: a waker takes it (thread_hold) while the
+	 * thread is still provably alive -- under the lock the thread's
+	 * own exit path must take, or in the interrupt that just owned the
+	 * slot naming it -- and releases it (thread_unhold) after the
+	 * wake.  sched_reap_zombies leaves a held body on the zombie list
+	 * for a later pass, which is all the pin means: not "do not die",
+	 * only "do not be freed yet".
+	 *
+	 * th_irq_queued is the irq-wake LIFO's own membership mark, set by
+	 * sched_post_irq_wake and cleared by the drain.  It exists because
+	 * two independent parties may post the same thread at once -- the
+	 * PIT's deadline walk and a device ISR, on different CPUs -- and
+	 * the second push would overwrite th_irq_link while the first list
+	 * still runs through it, cutting the LIFO or tying it into a
+	 * cycle.  Once queued is enough: the wake already coming carries
+	 * every kind of news, since every sleeper here re-tests anyway.
+	 */
+	uint32_t		 th_wake_hold;		/* (a) pins vs reap  */
+	volatile int		 th_irq_queued;		/* (a) on the LIFO   */
 
 	/*
 	 * Sleep-queue link: threads parked on a CHANNEL, i.e. those that
@@ -337,6 +384,25 @@ void		thread_wait_note(struct thread *, struct thread **qhead,
 		    struct thread **qtail, struct spinlock *qlock);
 void		thread_wait_forget(struct thread *);
 void		thread_wait_unbind_locked(struct thread *);
+
+/*
+ * The waker's claim against reap (see th_wake_hold above).  hold: pin the
+ * thread's memory -- legal only while the thread is provably alive, i.e.
+ * under the lock its exit path must take to leave the list it was popped
+ * from, or in the IRQ that just exchanged the slot naming it.  unhold:
+ * release the pin, after the thread_wake it was taken for.
+ */
+void		thread_hold(struct thread *);
+void		thread_unhold(struct thread *);
+
+/*
+ * The slot note (see th_wait_slot above): note around a driver wait loop
+ * whose ISR wakes by exchanging a single waiter cell, forget before every
+ * return from it.  thread_exit settles what the note still owes by CASing
+ * the thread's own name out of the cell.
+ */
+void		thread_slot_note(struct thread *, struct thread *volatile *);
+void		thread_slot_forget(struct thread *);
 
 const char	*thread_state_name(enum thread_state);
 const char	*thread_block_reason_name(enum thread_block_reason);

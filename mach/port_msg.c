@@ -87,6 +87,12 @@ msg_validate(const struct mach_msg_header *h)
  * Set-waiters take precedence: the canonical pattern is one server
  * thread parked on a set serving many member ports, so we'd rather
  * wake the server than a stray port-direct waiter.
+ *
+ * The waiter handed out is HELD (thread_hold, taken under the list's
+ * lock where it is provably alive): between our unlock and the
+ * caller's wake it can be woken by a kill, retire and be reaped, and
+ * the hold is what makes the reaper wait.  The caller owes a
+ * thread_unhold after its thread_wake.
  */
 static int
 msg_enqueue(struct port *p, struct port_msg *m, struct thread **waiter_out)
@@ -125,6 +131,7 @@ msg_enqueue(struct port *p, struct port_msg *m, struct thread **waiter_out)
 			if (set->ps_waiters_head == NULL)
 				set->ps_waiters_tail = NULL;
 			w->th_wait_link = NULL;
+			thread_hold(w);
 		}
 		spin_unlock(&set->ps_lock);
 	}
@@ -137,6 +144,7 @@ msg_enqueue(struct port *p, struct port_msg *m, struct thread **waiter_out)
 			if (p->p_waiters_head == NULL)
 				p->p_waiters_tail = NULL;
 			w->th_wait_link = NULL;
+			thread_hold(w);
 		}
 		spin_unlock(&p->p_lock);
 	}
@@ -149,7 +157,9 @@ msg_enqueue(struct port *p, struct port_msg *m, struct thread **waiter_out)
  * Pop one thread off the port's send-waiter FIFO, if any.  Caller
  * holds p_lock; caller wakes the returned thread (if non-NULL) *after*
  * dropping the lock (thread_wake takes sched_lock, and our lock order
- * is port -> sched).
+ * is port -> sched), and owes a thread_unhold after the wake -- the
+ * thread comes out of here held, for the same reap window msg_enqueue
+ * describes.
  */
 static struct thread *
 port_extract_send_waiter_locked(struct port *p)
@@ -162,6 +172,7 @@ port_extract_send_waiter_locked(struct port *p)
 		if (p->p_send_waiters_head == NULL)
 			p->p_send_waiters_tail = NULL;
 		w->th_wait_link = NULL;
+		thread_hold(w);
 	}
 	return (w);
 }
@@ -370,8 +381,10 @@ port_notify_enqueue(struct port *notify_port, uint32_t notify_id,
 		kfree(m);
 		return (rv);
 	}
-	if (waiter != NULL)
+	if (waiter != NULL) {
 		thread_wake(waiter);
+		thread_unhold(waiter);
+	}
 	return (MACH_MSG_OK);
 }
 
@@ -453,8 +466,10 @@ port_exception_post(struct port *port, uint32_t trapno, uint32_t err,
 		kfree(m);
 		return (rv);
 	}
-	if (waiter != NULL)
+	if (waiter != NULL) {
 		thread_wake(waiter);
+		thread_unhold(waiter);
+	}
 	return (MACH_MSG_OK);
 }
 
@@ -1381,8 +1396,10 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 			spin_unlock(&dest->p_lock);
 			/* Loop and retry. */
 		}
-		if (waiter != NULL)
+		if (waiter != NULL) {
 			thread_wake(waiter);
+			thread_unhold(waiter);
+		}
 	}
 
 	/*
@@ -1637,8 +1654,10 @@ mach_msg_recv(struct port_space *to, mach_port_name_t recv_name,
 		return (MACH_E_NOMSG);
 
 	rv = deliver_msg(to, p, m, buf, buf_size);
-	if (send_waiter != NULL)
+	if (send_waiter != NULL) {
 		thread_wake(send_waiter);
+		thread_unhold(send_waiter);
+	}
 	return (rv);
 }
 
@@ -1709,8 +1728,10 @@ mach_msg_recv_timed(struct port_space *to, mach_port_name_t recv_name,
 				    port_extract_send_waiter_locked(p);
 				spin_unlock(&p->p_lock);
 				rv = deliver_msg(to, p, m, buf, buf_size);
-				if (send_waiter != NULL)
+				if (send_waiter != NULL) {
 					thread_wake(send_waiter);
+					thread_unhold(send_waiter);
+				}
 				return (rv);
 			}
 
@@ -1795,8 +1816,10 @@ mach_msg_recv_timed(struct port_space *to, mach_port_name_t recv_name,
 					spin_unlock(&p->p_lock);
 					rv = deliver_msg(to, p, m, buf,
 					    buf_size);
-					if (send_waiter != NULL)
+					if (send_waiter != NULL) {
 						thread_wake(send_waiter);
+						thread_unhold(send_waiter);
+					}
 					return (rv);
 				}
 				spin_unlock(&p->p_lock);
@@ -1834,8 +1857,10 @@ mach_msg_recv_timed(struct port_space *to, mach_port_name_t recv_name,
 				spin_unlock(&p->p_lock);
 				spin_unlock(&set->ps_lock);
 				rv = deliver_msg(to, p, m, buf, buf_size);
-				if (send_waiter != NULL)
+				if (send_waiter != NULL) {
 					thread_wake(send_waiter);
+					thread_unhold(send_waiter);
+				}
 				return (rv);
 			}
 			spin_unlock(&p->p_lock);

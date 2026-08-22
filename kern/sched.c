@@ -1067,6 +1067,32 @@ sched_post_irq_wake(struct thread *th)
 	if (th == NULL)
 		return;
 
+	/*
+	 * ⚠ ONCE ON THE LIST IS A WAKE; TWICE IS A KNOT.  Two parties can
+	 * name the same thread in the same instant on different CPUs -- the
+	 * PIT's deadline walk expiring an ATA waiter's slice while the
+	 * drive's own interrupt completes the command -- and the second
+	 * push would overwrite th_irq_link while the list still runs
+	 * through it.  If the thread was the head, the link is pointed at
+	 * itself and the drain spins on a one-element cycle for ever; if
+	 * not, everything queued behind it is silently never woken.  So
+	 * membership is a mark taken atomically, and the loser simply
+	 * leaves: the wake already queued carries every kind of news,
+	 * because every sleeper here re-tests its condition anyway.
+	 */
+	if (__atomic_exchange_n(&th->th_irq_queued, 1, __ATOMIC_ACQ_REL) != 0)
+		return;
+
+	/*
+	 * Pinned from the moment it is published.  The pointer handed in
+	 * here is alive -- the slot or list it was taken from is what the
+	 * thread's own exit must pass through -- but between this push and
+	 * the drain's thread_wake the thread can be woken by someone else,
+	 * retire and be reaped.  The hold makes the reaper leave the body
+	 * on the zombie list until the drain has delivered the wake.
+	 */
+	thread_hold(th);
+
 	old = __atomic_load_n(&irq_wake_head, __ATOMIC_RELAXED);
 	do {
 		th->th_irq_link = old;
@@ -1083,7 +1109,18 @@ sched_drain_irq_wakes(void)
 	while (list != NULL) {
 		next = list->th_irq_link;
 		list->th_irq_link = NULL;
+		/*
+		 * The mark comes off BEFORE the wake, so an interrupt with
+		 * fresh news arriving mid-wake queues the thread again
+		 * instead of seeing the mark and dropping its wake on the
+		 * floor; the hold comes off only AFTER, so the thread
+		 * cannot be freed in between.  A wake delivered twice is a
+		 * spurious wakeup, which is the contract; a wake dropped is
+		 * the ATA hang of July.
+		 */
+		__atomic_store_n(&list->th_irq_queued, 0, __ATOMIC_RELEASE);
 		thread_wake(list);
+		thread_unhold(list);
 		list = next;
 	}
 }
@@ -1243,6 +1280,22 @@ sched_reap_zombies(void)
 
 	SLIST_FOREACH_SAFE(z, &drain, th_zombie_link, next) {
 		unsigned	exi;
+
+		/*
+		 * ⚠ SOMEBODY STILL HOLDS THIS BODY.  A waker popped this
+		 * thread from a list or slot and has not delivered its
+		 * thread_wake yet (th_wake_hold, kern/thread.h); freeing it
+		 * now is exactly the freed-memory wake the hold exists to
+		 * prevent.  Put it back for a later pass -- the pin only
+		 * outlives the few lines between a pop and a wake, so the
+		 * body is never kept long.
+		 */
+		if (__atomic_load_n(&z->th_wake_hold, __ATOMIC_ACQUIRE) != 0) {
+			spin_lock(&sched_lock);
+			SLIST_INSERT_HEAD(&zombie_head, z, th_zombie_link);
+			spin_unlock(&sched_lock);
+			continue;
+		}
 
 		t = z->th_task;
 

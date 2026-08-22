@@ -333,10 +333,14 @@ mouse_getpkt_block(uint8_t *out)
 	struct thread	*self;
 
 	self = current_thread;
+	/* Noted for the length of the loop -- see kbd_getc_block. */
+	thread_slot_note(self, &mouse_waiter);
 
 	for (;;) {
-		if (mouse_getpkt(out) == 0)
+		if (mouse_getpkt(out) == 0) {
+			thread_slot_forget(self);
 			return (0);
+		}
 
 		/*
 		 * Empty: clear pending, install the waiter, recheck.  Mirror
@@ -349,6 +353,7 @@ mouse_getpkt_block(uint8_t *out)
 		if (mouse_getpkt(out) == 0) {
 			__atomic_store_n(&mouse_waiter, NULL,
 			    __ATOMIC_RELAXED);
+			thread_slot_forget(self);
 			return (0);
 		}
 

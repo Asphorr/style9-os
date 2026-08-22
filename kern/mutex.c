@@ -206,6 +206,15 @@ mutex_unlock(struct mutex *m)
 	m->mtx_owner = NULL;
 	current_thread->th_mutex_depth--;
 	w = waiter_pop(m);
+	/*
+	 * Held from under the guard, where the waiter is provably alive: a
+	 * thread on this list cannot finish exiting without taking the guard
+	 * to unbind itself.  Between the unlock below and the wake, it can --
+	 * a kill fan-out wakes it, it retires, the reaper frees it -- and
+	 * the hold is what makes the reaper wait for our wake to land.
+	 */
+	if (w != NULL)
+		thread_hold(w);
 	spin_unlock(&m->mtx_guard);
 
 	/*
@@ -214,8 +223,10 @@ mutex_unlock(struct mutex *m)
 	 * the guard would queue the wake behind the very release that is
 	 * trying to let someone run.
 	 */
-	if (w != NULL)
+	if (w != NULL) {
 		thread_wake(w);
+		thread_unhold(w);
+	}
 }
 
 bool

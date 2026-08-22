@@ -1413,10 +1413,41 @@ the mutex's wait loop, which had never learned the recv loop's lesson -- a
 park that declines to park returns still linked, and the next push threads
 the tail into itself. `port-wait` grew two scenes for it: a thread that dies
 on the list by hand, and a task killed for real while its thread is parked in
-the recv path. What is still owed is narrower and written down where it
-lives, in `thread_wait_unbind`: an extractor that has popped a thread and not
-yet woken it races the corpse's reap -- closing that means a reference the
-waker holds, which is a rung of its own.
+the recv path. What that rung left owed -- an extractor that has popped a
+thread and not yet woken it races the corpse's reap -- is now paid, and the
+payment is the reference the debt asked for: **the waker holds what it is
+about to wake**. `thread_hold` pins the thread's memory, taken while it is
+still provably alive (under the lock its exit must take to leave the list it
+was popped from, or in the ISR that just exchanged the slot naming it);
+`thread_unhold` releases after the wake; and `sched_reap_zombies` leaves a
+held body on the zombie list for a later pass -- the pin never means "do not
+die", only "do not be freed yet". Every pop-then-wake in the kernel now pays
+it: `mutex_unlock`, the port and port-set extractors, both teardown drains,
+and `sched_post_irq_wake`, where the same look at the IRQ-wake LIFO found a
+second defect waiting: two parties can post the same thread in the same
+instant -- the PIT expiring an ATA waiter's slice while the drive's own
+interrupt completes the command -- and the second push overwrote
+`th_irq_link` while the list still ran through it, tying the LIFO into a
+one-element cycle for the drain to spin on for ever. Membership is a mark
+now (`th_irq_queued`), and the loser leaves: one queued wake carries every
+kind of news, because every sleeper here re-tests anyway.
+
+**And the same settling for the cells that are not lists.** Four drivers keep
+a single waiter *slot* an ISR exchanges -- `ch_waiter`, `kbd_waiter`,
+`mouse_waiter`, `uart_waiter` -- and a thread killed mid-park would leave its
+name in the cell for the next interrupt to wake. Walking every occupant says
+nothing can today: the kbd, mouse and uart slots only ever hold their
+`kernel_task` driver threads, which cannot be killed, and the ATA slot's
+callers are either `kernel_task` too or deferred by the mutex they hold. But
+that safety is a *table of conventions*, one per slot, and nothing was
+checking the table. So the convention became mechanism: the thread notes the
+cell it may be named in (`th_wait_slot`, taken around the whole wait loop),
+and `thread_exit` compare-and-swaps its own name out. Exactly one side gets
+the pointer -- if the exit wins, the interrupt finds the cell empty; if the
+interrupt wins, the wake it posts is pinned by `sched_post_irq_wake`'s hold
+before the exit can finish becoming reapable. The day a driver thread moves
+out of `kernel_task`, or a new caller parks in a slot killable, the settling
+is already standing instead of newly owed.
 
 **And the two siblings named there are now fixed with one number.** A thread
 killed while parked *under a mutex* -- every disk-touching path sleeps holding

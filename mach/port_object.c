@@ -187,6 +187,7 @@ port_deref(struct port *p, uint8_t rights)
 	struct port_msg *drain_head = NULL;
 	struct thread	*wake_head = NULL;
 	struct thread	*send_wake_head = NULL;
+	struct thread	*hw;
 	struct port	*notify_no_senders = NULL;
 	struct port_notify_node *dead_name_list = NULL;
 	uint32_t	 notify_no_senders_id = 0;
@@ -226,6 +227,20 @@ port_deref(struct port *p, uint8_t rights)
 
 		send_wake_head = p->p_send_waiters_head;
 		p->p_send_waiters_head = p->p_send_waiters_tail = NULL;
+
+		/*
+		 * Hold every thread on both snapshot chains while p_lock
+		 * still proves them alive -- a thread on the list cannot
+		 * finish exiting without taking p_lock to unbind itself.
+		 * The wakes happen after the lock is dropped, and in that
+		 * gap a kill fan-out can wake a chain member, retire it and
+		 * reap it; the hold makes the reaper leave the body until
+		 * our wake has landed (th_wake_hold, kern/thread.h).
+		 */
+		for (hw = wake_head; hw != NULL; hw = hw->th_wait_link)
+			thread_hold(hw);
+		for (hw = send_wake_head; hw != NULL; hw = hw->th_wait_link)
+			thread_hold(hw);
 
 		member_of = p->p_set;
 		p->p_set = NULL;
@@ -281,6 +296,10 @@ port_deref(struct port *p, uint8_t rights)
 			p->p_dead = true;
 			wake_head = p->p_waiters_head;
 			p->p_waiters_head = p->p_waiters_tail = NULL;
+			/* Same hold as the RECEIVE-drop chains above. */
+			for (hw = wake_head; hw != NULL;
+			    hw = hw->th_wait_link)
+				thread_hold(hw);
 		}
 	}
 
@@ -327,6 +346,7 @@ port_deref(struct port *p, uint8_t rights)
 		struct thread *next = wake_head->th_wait_link;
 		wake_head->th_wait_link = NULL;
 		thread_wake(wake_head);
+		thread_unhold(wake_head);
 		wake_head = next;
 	}
 
@@ -334,6 +354,7 @@ port_deref(struct port *p, uint8_t rights)
 		struct thread *next = send_wake_head->th_wait_link;
 		send_wake_head->th_wait_link = NULL;
 		thread_wake(send_wake_head);
+		thread_unhold(send_wake_head);
 		send_wake_head = next;
 	}
 
@@ -413,6 +434,7 @@ port_set_deref(struct port_set *ps)
 	bool		 last;
 	struct port	*detach_head = NULL;
 	struct thread	*wake_head = NULL;
+	struct thread	*hw;
 
 	spin_lock(&ps->ps_lock);
 	KASSERT(ps->ps_refs > 0, "port_set_deref: underflow");
@@ -425,6 +447,10 @@ port_set_deref(struct port_set *ps)
 		ps->ps_member_count = 0;
 		wake_head = ps->ps_waiters_head;
 		ps->ps_waiters_head = ps->ps_waiters_tail = NULL;
+		/* Held under ps_lock for the same reap window port_deref
+		 * describes; the wakes below run with the lock dropped. */
+		for (hw = wake_head; hw != NULL; hw = hw->th_wait_link)
+			thread_hold(hw);
 	}
 	spin_unlock(&ps->ps_lock);
 
@@ -443,6 +469,7 @@ port_set_deref(struct port_set *ps)
 		struct thread *next = wake_head->th_wait_link;
 		wake_head->th_wait_link = NULL;
 		thread_wake(wake_head);
+		thread_unhold(wake_head);
 		wake_head = next;
 	}
 
