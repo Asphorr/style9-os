@@ -157,6 +157,7 @@ entry(void)
 	long	got;
 	long	put;
 	int	fd;
+	int	held;
 
 	printf("filewrite: the volume, from ring 3\n");
 
@@ -356,15 +357,59 @@ entry(void)
 		}
 	}
 
-	/* 12. and it will not move a name onto one that is taken. */
-	if (rename(MOVED, HELD) == 0 || *__error() != EEXIST)
-		fail("rename replaced " HELD ", which this kernel refuses");
-	else if (rename("/etc/nothing-of-that-name", MOVED) == 0 ||
+	/*
+	 * 12. AND ONTO A NAME THAT IS TAKEN, which is the rename POSIX names
+	 * first: write the new file beside the real one, rename it over.  A
+	 * descriptor is held on the occupant across the move because the
+	 * promise has two readers, and only a program out here can be both:
+	 * every open of the NAME must get the newcomer at once, while the
+	 * holder goes on reading the file it opened, to the last byte.
+	 */
+	held = open(MOVED, O_RDONLY);
+	if (held < 0)
+		fail("cannot hold the occupant open before the takeover");
+	else {
+		fd = open(PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		put = fd < 0 ? -1 : write(fd, SECOND, slen(SECOND));
+		if (fd >= 0)
+			(void)close(fd);
+		if (put != (long)slen(SECOND))
+			fail("cannot make the newcomer for the takeover");
+		else if (rename(PATH, MOVED) != 0)
+			fail("rename refused a destination that is taken");
+		else if (open(PATH, O_RDONLY) >= 0)
+			fail(PATH " still opens after moving onto " MOVED);
+		else {
+			got = slurp(MOVED, buf, sizeof(buf));
+			if (got != (long)slen(SECOND) ||
+			    !same(buf, SECOND, slen(SECOND)))
+				fail("the taken name did not answer with the "
+				    "newcomer's bytes");
+			else {
+				got = read(held, buf, sizeof(buf));
+				if (got != (long)slen(FIRST) ||
+				    !same(buf, FIRST, slen(FIRST)))
+					fail("the holder did not keep the "
+					    "file it opened");
+				else
+					printf("filewrite: PASS rename took "
+					    "%s while a holder read the old "
+					    "file's %u byte(s) to the end\n",
+					    MOVED, (unsigned)slen(FIRST));
+			}
+		}
+		(void)close(held);
+	}
+
+	/* and the refusals that stay refusals. */
+	if (rename("/etc/nothing-of-that-name", MOVED) == 0 ||
 	    *__error() != ENOENT)
 		fail("rename moved a name that is not there");
+	else if (rename(MOVED, "/etc") == 0 || *__error() != EISDIR)
+		fail("rename put a file over a directory");
 	else
-		printf("filewrite: PASS rename refuses a destination that is "
-		    "taken and a source that is not there\n");
+		printf("filewrite: PASS rename refuses a source that is not "
+		    "there and a directory destination\n");
 	(void)unlink(MOVED);
 
 	/*

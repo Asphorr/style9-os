@@ -894,18 +894,30 @@ fs_rmdir(const char *path)
  * must not do is turn one such edit into two, which is why there is no
  * "unlink then create" anywhere in it.
  *
+ * A name that is already taken is taken OVER, in that same edit, and what
+ * stood there comes back up as an object id: the writer below knows the
+ * format and this layer knows the descriptors, so the occupant's fate is
+ * decided here, exactly as an unlinked file's is.  Held open, it is marked on
+ * its row and the last close will let it go; held by nothing, it is let go
+ * right now, BEFORE the checkpoint, so the takeover and the reap reach the
+ * platter as one published state.  If the reap refuses, the file simply waits
+ * in the private directory for the next mount -- the rename itself has
+ * already happened.
+ *
  * A trailing separator is refused on both paths, as it is for a create.  It
  * claims the name is a directory, and this call moves whatever is there.
  */
 static int
 rename_locked(const char *opath, const char *npath)
 {
+	struct fs_open	*fo;
 	char		 odir[FS_NAME_MAX];
 	char		 ndir[FS_NAME_MAX];
 	const char	*oleaf;
 	const char	*nleaf;
 	uint64_t	 oparent;
 	uint64_t	 nparent;
+	uint64_t	 victim;
 	uint64_t	 now_ns;
 	int		 is_dir;
 	int		 rv;
@@ -930,9 +942,28 @@ rename_locked(const char *opath, const char *npath)
 		return (FS_E_NOTDIR);
 
 	now_ns = (uint64_t)clock_walltime_us() * 1000ULL;
-	rv = apfs_err(fs_apfs_rename(oparent, oleaf, nparent, nleaf, now_ns));
+	victim = 0;
+	rv = apfs_err(fs_apfs_rename(oparent, oleaf, nparent, nleaf, now_ns,
+	    &victim));
 	if (rv != FS_E_OK)
 		return (rv);
+	if (victim != 0) {
+		fo = open_row(victim);
+		if (fo != NULL) {
+			fo->fo_nameless = true;
+			fs_n_orphan++;
+		} else {
+			rv = apfs_err(fs_apfs_reap(victim, now_ns));
+			if (rv == FS_E_OK)
+				fs_n_reap++;
+			else
+				kprintf("fs: inode %llu lost its name to a "
+				    "rename and will not go (%d) -- it stays "
+				    "in the private directory for the next "
+				    "mount\n", (unsigned long long)victim,
+				    rv);
+		}
+	}
 	rv = apfs_err(fs_apfs_checkpoint());
 	fs_gen++;
 	return (rv);
@@ -2648,6 +2679,18 @@ fs_stream_selftest(void)
 	mutex_unlock(&fs_lock);
 }
 
+/* And about the tree that counts the volume's runs outgrowing its root. */
+void
+fs_extref_selftest(void)
+{
+
+	if (!fs_apfs_ready())
+		return;
+	mutex_lock(&fs_lock);
+	fs_apfs_extref_selftest((uint64_t)clock_walltime_us() * 1000ULL);
+	mutex_unlock(&fs_lock);
+}
+
 /* And about a node a create is asked to make room in for itself. */
 void
 fs_room_selftest(void)
@@ -2727,6 +2770,162 @@ fs_orphan_selftest(void)
 	mutex_lock(&fs_lock);
 	fs_apfs_orphan_selftest((uint64_t)clock_walltime_us() * 1000ULL);
 	mutex_unlock(&fs_lock);
+}
+
+/*
+ * A RENAME LANDS ON A NAME SOMETHING IS READING
+ *
+ * The writer's own test (apfs-clobber, run first below) proves the records:
+ * the name answers with the newcomer, the occupant waits whole in the private
+ * directory.  What only THIS layer can prove is the promise those records
+ * exist for, because it is a promise about descriptors: a program that had
+ * the old file open goes on reading the old file -- to the last byte, from
+ * the platter, not from anything cached at open time -- while every open of
+ * the name gets the new one.  Two files under one name at once, each to the
+ * reader it belongs to.
+ *
+ * And the row is checked by name: after the rename the victim's row must say
+ * NAMELESS, and after the close it must be gone -- because the close is where
+ * the file actually stops existing, and a scene that only read bytes would
+ * pass with the reap broken and the volume quietly keeping every replaced
+ * file.
+ */
+#define	FS_CLOB_NAME	"/etc/usurped.txt"
+#define	FS_CLOB_TEMP	"/etc/usurper.txt"
+#define	FS_CLOB_OLD	"the file that stood at this name first\n"
+#define	FS_CLOB_NEW	"the newcomer the name answers with now\n"
+
+static void
+fs_clobber_scene(void)
+{
+	struct fs_handle	 hold;
+	struct fs_handle	 h;
+	struct fs_open		*fo;
+	uint8_t			 buf[64];
+	const char		*fail;
+	uint64_t		 vino, nino;
+	uint64_t		 orphan0, reap0;
+	const uint32_t		 oldn = sizeof(FS_CLOB_OLD) - 1;
+	const uint32_t		 newn = sizeof(FS_CLOB_NEW) - 1;
+	uint32_t		 got, put;
+	bool			 nameless, still;
+
+	fail = NULL;
+	vino = 0;
+	nino = 0;
+	(void)fs_unlink(FS_CLOB_NAME);
+	(void)fs_unlink(FS_CLOB_TEMP);
+
+	mutex_lock(&fs_lock);
+	orphan0 = fs_n_orphan;
+	reap0   = fs_n_reap;
+	mutex_unlock(&fs_lock);
+
+	/* The occupant, and a descriptor held on it across everything. */
+	if (fs_create(FS_CLOB_NAME, 0644, &vino) != FS_E_OK ||
+	    fs_open(FS_CLOB_NAME, &hold) != FS_E_OK) {
+		kprintf("fs-clobber: FAIL cannot make and hold the occupant\n");
+		return;
+	}
+	if (fs_pwrite(&hold, 0, (const uint8_t *)FS_CLOB_OLD, oldn,
+	    &put) != FS_E_OK || put != oldn)
+		fail = "cannot write the occupant's bytes";
+
+	/* The newcomer, under its own name for now. */
+	if (fail == NULL &&
+	    (fs_create(FS_CLOB_TEMP, 0644, &nino) != FS_E_OK ||
+	    fs_open(FS_CLOB_TEMP, &h) != FS_E_OK))
+		fail = "cannot make the newcomer";
+	else if (fail == NULL) {
+		if (fs_pwrite(&h, 0, (const uint8_t *)FS_CLOB_NEW,
+		    newn, &put) != FS_E_OK || put != newn)
+			fail = "cannot write the newcomer's bytes";
+		(void)fs_close(&h);
+	}
+
+	/* The takeover. */
+	if (fail == NULL && fs_rename(FS_CLOB_TEMP, FS_CLOB_NAME) != FS_E_OK)
+		fail = "the rename onto the held name was refused";
+
+	/*
+	 * The row: the occupant must now be marked nameless, and not because
+	 * this function marked it.
+	 */
+	if (fail == NULL) {
+		mutex_lock(&fs_lock);
+		fo = open_row(vino);
+		nameless = fo != NULL && fo->fo_nameless;
+		mutex_unlock(&fs_lock);
+		if (!nameless)
+			fail = "the occupant's row does not say nameless";
+	}
+
+	/* The name answers with the newcomer... */
+	if (fail == NULL) {
+		if (fs_open(FS_CLOB_NAME, &h) != FS_E_OK)
+			fail = "the taken name does not open";
+		else {
+			got = 0;
+			if (h.fh_ino != nino)
+				fail = "the taken name is not the newcomer's "
+				    "inode";
+			else if (fs_pread(&h, 0, buf, sizeof(buf), &got) !=
+			    FS_E_OK || got != newn ||
+			    !same(buf, (const uint8_t *)FS_CLOB_NEW, newn))
+				fail = "the name did not answer with the "
+				    "newcomer's bytes";
+			(void)fs_close(&h);
+		}
+	}
+	/* ...while the held descriptor still reads the old file whole. */
+	if (fail == NULL) {
+		got = 0;
+		if (fs_pread(&hold, 0, buf, sizeof(buf), &got) != FS_E_OK ||
+		    got != oldn ||
+		    !same(buf, (const uint8_t *)FS_CLOB_OLD, oldn))
+			fail = "the holder did not get the old bytes back";
+	}
+
+	/* The last holder lets go, and the file goes with it. */
+	(void)fs_close(&hold);
+	if (fail == NULL) {
+		mutex_lock(&fs_lock);
+		still = open_row(vino) != NULL;
+		mutex_unlock(&fs_lock);
+		if (still)
+			fail = "the occupant's row outlived the last close";
+	}
+	if (fail == NULL) {
+		mutex_lock(&fs_lock);
+		still = fs_n_orphan != orphan0 + 1 || fs_n_reap != reap0 + 1;
+		mutex_unlock(&fs_lock);
+		if (still)
+			fail = "the orphan and reap counts did not move by "
+			    "one each";
+	}
+
+	(void)fs_unlink(FS_CLOB_NAME);
+	if (fail != NULL) {
+		kprintf("fs-clobber: FAIL %s\n", fail);
+		return;
+	}
+	kprintf("fs-clobber: PASS -- the name answered with the newcomer's "
+	    "%u bytes at once, the holder read its own file's %u to the last "
+	    "one, and the file left when the holder let go\n",
+	    (unsigned)newn, (unsigned)oldn);
+}
+
+/* The writer's half first, then the descriptor's half. */
+void
+fs_clobber_selftest(void)
+{
+
+	if (!fs_apfs_ready())
+		return;
+	mutex_lock(&fs_lock);
+	fs_apfs_clobber_selftest((uint64_t)clock_walltime_us() * 1000ULL);
+	mutex_unlock(&fs_lock);
+	fs_clobber_scene();
 }
 
 /* And that a lookup by key agrees with reading the whole tree. */

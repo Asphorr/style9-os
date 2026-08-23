@@ -2936,12 +2936,16 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 	 * atomicity is kept by the edit underneath, which changes every leaf it
 	 * touches in memory before writing any of them.
 	 *
-	 * AN OPEN DESCRIPTOR ON THE FILE STILL ANSWERS WITH THE OLD PATH.  A
-	 * descriptor here remembers the name it was opened with rather than
-	 * pointing at the inode, which is what fchdir, fchmod and the fd
-	 * relative calls are built on -- and this is the call that makes that
-	 * shortcut visible, exactly as the comment where it is made predicted.
-	 * Nothing here holds a descriptor across a rename of its own file.
+	 * AN OPEN DESCRIPTOR STILL ANSWERS WITH THE OLD PATH.  A descriptor
+	 * here remembers the name it was opened with for the calls that ask
+	 * about names -- fchdir, fchmod, F_GETPATH -- and this is the call
+	 * that makes that shortcut visible, exactly as the comment where it is
+	 * made predicted.  The BYTES do not take that shortcut: reads and
+	 * writes go through the handle, which is why a descriptor held on a
+	 * file this call replaces goes on reading the file it opened -- now
+	 * nameless, waiting in the volume's private directory for the close
+	 * that finishes it -- while every open of the name gets the newcomer.
+	 * filewrite holds one across exactly that takeover and checks both.
 	 */
 	case DARWIN_SYS_rename: {
 		char	opath[DARWIN_PATH_MAX];

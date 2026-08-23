@@ -323,6 +323,15 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	fs_stream_selftest();
 
 	/*
+	 * And the OTHER tree -- the one that counts the volume's runs --
+	 * outgrowing its single-node root.  It runs here, before everything
+	 * below it, on purpose: once it has run the tree has an index level
+	 * for good, and every later test in this boot and every test of the
+	 * next one is exercising the two-level walk without being told.
+	 */
+	fs_extref_selftest();
+
+	/*
 	 * And the same three shapes again, this time asked for by an ordinary
 	 * caller rather than by a test: names go into a directory until a leaf
 	 * has no room, and the create that finds it full is the one that has to
@@ -347,6 +356,15 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	 * private directory, and a failure there is worth reading first.
 	 */
 	fs_orphan_selftest();
+
+	/*
+	 * And a rename that lands on a taken name -- the move and the
+	 * orphaning as ONE edit, then the half only descriptors can prove:
+	 * the name answers with the newcomer while the replaced file goes on
+	 * answering whoever still holds it.  After both of the above, since
+	 * it is those two machineries composed.
+	 */
+	fs_clobber_selftest();
 
 	/*
 	 * And that every file those tests opened was given back.  Last of the

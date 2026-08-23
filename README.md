@@ -547,6 +547,96 @@ to be the kernel's job -- so one was fabricated with the host runner and
 booted, and the mount said "1 file(s) were left waiting in the private
 directory by an earlier boot and have been let go."
 
+**And then the two rungs above turned out to be halves of a third.**  A
+rename can now land on a name that is **taken**, which is the rename POSIX
+names first -- write the new file beside the real one, move it over -- and
+the whole of the promise is that a reader sees the occupant or the newcomer
+and never an absent name.  The checkpoint is the only atom this volume has,
+so "unlink, then move" was never an option: it publishes a state in which
+the name is missing, which is the one state the call exists to prevent.  The
+occupant has to leave in the SAME edit that brings the newcomer in.
+
+What makes that affordable is that the occupant does not have to die there.
+Its bytes are the expensive half -- extents, the reference tree, the
+allocator, a truncate that moves leaves under everything located so far --
+and the volume already has a place for a file whose name is gone.  So a
+replaced FILE is orphaned right in the move's edit, by the same three
+differences the unlink-while-open path wrote: entry to the private
+directory, root for a parent, zero links.  Seen from the directory the
+event is one record: the entry's key does not change at all, a different
+file simply stands behind it.  A replaced DIRECTORY must be empty -- asked
+of the tree, the way rmdir asks -- and then it is two records and two
+counters, taken out in the edit, nothing deferred.
+
+Whose descriptors the occupant was holding is not the writer's question.
+The object id comes back up to `fs/fs.c`, which owns the open-file rows,
+and the fate is decided exactly as unlink decides it: held open, the row is
+marked and the last close finishes the file; held by nothing, it is reaped
+at once, BEFORE the checkpoint, so the takeover and the reap reach the
+platter as one published state.  A crash on either side of that line leaves
+a volume where the rename wholly happened or wholly did not, and a waiting
+orphan is what the next mount already knows how to let go.
+
+Three tests, one per layer.  `apfs-clobber` gives the two files different
+lengths and asks the records: the name answers 5000 at once, the orphan
+answers 11000 with no name at all, the reap returns its blocks, and the
+refusals -- a full directory, a file onto a directory, a directory onto a
+file -- leave no mark.  `fs-clobber` holds a descriptor on the occupant
+across the takeover, because the promise has two readers and only this
+layer can be both: every open of the NAME gets the newcomer immediately,
+the holder goes on reading the file it opened to the last byte, and the row
+must say *nameless* after the move and be gone after the close.  And
+`filewrite` does the same from ring 3 through `rename(2)`, where the old
+"destination is taken" refusal used to be checked and is now the takeover
+itself.  Getting the battery to say so also meant repairing it: the block
+autopsy had grown an appetite for ATA counters that `make hostcheck`'s five
+stubs never fed, so the host runner had been failing to link since that
+rung -- three stubs, and the fourteen-second oracle answers again.
+
+**And the takeover's acceptance run found a ceiling living where an edge had
+been filed.**  One boot in four failed all three new scenes with the same
+refusal, on a volume that was nearly empty: the extent reference tree -- a
+single node that was its own root, sixteen records, "split is the rung after
+this one" written where the refusal was -- turned out to be within a record
+or two of full in the volume's ordinary steady state, and that boot's layout
+touched it.  An edge a full disk hits is a limit; one an idle disk hits is a
+defect, and the rung after arrived.
+
+The tree can now be **two levels deep**, and the shape is the catalog's root
+division with the virtual half removed.  A physical tree names its children
+by block address: nothing is minted, no object map is told, and the root --
+whose address the volume superblock carries, rewritten by the spine every
+checkpoint -- keeps being the one name anybody holds.  Every writer reads
+the root, follows one child when there is an index level, edits the leaf and
+settles the pair back through the copy-on-write path, leaf first, then the
+root that must name the leaf's new address.  A full leaf splits under the
+root; an emptied one leaves the tree, because a separator over an empty node
+is a lie with nothing to point at; and all keys here are eight bytes, so the
+separator maintenance that cost the catalog a reindex pass is one aligned
+store, made unconditionally.
+
+The checker taught this rung its one real lesson: the first division of a
+root that was BORN a leaf.  The catalog's division never met it -- a catalog
+root was an index already -- so rebuilding the new root with the old one's
+flags quietly carried LEAF up a level, our own reader did not care, every
+test passed, and `apfsck` said "B-tree: nonleaf node flagged as leaf."  The
+flag comes off by hand now, and the ladder was measured around it: drop the
+node count and the checker answers "Extent reference tree: wrong node count
+in info footer"; leave a stale separator and it says nothing at all, because
+the identity rule it holds the catalog to is not applied here -- a
+separator below the child's first key still orders every descent -- so the
+refresh is kept as a discipline the checker happens not to demand.
+
+`apfs-extref` arranges the pressure on purpose: two files grow a block at a
+time in alternation, so each append lands right after the other file's and
+no append can merge -- twenty-eight fresh records, a division, a leaf
+split, every grow answered.  Then both files are cut to nothing, which makes
+the writer find every one of those records again in whichever leaf the
+splits left it.  It runs before the rest of the filesystem battery on
+purpose: once it has run, the index level is there for good, and every later
+test of that boot and all of the next one exercises the two-level walk
+without being told.
+
 ## A wake reaches the CPU
 
 Three waits in the Darwin layer polled with `thread_yield` -- a pipe read, a

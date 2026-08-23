@@ -1847,7 +1847,7 @@ moved_ok(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 	int		is_dir;
 	int		rv;
 
-	rv = fs_apfs_rename(odir, oname, ndir, nname, now);
+	rv = fs_apfs_rename(odir, oname, ndir, nname, now, NULL);
 	if (rv != FS_APFS_E_OK) {
 		kprintf("apfs-move: FAIL %s -> %s was refused (%d)\n", opath,
 		    npath, rv);
@@ -2012,7 +2012,7 @@ fs_apfs_move_selftest(uint64_t now)
 	 * afterwards, since a writer that took the entry out before putting it
 	 * back would answer the same and leave nothing behind.
 	 */
-	rv = fs_apfs_rename(var, "mvone.txt", var, "mvone.txt", now);
+	rv = fs_apfs_rename(var, "mvone.txt", var, "mvone.txt", now, NULL);
 	if (rv != FS_APFS_E_OK) {
 		kprintf("apfs-move: FAIL renaming a name to itself was "
 		    "refused (%d)\n", rv);
@@ -2060,13 +2060,13 @@ fs_apfs_move_selftest(uint64_t now)
 	}
 
 	/* THE REFUSALS, none of which may leave a mark. */
-	rv = fs_apfs_rename(var, "mvone.txt", var, "mvdir2", now);
-	if (rv != FS_APFS_E_EXIST) {
-		kprintf("apfs-move: FAIL moving onto a name that is taken "
-		    "answered %d, not EXIST\n", rv);
+	rv = fs_apfs_rename(var, "mvone.txt", var, "mvdir2", now, NULL);
+	if (rv != FS_APFS_E_ISDIR) {
+		kprintf("apfs-move: FAIL moving a file onto a directory's "
+		    "name answered %d, not ISDIR\n", rv);
 		goto clean;
 	}
-	rv = fs_apfs_rename(var, "mvnothing.txt", var, "mvhere.txt", now);
+	rv = fs_apfs_rename(var, "mvnothing.txt", var, "mvhere.txt", now, NULL);
 	if (rv != FS_APFS_E_NOTFOUND) {
 		kprintf("apfs-move: FAIL moving a name that is not there "
 		    "answered %d, not NOTFOUND\n", rv);
@@ -2077,7 +2077,7 @@ fs_apfs_move_selftest(uint64_t now)
 	 * through a child, because a check that only compared the two object
 	 * ids would pass the first and detach the volume on the second.
 	 */
-	rv = fs_apfs_rename(var, "mvdir2", dir, "loop", now);
+	rv = fs_apfs_rename(var, "mvdir2", dir, "loop", now, NULL);
 	if (rv != FS_APFS_E_INVAL) {
 		kprintf("apfs-move: FAIL moving a directory into itself "
 		    "answered %d, not INVAL\n", rv);
@@ -2091,7 +2091,7 @@ fs_apfs_move_selftest(uint64_t now)
 		    "(%d)\n", rv);
 		goto clean;
 	}
-	rv = fs_apfs_rename(var, "mvdir2", deep, "loop", now);
+	rv = fs_apfs_rename(var, "mvdir2", deep, "loop", now, NULL);
 	if (rv != FS_APFS_E_INVAL) {
 		kprintf("apfs-move: FAIL moving a directory under its own "
 		    "child answered %d, not INVAL\n", rv);
@@ -2103,7 +2103,7 @@ fs_apfs_move_selftest(uint64_t now)
 	 * destination, and a file would have taken a child in the field it
 	 * counts links in.
 	 */
-	rv = fs_apfs_rename(var, "mvdir2", file, "loop", now);
+	rv = fs_apfs_rename(var, "mvdir2", file, "loop", now, NULL);
 	if (rv != FS_APFS_E_NOTDIR) {
 		kprintf("apfs-move: FAIL moving into a file answered %d, not "
 		    "NOTDIR\n", rv);
@@ -2340,6 +2340,550 @@ clean:
 	(void)fs_apfs_unlink(etc, "orphan.txt", now);
 	if (file != 0)
 		(void)fs_apfs_reap(file, now);
+	(void)fs_apfs_checkpoint();
+}
+
+/*
+ * A NAME TAKEN OVER
+ *
+ * The rung this checks is the one POSIX asks for by name: rename lands on a
+ * name that is already taken, and a reader sees the occupant or the newcomer
+ * and never an absent name.  The absence cannot be watched for from in here --
+ * both endings of the edit leave a valid volume -- so what is checked instead
+ * is everything the one-edit shape implies: the name answers with the
+ * newcomer at once, the occupant waits in the private directory with its
+ * bytes intact rather than dying in the move, the reap returns exactly what
+ * it held, and a replaced directory -- which has nothing to defer -- is
+ * simply gone.
+ *
+ * The two files get DIFFERENT lengths, and that is the test's whole grip: the
+ * length rides in the data stream field of the packed inode record, so "the
+ * name answers 5000 and the orphan answers 11000" tells apart every wrong
+ * ending -- an entry rewritten but pointing at the old file, an occupant
+ * whose record was rebuilt as a fresh one, a newcomer that arrived empty.
+ */
+#define	APFS_CLOB_DIR		"/etc"
+#define	APFS_CLOB_OTHER		"/var"
+#define	APFS_CLOB_NEW_SIZE	5000u
+#define	APFS_CLOB_OLD_SIZE	11000u
+
+void
+fs_apfs_clobber_selftest(uint64_t now)
+{
+	uint64_t	etc, var;
+	uint64_t	winner, loser, second, dnew, dold, full, inner;
+	uint64_t	moves, clobs, orphans, reaps;
+	uint64_t	victim;
+	uint64_t	got;
+	uint32_t	left;
+	int		is_dir;
+	int		rv;
+
+	if (!g_apfs.ac_mounted || !g_apfs.ac_ip_valid) {
+		kprintf("apfs-clobber: nothing writable -- skipped\n");
+		return;
+	}
+	if (fs_apfs_lookup(APFS_CLOB_DIR, &etc, &is_dir) != FS_APFS_E_OK ||
+	    !is_dir ||
+	    fs_apfs_lookup(APFS_CLOB_OTHER, &var, &is_dir) != FS_APFS_E_OK ||
+	    !is_dir) {
+		kprintf("apfs-clobber: %s and %s are not both there -- "
+		    "skipped\n", APFS_CLOB_DIR, APFS_CLOB_OTHER);
+		return;
+	}
+
+	/*
+	 * Whatever an interrupted run left behind: the names, then the
+	 * private directory, which is the only place a half-finished takeover
+	 * can leave anything a name no longer reaches.
+	 */
+	got = 0;
+	if (fs_apfs_lookup("/etc/cbfull", &got, &is_dir) == FS_APFS_E_OK)
+		(void)fs_apfs_unlink(got, "held.txt", now);
+	(void)fs_apfs_unlink(etc, "cbnew.txt", now);
+	(void)fs_apfs_unlink(etc, "cbold.txt", now);
+	(void)fs_apfs_unlink(var, "cbold.txt", now);
+	(void)fs_apfs_rmdir(etc, "cbfull", now);
+	(void)fs_apfs_rmdir(etc, "cbdir", now);
+	(void)fs_apfs_rmdir(etc, "cbdir2", now);
+	left = 0;
+	(void)fs_apfs_reap_all(now, &left);
+	(void)fs_apfs_checkpoint();
+
+	moves   = fs_apfs_moves();
+	clobs   = fs_apfs_clobbers();
+	orphans = fs_apfs_orphans();
+	reaps   = fs_apfs_reaps();
+	winner  = 0;
+	loser   = 0;
+	second  = 0;
+	dnew    = 0;
+	dold    = 0;
+	full    = 0;
+	inner   = 0;
+
+	/* The occupant, with the larger length, and the newcomer beside it. */
+	rv = fs_apfs_create(etc, "cbold.txt", now, 0644, &loser);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_grow(loser, loser, APFS_CLOB_OLD_SIZE);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_create(etc, "cbnew.txt", now, 0644, &winner);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_grow(winner, winner, APFS_CLOB_NEW_SIZE);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_checkpoint();
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-clobber: FAIL cannot make the two files (%d)\n",
+		    rv);
+		goto clean;
+	}
+
+	/* The move lands on the taken name. */
+	victim = 0;
+	rv = fs_apfs_rename(etc, "cbnew.txt", etc, "cbold.txt", now, &victim);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-clobber: FAIL taking the name over was refused "
+		    "(%d)\n", rv);
+		goto clean;
+	}
+	if (fs_apfs_checkpoint() != FS_APFS_E_OK) {
+		kprintf("apfs-clobber: FAIL the checkpoint after it was "
+		    "refused\n");
+		goto clean;
+	}
+	if (victim != loser) {
+		kprintf("apfs-clobber: FAIL inode %llu stood at the name and "
+		    "the victim reported is %llu\n",
+		    (unsigned long long)loser, (unsigned long long)victim);
+		goto clean;
+	}
+	/* The name answers with the newcomer... */
+	got = 0;
+	if (fs_apfs_lookup("/etc/cbold.txt", &got, &is_dir) != FS_APFS_E_OK ||
+	    got != winner) {
+		kprintf("apfs-clobber: FAIL /etc/cbold.txt is inode %llu "
+		    "after the takeover, not %llu\n", (unsigned long long)got,
+		    (unsigned long long)winner);
+		goto clean;
+	}
+	if (fs_apfs_lookup("/etc/cbnew.txt", &got, &is_dir) !=
+	    FS_APFS_E_NOTFOUND) {
+		kprintf("apfs-clobber: FAIL /etc/cbnew.txt still resolves "
+		    "after moving away\n");
+		goto clean;
+	}
+	if (!size_still("apfs-clobber", winner, APFS_CLOB_NEW_SIZE,
+	    "under the name it took"))
+		goto clean;
+	/* ...and the occupant is whole, reachable by nothing but its id. */
+	if (!size_still("apfs-clobber", loser, APFS_CLOB_OLD_SIZE,
+	    "waiting with no name"))
+		goto clean;
+
+	/* Let go, it takes its bytes with it. */
+	rv = fs_apfs_reap(loser, now);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_checkpoint();
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-clobber: FAIL letting the occupant go was "
+		    "refused (%d)\n", rv);
+		goto clean;
+	}
+	if (fs_apfs_size(loser, &got) == FS_APFS_E_OK) {
+		kprintf("apfs-clobber: FAIL inode %llu still has a length "
+		    "after being let go\n", (unsigned long long)loser);
+		goto clean;
+	}
+	loser = 0;
+	if (!priv_dir_empty(now)) {
+		kprintf("apfs-clobber: FAIL the private directory is still "
+		    "holding something\n");
+		goto clean;
+	}
+
+	/*
+	 * ACROSS DIRECTORIES, onto an occupant with no bytes at all -- the
+	 * ends the first takeover did not pin: the counters of two parents
+	 * move in one edit, and an orphan with an empty stream is let go.
+	 */
+	rv = fs_apfs_create(var, "cbold.txt", now, 0644, &second);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_checkpoint();
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-clobber: FAIL cannot make the second occupant "
+		    "(%d)\n", rv);
+		goto clean;
+	}
+	victim = 0;
+	rv = fs_apfs_rename(etc, "cbold.txt", var, "cbold.txt", now, &victim);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_checkpoint();
+	if (rv != FS_APFS_E_OK || victim != second) {
+		kprintf("apfs-clobber: FAIL the takeover across directories "
+		    "was refused (%d) or named inode %llu, not %llu\n", rv,
+		    (unsigned long long)victim, (unsigned long long)second);
+		goto clean;
+	}
+	got = 0;
+	if (fs_apfs_lookup("/var/cbold.txt", &got, &is_dir) != FS_APFS_E_OK ||
+	    got != winner ||
+	    fs_apfs_lookup("/etc/cbold.txt", &got, &is_dir) !=
+	    FS_APFS_E_NOTFOUND) {
+		kprintf("apfs-clobber: FAIL the name did not follow the move "
+		    "into %s\n", APFS_CLOB_OTHER);
+		goto clean;
+	}
+	rv = fs_apfs_reap(second, now);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_checkpoint();
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-clobber: FAIL letting the empty occupant go was "
+		    "refused (%d)\n", rv);
+		goto clean;
+	}
+	second = 0;
+
+	/*
+	 * A DIRECTORY REPLACED, which defers nothing: an empty directory is
+	 * two records, both taken out in the edit, so nothing waits and the
+	 * victim reported is zero.
+	 */
+	rv = fs_apfs_mkdir(etc, "cbdir", now, 0755, &dold);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_mkdir(etc, "cbdir2", now, 0755, &dnew);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_checkpoint();
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-clobber: FAIL cannot make the two directories "
+		    "(%d)\n", rv);
+		goto clean;
+	}
+	victim = 1;
+	rv = fs_apfs_rename(etc, "cbdir2", etc, "cbdir", now, &victim);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_checkpoint();
+	if (rv != FS_APFS_E_OK || victim != 0) {
+		kprintf("apfs-clobber: FAIL replacing an empty directory was "
+		    "refused (%d) or left inode %llu waiting\n", rv,
+		    (unsigned long long)victim);
+		goto clean;
+	}
+	dold = 0;
+	got  = 0;
+	if (fs_apfs_lookup("/etc/cbdir", &got, &is_dir) != FS_APFS_E_OK ||
+	    got != dnew || !is_dir ||
+	    fs_apfs_lookup("/etc/cbdir2", &got, &is_dir) !=
+	    FS_APFS_E_NOTFOUND) {
+		kprintf("apfs-clobber: FAIL /etc/cbdir is not the directory "
+		    "that moved onto it\n");
+		goto clean;
+	}
+	/* And it is a directory the writer will file a name under. */
+	rv = fs_apfs_create(dnew, "held.txt", now, 0644, &inner);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_unlink(dnew, "held.txt", now);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_checkpoint();
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-clobber: FAIL the directory that took the name "
+		    "does not take a name itself (%d)\n", rv);
+		goto clean;
+	}
+	inner = 0;
+
+	/*
+	 * THE REFUSALS, none of which may leave a mark.  A directory that
+	 * still holds a name may not be replaced -- its children would keep
+	 * their perfectly valid records and lose every path to them -- and
+	 * the two ends must be the same kind of thing, each mismatch with the
+	 * answer POSIX gives it.
+	 */
+	rv = fs_apfs_mkdir(etc, "cbfull", now, 0755, &full);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_create(full, "held.txt", now, 0644, &inner);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_create(etc, "cbnew.txt", now, 0644, &winner);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_checkpoint();
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-clobber: FAIL cannot arrange the refusals "
+		    "(%d)\n", rv);
+		goto clean;
+	}
+	rv = fs_apfs_rename(etc, "cbdir", etc, "cbfull", now, NULL);
+	if (rv != FS_APFS_E_NOTEMPTY) {
+		kprintf("apfs-clobber: FAIL replacing a directory that holds "
+		    "a name answered %d, not NOTEMPTY\n", rv);
+		goto clean;
+	}
+	rv = fs_apfs_rename(etc, "cbnew.txt", etc, "cbfull", now, NULL);
+	if (rv != FS_APFS_E_ISDIR) {
+		kprintf("apfs-clobber: FAIL a file taking a directory's name "
+		    "answered %d, not ISDIR\n", rv);
+		goto clean;
+	}
+	rv = fs_apfs_rename(etc, "cbdir", etc, "cbnew.txt", now, NULL);
+	if (rv != FS_APFS_E_NOTDIR) {
+		kprintf("apfs-clobber: FAIL a directory taking a file's name "
+		    "answered %d, not NOTDIR\n", rv);
+		goto clean;
+	}
+	got = 0;
+	if (fs_apfs_lookup("/etc/cbfull/held.txt", &got, &is_dir) !=
+	    FS_APFS_E_OK || got != inner) {
+		kprintf("apfs-clobber: FAIL the refusals did not leave "
+		    "/etc/cbfull as they found it\n");
+		goto clean;
+	}
+
+	if (fs_apfs_moves() - moves != 3 || fs_apfs_clobbers() - clobs != 3 ||
+	    fs_apfs_orphans() - orphans != 2 || fs_apfs_reaps() - reaps != 2) {
+		kprintf("apfs-clobber: FAIL %llu move(s), %llu takeover(s), "
+		    "%llu orphaned, %llu let go -- and this test made 3, 3, "
+		    "2, 2\n", (unsigned long long)(fs_apfs_moves() - moves),
+		    (unsigned long long)(fs_apfs_clobbers() - clobs),
+		    (unsigned long long)(fs_apfs_orphans() - orphans),
+		    (unsigned long long)(fs_apfs_reaps() - reaps));
+		goto clean;
+	}
+	if (!index_check(g_apfs.ac_root_tree_bno, 0)) {
+		kprintf("apfs-clobber: FAIL the index is wrong after the "
+		    "takeovers\n");
+		goto clean;
+	}
+
+	kprintf("apfs-clobber: PASS -- a taken name answered with the "
+	    "newcomer's %u bytes at once, twice, the occupants waited whole "
+	    "(%u and none) and were let go, a directory replaced an empty "
+	    "one and files a name, three refusals that left no mark\n",
+	    (unsigned)APFS_CLOB_NEW_SIZE, (unsigned)APFS_CLOB_OLD_SIZE);
+
+clean:
+	/*
+	 * Names first, then the private directory, as in the test above: after
+	 * a failure, which side of the takeover anything is on is exactly
+	 * what is not known.
+	 */
+	if (full != 0)
+		(void)fs_apfs_unlink(full, "held.txt", now);
+	(void)fs_apfs_unlink(etc, "cbnew.txt", now);
+	(void)fs_apfs_unlink(etc, "cbold.txt", now);
+	(void)fs_apfs_unlink(var, "cbold.txt", now);
+	(void)fs_apfs_rmdir(etc, "cbfull", now);
+	(void)fs_apfs_rmdir(etc, "cbdir", now);
+	(void)fs_apfs_rmdir(etc, "cbdir2", now);
+	left = 0;
+	(void)fs_apfs_reap_all(now, &left);
+	(void)fs_apfs_checkpoint();
+}
+
+/*
+ * THE EXTENT REFERENCE TREE OUTGROWS ITS ROOT
+ *
+ * The volume's steady state ran within a record or two of the old ceiling --
+ * a single node, sixteen records -- and one boot's layout touched it, so a
+ * create on a nearly empty disk was refused for a reason that had nothing to
+ * do with the file.  This arranges that same pressure on purpose and demands
+ * the opposite ending.
+ *
+ * Two files grow one block at a time IN ALTERNATION, which is the whole
+ * arrangement: each append's blocks land right after the other file's, so no
+ * append can merge with the run before it and every single one costs a fresh
+ * record.  The old tree takes four of those; twenty-eight force the root to
+ * divide and then a leaf to split, and every grow along the way must be
+ * answered.
+ *
+ * The reads back are the CUTS.  Truncating both files to nothing makes the
+ * writer find every one of those records again -- by descent, in whichever
+ * leaf the splits left it -- and a record the split misplaced or the
+ * separator hides fails the truncate right there.  What the cuts cannot ask,
+ * apfsck asks after the boot: the bitmap, the counts, and both trees against
+ * each other.
+ */
+#define	APFS_EXTREF_DIR		"/var/db"
+#define	APFS_EXTREF_ROUNDS	14u
+
+/*
+ * Cut a file of many one-block runs down to nothing, IN STAGES, because the
+ * truncate itself has an honest edge of its own: it takes out at most eight
+ * runs per call, and the whole point of the file being cut here is that
+ * every one of its fourteen blocks is a separate run.
+ */
+static int
+extref_cut(uint64_t ino)
+{
+	uint64_t	size;
+	uint64_t	next;
+	int		rv;
+
+	rv = fs_apfs_size(ino, &size);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	while (size > 0) {
+		next = size > 6u * APFS_BLOCK_SIZE ?
+		    size - 6u * APFS_BLOCK_SIZE : 0;
+		rv = fs_apfs_truncate(ino, ino, next);
+		if (rv == FS_APFS_E_OK)
+			rv = fs_apfs_checkpoint();
+		if (rv != FS_APFS_E_OK)
+			return (rv);
+		size = next;
+	}
+	return (FS_APFS_E_OK);
+}
+
+void
+fs_apfs_extref_selftest(uint64_t now)
+{
+	struct btree_layout	 bl;
+	uint8_t			*node;
+	uint64_t		 db;
+	uint64_t		 a, b;
+	uint64_t		 asz, bsz;
+	uint64_t		 grows, splits, drops;
+	uint32_t		 round;
+	int			 is_dir;
+	int			 rv;
+	bool			 two;
+
+	if (!g_apfs.ac_mounted || !g_apfs.ac_ip_valid) {
+		kprintf("apfs-extref: nothing writable -- skipped\n");
+		return;
+	}
+	if (fs_apfs_lookup(APFS_EXTREF_DIR, &db, &is_dir) != FS_APFS_E_OK ||
+	    !is_dir) {
+		kprintf("apfs-extref: %s is not there -- skipped\n",
+		    APFS_EXTREF_DIR);
+		return;
+	}
+
+	/*
+	 * Whatever an interrupted run left behind -- cut in stages first,
+	 * since what it left is precisely files of many one-block runs.
+	 */
+	a = 0;
+	b = 0;
+	if (fs_apfs_lookup("/var/db/exta.bin", &a, &is_dir) == FS_APFS_E_OK)
+		(void)extref_cut(a);
+	if (fs_apfs_lookup("/var/db/extb.bin", &b, &is_dir) == FS_APFS_E_OK)
+		(void)extref_cut(b);
+	(void)fs_apfs_unlink(db, "exta.bin", now);
+	(void)fs_apfs_unlink(db, "extb.bin", now);
+	(void)fs_apfs_checkpoint();
+
+	/*
+	 * Which shape the tree is in NOW decides what can be demanded of it.
+	 * The first run through here finds it a single node and must see the
+	 * division and a split; every run after finds the index level already
+	 * there -- it never folds back while the volume owns a run -- and
+	 * what those runs prove is the standing claim: twenty-eight appends
+	 * past the old ceiling, all answered, through the two-level walk.
+	 */
+	two = false;
+	node = kmalloc(APFS_BLOCK_SIZE);
+	if (node != NULL &&
+	    fs_apfs_read_block(g_apfs.ac_extref_bno, node) == FS_APFS_E_OK) {
+		btree_layout(node, &bl);
+		two = bl.bl_level != 0;
+	}
+	kfree(node);
+
+	grows  = fs_apfs_extref_grows();
+	splits = fs_apfs_extref_splits();
+	drops  = fs_apfs_extref_drops();
+	a      = 0;
+	b      = 0;
+
+	rv = fs_apfs_create(db, "exta.bin", now, 0644, &a);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_create(db, "extb.bin", now, 0644, &b);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_checkpoint();
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-extref: FAIL cannot make the two files (%d)\n",
+		    rv);
+		goto clean;
+	}
+
+	asz = 0;
+	bsz = 0;
+	for (round = 0; round < APFS_EXTREF_ROUNDS; round++) {
+		asz += APFS_BLOCK_SIZE;
+		rv = fs_apfs_grow(a, a, asz);
+		if (rv == FS_APFS_E_OK) {
+			bsz += APFS_BLOCK_SIZE;
+			rv = fs_apfs_grow(b, b, bsz);
+		}
+		if (rv == FS_APFS_E_OK)
+			rv = fs_apfs_checkpoint();
+		if (rv != FS_APFS_E_OK) {
+			kprintf("apfs-extref: FAIL append %u of %u was "
+			    "refused (%d) -- the very refusal this rung "
+			    "exists to end\n", (unsigned)round,
+			    (unsigned)APFS_EXTREF_ROUNDS, rv);
+			goto clean;
+		}
+	}
+
+	if (!two && fs_apfs_extref_grows() == grows) {
+		kprintf("apfs-extref: FAIL %u unmergeable appends into a "
+		    "single-node tree and it never grew its index level\n",
+		    (unsigned)(APFS_EXTREF_ROUNDS * 2));
+		goto clean;
+	}
+	if (!two && fs_apfs_extref_splits() == splits) {
+		kprintf("apfs-extref: FAIL the tree grew a level and no leaf "
+		    "ever split\n");
+		goto clean;
+	}
+	if (!size_still("apfs-extref", a, asz, "after the appends") ||
+	    !size_still("apfs-extref", b, bsz, "after the appends"))
+		goto clean;
+
+	/* The cuts, which must find every record the splits scattered. */
+	rv = extref_cut(a);
+	if (rv == FS_APFS_E_OK)
+		rv = extref_cut(b);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-extref: FAIL a cut could not find its records "
+		    "again (%d)\n", rv);
+		goto clean;
+	}
+	if (!size_still("apfs-extref", a, 0, "after the cut") ||
+	    !size_still("apfs-extref", b, 0, "after the cut"))
+		goto clean;
+
+	if (two)
+		kprintf("apfs-extref: PASS -- %u appends that could not "
+		    "merge, all answered through the index level an earlier "
+		    "run left standing (%llu leaf split(s), %llu emptied "
+		    "leaf(s) left the tree)\n",
+		    (unsigned)(APFS_EXTREF_ROUNDS * 2),
+		    (unsigned long long)(fs_apfs_extref_splits() - splits),
+		    (unsigned long long)(fs_apfs_extref_drops() - drops));
+	else
+		kprintf("apfs-extref: PASS -- %u appends that could not "
+		    "merge, the tree grew %llu index level(s) and split "
+		    "%llu leaf(s), every grow was answered, and the cuts "
+		    "walked all of it back (%llu emptied leaf(s) left the "
+		    "tree)\n", (unsigned)(APFS_EXTREF_ROUNDS * 2),
+		    (unsigned long long)(fs_apfs_extref_grows() - grows),
+		    (unsigned long long)(fs_apfs_extref_splits() - splits),
+		    (unsigned long long)(fs_apfs_extref_drops() - drops));
+
+clean:
+	/*
+	 * The unlink truncates to nothing on its way, so a file still holding
+	 * many one-block runs has to be cut in stages first.  The same goes
+	 * for whatever an interrupted EARLIER run left, which is why the
+	 * sweep at the top resolves the names and comes through here too.
+	 */
+	if (a != 0)
+		(void)extref_cut(a);
+	if (b != 0)
+		(void)extref_cut(b);
+	(void)fs_apfs_unlink(db, "exta.bin", now);
+	(void)fs_apfs_unlink(db, "extb.bin", now);
 	(void)fs_apfs_checkpoint();
 }
 

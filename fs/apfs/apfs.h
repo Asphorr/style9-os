@@ -1049,25 +1049,42 @@ int	fs_apfs_mkdir(uint64_t dir, const char *name, uint64_t now,
 int	fs_apfs_rmdir(uint64_t dir, const char *name, uint64_t now);
 
 /*
- * Move a name, within one directory or between two, taking what is under it.
+ * Move a name, within one directory or between two, taking what is under it --
+ * and OVER whatever stands at the destination, in the same edit, because POSIX
+ * asks a rename to be atomic and the checkpoint is the only atom this volume
+ * has: a state in which the name is not there at all is the one state rename
+ * exists to keep readers from seeing.
  *
- * Nothing is created and nothing destroyed: the same inode ends up with a
- * different name, in a different place, and the tree holds exactly as many
- * records as it did.  What makes it a rung of its own is that the inode RECORD
- * has to follow -- it carries the name and the parent, apfsck checks both
- * against the entry that names it, and a name of a different length makes the
- * record a different length, so it is rebuilt rather than amended.
+ * Over a free name nothing is created and nothing destroyed: the same inode
+ * ends up with a different name, in a different place, and the tree holds
+ * exactly as many records as it did.  What makes it a rung of its own is that
+ * the inode RECORD has to follow -- it carries the name and the parent, apfsck
+ * checks both against the entry that names it, and a name of a different
+ * length makes the record a different length, so it is rebuilt rather than
+ * amended.
  *
- * Refuses FS_APFS_E_NOTFOUND for a name that is not there, FS_APFS_E_EXIST for
- * a destination that is taken (replacing what is already there is a rung up),
- * and FS_APFS_E_INVAL for the root, for an inode with more than one link, and
- * for a directory moved into itself -- which would take every name inside it
- * out of the volume.  Renaming a name to itself succeeds and changes nothing;
- * renaming one to another spelling of itself is a real move, so the case a
- * caller asks for is the case the volume keeps.
+ * A FILE standing at the destination is orphaned into the private directory --
+ * the same records the unlink-while-open path writes, and not one of its
+ * extents touched -- and its object id comes back through *victim_out (NULL if
+ * the caller does not care; 0 when nothing stood there).  Whether anything
+ * still holds that file open is the CALLER's question: this layer knows the
+ * format, the layer above knows the descriptors, so the caller either reaps it
+ * at once or leaves it for the close that will.  An empty DIRECTORY standing
+ * there is simply removed -- it has two records, no data stream and nothing to
+ * defer -- and *victim_out stays 0, since nothing waits.
+ *
+ * Refuses FS_APFS_E_NOTFOUND for a name that is not there; FS_APFS_E_ISDIR
+ * and FS_APFS_E_NOTDIR when the two ends are not the same kind of thing;
+ * FS_APFS_E_NOTEMPTY for a directory that still holds a name, asked of the
+ * tree the way rmdir asks; and FS_APFS_E_INVAL for the root, for an inode with
+ * more than one link on either end, and for a directory moved into itself --
+ * which would take every name inside it out of the volume.  Renaming a name to
+ * itself succeeds and changes nothing; renaming one to another spelling of
+ * itself is a real move, so the case a caller asks for is the case the volume
+ * keeps.
  */
 int	fs_apfs_rename(uint64_t odir, const char *oname, uint64_t ndir,
-	    const char *nname, uint64_t now);
+	    const char *nname, uint64_t now, uint64_t *victim_out);
 
 /*
  * Take a name away from a file that something still holds open.
@@ -1162,11 +1179,14 @@ uint64_t fs_apfs_dirkills(void);
 
 /*
  * Names moved.  Worth its own counter for the reason above and one more: a
- * rename is the only writer here whose success moves no total at all -- the
- * same records, the same key count, the same file and directory counts -- so
- * this is the only number that says it happened.
+ * rename onto a free name is the only writer here whose success moves no total
+ * at all -- the same records, the same key count, the same file and directory
+ * counts -- so this is the only number that says it happened.  And of those,
+ * how many landed on a taken name: a refusal and a half-done replacement
+ * answer a caller identically, and the counter is what tells them apart.
  */
 uint64_t fs_apfs_moves(void);
+uint64_t fs_apfs_clobbers(void);
 
 /*
  * apfs-move: a name moved, within a directory and between two.
@@ -1176,12 +1196,48 @@ uint64_t fs_apfs_moves(void);
  * an extended field packed after the name and a rename that rebuilt the record
  * instead of carrying it across would leave a valid empty file behind.  A
  * directory is moved with a child in it, which nothing touches.  And the
- * refusals are asked for -- onto a name that is taken, of a name that is not
- * there, of a directory into itself, under its own child, and into something
- * that is not a directory -- because a refusal leaves no trace on the volume
- * for a checker to find afterwards.
+ * refusals are asked for -- a file onto a directory's name, of a name that is
+ * not there, of a directory into itself, under its own child, and into
+ * something that is not a directory -- because a refusal leaves no trace on
+ * the volume for a checker to find afterwards.
  */
 void	fs_apfs_move_selftest(uint64_t now);
+
+/*
+ * apfs-clobber: a name taken over, and what stood there accounted for.
+ *
+ * Two files with different bytes, and one moved onto the other: the name
+ * answers with the newcomer's bytes, the occupant waits in the private
+ * directory with its own still intact -- the halves only a reader can tell
+ * apart, since both endings leave a valid volume -- and the reap returns its
+ * blocks.  Then the directory cases: an empty one replaced outright, a full
+ * one refused NOTEMPTY, a file onto a directory ISDIR and a directory onto a
+ * file NOTDIR, each refusal leaving no mark.  Takes the wall clock because
+ * this file has no clock of its own.
+ */
+void	fs_apfs_clobber_selftest(uint64_t now);
+
+/*
+ * The extent reference tree's growth, counted: index levels gained (it was
+ * born a single node that was its own root), leaves split under that index,
+ * and emptied leaves taken back out.  The counters exist because the volume's
+ * steady state ran within one record of the old sixteen-record ceiling and
+ * the first boot to touch it refused ordinary writes -- so whether the tree
+ * ever actually grew is a fact worth being able to ask for.
+ */
+uint64_t fs_apfs_extref_grows(void);
+uint64_t fs_apfs_extref_splits(void);
+uint64_t fs_apfs_extref_drops(void);
+
+/*
+ * apfs-extref: the extent reference tree outgrows its root and keeps
+ * answering.  Two files grow a block at a time in alternation, so no append
+ * can merge with the run before it and every one is a fresh record; the tree
+ * divides down, a leaf splits, and every record still resolves.  Then both
+ * files are cut to nothing, which walks the deletions back across the leaves
+ * it made.  Takes the wall clock because this file has no clock of its own.
+ */
+void	fs_apfs_extref_selftest(uint64_t now);
 
 /*
  * Split a leaf on purpose and prove nothing was lost: the same records, in the

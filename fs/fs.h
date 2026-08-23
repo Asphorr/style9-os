@@ -321,17 +321,23 @@ int		fs_rmdir(const char *path);
 
 /*
  * fs_rename: move a name, within a directory or between two, taking whatever
- * is under it -- a file with its bytes, a directory with everything in it.
+ * is under it -- a file with its bytes, a directory with everything in it --
+ * and over whatever stands at the destination, which is what POSIX says the
+ * call does.
  *
  * ONE transaction, which is the whole reason this is a call of its own and not
  * an unlink beside a create.  A program that writes a temporary file and
  * renames it over the real one is relying on a reader seeing one file or the
  * other and never a half-written one, and that promise is only worth anything
- * if the two edits reach the disk together.
+ * if the two edits reach the disk together.  A replaced file keeps Unix's
+ * other promise on the way out: still open somewhere, it loses its name and
+ * not its bytes, and goes when its last descriptor does -- the same road an
+ * unlinked open file takes.
  *
- * FS_E_EXIST if the destination is taken -- replacing what is there is a rung
- * this kernel has not climbed -- and FS_E_INVAL for a directory asked to move
- * inside itself, which would take every name in it out of the volume.
+ * FS_E_ISDIR and FS_E_NOTDIR when the two ends are not the same kind of
+ * thing, FS_E_NOTEMPTY for a directory that still holds a name, and
+ * FS_E_INVAL for a directory asked to move inside itself, which would take
+ * every name in it out of the volume.
  */
 int		fs_rename(const char *opath, const char *npath);
 
@@ -498,6 +504,13 @@ void		fs_stream_selftest(void);
 void		fs_room_selftest(void);
 
 /*
+ * apfs-extref through this layer's lock: the tree that counts the volume's
+ * runs outgrows its single-node root and every append is still answered.
+ * Silently does nothing when the volume is not APFS.
+ */
+void		fs_extref_selftest(void);
+
+/*
  * And that a name can move -- within a directory, into another one, to a
  * longer name and a shorter one -- carrying the inode, its bytes and, when it
  * is a directory, everything under it.  The refusals are asked for too, since
@@ -512,6 +525,15 @@ void		fs_move_selftest(void);
  * refusals are asked for.
  */
 void		fs_orphan_selftest(void);
+
+/*
+ * apfs-clobber through this layer's lock -- a rename lands on a taken name and
+ * the occupant is accounted for -- and then fs-clobber, the half only this
+ * layer can ask: the name answers with the newcomer while a descriptor held
+ * on the occupant goes on reading the occupant, which leaves for good when
+ * that descriptor closes.  Silently does nothing when the volume is not APFS.
+ */
+void		fs_clobber_selftest(void);
 
 /*
  * fs-open: nothing the self-tests opened is still held.  Run after all of them

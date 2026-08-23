@@ -155,6 +155,11 @@ static int	node_cow(uint8_t *node, uint64_t old_bno, uint64_t xid,
 		    uint64_t *new_bno);
 static uint32_t	node_place(const uint8_t *node, const uint8_t *key,
 		    uint32_t klen);
+static int	node_rebuild_as(const uint8_t *src, uint32_t from, uint32_t to,
+		    uint8_t *dst, uint16_t flags, uint32_t type);
+static int	node_rebuild(const uint8_t *src, uint32_t from, uint32_t to,
+		    uint8_t *dst);
+static void	tree_nodes_add(uint8_t *root, int64_t delta);
 static int	extref_move(uint64_t old_start, uint64_t new_start,
 		    uint64_t blocks, uint64_t xid, void *buf);
 static int	fq_insert(uint32_t q, uint64_t xid, uint64_t paddr,
@@ -198,6 +203,7 @@ static uint64_t	 kill_n;	/* ...and names taken back out     */
 static uint64_t	 dmake_n;	/* directories made                */
 static uint64_t	 dkill_n;	/* ...and directories removed      */
 static uint64_t	 move_n;	/* names moved by a rename         */
+static uint64_t	 clob_n;	/* ...of them onto a taken name    */
 static uint64_t	 orph_n;	/* names taken from an open file   */
 static uint64_t	 reap_n;	/* ...and those files let go       */
 static uint64_t	 hole_n;	/* record ends reusing a deletion  */
@@ -3975,51 +3981,142 @@ node_longest(const uint8_t *node, uint32_t *klen, uint32_t *vlen)
 }
 
 /*
- * A newly allocated run belongs to somebody: say so in the extent reference
- * tree.  The tree is a single node that is its own root, so its record count
- * is in the node being edited and there is nothing above it to tell.
+ * THE EXTENT REFERENCE TREE CAN NOW BE TWO LEVELS DEEP.
+ *
+ * It was a single node that was its own root, and that was an honest edge
+ * for as long as nothing lived on it: sixteen records, refused out loud.
+ * Then the volume's steady state grew to within a record of sixteen, and the
+ * first boot whose layout touched the ceiling refused perfectly ordinary
+ * writes on a volume that was nearly empty.  An edge a full disk hits is a
+ * limit; one an idle disk hits is a defect.
+ *
+ * The shape is the catalog's root division with the virtual half removed: a
+ * PHYSICAL tree names its children by block address, so there is no object
+ * map to tell, no oid to mint, and the root -- whose address the volume
+ * superblock carries, rewritten by the spine every checkpoint -- keeps being
+ * the one name anybody holds.  What is left is the walk: every writer below
+ * reads the root, follows one child when there is an index level, edits the
+ * leaf, and writes the pair back through cow_physical -- the leaf first,
+ * then the root that must name the leaf's new address.
+ *
+ * The root's copy of a leaf's FIRST key is refreshed on every settle,
+ * unconditionally: all keys here are eight bytes, so the separator update
+ * that cost the catalog a reindex pass with delete-and-insert is a single
+ * aligned store, and storing it always is cheaper than deciding whether the
+ * first record moved.
+ */
+struct extref_walk {
+	uint64_t	ew_leaf_bno;	/* where the records are          */
+	uint32_t	ew_slot;	/* the root entry naming the leaf */
+	bool		ew_two;		/* the tree has an index level    */
+};
+
+static uint64_t	 extgrow_n;	/* index levels the extref tree gained */
+static uint64_t	 extsplit_n;	/* extref leaves split in two          */
+static uint64_t	 extdrop_n;	/* ...and emptied ones taken out       */
+
+/*
+ * Read the root and, when the tree has an index level, the leaf covering
+ * `start`.  With one level the root IS the leaf and the caller works in the
+ * root buffer; `leaf` is not touched.
  */
 static int
-extref_insert(uint64_t start, uint64_t blocks, uint64_t owner, uint64_t xid,
-    void *buf)
+extref_descend(uint64_t start, uint8_t *root, uint8_t *leaf,
+    struct extref_walk *ew)
 {
-	struct apfs_phys_ext_val	 pv;
-	struct btree_layout		 bl;
-	uint8_t				*node;
-	uint64_t			 key;
-	uint64_t			 raw;
-	uint64_t			 new_bno;
-	uint32_t			 koff, klen, voff, vlen;
-	uint32_t			 pos;
-	int				 rv;
+	struct btree_layout	 bl;
+	uint64_t		 raw;
+	uint32_t		 koff, klen, voff, vlen;
+	uint32_t		 i;
+	int			 rv;
 
-	rv = fs_apfs_read_block(g_apfs.ac_extref_bno, buf);
+	if (g_apfs.ac_extref_bno == 0)
+		return (FS_APFS_E_NOTFOUND);
+	rv = fs_apfs_read_block(g_apfs.ac_extref_bno, root);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
-	node = buf;
-	btree_layout(node, &bl);
-	if (bl.bl_level != 0 || bl.bl_fixed)
+	btree_layout(root, &bl);
+	if (bl.bl_fixed)
 		return (FS_APFS_E_INVAL);
-
-	key = start | ((uint64_t)APFS_TYPE_EXTENT << APFS_J_OBJ_TYPE_SHIFT);
-	for (pos = 0; pos < bl.bl_nkeys; pos++) {
-		btree_entry_loc(&bl, pos, &koff, &klen, &voff, &vlen);
+	ew->ew_two      = bl.bl_level != 0;
+	ew->ew_leaf_bno = g_apfs.ac_extref_bno;
+	ew->ew_slot     = 0;
+	if (!ew->ew_two)
+		return (FS_APFS_E_OK);
+	if (bl.bl_level != 1 || bl.bl_nkeys == 0) {
+		kprintf("apfs: the extent reference tree at %llu is %u levels "
+		    "deep with %u children -- this writer walks two\n",
+		    (unsigned long long)g_apfs.ac_extref_bno,
+		    (unsigned)(bl.bl_level + 1), (unsigned)bl.bl_nkeys);
+		return (FS_APFS_E_INVAL);
+	}
+	/*
+	 * The last child whose separator is no greater than the key; a key
+	 * below every separator belongs to the first child, which is the same
+	 * rule the catalog's descent applies.
+	 */
+	for (i = 1; i < bl.bl_nkeys; i++) {
+		btree_entry_loc(&bl, i, &koff, &klen, &voff, &vlen);
+		if (klen < 8)
+			return (FS_APFS_E_INVAL);
 		raw = *(const uint64_t *)(bl.bl_keys + koff);
 		if ((raw & APFS_J_OBJ_ID_MASK) > start)
 			break;
+		ew->ew_slot = i;
 	}
+	btree_entry_loc(&bl, ew->ew_slot, &koff, &klen, &voff, &vlen);
+	if (vlen < sizeof(uint64_t))
+		return (FS_APFS_E_INVAL);
+	ew->ew_leaf_bno = *(const uint64_t *)(bl.bl_vals - voff);
+	return (fs_apfs_read_block(ew->ew_leaf_bno, leaf));
+}
 
-	pv.pe_len_and_kind = blocks |
-	    ((uint64_t)APFS_PEXT_KIND_NEW << APFS_PEXT_KIND_SHIFT);
-	pv.pe_owning_obj_id = owner;
-	pv.pe_refcnt        = 1;
-	rv = leaf_insert(node, pos, &key, (uint32_t)sizeof(key), &pv,
-	    (uint32_t)sizeof(pv));
-	if (rv != FS_APFS_E_OK)
-		return (rv);
-	tree_count_add(node, 1);
+/*
+ * The edited node goes back to the device, and everything that names it
+ * follows: the leaf through cow_physical, the root's value for that child,
+ * the root's copy of the child's first key, and the root itself -- whose new
+ * address lands in ac_extref_bno for the spine to write into the volume
+ * superblock.  With one level this is just the root's own copy-out.
+ *
+ * The first-key refresh is stricter than the checker asks, and knowingly:
+ * apfsck was measured holding "index key absent from child node" to the
+ * CATALOG and accepting a stale-but-lower separator here (the probe left one
+ * behind and the volume passed).  A separator below the child's first key
+ * still orders every descent correctly -- it is identity, not order, that
+ * lapses -- but Apple's own trees keep the identity, and eight bytes stored
+ * unconditionally is cheaper than a class of drift nobody is watching for.
+ */
+static int
+extref_settle(struct extref_walk *ew, uint64_t xid, uint8_t *root,
+    uint8_t *leaf)
+{
+	struct btree_layout	 bl;
+	struct btree_layout	 lb;
+	uint64_t		 new_bno;
+	uint32_t		 koff, klen, voff, vlen;
+	uint32_t		 lkoff, lklen, lvoff, lvlen;
+	int			 rv;
 
-	rv = cow_physical(g_apfs.ac_extref_bno, xid, buf, &new_bno);
+	if (ew->ew_two) {
+		rv = cow_physical(ew->ew_leaf_bno, xid, leaf, &new_bno);
+		if (rv != FS_APFS_E_OK)
+			return (rv);
+		ew->ew_leaf_bno = new_bno;
+		btree_layout(root, &bl);
+		btree_entry_loc(&bl, ew->ew_slot, &koff, &klen, &voff, &vlen);
+		if (klen < 8 || vlen < sizeof(uint64_t))
+			return (FS_APFS_E_INVAL);
+		*(uint64_t *)((uint8_t *)bl.bl_vals - voff) = new_bno;
+		btree_layout(leaf, &lb);
+		if (lb.bl_nkeys != 0) {
+			btree_entry_loc(&lb, 0, &lkoff, &lklen, &lvoff,
+			    &lvlen);
+			if (lklen >= 8)
+				*(uint64_t *)(bl.bl_keys + koff) =
+				    *(const uint64_t *)(lb.bl_keys + lkoff);
+		}
+	}
+	rv = cow_physical(g_apfs.ac_extref_bno, xid, root, &new_bno);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
 	g_apfs.ac_extref_bno = new_bno;
@@ -4027,36 +4124,338 @@ extref_insert(uint64_t start, uint64_t blocks, uint64_t owner, uint64_t xid,
 }
 
 /*
+ * The root is full and still a leaf: divide it down, the way the catalog's
+ * root divides -- its records go to two new nodes at its own level and it
+ * rebuilds in place one level up, holding a separator for each.  The volume
+ * superblock names this tree's ROOT, so the root is the one node that may
+ * not move away underneath it, and it does not: only its address moves, as
+ * it does on every checkpoint.
+ */
+static int
+extref_grow_level(uint64_t xid)
+{
+	struct apfs_btree_node_phys	*n;
+	struct btree_layout		 bl;
+	uint8_t				*root;
+	uint8_t				*lo;
+	uint8_t				*hi;
+	uint8_t				*nr;
+	uint64_t			 paddrs[2];
+	uint64_t			 sep;
+	uint64_t			 new_bno;
+	uint32_t			 half;
+	uint32_t			 koff, klen, voff, vlen;
+	uint32_t			 i;
+	int				 rv;
+
+	root = kmalloc(APFS_BLOCK_SIZE);
+	lo   = kmalloc(APFS_BLOCK_SIZE);
+	hi   = kmalloc(APFS_BLOCK_SIZE);
+	nr   = kmalloc(APFS_BLOCK_SIZE);
+	if (root == NULL || lo == NULL || hi == NULL || nr == NULL) {
+		rv = FS_APFS_E_NOMEM;
+		goto out;
+	}
+	rv = fs_apfs_read_block(g_apfs.ac_extref_bno, root);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	btree_layout(root, &bl);
+	if (bl.bl_level != 0 || bl.bl_fixed || bl.bl_nkeys < 2) {
+		rv = FS_APFS_E_INVAL;
+		goto out;
+	}
+	half = bl.bl_nkeys / 2;
+
+	rv = node_rebuild_as(root, 0, half, lo,
+	    (uint16_t)(bl.bl_flags & ~APFS_BTNODE_ROOT), APFS_OBJ_BTREE_NODE);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	rv = node_rebuild_as(root, half, bl.bl_nkeys, hi,
+	    (uint16_t)(bl.bl_flags & ~APFS_BTNODE_ROOT), APFS_OBJ_BTREE_NODE);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	/*
+	 * The new root is NOT a leaf any more, and the flag has to say so
+	 * itself: the level alone does not, and a level-one node still
+	 * flagged LEAF is what the checker calls "nonleaf node flagged as
+	 * leaf".  The catalog's division never met this, because a catalog
+	 * root was an index already; this tree's root is losing leafhood for
+	 * the first time in its life right here.
+	 */
+	rv = node_rebuild_as(root, 0, 0, nr,
+	    (uint16_t)(bl.bl_flags & ~APFS_BTNODE_LEAF), APFS_OBJ_BTREE_ROOT);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	n = (struct apfs_btree_node_phys *)nr;
+	n->btn_level = 1;
+
+	rv = alloc_blocks(1, g_apfs.ac_extref_bno, &paddrs[0]);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	rv = alloc_blocks(1, g_apfs.ac_extref_bno, &paddrs[1]);
+	if (rv != FS_APFS_E_OK) {
+		(void)free_blocks(paddrs[0], 1);
+		goto out;
+	}
+	/*
+	 * PHYSICAL: each half's object id IS its block number, which is the
+	 * whole difference from the catalog's division -- nothing is minted
+	 * and no map is told.
+	 */
+	for (i = 0; i < 2; i++) {
+		n = (struct apfs_btree_node_phys *)(i == 0 ? lo : hi);
+		n->btn_o.o_oid = paddrs[i];
+		n->btn_o.o_xid = xid;
+		rv = fs_apfs_write_block(paddrs[i], i == 0 ? lo : hi);
+		if (rv != FS_APFS_E_OK) {
+			(void)free_blocks(paddrs[0], 1);
+			(void)free_blocks(paddrs[1], 1);
+			goto out;
+		}
+	}
+	for (i = 0; i < 2; i++) {
+		btree_entry_loc(&bl, i == 0 ? 0 : half, &koff, &klen, &voff,
+		    &vlen);
+		sep = *(const uint64_t *)(bl.bl_keys + koff);
+		rv = leaf_insert(nr, i, &sep, (uint32_t)sizeof(sep),
+		    &paddrs[i], (uint32_t)sizeof(paddrs[i]));
+		if (rv != FS_APFS_E_OK) {
+			(void)free_blocks(paddrs[0], 1);
+			(void)free_blocks(paddrs[1], 1);
+			goto out;
+		}
+	}
+	tree_nodes_add(nr, 2);
+
+	rv = cow_physical(g_apfs.ac_extref_bno, xid, nr, &new_bno);
+	if (rv != FS_APFS_E_OK) {
+		(void)free_blocks(paddrs[0], 1);
+		(void)free_blocks(paddrs[1], 1);
+		goto out;
+	}
+	g_apfs.ac_extref_bno = new_bno;
+	g_apfs.ac_fs_alloc_count += 2;
+	extgrow_n++;
+	kprintf("apfs: the extent reference tree grew an index level -- %u "
+	    "runs split %u and %u under the root at %llu\n",
+	    (unsigned)bl.bl_nkeys, (unsigned)half,
+	    (unsigned)(bl.bl_nkeys - half), (unsigned long long)new_bno);
+	rv = FS_APFS_E_OK;
+out:
+	kfree(root);
+	kfree(lo);
+	kfree(hi);
+	kfree(nr);
+	return (rv);
+}
+
+/*
+ * A LEAF of the two-level tree is full: split it where it stands.  The upper
+ * half is a new node, the lower keeps the leaf's block (and so its place in
+ * the root), and the root gains one separator -- and when the ROOT has no
+ * room for that, the refusal is out loud and nothing has moved: this writer
+ * walks two levels, which is about two hundred and fifty runs, and a volume
+ * that outgrows THAT has outgrown the honest edge of this rung.
+ */
+static int
+extref_split_leaf(uint64_t start, uint64_t xid)
+{
+	struct apfs_btree_node_phys	*n;
+	struct extref_walk		 ew;
+	struct btree_layout		 lb;
+	uint8_t				*root;
+	uint8_t				*leaf;
+	uint8_t				*half;
+	uint64_t			 paddr;
+	uint64_t			 sep;
+	uint32_t			 mid;
+	uint32_t			 koff, klen, voff, vlen;
+	int				 rv;
+
+	root = kmalloc(APFS_BLOCK_SIZE);
+	leaf = kmalloc(APFS_BLOCK_SIZE);
+	half = kmalloc(APFS_BLOCK_SIZE);
+	if (root == NULL || leaf == NULL || half == NULL) {
+		rv = FS_APFS_E_NOMEM;
+		goto out;
+	}
+	rv = extref_descend(start, root, leaf, &ew);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	if (!ew.ew_two) {
+		rv = FS_APFS_E_INVAL;
+		goto out;
+	}
+	btree_layout(leaf, &lb);
+	if (lb.bl_nkeys < 2) {
+		rv = FS_APFS_E_INVAL;
+		goto out;
+	}
+	mid = lb.bl_nkeys / 2;
+
+	rv = node_rebuild(leaf, mid, lb.bl_nkeys, half);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	rv = alloc_blocks(1, ew.ew_leaf_bno, &paddr);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	n = (struct apfs_btree_node_phys *)half;
+	n->btn_o.o_oid = paddr;
+	n->btn_o.o_xid = xid;
+	rv = fs_apfs_write_block(paddr, half);
+	if (rv != FS_APFS_E_OK) {
+		(void)free_blocks(paddr, 1);
+		goto out;
+	}
+
+	/* The separator first: the root can refuse, the rebuild cannot. */
+	btree_entry_loc(&lb, mid, &koff, &klen, &voff, &vlen);
+	sep = *(const uint64_t *)(lb.bl_keys + koff);
+	rv = leaf_insert(root, ew.ew_slot + 1, &sep, (uint32_t)sizeof(sep),
+	    &paddr, (uint32_t)sizeof(paddr));
+	if (rv != FS_APFS_E_OK) {
+		(void)free_blocks(paddr, 1);
+		kprintf("apfs: the extent reference tree's root holds %u "
+		    "children and has no room for another -- a third level "
+		    "is a different rung\n",
+		    (unsigned)((struct apfs_btree_node_phys *)root)->
+		    btn_nkeys);
+		goto out;
+	}
+	rv = node_rebuild(leaf, 0, mid, half);
+	if (rv != FS_APFS_E_OK) {
+		(void)free_blocks(paddr, 1);
+		goto out;
+	}
+	mem_copy(leaf, half, APFS_BLOCK_SIZE);
+	tree_nodes_add(root, 1);
+
+	rv = extref_settle(&ew, xid, root, leaf);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	g_apfs.ac_fs_alloc_count += 1;
+	extsplit_n++;
+	kprintf("apfs: an extent reference leaf split -- %u runs stay at "
+	    "%llu, %u went to %llu\n", (unsigned)mid,
+	    (unsigned long long)ew.ew_leaf_bno,
+	    (unsigned)(lb.bl_nkeys - mid), (unsigned long long)paddr);
+	rv = FS_APFS_E_OK;
+out:
+	kfree(root);
+	kfree(leaf);
+	kfree(half);
+	return (rv);
+}
+
+/*
+ * A newly allocated run belongs to somebody: say so in the extent reference
+ * tree.  The record count lives in the ROOT's footer whichever node takes
+ * the record, and a full node is no longer the end of the answer -- a root
+ * that is its own leaf divides down, a full leaf under an index splits, and
+ * the insert is asked again.  Three rounds bound it: a division, a split,
+ * and the insert that then cannot be refused for room.
+ */
+static int
+extref_insert_pv(uint64_t start, const struct apfs_phys_ext_val *pv,
+    uint64_t xid)
+{
+	struct extref_walk	 ew;
+	struct btree_layout	 bl;
+	uint8_t			*root;
+	uint8_t			*leaf;
+	uint8_t			*node;
+	uint64_t		 key;
+	uint64_t		 raw;
+	uint32_t		 koff, klen, voff, vlen;
+	uint32_t		 pos;
+	uint32_t		 tries;
+	int			 rv;
+
+	root = kmalloc(APFS_BLOCK_SIZE);
+	leaf = kmalloc(APFS_BLOCK_SIZE);
+	if (root == NULL || leaf == NULL) {
+		rv = FS_APFS_E_NOMEM;
+		goto out;
+	}
+	key = start | ((uint64_t)APFS_TYPE_EXTENT << APFS_J_OBJ_TYPE_SHIFT);
+	for (tries = 0; ; tries++) {
+		rv = extref_descend(start, root, leaf, &ew);
+		if (rv != FS_APFS_E_OK)
+			goto out;
+		node = ew.ew_two ? leaf : root;
+		btree_layout(node, &bl);
+		for (pos = 0; pos < bl.bl_nkeys; pos++) {
+			btree_entry_loc(&bl, pos, &koff, &klen, &voff, &vlen);
+			raw = *(const uint64_t *)(bl.bl_keys + koff);
+			if ((raw & APFS_J_OBJ_ID_MASK) > start)
+				break;
+		}
+		rv = leaf_insert(node, pos, &key, (uint32_t)sizeof(key), pv,
+		    (uint32_t)sizeof(*pv));
+		if (rv == FS_APFS_E_OK)
+			break;
+		if (rv != FS_APFS_E_NOALLOC || tries >= 2)
+			goto out;
+		rv = ew.ew_two ? extref_split_leaf(start, xid) :
+		    extref_grow_level(xid);
+		if (rv != FS_APFS_E_OK)
+			goto out;
+	}
+	tree_count_add(root, 1);
+	rv = extref_settle(&ew, xid, root, leaf);
+out:
+	kfree(root);
+	kfree(leaf);
+	return (rv);
+}
+
+static int
+extref_insert(uint64_t start, uint64_t blocks, uint64_t owner, uint64_t xid,
+    void *buf)
+{
+	struct apfs_phys_ext_val	 pv;
+
+	(void)buf;
+	pv.pe_len_and_kind = blocks |
+	    ((uint64_t)APFS_PEXT_KIND_NEW << APFS_PEXT_KIND_SHIFT);
+	pv.pe_owning_obj_id = owner;
+	pv.pe_refcnt        = 1;
+	return (extref_insert_pv(start, &pv, xid));
+}
+
+/*
  * A run has grown at its end: say so in the extent reference tree, instead of
  * giving it a second record for blocks that touch the first.
  *
- * This is what keeps appending from being quadratic in records.  Its node is
- * its own root and holds sixteen entries, so four appends filled it -- the
- * fifth said "no room in its table of contents", which is true and is not the
- * problem.  Two runs that touch, with one owner between them, ARE one run; the
- * format says so by giving the record a length, and writing two records for
- * them is the thing that should never have been asked of the tree.
+ * This is what keeps appending from being quadratic in records.  Two runs
+ * that touch, with one owner between them, ARE one run; the format says so
+ * by giving the record a length, and writing two records for them is the
+ * thing that should never have been asked of the tree.  The length grows in
+ * place and the key does not change, so no separator above can be wrong
+ * afterwards.
  */
 static int
 extref_extend(uint64_t start, uint64_t extra, uint64_t xid, void *buf)
 {
 	struct apfs_phys_ext_val	*pv;
+	struct extref_walk		 ew;
 	struct btree_layout		 bl;
+	uint8_t				*root;
 	uint8_t				*node;
 	uint64_t			 raw;
-	uint64_t			 new_bno;
 	uint32_t			 koff, klen, voff, vlen;
 	uint32_t			 i;
 	int				 rv;
 
-	rv = fs_apfs_read_block(g_apfs.ac_extref_bno, buf);
+	root = kmalloc(APFS_BLOCK_SIZE);
+	if (root == NULL)
+		return (FS_APFS_E_NOMEM);
+	rv = extref_descend(start, root, buf, &ew);
 	if (rv != FS_APFS_E_OK)
-		return (rv);
-	node = buf;
+		goto out;
+	node = ew.ew_two ? (uint8_t *)buf : root;
 	btree_layout(node, &bl);
-	if (bl.bl_level != 0 || bl.bl_fixed)
-		return (FS_APFS_E_INVAL);
-
+	rv = FS_APFS_E_NOTFOUND;
 	for (i = 0; i < bl.bl_nkeys; i++) {
 		btree_entry_loc(&bl, i, &koff, &klen, &voff, &vlen);
 		raw = *(const uint64_t *)(bl.bl_keys + koff);
@@ -4064,17 +4463,18 @@ extref_extend(uint64_t start, uint64_t extra, uint64_t xid, void *buf)
 			continue;
 		if ((raw & APFS_J_OBJ_ID_MASK) != start)
 			continue;
-		if (vlen < sizeof(*pv))
-			return (FS_APFS_E_INVAL);
+		if (vlen < sizeof(*pv)) {
+			rv = FS_APFS_E_INVAL;
+			goto out;
+		}
 		pv = (struct apfs_phys_ext_val *)(bl.bl_vals - voff);
 		pv->pe_len_and_kind += extra;
-		rv = cow_physical(g_apfs.ac_extref_bno, xid, buf, &new_bno);
-		if (rv != FS_APFS_E_OK)
-			return (rv);
-		g_apfs.ac_extref_bno = new_bno;
-		return (FS_APFS_E_OK);
+		rv = extref_settle(&ew, xid, root, buf);
+		goto out;
 	}
-	return (FS_APFS_E_NOTFOUND);
+out:
+	kfree(root);
+	return (rv);
 }
 
 /*
@@ -4100,23 +4500,27 @@ extref_shrink(uint64_t start, uint64_t keep, uint64_t xid, void *buf,
     bool *dropped)
 {
 	struct apfs_phys_ext_val	*pv;
+	struct extref_walk		 ew;
 	struct btree_layout		 bl;
+	uint8_t				*root;
 	uint8_t				*node;
 	uint64_t			 raw;
 	uint64_t			 new_bno;
 	uint32_t			 koff, klen, voff, vlen;
 	uint32_t			 i;
 	int				 rv;
+	bool				 gone;
 
 	*dropped = false;
-	rv = fs_apfs_read_block(g_apfs.ac_extref_bno, buf);
+	root = kmalloc(APFS_BLOCK_SIZE);
+	if (root == NULL)
+		return (FS_APFS_E_NOMEM);
+	rv = extref_descend(start, root, buf, &ew);
 	if (rv != FS_APFS_E_OK)
-		return (rv);
-	node = buf;
+		goto out;
+	node = ew.ew_two ? (uint8_t *)buf : root;
 	btree_layout(node, &bl);
-	if (bl.bl_level != 0 || bl.bl_fixed)
-		return (FS_APFS_E_INVAL);
-
+	rv = FS_APFS_E_NOTFOUND;
 	for (i = 0; i < bl.bl_nkeys; i++) {
 		btree_entry_loc(&bl, i, &koff, &klen, &voff, &vlen);
 		raw = *(const uint64_t *)(bl.bl_keys + koff);
@@ -4124,32 +4528,83 @@ extref_shrink(uint64_t start, uint64_t keep, uint64_t xid, void *buf,
 			continue;
 		if ((raw & APFS_J_OBJ_ID_MASK) != start)
 			continue;
-		if (vlen < sizeof(*pv))
-			return (FS_APFS_E_INVAL);
+		if (vlen < sizeof(*pv)) {
+			rv = FS_APFS_E_INVAL;
+			goto out;
+		}
 		pv = (struct apfs_phys_ext_val *)(bl.bl_vals - voff);
 		if (pv->pe_refcnt != 1) {
 			kprintf("apfs: the run at %llu is named %d times -- "
 			    "shortening a shared run is a different rung\n",
 			    (unsigned long long)start, (int)pv->pe_refcnt);
-			return (FS_APFS_E_NOALLOC);
+			rv = FS_APFS_E_NOALLOC;
+			goto out;
 		}
+		gone = false;
 		if (keep == 0) {
 			rv = leaf_delete(node, i);
 			if (rv != FS_APFS_E_OK)
-				return (rv);
-			tree_count_add(node, -1);
+				goto out;
+			tree_count_add(root, -1);
 			*dropped = true;
+			btree_layout(node, &bl);
+			gone = bl.bl_nkeys == 0;
 		} else
 			pv->pe_len_and_kind =
 			    (pv->pe_len_and_kind & ~APFS_PEXT_LEN_MASK) | keep;
 
-		rv = cow_physical(g_apfs.ac_extref_bno, xid, buf, &new_bno);
-		if (rv != FS_APFS_E_OK)
-			return (rv);
-		g_apfs.ac_extref_bno = new_bno;
-		return (FS_APFS_E_OK);
+		/*
+		 * A LEAF WITH NOTHING IN IT LEAVES THE TREE.  Settling one
+		 * would refresh the root's separator from a first record the
+		 * leaf no longer has, and a separator over an empty node is
+		 * the shape the catalog measured as "index key absent from
+		 * child node".  So the root's entry goes instead, and the
+		 * block goes back.  A root left holding ONE empty child --
+		 * a volume with no owned runs at all -- folds back to being
+		 * its own leaf, which is where this tree began.
+		 */
+		if (gone && ew.ew_two) {
+			struct btree_layout	 rb;
+
+			btree_layout(root, &rb);
+			if (rb.bl_nkeys > 1) {
+				rv = leaf_delete(root, ew.ew_slot);
+				if (rv != FS_APFS_E_OK)
+					goto out;
+			} else {
+				struct apfs_btree_node_phys	*n;
+
+				rv = node_rebuild_as(root, 0, 0, (uint8_t *)
+				    buf, (uint16_t)(rb.bl_flags |
+				    APFS_BTNODE_LEAF), APFS_OBJ_BTREE_ROOT);
+				if (rv != FS_APFS_E_OK)
+					goto out;
+				n = (struct apfs_btree_node_phys *)buf;
+				n->btn_level = 0;
+				mem_copy(root, buf, APFS_BLOCK_SIZE);
+				kprintf("apfs: the extent reference tree "
+				    "emptied out and is its own leaf "
+				    "again\n");
+			}
+			rv = free_blocks(ew.ew_leaf_bno, 1);
+			if (rv != FS_APFS_E_OK)
+				goto out;
+			tree_nodes_add(root, -1);
+			rv = cow_physical(g_apfs.ac_extref_bno, xid, root,
+			    &new_bno);
+			if (rv != FS_APFS_E_OK)
+				goto out;
+			g_apfs.ac_extref_bno = new_bno;
+			g_apfs.ac_fs_alloc_count -= 1;
+			extdrop_n++;
+			goto out;
+		}
+		rv = extref_settle(&ew, xid, root, buf);
+		goto out;
 	}
-	return (FS_APFS_E_NOTFOUND);
+out:
+	kfree(root);
+	return (rv);
 }
 
 /*
@@ -5806,11 +6261,13 @@ grow_once(uint64_t ino, uint64_t id, uint64_t new_size, uint64_t *full_leaf)
 	/*
 	 * THE EXTENT-REFERENCE TREE, AND WHY ITS REFUSAL GIVES THE BLOCKS BACK.
 	 *
-	 * Both of these fail before they copy anything -- extref_insert refuses
-	 * a full node and extref_extend a run it cannot find, and neither has
-	 * reached its cow_physical by then -- and the catalog edit above is
-	 * still only in memory.  So NOTHING has moved, and the blocks this grow
-	 * took out of the bitmap are the one thing that has changed.
+	 * A full node is no longer among the refusals -- the tree divides and
+	 * splits now -- but refuse these still can: a run extend cannot find,
+	 * a tree deeper than the walk, an allocator with nothing to give the
+	 * split itself.  Every such ending cleans up after its own attempt
+	 * (the split paths free what they took), the catalog edit above is
+	 * still only in memory, and so the blocks this grow took out of the
+	 * bitmap are the one thing that has changed.
 	 *
 	 * They used to be kept.  The failure printed "this checkpoint must not
 	 * be written", which was a wish rather than a mechanism: the boot went
@@ -7548,18 +8005,35 @@ orphan_name(uint64_t ino, char *out)
  * count of zero.  Everything else -- building the record before deleting it,
  * carrying the entry's value across whole, the counters, the split retry -- is
  * the same problem with the same answer.
+ *
+ * AND A TAKEN NAME IS TAKEN OVER, in this same edit, because POSIX asks a
+ * rename to be atomic and the checkpoint is the only atom this volume has: an
+ * "unlink then move" would write a state in which the name is not there at
+ * all, which is the one state rename exists to keep readers from seeing.  The
+ * occupant does not have to DIE in the edit for that -- only its NAME has to
+ * go -- so a file standing where the move lands is orphaned right here, by the
+ * mechanism above: its record rebuilt under the derived name, its entry
+ * rewritten to the newcomer, and not one extent touched.  Whether anything
+ * still holds it is not this layer's question; the caller learns the inode
+ * through *victim_out and reaps it or leaves it to the close that will.  A
+ * DIRECTORY standing there cannot wait in the private directory, and does not
+ * need to: it must be empty before it may be replaced, and an empty directory
+ * is two records and two counters, taken out right here.
  */
 static int
 move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
-    uint64_t now, bool orphan, uint64_t *full_leaf)
+    uint64_t now, bool orphan, uint64_t *full_leaf, uint64_t *victim_out)
 {
 	struct apfs_drec_val	 dv;
+	struct apfs_drec_val	 vdv;
 	struct btree_layout	 bl;
 	struct dirent_search	 ds;
 	struct inode_info	 ii;
 	struct leaf_edit	 ne;
 	uint8_t			 okey[12 + APFS_MAKE_NAME_MAX + 1];
 	uint8_t			 nkey[12 + APFS_MAKE_NAME_MAX + 1];
+	uint8_t			 vkey[12 + APFS_MAKE_NAME_MAX + 1];
+	char			 dead[APFS_ORPHAN_NAME_MAX];
 	uint8_t			*rec;
 	uint8_t			*scratch;
 	const uint8_t		*old;
@@ -7570,7 +8044,13 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 	uint64_t		 odrec_leaf;
 	uint64_t		 ndrec_leaf;
 	uint64_t		 ino_leaf;
-	uint32_t		 oklen, nklen;
+	uint64_t		 victim;
+	uint64_t		 vic_leaf;
+	uint64_t		 priv_leaf;
+	uint64_t		 dead_leaf;
+	uint64_t		 vsize;
+	int64_t			 keydelta;
+	uint32_t		 oklen, nklen, vklen;
 	uint32_t		 onlen, nnlen;
 	uint32_t		 koff, klen, voff, vlen;
 	uint32_t		 rlen;
@@ -7580,8 +8060,12 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 	int			 rv;
 	bool			 stopped;
 	bool			 isdir;
+	bool			 victim_isdir;
 	bool			 under;
+	bool			 empty;
 
+	if (victim_out != NULL)
+		*victim_out = 0;
 	if (!g_apfs.ac_mounted)
 		return (FS_APFS_E_NOMOUNT);
 	if (!g_apfs.ac_ip_valid || g_apfs.ac_ctr_omap_tree == 0)
@@ -7629,7 +8113,13 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 	child = ds.ds_found;
 	isdir = ds.ds_is_dir;
 
-	/* And the name it moves to must be free.  Clobbering is a rung up. */
+	/*
+	 * And whatever already stands under the destination.  Finding something
+	 * is not a refusal any more: it is the occupant, and POSIX says the
+	 * move happens over it.  What kind of thing it is decides which of two
+	 * endings it gets, and both are decided further down, after the checks
+	 * that apply to every move.
+	 */
 	ds.ds_name    = nname;
 	ds.ds_namelen = nnlen;
 	ds.ds_parent  = ndir;
@@ -7640,8 +8130,20 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 	if (!btree_scan(g_apfs.ac_root_tree_bno, nkey, nklen, dirent_match, &ds,
 	    0, &stopped))
 		return (FS_APFS_E_IO);
-	if (ds.ds_found != 0)
-		return (FS_APFS_E_EXIST);
+	victim       = ds.ds_found;
+	victim_isdir = ds.ds_is_dir;
+	/*
+	 * One file cannot stand at both names: a link count of one is enforced
+	 * on everything this kernel makes, so the same object id under two
+	 * entries is not a state a healthy volume can be in.  Refused rather
+	 * than asserted, because the volume is an input here, not an invariant.
+	 */
+	if (victim != 0 && victim == child) {
+		kprintf("apfs: \"%s\" and \"%s\" both name inode %llu -- two "
+		    "names on one link is not a state this kernel makes\n",
+		    oname, nname, (unsigned long long)child);
+		return (FS_APFS_E_INVAL);
+	}
 
 	/*
 	 * The destination has to BE a directory, asked of its record.  Finding
@@ -7700,9 +8202,68 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 	}
 
 	/*
-	 * Five leaves at the most -- two parents, two entries and the inode --
-	 * against the nine an edit can hold, so the slots below are not checked
-	 * for overflow the way a wider writer's would have to be.
+	 * What the occupant must be, before anything is touched.  The kinds
+	 * have to agree -- POSIX gives each mismatch its own answer -- and a
+	 * directory about to be replaced must be EMPTY, asked of the tree the
+	 * way rmdir asks: replacing one over its children would leave every
+	 * entry in it valid, reachable by nothing, which is the one shape of
+	 * damage a checker cannot tell from a healthy volume.  A file about to
+	 * be replaced is bound for the private directory, where several names
+	 * cannot follow one inode -- so more links than one is refused with
+	 * the same words the source gets.
+	 */
+	vsize = 0;
+	vklen = 0;
+	if (victim != 0) {
+		if (victim_isdir && !isdir) {
+			kprintf("apfs: \"%s\" is a directory and \"%s\" is "
+			    "not -- a file cannot take a directory's name\n",
+			    nname, oname);
+			return (FS_APFS_E_ISDIR);
+		}
+		if (!victim_isdir && isdir) {
+			kprintf("apfs: \"%s\" is not a directory and \"%s\" "
+			    "is -- a directory cannot take a file's name\n",
+			    nname, oname);
+			return (FS_APFS_E_NOTDIR);
+		}
+		if (victim_isdir) {
+			rv = dir_empty(victim, &empty);
+			if (rv != FS_APFS_E_OK)
+				return (rv);
+			if (!empty) {
+				kprintf("apfs: \"%s\" still holds a name -- "
+				    "a directory replaced over its children "
+				    "leaves entries whose parent is gone\n",
+				    nname);
+				return (FS_APFS_E_NOTEMPTY);
+			}
+		} else {
+			if (inode_info(victim, &ii) != FS_APFS_E_OK)
+				return (FS_APFS_E_NOTFOUND);
+			if (ii.ii_nlink != 1) {
+				kprintf("apfs: inode %llu has %u links -- "
+				    "taking one name of several is a "
+				    "different rung\n",
+				    (unsigned long long)victim,
+				    (unsigned)ii.ii_nlink);
+				return (FS_APFS_E_NOALLOC);
+			}
+			vsize = ii.ii_size;
+		}
+		orphan_name(victim, dead);
+		rv = drec_key(APFS_PRIV_DIR_INO, dead,
+		    (uint32_t)str_len(dead), vkey, &vklen, true);
+		if (rv != FS_APFS_E_OK)
+			return (rv);
+	}
+
+	/*
+	 * Eight leaves at the most -- two parents, two entries and the inode,
+	 * and when the destination is occupied, the occupant's inode, the
+	 * private directory's and its new entry's -- against the nine an edit
+	 * can hold, so the slots below are not checked for overflow the way a
+	 * wider writer's would have to be.
 	 */
 	rv = inode_where(odir, &opar_leaf);
 	if (rv != FS_APFS_E_OK)
@@ -7719,6 +8280,22 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 	rv = leaf_home(nkey, nklen, &ndrec_leaf);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
+	vic_leaf  = 0;
+	priv_leaf = 0;
+	dead_leaf = 0;
+	if (victim != 0) {
+		rv = inode_where(victim, &vic_leaf);
+		if (rv != FS_APFS_E_OK)
+			return (rv);
+		if (!victim_isdir) {
+			rv = inode_where(APFS_PRIV_DIR_INO, &priv_leaf);
+			if (rv != FS_APFS_E_OK)
+				return (rv);
+			rv = leaf_home(vkey, vklen, &dead_leaf);
+			if (rv != FS_APFS_E_OK)
+				return (rv);
+		}
+	}
 
 	rec = kmalloc(APFS_BLOCK_SIZE);
 	if (rec == NULL)
@@ -7729,9 +8306,104 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 	(void)edit_leaf(&ne, odrec_leaf);
 	(void)edit_leaf(&ne, ndrec_leaf);
 	(void)edit_leaf(&ne, ino_leaf);
+	if (victim != 0) {
+		(void)edit_leaf(&ne, vic_leaf);
+		if (!victim_isdir) {
+			(void)edit_leaf(&ne, priv_leaf);
+			(void)edit_leaf(&ne, dead_leaf);
+		}
+	}
 	rv = edit_read(&ne);
 	if (rv != FS_APFS_E_OK)
 		goto out;
+
+	/*
+	 * THE OCCUPANT STEPS DOWN FIRST, while everything about it is still a
+	 * record.  A file is orphaned exactly as the mechanism above orphans
+	 * one -- rebuilt under the derived name with the root for a parent and
+	 * no links, its record out and back in at its own unchanged key, its
+	 * entry moved to the private directory carrying its value whole -- and
+	 * not one of its extents is touched: the bytes are the reap's problem,
+	 * later, under no lock this edit needs.  An empty directory has two
+	 * records and no third thing, and simply loses both.
+	 */
+	if (victim != 0) {
+		slot = edit_leaf(&ne, vic_leaf);
+		if (!node_slot(ne.le_node[slot], victim, APFS_TYPE_INODE, &pos,
+		    &voff, &vlen)) {
+			rv = FS_APFS_E_NOTFOUND;
+			goto out;
+		}
+		if (!victim_isdir) {
+			btree_layout(ne.le_node[slot], &bl);
+			old = (const uint8_t *)bl.bl_vals - voff;
+			rv  = inode_renamed(old, vlen, APFS_ROOT_DIR_INO, dead,
+			    (uint32_t)str_len(dead), now, rec, APFS_BLOCK_SIZE,
+			    &rlen);
+			if (rv != FS_APFS_E_OK)
+				goto out;
+			((struct apfs_inode_val *)rec)->ai_nchildren_or_nlink =
+			    0;
+		}
+		rv = leaf_delete(ne.le_node[slot], pos);
+		if (rv != FS_APFS_E_OK)
+			goto out;
+		if (!victim_isdir) {
+			ikey = (victim & APFS_J_OBJ_ID_MASK) |
+			    ((uint64_t)APFS_TYPE_INODE <<
+			    APFS_J_OBJ_TYPE_SHIFT);
+			*full_leaf = vic_leaf;
+			rv = leaf_insert(ne.le_node[slot],
+			    node_place(ne.le_node[slot],
+			    (const uint8_t *)&ikey, (uint32_t)sizeof(ikey)),
+			    &ikey, (uint32_t)sizeof(ikey), rec, rlen);
+			if (rv != FS_APFS_E_OK)
+				goto out;
+			*full_leaf = 0;
+		}
+
+		/*
+		 * Its entry out, by the exact key the newcomer's goes in by --
+		 * which is the whole event, seen from the directory: the same
+		 * key, a different file behind it.
+		 */
+		slot = edit_leaf(&ne, ndrec_leaf);
+		btree_layout(ne.le_node[slot], &bl);
+		rv = FS_APFS_E_NOTFOUND;
+		for (i = 0; i < bl.bl_nkeys; i++) {
+			btree_entry_loc(&bl, i, &koff, &klen, &voff, &vlen);
+			if (klen != nklen)
+				continue;
+			if (jkey_cmp(bl.bl_keys + koff, klen, nkey, nklen) !=
+			    0)
+				continue;
+			if (vlen < sizeof(vdv)) {
+				rv = FS_APFS_E_INVAL;
+				break;
+			}
+			vdv = *(const struct apfs_drec_val *)
+			    ((const uint8_t *)bl.bl_vals - voff);
+			rv = leaf_delete(ne.le_node[slot], i);
+			break;
+		}
+		if (rv != FS_APFS_E_OK) {
+			kprintf("apfs: \"%s\" was in inode %llu a moment ago "
+			    "and is not in leaf %llu now\n", nname,
+			    (unsigned long long)ndir,
+			    (unsigned long long)ndrec_leaf);
+			goto out;
+		}
+		if (!victim_isdir) {
+			slot = edit_leaf(&ne, dead_leaf);
+			*full_leaf = dead_leaf;
+			rv = leaf_insert(ne.le_node[slot],
+			    node_place(ne.le_node[slot], vkey, vklen), vkey,
+			    vklen, &vdv, (uint32_t)sizeof(vdv));
+			if (rv != FS_APFS_E_OK)
+				goto out;
+			*full_leaf = 0;
+		}
+	}
 
 	/*
 	 * THE NEW RECORD IS BUILT FIRST, while the old one is still a record.
@@ -7835,17 +8507,26 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 	 * The counts.  A name that stays in its directory changes neither
 	 * count, and the times still move: the directory was modified, and one
 	 * call with nothing to add says that in one place rather than two.
+	 * An occupant shifts each sum by one where it stood: its old directory
+	 * lost it, which cancels the newcomer's arrival there, and the private
+	 * directory gains what a file it takes in.
 	 */
-	if (odir == ndir) {
-		slot = edit_leaf(&ne, opar_leaf);
-		rv = dir_children_add(ne.le_node[slot], odir, 0, now);
-	} else {
-		slot = edit_leaf(&ne, opar_leaf);
+	slot = edit_leaf(&ne, opar_leaf);
+	if (odir == ndir)
+		rv = dir_children_add(ne.le_node[slot], odir,
+		    victim != 0 ? -1 : 0, now);
+	else {
 		rv = dir_children_add(ne.le_node[slot], odir, -1, now);
 		if (rv == FS_APFS_E_OK) {
 			slot = edit_leaf(&ne, npar_leaf);
-			rv = dir_children_add(ne.le_node[slot], ndir, 1, now);
+			rv = dir_children_add(ne.le_node[slot], ndir,
+			    victim != 0 ? 0 : 1, now);
 		}
+	}
+	if (rv == FS_APFS_E_OK && victim != 0 && !victim_isdir) {
+		slot = edit_leaf(&ne, priv_leaf);
+		rv = dir_children_add(ne.le_node[slot], APFS_PRIV_DIR_INO, 1,
+		    now);
 	}
 	if (rv != FS_APFS_E_OK)
 		goto out;
@@ -7856,14 +8537,23 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 		goto out;
 	}
 	/*
-	 * Two records out and two back in: the tree holds exactly as many keys
-	 * as it did, and nothing about the volume's file or directory counts
-	 * has changed either.  A rename is the only writer here that moves no
-	 * totals at all.
+	 * Over a free name, two records out and two back in: the tree holds
+	 * exactly as many keys as it did and no total moves at all.  Over a
+	 * FILE, still none: the occupant's inode went out and came back, and
+	 * its entry left one directory for another -- the file itself is
+	 * still counted, because it still exists.  Over a DIRECTORY the tree
+	 * is two records short -- the occupant's entry was replaced and its
+	 * inode simply removed -- and the volume holds one directory fewer,
+	 * which is put back if the commit refuses before anything moved.
 	 */
-	rv = edit_commit(&ne, 0, g_apfs.ac_xid + 1, scratch);
+	keydelta = (victim != 0 && victim_isdir) ? -2 : 0;
+	if (victim != 0 && victim_isdir)
+		g_apfs.ac_num_dirs -= 1;
+	rv = edit_commit(&ne, keydelta, g_apfs.ac_xid + 1, scratch);
 	kfree(scratch);
 	if (rv != FS_APFS_E_OK) {
+		if (victim != 0 && victim_isdir && !edit_moved(&ne))
+			g_apfs.ac_num_dirs += 1;
 		kprintf("apfs: moving \"%s\" failed (%d) -- %s\n", oname, rv,
 		    edit_moved(&ne) ? "a leaf had moved, and this checkpoint "
 		    "must not be written" : "before anything moved, so the "
@@ -7878,6 +8568,26 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 		    "still there, %u leaves moved\n", oname,
 		    (unsigned long long)odir, (unsigned long long)child, nname,
 		    (unsigned long long)ii.ii_size, (unsigned)ne.le_n);
+	} else if (victim != 0 && !victim_isdir) {
+		move_n++;
+		clob_n++;
+		orph_n++;
+		kprintf("apfs: \"%s\" in inode %llu is now \"%s\" in inode "
+		    "%llu -- inode %llu took the name, inode %llu waits in "
+		    "the private directory with %llu byte(s), %u leaves "
+		    "moved\n", oname, (unsigned long long)odir, nname,
+		    (unsigned long long)ndir, (unsigned long long)child,
+		    (unsigned long long)victim, (unsigned long long)vsize,
+		    (unsigned)ne.le_n);
+	} else if (victim != 0) {
+		move_n++;
+		clob_n++;
+		kprintf("apfs: \"%s\" in inode %llu is now \"%s\" in inode "
+		    "%llu -- inode %llu took the name, directory %llu is "
+		    "gone, %u leaves moved\n", oname,
+		    (unsigned long long)odir, nname, (unsigned long long)ndir,
+		    (unsigned long long)child, (unsigned long long)victim,
+		    (unsigned)ne.le_n);
 	} else {
 		move_n++;
 		kprintf("apfs: \"%s\" in inode %llu is now \"%s\" in inode "
@@ -7885,6 +8595,8 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 		    (unsigned long long)odir, nname, (unsigned long long)ndir,
 		    (unsigned long long)child, (unsigned)ne.le_n);
 	}
+	if (victim_out != NULL && victim != 0 && !victim_isdir)
+		*victim_out = victim;
 	rv = FS_APFS_E_OK;
 out:
 	edit_free(&ne);
@@ -7894,19 +8606,21 @@ out:
 
 /*
  * And the same, with the room made underneath it -- make_at's loop, for the
- * same two reasons and with the same ceiling.
+ * same two reasons and with a wider ceiling.
  *
- * TWO inserts here can be refused: the new entry, which sorts under the
- * destination directory's object id, and the inode record, which sorts under
- * the child's and comes back LONGER when the new name is longer than the old.
- * Neither says anything about the other, so splitting for one can be answered
- * by the other, and two is still the ceiling: each of those leaves needs at
- * most one split, and half a node is room enough for either record several
+ * FOUR inserts here can be refused: the new entry, which sorts under the
+ * destination directory's object id; the inode record, which sorts under the
+ * child's and comes back LONGER when the new name is longer than the old; and
+ * when the destination is occupied, the occupant's inode coming back under
+ * its derived name and its new entry in the private directory.  None of them
+ * says anything about the others, so splitting for one can be answered by
+ * another, and four is still the ceiling: each of those leaves needs at most
+ * one split, and half a node is room enough for any of the records several
  * times over.
  */
 static int
 move_at(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
-    uint64_t now, bool orphan)
+    uint64_t now, bool orphan, uint64_t *victim_out)
 {
 	uint8_t		*scratch;
 	uint64_t	 full;
@@ -7915,10 +8629,11 @@ move_at(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 
 	for (tries = 0; ; tries++) {
 		full = 0;
-		rv = move_once(odir, oname, ndir, nname, now, orphan, &full);
+		rv = move_once(odir, oname, ndir, nname, now, orphan, &full,
+		    victim_out);
 		if (rv != FS_APFS_E_NOALLOC || full == 0)
 			return (rv);
-		if (tries >= 2) {
+		if (tries >= 4) {
 			kprintf("apfs: the leaf at %llu still has no room for "
 			    "\"%s\" after %u split(s) -- whatever is refusing, "
 			    "it is not a full node\n", (unsigned long long)full,
@@ -7938,10 +8653,10 @@ move_at(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 
 int
 fs_apfs_rename(uint64_t odir, const char *oname, uint64_t ndir,
-    const char *nname, uint64_t now)
+    const char *nname, uint64_t now, uint64_t *victim_out)
 {
 
-	return (move_at(odir, oname, ndir, nname, now, false));
+	return (move_at(odir, oname, ndir, nname, now, false, victim_out));
 }
 
 /*
@@ -8004,7 +8719,7 @@ fs_apfs_orphan(uint64_t dir, const char *name, uint64_t now, uint64_t *ino_out)
 		return (FS_APFS_E_ISDIR);
 
 	orphan_name(child, dead);
-	rv = move_at(dir, name, APFS_PRIV_DIR_INO, dead, now, true);
+	rv = move_at(dir, name, APFS_PRIV_DIR_INO, dead, now, true, NULL);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
 	if (ino_out != NULL)
@@ -8139,6 +8854,34 @@ fs_apfs_moves(void)
 {
 
 	return (move_n);
+}
+
+uint64_t
+fs_apfs_clobbers(void)
+{
+
+	return (clob_n);
+}
+
+uint64_t
+fs_apfs_extref_grows(void)
+{
+
+	return (extgrow_n);
+}
+
+uint64_t
+fs_apfs_extref_splits(void)
+{
+
+	return (extsplit_n);
+}
+
+uint64_t
+fs_apfs_extref_drops(void)
+{
+
+	return (extdrop_n);
 }
 
 uint64_t
@@ -9210,46 +9953,50 @@ omap_replace_cow(uint64_t node_bno, const struct omap_edit *oe, uint64_t xid,
  *
  * The record's KEY is the run's first block, which is what makes this
  * different from patching a file extent: the key changes, so the record sorts
- * somewhere else.  Nothing is inserted or removed for all that -- the count is
- * the same and so are the sizes, so the key and value keep the bytes they
- * already occupy and only their entry in the table of contents moves.  That is
- * deliberate: a B-tree insert has to find room and a node with none has to
- * split, which is the rung after this one.
+ * somewhere else.  While both places are in ONE node -- always, until the
+ * tree grew an index level -- the count is the same and so are the sizes, so
+ * the key and value keep the bytes they already occupy and only their entry
+ * in the table of contents moves.  When the two places are in different
+ * LEAVES, the record is carried instead: taken out through the shrink and
+ * put back through the insert, value verbatim, each half settling its own
+ * nodes.  A failure between the two leaves this checkpoint unpublishable --
+ * said out loud -- and the volume on disk still whole, because nothing here
+ * lands until the checkpoint does.
  */
 static int
 extref_move(uint64_t old_start, uint64_t new_start, uint64_t blocks,
     uint64_t xid, void *buf)
 {
 	struct apfs_btree_node_phys	*n;
+	struct apfs_phys_ext_val	 keepv;
 	struct apfs_phys_ext_val	*pv;
+	struct extref_walk		 ew;
+	struct extref_walk		 tw;
 	struct btree_layout		 bl;
 	struct apfs_kvloc		*kv;
 	struct apfs_kvloc		 save;
+	uint8_t				*root;
 	uint8_t				*node;
 	uint64_t			 raw;
-	uint64_t			 new_bno;
 	uint32_t			 koff, klen, voff, vlen;
 	uint32_t			 i;
 	uint32_t			 pos;
 	int				 rv;
+	bool				 dropped;
 
-	if (g_apfs.ac_extref_bno == 0)
-		return (FS_APFS_E_NOTFOUND);
-	rv = fs_apfs_read_block(g_apfs.ac_extref_bno, buf);
+	root = kmalloc(APFS_BLOCK_SIZE);
+	if (root == NULL)
+		return (FS_APFS_E_NOMEM);
+	rv = extref_descend(old_start, root, buf, &ew);
 	if (rv != FS_APFS_E_OK)
-		return (rv);
-	node = buf;
+		goto out;
+	node = ew.ew_two ? (uint8_t *)buf : root;
 	n    = (struct apfs_btree_node_phys *)node;
 	btree_layout(node, &bl);
-	if (bl.bl_level != 0) {
-		kprintf("apfs: the extent reference tree at %llu has grown to "
-		    "level %u -- this writer only knows a single node\n",
-		    (unsigned long long)g_apfs.ac_extref_bno,
-		    (unsigned)bl.bl_level);
-		return (FS_APFS_E_INVAL);
+	if (bl.bl_nkeys == 0) {
+		rv = FS_APFS_E_INVAL;
+		goto out;
 	}
-	if (bl.bl_fixed || bl.bl_nkeys == 0)
-		return (FS_APFS_E_INVAL);
 
 	for (i = 0; i < bl.bl_nkeys; i++) {
 		btree_entry_loc(&bl, i, &koff, &klen, &voff, &vlen);
@@ -9258,15 +10005,18 @@ extref_move(uint64_t old_start, uint64_t new_start, uint64_t blocks,
 			continue;
 		if ((raw & APFS_J_OBJ_ID_MASK) != old_start)
 			continue;
-		if (vlen < sizeof(*pv))
-			return (FS_APFS_E_INVAL);
+		if (vlen < sizeof(*pv)) {
+			rv = FS_APFS_E_INVAL;
+			goto out;
+		}
 		break;
 	}
 	if (i == bl.bl_nkeys) {
 		kprintf("apfs: no physical extent record starts at %llu -- the "
 		    "run being moved is not the whole of one\n",
 		    (unsigned long long)old_start);
-		return (FS_APFS_E_NOTFOUND);
+		rv = FS_APFS_E_NOTFOUND;
+		goto out;
 	}
 
 	/*
@@ -9282,7 +10032,43 @@ extref_move(uint64_t old_start, uint64_t new_start, uint64_t blocks,
 		    (unsigned long long)old_start,
 		    (unsigned long long)(pv->pe_len_and_kind &
 		    APFS_PEXT_LEN_MASK), (unsigned long long)blocks);
-		return (FS_APFS_E_INVAL);
+		rv = FS_APFS_E_INVAL;
+		goto out;
+	}
+
+	/*
+	 * Where the new key would land.  The same descent the old one took;
+	 * only when both answers name one node is the cheap dance below safe.
+	 */
+	if (ew.ew_two) {
+		struct btree_layout	 rb;
+		uint32_t		 rkoff, rklen, rvoff, rvlen;
+		uint32_t		 j;
+
+		tw.ew_slot = 0;
+		btree_layout(root, &rb);
+		for (j = 1; j < rb.bl_nkeys; j++) {
+			btree_entry_loc(&rb, j, &rkoff, &rklen, &rvoff,
+			    &rvlen);
+			raw = *(const uint64_t *)(rb.bl_keys + rkoff);
+			if ((raw & APFS_J_OBJ_ID_MASK) > new_start)
+				break;
+			tw.ew_slot = j;
+		}
+		if (tw.ew_slot != ew.ew_slot) {
+			keepv = *pv;
+			rv = extref_shrink(old_start, 0, xid, buf, &dropped);
+			if (rv != FS_APFS_E_OK)
+				goto out;
+			rv = extref_insert_pv(new_start, &keepv, xid);
+			if (rv != FS_APFS_E_OK)
+				kprintf("apfs: the run moved to %llu came out "
+				    "of one leaf and would not go into "
+				    "another (%d) -- this checkpoint must "
+				    "not be written\n",
+				    (unsigned long long)new_start, rv);
+			goto out;
+		}
 	}
 
 	*(uint64_t *)(bl.bl_keys + koff) = new_start |
@@ -9303,16 +10089,15 @@ extref_move(uint64_t old_start, uint64_t new_start, uint64_t blocks,
 		kv[i] = kv[i - 1];
 	kv[pos] = save;
 
-	rv = cow_physical(g_apfs.ac_extref_bno, xid, buf, &new_bno);
-	if (rv != FS_APFS_E_OK)
-		return (rv);
 	/*
 	 * PHYSICAL, so nothing resolves an oid to find it: the volume
-	 * superblock names its block outright, and spine_update writes this
-	 * number in when it copies that superblock.
+	 * superblock names the root's block outright, and spine_update writes
+	 * ac_extref_bno in when it copies that superblock.
 	 */
-	g_apfs.ac_extref_bno = new_bno;
-	return (FS_APFS_E_OK);
+	rv = extref_settle(&ew, xid, root, buf);
+out:
+	kfree(root);
+	return (rv);
 }
 
 /*

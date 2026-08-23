@@ -128,6 +128,37 @@ bio_read(unsigned drive, uint64_t lba, uint32_t nsec, void *buf)
 	return (0);
 }
 
+/*
+ * The block autopsy (block_autopsy in apfs.c) grew an appetite the original
+ * five stubs did not cover: on a checksum failure it asks the ATA driver for
+ * its interrupt counters and for a read straight off the platter, to say
+ * whether the cache or the device is the liar.  On the host there is no
+ * driver and no platter -- the image IS the device -- so the counters are
+ * zero and the "straight off the device" read is the same pread every other
+ * read is.  Which is honest: on the host the two answers cannot differ, and
+ * an autopsy that runs here is reporting a corrupt image, not a caching bug.
+ */
+uint32_t
+ata_lost_intrs(void)
+{
+
+	return (0);
+}
+
+uint32_t
+ata_overlaps(void)
+{
+
+	return (0);
+}
+
+int
+ata_kread(unsigned drive_idx, uint64_t lba, uint32_t count, void *buf)
+{
+
+	return (bio_read(drive_idx, lba, count, buf));
+}
+
 int
 bio_write(unsigned drive, uint64_t lba, uint32_t nsec, const void *buf)
 {
@@ -168,9 +199,11 @@ static const struct hosttest	tests[] = {
 	{ "index",  fs_apfs_index_selftest,  true  },
 	{ "drop",   fs_apfs_drop_selftest,   true  },
 	{ "stream", fs_apfs_stream_selftest, true  },
+	{ "extref", fs_apfs_extref_selftest, true  },
 	{ "room",   fs_apfs_room_selftest,   true  },
 	{ "move",   fs_apfs_move_selftest,   true  },
 	{ "orphan", fs_apfs_orphan_selftest, true  },
+	{ "clobber", fs_apfs_clobber_selftest, true },
 	{ "seek",   run_seek,		     false },
 	{ "ckpt",   run_ckpt,		     false },
 };
