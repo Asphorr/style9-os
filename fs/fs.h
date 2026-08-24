@@ -381,13 +381,26 @@ void		fs_write_selftest(void);
  *
  * On APFS this writes a checkpoint (see fs/apfs/apfs.h); the container is the
  * old one entire until the last block lands and the new one entire
- * afterwards.  On FAT there is nothing to close -- every write there is
- * already final the moment it reaches the platter -- so this succeeds without
- * doing anything, which is the honest answer rather than a refusal.
+ * afterwards.  Mutations no longer do this themselves -- they batch, and the
+ * essay above ckpt_policy in fs.c says who collects the debt -- so this call
+ * is the one that means NOW: it is what fsync(2) becomes, and a volume with
+ * nothing owed answers success without spending a checkpoint on saying so.
+ * On FAT there is nothing to close -- every write there is already final the
+ * moment it reaches the platter -- so this succeeds without doing anything,
+ * which is the honest answer rather than a refusal.
  *
  * Returns FS_E_OK or a negative FS_E_*.
  */
 int		fs_sync(void);
+
+/*
+ * Start the syncer: the kernel thread that publishes a dirty volume on a
+ * clock, so what a crash can lose is bounded in seconds as well as in edits.
+ * Called once from kmain, after the self-tests and their closing sync --
+ * nothing before that point wants a second writer of checkpoints appearing
+ * mid-test.  Does nothing when the volume cannot be written.
+ */
+void		fs_syncer_start(void);
 
 /*
  * Prove the checkpoint writer against the mounted container, at boot, out

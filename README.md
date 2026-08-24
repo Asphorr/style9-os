@@ -651,13 +651,14 @@ left and answers three questions: does it mount at all, is the volume
 WHOLLY the old state or WHOLLY the new one -- names, sizes, and every byte,
 because a state that merely LOOKS old is exactly the kind of half-published
 edit the sweep exists to catch -- and what does `apfsck` say.  K sweeps
-every write of four different edits, chosen for what they make a checkpoint
+every write of five different edits, chosen for what they make a checkpoint
 carry: a creation, the clobbering rename with its reap, an unlink, a growth
-through the two-level extent reference tree.  Six hundred and seventy-two
-staged power failures per run; between them the image is restored by
-replaying a pre-image journal backwards -- per-run truth, not a bet on the
-workload writing the same blocks twice -- and the tool leaves the image as
-it found it, which the closing `apfsck` states rather than assumes.
+through the two-level extent reference tree, and a batch of four edits
+published by a single checkpoint, of which more below.  Nine hundred and
+seventy-seven staged power failures per run; between them the image is
+restored by replaying a pre-image journal backwards -- per-run truth, not a
+bet on the workload writing the same blocks twice -- and the tool leaves the
+image as it found it, which the closing `apfsck` states rather than assumes.
 
 The sweep proved the sentence, with one asterisk measured into it.  Every
 edit has exactly one write that changes the answer -- the container
@@ -696,6 +697,42 @@ is that the LOGICAL order is crash-consistent.  A disk's write cache can
 reorder across that prefix until someone sends it a flush, and nothing in
 this stack sends one yet.  That is a later rung's question, named rather
 than absorbed.
+
+**With the atom proved, the kernel stopped spending one per operation.**
+Every mutation used to end by writing a checkpoint -- and the write path
+said out loud what that cost: "one checkpoint per write is not how a
+filesystem should batch."  Now mutations batch.  An edit completes on fresh
+blocks, readable through the writer's own view and reachable from no
+superblock, and the checkpoint that publishes it is owed rather than
+written.  Three things collect the debt.  The free queue running low on
+room, asked after every mutation -- the one bound that is physical, because
+every block a batch releases is an entry in a single node, held there until
+its transaction is old enough that no mountable superblock still needs it,
+and a batch that outgrew the node would start leaking blocks out loud.
+That bound had to be learned twice: a first draft capped the node's total
+occupancy, and a live boot filled the queue anyway, because releases lag
+insertions by the retention depth and closing a transaction removes
+nothing -- so the cap moved to the open transaction's own entries, and the
+retention itself was repriced from four checkpoints to two, the stand
+having shown that a crashed mount only ever adopts the newest intact
+checkpoint and the old depth was courtesy priced for one-edit
+transactions.  A
+syncer thread, publishing a dirty volume every two seconds, so the gap
+between "returned" and "on the platter" is bounded by a clock.  And
+`fsync(2)` -- Darwin call 95, wired through libSystem and demonstrated from
+ring 3 by `filewrite` -- for the caller who means NOW; one volume has one
+open transaction, so fsync is sync, and a 0 from it is where write(2)'s old
+durability promise moved.  What a crash loses is the open transaction and
+nothing else, and that is not asserted but staged: the stand's fifth
+workload runs a create, an unlink, a rename and a growth into ONE
+checkpoint and cuts the power at each of its 76 writes -- before the commit
+none of the four edits exists, from it all four do, and no cut or tear ever
+shows a volume carrying some of a batch.  The free queue's xid gate is what
+that leans on -- a block freed mid-batch stays marked in use, so nothing
+later in the batch can be handed a block the published checkpoint still
+reaches -- and the boot's own self-tests now end with the explicit sync
+their cross-boot claims ride on, which is the honest shape: a promise about
+the platter belongs to the call that says so.
 
 ## A wake reaches the CPU
 

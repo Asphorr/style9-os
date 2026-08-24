@@ -1597,6 +1597,97 @@ fq_mem(uint64_t oid)
 	return (NULL);
 }
 
+/* Is there an open transaction -- changes made and no checkpoint yet? */
+int
+fs_apfs_dirty(void)
+{
+
+	return (g_apfs.ac_mounted && g_apfs.ac_dirty);
+}
+
+/*
+ * Does the open transaction need publishing NOW rather than when the caller's
+ * policy would get around to it?
+ *
+ * The bound is physical, not chosen: every block an edit releases becomes one
+ * entry in a single-node free queue, held there until the transaction that
+ * released it is APFS_FQ_KEEP checkpoints behind.  That LAG is the part a
+ * first draft of this function got wrong, and a live boot caught it: it
+ * capped the node's total occupancy, but closing a transaction removes
+ * nothing -- a giant batch, published in perfectly good time, still sits in
+ * the node for KEEP more checkpoints while the transactions after it pile
+ * on top, and the node went to the brim with every entry too young to
+ * release.  So the cap goes on the one number a policy actually controls:
+ * the OPEN transaction's own entries, which sit at the tail of the node's
+ * (xid, paddr) order and are counted from there.
+ *
+ * Two triggers, and the arithmetic between them is the point.  The BUDGET
+ * caps the open transaction at a fifth of the node, so a closed slice --
+ * budget plus the one edit that lands after crossing it -- stays around a
+ * third; retention holds APFS_FQ_KEEP closed slices plus the open one, and
+ * with KEEP at 2 that is three thirds with the belt still to spare.  The
+ * BELT fires on total occupancy at two thirds of the node: from there every
+ * mutation publishes, and each publish releases a slice from two
+ * checkpoints back -- a lag the belt's remaining third comfortably covers.
+ * That lag is what the first arithmetic of this function missed and a live
+ * boot caught: releases trail insertions by KEEP checkpoints, and at KEEP's
+ * old value of 4 the node could brim over faster than forced publishing
+ * aged the big slices out.  fq_insert's early-release fallback is the
+ * container degrading out loud; a policy that can reach it has not bounded
+ * anything, and this one, checked slice by slice, cannot.
+ *
+ * This is also the honest ceiling on batching itself, worth naming: a
+ * single-node queue budgeted a fifth at a time caps a batch at a couple of
+ * edits.  Raising it means a free queue that can grow a level, and THAT
+ * means a checkpoint writer that can re-emit a multi-block ephemeral
+ * object, which it currently refuses; the ceiling belongs to that rung,
+ * not this one.
+ */
+#define	APFS_CKPT_HEADROOM	32u
+
+int
+fs_apfs_ckpt_due(void)
+{
+	const struct apfs_btree_node_phys	*n;
+	struct fq_node				 fn;
+	uint64_t				 open_xid;
+	uint64_t				 xid;
+	uint64_t				 paddr;
+	uint32_t				 cap;
+	uint32_t				 open_n;
+	uint32_t				 q;
+
+	if (!g_apfs.ac_mounted || !g_apfs.ac_dirty)
+		return (0);
+	open_xid = g_apfs.ac_xid + 1;
+	for (q = 0; q < APFS_SFQ_COUNT; q++) {
+		if (g_fq[q] == NULL)
+			continue;
+		n = (const struct apfs_btree_node_phys *)g_fq[q];
+		fq_layout(g_fq[q], &fn);
+		cap = fn.fn_toc_len / 4u;
+
+		/* the budget: the open transaction's entries are the tail */
+		open_n = 0;
+		while (open_n < fn.fn_nkeys) {
+			fq_key(&fn, fn.fn_nkeys - 1 - open_n, &xid, &paddr);
+			if (xid != open_xid)
+				break;
+			open_n++;
+		}
+		if (open_n >= cap / 5u)
+			return (1);
+
+		/* the belt: two thirds full publishes regardless of whose */
+		if (fn.fn_nkeys + cap / 3u > cap)
+			return (1);
+		if (n->btn_free_space.nl_len < APFS_CKPT_HEADROOM *
+		    (uint32_t)(sizeof(struct apfs_spaceman_free_queue_key) + 8u))
+			return (1);
+	}
+	return (0);
+}
+
 /*
  * Put the pool's bitmap down in a fresh ring slot and tell the space manager
  * where it went.  The slot it replaces goes to the TAIL of the free list, not
@@ -10628,6 +10719,20 @@ fs_apfs_merges(void)
 {
 
 	return (merge_n);
+}
+
+/*
+ * Checkpoints written since boot.  A test that measures allocator behaviour
+ * across a window needs this: a checkpoint is when the free queue lets go of
+ * blocks, and blocks let go are holes a first-fit scan may prefer -- so a
+ * claim about WHERE allocations land is only decidable over a window no
+ * checkpoint interrupted, and this is how a test knows whether one did.
+ */
+uint64_t
+fs_apfs_ckpts(void)
+{
+
+	return (ckpt_n_written);
 }
 
 uint64_t

@@ -273,6 +273,57 @@ fs_kind(void)
 }
 
 /*
+ * WHEN THE CHECKPOINT HAPPENS, which stopped being "now".
+ *
+ * Every mutation below used to end by writing one, and the write path said
+ * what that cost out loud: one checkpoint per write is not how a filesystem
+ * should batch.  Now it batches.  An edit completes in memory and on fresh
+ * blocks -- readable through the writer's own view, reachable from no
+ * superblock yet -- and the checkpoint that publishes it is owed rather than
+ * written.  Three things collect the debt:
+ *
+ *	- the free queue running low on room, asked after every mutation.
+ *	  fs_apfs_ckpt_due is the one bound that is physical: every block a
+ *	  batch releases is an entry in a single node, and a batch that
+ *	  outgrew it would start leaking blocks out loud;
+ *	- the syncer, a kernel thread that publishes a dirty volume every
+ *	  FS_SYNC_MS, so the gap between "returned" and "on the platter" is
+ *	  bounded by a clock rather than by luck;
+ *	- fs_sync, for the caller who means NOW: fsync(2) lands there, and
+ *	  so does the boot path after the self-tests, whose claims about
+ *	  surviving a power cycle ride on it.
+ *
+ * What a crash loses is the open transaction and nothing else.  Every edit
+ * in the batch vanishes together, back to the last published checkpoint --
+ * the torn-write stand stages power failures through a batch of four
+ * different edits and holds the volume to exactly that.  Which is the
+ * contract Unix has always sold: write(2) promises order, fsync(2) promises
+ * the platter.
+ */
+#define	FS_SYNC_MS	2000
+
+static uint64_t		fs_n_owed;	/* (fs_lock) mutations that batched  */
+static uint64_t		fs_n_room;	/* ...checkpoints the queue forced   */
+static uint64_t		fs_n_timer;	/* checkpoints the syncer wrote      */
+
+/*
+ * A mutation just succeeded; decide about the checkpoint.  Called with
+ * fs_lock held.  The edit is complete and readable whatever happens here, so
+ * a checkpoint failure is returned exactly as the eager version returned it
+ * -- and the volume stays dirty, for the syncer to retry out loud.
+ */
+static int
+ckpt_policy(void)
+{
+
+	fs_n_owed++;
+	if (!fs_apfs_ckpt_due())
+		return (FS_E_OK);
+	fs_n_room++;
+	return (apfs_err(fs_apfs_checkpoint()));
+}
+
+/*
  * Each operation is written once, as a _locked body, and wrapped.  Wrapping
  * rather than sprinkling lock/unlock through the bodies is what keeps an
  * early return from leaking the lock -- several of these have four or five
@@ -412,7 +463,7 @@ fs_close(struct fs_handle *h)
 		now_ns = (uint64_t)clock_walltime_us() * 1000ULL;
 		rv = apfs_err(fs_apfs_reap(ino, now_ns));
 		if (rv == FS_E_OK)
-			rv = apfs_err(fs_apfs_checkpoint());
+			rv = ckpt_policy();
 		fs_gen++;
 		fs_n_reap++;
 		if (rv != FS_E_OK)
@@ -523,19 +574,18 @@ pwrite_locked(struct fs_handle *h, uint64_t off, const uint8_t *buf,
 	rv = apfs_err(fs_apfs_touch(h->fh_ino, now_ns));
 
 	/*
-	 * And close the transaction, because stamping the file no longer
-	 * writes anything where it stood: the inode's node is copied, and so
-	 * is every object between it and the container superblock.  All of
-	 * that is reachable only from a checkpoint, so a write that returned
-	 * without one would have put its bytes on the disk and left the
-	 * modification time in memory.
-	 *
-	 * One checkpoint per write is not how a filesystem should batch, and
-	 * it is what "the bytes are down when this returns" costs until
-	 * something above here knows when it is finished.
+	 * Stamping the file no longer writes anything where it stood: the
+	 * inode's node is copied, and so is every object between it and the
+	 * container superblock, all of it reachable only from a checkpoint
+	 * that has not been written yet.  One used to be written HERE, once
+	 * per write, and this comment called that not how a filesystem
+	 * should batch.  Now the policy above decides, and what this call
+	 * promises shrank to what write(2) has always promised: the edit is
+	 * complete and ordered, and fsync(2) is the word for "and on the
+	 * platter".
 	 */
 	if (rv == FS_E_OK)
-		rv = apfs_err(fs_apfs_checkpoint());
+		rv = ckpt_policy();
 
 	/*
 	 * Metadata moved, so every handle in the system is now suspect --
@@ -596,11 +646,11 @@ truncate_locked(struct fs_handle *h, uint64_t new_size)
 		return (rv);
 	h->fh_size = new_size;
 
-	/* Stamped and closed for exactly the reasons a write is: see above. */
+	/* Stamped and offered to the policy for the same reasons a write is. */
 	now_ns = (uint64_t)clock_walltime_us() * 1000ULL;
 	rv = apfs_err(fs_apfs_touch(h->fh_ino, now_ns));
 	if (rv == FS_E_OK)
-		rv = apfs_err(fs_apfs_checkpoint());
+		rv = ckpt_policy();
 	fs_gen++;
 	h->fh_gen = fs_gen;
 	return (rv);
@@ -678,11 +728,13 @@ create_locked(const char *path, uint16_t perm, uint64_t *ino_out)
 	if (rv != FS_E_OK)
 		return (rv);
 	/*
-	 * Closed here for the same reason a write is: the records describing
-	 * one file are several disk updates, and a reader that got between
-	 * them would see a directory naming an inode that does not exist yet.
+	 * Whether the create is published now is the policy's question.  A
+	 * crash before the checkpoint takes the whole of it back -- name,
+	 * inode and all, one state the volume is allowed to be in -- and
+	 * never the half-made one where a directory names an inode that
+	 * does not exist.
 	 */
-	rv = apfs_err(fs_apfs_checkpoint());
+	rv = ckpt_policy();
 	fs_gen++;
 	return (rv);
 }
@@ -745,7 +797,7 @@ unlink_locked(const char *path)
 		rv = apfs_err(fs_apfs_unlink(parent, leaf, now_ns));
 	if (rv != FS_E_OK)
 		return (rv);
-	rv = apfs_err(fs_apfs_checkpoint());
+	rv = ckpt_policy();
 	fs_gen++;
 	return (rv);
 }
@@ -774,7 +826,12 @@ fs_reap_orphans(void)
 	mutex_lock(&fs_lock);
 	rv = apfs_err(fs_apfs_reap_all(now_ns, &n));
 	if (rv == FS_E_OK && n != 0) {
-		rv = apfs_err(fs_apfs_checkpoint());
+		/*
+		 * Deferred like any other mutation.  Reaping is idempotent, so
+		 * a boot that dies before the publish simply finds the same
+		 * orphans and finishes them again.
+		 */
+		rv = ckpt_policy();
 		fs_n_reap += n;
 		fs_gen++;
 	}
@@ -856,7 +913,7 @@ dir_locked(const char *path, int make, uint16_t perm, uint64_t *ino_out)
 	rv = apfs_err(rv);
 	if (rv != FS_E_OK)
 		return (rv);
-	rv = apfs_err(fs_apfs_checkpoint());
+	rv = ckpt_policy();
 	fs_gen++;
 	return (rv);
 }
@@ -964,7 +1021,7 @@ rename_locked(const char *opath, const char *npath)
 				    rv);
 		}
 	}
-	rv = apfs_err(fs_apfs_checkpoint());
+	rv = ckpt_policy();
 	fs_gen++;
 	return (rv);
 }
@@ -1010,7 +1067,7 @@ fs_chmod(const char *path, uint16_t mode)
 	now_ns = (uint64_t)clock_walltime_us() * 1000ULL;
 	rv = apfs_err(fs_apfs_chmod(asb.afs_ino, mode, now_ns));
 	if (rv == FS_E_OK) {
-		rv = apfs_err(fs_apfs_checkpoint());
+		rv = ckpt_policy();
 		fs_gen++;
 	}
 	mutex_unlock(&fs_lock);
@@ -1120,6 +1177,12 @@ fs_readdir(const char *path, uint32_t index, struct fs_dirent *out)
 	return (rv);
 }
 
+/*
+ * The caller means NOW.  This is where every deferred checkpoint is
+ * collected: fsync(2) lands here, and so does the boot path once the
+ * self-tests are done.  A clean volume is a no-op rather than a checkpoint
+ * of nothing -- writing one anyway would spend a ring slot saying so.
+ */
 int
 fs_sync(void)
 {
@@ -1127,13 +1190,61 @@ fs_sync(void)
 
 	mutex_lock(&fs_lock);
 	if (fs_apfs_ready())
-		rv = apfs_err(fs_apfs_checkpoint());
+		rv = fs_apfs_dirty() ? apfs_err(fs_apfs_checkpoint()) :
+		    FS_E_OK;
 	else if (fs_fat_ready())
 		rv = FS_E_OK;	/* FAT has no transaction to close */
 	else
 		rv = FS_E_NOMOUNT;
 	mutex_unlock(&fs_lock);
 	return (rv);
+}
+
+/*
+ * THE SYNCER, which is the timer leg of the policy.
+ *
+ * A kernel thread, and deliberately a dumb one: sleep, and publish the volume
+ * if it is dirty.  The dirty test is a bare read taken without the lock --
+ * stale by at most one tick, and the lock is taken to act -- and a failed
+ * checkpoint is retried on the next tick for as long as the volume stays
+ * dirty, complaining each time, because a syncer that goes quiet about a
+ * volume it cannot publish has turned the bounded loss window into an
+ * unbounded one.
+ */
+static void
+syncer_entry(void *arg)
+{
+	int	rv;
+
+	(void)arg;
+	for (;;) {
+		sched_nap_ms(FS_SYNC_MS);
+		if (!fs_apfs_ready() || !fs_apfs_dirty())
+			continue;
+		rv = fs_sync();
+		if (rv != FS_E_OK)
+			kprintf("fs-sync: the checkpoint would not write (%d) "
+			    "-- the volume stays dirty and the next tick "
+			    "tries again\n", rv);
+		else
+			fs_n_timer++;
+	}
+}
+
+void
+fs_syncer_start(void)
+{
+	struct thread	*th;
+
+	if (!fs_apfs_ready())
+		return;
+	th = thread_create(kernel_task, syncer_entry, NULL, "syncer");
+	if (th == NULL) {
+		kprintf("fs-sync: no thread for the syncer -- only fsync and "
+		    "the free queue will collect deferred checkpoints\n");
+		return;
+	}
+	thread_start(th);
 }
 
 /*
@@ -1157,6 +1268,19 @@ void
 fs_handle_stats(void)
 {
 
+	/*
+	 * The policy's own tally: how much batching actually happened, and
+	 * which leg collected the debt.  The syncer's count is usually the
+	 * small one -- the boot's write storm is published by the free
+	 * queue's headroom and by the explicit sync that follows the tests,
+	 * and the timer only catches what trickles in after.
+	 */
+	if (fs_n_owed != 0)
+		kprintf("fs-sync: %llu mutation(s) batched, %llu checkpoint(s) "
+		    "forced by the free queue's room, %llu written by the "
+		    "syncer\n", (unsigned long long)fs_n_owed,
+		    (unsigned long long)fs_n_room,
+		    (unsigned long long)fs_n_timer);
 	if (fs_n_stale == 0 && fs_n_orphan == 0)
 		return;
 	kprintf("fs: volume generation %llu -- %llu stale handle(s) refreshed, "
@@ -1463,6 +1587,7 @@ fs_grow_selftest(void)
 	uint8_t			*back;
 	uint64_t		 was;
 	uint64_t		 merges;
+	uint64_t		 ckpts;
 	uint64_t		 at;
 	uint32_t		 rounds;
 	uint32_t		 got;
@@ -1487,6 +1612,7 @@ fs_grow_selftest(void)
 
 	was    = h.fh_size;
 	merges = fs_apfs_merges();
+	ckpts  = fs_apfs_ckpts();
 	rounds = 0;
 
 	while (h.fh_size < SELFTEST_GROW_TO) {
@@ -1597,7 +1723,28 @@ fs_grow_selftest(void)
 	 * doing the only thing that makes an abandoned checkpoint safe.
 	 */
 	merges = fs_apfs_merges() - merges;
+	ckpts  = fs_apfs_ckpts() - ckpts;
 	if (merges + 1 < rounds) {
+		/*
+		 * Decidable only over an uninterrupted window, and the fourth
+		 * boot of an acceptance run is what taught it that.  A
+		 * checkpoint is when the free queue lets go of blocks, and
+		 * blocks let go are holes the first-fit scan may prefer over
+		 * the block that would have continued the run -- so once
+		 * checkpoints began landing by policy rather than once per
+		 * append, one inside this loop stopped being anyone's
+		 * mistake and started being the window's weather.  With no
+		 * checkpoint in the window the claim stands full strength.
+		 */
+		if (ckpts != 0) {
+			kprintf("apfs-grow: %u append(s) merged %llu run(s) "
+			    "with %llu checkpoint(s) landing mid-loop -- "
+			    "freed blocks came back as holes, so the merge "
+			    "claim is not decidable this boot; skipped\n",
+			    (unsigned)rounds, (unsigned long long)merges,
+			    (unsigned long long)ckpts);
+			goto out;
+		}
 		kprintf("apfs-grow: FAIL %u appends lengthened only %llu runs "
 		    "-- the rest were given records of their own, and blocks "
 		    "that touch should never need one\n", (unsigned)rounds,
@@ -2577,12 +2724,14 @@ fs_shell_selftest(void)
 	/*
 	 * EMPTY IS A STATE THE DISK CAN HONESTLY BE IN, and it is worth
 	 * naming rather than failing on.  A redirection is two events -- the
-	 * file is created and emptied by open(2), then written -- and each
-	 * closes its own checkpoint, so a machine switched off between them
-	 * leaves exactly this: the name, with nothing in it.  That is the
-	 * crash-consistent midpoint the checkpoint boundary exists to
-	 * produce, not a write that went missing.  Anything ELSE in the file
-	 * is a failure, because nothing but the shell writes here.
+	 * file is created and emptied by open(2), then written -- and a
+	 * checkpoint is allowed to land between them, so a machine switched
+	 * off there leaves exactly this: the name, with nothing in it.  That
+	 * is a crash-consistent midpoint the checkpoint boundary exists to
+	 * produce, not a write that went missing.  (Under the deferred
+	 * policy the file can also be missing entirely, which the NOTFOUND
+	 * branch above already forgives.)  Anything ELSE in the file is a
+	 * failure, because nothing but the shell writes here.
 	 */
 	if (h.fh_size == 0) {
 		kprintf("apfs-shell: %s is there but empty -- a boot was "

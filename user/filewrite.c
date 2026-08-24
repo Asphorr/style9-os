@@ -84,6 +84,7 @@ extern int	 open(const char *path, int flags, ...);
 extern long	 read(int fd, void *buf, unsigned long n);
 extern long	 write(int fd, const void *buf, unsigned long n);
 extern int	 close(int fd);
+extern int	 fsync(int fd);
 extern long	 lseek(int fd, long off, int whence);
 extern int	 unlink(const char *path);
 extern int	 mkdir(const char *path, unsigned short mode);
@@ -475,6 +476,34 @@ entry(void)
 			printf("filewrite: PASS the name came free once the "
 			    "last descriptor on it closed\n");
 		}
+	}
+
+	/*
+	 * 14. FSYNC, which is where the durability promise moved when the
+	 * kernel began to batch its checkpoints.  write(2) returning means
+	 * the edit is complete and ordered; fsync(2) returning 0 means it is
+	 * published on the platter rather than parked in the open batch.
+	 * From out here only the syscall's answer is checkable -- the platter
+	 * half is what the kernel's own torn-write stand holds it to -- and
+	 * the refusals are checkable too: a descriptor that is not there, and
+	 * a pipe, which has no platter for the promise to be about.
+	 */
+	fd = open(PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0)
+		fail("cannot make a file to fsync");
+	else {
+		put = write(fd, FIRST, slen(FIRST));
+		if (put != (long)slen(FIRST))
+			fail("the write before the fsync was short");
+		else if (fsync(fd) != 0)
+			fail("fsync refused a file descriptor");
+		else
+			printf("filewrite: PASS fsync answered 0 -- the "
+			    "write is published, not parked\n");
+		(void)close(fd);
+		if (fsync(fd) == 0)
+			fail("fsync accepted a closed descriptor");
+		(void)unlink(PATH);
 	}
 
 	if (fails != 0) {

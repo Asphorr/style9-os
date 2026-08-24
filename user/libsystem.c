@@ -2997,6 +2997,18 @@ open(const char *path, int flags, ...)
 }
 
 /*
+ * fsync (Darwin #95): the promise write(2) does not carry.  The kernel
+ * batches mutations and publishes them by policy; a 0 from here means the
+ * policy was made to pay up and this descriptor's writes are on the platter.
+ */
+int
+fsync(int fd)
+{
+
+	return ((int)bsd_call_e(0x200005f, fd, 0, 0));
+}
+
+/*
  * fcntl: F_DUPFD (cmd 0) has real semantics -- a shell parks its saved std
  * fds at 10+ with it around redirections -- so it travels to the kernel
  * (Darwin #92), which duplicates the slot at the lowest free fd >= arg.

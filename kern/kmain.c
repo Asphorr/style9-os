@@ -385,6 +385,20 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	fs_seek_selftest();
 
 	/*
+	 * The tests above no longer publish as they go: mutations batch, and
+	 * the checkpoint is owed until something collects it (see the policy
+	 * essay in fs/fs.c).  This is the boot's collection point -- every
+	 * cross-boot claim the tests make, from the write marker to the 0711
+	 * chmod, is durable from HERE, not from the call that made it.  Then
+	 * the syncer starts, so what ring 3 writes from now on is published
+	 * on a clock rather than only when a queue fills or an fsync asks.
+	 */
+	if (fs_ready() && fs_sync() < 0)
+		kprintf("kmain: the closing sync failed -- what the "
+		    "self-tests wrote is not yet on the platter\n");
+	fs_syncer_start();
+
+	/*
 	 * Register a demo service under the bootstrap port so ring-3
 	 * code has something to look up.  MACH_PORT_TASK_SELF=1 in
 	 * kernel_space resolves to kernel_task's task_self port; we

@@ -3044,6 +3044,41 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		darwin_ofile_clear(of);
 		return (darwin_ok(f, 0));
 	}
+	case DARWIN_SYS_fsync: {
+		struct darwin_ofile	*of;
+		struct task		*t;
+		int			 fd;
+
+		fd = (int)f->sf_arg0;
+		t  = current_thread->th_task;
+		if (fd < 0 || fd >= DARWIN_NOFILE)
+			return (darwin_err(f, DARWIN_EBADF));
+		of = &t->t_darwin_files[fd];
+		switch (of->of_type) {
+		case DARWIN_OF_FREE:
+			if (fd <= 2)	/* legacy std streams: no backing */
+				return (darwin_ok(f, 0));
+			return (darwin_err(f, DARWIN_EBADF));
+		case DARWIN_OF_PIPE_R:
+		case DARWIN_OF_PIPE_W:
+			return (darwin_err(f, DARWIN_EINVAL));
+		case DARWIN_OF_CONSOLE:
+			return (darwin_ok(f, 0));	/* nothing is cached */
+		default:
+			break;		/* a file or a directory: the volume */
+		}
+		/*
+		 * One volume, one open transaction: publishing this file and
+		 * publishing everything are the same checkpoint, so fsync is
+		 * sync.  The promise is the point -- write(2) stopped
+		 * carrying it when mutations began to batch (see the policy
+		 * essay in fs/fs.c), and a 0 from here is where it moved to:
+		 * the write is on the platter, not parked in the batch.
+		 */
+		if (fs_sync() != FS_E_OK)
+			return (darwin_err(f, DARWIN_EIO));
+		return (darwin_ok(f, 0));
+	}
 	case DARWIN_SYS_lseek: {
 		struct darwin_ofile	*of;
 		struct task		*t;

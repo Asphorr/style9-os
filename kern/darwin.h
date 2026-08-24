@@ -82,6 +82,7 @@
 #define	DARWIN_SYS_munmap	73
 #define	DARWIN_SYS_setitimer	83
 #define	DARWIN_SYS_dup2		90
+#define	DARWIN_SYS_fsync	95
 #define	DARWIN_SYS_gettimeofday	116
 #define	DARWIN_SYS_fchmod	124
 #define	DARWIN_SYS_fcntl	92

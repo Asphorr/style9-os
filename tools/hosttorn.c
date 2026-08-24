@@ -243,14 +243,19 @@ bio_write(unsigned drive, uint64_t lba, uint32_t nsec, const void *buf)
 /* ---- the workloads ------------------------------------------------------ */
 
 /*
- * Four edits, chosen for what they make the checkpoint carry: a creation
+ * Five edits, chosen for what they make the checkpoint carry: a creation
  * (records and fresh extents), the clobbering rename (the takeover, the
  * orphan machinery and a reap in one edit -- the sentence this stand exists
- * to test), an unlink (records leaving, blocks to the free queue), and a
- * growth (the extent reference tree's new two-level paths under power loss).
- * Each is a setup phase that completes -- its own checkpoint and all --
- * and a measured phase that ends in exactly one fs_apfs_checkpoint(); only
- * the measured phase's writes are counted and cut.
+ * to test), an unlink (records leaving, blocks to the free queue), a growth
+ * (the extent reference tree's new two-level paths under power loss), and a
+ * BATCH -- four different edits published by a single checkpoint, which is
+ * the shape the kernel's sync policy produces once mutations stop
+ * checkpointing themselves.  The batch is the policy's acceptance: before
+ * the flip none of its edits exists, from the flip all of them do, and no
+ * cut or tear may ever show a volume carrying some.
+ * Each workload is a setup phase that completes -- its own checkpoint and
+ * all -- and a measured phase that ends in exactly one fs_apfs_checkpoint();
+ * only the measured phase's writes are counted and cut.
  */
 
 static void
@@ -497,6 +502,80 @@ w_grow_classify(void)
 	return (CLS_MIX);
 }
 
+/* -- a batch: four edits go to the platter as one atom, or not at all ----- */
+
+static void
+w_batch_setup(void)
+{
+	uint64_t	etc;
+
+	etc = etc_ino();
+	make_file(etc, "victim.txt", 1, 'V');
+	make_file(etc, "mover.txt", 1, 'M');
+	must(fs_apfs_checkpoint(), "setup checkpoint");
+}
+
+/*
+ * A create, an unlink, a rename and a growth, then ONE checkpoint -- the
+ * kernel's deferred policy seen from below.  The unlink-then-create pair is
+ * in here on purpose: the blocks the unlink releases are queued at the OPEN
+ * transaction's xid and stay marked in use, so nothing later in the batch
+ * can be handed a block the published checkpoint still reaches.  That claim
+ * is exactly what a cut anywhere in this edit puts to the proof.
+ */
+static void
+w_batch_measured(void)
+{
+	uint8_t		 buf[BLKSZ];
+	uint64_t	 etc;
+	uint64_t	 victim;
+	uint64_t	 id;
+	uint64_t	 ino;
+	uint64_t	 size;
+	uint32_t	 put;
+
+	etc = etc_ino();
+	make_file(etc, "fresh.txt", 1, 'F');
+	must(fs_apfs_unlink(etc, "victim.txt", NOW), "unlink");
+	must(fs_apfs_rename(etc, "mover.txt", etc, "moved.txt", NOW, &victim),
+	    "rename");
+	if (victim != 0)
+		_exit(BUG_EXIT);	/* moved.txt was supposed to be free */
+	must(fs_apfs_open("/etc/fresh.txt", &id, &size, &ino), "open");
+	must(fs_apfs_grow(ino, id, 2 * BLKSZ), "grow");
+	memset(buf, 'G', sizeof(buf));
+	must(fs_apfs_pwrite(id, 2 * BLKSZ, BLKSZ, buf, BLKSZ, &put), "pwrite");
+	if (put != BLKSZ)
+		_exit(BUG_EXIT);
+	must(fs_apfs_checkpoint(), "checkpoint");
+}
+
+static int
+w_batch_classify(void)
+{
+	int	fresh;
+	int	vict;
+	int	mover;
+	int	moved;
+
+	fresh = absent("/etc/fresh.txt");
+	vict  = absent("/etc/victim.txt");
+	mover = absent("/etc/mover.txt");
+	moved = absent("/etc/moved.txt");
+	if (fresh < 0 || vict < 0 || mover < 0 || moved < 0)
+		return (CLS_MIX);
+	if (fresh == 1 && vict == 0 && mover == 0 && moved == 1)
+		return (shaped("/etc/victim.txt", BLKSZ, BLKSZ, 'V', 0) == 1 &&
+		    shaped("/etc/mover.txt", BLKSZ, BLKSZ, 'M', 0) == 1 ?
+		    CLS_OLD : CLS_MIX);
+	if (fresh == 0 && vict == 1 && mover == 1 && moved == 0)
+		return (shaped("/etc/fresh.txt", 2 * BLKSZ, BLKSZ, 'F', 'G')
+		    == 1 &&
+		    shaped("/etc/moved.txt", BLKSZ, BLKSZ, 'M', 0) == 1 ?
+		    CLS_NEW : CLS_MIX);
+	return (CLS_MIX);
+}
+
 struct workload {
 	const char	*w_name;
 	void		(*w_setup)(void);
@@ -509,6 +588,7 @@ static const struct workload	workloads[] = {
 	{ "clobber", w_clobber_setup, w_clobber_measured, w_clobber_classify },
 	{ "unlink",  w_unlink_setup,  w_unlink_measured,  w_unlink_classify  },
 	{ "grow",    w_grow_setup,    w_grow_measured,    w_grow_classify    },
+	{ "batch",   w_batch_setup,   w_batch_measured,   w_batch_classify   },
 };
 
 /* ---- the harness -------------------------------------------------------- */

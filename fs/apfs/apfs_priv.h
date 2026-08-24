@@ -212,8 +212,23 @@ extern uint64_t	gone_n;		/* emptied nodes taken out of a tree  */
  * How many checkpoints a released block stays unavailable for.  Policy, not
  * format: it is how long this kernel promises an older checkpoint remains
  * readable, and the free queue holds blocks for exactly that long.
+ *
+ * It was 4, and batching repriced it.  The number is rent paid in free-queue
+ * room -- a single node holds every unreleased entry of the last KEEP+1
+ * transactions -- and at 4 it was priced for transactions of one edit each.
+ * Once checkpoints became a policy and a transaction became several edits,
+ * the arithmetic stopped closing: the belt in fs_apfs_ckpt_due catches a
+ * filling node, but its releases lag insertion by KEEP checkpoints, and
+ * with 4 the node could brim over faster than forced publishing aged the
+ * big slices out (measured: "free queue 1 is full (144 keys)" once per busy
+ * boot).  At 2 the lag is short enough for the belt to always win, and what
+ * the promise actually protects is intact with room to spare: the torn
+ * stand proved a crashed mount only ever falls back to the NEWEST intact
+ * checkpoint, which needs just the open transaction's frees held -- keeping
+ * one more checkpoint mountable behind it is the courtesy, kept at half the
+ * old rent.
  */
-#define	APFS_FQ_KEEP		4
+#define	APFS_FQ_KEEP		2
 
 /*
  * One chunk of the allocation bitmap, in memory.  Resident chunks are the

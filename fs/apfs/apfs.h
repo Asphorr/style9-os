@@ -938,6 +938,26 @@ void	fs_apfs_alloc_selftest(void);
 int	fs_apfs_checkpoint(void);
 
 /*
+ * The two questions a checkpoint POLICY asks, so that one need not live here.
+ *
+ * fs_apfs_dirty says whether there is an open transaction at all -- edits made
+ * since the last checkpoint, readable through the writer's own view and
+ * reachable from no superblock yet.  A sync of a clean container is a no-op
+ * the caller can skip without asking the disk anything.
+ *
+ * fs_apfs_ckpt_due says the open transaction is as large as the container can
+ * safely absorb and the next edit might not fit -- the bound is the free
+ * queue's single node, and the essay at the definition says why.  A policy
+ * that checkpoints when this fires, and otherwise whenever ITS reasons say to
+ * (a sync, a timer), never runs the queue into its own overflow fallback.
+ *
+ * Both are reads of mount state; callers hold the volume lock like every
+ * other caller here.
+ */
+int	fs_apfs_dirty(void);
+int	fs_apfs_ckpt_due(void);
+
+/*
  * Write two checkpoints and interrogate the disk after each: block zero moved,
  * the ring's newest superblock is the one just written, the checkpoint it
  * replaced still reads and still says its own xid, and every object the new
@@ -989,6 +1009,17 @@ uint64_t fs_apfs_splits(void);
  * that is quietly spending a record per block.
  */
 uint64_t fs_apfs_merges(void);
+
+/*
+ * And how many checkpoints have been written since boot.  A checkpoint is
+ * when the free queue lets go, and what it lets go of becomes holes a
+ * first-fit allocator may prefer -- so a test claiming appends MERGE can
+ * only decide the claim over a window no checkpoint landed in, and this is
+ * how it finds out whether one did.  With checkpoints written by policy
+ * rather than by every mutation, that landing is no longer the test's to
+ * predict.
+ */
+uint64_t fs_apfs_ckpts(void);
 
 /*
  * How many records a truncate has shortened, and how many it has taken out of
