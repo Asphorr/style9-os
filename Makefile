@@ -819,7 +819,32 @@ hostcheck: $(HOSTAPFS)
 	./$(HOSTAPFS) $(DISKIMG) $(T)
 	apfsck -c $(DISKIMG) && printf 'hostcheck: apfsck is happy\n'
 
+# THE POWER FAILS ON PURPOSE.  hosttorn shares fs/apfs/apfs.c with hostapfs
+# but brings its own five externs: its bio_write journals a pre-image of
+# every block before touching it and can kill the process mid-write -- which
+# is the instrument, not a debugging aid.  It does NOT link apfs_test.c; its
+# workloads are its own, chosen for what they make a checkpoint carry.
+HOSTTORN = $(OBJDIR)/hosttorn
+TORNSRC	 = tools/hosttorn.c fs/apfs/apfs.c
+
+hosttorn: $(HOSTTORN)
+
+$(HOSTTORN): $(TORNSRC) | $(OBJDIR)
+	$(HOSTCC) $(HOSTFLAGS) -o $@ $(TORNSRC)
+	@printf 'hosttorn: %s\n' $@
+
+# Every write of four edits becomes a power failure, clean and torn, with a
+# remount, a state check and an apfsck after each one; the image is restored
+# between failures and left as it was found, which the closing apfsck states
+# rather than assumes.  A fresh image first, for the reason hostcheck takes
+# one: a stale $(DISKIMG) is a sweep that starts from the last run's damage.
+torncheck: $(HOSTTORN)
+	@rm -f $(DISKIMG)
+	@$(MAKE) --no-print-directory $(DISKIMG) >/dev/null
+	./$(HOSTTORN) $(DISKIMG)
+	apfsck -c $(DISKIMG) && printf 'torncheck: the image is as it was found\n'
+
 clean:
 	rm -rf $(OBJDIR) kernel.elf
 
-.PHONY: all run log disk clean hostapfs hostcheck
+.PHONY: all run log disk clean hostapfs hostcheck hosttorn torncheck

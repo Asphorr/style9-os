@@ -637,6 +637,66 @@ purpose: once it has run, the index level is there for good, and every later
 test of that boot and all of the next one exercises the two-level walk
 without being told.
 
+**Then the atom itself went under the instrument.**  Every rung above leans
+on one sentence -- the checkpoint is the only atom this volume has -- and
+the clobbering rename leaned on it hardest: "the takeover and the reap
+publish as one state" is a claim about power failure, made by code that had
+never once been measured against one.  `make torncheck` measures it.  A
+workload runs against the image and the harness kills the process INSIDE
+`bio_write`: after the Kth write of the measured edit, the (K+1)th either
+never starts -- a clean cut -- or lands its first one, four or seven
+sectors and no more, which is a torn write, the disk's own way of failing a
+4 KiB block it was half way through.  A fresh process then mounts what is
+left and answers three questions: does it mount at all, is the volume
+WHOLLY the old state or WHOLLY the new one -- names, sizes, and every byte,
+because a state that merely LOOKS old is exactly the kind of half-published
+edit the sweep exists to catch -- and what does `apfsck` say.  K sweeps
+every write of four different edits, chosen for what they make a checkpoint
+carry: a creation, the clobbering rename with its reap, an unlink, a growth
+through the two-level extent reference tree.  Six hundred and seventy-two
+staged power failures per run; between them the image is restored by
+replaying a pre-image journal backwards -- per-run truth, not a bet on the
+workload writing the same blocks twice -- and the tool leaves the image as
+it found it, which the closing `apfsck` states rather than assumes.
+
+The sweep proved the sentence, with one asterisk measured into it.  Every
+edit has exactly one write that changes the answer -- the container
+superblock landing in the checkpoint descriptor ring, always the
+second-to-last write, a position the sweep asserts rather than trusts --
+with the old state whole and clean at every cut before it and the new state
+whole from it on.  A torn write never flips the answer on its own: a torn
+block fails its Fletcher-64, and the mount's ring scan refuses to believe a
+block it cannot checksum.  What a tear CAN do is COMPLETE a write -- when
+every byte that differs sits inside the sectors that landed, and a
+superblock's tail is padding that does not change between checkpoints --
+and the sweep judges that moment as the write having finished, because on
+the platter that is what it is.
+
+The asterisk is the last write.  A checkpoint ends with two copies of the
+same superblock: the ring slot, which is the commit, and block zero, the
+anchor every reader starts at.  Two fixed locations cannot both change in
+one block write -- no order avoids this -- so between those two writes
+every volume of this design momentarily has an anchor that lags its ring,
+and `apfsck` says exactly that: "Block zero: the filesystem was not
+unmounted cleanly", which after a power cut is a true statement, and it
+withholds the clean bill.  The order is still the right order; an anchor
+committed first would advertise a checkpoint the ring does not hold.  So
+the stand holds that window -- three grid points per edit, no more -- to a
+two-tier oracle: strict `apfsck` must refuse, and `apfsck -u`,
+uncleanliness tolerated with everything else still checked, must call the
+volume whole.  The tolerance itself went under the ladder first: one byte
+of a catalog node was broken and `-u` caught it before the stand was
+allowed to trust it.  Our own mount never consults the anchor's opinion of
+how things went -- the ring scan finds the commit -- and the next
+checkpoint rewrites block zero behind it.
+
+What the stand does not claim is written down beside what it does: writes
+land in issue order here, and a cut keeps a prefix, so the property proved
+is that the LOGICAL order is crash-consistent.  A disk's write cache can
+reorder across that prefix until someone sends it a flush, and nothing in
+this stack sends one yet.  That is a later rung's question, named rather
+than absorbed.
+
 ## A wake reaches the CPU
 
 Three waits in the Darwin layer polled with `thread_yield` -- a pipe read, a
