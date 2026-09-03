@@ -723,7 +723,14 @@ darwin_file_read(struct syscall_frame *f, struct darwin_ofile *of, void *ubuf,
 		    (uint32_t)chunk, &got);
 		if (rv != FS_E_OK) {
 			kfree(bounce);
-			return (darwin_err(f, DARWIN_EIO));
+			/*
+			 * A read that fails mid-file is the disk's failing,
+			 * EIO -- except the one failure a descriptor onto
+			 * /.xid can have, which is its checkpoint sliding
+			 * out of the window, and that has its own word.
+			 */
+			return (darwin_err(f, rv == FS_E_GONE ?
+			    DARWIN_ESTALE : DARWIN_EIO));
 		}
 		if (got == 0)			/* end of file, short read */
 			break;
@@ -771,6 +778,12 @@ darwin_fs_errno(int rv)
 	case FS_E_NOALLOC:	return (DARWIN_ENOSPC);
 	case FS_E_SPREAD:	return (DARWIN_ENOSPC);
 	case FS_E_INVAL:	return (DARWIN_EINVAL);
+	/*
+	 * A checkpoint read through /.xid that the free queue has since let
+	 * go of.  NFS's word for a handle whose object is no longer there,
+	 * and the nearest thing errno has to "this was true a moment ago".
+	 */
+	case FS_E_GONE:		return (DARWIN_ESTALE);
 	default:		return (DARWIN_EIO);
 	}
 }
@@ -2669,6 +2682,17 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		 */
 		flags   = (uint32_t)f->sf_arg1;
 		writing = (flags & DARWIN_O_ACCMODE) != DARWIN_O_RDONLY;
+
+		/*
+		 * The published past (fs.h, /.xid) is refused to a writer at
+		 * the open, which is where open(2) says a read-only
+		 * filesystem refuses: a descriptor that accepted the mode and
+		 * then failed every write would be the same lie EROFS exists
+		 * to prevent.  Creating and truncating are writes too.
+		 */
+		if (fs_readonly(path) && (writing ||
+		    (flags & (DARWIN_O_CREAT | DARWIN_O_TRUNC)) != 0))
+			return (darwin_err(f, DARWIN_EROFS));
 
 		/*
 		 * A DIRECTORY CAN BE OPENED, and that is not a technicality.

@@ -367,6 +367,15 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	fs_clobber_selftest();
 
 	/*
+	 * And the published past, by name: the checkpoints the tests above
+	 * left in the ring read back through /.xid exactly as they were
+	 * written, refuse every write, and slide out of reach on the free
+	 * queue's schedule.  After every writer above, because what it reads
+	 * is what they published.
+	 */
+	fs_view_selftest();
+
+	/*
 	 * And that every file those tests opened was given back.  Last of the
 	 * filesystem tests on purpose: it is an assertion about all of them,
 	 * and the only moment it can be made is after the last one and before

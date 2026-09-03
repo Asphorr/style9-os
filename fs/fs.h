@@ -130,9 +130,58 @@ _Static_assert(sizeof(struct fs_statbuf) == 72,
  * being exhausted: nothing is wrong and the answer is to close something.
  */
 #define	FS_E_NOSPACE	(-14)
+/*
+ * A published checkpoint that was being read through /.xid (below) has been
+ * let go of by the free queue since, and its blocks may belong to something
+ * else now.  Not FS_E_NOTFOUND: the path was valid and answered until moments
+ * ago, and a caller told "no such file" would look for a typo.
+ */
+#define	FS_E_GONE	(-15)
 
 /* Non-zero once some filesystem is mounted and can serve files. */
 int		fs_ready(void);
+
+/*
+ * THE PUBLISHED PAST, BY NAME
+ *
+ * Every checkpoint the free queue still holds the blocks of is a complete,
+ * older volume sitting on the platter (fs/apfs/apfs.h, "the published past"),
+ * and this is how a path reaches one: /.xid/<N> is the volume as checkpoint N
+ * left it, /.xid/<N>/etc/notes.txt is that file as of then, and /.xid itself
+ * lists the checkpoints that can be reached right now, oldest first.  The
+ * listing is a window that slides -- each checkpoint the live volume writes
+ * lets go of the oldest one behind it -- and a name under a checkpoint that
+ * has slid out answers FS_E_GONE rather than a guess.
+ *
+ * Hidden, the way ZFS hides .zfs: the root's listing does not name it, so a
+ * walker does not descend into a directory that is the whole volume again
+ * several times over, and a program that knows the name asks for it.  A
+ * checkpoint's directory reports itself as the volume's root as of then --
+ * its times are that root's -- under a synthetic inode number no real inode
+ * can carry, so that a stat of /.xid/<N> and the entry /.xid lists agree.
+ *
+ * Read-only, all of it, and by the filesystem's construction rather than by
+ * a flag here: every path that would change something under /.xid answers
+ * FS_E_ROFS, and a handle opened there refuses to write.  What a handle onto
+ * the past carries is its checkpoint's number, and every read through it
+ * asks the filesystem for that checkpoint again -- so the window's edge is
+ * enforced at each read, not once at open.
+ */
+#define	FS_VIEW_DIR	"/.xid"
+
+/*
+ * The synthetic inode of /.xid (xid 0) and of /.xid/<N>.  Bit 63 is outside
+ * the 60-bit object-id space an APFS record key can hold, so nothing on the
+ * volume can collide with it.
+ */
+#define	FS_VIEW_INO(xid)	((uint64_t)1 << 63 | (uint64_t)(xid))
+
+/*
+ * Non-zero when nothing at `path` may be changed -- it lies under /.xid.
+ * Asked by open(2) so that a request to write is refused at the open, as
+ * POSIX has it, rather than at the first write.
+ */
+int		fs_readonly(const char *path);
 
 /* "apfs", "fat", or "none" -- for banners and diagnostics. */
 const char	*fs_kind(void);
@@ -195,6 +244,14 @@ struct fs_handle {
 	 * being true.
 	 */
 	uint64_t	fh_gen;
+	/*
+	 * The published checkpoint this handle reads, or 0 for the live
+	 * volume.  A handle onto the past has no row in the open table --
+	 * nothing it reads can be unlinked -- and no generation to refresh,
+	 * since a checkpoint does not change; what it has instead is an edge
+	 * to fall off, and fs_pread asks about that every time.
+	 */
+	uint64_t	fh_xid;
 	uint8_t		fh_kind;	/* FS_HANDLE_*                      */
 };
 
@@ -547,6 +604,15 @@ void		fs_orphan_selftest(void);
  * that descriptor closes.  Silently does nothing when the volume is not APFS.
  */
 void		fs_clobber_selftest(void);
+
+/*
+ * The published past, by name: a file's earlier bytes through /.xid/<N>, the
+ * listing of /.xid, every write under it refused, a handle onto it read and
+ * then found to have slid out of the window.  After every writer above, since
+ * what it reads is what they published.  Silently does nothing when the
+ * volume is not APFS.
+ */
+void		fs_view_selftest(void);
 
 /*
  * fs-open: nothing the self-tests opened is still held.  Run after all of them

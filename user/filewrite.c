@@ -48,12 +48,15 @@
  *	   once the name is gone, and takes the path to the file with it.
  *	10. The two removals do not stand in for each other: rmdir refuses a
  *	   file, unlink refuses a directory.
+ *	15. The checkpoint fsync(2) published can be read back by its number
+ *	   under /.xid, and nothing under that name can be written.
  *
  * Freestanding: no SDK headers, prototypes declared as <fcntl.h>/<unistd.h>
  * would alias them, entry at _entry (ld -e), relinked low like dyldhello.
  */
 
 typedef __UINT8_TYPE__	uint8_t;
+typedef __UINT16_TYPE__	uint16_t;
 typedef __UINT32_TYPE__	uint32_t;
 typedef __UINT64_TYPE__	uint64_t;
 typedef __INT64_TYPE__	int64_t;
@@ -78,6 +81,25 @@ typedef __SIZE_TYPE__	size_t;
 #define	ENOSPC		28
 #define	EROFS		30
 #define	ENOTEMPTY	66
+#define	ESTALE		70
+
+/*
+ * The directory stream, as libSystem's $INODE64 flavour of it lays out the
+ * entry: an Apple binary sees exactly this, so this probe sees exactly this.
+ * DIR itself is opaque to the caller, as it is to Apple's.
+ */
+struct dirent {
+	uint64_t	d_ino;
+	uint64_t	d_seekoff;
+	uint16_t	d_reclen;
+	uint16_t	d_namlen;
+	uint8_t		d_type;
+	char		d_name[1024];
+};
+
+extern void	*opendir(const char *path) __asm__("_opendir$INODE64");
+extern struct dirent *readdir(void *dp) __asm__("_readdir$INODE64");
+extern int	 closedir(void *dp);
 
 extern int	*__error(void);		/* Apple's <errno.h>: errno == *__error() */
 extern int	 open(const char *path, int flags, ...);
@@ -151,14 +173,39 @@ slurp(const char *path, char *buf, size_t cap)
 	return (got);
 }
 
+/* The decimal digits of `v` into `dst`, no terminator; how many there were. */
+static size_t
+putnum(char *dst, unsigned long v)
+{
+	char	tmp[24];
+	size_t	n;
+	size_t	i;
+
+	n = 0;
+	do {
+		tmp[n++] = (char)('0' + v % 10);
+		v /= 10;
+	} while (v != 0);
+	for (i = 0; i < n; i++)
+		dst[i] = tmp[n - 1 - i];
+	return (n);
+}
+
 int
 entry(void)
 {
-	char	buf[512];
-	long	got;
-	long	put;
-	int	fd;
-	int	held;
+	char		 buf[512];
+	char		 vpath[96];
+	struct dirent	*ent;
+	void		*dp;
+	unsigned long	 best;
+	unsigned long	 xid;
+	size_t		 i;
+	size_t		 n;
+	long		 got;
+	long		 put;
+	int		 fd;
+	int		 held;
 
 	printf("filewrite: the volume, from ring 3\n");
 
@@ -503,6 +550,95 @@ entry(void)
 		(void)close(fd);
 		if (fsync(fd) == 0)
 			fail("fsync accepted a closed descriptor");
+		(void)unlink(PATH);
+	}
+
+	/*
+	 * 15. THE PUBLISHED PAST, BY PATH.  fsync(2) publishes a checkpoint,
+	 * and the kernel lists every checkpoint it can still read under
+	 * /.xid (fs/fs.h) -- so the newest name there is the one the fsync
+	 * just made, and the file under it has to read as what was written,
+	 * out of a directory that refuses every write.  Read by a path that
+	 * names the checkpoint by NUMBER, which is a claim no cache of this
+	 * program's could satisfy: the bytes were on the platter before the
+	 * number was known out here.
+	 *
+	 * Softened at one point, and out loud: the window slides with every
+	 * checkpoint, and the syncer may publish one between the listing and
+	 * the read.  ESTALE there is the window being honest rather than the
+	 * file being lost, and is reported as skipped, not as failed.
+	 */
+	fd = open(PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0)
+		fail("cannot make a file to publish");
+	else {
+		put = write(fd, FIRST, slen(FIRST));
+		if (put != (long)slen(FIRST) || fsync(fd) != 0)
+			fail("the write or the fsync before the view failed");
+		(void)close(fd);
+		best = 0;
+		dp = opendir("/.xid");
+		if (dp == NULL)
+			fail("/.xid would not open as a directory");
+		else {
+			while ((ent = readdir(dp)) != NULL) {
+				xid = 0;
+				for (i = 0; ent->d_name[i] >= '0' &&
+				    ent->d_name[i] <= '9'; i++)
+					xid = xid * 10 + (unsigned long)
+					    (ent->d_name[i] - '0');
+				if (i == 0 || ent->d_name[i] != '\0' ||
+				    ent->d_type != 4)
+					fail("/.xid lists something that is "
+					    "not a numbered directory");
+				else if (xid > best)
+					best = xid;
+			}
+			(void)closedir(dp);
+		}
+		if (best == 0)
+			fail("/.xid lists no checkpoint at all");
+		else {
+			n = 0;
+			for (i = 0; "/.xid/"[i] != '\0'; i++)
+				vpath[n++] = "/.xid/"[i];
+			n += putnum(vpath + n, best);
+			for (i = 0; PATH[i] != '\0'; i++)
+				vpath[n++] = PATH[i];
+			vpath[n] = '\0';
+
+			got = slurp(vpath, buf, sizeof(buf));
+			if (got < 0 && *__error() == ESTALE)
+				printf("filewrite: checkpoint %lu slid out of "
+				    "the window before it could be read -- "
+				    "the window being honest; skipped\n", best);
+			else if (got != (long)slen(FIRST) ||
+			    !same(buf, FIRST, (size_t)got))
+				fail("the file under the newest /.xid entry "
+				    "does not read as what fsync published");
+			else
+				printf("filewrite: PASS %s read back through "
+				    "%s -- the checkpoint fsync published, "
+				    "by number\n", PATH, vpath);
+
+			fd = open(vpath, O_WRONLY);
+			if (fd >= 0) {
+				(void)close(fd);
+				fail("open(O_WRONLY) under /.xid handed out a "
+				    "descriptor");
+			} else if (*__error() != EROFS)
+				fail("open(O_WRONLY) under /.xid refused with "
+				    "something other than EROFS");
+			else if (unlink(vpath) == 0 || *__error() != EROFS)
+				fail("unlink under /.xid did not answer EROFS");
+			else if (mkdir("/.xid/ring3", 0755) == 0 ||
+			    *__error() != EROFS)
+				fail("mkdir under /.xid did not answer EROFS");
+			else
+				printf("filewrite: PASS the past is read-only "
+				    "-- open for writing, unlink and mkdir "
+				    "under /.xid all answered EROFS\n");
+		}
 		(void)unlink(PATH);
 	}
 

@@ -3485,3 +3485,310 @@ fs_apfs_ckpt_selftest(void)
 out:
 	kfree(scratch);
 }
+
+/*
+ * THE PUBLISHED PAST READS BACK, AND EXACTLY AS FAR BACK AS PROMISED
+ *
+ * apfs-ckpt above proves that a checkpoint's superblock survives the next
+ * one.  That is a claim about one block.  What the free queue has promised
+ * since it existed is a claim about every block: for APFS_FQ_KEEP checkpoints
+ * after a transaction stops using a block, nothing is allowed to reuse it --
+ * and nothing had ever gone back and READ through an old checkpoint to see
+ * whether the promise was kept.  This does, byte for byte, on a file whose
+ * every checkpoint left it a different shape.
+ *
+ * The shape of the proof is a file that exists in three states across three
+ * consecutive checkpoints -- absent, one block of one byte, two blocks of
+ * another -- and then absent again in a fourth.  Every view is asked for the
+ * state its checkpoint held, which "merely looks right" cannot satisfy: a
+ * view that resolved the wrong root would answer with a shape from the wrong
+ * column.  The mount is photographed before the views and compared after,
+ * because a view that quietly moved the live root would pass every read and
+ * corrupt the next write.
+ *
+ * And the window's EDGE is asked for, not just its inside: the checkpoint
+ * one older than the floor must be refused with GONE, and the listing must
+ * name exactly the checkpoints inside it.  A window nobody has found closed
+ * is a window whose width nobody has measured.  The expectations are written
+ * against APFS_FQ_KEEP rather than against the number 2, so that repricing
+ * the constant reprices the test with it.
+ */
+#define	APFS_VIEW_NAME	"view.txt"
+#define	APFS_VIEW_PATH	"/etc/view.txt"
+
+/* 1 = the file is `blocks` blocks of `fill`, 0 = it is not, -1 = no file */
+static int
+view_shaped(uint32_t blocks, uint8_t fill)
+{
+	uint8_t		*buf;
+	uint32_t	 got;
+	uint32_t	 i;
+	int		 ok;
+
+	if (fs_apfs_slurp(APFS_VIEW_PATH, &buf, &got) != FS_APFS_E_OK)
+		return (-1);
+	ok = (got == blocks * APFS_BLOCK_SIZE);
+	for (i = 0; ok && i < got; i++)
+		ok = (buf[i] == fill);
+	kfree(buf);
+	return (ok);
+}
+
+/*
+ * What the file looks like through a view of `xid`, against what it should:
+ * `blocks` of `fill`, or absent when blocks is 0.  `want_rv` is what opening
+ * the view itself must answer -- OK inside the window, GONE below it,
+ * NOTFOUND above it -- and only an OK view is entered and read.
+ */
+static bool
+view_expect(uint64_t xid, int want_rv, uint32_t blocks, uint8_t fill)
+{
+	struct fs_apfs_view	v;
+	uint64_t		oid;
+	int			is_dir;
+	int			rv;
+	int			shape;
+
+	rv = fs_apfs_view_open(xid, &v);
+	if (rv != want_rv) {
+		kprintf("apfs-view: FAIL opening a view of xid %llu answered "
+		    "%d, wanted %d\n", (unsigned long long)xid, rv, want_rv);
+		return (false);
+	}
+	if (want_rv != FS_APFS_E_OK)
+		return (true);
+	rv = fs_apfs_view_enter(&v);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-view: FAIL entering the view of xid %llu "
+		    "answered %d\n", (unsigned long long)xid, rv);
+		return (false);
+	}
+	if (blocks == 0) {
+		rv = fs_apfs_lookup(APFS_VIEW_PATH, &oid, &is_dir);
+		fs_apfs_view_leave();
+		if (rv != FS_APFS_E_NOTFOUND) {
+			kprintf("apfs-view: FAIL through xid %llu the name "
+			    "answers %d, and it did not exist then\n",
+			    (unsigned long long)xid, rv);
+			return (false);
+		}
+		return (true);
+	}
+	shape = view_shaped(blocks, fill);
+	fs_apfs_view_leave();
+	if (shape != 1) {
+		kprintf("apfs-view: FAIL through xid %llu the file is not %u "
+		    "block(s) of '%c' (%s)\n", (unsigned long long)xid,
+		    (unsigned)blocks, (char)fill,
+		    shape < 0 ? "it does not read" : "the bytes differ");
+		return (false);
+	}
+	return (true);
+}
+
+static bool
+view_fill_block(uint64_t ino, uint64_t size, uint64_t off, uint8_t fill,
+    uint8_t *blk)
+{
+	uint32_t	put;
+	uint32_t	i;
+
+	for (i = 0; i < APFS_BLOCK_SIZE; i++)
+		blk[i] = fill;
+	if (fs_apfs_pwrite(ino, size, off, blk, APFS_BLOCK_SIZE, &put) !=
+	    FS_APFS_E_OK || put != APFS_BLOCK_SIZE)
+		return (false);
+	return (true);
+}
+
+void
+fs_apfs_view_selftest(uint64_t now)
+{
+	uint64_t		 xids[APFS_FQ_KEEP + 2];
+	struct apfs_mount	*before;
+	uint8_t			*blk;
+	const uint8_t		*a;
+	const uint8_t		*b;
+	uint64_t		 etc;
+	uint64_t		 ino;
+	uint64_t		 oid;
+	uint64_t		 x0, x1, x2, x3;
+	uint64_t		 floor;
+	uint32_t		 n;
+	uint32_t		 i;
+	int			 is_dir;
+	int			 rv;
+	bool			 ok;
+
+	if (!g_apfs.ac_mounted || !g_apfs.ac_ip_valid) {
+		kprintf("apfs-view: nothing writable -- skipped\n");
+		return;
+	}
+	if (fs_apfs_lookup("/etc", &etc, &is_dir) != FS_APFS_E_OK || !is_dir) {
+		kprintf("apfs-view: /etc is not there -- skipped\n");
+		return;
+	}
+	before = kmalloc(sizeof(*before));
+	blk    = kmalloc(APFS_BLOCK_SIZE);
+	if (before == NULL || blk == NULL) {
+		kprintf("apfs-view: no memory -- skipped\n");
+		kfree(before);
+		kfree(blk);
+		return;
+	}
+	ino = 0;
+
+	/* Whatever an interrupted run left, then a checkpoint to stand on. */
+	(void)fs_apfs_unlink(etc, APFS_VIEW_NAME, now);
+	if (fs_apfs_checkpoint() != FS_APFS_E_OK) {
+		kprintf("apfs-view: FAIL the opening checkpoint was refused\n");
+		goto clean;
+	}
+	x0 = g_apfs.ac_xid;
+
+	/* x1: the file, one block of 'A'. */
+	rv = fs_apfs_create(etc, APFS_VIEW_NAME, now, 0644, &ino);
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_grow(ino, ino, APFS_BLOCK_SIZE);
+	if (rv == FS_APFS_E_OK &&
+	    !view_fill_block(ino, APFS_BLOCK_SIZE, 0, 'A', blk))
+		rv = FS_APFS_E_IO;
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_checkpoint();
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-view: FAIL cannot make the file's first state "
+		    "(%d)\n", rv);
+		goto clean;
+	}
+	x1 = g_apfs.ac_xid;
+
+	/* x2: the first block rewritten as 'B' and a second block of it. */
+	rv = FS_APFS_E_OK;
+	if (!view_fill_block(ino, APFS_BLOCK_SIZE, 0, 'B', blk))
+		rv = FS_APFS_E_IO;
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_grow(ino, ino, 2 * APFS_BLOCK_SIZE);
+	if (rv == FS_APFS_E_OK &&
+	    !view_fill_block(ino, 2 * APFS_BLOCK_SIZE, APFS_BLOCK_SIZE, 'B',
+	    blk))
+		rv = FS_APFS_E_IO;
+	if (rv == FS_APFS_E_OK)
+		rv = fs_apfs_checkpoint();
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-view: FAIL cannot make the file's second state "
+		    "(%d)\n", rv);
+		goto clean;
+	}
+	x2 = g_apfs.ac_xid;
+
+	/*
+	 * The name goes, and the transaction stays OPEN.  The live volume and
+	 * the newest published checkpoint now disagree about the file, which
+	 * is the state the sync policy leaves a volume in most of the time --
+	 * and exactly the state a view of the newest checkpoint is for.
+	 */
+	rv = fs_apfs_unlink(etc, APFS_VIEW_NAME, now);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-view: FAIL the unlink was refused (%d)\n", rv);
+		goto clean;
+	}
+	if (fs_apfs_lookup(APFS_VIEW_PATH, &oid, &is_dir) !=
+	    FS_APFS_E_NOTFOUND) {
+		kprintf("apfs-view: FAIL the live volume still names the "
+		    "unlinked file\n");
+		goto clean;
+	}
+
+	/* The past, with the mount photographed before and compared after. */
+	*before = g_apfs;
+	ok = view_expect(x2, FS_APFS_E_OK, 2, 'B') &&
+	    view_expect(x1, FS_APFS_E_OK, 1, 'A') &&
+	    view_expect(x0, FS_APFS_E_OK, 0, 0) &&
+	    view_expect(x2 + 1, FS_APFS_E_NOTFOUND, 0, 0);
+	if (!ok)
+		goto clean;
+	a = (const uint8_t *)before;
+	b = (const uint8_t *)&g_apfs;
+	for (i = 0; i < sizeof(g_apfs); i++) {
+		if (a[i] != b[i]) {
+			kprintf("apfs-view: FAIL reading the past moved the "
+			    "mount (byte %u of the mount state changed)\n",
+			    (unsigned)i);
+			goto clean;
+		}
+	}
+	if (fs_apfs_view_xid() != 0) {
+		kprintf("apfs-view: FAIL a view of xid %llu was left "
+		    "entered\n", (unsigned long long)fs_apfs_view_xid());
+		goto clean;
+	}
+
+	/*
+	 * The checkpoint publishing the unlink slides the window.  Three
+	 * consecutive checkpoints written by this test stand behind it, and
+	 * which of them survive is APFS_FQ_KEEP's decision, not the test's.
+	 */
+	if (fs_apfs_checkpoint() != FS_APFS_E_OK) {
+		kprintf("apfs-view: FAIL the publishing checkpoint was "
+		    "refused\n");
+		goto clean;
+	}
+	x3    = g_apfs.ac_xid;
+	floor = x3 - APFS_FQ_KEEP;
+	if (view_floor() != floor) {
+		kprintf("apfs-view: FAIL the floor stands at %llu after "
+		    "checkpoint %llu; APFS_FQ_KEEP of %u puts it at %llu\n",
+		    (unsigned long long)view_floor(), (unsigned long long)x3,
+		    (unsigned)APFS_FQ_KEEP, (unsigned long long)floor);
+		goto clean;
+	}
+	ok = view_expect(x0, x0 < floor ? FS_APFS_E_GONE : FS_APFS_E_OK, 0,
+	    0) &&
+	    view_expect(x1, x1 < floor ? FS_APFS_E_GONE : FS_APFS_E_OK, 1,
+	    'A') &&
+	    view_expect(x2, x2 < floor ? FS_APFS_E_GONE : FS_APFS_E_OK, 2,
+	    'B') &&
+	    view_expect(x3, FS_APFS_E_OK, 0, 0);
+	if (!ok)
+		goto clean;
+
+	/* And the listing names the window exactly: floor to x3, in order. */
+	rv = fs_apfs_view_list(xids, (uint32_t)(sizeof(xids) /
+	    sizeof(xids[0])), &n);
+	if (rv != FS_APFS_E_OK) {
+		kprintf("apfs-view: FAIL listing the views answered %d\n", rv);
+		goto clean;
+	}
+	if (n != APFS_FQ_KEEP + 1) {
+		kprintf("apfs-view: FAIL %u checkpoint(s) listed, the window "
+		    "is %u wide\n", (unsigned)n, (unsigned)(APFS_FQ_KEEP + 1));
+		goto clean;
+	}
+	for (i = 0; i < n; i++) {
+		if (xids[i] != floor + i) {
+			kprintf("apfs-view: FAIL entry %u of the listing is "
+			    "xid %llu, wanted %llu\n", (unsigned)i,
+			    (unsigned long long)xids[i],
+			    (unsigned long long)(floor + i));
+			goto clean;
+		}
+	}
+
+	kprintf("apfs-view: PASS -- through the ring the file read as absent "
+	    "at xid %llu, 1 block of 'A' at %llu and 2 of 'B' at %llu while "
+	    "the live volume had unlinked it; after xid %llu the window is "
+	    "%llu..%llu, %llu refused as let go, the mount untouched\n",
+	    (unsigned long long)x0, (unsigned long long)x1,
+	    (unsigned long long)x2, (unsigned long long)x3,
+	    (unsigned long long)floor, (unsigned long long)x3,
+	    (unsigned long long)(floor - 1));
+
+clean:
+	if (fs_apfs_view_xid() != 0)
+		fs_apfs_view_leave();
+	(void)fs_apfs_unlink(etc, APFS_VIEW_NAME, now);
+	if (g_apfs.ac_dirty)
+		(void)fs_apfs_checkpoint();
+	kfree(before);
+	kfree(blk);
+}

@@ -182,12 +182,65 @@ static int	drec_key(uint64_t parent, const char *name, uint32_t nlen,
  * That is not a hypothetical: the first boot with a copied inode read the
  * file back as an I/O error, because the leaf it had just moved was invisible
  * to a lookup that still believed in the committed checkpoint.
+ *
+ * AND THE VIEW, which is the same question with the opposite answer.  A
+ * reader can be pointed at a checkpoint OLDER than the mount (apfs.h, "the
+ * published past"), and then every one of these three answers is that
+ * checkpoint's: its xid, its volume object map, its root.  The three travel
+ * together because they are one statement about one checkpoint, and a reader
+ * that took the root from one and the map from another would resolve the
+ * tree's children through a map that never named them.  g_view is the view
+ * entered, or NULL when readers answer for the live volume; nothing in this
+ * file reads the three fields it shadows except through these.
  */
+static const struct fs_apfs_view	*g_view;
+static uint64_t	 view_n_open;	/* checkpoints resolved into views */
+static uint64_t	 view_n_enter;	/* views readers were pointed at   */
+static uint64_t	 view_n_gone;	/* refused: the queue let it go    */
+static uint64_t	 view_n_forbid;	/* writes asked for under a view   */
+
 uint64_t
 view_xid(void)
 {
 
+	if (g_view != NULL)
+		return (g_view->av_xid);
 	return (g_apfs.ac_xid + (g_apfs.ac_dirty ? 1 : 0));
+}
+
+uint64_t
+view_omap(void)
+{
+
+	return (g_view != NULL ? g_view->av_omap_tree :
+	    g_apfs.ac_vol_omap_tree);
+}
+
+uint64_t
+view_root(void)
+{
+
+	return (g_view != NULL ? g_view->av_root_bno : g_apfs.ac_root_tree_bno);
+}
+
+/*
+ * A view is read-only by construction, and this is the construction: the
+ * three doors through which this file changes the container -- a block
+ * written, a block taken, a block given back -- each ask this first.  It
+ * cannot happen, since the volume lock keeps a view and a writer apart, and
+ * that is exactly why it is checked at the doors rather than trusted at the
+ * gates: the failure it would be is a reader silently becoming a writer.
+ */
+static bool
+view_forbids(const char *what)
+{
+
+	if (g_view == NULL)
+		return (false);
+	kprintf("apfs: %s while a view of xid %llu is entered -- refused\n",
+	    what, (unsigned long long)g_view->av_xid);
+	view_n_forbid++;
+	return (true);
 }
 static uint64_t	 ip_n_alloc;	/* pool blocks taken    */
 static uint64_t	 ip_n_free;	/* pool blocks returned */
@@ -307,6 +360,8 @@ static int
 write_block_raw(uint64_t bno, const void *buf)
 {
 
+	if (view_forbids("a block write"))
+		return (FS_APFS_E_IO);
 	if (bio_write(0, bno * APFS_SECTORS_PER_BLOCK, APFS_SECTORS_PER_BLOCK,
 	    buf) != 0)
 		return (FS_APFS_E_IO);
@@ -1449,12 +1504,41 @@ fq_insert(uint32_t q, uint64_t xid, uint64_t paddr, uint64_t count)
 }
 
 /*
+ * THE FLOOR OF THE WINDOW: the oldest checkpoint whose every block the free
+ * queue still holds, which is the oldest a view may be opened on.
+ *
+ * Recorded, not computed.  The arithmetic says ac_xid - APFS_FQ_KEEP, and
+ * the arithmetic is right whenever a checkpoint write runs to completion;
+ * but the release happens at the START of the write, in memory, and a write
+ * that then fails leaves the queue having let go of one more slice than any
+ * superblock on the platter accounts for.  The open transaction may already
+ * be handing those blocks out.  So the floor is whatever fq_release was last
+ * told to release, and a floor that moved without a checkpoint landing is
+ * the failed write telling the truth about itself.
+ *
+ * At mount it is the checkpoint before the one adopted, and one step short
+ * of this kernel's own arithmetic on purpose: a fresh mount does not know
+ * who wrote the container last.  Any writer able to fall back after a torn
+ * checkpoint must hold at least the previous checkpoint's blocks -- that is
+ * what falling back means -- so ac_xid - 1 is the floor the format itself
+ * guarantees, while ac_xid - APFS_FQ_KEEP is only what THIS writer keeps.
+ * The first checkpoint written after mount brings the window to its full
+ * APFS_FQ_KEEP + 1 checkpoints, and every one after that slides it.
+ */
+static uint64_t	fq_floor;
+
+/*
  * Let go of everything queued at `upto_xid` or earlier: clear the bits, move
  * the counters, and drop the entries.
  *
  * This is the only place a block becomes free again, and the xid is what
  * makes it safe -- by the time a transaction is APFS_FQ_KEEP checkpoints
  * behind, no superblock still worth mounting refers to what it released.
+ *
+ * Every entry at or below `upto_xid` was queued by a transaction that had
+ * stopped using its block, so the last checkpoint to name that block is one
+ * older still: after this, nothing older than `upto_xid` itself is whole,
+ * and the floor above records exactly that.
  */
 static void
 fq_release(uint32_t q, uint64_t upto_xid)
@@ -1472,6 +1556,14 @@ fq_release(uint32_t q, uint64_t upto_xid)
 	uint32_t			 j;
 	uint32_t			 kept;
 
+	/*
+	 * Before the queue is even looked at: what is asked to be released is
+	 * what the floor records, and a queue that cannot be reached right now
+	 * has still been TOLD -- the next call that can reach it lets go on
+	 * these terms.
+	 */
+	if (upto_xid > fq_floor)
+		fq_floor = upto_xid;
 	if (q >= APFS_SFQ_COUNT || g_fq[q] == NULL || g_sm == NULL)
 		return;
 	n   = (struct apfs_btree_node_phys *)g_fq[q];
@@ -2173,6 +2265,286 @@ mount_volume(void *scratch)
 	return (FS_APFS_E_OK);
 }
 
+/* ---- the published past -------------------------------------------------- */
+
+/*
+ * The superblock of checkpoint `xid`, out of the ring, into `buf`.  A slot is
+ * asked its magic and xid before it is checksummed, because the ring is
+ * mostly checkpoint maps and superblocks of other checkpoints, and summing
+ * every one of them to find the one wanted would make a view cost a ring's
+ * worth of arithmetic.  The one match IS checksummed: a torn slot carrying
+ * the right xid is not that checkpoint, it is the crash that interrupted it.
+ */
+static int
+ring_find(uint64_t xid, void *buf)
+{
+	const struct apfs_nx_superblock	*nx;
+	uint32_t			 i;
+
+	for (i = 0; i < g_apfs.ac_xp_desc_blocks; i++) {
+		if (read_block_raw(g_apfs.ac_xp_desc_base + i, buf) !=
+		    FS_APFS_E_OK)
+			return (FS_APFS_E_IO);
+		nx = (const struct apfs_nx_superblock *)buf;
+		if (nx->nx_magic != APFS_NX_MAGIC || nx->nx_o.o_xid != xid)
+			continue;
+		if (!block_is_nxsb(buf))
+			continue;
+		return (FS_APFS_E_OK);
+	}
+	return (FS_APFS_E_NOTFOUND);
+}
+
+/*
+ * Is `xid` a checkpoint a view may be opened on?  Three answers, in the
+ * order they are cheap: not published (the open transaction, or a number
+ * from nowhere), let go of (below the floor), or yes.
+ */
+static int
+view_admits(uint64_t xid)
+{
+
+	if (!g_apfs.ac_mounted)
+		return (FS_APFS_E_NOMOUNT);
+	if (xid == 0 || xid > g_apfs.ac_xid)
+		return (FS_APFS_E_NOTFOUND);
+	if (xid < fq_floor) {
+		view_n_gone++;
+		return (FS_APFS_E_GONE);
+	}
+	return (FS_APFS_E_OK);
+}
+
+/*
+ * The walk mount_volume does, done again for one older checkpoint, with one
+ * difference that is the whole of the safety argument: every block on the
+ * way is asked whether it is the checkpoint's own.  A block the queue had let
+ * go of and the allocator had handed out again would checksum perfectly --
+ * that is what a reused block IS -- and only its header would say it belongs
+ * to a newer transaction, or to another object.  The floor is meant to make
+ * that impossible; this is what catches the floor being wrong.
+ */
+static int
+view_read_own(uint64_t bno, uint64_t oid, uint64_t xid, void *buf)
+{
+	const struct apfs_obj_phys	*o;
+	int				 rv;
+
+	rv = fs_apfs_read_block(bno, buf);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	o = (const struct apfs_obj_phys *)buf;
+	if (o->o_xid > xid || (oid != 0 && o->o_oid != oid)) {
+		kprintf("apfs: block %llu is oid %llu at xid %llu, but the "
+		    "checkpoint at xid %llu names it as oid %llu -- reused "
+		    "out from under the view\n", (unsigned long long)bno,
+		    (unsigned long long)o->o_oid, (unsigned long long)o->o_xid,
+		    (unsigned long long)xid, (unsigned long long)oid);
+		return (FS_APFS_E_INVAL);
+	}
+	return (FS_APFS_E_OK);
+}
+
+int
+fs_apfs_view_open(uint64_t xid, struct fs_apfs_view *out)
+{
+	const struct apfs_nx_superblock	*nx;
+	const struct apfs_superblock	*sb;
+	const struct apfs_omap_phys	*om;
+	uint8_t				*buf;
+	uint64_t			 ctr_omap_bno;
+	uint64_t			 ctr_tree;
+	uint64_t			 fs_oid;
+	uint64_t			 vsb_bno;
+	uint64_t			 vol_omap_bno;
+	uint64_t			 vol_tree;
+	uint64_t			 root_oid;
+	uint64_t			 root_bno;
+	int				 rv;
+	bool				 hashed;
+
+	if (out == NULL)
+		return (FS_APFS_E_IO);
+	rv = view_admits(xid);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	buf = kmalloc(APFS_BLOCK_SIZE);
+	if (buf == NULL)
+		return (FS_APFS_E_NOMEM);
+
+	/* the checkpoint's superblock, which names its container object map */
+	rv = ring_find(xid, buf);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	nx = (const struct apfs_nx_superblock *)buf;
+	ctr_omap_bno = nx->nx_omap_oid;
+	fs_oid       = nx->nx_fs_oid[0];
+
+	/* that map, to the volume superblock as of then */
+	rv = view_read_own(ctr_omap_bno, ctr_omap_bno, xid, buf);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	om = (const struct apfs_omap_phys *)buf;
+	ctr_tree = om->om_tree_oid;
+	rv = fs_apfs_omap_lookup(ctr_tree, fs_oid, xid, &vsb_bno);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	rv = view_read_own(vsb_bno, fs_oid, xid, buf);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	sb = (const struct apfs_superblock *)buf;
+	if (sb->apfs_magic != APFS_APSB_MAGIC) {
+		rv = FS_APFS_E_INVAL;
+		goto out;
+	}
+	/*
+	 * The key shape is a property of the volume and not of a checkpoint,
+	 * and the comparator was told it once, at mount.  A checkpoint that
+	 * disagreed would be a different volume under the same name.
+	 */
+	hashed = (sb->apfs_incompat & (APFS_INCOMPAT_CASE_INSENSITIVE |
+	    APFS_INCOMPAT_NORM_INSENSITIVE)) != 0;
+	if (hashed != g_apfs.ac_drec_hashed) {
+		rv = FS_APFS_E_INVAL;
+		goto out;
+	}
+	vol_omap_bno = sb->apfs_omap_oid;
+	root_oid     = sb->apfs_root_tree_oid;
+
+	/* the volume's map as of then, to the root as of then */
+	rv = view_read_own(vol_omap_bno, vol_omap_bno, xid, buf);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	om = (const struct apfs_omap_phys *)buf;
+	vol_tree = om->om_tree_oid;
+	rv = fs_apfs_omap_lookup(vol_tree, root_oid, xid, &root_bno);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+	rv = view_read_own(root_bno, root_oid, xid, buf);
+	if (rv != FS_APFS_E_OK)
+		goto out;
+
+	out->av_xid       = xid;
+	out->av_omap_tree = vol_tree;
+	out->av_root_bno  = root_bno;
+	view_n_open++;
+out:
+	kfree(buf);
+	return (rv);
+}
+
+int
+fs_apfs_view_enter(const struct fs_apfs_view *v)
+{
+	int	rv;
+
+	if (v == NULL)
+		return (FS_APFS_E_IO);
+	if (g_view != NULL) {
+		kprintf("apfs: a view of xid %llu is already entered -- xid "
+		    "%llu refused; views do not nest\n",
+		    (unsigned long long)g_view->av_xid,
+		    (unsigned long long)v->av_xid);
+		return (FS_APFS_E_INVAL);
+	}
+	rv = view_admits(v->av_xid);
+	if (rv != FS_APFS_E_OK)
+		return (rv);
+	g_view = v;
+	view_n_enter++;
+	return (FS_APFS_E_OK);
+}
+
+void
+fs_apfs_view_leave(void)
+{
+
+	if (g_view == NULL)
+		kprintf("apfs: leaving a view when none is entered\n");
+	g_view = NULL;
+}
+
+uint64_t
+fs_apfs_view_xid(void)
+{
+
+	return (g_view != NULL ? g_view->av_xid : 0);
+}
+
+uint64_t
+fs_apfs_xid(void)
+{
+
+	return (g_apfs.ac_mounted ? g_apfs.ac_xid : 0);
+}
+
+/* What the floor stands at; the self-test says it out loud. */
+uint64_t
+view_floor(void)
+{
+
+	return (fq_floor);
+}
+
+int
+fs_apfs_view_list(uint64_t *xids, uint32_t cap, uint32_t *n_out)
+{
+	const struct apfs_nx_superblock	*nx;
+	uint8_t				*buf;
+	uint64_t			 xid;
+	uint32_t			 n;
+	uint32_t			 i;
+	uint32_t			 j;
+	uint32_t			 k;
+	int				 rv;
+
+	if (xids == NULL || n_out == NULL)
+		return (FS_APFS_E_IO);
+	if (!g_apfs.ac_mounted)
+		return (FS_APFS_E_NOMOUNT);
+	buf = kmalloc(APFS_BLOCK_SIZE);
+	if (buf == NULL)
+		return (FS_APFS_E_NOMEM);
+
+	/*
+	 * One pass over the ring, keeping what the window admits, in order.
+	 * The window is APFS_FQ_KEEP + 1 wide at most, so the sort is an
+	 * insertion into a handful of entries and not worth a better one.
+	 * A slot is checksummed only once it is known to be wanted, for the
+	 * reason ring_find gives.
+	 */
+	n  = 0;
+	rv = FS_APFS_E_OK;
+	for (i = 0; i < g_apfs.ac_xp_desc_blocks; i++) {
+		if (read_block_raw(g_apfs.ac_xp_desc_base + i, buf) !=
+		    FS_APFS_E_OK) {
+			rv = FS_APFS_E_IO;
+			break;
+		}
+		nx = (const struct apfs_nx_superblock *)buf;
+		if (nx->nx_magic != APFS_NX_MAGIC)
+			continue;
+		xid = nx->nx_o.o_xid;
+		if (xid < fq_floor || xid > g_apfs.ac_xid)
+			continue;
+		if (!block_is_nxsb(buf))
+			continue;
+		for (j = 0; j < n && xids[j] < xid; j++)
+			continue;
+		if (j < n && xids[j] == xid)
+			continue;		/* a ring names each once */
+		if (n >= cap)
+			continue;
+		for (k = n; k > j; k--)
+			xids[k] = xids[k - 1];
+		xids[j] = xid;
+		n++;
+	}
+	*n_out = n;
+	kfree(buf);
+	return (rv);
+}
+
 /* ---- file-system tree ----------------------------------------------------- */
 
 /*
@@ -2406,7 +2778,7 @@ btree_scan(uint64_t bno, const uint8_t *key, uint32_t klen, apfs_rec_fn fn,
 			continue;
 		}
 		child_oid = *(const uint64_t *)(bl.bl_vals - voff);
-		if (fs_apfs_omap_lookup(g_apfs.ac_vol_omap_tree, child_oid,
+		if (fs_apfs_omap_lookup(view_omap(), child_oid,
 		    view_xid(), &child_bno) != FS_APFS_E_OK) {
 			ok = false;
 			break;
@@ -2456,7 +2828,7 @@ leaf_home(const uint8_t *key, uint32_t klen, uint64_t *bno_out)
 	if (node == NULL)
 		return (FS_APFS_E_NOMEM);
 	g_n_seeks++;
-	bno = g_apfs.ac_root_tree_bno;
+	bno = view_root();
 	rv = FS_APFS_E_OK;
 	for (depth = 0; depth < APFS_TREE_MAX_DEPTH; depth++) {
 		rv = fs_apfs_read_block(bno, node);
@@ -2476,7 +2848,7 @@ leaf_home(const uint8_t *key, uint32_t klen, uint64_t *bno_out)
 		btree_entry_loc(&bl, node_child_for(&bl, key, klen), &koff,
 		    &klen2, &voff, &vlen);
 		oid = *(const uint64_t *)(bl.bl_vals - voff);
-		rv = fs_apfs_omap_lookup(g_apfs.ac_vol_omap_tree, oid,
+		rv = fs_apfs_omap_lookup(view_omap(), oid,
 		    view_xid(), &bno);
 		if (rv != FS_APFS_E_OK)
 			break;
@@ -2639,10 +3011,10 @@ fs_apfs_lookup(const char *path, uint64_t *oid_out, int *is_dir_out)
 		ds.ds_keyed = drec_key(oid, comp, (uint32_t)(p - comp), dkey,
 		    &dklen, false) == FS_APFS_E_OK;
 		if (ds.ds_keyed)
-			ok = btree_scan(g_apfs.ac_root_tree_bno, dkey, dklen,
+			ok = btree_scan(view_root(), dkey, dklen,
 			    dirent_match, &ds, 0, &stopped);
 		else
-			ok = btree_walk(g_apfs.ac_root_tree_bno, dirent_match,
+			ok = btree_walk(view_root(), dirent_match,
 			    &ds, 0, &stopped);
 		if (!ok)
 			return (FS_APFS_E_IO);
@@ -2805,7 +3177,7 @@ inode_info(uint64_t oid, struct inode_info *ii)
 	key = (oid & APFS_J_OBJ_ID_MASK) |
 	    ((uint64_t)APFS_TYPE_INODE << APFS_J_OBJ_TYPE_SHIFT);
 	stopped = false;
-	if (!btree_scan(g_apfs.ac_root_tree_bno, (const uint8_t *)&key,
+	if (!btree_scan(view_root(), (const uint8_t *)&key,
 	    (uint32_t)sizeof(key), inode_pick, ii, 0, &stopped))
 		return (FS_APFS_E_IO);
 	return (ii->ii_found ? FS_APFS_E_OK : FS_APFS_E_NOTFOUND);
@@ -3027,7 +3399,7 @@ fs_apfs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size)
 	er.er_rv     = FS_APFS_E_OK;
 	extent_key(er.er_id, 0, ekey);
 	stopped = false;
-	if (!btree_scan(g_apfs.ac_root_tree_bno, (const uint8_t *)ekey,
+	if (!btree_scan(view_root(), (const uint8_t *)ekey,
 	    (uint32_t)sizeof(ekey), extent_copy, &er, 0, &stopped))
 		er.er_rv = FS_APFS_E_IO;
 	kfree(bounce);
@@ -3130,7 +3502,7 @@ fs_apfs_pread(uint64_t id, uint64_t size, uint64_t off, uint8_t *buf,
 	er.er_rv     = FS_APFS_E_OK;
 	extent_key(id, 0, ekey);
 	stopped = false;
-	if (!btree_scan(g_apfs.ac_root_tree_bno, (const uint8_t *)ekey,
+	if (!btree_scan(view_root(), (const uint8_t *)ekey,
 	    (uint32_t)sizeof(ekey), extent_copy, &er, 0, &stopped))
 		er.er_rv = FS_APFS_E_IO;
 	kfree(bounce);
@@ -3246,7 +3618,7 @@ extent_at(uint64_t id, uint64_t off, uint64_t *phys_out)
 	el.el_found = false;
 	extent_key(id, 0, ekey);
 	stopped = false;
-	if (!btree_scan(g_apfs.ac_root_tree_bno, (const uint8_t *)ekey,
+	if (!btree_scan(view_root(), (const uint8_t *)ekey,
 	    (uint32_t)sizeof(ekey), extent_locate, &el, 0, &stopped))
 		return (FS_APFS_E_IO);
 	if (!el.el_found)
@@ -3471,7 +3843,7 @@ fs_apfs_pwrite(uint64_t id, uint64_t size, uint64_t off, const uint8_t *buf,
 		el.el_found = false;
 		extent_key(id, 0, ekey);
 		stopped = false;
-		if (!btree_scan(g_apfs.ac_root_tree_bno, (const uint8_t *)ekey,
+		if (!btree_scan(view_root(), (const uint8_t *)ekey,
 		    (uint32_t)sizeof(ekey), extent_locate, &el, 0, &stopped)) {
 			rv = FS_APFS_E_IO;
 			goto out;
@@ -3561,7 +3933,7 @@ inode_where(uint64_t oid, uint64_t *bno_out)
 	il.il_bno   = 0;
 	il.il_found = false;
 	stopped = false;
-	if (!btree_scan(g_apfs.ac_root_tree_bno, (const uint8_t *)&key,
+	if (!btree_scan(view_root(), (const uint8_t *)&key,
 	    (uint32_t)sizeof(key), inode_locate, &il, 0, &stopped))
 		return (FS_APFS_E_IO);
 	if (!il.il_found)
@@ -5021,7 +5393,7 @@ path_walk(uint64_t bno, uint64_t want, struct tree_path *tp, uint32_t depth)
 		for (i = 0; !found && i < bl.bl_nkeys; i++) {
 			btree_entry_loc(&bl, i, &koff, &klen, &voff, &vlen);
 			oid = *(const uint64_t *)(bl.bl_vals - voff);
-			if (fs_apfs_omap_lookup(g_apfs.ac_vol_omap_tree, oid,
+			if (fs_apfs_omap_lookup(view_omap(), oid,
 			    view_xid(), &child) != FS_APFS_E_OK)
 				break;
 			found = path_walk(child, want, tp, depth + 1);
@@ -5036,7 +5408,7 @@ path_to(uint64_t want, struct tree_path *tp)
 {
 
 	tp->tp_n = 0;
-	return (path_walk(g_apfs.ac_root_tree_bno, want, tp, 0));
+	return (path_walk(view_root(), want, tp, 0));
 }
 
 /*
@@ -6145,7 +6517,7 @@ grow_once(uint64_t ino, uint64_t id, uint64_t new_size, uint64_t *full_leaf)
 			last.el_found = false;
 			extent_key(id, 0, key);
 			stopped = false;
-			if (!btree_scan(g_apfs.ac_root_tree_bno,
+			if (!btree_scan(view_root(),
 			    (const uint8_t *)key, (uint32_t)sizeof(key),
 			    extent_locate, &last, 0, &stopped)) {
 				rv = FS_APFS_E_IO;
@@ -6609,7 +6981,7 @@ fs_apfs_truncate(uint64_t ino, uint64_t id, uint64_t new_size)
 	ec.ec_over = false;
 	extent_key(id, 0, ekey);
 	stopped    = false;
-	if (!btree_scan(g_apfs.ac_root_tree_bno, (const uint8_t *)ekey,
+	if (!btree_scan(view_root(), (const uint8_t *)ekey,
 	    (uint32_t)sizeof(ekey), extent_cut_pick, &ec, 0, &stopped))
 		return (FS_APFS_E_IO);
 	if (ec.ec_over) {
@@ -7262,7 +7634,7 @@ make_once(uint64_t dir, const char *name, uint64_t now, bool isdir,
 	ds.ds_is_dir  = false;
 	ds.ds_keyed   = true;
 	stopped = false;
-	if (!btree_scan(g_apfs.ac_root_tree_bno, dkey, dklen, dirent_match, &ds,
+	if (!btree_scan(view_root(), dkey, dklen, dirent_match, &ds,
 	    0, &stopped))
 		return (FS_APFS_E_IO);
 	if (ds.ds_found != 0)
@@ -7576,7 +7948,7 @@ dir_empty(uint64_t dir, bool *empty_out)
 	dp.dp_any = false;
 	drec_low_key(dir, dkey, &dklen);
 	stopped = false;
-	if (!btree_scan(g_apfs.ac_root_tree_bno, dkey, dklen, dirent_any, &dp,
+	if (!btree_scan(view_root(), dkey, dklen, dirent_any, &dp,
 	    0, &stopped))
 		return (FS_APFS_E_IO);
 	*empty_out = !dp.dp_any;
@@ -7637,7 +8009,7 @@ unmake_at(uint64_t dir, const char *name, uint64_t now, bool isdir)
 	ds.ds_is_dir  = false;
 	ds.ds_keyed   = true;
 	stopped = false;
-	if (!btree_scan(g_apfs.ac_root_tree_bno, dkey, dklen, dirent_match, &ds,
+	if (!btree_scan(view_root(), dkey, dklen, dirent_match, &ds,
 	    0, &stopped))
 		return (FS_APFS_E_IO);
 	if (ds.ds_found == 0)
@@ -8196,7 +8568,7 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 	ds.ds_is_dir  = false;
 	ds.ds_keyed   = true;
 	stopped = false;
-	if (!btree_scan(g_apfs.ac_root_tree_bno, okey, oklen, dirent_match, &ds,
+	if (!btree_scan(view_root(), okey, oklen, dirent_match, &ds,
 	    0, &stopped))
 		return (FS_APFS_E_IO);
 	if (ds.ds_found == 0)
@@ -8218,7 +8590,7 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 	ds.ds_is_dir  = false;
 	ds.ds_keyed   = true;
 	stopped = false;
-	if (!btree_scan(g_apfs.ac_root_tree_bno, nkey, nklen, dirent_match, &ds,
+	if (!btree_scan(view_root(), nkey, nklen, dirent_match, &ds,
 	    0, &stopped))
 		return (FS_APFS_E_IO);
 	victim       = ds.ds_found;
@@ -8783,7 +9155,7 @@ dirent_find(uint64_t dir, const char *name, uint64_t *child, bool *isdir)
 	ds.ds_is_dir  = false;
 	ds.ds_keyed   = true;
 	stopped = false;
-	if (!btree_scan(g_apfs.ac_root_tree_bno, dkey, dklen, dirent_match, &ds,
+	if (!btree_scan(view_root(), dkey, dklen, dirent_match, &ds,
 	    0, &stopped))
 		return (FS_APFS_E_IO);
 	if (ds.ds_found == 0)
@@ -8914,7 +9286,7 @@ fs_apfs_reap_all(uint64_t now, uint32_t *n_out)
 		op.op_any   = false;
 		drec_low_key(APFS_PRIV_DIR_INO, dkey, &dklen);
 		stopped = false;
-		if (!btree_scan(g_apfs.ac_root_tree_bno, dkey, dklen,
+		if (!btree_scan(view_root(), dkey, dklen,
 		    orphan_first, &op, 0, &stopped))
 			return (FS_APFS_E_IO);
 		if (!op.op_any)
@@ -9117,7 +9489,7 @@ fs_apfs_readdir(const char *path, uint32_t index, struct fs_apfs_dirent *out)
 	rs.rs_hit  = false;
 	drec_low_key(oid, dkey, &dklen);
 	stopped = false;
-	if (!btree_scan(g_apfs.ac_root_tree_bno, dkey, dklen, readdir_pick, &rs,
+	if (!btree_scan(view_root(), dkey, dklen, readdir_pick, &rs,
 	    0, &stopped))
 		return (FS_APFS_E_IO);
 	if (!rs.rs_hit)
@@ -9287,6 +9659,13 @@ fs_apfs_init(void)
 	    (unsigned long long)g_apfs.ac_xid,
 	    (unsigned long long)g_apfs.ac_omap_oid,
 	    (unsigned long long)g_apfs.ac_fs_oid);
+	/*
+	 * The floor of the view window, on the terms the essay at fq_floor
+	 * sets out: the checkpoint before this one is what any writer able
+	 * to fall back had to keep whole, and it is all a fresh mount vouches
+	 * for.
+	 */
+	fq_floor = g_apfs.ac_xid > 1 ? g_apfs.ac_xid - 1 : 1;
 
 	/*
 	 * The ephemeral layer.  Not required to mount -- nothing a file read
@@ -9617,6 +9996,8 @@ alloc_blocks(uint32_t count, uint64_t near, uint64_t *first_out)
 
 	if (!g_apfs.ac_alloc_have || count == 0)
 		return (FS_APFS_E_INVAL);
+	if (view_forbids("an allocation"))
+		return (FS_APFS_E_INVAL);
 
 	ch = (near != 0) ? chunk_for(near) : NULL;
 	if (ch != NULL) {
@@ -9670,6 +10051,8 @@ free_blocks(uint64_t first, uint32_t count)
 	struct alloc_chunk	*ch;
 
 	if (!g_apfs.ac_alloc_have)
+		return (FS_APFS_E_INVAL);
+	if (view_forbids("a release"))
 		return (FS_APFS_E_INVAL);
 	ch = chunk_for(first);
 	if (ch == NULL)
@@ -10881,6 +11264,23 @@ fs_apfs_stats(void)
 		    (unsigned long long)ckpt_n_refused,
 		    (unsigned long long)g_apfs.ac_xid,
 		    (unsigned long long)g_apfs.ac_sb_bno);
+
+	/*
+	 * The published past: how far back it reaches right now, and how
+	 * often it was asked for.  The refusals are printed with the rest
+	 * because a window that is never found closed is a window nobody
+	 * has tested the edge of.
+	 */
+	if (view_n_open != 0 || view_n_gone != 0 || view_n_forbid != 0)
+		kprintf("apfs: views -- checkpoints %llu..%llu readable, %llu "
+		    "opened, %llu entered, %llu refused as let go, %llu "
+		    "write(s) refused under one\n",
+		    (unsigned long long)fq_floor,
+		    (unsigned long long)g_apfs.ac_xid,
+		    (unsigned long long)view_n_open,
+		    (unsigned long long)view_n_enter,
+		    (unsigned long long)view_n_gone,
+		    (unsigned long long)view_n_forbid);
 
 	/*
 	 * The pool and the spine, and what copy-on-write has cost them.

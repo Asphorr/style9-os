@@ -164,6 +164,8 @@ handle_refresh(struct fs_handle *h)
 {
 	uint64_t	size;
 
+	if (h->fh_xid != 0)
+		return;			/* a checkpoint does not change */
 	if (h->fh_gen == fs_gen)
 		return;
 	fs_n_stale++;
@@ -236,6 +238,7 @@ apfs_err(int rv)
 	case FS_APFS_E_NOTEMPTY:	return (FS_E_NOTEMPTY);
 	case FS_APFS_E_SPREAD:		return (FS_E_SPREAD);
 	case FS_APFS_E_INVAL:		return (FS_E_INVAL);
+	case FS_APFS_E_GONE:		return (FS_E_GONE);
 	default:			return (FS_E_IO);
 	}
 }
@@ -270,6 +273,101 @@ fs_kind(void)
 	if (fs_fat_ready())
 		return ("fat");
 	return ("none");
+}
+
+/*
+ * THE PUBLISHED PAST, BY NAME.  See fs.h for what /.xid is; this is how a
+ * path is told apart from a live one and how a checkpoint is entered and
+ * left around a single backend call.
+ *
+ * Four answers to "what is this path": live (not under /.xid at all), the
+ * directory of checkpoints itself, a checkpoint (with the path under it that
+ * the backend is asked, "/" when nothing follows the number), or a name under
+ * /.xid that is not a number -- which is not a checkpoint and not a live
+ * name either, so it is simply absent.
+ */
+#define	FS_PATH_LIVE	0
+#define	FS_PATH_VIEWS	1
+#define	FS_PATH_VIEW	2
+#define	FS_PATH_NOVIEW	3
+
+static int
+view_parse(const char *path, uint64_t *xid_out, const char **rest_out)
+{
+	const char	*p;
+	uint64_t	 x;
+
+	p = path;
+	while (*p == '/')
+		p++;
+	if (p[0] != '.' || p[1] != 'x' || p[2] != 'i' || p[3] != 'd')
+		return (FS_PATH_LIVE);
+	p += 4;
+	if (*p != '\0' && *p != '/')
+		return (FS_PATH_LIVE);		/* ".xidfoo" is a live name */
+	while (*p == '/')
+		p++;
+	if (*p == '\0')
+		return (FS_PATH_VIEWS);
+	if (*p < '0' || *p > '9')
+		return (FS_PATH_NOVIEW);
+	x = 0;
+	while (*p >= '0' && *p <= '9') {
+		if (x > (~(uint64_t)0 - 9) / 10)
+			return (FS_PATH_NOVIEW);	/* no ring holds that */
+		x = x * 10 + (uint64_t)(*p - '0');
+		p++;
+	}
+	if (*p != '\0' && *p != '/')
+		return (FS_PATH_NOVIEW);
+	*xid_out  = x;
+	*rest_out = (*p == '\0') ? "/" : p;
+	return (FS_PATH_VIEW);
+}
+
+int
+fs_readonly(const char *path)
+{
+	const char	*rest;
+	uint64_t	 xid;
+
+	return (view_parse(path, &xid, &rest) != FS_PATH_LIVE);
+}
+
+/*
+ * Point the backend's readers at checkpoint `xid`.  Called with fs_lock held;
+ * the caller leaves with fs_apfs_view_leave before letting go of the lock.
+ * Only APFS has a past: FAT publishes nothing and so has nothing to view.
+ */
+static int
+view_enter(uint64_t xid, struct fs_apfs_view *v)
+{
+	int	rv;
+
+	if (!fs_apfs_ready())
+		return (fs_fat_ready() ? FS_E_NOTFOUND : FS_E_NOMOUNT);
+	rv = apfs_err(fs_apfs_view_open(xid, v));
+	if (rv != FS_E_OK)
+		return (rv);
+	return (apfs_err(fs_apfs_view_enter(v)));
+}
+
+/* The decimal name a checkpoint is listed under. */
+static void
+view_name(char *dst, size_t cap, uint64_t xid)
+{
+	char	tmp[24];
+	size_t	n;
+	size_t	i;
+
+	n = 0;
+	do {
+		tmp[n++] = (char)('0' + xid % 10);
+		xid /= 10;
+	} while (xid != 0 && n < sizeof(tmp));
+	for (i = 0; i < n && i + 1 < cap; i++)
+		dst[i] = tmp[n - 1 - i];
+	dst[i] = '\0';
 }
 
 /*
@@ -333,7 +431,23 @@ ckpt_policy(void)
 static int
 slurp_locked(const char *path, uint8_t **out_buf, uint32_t *out_size)
 {
+	struct fs_apfs_view	 v;
+	const char		*rest;
+	uint64_t		 xid;
+	int			 kind;
+	int			 rv;
 
+	kind = view_parse(path, &xid, &rest);
+	if (kind != FS_PATH_LIVE) {
+		if (kind != FS_PATH_VIEW)
+			return (FS_E_NOTFOUND);	/* a directory, or nothing */
+		rv = view_enter(xid, &v);
+		if (rv != FS_E_OK)
+			return (rv);
+		rv = apfs_err(fs_apfs_slurp(rest, out_buf, out_size));
+		fs_apfs_view_leave();
+		return (rv);
+	}
 	if (fs_apfs_ready())
 		return (apfs_err(fs_apfs_slurp(path, out_buf, out_size)));
 	if (fs_fat_ready())
@@ -355,10 +469,14 @@ fs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size)
 static int
 open_locked(const char *path, struct fs_handle *out)
 {
-	uint64_t	id;
-	uint64_t	size;
-	uint64_t	ino;
-	int		rv;
+	struct fs_apfs_view	 v;
+	const char		*rest;
+	uint64_t		 id;
+	uint64_t		 size;
+	uint64_t		 ino;
+	uint64_t		 xid;
+	int			 kind;
+	int			 rv;
 
 	if (out == NULL)
 		return (FS_E_NOTFOUND);
@@ -367,6 +485,32 @@ open_locked(const char *path, struct fs_handle *out)
 	out->fh_size = 0;
 	out->fh_ino  = 0;
 	out->fh_gen  = fs_gen;
+	out->fh_xid  = 0;
+
+	kind = view_parse(path, &xid, &rest);
+	if (kind != FS_PATH_LIVE) {
+		if (kind != FS_PATH_VIEW)
+			return (FS_E_NOTFOUND);
+		rv = view_enter(xid, &v);
+		if (rv != FS_E_OK)
+			return (rv);
+		rv = apfs_err(fs_apfs_open(rest, &id, &size, &ino));
+		fs_apfs_view_leave();
+		if (rv != FS_E_OK)
+			return (rv);
+		/*
+		 * NOT counted.  The open table exists so that unlink can tell
+		 * a held file from a free name, and nothing under a checkpoint
+		 * can be unlinked; what keeps this handle's bytes readable is
+		 * the free queue's retention, and that is asked at every read.
+		 */
+		out->fh_kind = FS_HANDLE_APFS;
+		out->fh_ino  = ino;
+		out->fh_xid  = xid;
+		out->fh_id   = id;
+		out->fh_size = size;
+		return (FS_E_OK);
+	}
 
 	if (fs_apfs_ready()) {
 		rv = fs_apfs_open(path, &id, &size, &ino);
@@ -411,7 +555,7 @@ fs_hold(const struct fs_handle *h)
 {
 	int	rv;
 
-	if (h == NULL || h->fh_kind != FS_HANDLE_APFS)
+	if (h == NULL || h->fh_kind != FS_HANDLE_APFS || h->fh_xid != 0)
 		return (FS_E_OK);
 	mutex_lock(&fs_lock);
 	rv = open_hold(h->fh_ino);
@@ -439,6 +583,15 @@ fs_close(struct fs_handle *h)
 
 	if (h == NULL || h->fh_kind != FS_HANDLE_APFS)
 		return (FS_E_OK);
+	if (h->fh_xid != 0) {
+		/* Nothing counted it (see open_locked), so nothing is owed. */
+		h->fh_kind = FS_HANDLE_NONE;
+		h->fh_ino  = 0;
+		h->fh_id   = 0;
+		h->fh_size = 0;
+		h->fh_xid  = 0;
+		return (FS_E_OK);
+	}
 	ino = h->fh_ino;
 	rv  = FS_E_OK;
 
@@ -487,12 +640,28 @@ static int
 pread_locked(struct fs_handle *h, uint64_t off, uint8_t *buf,
     uint32_t len, uint32_t *out_got)
 {
+	struct fs_apfs_view	v;
+	int			rv;
 
 	if (h == NULL || out_got == NULL)
 		return (FS_E_NOTFOUND);
 	handle_refresh(h);
 	switch (h->fh_kind) {
 	case FS_HANDLE_APFS:
+		if (h->fh_xid != 0) {
+			/*
+			 * The checkpoint is resolved again for every read,
+			 * which is where a handle finds out it has fallen off
+			 * the window's edge: FS_E_GONE, and no bytes.
+			 */
+			rv = view_enter(h->fh_xid, &v);
+			if (rv != FS_E_OK)
+				return (rv);
+			rv = apfs_err(fs_apfs_pread(h->fh_id, h->fh_size, off,
+			    buf, len, out_got));
+			fs_apfs_view_leave();
+			return (rv);
+		}
 		return (apfs_err(fs_apfs_pread(h->fh_id, h->fh_size, off, buf,
 		    len, out_got)));
 	case FS_HANDLE_FAT:
@@ -526,6 +695,8 @@ pwrite_locked(struct fs_handle *h, uint64_t off, const uint8_t *buf,
 		return (FS_E_NOTFOUND);
 	if (h->fh_kind != FS_HANDLE_APFS)
 		return (FS_E_ROFS);	/* FAT reads here; it does not write */
+	if (h->fh_xid != 0)
+		return (FS_E_ROFS);	/* and so does the past */
 
 	/*
 	 * Before the bounds check, not after: this call refuses a write that
@@ -626,7 +797,7 @@ truncate_locked(struct fs_handle *h, uint64_t new_size)
 
 	if (h == NULL)
 		return (FS_E_NOTFOUND);
-	if (h->fh_kind != FS_HANDLE_APFS)
+	if (h->fh_kind != FS_HANDLE_APFS || h->fh_xid != 0)
 		return (FS_E_ROFS);
 
 	/*
@@ -714,6 +885,8 @@ create_locked(const char *path, uint16_t perm, uint64_t *ino_out)
 
 	if (!fs_apfs_ready())
 		return (fs_fat_ready() ? FS_E_ROFS : FS_E_NOMOUNT);
+	if (fs_readonly(path))
+		return (FS_E_ROFS);
 	rv = path_split(path, dir, sizeof(dir), &leaf);
 	if (rv != FS_E_OK)
 		return (rv);
@@ -764,6 +937,8 @@ unlink_locked(const char *path)
 
 	if (!fs_apfs_ready())
 		return (fs_fat_ready() ? FS_E_ROFS : FS_E_NOMOUNT);
+	if (fs_readonly(path))
+		return (FS_E_ROFS);
 	rv = path_split(path, dir, sizeof(dir), &leaf);
 	if (rv != FS_E_OK)
 		return (rv);
@@ -895,6 +1070,8 @@ dir_locked(const char *path, int make, uint16_t perm, uint64_t *ino_out)
 
 	if (!fs_apfs_ready())
 		return (fs_fat_ready() ? FS_E_ROFS : FS_E_NOMOUNT);
+	if (fs_readonly(path))
+		return (FS_E_ROFS);
 	rv = path_undress(path, norm, sizeof(norm));
 	if (rv != FS_E_OK)
 		return (rv);
@@ -981,6 +1158,8 @@ rename_locked(const char *opath, const char *npath)
 
 	if (!fs_apfs_ready())
 		return (fs_fat_ready() ? FS_E_ROFS : FS_E_NOMOUNT);
+	if (fs_readonly(opath) || fs_readonly(npath))
+		return (FS_E_ROFS);
 	rv = path_split(opath, odir, sizeof(odir), &oleaf);
 	if (rv != FS_E_OK)
 		return (rv);
@@ -1059,6 +1238,10 @@ fs_chmod(const char *path, uint16_t mode)
 		mutex_unlock(&fs_lock);
 		return (fs_fat_ready() ? FS_E_ROFS : FS_E_NOMOUNT);
 	}
+	if (fs_readonly(path)) {
+		mutex_unlock(&fs_lock);
+		return (FS_E_ROFS);
+	}
 	rv = apfs_err(fs_apfs_stat(path, &asb));
 	if (rv != FS_E_OK) {
 		mutex_unlock(&fs_lock);
@@ -1077,15 +1260,49 @@ fs_chmod(const char *path, uint16_t mode)
 static int
 stat_locked(const char *path, struct fs_statbuf *out)
 {
-	struct fs_apfs_statbuf	asb;
-	struct fs_fat_statbuf	fsb;
-	int			rv;
+	struct fs_apfs_statbuf	 asb;
+	struct fs_fat_statbuf	 fsb;
+	struct fs_apfs_view	 v;
+	const char		*rest;
+	uint64_t		 xid;
+	int			 kind;
+	int			 rv;
 
 	zero(out, sizeof(*out));
+	kind = view_parse(path, &xid, &rest);
+	if (kind == FS_PATH_NOVIEW)
+		return (FS_E_NOTFOUND);
+	if (kind == FS_PATH_VIEWS && !fs_apfs_ready())
+		return (fs_fat_ready() ? FS_E_NOTFOUND : FS_E_NOMOUNT);
 	if (fs_apfs_ready()) {
-		rv = fs_apfs_stat(path, &asb);
-		if (rv != FS_APFS_E_OK)
-			return (apfs_err(rv));
+		if (kind == FS_PATH_VIEWS) {
+			/*
+			 * The directory of checkpoints reports itself as the
+			 * live root does -- its times, its owner -- under its
+			 * own inode and with the write bits off, since nothing
+			 * under it can be made.
+			 */
+			rv = fs_apfs_stat("/", &asb);
+			if (rv != FS_APFS_E_OK)
+				return (apfs_err(rv));
+			asb.afs_ino  = FS_VIEW_INO(0);
+			asb.afs_mode = (uint16_t)(FS_S_IFDIR | 0555);
+		} else if (kind == FS_PATH_VIEW) {
+			rv = view_enter(xid, &v);
+			if (rv != FS_E_OK)
+				return (rv);
+			rv = fs_apfs_stat(rest, &asb);
+			fs_apfs_view_leave();
+			if (rv != FS_APFS_E_OK)
+				return (apfs_err(rv));
+			/* The checkpoint's root, under its listing entry's inode. */
+			if (rest[0] == '/' && rest[1] == '\0')
+				asb.afs_ino = FS_VIEW_INO(xid);
+		} else {
+			rv = fs_apfs_stat(path, &asb);
+			if (rv != FS_APFS_E_OK)
+				return (apfs_err(rv));
+		}
 		out->fs_size     = asb.afs_size;
 		out->fs_ino      = asb.afs_ino;
 		out->fs_alloced  = asb.afs_alloced;
@@ -1136,13 +1353,58 @@ fs_stat(const char *path, struct fs_statbuf *out)
 	return (rv);
 }
 
+/*
+ * How many checkpoints the listing of /.xid can name.  The window is
+ * APFS_FQ_KEEP + 1 wide and the constant is the backend's business; this is
+ * bounded stack far above any value it has been priced at, and a window that
+ * outgrew it would be listed short rather than overrun.
+ */
+#define	FS_VIEW_LIST_MAX	16
+
 static int
 readdir_locked(const char *path, uint32_t index, struct fs_dirent *out)
 {
-	struct fs_apfs_dirent	ade;
-	struct fs_fat_dirent	fde;
-	int			rv;
+	uint64_t		 xids[FS_VIEW_LIST_MAX];
+	struct fs_apfs_dirent	 ade;
+	struct fs_fat_dirent	 fde;
+	struct fs_apfs_view	 v;
+	const char		*rest;
+	uint64_t		 xid;
+	uint32_t		 n;
+	int			 kind;
+	int			 rv;
 
+	kind = view_parse(path, &xid, &rest);
+	if (kind == FS_PATH_NOVIEW)
+		return (FS_E_NOTFOUND);
+	if (kind != FS_PATH_LIVE && !fs_apfs_ready())
+		return (fs_fat_ready() ? FS_E_NOTFOUND : FS_E_NOMOUNT);
+	if (kind == FS_PATH_VIEWS) {
+		rv = apfs_err(fs_apfs_view_list(xids, FS_VIEW_LIST_MAX, &n));
+		if (rv != FS_E_OK)
+			return (rv);
+		if (index >= n)
+			return (0);
+		out->fde_ino    = FS_VIEW_INO(xids[index]);
+		out->fde_size   = 0;
+		out->fde_is_dir = 1;
+		view_name(out->fde_name, sizeof(out->fde_name), xids[index]);
+		return (1);
+	}
+	if (kind == FS_PATH_VIEW) {
+		rv = view_enter(xid, &v);
+		if (rv != FS_E_OK)
+			return (rv);
+		rv = fs_apfs_readdir(rest, index, &ade);
+		fs_apfs_view_leave();
+		if (rv != 1)
+			return (rv < 0 ? apfs_err(rv) : 0);
+		out->fde_ino    = ade.ade_ino;
+		out->fde_size   = ade.ade_size;
+		out->fde_is_dir = ade.ade_is_dir;
+		name_copy(out->fde_name, ade.ade_name, sizeof(out->fde_name));
+		return (1);
+	}
 	if (fs_apfs_ready()) {
 		rv = fs_apfs_readdir(path, index, &ade);
 		if (rv != 1)
@@ -3252,5 +3514,339 @@ fs_kill_selftest(void)
 	    "storm surfaced with the volume lock returned, and the volume "
 	    "answered a read and an unlink as though nothing had happened\n",
 	    (unsigned)fk_ops);
+}
+
+/*
+ * THE PUBLISHED PAST, BY NAME -- what only this layer can prove.
+ *
+ * apfs-view (run first, from the backend's own tests) proves the mechanism:
+ * a checkpoint's spine resolves, its blocks read as they were, the window
+ * has the width the free queue prices it at.  What THIS proves is the
+ * promise a program can actually use, which is a promise about paths and
+ * descriptors: that /.xid/<N>/etc/x answers with the bytes fsync published at
+ * N, that /.xid lists what can be reached, that every way of changing
+ * something under it is refused with the same word, and -- the half only a
+ * descriptor can show -- that a handle opened onto the past goes on reading
+ * it until the window moves, and then says GONE rather than something else.
+ *
+ * Checkpoints are counted from what fs_apfs_xid reports after each sync
+ * rather than assumed to advance by one: the room-forced checkpoint of the
+ * policy is allowed to land inside this test, and the claims are written so
+ * that it may.
+ */
+#define	FS_VIEW_FILE	"/etc/viewpath.txt"
+#define	FS_VIEW_SCRATCH	"/etc/viewpath-scratch.txt"
+#define	FS_VIEW_FIRST	"the first thing published under this name\n"
+#define	FS_VIEW_SECOND	"and the second, a little longer, published after\n"
+
+/* "/.xid/<xid><rest>" */
+static void
+fs_view_path(char *dst, size_t cap, uint64_t xid, const char *rest)
+{
+	size_t	i;
+	size_t	n;
+
+	n = 0;
+	for (i = 0; FS_VIEW_DIR[i] != '\0' && n + 1 < cap; i++)
+		dst[n++] = FS_VIEW_DIR[i];
+	if (n + 1 < cap)
+		dst[n++] = '/';
+	view_name(dst + n, cap - n, xid);
+	n += slen(dst + n);
+	for (i = 0; rest[i] != '\0' && n + 1 < cap; i++)
+		dst[n++] = rest[i];
+	dst[n] = '\0';
+}
+
+/* Make the name if it is not there, then put `text` at its start. */
+static int
+fs_view_publish(const char *path, const char *text)
+{
+	struct fs_handle	h;
+	uint64_t		ino;
+	uint32_t		put;
+	int			rv;
+
+	rv = fs_create(path, 0644, &ino);
+	if (rv != FS_E_OK && rv != FS_E_EXIST)
+		return (rv);
+	rv = fs_open(path, &h);
+	if (rv != FS_E_OK)
+		return (rv);
+	rv = fs_pwrite(&h, 0, (const uint8_t *)text, (uint32_t)slen(text),
+	    &put);
+	if (rv == FS_E_OK && put != slen(text))
+		rv = FS_E_IO;
+	(void)fs_close(&h);
+	return (rv);
+}
+
+/* 1 = the file at `path` is exactly `text`; 0 = it is not; <0 = the FS_E_* */
+static int
+fs_view_reads(const char *path, const char *text)
+{
+	uint8_t		*buf;
+	uint32_t	 got;
+	int		 rv;
+	int		 ok;
+
+	rv = fs_slurp(path, &buf, &got);
+	if (rv != FS_E_OK)
+		return (rv);
+	ok = (got == slen(text) && same(buf, (const uint8_t *)text, got));
+	kfree(buf);
+	return (ok);
+}
+
+void
+fs_view_selftest(void)
+{
+	struct fs_handle	 h;
+	struct fs_statbuf	 st;
+	struct fs_dirent	 de;
+	char			 p1[64];
+	char			 p2[64];
+	char			 pd[64];
+	uint8_t			 back[128];
+	uint64_t		 listed[FS_VIEW_LIST_MAX];
+	uint64_t		 x1, x2, x3, x4;
+	uint64_t		 ino;
+	uint32_t		 n;
+	uint32_t		 got;
+	uint32_t		 i;
+	int			 rv;
+	int			 opened;
+
+	if (!fs_apfs_ready())
+		return;
+	opened = 0;
+
+	/* The mechanism first, under the lock like every backend test. */
+	mutex_lock(&fs_lock);
+	fs_apfs_view_selftest((uint64_t)clock_walltime_us() * 1000ULL);
+	mutex_unlock(&fs_lock);
+
+	/* Whatever an interrupted run left, then a checkpoint to stand on. */
+	(void)fs_unlink(FS_VIEW_FILE);
+	(void)fs_unlink(FS_VIEW_SCRATCH);
+	if (fs_sync() != FS_E_OK) {
+		kprintf("fs-view: FAIL the opening sync was refused\n");
+		return;
+	}
+
+	/* Two publications of one name, each a checkpoint. */
+	rv = fs_view_publish(FS_VIEW_FILE, FS_VIEW_FIRST);
+	if (rv == FS_E_OK)
+		rv = fs_sync();
+	if (rv != FS_E_OK) {
+		kprintf("fs-view: FAIL cannot publish the first text (%d)\n",
+		    rv);
+		goto clean;
+	}
+	x1 = fs_apfs_xid();
+	rv = fs_view_publish(FS_VIEW_FILE, FS_VIEW_SECOND);
+	if (rv == FS_E_OK)
+		rv = fs_sync();
+	if (rv != FS_E_OK) {
+		kprintf("fs-view: FAIL cannot publish the second text (%d)\n",
+		    rv);
+		goto clean;
+	}
+	x2 = fs_apfs_xid();
+	if (x2 <= x1) {
+		kprintf("fs-view: FAIL the second sync left the xid at %llu\n",
+		    (unsigned long long)x2);
+		goto clean;
+	}
+
+	/* By name: each checkpoint answers with what it published. */
+	fs_view_path(p1, sizeof(p1), x1, FS_VIEW_FILE);
+	fs_view_path(p2, sizeof(p2), x2, FS_VIEW_FILE);
+	if (fs_view_reads(p1, FS_VIEW_FIRST) != 1) {
+		kprintf("fs-view: FAIL %s does not read as the first text\n",
+		    p1);
+		goto clean;
+	}
+	if (fs_view_reads(p2, FS_VIEW_SECOND) != 1) {
+		kprintf("fs-view: FAIL %s does not read as the second text\n",
+		    p2);
+		goto clean;
+	}
+	if (fs_view_reads(FS_VIEW_FILE, FS_VIEW_SECOND) != 1) {
+		kprintf("fs-view: FAIL the live name does not read as the "
+		    "second text\n");
+		goto clean;
+	}
+
+	/* The directory of checkpoints, and a checkpoint as a directory. */
+	if (fs_stat(FS_VIEW_DIR, &st) != FS_E_OK || !st.fs_is_dir ||
+	    st.fs_ino != FS_VIEW_INO(0) || (st.fs_mode & 0222) != 0) {
+		kprintf("fs-view: FAIL %s does not stat as a read-only "
+		    "directory under its own inode\n", FS_VIEW_DIR);
+		goto clean;
+	}
+	fs_view_path(pd, sizeof(pd), x2, "");
+	if (fs_stat(pd, &st) != FS_E_OK || !st.fs_is_dir ||
+	    st.fs_ino != FS_VIEW_INO(x2)) {
+		kprintf("fs-view: FAIL %s does not stat as a directory under "
+		    "the inode its listing entry carries\n", pd);
+		goto clean;
+	}
+	fs_view_path(pd, sizeof(pd), x2 + 1000, "");
+	if (fs_stat(pd, &st) != FS_E_NOTFOUND) {
+		kprintf("fs-view: FAIL %s, a checkpoint never written, "
+		    "stats\n", pd);
+		goto clean;
+	}
+	if (fs_stat("/.xid/latest", &st) != FS_E_NOTFOUND) {
+		kprintf("fs-view: FAIL /.xid/latest, which is not a number, "
+		    "stats\n");
+		goto clean;
+	}
+	n = 0;
+	while (n < FS_VIEW_LIST_MAX && fs_readdir(FS_VIEW_DIR, n, &de) == 1) {
+		listed[n] = de.fde_ino & ~FS_VIEW_INO(0);
+		if (!de.fde_is_dir || de.fde_ino != FS_VIEW_INO(listed[n]) ||
+		    (n > 0 && listed[n] <= listed[n - 1])) {
+			kprintf("fs-view: FAIL entry %u of %s is \"%s\" -- "
+			    "not a directory, or out of order\n", (unsigned)n,
+			    FS_VIEW_DIR, de.fde_name);
+			goto clean;
+		}
+		n++;
+	}
+	if (n == 0 || listed[n - 1] != x2) {
+		kprintf("fs-view: FAIL %s lists %u checkpoint(s) and the "
+		    "newest is not %llu\n", FS_VIEW_DIR, (unsigned)n,
+		    (unsigned long long)x2);
+		goto clean;
+	}
+	for (i = 0; i < n && listed[i] != x1; i++)
+		continue;
+	if (i == n) {
+		kprintf("fs-view: FAIL %s does not list %llu, which was "
+		    "published moments ago\n", FS_VIEW_DIR,
+		    (unsigned long long)x1);
+		goto clean;
+	}
+
+	/* Every way of changing the past, refused with the one word. */
+	fs_view_path(pd, sizeof(pd), x2, "/etc/nope.txt");
+	if (fs_create(pd, 0644, &ino) != FS_E_ROFS ||
+	    fs_mkdir(pd, 0755, &ino) != FS_E_ROFS ||
+	    fs_unlink(p2) != FS_E_ROFS ||
+	    fs_rmdir(pd) != FS_E_ROFS ||
+	    fs_rename(p2, "/etc/viewpath-moved.txt") != FS_E_ROFS ||
+	    fs_rename("/etc/viewpath-moved.txt", p2) != FS_E_ROFS ||
+	    fs_chmod(p2, 0600) != FS_E_ROFS) {
+		kprintf("fs-view: FAIL something under %s could be changed, "
+		    "or was refused with a word other than ROFS\n",
+		    FS_VIEW_DIR);
+		goto clean;
+	}
+
+	/* A handle onto the past: reads it, will not write it. */
+	rv = fs_open(p1, &h);
+	if (rv != FS_E_OK || h.fh_xid != x1 ||
+	    h.fh_size != slen(FS_VIEW_FIRST)) {
+		kprintf("fs-view: FAIL opening %s answered %d (xid %llu, %llu "
+		    "bytes)\n", p1, rv, (unsigned long long)h.fh_xid,
+		    (unsigned long long)h.fh_size);
+		goto clean;
+	}
+	opened = 1;
+	if (fs_pread(&h, 0, back, sizeof(back), &got) != FS_E_OK ||
+	    got != slen(FS_VIEW_FIRST) ||
+	    !same(back, (const uint8_t *)FS_VIEW_FIRST, got)) {
+		kprintf("fs-view: FAIL the handle onto %s does not read the "
+		    "first text\n", p1);
+		goto clean;
+	}
+	if (fs_pwrite(&h, 0, back, 1, &got) != FS_E_ROFS ||
+	    fs_truncate(&h, 0) != FS_E_ROFS) {
+		kprintf("fs-view: FAIL the handle onto %s accepted a write or "
+		    "a truncate\n", p1);
+		goto clean;
+	}
+
+	/*
+	 * The window slides: two more publications, and what the free queue
+	 * lets go of is decided by its retention and not by this test -- so
+	 * the claims below are made about the listing's own width.  The
+	 * handle from before the slide is asked afterwards, which is the
+	 * moment a descriptor learns the difference between a snapshot and a
+	 * view.
+	 */
+	rv = fs_unlink(FS_VIEW_FILE);
+	if (rv == FS_E_OK)
+		rv = fs_sync();
+	if (rv == FS_E_OK)
+		rv = fs_view_publish(FS_VIEW_SCRATCH, "x");
+	if (rv == FS_E_OK)
+		rv = fs_sync();
+	if (rv != FS_E_OK) {
+		kprintf("fs-view: FAIL sliding the window was refused (%d)\n",
+		    rv);
+		goto clean;
+	}
+	x4 = fs_apfs_xid();
+	x3 = 0;
+	n = 0;
+	while (n < FS_VIEW_LIST_MAX && fs_readdir(FS_VIEW_DIR, n, &de) == 1) {
+		listed[n] = de.fde_ino & ~FS_VIEW_INO(0);
+		n++;
+	}
+	if (n == 0 || listed[n - 1] != x4 || listed[0] + (n - 1) != x4) {
+		kprintf("fs-view: FAIL after the slide %s lists %u "
+		    "checkpoint(s) that are not consecutive up to %llu\n",
+		    FS_VIEW_DIR, (unsigned)n, (unsigned long long)x4);
+		goto clean;
+	}
+	x3 = listed[0];			/* the floor, as listed */
+	if (x1 >= x3) {
+		kprintf("fs-view: the window is %u wide and still holds %llu "
+		    "-- its edge is not decidable with three checkpoints; "
+		    "skipped\n", (unsigned)n, (unsigned long long)x1);
+	} else {
+		if (fs_pread(&h, 0, back, sizeof(back), &got) != FS_E_GONE) {
+			kprintf("fs-view: FAIL the handle onto %s still "
+			    "answers after its checkpoint slid out of the "
+			    "window\n", p1);
+			goto clean;
+		}
+		if (fs_view_reads(p1, FS_VIEW_FIRST) != FS_E_GONE) {
+			kprintf("fs-view: FAIL %s answers after its "
+			    "checkpoint slid out of the window\n", p1);
+			goto clean;
+		}
+		if (fs_stat(p1, &st) != FS_E_GONE) {
+			kprintf("fs-view: FAIL %s stats after its checkpoint "
+			    "slid out of the window\n", p1);
+			goto clean;
+		}
+	}
+	if (fs_close(&h) != FS_E_OK) {
+		kprintf("fs-view: FAIL closing the handle onto the past was "
+		    "refused\n");
+		goto clean;
+	}
+	opened = 0;
+
+	kprintf("fs-view: PASS -- %s read the first text at xid %llu and the "
+	    "second at %llu while the live name held the second; the "
+	    "directory stats and lists, seven writes under it were refused "
+	    "with ROFS, and a handle onto %llu read it until the window slid "
+	    "to %llu..%llu and then answered GONE\n", FS_VIEW_DIR,
+	    (unsigned long long)x1, (unsigned long long)x2,
+	    (unsigned long long)x1, (unsigned long long)x3,
+	    (unsigned long long)x4);
+
+clean:
+	if (opened)
+		(void)fs_close(&h);
+	(void)fs_unlink(FS_VIEW_FILE);
+	(void)fs_unlink(FS_VIEW_SCRATCH);
+	if (fs_sync() != FS_E_OK)
+		kprintf("fs-view: the closing sync was refused\n");
 }
 

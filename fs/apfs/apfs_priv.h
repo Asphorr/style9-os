@@ -317,7 +317,16 @@ struct tree_path {
 
 /* ---- reading the container ------------------------------------------------ */
 
+/*
+ * The three answers a reader descends from -- which transaction, which volume
+ * object map, which root -- and they come from here rather than from g_apfs
+ * because a view (apfs.h) can point all three at an older checkpoint at once.
+ * view_floor is the oldest checkpoint a view may still be opened on.
+ */
 uint64_t	view_xid(void);
+uint64_t	view_omap(void);
+uint64_t	view_root(void);
+uint64_t	view_floor(void);
 bool		block_is_nxsb(const void *buf);
 int		read_block_raw(uint64_t bno, void *buf);
 uint32_t	crc32c(uint32_t crc, const uint8_t *p, uint32_t n);

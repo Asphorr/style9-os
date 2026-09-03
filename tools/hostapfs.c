@@ -204,6 +204,7 @@ static const struct hosttest	tests[] = {
 	{ "move",   fs_apfs_move_selftest,   true  },
 	{ "orphan", fs_apfs_orphan_selftest, true  },
 	{ "clobber", fs_apfs_clobber_selftest, true },
+	{ "view",   fs_apfs_view_selftest,   true  },
 	{ "seek",   run_seek,		     false },
 	{ "ckpt",   run_ckpt,		     false },
 };

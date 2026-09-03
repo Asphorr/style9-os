@@ -19,7 +19,11 @@
  * Then a fresh process mounts what is left and answers three questions: does
  * it mount at all, is the volume WHOLLY the old state or WHOLLY the new one,
  * and does apfsck agree.  K sweeps every write the edit makes, so every
- * moment the power could fail is a moment it does.
+ * moment the power could fail is a moment it does.  A mount that answers
+ * NEW is asked one more: through a view of the checkpoint before (apfs.h,
+ * "the published past"), is the old state still there to the byte -- the
+ * free queue's retention, measured at every failure that let a checkpoint
+ * land.
  *
  * WHAT MUST BE TRUE.  There is exactly one write that changes the answer --
  * the container superblock landing in the descriptor ring -- and the sweep
@@ -312,6 +316,8 @@ make_file(uint64_t dir, const char *name, uint32_t blocks, uint8_t fill)
 #define	CLS_NEW		11
 #define	CLS_MIX		12
 #define	CLS_NOMOUNT	13
+#define	CLS_NOPAST	14	/* new, but the checkpoint before it does
+				   not read back as the old state         */
 
 /* 1 = absent, 0 = present, -1 = the question itself failed */
 static int
@@ -650,12 +656,37 @@ run_cut(const struct workload *wl, long k, int s, bool to_stdout)
 	return (-2);			/* something the model forbids */
 }
 
+/*
+ * THE PAST BEHIND THE NEW STATE.  When the measured checkpoint landed, the
+ * checkpoint before it is the old state by definition -- setup's own, or the
+ * image's -- and the free queue promises its blocks are untouched for
+ * APFS_FQ_KEEP more checkpoints.  So a mount that classifies as NEW is asked
+ * a second question through a view of the checkpoint before: is THAT wholly
+ * the old state, to the byte?  It is the retention promise measured at every
+ * power failure that let the new state land, including the tears: a torn
+ * checkpoint that completed still had its predecessor's blocks to keep.
+ */
+static int
+past_is_old(const struct workload *wl)
+{
+	struct fs_apfs_view	v;
+	int			cls;
+
+	if (fs_apfs_view_open(fs_apfs_xid() - 1, &v) != FS_APFS_E_OK ||
+	    fs_apfs_view_enter(&v) != FS_APFS_E_OK)
+		return (CLS_NOPAST);
+	cls = wl->w_classify();
+	fs_apfs_view_leave();
+	return (cls == CLS_OLD ? CLS_NEW : CLS_NOPAST);
+}
+
 /* Mount what is left and say which state it is.  Reads only. */
 static int
 run_verify(const struct workload *wl, bool to_stdout)
 {
 	pid_t	pid;
 	int	status;
+	int	cls;
 
 	pid = fork();
 	if (pid == 0) {
@@ -667,7 +698,10 @@ run_verify(const struct workload *wl, bool to_stdout)
 		fs_apfs_init();
 		if (!fs_apfs_ready())
 			_exit(CLS_NOMOUNT);
-		_exit(wl->w_classify());
+		cls = wl->w_classify();
+		if (cls == CLS_NEW)
+			cls = past_is_old(wl);
+		_exit(cls);
 	}
 	waitpid(pid, &status, 0);
 	return (WIFEXITED(status) ? WEXITSTATUS(status) : CLS_MIX);
@@ -722,7 +756,8 @@ cls_name(int cls)
 {
 
 	return (cls == CLS_OLD ? "old" : cls == CLS_NEW ? "new" :
-	    cls == CLS_NOMOUNT ? "NO MOUNT" : "MIXED");
+	    cls == CLS_NOMOUNT ? "NO MOUNT" :
+	    cls == CLS_NOPAST ? "NEW WITHOUT ITS PAST" : "MIXED");
 }
 
 static const char *

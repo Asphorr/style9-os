@@ -878,6 +878,8 @@ struct fs_apfs_statbuf {
 #define	FS_APFS_E_NOTDIR	(-12)	/* ...and it is NOT a directory  */
 #define	FS_APFS_E_NOTEMPTY	(-13)	/* a directory that still holds a
 					   name, which nothing may remove */
+#define	FS_APFS_E_GONE		(-14)	/* a checkpoint the free queue has
+					   let go of; no longer readable  */
 
 /*
  * Probe the first ATA drive for an APFS container and adopt the newest valid
@@ -1507,5 +1509,96 @@ int	fs_apfs_chmod(uint64_t oid, uint16_t perm, uint64_t now_ns);
  * rather than caching a length and hoping.
  */
 int	fs_apfs_size(uint64_t ino, uint64_t *size_out);
+
+/*
+ * THE PUBLISHED PAST, READ BACK
+ *
+ * A checkpoint is written and then left alone.  Its superblock stays in the
+ * descriptor ring until the ring comes round, and every object it names is a
+ * block that copy-on-write never touched again: the blocks a later transaction
+ * stopped using went to the free queue, and the queue holds them for
+ * APFS_FQ_KEEP checkpoints before the bitmap may hand them out.  So for that
+ * long a checkpoint is not merely a fallback for a crash -- it is a complete
+ * volume, older than the live one, sitting on the platter with nothing
+ * pointing at it.
+ *
+ * A VIEW points at it.  fs_apfs_view_open walks that checkpoint's own spine
+ * -- its superblock, its container object map, its volume superblock, its
+ * volume object map, its file-system root -- and records the two numbers a
+ * reader descends from: the volume object map's tree and the root's block,
+ * both as of that xid.  fs_apfs_view_enter makes every reader in this file
+ * ask THOSE instead of the mount's, until fs_apfs_view_leave; between the two
+ * a lookup, a stat, a readdir, a slurp or a ranged read answers with the
+ * volume as that checkpoint left it, byte for byte, out of blocks the live
+ * volume no longer names.  The retention is what makes the answer honest:
+ * the free queue's promise had been kept since the queue existed and never
+ * once called in, and this is what calls it in.
+ *
+ * WHAT A VIEW IS NOT.  It is not a snapshot.  A snapshot holds its blocks --
+ * the object map keeps a version per snapshot and the free queue waits on
+ * the oldest of them -- and this object map replaces rather than keeps
+ * (omap_replace_cow says why).  A view merely BORROWS the blocks for as long
+ * as the free queue would have held them anyway, so it is a window that
+ * slides: the live volume goes on publishing, and each checkpoint written
+ * lets go of the oldest one behind it.  A view of a checkpoint the queue has
+ * let go of is refused with FS_APFS_E_GONE rather than served, because the
+ * blocks may already belong to something else and file data carries no
+ * header to say so.  The floor of the window is not computed from the
+ * arithmetic but recorded from what the queue actually released, and the
+ * essay at fq_floor in apfs.c says why the two can differ.
+ *
+ * A view is read-only by construction rather than by policy: while one is
+ * entered this file writes no block, allocates none and releases none, and
+ * says so out loud if asked to.  Views do not nest, and are entered and left
+ * within one holding of the volume lock -- the writer never sees one.
+ */
+struct fs_apfs_view {
+	uint64_t	av_xid;		/* the checkpoint it reads          */
+	uint64_t	av_omap_tree;	/* its volume object map B-tree     */
+	uint64_t	av_root_bno;	/* its file-system tree root        */
+};
+
+/*
+ * Resolve the checkpoint `xid` into a view.  FS_APFS_E_NOTFOUND when no such
+ * checkpoint is published -- the open transaction's xid included, since it
+ * has no superblock yet -- or when the ring no longer holds its superblock;
+ * FS_APFS_E_GONE when the free queue has let its blocks go; FS_APFS_E_INVAL
+ * when the spine it walks names a block newer than the checkpoint, which is
+ * a block reused out from under it.  Reads only.
+ */
+int	fs_apfs_view_open(uint64_t xid, struct fs_apfs_view *out);
+
+/*
+ * Make every reader answer as of `v` until fs_apfs_view_leave.  Re-checks
+ * the floor, since a view resolved earlier may have slid out of the window
+ * meanwhile: FS_APFS_E_GONE then, and nothing is entered.  The caller keeps
+ * `v` alive until it leaves, and holds the volume lock across both.
+ */
+int	fs_apfs_view_enter(const struct fs_apfs_view *v);
+void	fs_apfs_view_leave(void);
+
+/* The xid of the entered view, or 0 when readers answer for the live volume. */
+uint64_t fs_apfs_view_xid(void);
+
+/*
+ * Every checkpoint a view could be opened on right now, oldest first: those
+ * the ring still holds a superblock for and the free queue still holds the
+ * blocks of.  At most `cap` are stored; the count stored comes back through
+ * `n_out`.  Reads only.
+ */
+int	fs_apfs_view_list(uint64_t *xids, uint32_t cap, uint32_t *n_out);
+
+/* The newest published checkpoint -- what a fresh mount would adopt. */
+uint64_t fs_apfs_xid(void);
+
+/*
+ * Prove the published past reads back exactly, and exactly as far back as
+ * promised: a file's earlier lengths and bytes through views of the
+ * checkpoints that held them, a name's absence through a view from before it
+ * was made, the live mount left untouched by all of it, and the window found
+ * to be APFS_FQ_KEEP + 1 checkpoints wide with the one beyond it refused.
+ * Restores what it found.
+ */
+void	fs_apfs_view_selftest(uint64_t now);
 
 #endif /* !_SYS_FS_APFS_H_ */

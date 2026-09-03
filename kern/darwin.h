@@ -400,6 +400,7 @@ struct darwin_uname {
 #define	DARWIN_ENAMETOOLONG	63
 #define	DARWIN_ENOTDIR	20
 #define	DARWIN_ENOTEMPTY	66
+#define	DARWIN_ESTALE	70	/* a handle onto a checkpoint since let go */
 #define	DARWIN_ENOSYS	78
 
 /*
