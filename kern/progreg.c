@@ -249,6 +249,21 @@ extern uint8_t	_binary_grmdir_macho_start[];
 extern uint8_t	_binary_grmdir_macho_end[];
 
 /*
+ * The THIRTEENTH: gmake (GNU make 4.4.1).  Every binary before it did one
+ * thing to one file; this one's entire purpose is to run OTHER programs,
+ * in the right order, only when needed.  It is the first here to ask the
+ * kernel whether a descriptor is READY rather than reading it and finding
+ * out, and the first to hand its children an environment it built.  The
+ * project it builds at boot is written by makedemo.sh, a dash script
+ * carried the way demo.sh is.
+ */
+extern uint8_t	_binary_gmake_macho_start[];
+extern uint8_t	_binary_gmake_macho_end[];
+
+extern uint8_t	_binary_makedemo_sh_macho_start[];
+extern uint8_t	_binary_makedemo_sh_macho_end[];
+
+/*
  * A fourth REAL Apple binary: gfactor (GNU coreutils' factor, a Homebrew
  * bottle).  Unlike the libSystem-only binaries above, it also links libgmp --
  * the first program to drive a SECOND dependency, so our dyld maps the whole
@@ -415,6 +430,10 @@ progreg_init(void)
 	    _binary_gmkdir_macho_start, _binary_gmkdir_macho_end);
 	register_one("grmdir",
 	    _binary_grmdir_macho_start, _binary_grmdir_macho_end);
+	register_one("gmake",
+	    _binary_gmake_macho_start, _binary_gmake_macho_end);
+	register_one("makedemo.sh",
+	    _binary_makedemo_sh_macho_start, _binary_makedemo_sh_macho_end);
 	register_one("gfactor",
 	    _binary_gfactor_macho_start, _binary_gfactor_macho_end);
 	register_one("pipefork",

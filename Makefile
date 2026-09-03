@@ -211,6 +211,7 @@ OBJS	= \
 	$(OBJDIR)/gstty_macho.o \
 	$(OBJDIR)/gmkdir_macho.o \
 	$(OBJDIR)/grmdir_macho.o \
+	$(OBJDIR)/gmake_macho.o \
 	$(OBJDIR)/tree_macho.o \
 	$(OBJDIR)/guname_macho.o \
 	$(OBJDIR)/gcat_macho.o \
@@ -221,6 +222,7 @@ OBJS	= \
 	$(OBJDIR)/pipefork_macho.o \
 	$(OBJDIR)/dash_macho.o \
 	$(OBJDIR)/demo_sh_macho.o \
+	$(OBJDIR)/makedemo_sh_macho.o \
 	$(OBJDIR)/libSystem_dylib.o \
 	$(OBJDIR)/libgmp_dylib.o \
 	$(OBJDIR)/libedit_dylib.o \
@@ -607,6 +609,22 @@ $(OBJDIR)/dash.macho: extern/dash.macho | $(OBJDIR)
 # refuses it by magic).  The .macho name is only to ride the generic embed
 # rule; nothing ever parses it as Mach-O.
 $(OBJDIR)/demo_sh.macho: $(USER_DIR)/demo.sh | $(OBJDIR)
+	cp $< $@
+
+# gmake: GNU make 4.4.1, a Homebrew bottle vendored in extern/gmake.macho --
+# the THIRTEENTH real Apple binary, and the first whose whole job is running
+# other programs.  Depends only on libSystem.  It is what made the kernel
+# answer a readiness question (select/pselect/poll), carry an environment
+# across an exec, and let /bin/sh mean dash to a Darwin task; libSystem grew
+# posix_spawn and the ordinary thirty symbols around it.  Embedded like figlet.
+$(OBJDIR)/gmake.macho: extern/gmake.macho | $(OBJDIR)
+	cp $< $@
+
+# makedemo.sh: the build make runs at boot -- a dash script that writes a
+# small project onto the APFS volume, then drives gmake through it: a build,
+# a no-op rebuild, a parallel build over a jobserver pipe, a recipe that
+# fails.  Carried like demo.sh.
+$(OBJDIR)/makedemo_sh.macho: $(USER_DIR)/makedemo.sh | $(OBJDIR)
 	cp $< $@
 
 # clean-room libedit.3.dylib -- dash's interactive line-editor dependency,

@@ -152,11 +152,13 @@ while ($b -le $Boots) {
         throw "boot ${b}: the kernel never reported a drive TWICE -- it ran against nothing"
     }
     $retried = $false
-    $pass  = ($lines | Select-String -Pattern 'PASS' ).Count
-    $fail  = ($lines | Select-String -Pattern 'FAIL' ).Count
+    # Case-sensitive on purpose: Select-String is not by default, and a demo
+    # that said "a recipe that fails on purpose" was tallied as three FAILs.
+    $pass  = ($lines | Select-String -CaseSensitive -Pattern 'PASS' ).Count
+    $fail  = ($lines | Select-String -CaseSensitive -Pattern 'FAIL' ).Count
     $panic = ($lines | Select-String -Pattern 'panic').Count
     Write-Host "[accept] boot ${b}: $pass PASS / $fail FAIL / $panic panic"
-    if ($fail -gt 0) { $lines | Select-String -Pattern 'FAIL' | ForEach-Object { "    $_" } }
+    if ($fail -gt 0) { $lines | Select-String -CaseSensitive -Pattern 'FAIL' | ForEach-Object { "    $_" } }
     $lines | Select-String -Pattern '^apfs-(room|move):' | ForEach-Object { "    $_" }
     Copy-Item $log (Join-Path $Root "serial-accept$b.log") -Force
 

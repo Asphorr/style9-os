@@ -2270,6 +2270,36 @@ demo_darwin_spawn(void)
 	}
 
 	/*
+	 * gmake, the THIRTEENTH real Apple binary, and the first whose job
+	 * is running the others.  makedemo.sh (user/makedemo.sh) writes a
+	 * small project onto the volume and drives make through it: a build
+	 * that has work, a rebuild that must find none, a parallel build
+	 * over a jobserver pipe (the readiness wait this rung is about), and
+	 * a recipe that fails.  The script prints its own PASS/FAIL lines;
+	 * this side only starts it and waits.
+	 */
+	{
+		mach_port_name_t	 mk_tp;
+		char			*mk_argv[3];
+
+		printf("  >>> gmake -- a REAL Apple build tool, running a "
+		    "REAL build <<<\n");
+		mk_argv[0] = "dash";
+		mk_argv[1] = "/bin/makedemo.sh";
+		mk_argv[2] = NULL;
+		mk_tp = MACH_PORT_NULL;
+		child_id = spawn_args("dash", 2, mk_argv, &mk_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('dash makedemo.sh') failed "
+			    "(rv=%ld)\n", child_id);
+			return (99);
+		}
+		for (i = 0; i < 65536 && task_alive((uint64_t)child_id); i++)
+			(void)poll_turn();
+		printf("  dash[makedemo] retired after %d turns\n", i);
+	}
+
+	/*
 	 * A THIRD real Apple binary: guname (GNU coreutils' uname).  The
 	 * machine-identity trick -- it asks uname(2) what it is running on and
 	 * prints the answer, never validating it.  Our kernel hands back a

@@ -52,7 +52,7 @@ so a flat `fs/` had stopped saying which files belonged to what.
 | usermode | `arch/amd64/usermode.c` | per-task PML4 staged at task creation; the launcher sniffs the image's 4-byte magic and routes ELF to `elf_load` or Mach-O to `macho_load` (shared `(task, image, size, &entry)` contract, shared argv/stack/port-injection path); `iretq` lands at the entry RIP with a fresh user stack |
 | elf loader | `kern/elf.c` | static ELF64 parser.  Walks PT_LOAD program headers, allocates 4 KiB user pages and maps them via the task's pmap with R/W/X taken from p_flags, copies file data via `pmm_kva_from_pa` of the freshly-allocated frame |
 | macho loader | `kern/macho.c`, `tools/elf2macho.c` | XNU binary compat, S1: thin x86-64 Mach-O + fat/universal slice picker, mapping each `LC_SEGMENT_64` the way the ELF loader maps PT_LOAD and resolving the entry from `LC_UNIXTHREAD`/`LC_MAIN`.  The build host has no Darwin cross-toolchain, so the host tool `elf2macho` rewraps a style9 ELF into a spec-shaped Mach-O; `-Ikern` shares the wire structs so loader and converter never drift |
-| darwin abi | `kern/darwin.c` | XNU binary compat, S2/S3: a per-task syscall personality, through which **ring 3 can now change the disk** -- `open(2)` honours `O_CREAT`/`O_TRUNC`/`O_APPEND`, `write(2)` on a file descriptor reaches the APFS writer, `unlink(2)` takes a name back out, `mkdir(2)`/`rmdir(2)` make and remove a directory with the mode they were given less this task's `umask(2)`, `chmod(2)`/`fchmod(2)` change one afterwards, a directory can be OPENED (a descriptor that names a place: `read(2)` on it answers EISDIR, and `openat`/`fdopendir`/`fchdir`/`fchmod` are built on it), and a real Apple `dash` redirecting with `>` makes a file that survives the machine being switched off.  **The terminal can be told what to do**: `ioctl(2)` at 54 carries `TIOCGETA`/`TIOCSETA`/`TIOCGWINSZ`, the kernel keeps a `struct termios` in Apple's exact layout (asserted, not assumed -- the size is encoded in the ioctl number), and the line discipline asks the flags instead of assuming them, so a program that turns ICANON and ECHO off reads one keystroke with no Return behind it.  A file and a pipe answer ENOTTY, which is what `isatty(3)` is built out of.  A Mach-O carrying an `LC_BUILD_VERSION` for macOS is tagged `TASK_PERSONALITY_DARWIN`, and `syscall_dispatch` routes it to `darwin_dispatch`, which decodes Apple's class-encoded `%rax` -- class 2 = BSD `write`/`getpid`/`exit` with the carry-flag errno convention; class 1 = Mach `task_self_trap`/`mach_reply_port`/`mach_msg` traps -- and translates each onto the style9 primitive.  The `mach_msg` trap drives the kernel's existing message queue, so a Darwin task does real IPC; the native style9 syscall table is left untouched |
+| darwin abi | `kern/darwin.c` | XNU binary compat, S2/S3: a per-task syscall personality, through which **ring 3 can now change the disk** -- `open(2)` honours `O_CREAT`/`O_TRUNC`/`O_APPEND`, `write(2)` on a file descriptor reaches the APFS writer, `unlink(2)` takes a name back out, `mkdir(2)`/`rmdir(2)` make and remove a directory with the mode they were given less this task's `umask(2)`, `chmod(2)`/`fchmod(2)` change one afterwards, a directory can be OPENED (a descriptor that names a place: `read(2)` on it answers EISDIR, and `openat`/`fdopendir`/`fchdir`/`fchmod` are built on it), and a real Apple `dash` redirecting with `>` makes a file that survives the machine being switched off.  **The terminal can be told what to do**: `ioctl(2)` at 54 carries `TIOCGETA`/`TIOCSETA`/`TIOCGWINSZ`, the kernel keeps a `struct termios` in Apple's exact layout (asserted, not assumed -- the size is encoded in the ioctl number), and the line discipline asks the flags instead of assuming them, so a program that turns ICANON and ECHO off reads one keystroke with no Return behind it.  A file and a pipe answer ENOTTY, which is what `isatty(3)` is built out of.  **Readiness can be asked**: `select(2)`, `pselect` and `poll(2)` answer for files, pipe ends and the console over one broadcast channel and a generation count, pselect's mask swap survives the signal that ends the wait, `access(2)` and `ftruncate(2)` exist, the environment crosses `execve(2)`, `/bin/sh` resolves to dash for a Darwin task, and `/dev/null`, `/dev/console` and `/dev/tty` open.  A Mach-O carrying an `LC_BUILD_VERSION` for macOS is tagged `TASK_PERSONALITY_DARWIN`, and `syscall_dispatch` routes it to `darwin_dispatch`, which decodes Apple's class-encoded `%rax` -- class 2 = BSD `write`/`getpid`/`exit` with the carry-flag errno convention; class 1 = Mach `task_self_trap`/`mach_reply_port`/`mach_msg` traps -- and translates each onto the style9 primitive.  The `mach_msg` trap drives the kernel's existing message queue, so a Darwin task does real IPC; the native style9 syscall table is left untouched |
 | progreg | `kern/progreg.c` | "program registry" -- two dozen user programs embedded in the kernel image via objcopy, delivered as ELF or (for the Mach-O loader + Darwin demos) Mach-O containers.  `progreg_spawn(name)` creates a task and loads the matching image into it; `SYS_SPAWN` is the userspace door |
 | traps | `arch/amd64/idt.c`, `intr.c`, `isr.S` | 48-vector IDT, trap-frame dispatcher, symbolicated autopsy on exception |
 | irqs | `arch/amd64/pic.c`, `pit.c` | 8259 remap to 0x20/0x28, PIT @ 100 Hz with quantum tracking |
@@ -1843,6 +1843,134 @@ real Apple shell redirecting into a file, nodes that leave the tree when
 they empty, directories that can be made and removed, and a terminal a
 program can put into raw mode were all on this list once and have since
 landed.)
+
+## A build tool runs, and readiness is asked rather than assumed
+
+Twelve real Apple binaries ran here, and every one of them did one thing to
+one file.  GNU make -- **gmake 4.4.1, a Homebrew bottle vendored unmodified
+as the THIRTEENTH** -- does nothing itself: its whole job is to run OTHER
+programs, in an order it works out from timestamps, only when they are
+needed, and several at once when asked.  That made it the first program to
+want four things this kernel had never been asked for, and the measurement
+that scoped the rung (`tools/machoimports.py`, the same tool that scoped the
+terminal) said which four before a line was written: of make's 134 imports,
+33 were missing, and among them **pselect**, **access**, **ftruncate** and
+the family of **posix_spawn**.  The rest was ordinary libc.
+
+**Readiness is a question, not a copy of the answer.**  Every wait in the
+Darwin layer had been a wait for one thing -- a pipe with bytes, a console
+with a line, a child with news.  `select(2)`, `pselect` and `poll(2)` ask
+about several at once and want the first.  BSD gives each kind of file its
+own wait queue and registers the asker on all of them; this kernel does the
+simpler thing that is right at its size: ONE channel for "something a
+selector might care about changed", rung by every producer after the wake
+it already does, and a generation count read before the scan and compared
+under the lock before the park -- the console's own missed-wakeup argument
+with one extra word in it.  A disk file is always ready; a pipe's read end
+is readable with bytes or with no writer left, its write end writable with
+room or with no reader left; the console is readable when the discipline
+holds a line, or a byte out of canonical mode, or has reached end-of-input,
+or has a scripted session it has not finished releasing.
+
+pselect's mask is the point of pselect, and it is where the kernel had to
+learn something about signals.  make blocks SIGCHLD, checks whether a child
+has died, and then waits for a jobserver token with SIGCHLD *unblocked* --
+and that is race-free only if the unblocking and the wait are one
+operation.  Swapped in before the wait is easy; the exit that IS the signal
+is the hard part.  Put the old mask back before returning EINTR and the
+signal the caller unblocked to receive is blocked again, sits pending, and
+every later pselect returns EINTR for it on entry without it ever arriving.
+So the wait that ends in a signal leaves the temporary mask installed and
+arms a restore that the delivery path makes: into the signal frame, where
+`sigreturn` puts it back, or directly if nothing was delivered after all.
+Linux calls the same thing `TIF_RESTORE_SIGMASK`.  pselect rides the
+style9-private syscall class, because XNU's number for it was not verified
+from a source at hand and a number written down from memory is exactly the
+kind of "faithful" that is not; `select` is 93 and `poll` 230, checked.
+
+**The environment crosses an exec now.**  It did not, and nothing noticed:
+the kernel passed an empty envp and libSystem made one up (`PATH=/bin`),
+which every program so far survived because none of them told a child
+anything.  A build tool is made of telling children things -- MAKEFLAGS,
+MAKELEVEL, the jobserver's descriptors.  execve copies the vector under
+its own caps, refuses one that will not fit the handoff page with E2BIG
+*before* letting go of the old image, and the dyld hands it to libSystem
+from the same stack it reads argv off.  On the way, `setenv` and `putenv`
+stopped returning success while changing nothing.
+
+**`/bin/sh` means dash to a Darwin task.**  make's default SHELL is that
+string, compiled in, and the registry's `sh` is this kernel's own native
+shell -- an ELF the Darwin loader rightly refuses.  Debian answers the same
+question with a symlink; this answers it at the one point every Darwin-side
+lookup of a program passes through, so stat, open and execve agree.  And
+`/dev` exists, such as it is: `/dev/console` and `/dev/tty` open the
+console (`ttyname` hands out a name that opens the thing it names, or it is
+not a name), and `/dev/null` is its own descriptor type, because a shell's
+`2>/dev/null` is the most common redirection there is and without it that
+open either failed or made a plain file called null.
+
+**posix_spawn** lives in libSystem, out of fork and execve -- a fork here is
+a copy-on-write map share and costs what a spawn would -- with one
+difference that matters: it learns that a program does not exist *before*
+it forks, so ENOENT comes back as a return value the way the real one
+returns it, not as a child that exited 127.  `signal(3)` now returns the
+disposition it replaced, which make relies on for every fatal signal;
+`sigaddset` stopped being a no-op that made every mask empty; `fopen`
+learned its mode string; `open(2)` stopped dropping the create mode on the
+floor, which had been making every file a shell wrote with `>` mode 0000
+-- readable by root, which is everyone, and invisible as a defect for
+exactly that reason.
+
+The demonstration is `user/makedemo.sh`, a dash script that writes a small
+project onto the APFS volume every boot and drives make through it: a
+build that has work (the sources are rewritten each boot, so their
+timestamps are newer than whatever the last boot built), a rebuild that
+must find none (`Nothing to be done for 'all'` -- the half a make that
+rebuilds everything would fail), a `$(shell ...)` expansion, **a parallel
+build over a jobserver pipe** -- three targets under two job slots, so
+that for the third make has to WAIT in pselect, with SIGCHLD unblocked for
+the wait alone, until a child's death ends it -- and a recipe that exits 3
+on purpose and has to be reported and exited 2 for.  Every command in it
+is dash, gmake, or a coreutils bottle.  The kernel counts what happened:
+`select: 9 call(s), 2 park(s), 1 ended by the clock, 1 by a signal` --
+the one by the clock is `ttyprobe`'s 40 ms wait on an empty pipe (checks
+9-12 there cover select, poll, POLLHUP and EBADF from ring 3), the one by
+a signal is make's third job.  A first cut of the demo had two targets
+and the line read `1 call(s), 0 park(s)`: the token was always there and
+nothing had ever parked, which is why the demo has three.
+
+Two things the first boot found, neither of them in the new code.  `cat`
+refused the second of two inputs with "input file is output file", about
+a file that was neither: fstat reported inode 0 for every regular file,
+and cat compares exactly that.  The descriptor now reports the inode the
+handle carries.  And a parallel build **panicked the kernel** with
+`thread_block_release: idle cannot block` -- a Darwin task's files were
+closed by whoever reaped its body, which is the idle thread, and closing a
+file can block on the filesystem's mutex.  It never mattered while nothing
+closed files concurrently; two recipes writing at once put the mutex in
+one child's hand at the moment idle reaped the other.  A task's files are
+closed by its own last thread now, in `thread_exit`, in its own context --
+which is where Unix has always done it.
+
+One more thing the probe measured that the code had not thought about.  A
+40 ms wait came back after 33: "now" read from the tick clock is up to a
+tick stale, so a deadline made from it alone is short by that much, and
+coming back early is the one thing a timeout must not do.  The first fix
+computed the deadline from the microsecond clock and turned 40 ms into
+**1763**: that clock is the tick count plus a TSC delta since calibration,
+and under a hypervisor the tick count falls behind real time as ticks are
+swallowed, so the two clocks had drifted apart by 1.7 s of lost ticks
+since boot.  A deadline has to be spelled in the clock that will judge it,
+plus one tick for the fraction already gone -- Unix's `tvtohz` rule, which
+is older than this mistake.
+
+Two honest edges, said where they live.  `mkfifo` is refused (EPERM: this
+kernel keeps its pipes in descriptor tables and its names on a volume with
+no node type for one), so make's default fifo-style jobserver says so and
+falls back to a pipe; the demo asks for the pipe outright.  `dlopen`
+answers NULL and `dlerror` says why in words, once: a program that only
+loads a plugin when asked runs, and reports the refusal where it would
+have reported a missing plugin.
 
 ## License
 
