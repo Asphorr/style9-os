@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "darwin.h"
 #include "fpu.h"
 #include "kmem.h"
 #include "kprintf.h"
@@ -414,6 +415,25 @@ thread_exit(void)
 	 */
 	KASSERT(me->th_mutex_depth == 0,
 	    "thread_exit: dying with a mutex still held");
+
+	/*
+	 * A DARWIN TASK'S FILES ARE CLOSED BY ITS OWN LAST THREAD, here, and
+	 * not by whoever reaps the body.  Closing a file can BLOCK: the
+	 * filesystem's lock is a mutex, and an orphan's blocks are given back
+	 * on the last close.  The reaper runs on the idle thread, which
+	 * cannot block, and the assertion saying so is what found this.  It
+	 * never mattered while nothing closed files concurrently; two
+	 * recipes of a parallel make writing at once put the mutex in one
+	 * child's hand at the moment the idle thread reaped the other.
+	 * Unix closes a process's files in exit(2), in process context, for
+	 * exactly this reason.  The reaper's own call stays as the fallback
+	 * and finds nothing to do -- the teardown is idempotent.  Darwin
+	 * tasks are single-threaded, and the count says so.
+	 */
+	if (me->th_task != NULL &&
+	    me->th_task->t_personality == TASK_PERSONALITY_DARWIN &&
+	    me->th_task->t_nthreads == 1)
+		darwin_files_teardown(me->th_task);
 
 	/*
 	 * OFF THE DEADLINE LIST BEFORE GOING ANYWHERE ELSE.
