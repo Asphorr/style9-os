@@ -327,9 +327,10 @@ build_user_arg_stack(uint64_t kva_base, int argc, char *const *argv)
  */
 static uint64_t
 build_dyld_arg_stack(uint64_t kva_base, uint64_t main_mh, uint64_t stack_top,
-    int argc, char *const *argv)
+    int argc, char *const *argv, int envc, char *const *envp)
 {
 	uint64_t	argv_uva[SPAWN_ARGV_MAX];
+	uint64_t	envp_uva[SPAWN_ENV_MAX];
 	uint64_t	rsp;
 	uint64_t	slot;
 	uint64_t	sp;
@@ -345,6 +346,10 @@ build_dyld_arg_stack(uint64_t kva_base, uint64_t main_mh, uint64_t stack_top,
 		argc = 0;
 	if (argc > SPAWN_ARGV_MAX)
 		argc = SPAWN_ARGV_MAX;
+	if (envc < 0 || envp == NULL)
+		envc = 0;
+	if (envc > SPAWN_ENV_MAX)
+		envc = SPAWN_ENV_MAX;
 
 	/*
 	 * `kva_base` aliases the TOP page of the stack -- [top_base, stack_top)
@@ -367,11 +372,34 @@ build_dyld_arg_stack(uint64_t kva_base, uint64_t main_mh, uint64_t stack_top,
 	}
 
 	/*
-	 * Reserve the handoff block below the strings:
-	 *	mach_header + argc + argv[argc] + argv NULL + envp NULL + apple NULL
-	 * = argc + 5 quadwords.  Align the base (where %rsp lands) down to 16.
+	 * The environment's strings go below argv's, in the same page.  An
+	 * environment is the one part of this frame whose size the CALLER
+	 * chooses -- a shell exports what it likes -- so the fit is checked
+	 * below rather than asserted: a frame that does not fit is an execve
+	 * refused, not a kernel that stops.
 	 */
-	nwords = argc + 5;
+	for (i = 0; i < envc; i++) {
+		s = envp[i];
+		len = spawn_strlen(s) + 1;
+		if (sp - top_base < len)
+			return (0);
+		sp -= len;
+		dst = (uint8_t *)(uintptr_t)(kva_base + (sp - top_base));
+		for (j = 0; j < len; j++)
+			dst[j] = (uint8_t)s[j];
+		envp_uva[i] = sp;
+	}
+
+	/*
+	 * Reserve the handoff block below the strings:
+	 *	mach_header + argc + argv[argc] + argv NULL
+	 *	+ envp[envc] + envp NULL + apple NULL
+	 * = argc + envc + 5 quadwords.  Align the base (where %rsp lands)
+	 * down to 16.
+	 */
+	nwords = argc + envc + 5;
+	if (sp - top_base < (uint64_t)(8 * nwords) + 16)
+		return (0);
 	rsp = sp - (uint64_t)(8 * nwords);
 	rsp &= ~(uint64_t)15;
 
@@ -391,6 +419,11 @@ build_dyld_arg_stack(uint64_t kva_base, uint64_t main_mh, uint64_t stack_top,
 	}
 	*(uint64_t *)(uintptr_t)(kva_base + (slot - top_base)) = 0; /* argv  */
 	slot += 8;
+	for (i = 0; i < envc; i++) {
+		*(uint64_t *)(uintptr_t)(kva_base + (slot - top_base)) =
+		    envp_uva[i];
+		slot += 8;
+	}
 	*(uint64_t *)(uintptr_t)(kva_base + (slot - top_base)) = 0; /* envp  */
 	slot += 8;
 	*(uint64_t *)(uintptr_t)(kva_base + (slot - top_base)) = 0; /* apple */
@@ -422,7 +455,7 @@ build_dyld_arg_stack(uint64_t kva_base, uint64_t main_mh, uint64_t stack_top,
 static long
 usermode_setup_image(struct task *ut, const uint8_t *image,
     size_t image_size, const char *name, int argc, char *const *argv,
-    uint64_t *rip_out, uint64_t *rsp_out)
+    int envc, char *const *envp, uint64_t *rip_out, uint64_t *rsp_out)
 {
 	uint64_t	*kva;
 	uint64_t	 entry;
@@ -520,7 +553,12 @@ usermode_setup_image(struct task *ut, const uint8_t *image,
 		}
 		entry    = dres.entry;
 		user_rsp = build_dyld_arg_stack((uint64_t)kva, main_base,
-		    stack_top, argc, argv);
+		    stack_top, argc, argv, envc, envp);
+		if (user_rsp == 0) {
+			kprintf("usermode: %s: argv + envp do not fit the "
+			    "handoff page\n", name);
+			return (SYS_E_INVAL);
+		}
 	} else {
 		user_rsp = build_user_arg_stack((uint64_t)kva, argc, argv);
 	}
@@ -556,7 +594,8 @@ usermode_elf_launcher(void *arg)
 	ut = current_thread->th_task;
 
 	rv = usermode_setup_image(ut, sa->sa_image, sa->sa_image_size,
-	    sa->sa_name, sa->sa_argc, sa->sa_argv, &entry, &user_rsp);
+	    sa->sa_name, sa->sa_argc, sa->sa_argv, 0, NULL, &entry,
+	    &user_rsp);
 	if (rv < 0)
 		panic("usermode_elf_launcher: setup_image %s rv=%ld",
 		    sa->sa_name, rv);
@@ -920,7 +959,7 @@ arch_darwin_fork(struct syscall_frame *f)
  */
 long
 arch_darwin_execve(const unsigned char *image, unsigned long image_size,
-    int argc, char **argv, struct syscall_frame *f)
+    int argc, char **argv, int envc, char **envp, struct syscall_frame *f)
 {
 	struct task	*t;
 	uint64_t	 rip;
@@ -934,7 +973,7 @@ arch_darwin_execve(const unsigned char *image, unsigned long image_size,
 	t->t_darwin_dylib_next = 0;
 
 	rv = usermode_setup_image(t, image, (size_t)image_size, t->t_name,
-	    argc, argv, &rip, &rsp);
+	    argc, argv, envc, envp, &rip, &rsp);
 	if (rv < 0) {
 		kprintf("darwin: execve setup failed rv=%ld, task exits\n",
 		    rv);

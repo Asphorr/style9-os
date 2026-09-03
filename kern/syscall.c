@@ -552,7 +552,8 @@ syscall_copyin(void *kbuf, const void *uptr, size_t n)
  * NULL uargv is argc 0 with no block.  Negative SYS_E_* on fault/limit.
  */
 long
-syscall_copyin_argv(char *const *uargv, char ***blockp, int *argcp)
+syscall_copyin_vec(char *const *uargv, char ***blockp, int *argcp,
+    size_t max_ptrs, size_t max_bytes)
 {
 	char		**kargv;
 	char		 *block;
@@ -574,7 +575,7 @@ syscall_copyin_argv(char *const *uargv, char ***blockp, int *argcp)
 	/* First pass: count entries up to the NULL terminator. */
 	n = 0;
 	for (;;) {
-		if (n > SPAWN_ARGV_MAX)
+		if (n > max_ptrs)
 			return (SYS_E_INVAL);
 		if (!user_range_ok((uint64_t)(uintptr_t)(uargv + n),
 		    sizeof(char *)))
@@ -590,7 +591,7 @@ syscall_copyin_argv(char *const *uargv, char ***blockp, int *argcp)
 		return (0);
 
 	ptrs_sz = (n + 1) * sizeof(char *);
-	block = kmalloc(ptrs_sz + SPAWN_ARG_BYTES_MAX);
+	block = kmalloc(ptrs_sz + max_bytes);
 	if (block == NULL)
 		return (SYS_E_NOMEM);
 	kargv = (char **)block;
@@ -610,7 +611,7 @@ syscall_copyin_argv(char *const *uargv, char ***blockp, int *argcp)
 		k = 0;
 		smap_user_access_begin();
 		for (;;) {
-			if (used >= SPAWN_ARG_BYTES_MAX) {
+			if (used >= max_bytes) {
 				smap_user_access_end();
 				kfree(block);
 				return (SYS_E_INVAL);
@@ -634,6 +635,15 @@ syscall_copyin_argv(char *const *uargv, char ***blockp, int *argcp)
 	*blockp = kargv;
 	*argcp  = (int)n;
 	return (0);
+}
+
+/* The argv shape: the spawn caps, which the launcher's frame is sized for. */
+long
+syscall_copyin_argv(char *const *uargv, char ***blockp, int *argcp)
+{
+
+	return (syscall_copyin_vec(uargv, blockp, argcp, SPAWN_ARGV_MAX,
+	    SPAWN_ARG_BYTES_MAX));
 }
 
 static long

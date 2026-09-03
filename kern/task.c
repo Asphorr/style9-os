@@ -151,6 +151,8 @@ task_create(const char *name)
 		t->t_sig_pending = 0;
 		t->t_sig_mask    = 0;
 		t->t_sig_tramp   = 0;
+		t->t_sig_mask_saved   = 0;
+		t->t_sig_mask_restore = false;
 		for (si = 0; si < DARWIN_NSIG; si++)
 			t->t_sig_handler[si] = DARWIN_SIG_DFL;
 	}

@@ -31,7 +31,7 @@
  * instead of dropping the last entry: a program that silently failed to
  * register would have looked like a program that failed to LOAD.
  */
-#define	PROGREG_MAX		48
+#define	PROGREG_MAX		64
 #define	PROGREG_NAME_MAX	24
 
 /*
@@ -44,6 +44,19 @@
  */
 #define	SPAWN_ARGV_MAX		16
 #define	SPAWN_ARG_BYTES_MAX	512
+
+/*
+ * The environment a Darwin execve(2) carries across, with its own caps: a
+ * build tool hands its children a dozen variables, a shell everything it
+ * exported.  The dyld handoff frame still lives in the TOP PAGE of the new
+ * stack, so the whole of argv + envp + their pointer block must fit in 4 KiB:
+ * (16 + 32 + 6) pointers = 432 bytes, plus 512 + 2048 of strings = 2992,
+ * which leaves room for the alignment the frame builder takes.  The builder
+ * checks the sum rather than trusting this arithmetic, and an execve whose
+ * frame will not fit is refused with E2BIG, which is the errno for it.
+ */
+#define	SPAWN_ENV_MAX		32
+#define	SPAWN_ENV_BYTES_MAX	2048
 
 struct progreg_entry {
 	const char	*pr_name;	/* lookup key                   */

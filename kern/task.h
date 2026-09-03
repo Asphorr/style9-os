@@ -101,6 +101,14 @@ struct vm_map;
  * does and what makes the distinction visible from ring 3.
  */
 #define	DARWIN_OF_DIR		5
+/*
+ * /dev/null.  A descriptor that reads as empty and swallows what is written
+ * to it.  Its own type because it is neither a file (nothing is on any
+ * volume) nor the console (nothing reaches the screen), and because a
+ * shell's `2>/dev/null` is the most common redirection there is: without
+ * this, that open either failed or -- worse -- made a FILE called null.
+ */
+#define	DARWIN_OF_NULL		6
 
 struct darwin_pipe;
 
@@ -206,6 +214,21 @@ struct task {
 	uint64_t		 t_sig_tramp;	/* libSystem _sigtramp VA     */
 	volatile uint32_t	 t_sig_pending;
 	uint32_t		 t_sig_mask;
+
+	/*
+	 * A mask pselect(2) swapped in for the length of one wait, and the
+	 * one it will put back.  When the wait ends with a signal, the
+	 * temporary mask has to STAY until that signal has been delivered
+	 * -- restoring it first would block the very signal the caller
+	 * unblocked to receive, which then sits pending for ever while every
+	 * later pselect returns EINTR for it on entry.  So the wait leaves
+	 * the temporary mask installed and this pair armed; the delivery
+	 * path puts t_sig_mask_saved into the signal frame (sigreturn then
+	 * restores it, exactly as Linux's TIF_RESTORE_SIGMASK does) or, if
+	 * nothing was delivered after all, restores it directly.
+	 */
+	uint32_t		 t_sig_mask_saved;
+	bool			 t_sig_mask_restore;
 
 	/*
 	 * Next base VA at which the Darwin dynamic linker's "map image by

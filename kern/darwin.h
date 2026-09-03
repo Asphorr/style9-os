@@ -100,6 +100,52 @@
 #define	DARWIN_SYS___getcwd	326
 
 /*
+ * READINESS, AND THE CALLS THAT ARRIVED WITH IT
+ *
+ * Numbers are Darwin's.  access(2) is 33, select(2) 93, mkfifo(2) 132,
+ * ftruncate(2) 201, poll(2) 230 -- each checked against the class-2 table
+ * the way every number above was.  pselect is NOT here: XNU has had a
+ * native pselect since around 10.14, but its number was not verified from a
+ * source at hand, and a number written down from memory would be exactly
+ * the kind of "faithful" that is not.  It rides the style9-private class
+ * instead (DARWIN_S9_pselect below), where libSystem is the only caller.
+ */
+#define	DARWIN_SYS_access	33
+#define	DARWIN_SYS_select	93
+#define	DARWIN_SYS_mkfifo	132
+#define	DARWIN_SYS_ftruncate	201
+#define	DARWIN_SYS_poll		230
+
+/* access(2)'s mode word, <unistd.h> spelling. */
+#define	DARWIN_F_OK		0
+#define	DARWIN_X_OK		1
+#define	DARWIN_W_OK		2
+#define	DARWIN_R_OK		4
+
+/*
+ * select(2)'s fd_set is FD_SETSIZE bits in 32-bit words; poll(2)'s pollfd is
+ * {int fd; short events; short revents}.  The event bits are <sys/poll.h>'s.
+ * Only POLLIN, POLLOUT and the three answers a caller cannot ask for (ERR,
+ * HUP, NVAL) mean anything here; PRI is accepted and never reported.
+ */
+#define	DARWIN_FD_SETSIZE	1024
+#define	DARWIN_NFDBITS		32
+
+#define	DARWIN_POLLIN		0x0001
+#define	DARWIN_POLLPRI		0x0002
+#define	DARWIN_POLLOUT		0x0004
+#define	DARWIN_POLLERR		0x0008
+#define	DARWIN_POLLHUP		0x0010
+#define	DARWIN_POLLNVAL		0x0020
+
+struct darwin_pollfd {
+	int32_t		pfd_fd;
+	int16_t		pfd_events;
+	int16_t		pfd_revents;
+};
+_Static_assert(sizeof(struct darwin_pollfd) == 8, "pollfd is 8 bytes");
+
+/*
  * open(2)'s vocabulary, as Darwin's <sys/fcntl.h> spells it.
  *
  * The access mode is NOT a bitmask of the other flags: it is the low two bits,
@@ -206,6 +252,15 @@
 #define	DARWIN_S9_fs_fdpath		6
 
 /*
+ * pselect(int nfds, uint32_t *in, uint32_t *ou, uint32_t *ex,
+ *     const struct darwin_timespec *ts, const uint32_t *sigmask):
+ * select(2) with a signal mask swapped in for the duration of the wait --
+ * the primitive select(2) is the special case of.  Why it is in this class
+ * and not class 2 is said next to DARWIN_SYS_select.
+ */
+#define	DARWIN_S9_pselect		7
+
+/*
  * fs_fstat(int fd, struct darwin_fdstat *out): the fd-flavored sibling of
  * fs_stat, behind libSystem's fstat64.  The kernel classifies what the fd
  * actually holds (regular buffered file / console / pipe end) into this
@@ -219,6 +274,15 @@
 #define	DARWIN_FDSTAT_DIR	3
 
 struct darwin_fdstat {
+	/*
+	 * The inode, so that two descriptors onto the same file say so and
+	 * two onto different files do not.  It was absent, and every
+	 * regular file fstat'd as inode 0: cat, which refuses to copy a file
+	 * onto itself by comparing exactly this, refused the second of any
+	 * two inputs once the first had been written -- "input file is
+	 * output file", about a file that was neither.
+	 */
+	uint64_t	fds_ino;
 	uint32_t	fds_size;	/* byte length (regular files)   */
 	uint8_t		fds_kind;	/* DARWIN_FDSTAT_*               */
 };
@@ -339,6 +403,14 @@ struct darwin_timeval {
 	int32_t		tv_pad;
 };
 
+/* struct timespec, Darwin x86-64: two longs.  pselect's deadline. */
+struct darwin_timespec {
+	int64_t		ts_sec;
+	int64_t		ts_nsec;
+};
+_Static_assert(sizeof(struct darwin_timespec) == 16,
+    "Darwin timespec is 16 bytes");
+
 _Static_assert(sizeof(struct darwin_timeval) == 16,
     "struct timeval is 16 bytes on x86_64 Darwin");
 
@@ -381,6 +453,7 @@ struct darwin_uname {
 #define	DARWIN_ESRCH	3
 #define	DARWIN_EINTR	4
 #define	DARWIN_EIO	5
+#define	DARWIN_E2BIG	7
 #define	DARWIN_ENOEXEC	8
 #define	DARWIN_EBADF	9
 #define	DARWIN_ECHILD	10
@@ -643,6 +716,6 @@ _Static_assert(__builtin_offsetof(struct darwin_sigframe_full, sf_fpu) % 16 == 0
 long	arch_darwin_fork(struct syscall_frame *f);
 long	arch_darwin_execve(const unsigned char *image,
 	    unsigned long image_size, int argc, char **argv,
-	    struct syscall_frame *f);
+	    int envc, char **envp, struct syscall_frame *f);
 
 #endif /* !_SYS_DARWIN_H_ */

@@ -141,6 +141,14 @@ long	syscall_copyin(void *kbuf, const void *uptr, size_t n);
 long	syscall_copyin_argv(char *const *uargv, char ***blockp, int *argcp);
 
 /*
+ * The same copy with the caps as parameters -- the environment vector an
+ * execve carries has its own (SPAWN_ENV_MAX / SPAWN_ENV_BYTES_MAX), and the
+ * argv form above is this with the spawn caps filled in.
+ */
+long	syscall_copyin_vec(char *const *uargv, char ***blockp, int *argcp,
+	    size_t max_ptrs, size_t max_bytes);
+
+/*
  * Mach message send/recv core: user-range-check + SMAP bracket + the
  * matching mach_msg_* call.  Back SYS_MSG_SEND / SYS_MSG_RECV[_TIMED] and
  * the Darwin personality's mach_msg trap (kern/darwin.c).  Return MACH_MSG_OK

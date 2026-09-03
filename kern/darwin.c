@@ -113,8 +113,13 @@ static long	darwin_s9_fs_readdir(struct syscall_frame *f);
 static long	darwin_s9_uname(struct syscall_frame *f);
 static long	darwin_s9_fs_fstat(struct syscall_frame *f);
 static long	darwin_s9_fs_fdpath(struct syscall_frame *f);
+static long	darwin_s9_pselect(struct syscall_frame *f);
+static inline uint32_t darwin_sigbit(int signo);
 static bool	darwin_streq(const char *a, const char *b);
+static const struct progreg_entry *darwin_bin_find(const char *name);
 static const struct progreg_entry *darwin_bin_lookup(const char *path);
+static void	darwin_select_news(void);
+static void	darwin_select_stats(void);
 
 static struct darwin_pipe *darwin_pipe_create(void);
 static void	darwin_pipe_drop(struct darwin_pipe *p, bool writer);
@@ -434,6 +439,7 @@ darwin_pipe_drop(struct darwin_pipe *p, bool writer)
 	 */
 	(void)sched_wakeup(&p->p_count);
 	(void)sched_wakeup(&p->p_rpos);
+	darwin_select_news();
 }
 
 /*
@@ -500,6 +506,7 @@ darwin_pipe_read(struct syscall_frame *f, struct darwin_pipe *p,
 			spin_unlock(&p->p_lock);
 			/* Room in the ring now: a blocked writer wants it. */
 			(void)sched_wakeup(&p->p_rpos);
+			darwin_select_news();
 			darwin_pipe_n_read++;
 			if (syscall_copyout(ubuf, bounce, take) != 0)
 				return (darwin_err(f, DARWIN_EFAULT));
@@ -622,6 +629,7 @@ darwin_pipe_write(struct syscall_frame *f, struct darwin_pipe *p,
 			spin_unlock(&p->p_lock);
 			/* Bytes in the ring: a blocked reader wants them. */
 			(void)sched_wakeup(&p->p_count);
+			darwin_select_news();
 			off  += put;
 			done += put;
 		}
@@ -1136,8 +1144,10 @@ darwin_cons_input(char c)
 	/* Both of these can sleep or take other locks; neither may run above. */
 	if (intr)
 		darwin_cons_signal_fg(DARWIN_SIGINT);
-	if (owed)
+	if (owed) {
 		(void)sched_wakeup(&darwin_cons_head);
+		darwin_select_news();
+	}
 	return (true);
 }
 
@@ -1238,6 +1248,7 @@ darwin_cons_feed(const char *buf, size_t n)
 	darwin_cons_script_off = 0;
 	darwin_cons_eof = false;
 	spin_unlock(&darwin_cons_lock);
+	darwin_select_news();
 }
 
 /*
@@ -1553,6 +1564,7 @@ void
 darwin_wait_stats(void)
 {
 
+	darwin_select_stats();
 	if (darwin_pipe_n_read == 0 && darwin_pipe_n_write == 0 &&
 	    darwin_wait_n_call == 0)
 		return;
@@ -1582,6 +1594,554 @@ darwin_wait_stats(void)
 		kprintf("wait: FAIL %llu answer(s) reached a parent only "
 		    "because of the deadline -- a wake is missing\n",
 		    (unsigned long long)darwin_wait_n_lost);
+}
+
+/* ---- readiness: select(2), pselect, poll(2) ------------------------------ */
+
+/*
+ * READINESS IS A QUESTION, NOT A COPY OF THE ANSWER
+ *
+ * Every wait in this file so far has been a wait for ONE thing: a pipe with
+ * bytes, a console with a line, a child with news.  select(2) asks about
+ * several at once and wants the first, and the obvious design gives each
+ * kind of file its own wait queue and registers the asking thread on all of
+ * them, which is what BSD's selrecord does.  This kernel does the simpler
+ * thing that is right at its size: there is ONE channel for "something a
+ * selector might care about changed", every producer rings it after the
+ * wake it already does, and a selector that finds nothing ready parks there
+ * and looks again.  A spurious wake costs one scan of at most sixteen slots.
+ *
+ * What makes that correct rather than merely usually right is the
+ * generation count.  A producer bumps it under darwin_select_lock; a
+ * selector reads it, scans WITHOUT the lock (the scan takes the pipe and
+ * console locks, and nothing may hold those under this one), then takes the
+ * lock and compares.  A bump in between means a rescan; none means the park
+ * is made with the lock still held, and thread_block_release drops it under
+ * the scheduler lock, so a producer cannot bump and wake in the gap.  This is
+ * the console's own missed-wakeup argument with one extra word in it.
+ *
+ * WHAT EACH KIND OF FILE ANSWERS.  A disk file, a directory and /dev/null
+ * are always ready both ways: nothing about them waits.  A pipe's read end
+ * is readable with bytes in the ring or with no writer left (the read would
+ * return 0, which is an answer); its write end is writable with room or
+ * with no reader left (the write would fail at once, which is also an
+ * answer).  The console is readable when the discipline holds a line -- or
+ * a byte, out of canonical mode -- or has reached end-of-input, or has a
+ * scripted session it has not finished releasing; a reader asking is what
+ * releases the next line, so an unspent script IS input waiting.  The
+ * console is always writable.  Exceptional conditions do not exist here and
+ * are never reported.
+ *
+ * A raw-mode VMIN above one is answered as "readable" from the first byte,
+ * which is what BSD's ttnread answers too; the read that follows may still
+ * wait for the rest.  Said here because it is the one place select's answer
+ * and read's behaviour part company.
+ */
+#define	DARWIN_RD	0x1u		/* would not block reading   */
+#define	DARWIN_WR	0x2u		/* would not block writing   */
+#define	DARWIN_HUP	0x4u		/* a reader's writers are gone */
+#define	DARWIN_ERR	0x8u		/* a writer's readers are gone */
+
+#define	DARWIN_POLL_MAX	64		/* pollfds one call may carry */
+
+static struct spinlock	darwin_select_lock = SPINLOCK_INIT("dselect");
+static uint64_t		darwin_select_gen;	  /* (s) bumped per event   */
+static uint64_t		darwin_select_n_call;	  /* select/pselect/poll    */
+static uint64_t		darwin_select_n_wait;	  /* parks                  */
+static uint64_t		darwin_select_n_timeout;  /* parks the clock ended  */
+static uint64_t		darwin_select_n_intr;	  /* waits a signal ended   */
+
+/* A producer's one duty: say that something changed, then wake whoever asks. */
+static void
+darwin_select_news(void)
+{
+
+	spin_lock(&darwin_select_lock);
+	darwin_select_gen++;
+	spin_unlock(&darwin_select_lock);
+	(void)sched_wakeup(&darwin_select_gen);
+}
+
+static void
+darwin_select_stats(void)
+{
+
+	if (darwin_select_n_call == 0)
+		return;
+	kprintf("select: %llu call(s), %llu park(s), %llu ended by the clock, "
+	    "%llu by a signal\n",
+	    (unsigned long long)darwin_select_n_call,
+	    (unsigned long long)darwin_select_n_wait,
+	    (unsigned long long)darwin_select_n_timeout,
+	    (unsigned long long)darwin_select_n_intr);
+}
+
+/*
+ * What one descriptor would answer now.  `want` is DARWIN_RD/WR; the return
+ * is the subset that would not block, plus DARWIN_HUP/ERR for a pipe end
+ * whose other side is gone (poll(2) reports those on their own, select(2)
+ * folds them into readable/writable).  A slot nothing is open in is EBADF's
+ * business: *bad says so and the answer is empty.
+ */
+static uint32_t
+darwin_fd_ready(struct task *t, int fd, uint32_t want, bool *bad)
+{
+	struct darwin_ofile	*of;
+	struct darwin_pipe	*p;
+	uint32_t		 got;
+	uint8_t			 type;
+
+	*bad = false;
+	if (fd < 0 || fd >= DARWIN_NOFILE) {
+		*bad = true;
+		return (0);
+	}
+	of   = &t->t_darwin_files[fd];
+	type = of->of_type;
+	if (type == DARWIN_OF_FREE) {
+		if (fd > 2) {
+			*bad = true;
+			return (0);
+		}
+		type = DARWIN_OF_CONSOLE;	/* the implicit std streams */
+	}
+	got = 0;
+	switch (type) {
+	case DARWIN_OF_FILE:
+	case DARWIN_OF_DIR:
+	case DARWIN_OF_NULL:
+		got = want;
+		break;
+	case DARWIN_OF_CONSOLE:
+		if ((want & DARWIN_WR) != 0)
+			got |= DARWIN_WR;
+		if ((want & DARWIN_RD) != 0) {
+			spin_lock(&darwin_cons_lock);
+			if (darwin_cons_head != darwin_cons_tail ||
+			    darwin_cons_eof || darwin_cons_script_len != 0)
+				got |= DARWIN_RD;
+			spin_unlock(&darwin_cons_lock);
+		}
+		break;
+	case DARWIN_OF_PIPE_R:
+		p = of->of_pipe;
+		spin_lock(&p->p_lock);
+		if (p->p_writers == 0)
+			got |= DARWIN_HUP;
+		if ((want & DARWIN_RD) != 0 &&
+		    (p->p_count > 0 || p->p_writers == 0))
+			got |= DARWIN_RD;
+		spin_unlock(&p->p_lock);
+		break;
+	case DARWIN_OF_PIPE_W:
+		p = of->of_pipe;
+		spin_lock(&p->p_lock);
+		if (p->p_readers == 0)
+			got |= DARWIN_ERR;
+		if ((want & DARWIN_WR) != 0 &&
+		    (p->p_count < DARWIN_PIPE_BUF || p->p_readers == 0))
+			got |= DARWIN_WR;
+		spin_unlock(&p->p_lock);
+		break;
+	default:
+		*bad = true;
+		break;
+	}
+	return (got);
+}
+
+/*
+ * An absolute deadline `ms` from now, in the tick clock the timed waiter is
+ * checked against, plus ONE TICK.  The tick clock advances in whole ticks,
+ * so "now" read from it is up to a tick stale, and a deadline made from it
+ * alone comes up short by that much -- a 40 ms wait came back after 33 --
+ * and coming back early is the one thing a timeout must not do.  This is
+ * Unix's tvtohz rule, one tick added for the fraction already gone.
+ *
+ * NOT computed from the microsecond clock, which was the first fix and
+ * turned a 40 ms wait into 1763.  That clock is the tick count plus a TSC
+ * delta since calibration, and under a hypervisor the tick count falls
+ * behind real time as ticks are lost, so the two clocks drift apart by the
+ * seconds of ticks the host has swallowed since boot.  A deadline has to be
+ * spelled in the clock that will judge it.  Never 0, which callers use for
+ * "no deadline".
+ */
+static uint64_t
+darwin_deadline_ms(uint64_t ms)
+{
+	uint64_t	d;
+	uint64_t	tick;
+
+	tick = 1000u / clock_hz();
+	if (tick == 0)
+		tick = 1;
+	d = clock_uptime_ms() + ms + tick;
+	return (d == 0 ? 1 : d);
+}
+
+/*
+ * Wait until something is ready, the deadline passes, or a signal arrives.
+ * `scan` is the caller's readiness pass over its own list; it returns how
+ * many answers it found (or a negative errno) and is run again after every
+ * wake.  `deadline_ms` is an absolute uptime, 0 for none; `once` is a
+ * zero timeout -- one scan, no park.  Returns the scan's count, 0 on the
+ * deadline, or -EINTR.
+ *
+ * The signal test sits between the scan and the park with nothing held,
+ * and that is safe for the reason every other wait here relies on: posting
+ * a signal wakes the target's sleeper, and a wake that finds nobody asleep
+ * leaves a note the next park consumes (kern/sched.c).
+ */
+static long
+darwin_readiness_wait(long (*scan)(void *), void *arg, uint64_t deadline_ms,
+    bool once)
+{
+	struct task	*t;
+	uint64_t	 gen;
+	long		 n;
+
+	t = current_thread->th_task;
+	for (;;) {
+		spin_lock(&darwin_select_lock);
+		gen = darwin_select_gen;
+		spin_unlock(&darwin_select_lock);
+		n = scan(arg);
+		if (n != 0)
+			return (n);		/* ready, or an error */
+		if (once)
+			return (0);
+		if (deadline_ms != 0 && clock_uptime_ms() >= deadline_ms) {
+			darwin_select_n_timeout++;
+			return (0);
+		}
+		if (task_kill_pending(t) || darwin_signal_pending(t)) {
+			darwin_select_n_intr++;
+			return (-DARWIN_EINTR);
+		}
+		spin_lock(&darwin_select_lock);
+		if (darwin_select_gen != gen) {
+			spin_unlock(&darwin_select_lock);
+			continue;		/* news since the scan */
+		}
+		if (deadline_ms != 0) {
+			current_thread->th_wake_deadline_ms = deadline_ms;
+			sched_add_timed_waiter(current_thread);
+		}
+		darwin_select_n_wait++;
+		thread_block_release(THREAD_BLOCK_SLEEP, &darwin_select_gen,
+		    &darwin_select_lock);
+		if (deadline_ms != 0) {
+			sched_remove_timed_waiter(current_thread);
+			current_thread->th_wake_deadline_ms = 0;
+		}
+	}
+}
+
+/*
+ * select(2)'s three bit sets, in and out.  FD_SETSIZE bits each, in 32-bit
+ * words; only the words nfds reaches are read or written.
+ */
+struct darwin_select_scan {
+	struct task	*ss_task;
+	uint32_t	 ss_want[3][DARWIN_FD_SETSIZE / DARWIN_NFDBITS];
+	uint32_t	 ss_got[3][DARWIN_FD_SETSIZE / DARWIN_NFDBITS];
+	size_t		 ss_words;
+	int		 ss_nfds;
+	bool		 ss_has[3];
+};
+
+static bool
+darwin_fdset_isset(const uint32_t *set, int fd)
+{
+
+	return ((set[fd / DARWIN_NFDBITS] &
+	    ((uint32_t)1 << (fd % DARWIN_NFDBITS))) != 0);
+}
+
+static void
+darwin_fdset_set(uint32_t *set, int fd)
+{
+
+	set[fd / DARWIN_NFDBITS] |= (uint32_t)1 << (fd % DARWIN_NFDBITS);
+}
+
+static long
+darwin_select_scan(void *arg)
+{
+	struct darwin_select_scan	*ss;
+	uint32_t			 got;
+	uint32_t			 want;
+	size_t				 i;
+	long				 n;
+	int				 fd;
+	int				 k;
+	bool				 bad;
+
+	ss = arg;
+	for (k = 0; k < 3; k++)
+		for (i = 0; i < ss->ss_words; i++)
+			ss->ss_got[k][i] = 0;
+	n = 0;
+	for (fd = 0; fd < ss->ss_nfds; fd++) {
+		want = 0;
+		if (ss->ss_has[0] && darwin_fdset_isset(ss->ss_want[0], fd))
+			want |= DARWIN_RD;
+		if (ss->ss_has[1] && darwin_fdset_isset(ss->ss_want[1], fd))
+			want |= DARWIN_WR;
+		if (want == 0 && !(ss->ss_has[2] &&
+		    darwin_fdset_isset(ss->ss_want[2], fd)))
+			continue;
+		got = darwin_fd_ready(ss->ss_task, fd, want, &bad);
+		if (bad)
+			return (-DARWIN_EBADF);
+		if ((got & DARWIN_RD) != 0) {
+			darwin_fdset_set(ss->ss_got[0], fd);
+			n++;
+		}
+		if ((got & DARWIN_WR) != 0) {
+			darwin_fdset_set(ss->ss_got[1], fd);
+			n++;
+		}
+	}
+	return (n);
+}
+
+/*
+ * The shared body of select(2) and pselect: (nfds, in, out, except, timeout
+ * [, sigmask]) in arg0..5.  `by_spec` says the timeout is a timespec (and
+ * arg5 a mask) rather than a timeval.  A NULL timeout waits for ever; a zero
+ * one asks once.  On return each set holds the ready subset (all clear on a
+ * timeout), which is what POSIX says and what BSD does; the timeout is not
+ * written back.
+ *
+ * THE MASK IS THE POINT OF PSELECT.  A caller that blocks SIGCHLD, looks at
+ * whether a child has died, and then waits for a token with SIGCHLD
+ * unblocked has no window in which a death goes unnoticed -- provided the
+ * unblocking and the wait are one operation.  Swapped in before the wait
+ * and, on the ordinary exits, swapped back after.  The exit that IS the
+ * signal keeps the temporary mask installed and arms the restore for the
+ * delivery path to make (task.h, t_sig_mask_restore): put back here, it
+ * would block the signal the caller unblocked to receive.
+ */
+static long
+darwin_select_common(struct syscall_frame *f, bool by_spec)
+{
+	struct darwin_select_scan	ss;
+	struct darwin_timespec		ts;
+	struct darwin_timeval		tv;
+	struct task			*t;
+	uint64_t			 args[3];
+	uint64_t			 deadline;
+	uint64_t			 ms;
+	uint32_t			 mask;
+	uint32_t			 old_mask;
+	long				 rv;
+	int				 k;
+	int				 nfds;
+	bool				 masked;
+	bool				 once;
+
+	t    = current_thread->th_task;
+	nfds = (int)f->sf_arg0;
+	if (nfds < 0 || nfds > DARWIN_FD_SETSIZE)
+		return (darwin_err(f, DARWIN_EINVAL));
+	ss.ss_task  = t;
+	ss.ss_nfds  = nfds;
+	ss.ss_words = ((size_t)nfds + DARWIN_NFDBITS - 1) / DARWIN_NFDBITS;
+	args[0] = f->sf_arg1;
+	args[1] = f->sf_arg2;
+	args[2] = f->sf_arg3;
+	for (k = 0; k < 3; k++) {
+		ss.ss_has[k] = args[k] != 0;
+		if (!ss.ss_has[k] || ss.ss_words == 0)
+			continue;
+		if (syscall_copyin(ss.ss_want[k], (const void *)args[k],
+		    ss.ss_words * sizeof(uint32_t)) != 0)
+			return (darwin_err(f, DARWIN_EFAULT));
+	}
+
+	once     = false;
+	deadline = 0;
+	if (f->sf_arg4 != 0) {
+		if (by_spec) {
+			if (syscall_copyin(&ts, (const void *)f->sf_arg4,
+			    sizeof(ts)) != 0)
+				return (darwin_err(f, DARWIN_EFAULT));
+			if (ts.ts_sec < 0 || ts.ts_nsec < 0 ||
+			    ts.ts_nsec >= 1000000000LL)
+				return (darwin_err(f, DARWIN_EINVAL));
+			ms = (uint64_t)ts.ts_sec * 1000u +
+			    ((uint64_t)ts.ts_nsec + 999999u) / 1000000u;
+		} else {
+			if (syscall_copyin(&tv, (const void *)f->sf_arg4,
+			    sizeof(tv)) != 0)
+				return (darwin_err(f, DARWIN_EFAULT));
+			if (tv.tv_sec < 0 || tv.tv_usec < 0 ||
+			    tv.tv_usec >= 1000000)
+				return (darwin_err(f, DARWIN_EINVAL));
+			ms = (uint64_t)tv.tv_sec * 1000u +
+			    ((uint64_t)tv.tv_usec + 999u) / 1000u;
+		}
+		if (ms == 0)
+			once = true;
+		else
+			deadline = darwin_deadline_ms(ms);
+	}
+
+	masked   = by_spec && f->sf_arg5 != 0;
+	old_mask = t->t_sig_mask;
+	if (masked) {
+		if (syscall_copyin(&mask, (const void *)f->sf_arg5,
+		    sizeof(mask)) != 0)
+			return (darwin_err(f, DARWIN_EFAULT));
+		t->t_sig_mask = mask & ~darwin_sigbit(DARWIN_SIGKILL);
+	}
+
+	darwin_select_n_call++;
+	rv = darwin_readiness_wait(darwin_select_scan, &ss, deadline, once);
+
+	if (masked) {
+		if (rv == -DARWIN_EINTR) {
+			t->t_sig_mask_saved   = old_mask;
+			t->t_sig_mask_restore = true;
+		} else
+			t->t_sig_mask = old_mask;
+	}
+	if (rv < 0)
+		return (darwin_err(f, (int)-rv));
+
+	for (k = 0; k < 3; k++) {
+		if (!ss.ss_has[k] || ss.ss_words == 0)
+			continue;
+		if (syscall_copyout((void *)args[k], ss.ss_got[k],
+		    ss.ss_words * sizeof(uint32_t)) != 0)
+			return (darwin_err(f, DARWIN_EFAULT));
+	}
+	return (darwin_ok(f, rv));
+}
+
+static long
+darwin_s9_pselect(struct syscall_frame *f)
+{
+
+	return (darwin_select_common(f, true));
+}
+
+/* poll(2)'s array, in and out. */
+struct darwin_poll_scan {
+	struct task		*ps_task;
+	struct darwin_pollfd	 ps_fds[DARWIN_POLL_MAX];
+	uint32_t		 ps_nfds;
+};
+
+static long
+darwin_poll_scan(void *arg)
+{
+	struct darwin_poll_scan	*ps;
+	struct darwin_pollfd	*pf;
+	uint32_t		 got;
+	uint32_t		 i;
+	uint32_t		 want;
+	long			 n;
+	int16_t			 rev;
+	bool			 bad;
+
+	ps = arg;
+	n  = 0;
+	for (i = 0; i < ps->ps_nfds; i++) {
+		pf = &ps->ps_fds[i];
+		pf->pfd_revents = 0;
+		if (pf->pfd_fd < 0)
+			continue;		/* POSIX: ignored, answers 0 */
+		want = 0;
+		if ((pf->pfd_events & DARWIN_POLLIN) != 0)
+			want |= DARWIN_RD;
+		if ((pf->pfd_events & DARWIN_POLLOUT) != 0)
+			want |= DARWIN_WR;
+		got = darwin_fd_ready(ps->ps_task, pf->pfd_fd, want, &bad);
+		rev = 0;
+		if (bad)
+			rev = DARWIN_POLLNVAL;
+		else {
+			if ((got & DARWIN_RD) != 0)
+				rev |= DARWIN_POLLIN;
+			if ((got & DARWIN_WR) != 0)
+				rev |= DARWIN_POLLOUT;
+			if ((got & DARWIN_HUP) != 0)
+				rev |= DARWIN_POLLHUP;
+			if ((got & DARWIN_ERR) != 0)
+				rev |= DARWIN_POLLERR;
+		}
+		pf->pfd_revents = rev;
+		if (rev != 0)
+			n++;
+	}
+	return (n);
+}
+
+/*
+ * poll(2): (fds, nfds, timeout-in-ms) in arg0..2; a negative timeout waits
+ * for ever, zero asks once.  Returns how many entries have a non-zero
+ * revents, the array written back whatever the outcome.
+ */
+static long
+darwin_sys_poll(struct syscall_frame *f)
+{
+	struct darwin_poll_scan	ps;
+	uint64_t		 deadline;
+	long			 rv;
+	int			 timeout;
+	bool			 once;
+
+	ps.ps_task = current_thread->th_task;
+	ps.ps_nfds = (uint32_t)f->sf_arg1;
+	timeout    = (int)f->sf_arg2;
+	if (ps.ps_nfds > DARWIN_POLL_MAX)
+		return (darwin_err(f, DARWIN_EINVAL));
+	if (ps.ps_nfds != 0 && syscall_copyin(ps.ps_fds,
+	    (const void *)f->sf_arg0, ps.ps_nfds * sizeof(ps.ps_fds[0])) != 0)
+		return (darwin_err(f, DARWIN_EFAULT));
+
+	once     = timeout == 0;
+	deadline = 0;
+	if (timeout > 0)
+		deadline = darwin_deadline_ms((uint64_t)timeout);
+	darwin_select_n_call++;
+	rv = darwin_readiness_wait(darwin_poll_scan, &ps, deadline, once);
+	if (rv < 0)
+		return (darwin_err(f, (int)-rv));
+	if (ps.ps_nfds != 0 && syscall_copyout((void *)f->sf_arg0, ps.ps_fds,
+	    ps.ps_nfds * sizeof(ps.ps_fds[0])) != 0)
+		return (darwin_err(f, DARWIN_EFAULT));
+	return (darwin_ok(f, rv));
+}
+
+/*
+ * Will argv + envp fit the dyld handoff page?  The same arithmetic as
+ * build_dyld_arg_stack (arch/amd64/usermode.c), asked BEFORE execve lets go
+ * of the old image -- past that point a refusal has nowhere to return to
+ * and the task exits 127.  The builder checks again on its own; this is the
+ * copy that can still say E2BIG.
+ */
+static bool
+darwin_frame_fits(int argc, char **argv, int envc, char **envp)
+{
+	size_t	need;
+	size_t	i;
+	int	k;
+
+	need = 8u * (size_t)(argc + envc + 5) + 16u;
+	for (k = 0; k < argc; k++) {
+		for (i = 0; argv[k][i] != '\0'; i++)
+			continue;
+		need += i + 1;
+	}
+	for (k = 0; k < envc; k++) {
+		for (i = 0; envp[k][i] != '\0'; i++)
+			continue;
+		need += i + 1;
+	}
+	return (need <= 4096u - 64u);
 }
 
 /* ---- the working directory ----------------------------------------------- */
@@ -1702,7 +2262,8 @@ darwin_files_fork_copy(struct task *parent, struct task *child)
 		dst = &child->t_darwin_files[i];
 		switch (src->of_type) {
 		case DARWIN_OF_CONSOLE:
-			dst->of_type = DARWIN_OF_CONSOLE;
+		case DARWIN_OF_NULL:
+			dst->of_type = src->of_type;
 			break;
 		case DARWIN_OF_DIR:
 		case DARWIN_OF_FILE:
@@ -1796,7 +2357,8 @@ darwin_dup_install(struct task *t, int oldfd, int newfd)
 
 	switch (type) {
 	case DARWIN_OF_CONSOLE:
-		dst->of_type = DARWIN_OF_CONSOLE;
+	case DARWIN_OF_NULL:
+		dst->of_type = type;
 		return (0);
 	case DARWIN_OF_DIR:
 	case DARWIN_OF_FILE:
@@ -1896,6 +2458,36 @@ darwin_sig_default_is_ignore(int signo)
 {
 
 	return (signo == DARWIN_SIGCHLD);
+}
+
+/*
+ * The mask a signal frame records for sigreturn to put back: the mask in
+ * force -- or, after a pselect(2) that ended in this very signal, the mask
+ * pselect was asked to put back (task.h, t_sig_mask_restore).  Reading it
+ * disarms the request: the frame now carries the restore.
+ */
+static uint32_t
+darwin_sig_mask_for_frame(struct task *t)
+{
+	uint32_t	m;
+
+	if (t->t_sig_mask_restore) {
+		t->t_sig_mask_restore = false;
+		m = t->t_sig_mask_saved;
+		return (m);
+	}
+	return (t->t_sig_mask);
+}
+
+/* Nothing was delivered after all: put the mask back now, by hand. */
+static void
+darwin_sig_mask_unarm(struct task *t)
+{
+
+	if (t->t_sig_mask_restore) {
+		t->t_sig_mask_restore = false;
+		t->t_sig_mask = t->t_sig_mask_saved;
+	}
 }
 
 void
@@ -2097,7 +2689,7 @@ darwin_signal_setup_frame(struct syscall_frame *f, int signo, uint64_t handler,
 	frame.sf_rsp    = f->sf_user_rsp;
 	frame.sf_rflags = f->sf_user_rflags;
 	frame.sf_rax    = (uint64_t)rv;
-	frame.sf_mask   = (uint64_t)t->t_sig_mask;
+	frame.sf_mask   = (uint64_t)darwin_sig_mask_for_frame(t);
 	frame.sf_pad    = 0;
 
 	base = (f->sf_user_rsp - 128) & ~(uint64_t)15;
@@ -2125,8 +2717,10 @@ darwin_signal_deliver_syscall(struct syscall_frame *f, long rv)
 	t = current_thread->th_task;
 	disp = DARWIN_SIG_DFL;
 	signo = darwin_signal_next(t, &disp);
-	if (signo == 0)
+	if (signo == 0) {
+		darwin_sig_mask_unarm(t);
 		return;
+	}
 	if (disp != DARWIN_SIG_DFL) {
 		/*
 		 * Caught: consume the pending bit and deliver to the ring-3
@@ -2171,7 +2765,7 @@ darwin_signal_setup_frame_trap(struct trapframe *tf, int signo,
 
 	frame.sf_magic = DARWIN_SIGFRAME_MAGIC_FULL;
 	frame.sf_signo = (uint64_t)signo;
-	frame.sf_mask  = (uint64_t)t->t_sig_mask;
+	frame.sf_mask  = (uint64_t)darwin_sig_mask_for_frame(t);
 	frame.sf_r15   = tf->tf_r15;
 	frame.sf_r14   = tf->tf_r14;
 	frame.sf_r13   = tf->tf_r13;
@@ -2533,6 +3127,9 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		case DARWIN_OF_FILE:
 			return (darwin_file_write(f, of,
 			    (const void *)f->sf_arg1, (size_t)f->sf_arg2));
+		case DARWIN_OF_NULL:
+			/* Swallowed whole; the bytes are not even read. */
+			return (darwin_ok(f, (long)f->sf_arg2));
 		default:
 			return (darwin_err(f, DARWIN_EBADF));
 		}
@@ -2668,6 +3265,28 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		if (darwin_path_resolve(current_thread->th_task, raw, path,
 		    sizeof(path)) != 0)
 			return (darwin_err(f, DARWIN_ENAMETOOLONG));
+
+		/*
+		 * /dev, such as it is: three names and no directory.  The
+		 * console answers to /dev/console and /dev/tty -- the name
+		 * ttyname(3) hands out has to open the thing it names, or it
+		 * is not a name -- and /dev/null is the sink every shell
+		 * redirection reaches for.  Answered before the volume is
+		 * asked, because a volume that HAD a /dev would otherwise
+		 * be handed a create and make a plain file called null.
+		 */
+		if (darwin_streq(path, "/dev/null") ||
+		    darwin_streq(path, "/dev/console") ||
+		    darwin_streq(path, "/dev/tty")) {
+			fd = darwin_fd_alloc(current_thread->th_task);
+			if (fd < 0)
+				return (darwin_err(f, DARWIN_EMFILE));
+			t = current_thread->th_task;
+			t->t_darwin_files[fd].of_flags = (uint32_t)f->sf_arg1;
+			t->t_darwin_files[fd].of_type  = path[5] == 'n' ?
+			    DARWIN_OF_NULL : DARWIN_OF_CONSOLE;
+			return (darwin_ok(f, fd));
+		}
 
 		/*
 		 * WHAT AN OPEN FOR WRITING NOW MEANS
@@ -2888,7 +3507,13 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			 */
 			return (darwin_err(f, DARWIN_EISDIR));
 		case DARWIN_OF_FILE:
-			avail = of->of_size - of->of_off;
+			/*
+			 * A cursor past the end reads as EOF, not as a very
+			 * large number: ftruncate(2) leaves the offset where
+			 * it was, and the difference below would wrap.
+			 */
+			avail = of->of_off < of->of_size ?
+			    of->of_size - of->of_off : 0;
 			if (n > (size_t)avail)
 				n = avail;
 			if (n == 0)
@@ -2906,6 +3531,8 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		case DARWIN_OF_PIPE_R:
 			return (darwin_pipe_read(f, of->of_pipe,
 			    (void *)f->sf_arg1, n));
+		case DARWIN_OF_NULL:
+			return (darwin_ok(f, 0));	/* always at its end */
 		default:
 			return (darwin_err(f, DARWIN_EBADF));
 		}
@@ -3122,6 +3749,8 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		if (of->of_type == DARWIN_OF_PIPE_R ||
 		    of->of_type == DARWIN_OF_PIPE_W)
 			return (darwin_err(f, DARWIN_ESPIPE));
+		if (of->of_type == DARWIN_OF_NULL)
+			return (darwin_ok(f, 0));	/* every offset is 0 */
 		if (of->of_type != DARWIN_OF_FILE)
 			return (darwin_err(f, DARWIN_EBADF));
 
@@ -3137,6 +3766,101 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			return (darwin_err(f, DARWIN_EINVAL));
 		of->of_off = (uint32_t)pos;
 		return (darwin_ok(f, (long)pos));
+	}
+	case DARWIN_SYS_access: {
+		struct fs_statbuf	sb;
+		char			path[DARWIN_PATH_MAX];
+		char			raw[DARWIN_PATH_MAX];
+		long			len;
+		int			mode;
+		int			rv;
+
+		/*
+		 * There is one user and it is root, so the only permission
+		 * question with a real answer is "can this be written":
+		 * the synthetic /bin and the published past cannot.  The
+		 * rest is existence, which is what most callers ask (a
+		 * PATH search asks X_OK and means "is it there").
+		 */
+		len = syscall_copyin_str((const char *)f->sf_arg0, raw,
+		    sizeof(raw));
+		if (len < 0)
+			return (darwin_err(f, DARWIN_EFAULT));
+		if (darwin_path_resolve(current_thread->th_task, raw, path,
+		    sizeof(path)) != 0)
+			return (darwin_err(f, DARWIN_ENAMETOOLONG));
+		mode = (int)f->sf_arg1;
+		if (darwin_bin_lookup(path) != NULL) {
+			if ((mode & DARWIN_W_OK) != 0)
+				return (darwin_err(f, DARWIN_EROFS));
+			return (darwin_ok(f, 0));
+		}
+		if (darwin_streq(path, "/dev/null") ||
+		    darwin_streq(path, "/dev/console") ||
+		    darwin_streq(path, "/dev/tty"))
+			return (darwin_ok(f, 0));
+		rv = fs_stat(path, &sb);
+		if (rv != FS_E_OK)
+			return (darwin_err(f, darwin_fs_errno(rv)));
+		if ((mode & DARWIN_W_OK) != 0 && fs_readonly(path))
+			return (darwin_err(f, DARWIN_EROFS));
+		return (darwin_ok(f, 0));
+	}
+	case DARWIN_SYS_select:
+		return (darwin_select_common(f, false));
+	case DARWIN_SYS_poll:
+		return (darwin_sys_poll(f));
+	case DARWIN_SYS_ftruncate: {
+		struct darwin_ofile	*of;
+		struct task		*t;
+		int64_t			 len;
+		int			 fd;
+		int			 rv;
+
+		fd  = (int)f->sf_arg0;
+		len = (int64_t)f->sf_arg1;
+		t   = current_thread->th_task;
+		if (fd < 0 || fd >= DARWIN_NOFILE)
+			return (darwin_err(f, DARWIN_EBADF));
+		of = &t->t_darwin_files[fd];
+		if (of->of_type == DARWIN_OF_FREE)
+			return (darwin_err(f, DARWIN_EBADF));
+		if (len < 0)
+			return (darwin_err(f, DARWIN_EINVAL));
+		if (of->of_type == DARWIN_OF_DIR)
+			return (darwin_err(f, DARWIN_EISDIR));
+		if (of->of_type != DARWIN_OF_FILE)
+			return (darwin_err(f, DARWIN_EINVAL));
+		if (of->of_buf != NULL)
+			return (darwin_err(f, DARWIN_EROFS)); /* a /bin image */
+		if ((of->of_flags & DARWIN_O_ACCMODE) == DARWIN_O_RDONLY)
+			return (darwin_err(f, DARWIN_EINVAL));
+		rv = fs_truncate(&of->of_handle, (uint64_t)len);
+		if (rv != FS_E_OK)
+			return (darwin_err(f, darwin_fs_errno(rv)));
+		/* The cursor stays where it was: read(2) knows about that. */
+		of->of_size = (uint32_t)of->of_handle.fh_size;
+		return (darwin_ok(f, 0));
+	}
+	case DARWIN_SYS_mkfifo: {
+		char	raw[DARWIN_PATH_MAX];
+		long	len;
+
+		/*
+		 * No FIFOs.  A named pipe is a pipe reachable by a path, and
+		 * this kernel keeps its pipes in descriptor tables and its
+		 * names on a volume that has no node type for one yet.  EPERM
+		 * is what a filesystem that cannot hold one answers, and the
+		 * one caller so far (make's jobserver) hears it, says so, and
+		 * uses a pipe(2) instead.
+		 */
+		len = syscall_copyin_str((const char *)f->sf_arg0, raw,
+		    sizeof(raw));
+		if (len < 0)
+			return (darwin_err(f, DARWIN_EFAULT));
+		kprintf("darwin: mkfifo('%s'): this kernel has no FIFOs\n",
+		    raw);
+		return (darwin_err(f, DARWIN_EPERM));
 	}
 	case DARWIN_SYS_fork: {
 		long	rv;
@@ -3476,12 +4200,14 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		char				  path[256];
 		const struct progreg_entry	 *e;
 		char				**kargv;
+		char				**kenvp;
 		const char			 *base;
 		size_t				  i;
 		long				  n;
 		long				  rv;
 		uint32_t			  magic;
 		int				  argc;
+		int				  envc;
 
 		n = syscall_copyin_str((const char *)f->sf_arg0, path,
 		    sizeof(path));
@@ -3498,7 +4224,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			if (path[i] == '/')
 				base = &path[i + 1];
 		}
-		e = progreg_find(base);
+		e = darwin_bin_find(base);
 		if (e == NULL) {
 			kprintf("darwin: UNIX execve('%s') -> "
 			    "not registered\n", path);
@@ -3518,11 +4244,44 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			return (darwin_err(f, rv == SYS_E_NOMEM ?
 			    DARWIN_ENOMEM : DARWIN_EFAULT));
 
-		kprintf("darwin: UNIX execve('%s') argc=%d\n", path, argc);
+		/*
+		 * THE ENVIRONMENT CROSSES AN EXEC.  It did not, for a long
+		 * time: the kernel passed an empty envp and libSystem made
+		 * one up (PATH=/bin), which every program so far survived
+		 * because none of them told a child anything.  A build tool
+		 * is nothing but that -- MAKEFLAGS, MAKELEVEL, the jobserver's
+		 * descriptors -- and a shell exporting a variable expects the
+		 * program it runs to see it.  Copied under its own caps; a
+		 * vector that will not fit the handoff page is refused here,
+		 * with the errno for it, before the old image is let go of.
+		 */
+		kenvp = NULL;
+		envc  = 0;
+		rv = syscall_copyin_vec((char *const *)f->sf_arg2, &kenvp,
+		    &envc, SPAWN_ENV_MAX, SPAWN_ENV_BYTES_MAX);
+		if (rv < 0) {
+			if (kargv != NULL)
+				kfree(kargv);
+			return (darwin_err(f, rv == SYS_E_NOMEM ?
+			    DARWIN_ENOMEM : rv == SYS_E_INVAL ?
+			    DARWIN_E2BIG : DARWIN_EFAULT));
+		}
+		if (!darwin_frame_fits(argc, kargv, envc, kenvp)) {
+			if (kargv != NULL)
+				kfree(kargv);
+			if (kenvp != NULL)
+				kfree(kenvp);
+			return (darwin_err(f, DARWIN_E2BIG));
+		}
+
+		kprintf("darwin: UNIX execve('%s') argc=%d envc=%d\n", path,
+		    argc, envc);
 		rv = arch_darwin_execve(e->pr_image, e->pr_size, argc,
-		    kargv, f);
+		    kargv, envc, kenvp, f);
 		if (kargv != NULL)
 			kfree(kargv);
+		if (kenvp != NULL)
+			kfree(kenvp);
 		if (rv < 0)
 			return (darwin_err(f, DARWIN_ENOMEM));
 		/* Frame rewritten; the sysret enters the new image. */
@@ -3583,7 +4342,8 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		return (darwin_ok(f, 0));
 	}
 	case DARWIN_SYS_sigaction: {
-		int	signo;
+		uint64_t	old;
+		int		signo;
 
 		/*
 		 * libSystem's sigaction/signal marshal (signo, handler) into
@@ -3597,11 +4357,21 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		if (signo <= 0 || signo >= DARWIN_NSIG ||
 		    signo == DARWIN_SIGKILL)
 			return (darwin_err(f, DARWIN_EINVAL));
+		/*
+		 * The disposition being replaced comes back in %rax.  It is
+		 * not decoration: a program that sets a handler only where
+		 * the signal was not already ignored -- which is what a
+		 * command run in the background under a shell expects, and
+		 * what make does for every fatal signal -- needs the old
+		 * value, and a libc that always said SIG_DFL made it install
+		 * handlers it had promised not to.
+		 */
+		old = current_thread->th_task->t_sig_handler[signo];
 		current_thread->th_task->t_sig_handler[signo] = f->sf_arg1;
 		/* arg2 carries libSystem's _sigtramp VA (same for every sig). */
 		if (f->sf_arg2 != 0)
 			current_thread->th_task->t_sig_tramp = f->sf_arg2;
-		return (darwin_ok(f, 0));
+		return (darwin_ok(f, (long)old));
 	}
 	case DARWIN_SYS_sigprocmask: {
 		struct task	*t;
@@ -3955,6 +4725,8 @@ darwin_style9(struct syscall_frame *f, uint32_t num)
 		return (darwin_s9_fs_fstat(f));
 	case DARWIN_S9_fs_fdpath:
 		return (darwin_s9_fs_fdpath(f));
+	case DARWIN_S9_pselect:
+		return (darwin_s9_pselect(f));
 	default:
 		kprintf("darwin: unimplemented style9 call %u\n",
 		    (unsigned)num);
@@ -4223,6 +4995,7 @@ darwin_s9_fs_fstat(struct syscall_frame *f)
 		return (darwin_err(f, DARWIN_EBADF));
 	of = &t->t_darwin_files[fd];
 	ds.fds_size = 0;
+	ds.fds_ino  = 0;
 	switch (of->of_type) {
 	case DARWIN_OF_FREE:
 		if (fd > 2)
@@ -4230,15 +5003,22 @@ darwin_s9_fs_fstat(struct syscall_frame *f)
 		ds.fds_kind = DARWIN_FDSTAT_CHR;
 		break;
 	case DARWIN_OF_CONSOLE:
+	case DARWIN_OF_NULL:
 		ds.fds_kind = DARWIN_FDSTAT_CHR;
 		break;
 	case DARWIN_OF_FILE:
 		ds.fds_size = of->of_size;
 		ds.fds_kind = DARWIN_FDSTAT_REG;
+		ds.fds_ino  = of->of_handle.fh_ino;
 		break;
-	case DARWIN_OF_DIR:
+	case DARWIN_OF_DIR: {
+		struct fs_statbuf	sb;
+
 		ds.fds_kind = DARWIN_FDSTAT_DIR;
+		if (of->of_path != NULL && fs_stat(of->of_path, &sb) == FS_E_OK)
+			ds.fds_ino = sb.fs_ino;
 		break;
+	}
 	case DARWIN_OF_PIPE_R:
 	case DARWIN_OF_PIPE_W:
 		ds.fds_kind = DARWIN_FDSTAT_FIFO;
@@ -4346,6 +5126,27 @@ darwin_streq(const char *a, const char *b)
 }
 
 /*
+ * A name in the Darwin view of /bin.  One alias: "sh" is dash.
+ *
+ * Every program built for a Unix that needs a shell asks for /bin/sh --
+ * make's default SHELL is that string, compiled in -- and the registry's
+ * "sh" is this kernel's own native shell, an ELF the Darwin loader rightly
+ * refuses with ENOEXEC.  Debian answers the same question with a symlink;
+ * this answers it here, at the one point every Darwin-side lookup of a
+ * program passes through, so stat, open and execve agree on what the name
+ * means.  The native side never asks through this function and is not
+ * affected: `sh` typed at the style9 prompt is still sh.elf.
+ */
+static const struct progreg_entry *
+darwin_bin_find(const char *name)
+{
+
+	if (darwin_streq(name, "sh"))
+		name = "dash";
+	return (progreg_find(name));
+}
+
+/*
  * The synthetic /bin: the program registry presented as a directory.  A
  * shell's PATH machinery stat(2)s each candidate before committing to an
  * execve, so the registry the execve resolves against must also be visible
@@ -4364,5 +5165,5 @@ darwin_bin_lookup(const char *path)
 			return (NULL);
 	if (path[i] != '/')
 		return (NULL);
-	return (progreg_find(path + i + 1));
+	return (darwin_bin_find(path + i + 1));
 }
