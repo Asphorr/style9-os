@@ -143,12 +143,6 @@ bsd_call(long nr, long a, long b, long c)
 	return (ret);
 }
 
-static int
-s_open(const char *path, int flags)
-{
-	return ((int)bsd_call(0x2000005, (long)path, flags, 0));   /* BSD open */
-}
-
 static long
 s_read(int fd, void *buf, unsigned long n)
 {
@@ -744,14 +738,54 @@ fread(void *ptr, size_t size, size_t nmemb, FILE *fp)
 	return (got / size);
 }
 
+/*
+ * fopen(3)'s mode string, as open(2) flags.  "r" reads, "w" makes and
+ * empties, "a" makes and appends; a "+" opens both ways, an "x" (C11)
+ * refuses a file that exists, and "b", "e" and "t" mean nothing here.
+ * Anything else is EINVAL, which is the standard's answer.
+ */
+int	open(const char *path, int flags, ...);
+
+static int
+fopen_flags(const char *mode)
+{
+	int	flags;
+	int	i;
+
+	if (mode == NULL)
+		return (-1);
+	switch (mode[0]) {
+	case 'r':	flags = 0x0000;					break;
+	case 'w':	flags = 0x0001 | 0x0200 | 0x0400;		break;
+	case 'a':	flags = 0x0001 | 0x0200 | 0x0008;		break;
+	default:	return (-1);
+	}
+	for (i = 1; mode[i] != '\0'; i++) {
+		switch (mode[i]) {
+		case '+':	flags = (flags & ~0x0003) | 0x0002;	break;
+		case 'x':	flags |= 0x0800;			break;
+		case 'b':
+		case 'e':
+		case 't':	break;
+		default:	return (-1);
+		}
+	}
+	return (flags);
+}
+
 FILE *
 fopen(const char *path, const char *mode)
 {
 	FILE	*fp;
 	int	 fd;
+	int	 flags;
 
-	(void)mode;				/* read-only FS: always O_RDONLY */
-	fd = s_open(path, 0);
+	flags = fopen_flags(mode);
+	if (flags < 0) {
+		g_errno = 22;			/* EINVAL */
+		return (NULL);
+	}
+	fd = open(path, flags, 0666);
 	if (fd < 0)
 		return (NULL);			/* absent / unreadable */
 	fp = (FILE *)malloc(sizeof(*fp));
@@ -805,12 +839,6 @@ ftell(FILE *fp)
 	return (s_lseek(fp->fd, 0, 1));		/* SEEK_CUR */
 }
 
-FILE *
-tmpfile(void)
-{
-
-	return (NULL);				/* no writable FS yet */
-}
 
 /* ---- formatted output (printf / fprintf / sprintf family) --------------- */
 
@@ -1500,6 +1528,7 @@ lstat_inode64(const char *path, void *buf)
  * neutral struct and the S_IF* spelling happens here.
  */
 struct s9_fdstat {			/* mirrors kern/darwin.h */
+	uint64_t	fds_ino;
 	uint32_t	fds_size;
 	uint8_t		fds_kind;	/* 0 reg / 1 chr / 2 fifo / 3 dir */
 };
@@ -1547,6 +1576,7 @@ fstat64(int fd, void *buf)
 		break;
 	}
 	*(uint16_t *)(p + 6)   = 1;			/* st_nlink   */
+	*(uint64_t *)(p + 8)   = ds.fds_ino;		/* st_ino     */
 	*(uint32_t *)(p + 112) = 512;			/* st_blksize */
 	return (0);
 }
@@ -2588,15 +2618,6 @@ clock_gettime(int clk, struct s9_timespec *ts)
 	return (0);
 }
 
-void *
-localtime(const long *t)
-{
-	static long	tmbuf[16];	/* a zeroed struct tm, amply sized */
-
-	(void)t;
-	return (tmbuf);
-}
-
 size_t
 strftime(char *s, size_t max, const char *fmt, const void *tm)
 {
@@ -2989,11 +3010,27 @@ close(int fd)
 	return (s_close(fd));
 }
 
+/*
+ * open(2).  The third argument exists only when O_CREAT (0x200) is in the
+ * flags, and then it is the mode the file is made with, less the umask --
+ * which the kernel subtracts.  It used to be dropped here and 0 sent in its
+ * place, so every file a shell made with `>` came out mode 0000: readable
+ * by root, which is everyone, and invisible as a defect for exactly that
+ * reason.
+ */
 int
 open(const char *path, int flags, ...)
 {
+	__builtin_va_list	ap;
+	int			mode;
 
-	return ((int)bsd_call_e(0x2000005, (long)path, flags, 0));
+	mode = 0;
+	if ((flags & 0x0200) != 0) {
+		__builtin_va_start(ap, flags);
+		mode = __builtin_va_arg(ap, int);
+		__builtin_va_end(ap);
+	}
+	return ((int)bsd_call_e(0x2000005, (long)path, flags, mode));
 }
 
 /*
@@ -3474,28 +3511,48 @@ __asm__(
 	"\tud2\n"			/* sigreturn does not return           */
 );
 
+/*
+ * The kernel hands the disposition being replaced back in %rax, and both
+ * entry points pass it on: sigaction into oact's leading handler word,
+ * signal as its return.  A caller that only installs a handler where the
+ * signal was not already ignored -- make does this for every fatal signal,
+ * the way a job run in the background is meant to -- needs that word to
+ * be true.  A NULL act asks without changing: the kernel is told the
+ * current disposition back, which is what "no change" spells here.
+ */
 int
 sigaction(int sig, const void *act, void *oact)
 {
 	long	handler;
+	long	old;
 
-	handler = (act != NULL) ? (long)*(const unsigned long *)act : 0;
-	if (oact != NULL)
+	if (act != NULL)
+		handler = (long)*(const unsigned long *)act;
+	else {
+		old = bsd_call_e(0x200002E, sig, 0, (long)&sig_tramp);
+		if (old < 0)
+			return (-1);
+		handler = old;
+	}
+	old = bsd_call_e(0x200002E, sig, handler, (long)&sig_tramp);
+	if (old < 0)
+		return (-1);
+	if (oact != NULL) {
 		(void)memset(oact, 0, 16);
-	return ((int)bsd_call_e(0x200002E, sig, handler, (long)&sig_tramp));
+		*(unsigned long *)oact = (unsigned long)old;
+	}
+	return (0);
 }
 
 void *
 signal(int sig, void *handler)
 {
+	long	old;
 
-	/*
-	 * signal(3) records through the same path as sigaction, handing the
-	 * kernel the trampoline too.  We do not track the previous
-	 * disposition, so report SIG_DFL (NULL).
-	 */
-	(void)bsd_call_e(0x200002E, sig, (long)handler, (long)&sig_tramp);
-	return (NULL);
+	old = bsd_call_e(0x200002E, sig, (long)handler, (long)&sig_tramp);
+	if (old < 0)
+		return ((void *)-1);		/* SIG_ERR */
+	return ((void *)old);
 }
 
 int
@@ -3527,12 +3584,22 @@ sigemptyset(void *set)
 	return (0);
 }
 
+/*
+ * These two used to do nothing, and a mask built out of them was always
+ * empty.  That is a lie with a shape: a program blocks SIGCHLD, checks for
+ * a dead child, and waits with pselect -- and with an empty mask the check
+ * and the wait have a window between them that the block was meant to
+ * close.  Apple's sigset_t is a 32-bit word, signals 1..31.
+ */
 int
 sigaddset(void *set, int sig)
 {
 
-	(void)set;
-	(void)sig;
+	if (set == NULL || sig < 1 || sig > 31) {
+		g_errno = 22;			/* EINVAL */
+		return (-1);
+	}
+	*(unsigned int *)set |= 1u << sig;
 	return (0);
 }
 
@@ -3540,9 +3607,9 @@ int
 sigismember(const void *set, int sig)
 {
 
-	(void)set;
-	(void)sig;
-	return (0);
+	if (set == NULL || sig < 1 || sig > 31)
+		return (0);
+	return ((*(const unsigned int *)set & (1u << sig)) != 0);
 }
 
 int
@@ -3590,6 +3657,21 @@ _NSGetEnviron(void)
 }
 
 /*
+ * The environment the kernel handed over, if any: our dyld calls this
+ * before main, from the same handoff stack it reads argv off, the way it
+ * calls setprogname.  An empty vector means the kernel had nothing to say
+ * -- a task spawned from the native shell -- and the default above stands,
+ * so a program started by hand still finds its PATH.
+ */
+void
+s9_environ_init(char **envp)
+{
+
+	if (envp != NULL && envp[0] != NULL)
+		environ = envp;
+}
+
+/*
  * The kernel has a working directory now, so these stop pretending.
  *
  * What they used to be is worth recording, because the shape of the lie is
@@ -3606,22 +3688,142 @@ chdir(const char *path)
 	return ((int)bsd_call_e(0x2000000 | 12, (long)path, 0, 0));
 }
 
-int
-unsetenv(const char *name)
-{
+/*
+ * THE ENVIRONMENT CAN BE EDITED, which it could not: setenv and unsetenv
+ * returned success and changed nothing, a lie nothing noticed while no
+ * program here told a child anything.  A build tool is made of telling
+ * children things.  The vector is taken over on the first edit -- a copy
+ * of the pointers, malloc'd, so the handoff-stack vector the kernel wrote
+ * is never written to -- and grown as needed.  putenv keeps the caller's
+ * string, as POSIX says it must; setenv makes its own.
+ */
+static char	**environ_owned;		/* the vector, once ours   */
+static size_t	  environ_cap;			/* slots in it, NULL incl. */
 
-	(void)name;
+static size_t
+environ_count(void)
+{
+	size_t	n;
+
+	for (n = 0; environ != NULL && environ[n] != NULL; n++)
+		continue;
+	return (n);
+}
+
+/* Find "name=..." in environ; the index, or the count when absent. */
+static size_t
+environ_find(const char *name, size_t namelen)
+{
+	size_t	i;
+
+	for (i = 0; environ != NULL && environ[i] != NULL; i++) {
+		if (strncmp(environ[i], name, namelen) == 0 &&
+		    environ[i][namelen] == '=')
+			return (i);
+	}
+	return (i);
+}
+
+/* Make environ ours to edit, with room for `extra` more entries. */
+static int
+environ_own(size_t extra)
+{
+	char	**v;
+	size_t	  n;
+	size_t	  i;
+
+	n = environ_count();
+	if (environ == environ_owned && environ_owned != NULL &&
+	    environ_cap >= n + extra + 1)
+		return (0);
+	v = malloc((n + extra + 16) * sizeof(char *));
+	if (v == NULL) {
+		g_errno = 12;			/* ENOMEM */
+		return (-1);
+	}
+	for (i = 0; i < n; i++)
+		v[i] = environ[i];
+	v[n] = NULL;
+	environ       = v;
+	environ_owned = v;
+	environ_cap   = n + extra + 16;
+	return (0);
+}
+
+int
+putenv(char *str)
+{
+	size_t	namelen;
+	size_t	i;
+	size_t	n;
+
+	if (str == NULL || strchr(str, '=') == NULL) {
+		g_errno = 22;			/* EINVAL */
+		return (-1);
+	}
+	namelen = (size_t)(strchr(str, '=') - str);
+	if (environ_own(1) != 0)
+		return (-1);
+	i = environ_find(str, namelen);
+	n = environ_count();
+	environ[i] = str;
+	if (i == n)
+		environ[n + 1] = NULL;
 	return (0);
 }
 
 int
 setenv(const char *name, const char *value, int overwrite)
 {
+	char	*s;
+	size_t	 namelen;
+	size_t	 i;
+	size_t	 n;
 
-	(void)name;
-	(void)value;
-	(void)overwrite;
-	return (0);
+	if (name == NULL || name[0] == '\0' || strchr(name, '=') != NULL) {
+		g_errno = 22;
+		return (-1);
+	}
+	if (value == NULL)
+		value = "";
+	namelen = strlen(name);
+	i = environ_find(name, namelen);
+	n = environ_count();
+	if (i < n && !overwrite)
+		return (0);
+	s = malloc(namelen + 1 + strlen(value) + 1);
+	if (s == NULL) {
+		g_errno = 12;
+		return (-1);
+	}
+	memcpy(s, name, namelen);
+	s[namelen] = '=';
+	strcpy(s + namelen + 1, value);
+	return (putenv(s));
+}
+
+int
+unsetenv(const char *name)
+{
+	size_t	namelen;
+	size_t	i;
+	size_t	n;
+
+	if (name == NULL || name[0] == '\0' || strchr(name, '=') != NULL) {
+		g_errno = 22;
+		return (-1);
+	}
+	namelen = strlen(name);
+	for (;;) {
+		i = environ_find(name, namelen);
+		n = environ_count();
+		if (i == n)
+			return (0);
+		if (environ_own(0) != 0)
+			return (-1);
+		for (; i < n; i++)
+			environ[i] = environ[i + 1];
+	}
 }
 
 /* Process groups and resource limits do not exist yet: report success. */
@@ -4058,14 +4260,6 @@ rename(const char *from, const char *to)
 	return ((int)bsd_call_e(0x2000080, (long)from, (long)to, 0));
 }
 
-int
-mkstemp(char *tmpl)
-{
-
-	(void)tmpl;
-	g_errno = 30;				/* EROFS */
-	return (-1);
-}
 
 /*
  * Resource limits: everything unlimited (Darwin RLIM_INFINITY).  dash's
@@ -4959,4 +5153,758 @@ pthread_mutex_unlock(void *m)
 
 	(void)m;
 	return (0);
+}
+
+/* ---- the gmake rung: readiness, spawning, and what a build tool asks ----- */
+
+/*
+ * GNU make is the first program here that is nothing but a way of running
+ * OTHER programs, and the thirty-three symbols it needed sort into three
+ * kinds.  A kernel kind, which is where the rung earned its keep: select(2)
+ * and pselect -- readiness, asked rather than assumed, the first wait in
+ * this system that is about more than one thing -- plus access(2),
+ * ftruncate(2) and an environment that survives an exec.  A spawning kind:
+ * posix_spawn, which on Darwin is THE way a process is started and which
+ * this library builds out of fork and execve, because a fork here is a
+ * copy-on-write map share and costs what a spawn would.  And the ordinary
+ * kind -- strndup, perror, setvbuf -- which is what most of any libc is.
+ *
+ * Each of the honest edges is said where it lives: mkfifo is refused by the
+ * kernel, dlopen by this library, getloadavg has nothing to report, and
+ * posix_spawn learns that a program does not exist before it forks, which is
+ * how it can answer ENOENT as a return value the way the real one does.
+ */
+
+/*
+ * select(2), Darwin #93, and pselect through the style9-private class (the
+ * kernel says why, next to DARWIN_SYS_select).  The two-level namespace
+ * hands out several spellings of each -- $1050 for a binary built against
+ * the 10.5 SDK's FD_SETSIZE semantics, $DARWIN_EXTSN for one built with the
+ * extended-size fd_set -- and every one of them is the same call here: an
+ * fd_set is 1024 bits in both, and the kernel reads only the words nfds
+ * reaches.
+ */
+int
+select(int nfds, void *rfds, void *wfds, void *efds, const void *tv)
+{
+
+	return ((int)bsd_call6_e(0x200005D, nfds, (long)rfds, (long)wfds,
+	    (long)efds, (long)tv, 0));
+}
+
+int	select_1050(int, void *, void *, void *, const void *)
+	    __asm__("_select$1050");
+int	select_extsn(int, void *, void *, void *, const void *)
+	    __asm__("_select$DARWIN_EXTSN");
+
+int
+select_1050(int nfds, void *rfds, void *wfds, void *efds, const void *tv)
+{
+
+	return (select(nfds, rfds, wfds, efds, tv));
+}
+
+int
+select_extsn(int nfds, void *rfds, void *wfds, void *efds, const void *tv)
+{
+
+	return (select(nfds, rfds, wfds, efds, tv));
+}
+
+int
+pselect(int nfds, void *rfds, void *wfds, void *efds, const void *ts,
+    const void *sigmask)
+{
+
+	return ((int)bsd_call6_e(0x2A000007, nfds, (long)rfds, (long)wfds,
+	    (long)efds, (long)ts, (long)sigmask));
+}
+
+int	pselect_1050(int, void *, void *, void *, const void *, const void *)
+	    __asm__("_pselect$1050");
+int	pselect_extsn(int, void *, void *, void *, const void *, const void *)
+	    __asm__("_pselect$DARWIN_EXTSN");
+
+int
+pselect_1050(int nfds, void *rfds, void *wfds, void *efds, const void *ts,
+    const void *sigmask)
+{
+
+	return (pselect(nfds, rfds, wfds, efds, ts, sigmask));
+}
+
+int
+pselect_extsn(int nfds, void *rfds, void *wfds, void *efds, const void *ts,
+    const void *sigmask)
+{
+
+	return (pselect(nfds, rfds, wfds, efds, ts, sigmask));
+}
+
+/* poll(2), Darwin #230. */
+int
+poll(void *fds, unsigned int nfds, int timeout)
+{
+
+	return ((int)bsd_call_e(0x20000E6, (long)fds, (long)nfds, timeout));
+}
+
+/*
+ * Apple's <sys/select.h> guards every FD_SET/FD_ISSET with this when
+ * _FORTIFY_SOURCE is on: a 1 means the fd is inside the set, a 0 aborts
+ * the caller.  FD_SETSIZE is 1024 here as there.
+ */
+int
+__darwin_check_fd_set_overflow(int n, const void *set, int unlimited)
+{
+
+	(void)set;
+	if (unlimited != 0)
+		return (1);
+	return (n >= 0 && n < 1024);
+}
+
+/* access(2), Darwin #33.  The kernel says what the answer means here. */
+int
+access(const char *path, int mode)
+{
+
+	return ((int)bsd_call_e(0x2000021, (long)path, mode, 0));
+}
+
+/* ftruncate(2), Darwin #201; truncate(2) over it. */
+int
+ftruncate(int fd, long length)
+{
+
+	return ((int)bsd_call_e(0x20000C9, fd, length, 0));
+}
+
+int
+truncate(const char *path, long length)
+{
+	int	fd;
+	int	rv;
+	int	err;
+
+	fd = open(path, 1);			/* O_WRONLY */
+	if (fd < 0)
+		return (-1);
+	rv  = ftruncate(fd, length);
+	err = g_errno;
+	close(fd);
+	g_errno = err;
+	return (rv);
+}
+
+/* mkfifo(2), Darwin #132.  Refused by the kernel, which says why. */
+int
+mkfifo(const char *path, unsigned short mode)
+{
+
+	return ((int)bsd_call_e(0x2000084, (long)path, (long)mode, 0));
+}
+
+/* remove(3): unlink, and rmdir for what unlink will not take. */
+int
+remove(const char *path)
+{
+
+	if (unlink(path) == 0)
+		return (0);
+	if (g_errno == 21 || g_errno == 1)	/* EISDIR, EPERM */
+		return (rmdir(path));
+	return (-1);
+}
+
+/* ---- posix_spawn --------------------------------------------------------- */
+
+/*
+ * Apple's posix_spawnattr_t and posix_spawn_file_actions_t are both `void *`:
+ * the caller holds a pointer and the library owns what it points at, so the
+ * shapes below are this library's business alone.  File actions are kept in
+ * order, as POSIX requires -- a dup2 after a close of the same fd means
+ * something different from the reverse.
+ */
+#define	SPAWN_FA_MAX		16
+#define	SPAWN_FA_DUP2		1
+#define	SPAWN_FA_CLOSE		2
+
+#define	POSIX_SPAWN_SETSIGDEF	0x0004
+#define	POSIX_SPAWN_SETSIGMASK	0x0008
+
+struct s9_spawn_fa {
+	int	fa_n;
+	int	fa_kind[SPAWN_FA_MAX];
+	int	fa_from[SPAWN_FA_MAX];
+	int	fa_to[SPAWN_FA_MAX];
+};
+
+struct s9_spawn_attr {
+	unsigned int	sa_sigmask;
+	unsigned int	sa_sigdefault;
+	short		sa_flags;
+};
+
+int
+posix_spawn_file_actions_init(void **fap)
+{
+	struct s9_spawn_fa	*fa;
+
+	fa = malloc(sizeof(*fa));
+	if (fa == NULL)
+		return (12);				/* ENOMEM */
+	fa->fa_n = 0;
+	*fap = fa;
+	return (0);
+}
+
+int
+posix_spawn_file_actions_destroy(void **fap)
+{
+
+	if (*fap != NULL)
+		free(*fap);
+	*fap = NULL;
+	return (0);
+}
+
+static int
+spawn_fa_add(void **fap, int kind, int from, int to)
+{
+	struct s9_spawn_fa	*fa;
+
+	fa = *fap;
+	if (fa == NULL || fa->fa_n >= SPAWN_FA_MAX)
+		return (12);				/* ENOMEM */
+	if (from < 0 || to < 0)
+		return (9);				/* EBADF */
+	fa->fa_kind[fa->fa_n] = kind;
+	fa->fa_from[fa->fa_n] = from;
+	fa->fa_to[fa->fa_n]   = to;
+	fa->fa_n++;
+	return (0);
+}
+
+int
+posix_spawn_file_actions_adddup2(void **fap, int fd, int newfd)
+{
+
+	return (spawn_fa_add(fap, SPAWN_FA_DUP2, fd, newfd));
+}
+
+int
+posix_spawn_file_actions_addclose(void **fap, int fd)
+{
+
+	return (spawn_fa_add(fap, SPAWN_FA_CLOSE, fd, fd));
+}
+
+int
+posix_spawnattr_init(void **attrp)
+{
+	struct s9_spawn_attr	*sa;
+
+	sa = malloc(sizeof(*sa));
+	if (sa == NULL)
+		return (12);
+	sa->sa_flags      = 0;
+	sa->sa_sigmask    = 0;
+	sa->sa_sigdefault = 0;
+	*attrp = sa;
+	return (0);
+}
+
+int
+posix_spawnattr_destroy(void **attrp)
+{
+
+	if (*attrp != NULL)
+		free(*attrp);
+	*attrp = NULL;
+	return (0);
+}
+
+int
+posix_spawnattr_setflags(void **attrp, short flags)
+{
+	struct s9_spawn_attr	*sa;
+
+	sa = *attrp;
+	if (sa == NULL)
+		return (22);				/* EINVAL */
+	sa->sa_flags = flags;
+	return (0);
+}
+
+int
+posix_spawnattr_setsigmask(void **attrp, const unsigned int *mask)
+{
+	struct s9_spawn_attr	*sa;
+
+	sa = *attrp;
+	if (sa == NULL || mask == NULL)
+		return (22);
+	sa->sa_sigmask = *mask;
+	return (0);
+}
+
+int
+posix_spawnattr_setsigdefault(void **attrp, const unsigned int *set)
+{
+	struct s9_spawn_attr	*sa;
+
+	sa = *attrp;
+	if (sa == NULL || set == NULL)
+		return (22);
+	sa->sa_sigdefault = *set;
+	return (0);
+}
+
+/*
+ * posix_spawn(3): fork, arrange the child, exec.  Errors come back as the
+ * RETURN VALUE, not through errno, which is the one way this differs from
+ * every other call in the file and the reason the existence check comes
+ * first: a program that is not there is reported to the caller as ENOENT
+ * before any child exists, exactly as the real one reports it, instead of
+ * as a child that exited 127.  What is left for the child to fail at after
+ * that -- a dup2 onto a closed fd, an image the loader refuses -- it reports
+ * the shell's way, by exiting 127.
+ */
+int
+posix_spawn(int *pidp, const char *path, void *const *fap, void *const *attrp,
+    char *const argv[], char *const envp[])
+{
+	struct s9_spawn_fa	*fa;
+	struct s9_spawn_attr	*sa;
+	int			 i;
+	int			 pid;
+	int			 sig;
+
+	if (access(path, 1) != 0)			/* X_OK */
+		return (g_errno);
+	fa = fap != NULL ? *fap : NULL;
+	sa = attrp != NULL ? *attrp : NULL;
+
+	pid = fork();
+	if (pid < 0)
+		return (g_errno);
+	if (pid == 0) {
+		if (fa != NULL) {
+			for (i = 0; i < fa->fa_n; i++) {
+				if (fa->fa_kind[i] == SPAWN_FA_CLOSE) {
+					close(fa->fa_from[i]);
+					continue;
+				}
+				if (fa->fa_from[i] == fa->fa_to[i])
+					continue;
+				if (dup2(fa->fa_from[i], fa->fa_to[i]) < 0)
+					_exit(127);
+			}
+		}
+		if (sa != NULL && (sa->sa_flags & POSIX_SPAWN_SETSIGDEF) != 0) {
+			for (sig = 1; sig < 32; sig++)
+				if ((sa->sa_sigdefault & (1u << sig)) != 0)
+					(void)signal(sig, NULL);
+		}
+		if (sa != NULL && (sa->sa_flags & POSIX_SPAWN_SETSIGMASK) != 0)
+			(void)sigprocmask(3, &sa->sa_sigmask, NULL);
+		(void)execve(path, argv, envp != NULL ? envp : environ);
+		_exit(127);
+	}
+	if (pidp != NULL)
+		*pidp = pid;
+	return (0);
+}
+
+/* The PATH search collapses to one try here, as execvp's does. */
+int
+posix_spawnp(int *pidp, const char *file, void *const *fap,
+    void *const *attrp, char *const argv[], char *const envp[])
+{
+
+	return (posix_spawn(pidp, file, fap, attrp, argv, envp));
+}
+
+/* ---- the ordinary kind --------------------------------------------------- */
+
+/*
+ * bsd_signal(3): signal(3) with BSD semantics, which is what signal(3) here
+ * has always had -- the handler stays installed after it runs.
+ */
+void *
+bsd_signal(int sig, void *handler)
+{
+
+	return (signal(sig, handler));
+}
+
+/* fopen under its unix2003 name, the way fdopen already is. */
+FILE	*fopen_extsn(const char *path, const char *mode)
+	    __asm__("_fopen$DARWIN_EXTSN");
+
+FILE *
+fopen_extsn(const char *path, const char *mode)
+{
+
+	return (fopen(path, mode));
+}
+
+/* feof(3) as a function, for a binary that did not inline the macro. */
+int
+feof(FILE *fp)
+{
+
+	if (fp == NULL)
+		return (0);
+	return ((fp->aflags & APPLE_SEOF) != 0);
+}
+
+/*
+ * setvbuf(3): this stdio is unbuffered, which satisfies every mode a caller
+ * can ask for -- an unbuffered stream never holds back what a line-buffered
+ * or fully-buffered one would have flushed by now.  Accepted, and nothing
+ * changes.
+ */
+int
+setvbuf(FILE *fp, char *buf, int mode, size_t size)
+{
+
+	(void)fp;
+	(void)buf;
+	(void)mode;
+	(void)size;
+	return (0);
+}
+
+void
+perror(const char *s)
+{
+
+	if (s != NULL && s[0] != '\0')
+		fprintf(__stderrp, "%s: %s\n", s, strerror(g_errno));
+	else
+		fprintf(__stderrp, "%s\n", strerror(g_errno));
+}
+
+char *
+strndup(const char *s, size_t n)
+{
+	char	*d;
+	size_t	 len;
+
+	for (len = 0; len < n && s[len] != '\0'; len++)
+		continue;
+	d = malloc(len + 1);
+	if (d == NULL)
+		return (NULL);
+	memcpy(d, s, len);
+	d[len] = '\0';
+	return (d);
+}
+
+/* long long IS long on this ABI: strtoll is strtol under another name. */
+long long
+strtoll(const char *s, char **end, int base)
+{
+
+	return ((long long)strtol(s, end, base));
+}
+
+double
+atof(const char *s)
+{
+
+	return (strtod(s, NULL));
+}
+
+/*
+ * __strncpy_chk: the _FORTIFY_SOURCE form.  The compiler passes the
+ * destination's known size; a copy that would overrun it is a bug in the
+ * caller and aborts, as Apple's does.
+ */
+char *
+__strncpy_chk(char *dst, const char *src, size_t n, size_t dstlen)
+{
+
+	if (n > dstlen)
+		abort();
+	return (strncpy(dst, src, n));
+}
+
+/*
+ * asctime(3) and ctime(3): the fixed 26-character form, "Www Mmm dd
+ * hh:mm:ss yyyy\n".  Over the same calendar arithmetic as gmtime_r.
+ */
+static const char	asctime_wday[7][4] = {
+	"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
+};
+static const char	asctime_mon[12][4] = {
+	"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+	"Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+};
+
+char *
+asctime_r(const struct tm *tm, char *buf)
+{
+	const char	*wd;
+	const char	*mn;
+
+	if (tm == NULL || buf == NULL)
+		return (NULL);
+	wd = tm->tm_wday >= 0 && tm->tm_wday < 7 ?
+	    asctime_wday[tm->tm_wday] : "???";
+	mn = tm->tm_mon >= 0 && tm->tm_mon < 12 ?
+	    asctime_mon[tm->tm_mon] : "???";
+	snprintf(buf, 26, "%s %s %2d %02d:%02d:%02d %d\n", wd, mn,
+	    tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec,
+	    tm->tm_year + 1900);
+	return (buf);
+}
+
+char *
+asctime(const struct tm *tm)
+{
+	static char	buf[32];
+
+	return (asctime_r(tm, buf));
+}
+
+char *
+ctime_r(const long *t, char *buf)
+{
+	struct tm	tm;
+	int64_t		secs;
+
+	if (t == NULL)
+		return (NULL);
+	secs = (int64_t)*t;
+	if (localtime_r(&secs, &tm) == NULL)
+		return (NULL);
+	return (asctime_r(&tm, buf));
+}
+
+char *
+ctime(const long *t)
+{
+	static char	buf[32];
+
+	return (ctime_r(t, buf));
+}
+
+struct tm *
+localtime(const long *t)
+{
+	static struct tm	tm;
+	int64_t			secs;
+
+	if (t == NULL)
+		return (NULL);
+	secs = (int64_t)*t;
+	return (localtime_r(&secs, &tm));
+}
+
+/*
+ * getloadavg(3): there is no load average to report.  The kernel keeps no
+ * such number, and inventing one would be the wrong kind of compatible.
+ * -1, and make says once that it cannot enforce load limits here.
+ */
+int
+getloadavg(double *avg, int n)
+{
+
+	(void)avg;
+	(void)n;
+	g_errno = 78;				/* ENOSYS */
+	return (-1);
+}
+
+/* There is one user and it is root. */
+char *
+getlogin(void)
+{
+
+	return ((char *)"root");
+}
+
+/*
+ * confstr(3): _CS_PATH (1) is the only name with an answer, and it is the
+ * same one the default environment gives -- everything runnable lives in
+ * the synthetic /bin.  Returns the length the answer needs, NUL included;
+ * copies as much as fits.
+ */
+size_t
+confstr(int name, char *buf, size_t len)
+{
+	const char	*v;
+	size_t		 n;
+	size_t		 i;
+
+	if (name != 1) {
+		g_errno = 22;			/* EINVAL */
+		return (0);
+	}
+	v = "/bin";
+	n = strlen(v) + 1;
+	if (buf != NULL && len > 0) {
+		for (i = 0; i + 1 < len && v[i] != '\0'; i++)
+			buf[i] = v[i];
+		buf[i] = '\0';
+	}
+	return (n);
+}
+
+/*
+ * ttyname(3): the console's name, and only for a descriptor that IS the
+ * console.  The name is one the kernel opens -- a name that could not be
+ * opened would be a label, not a name.
+ */
+char *
+ttyname(int fd)
+{
+
+	if (!isatty(fd)) {
+		g_errno = 25;			/* ENOTTY */
+		return (NULL);
+	}
+	return ((char *)"/dev/console");
+}
+
+int
+ttyname_r(int fd, char *buf, size_t len)
+{
+	const char	*name;
+	size_t		 n;
+
+	name = ttyname(fd);
+	if (name == NULL)
+		return (25);
+	n = strlen(name) + 1;
+	if (len < n)
+		return (34);			/* ERANGE */
+	memcpy(buf, name, n);
+	return (0);
+}
+
+/*
+ * dlopen(3) and its family: there is no dynamic loading after the dyld has
+ * handed off.  dlopen answers NULL and dlerror says why in words, once,
+ * which is the contract; dlsym on any handle finds nothing.  A program that
+ * only loads a plugin when asked to -- make's $(load), a shell's `enable
+ * -f` -- runs, and reports the refusal where it would have reported a
+ * missing plugin.
+ */
+static const char	*dl_error_pending;
+
+void *
+dlopen(const char *path, int mode)
+{
+
+	(void)path;
+	(void)mode;
+	dl_error_pending = "dynamic loading is not supported on style9";
+	return (NULL);
+}
+
+void *
+dlsym(void *handle, const char *symbol)
+{
+
+	(void)handle;
+	(void)symbol;
+	dl_error_pending = "symbol not found: no image is open";
+	return (NULL);
+}
+
+char *
+dlerror(void)
+{
+	const char	*e;
+
+	e = dl_error_pending;
+	dl_error_pending = NULL;
+	return ((char *)e);
+}
+
+int
+dlclose(void *handle)
+{
+
+	(void)handle;
+	return (0);
+}
+
+/*
+ * mkstemps(3) and mkstemp(3): the XXXXXX before `suffixlen` trailing bytes
+ * is replaced until a name is new, which O_EXCL is the judge of.  The
+ * candidates are made from the pid and a counter rather than a random
+ * source -- there is one user and no adversary, and a name that is new is
+ * all the contract asks for.
+ */
+int
+mkstemps(char *tmpl, int suffixlen)
+{
+	static unsigned long	counter;
+	unsigned long		v;
+	size_t			len;
+	size_t			i;
+	char			*x;
+	int			fd;
+	int			tries;
+
+	len = strlen(tmpl);
+	if (suffixlen < 0 || len < 6 + (size_t)suffixlen) {
+		g_errno = 22;			/* EINVAL */
+		return (-1);
+	}
+	x = tmpl + len - 6 - (size_t)suffixlen;
+	for (i = 0; i < 6; i++) {
+		if (x[i] != 'X') {
+			g_errno = 22;
+			return (-1);
+		}
+	}
+	for (tries = 0; tries < 100; tries++) {
+		v = (unsigned long)getpid() * 7919ul + counter++;
+		for (i = 0; i < 6; i++) {
+			x[i] = (char)('a' + (v % 26));
+			v /= 26;
+		}
+		fd = open(tmpl, 0x0002 | 0x0200 | 0x0800, 0600);
+		if (fd >= 0)
+			return (fd);
+		if (g_errno != 17)		/* EEXIST: try another */
+			return (-1);
+	}
+	g_errno = 17;
+	return (-1);
+}
+
+int
+mkstemp(char *tmpl)
+{
+
+	return (mkstemps(tmpl, 0));
+}
+
+/*
+ * tmpfile(3): a file with no name from the moment it is open -- the orphan
+ * the volume keeps for exactly this, unlinked while a descriptor holds it.
+ */
+FILE *
+tmpfile(void)
+{
+	char	name[32];
+	FILE	*fp;
+	int	 fd;
+
+	strcpy(name, "/tmp/tmpf.XXXXXX");
+	fd = mkstemp(name);
+	if (fd < 0)
+		return (NULL);
+	(void)unlink(name);
+	fp = fdopen_extsn(fd, "w+");
+	if (fp == NULL)
+		close(fd);
+	return (fp);
 }

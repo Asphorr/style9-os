@@ -1081,6 +1081,17 @@ dyld_main(uint64_t *sp)
 	if (set_addr != 0 && argc > 0)
 		((void (*)(const char *))(uintptr_t)set_addr)(argv[0]);
 
+	/*
+	 * And its environment, for the same reason and from the same stack:
+	 * the kernel writes envp after argv, and libSystem's `environ` has to
+	 * point at it before main reads a variable.  A dyld that skipped this
+	 * left every program with a made-up environment however carefully
+	 * its parent had built one.
+	 */
+	set_addr = resolve_sym(&ls, &ls.im[0], 0xFE, "_s9_environ_init");
+	if (set_addr != 0)
+		((void (*)(char **))(uintptr_t)set_addr)(envp);
+
 	entry = main_mh + ls.im[0].entryoff;
 	d_puts("dyld: enter main @ ");
 	d_puthex(entry);

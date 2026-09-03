@@ -45,12 +45,26 @@
  *	   discipline really did stop being line-based.
  *	8. The restore takes, so the shell that runs next has its terminal back.
  *
+ * And, from the rung after -- readiness, which arrived for make and is
+ * checked here because this is the probe that already owns a pipe:
+ *
+ *	9. select(2) asked once (a zero timeout) sees a pipe's read end go from
+ *	   not ready to ready when a byte is written, and its write end ready
+ *	   throughout.
+ *	10. A 40 ms select on an empty pipe returns 0 AFTER 40 ms: the wait
+ *	    parked and the clock ended it, which is the path nothing in make's
+ *	    own use of pselect exercises.
+ *	11. poll(2) reports POLLIN and POLLHUP together on a read end whose
+ *	    writer has closed with a byte still in the pipe.
+ *	12. A closed descriptor is EBADF to select and POLLNVAL to poll.
+ *
  * Freestanding: no SDK headers, prototypes declared as <termios.h> would alias
  * them, entry at _entry (ld -e), relinked low like dyldhello.
  */
 
 typedef __UINT8_TYPE__	uint8_t;
 typedef __UINT16_TYPE__	uint16_t;
+typedef __UINT32_TYPE__	uint32_t;
 typedef __UINT64_TYPE__	uint64_t;
 typedef __SIZE_TYPE__	size_t;
 
@@ -100,11 +114,36 @@ struct winsize {
 	uint16_t	ws_ypixel;
 };
 
+/* select(2)/poll(2) as <sys/select.h> and <poll.h> lay them out. */
+struct timeval {
+	long	tv_sec;
+	int	tv_usec;
+	int	tv_pad;
+};
+
+struct pollfd {
+	int	fd;
+	short	events;
+	short	revents;
+};
+
+#define	NFDBITS		32
+#define	FD_WORDS	(1024 / NFDBITS)
+#define	POLLIN		0x0001
+#define	POLLOUT		0x0004
+#define	POLLHUP		0x0010
+#define	POLLNVAL	0x0020
+#define	EBADF		9
+
 extern int	*__error(void);
 extern int	 open(const char *path, int flags, ...);
 extern long	 read(int fd, void *buf, unsigned long n);
+extern long	 write(int fd, const void *buf, unsigned long n);
 extern int	 close(int fd);
 extern int	 pipe(int fds[2]);
+extern int	 select(int nfds, void *r, void *w, void *e, const void *tv);
+extern int	 poll(void *fds, unsigned int nfds, int timeout);
+extern int	 gettimeofday(void *tv, void *tz);
 extern int	 ioctl(int fd, unsigned long request, ...);
 extern int	 tcgetattr(int fd, void *tp);
 extern int	 tcsetattr(int fd, int action, const void *tp);
@@ -124,6 +163,142 @@ fail(const char *what)
 
 	printf("ttyprobe: FAIL %s\n", what);
 	fails++;
+}
+
+static void
+fd_zero(uint32_t *set)
+{
+	int	i;
+
+	for (i = 0; i < FD_WORDS; i++)
+		set[i] = 0;
+}
+
+static void
+fd_set_(uint32_t *set, int fd)
+{
+
+	set[fd / NFDBITS] |= (uint32_t)1 << (fd % NFDBITS);
+}
+
+static int
+fd_isset(const uint32_t *set, int fd)
+{
+
+	return ((set[fd / NFDBITS] >> (fd % NFDBITS)) & 1u);
+}
+
+static long
+now_ms(void)
+{
+	struct timeval	tv;
+
+	tv.tv_sec  = 0;
+	tv.tv_usec = 0;
+	(void)gettimeofday(&tv, NULL);
+	return (tv.tv_sec * 1000 + tv.tv_usec / 1000);
+}
+
+/*
+ * 9-12: readiness on a pipe, the object this probe already knows how to make.
+ * Kept after the terminal is restored so that a failure here leaves the shell
+ * its terminal all the same.
+ */
+static void
+readiness_checks(void)
+{
+	uint32_t	rset[FD_WORDS];
+	uint32_t	wset[FD_WORDS];
+	struct timeval	tv;
+	struct pollfd	pf;
+	long		t0;
+	long		t1;
+	int		fds[2];
+	int		n;
+	char		c;
+
+	if (pipe(fds) != 0) {
+		fail("cannot make a pipe for the readiness checks");
+		return;
+	}
+
+	/* 9. asked once: not ready, then ready after a byte. */
+	fd_zero(rset);
+	fd_set_(rset, fds[0]);
+	fd_zero(wset);
+	fd_set_(wset, fds[1]);
+	tv.tv_sec  = 0;
+	tv.tv_usec = 0;
+	tv.tv_pad  = 0;
+	n = select(fds[1] + 1, rset, wset, NULL, &tv);
+	if (n != 1 || fd_isset(rset, fds[0]) || !fd_isset(wset, fds[1]))
+		fail("an empty pipe: its read end should not be ready and "
+		    "its write end should");
+	else if (write(fds[1], "x", 1) != 1)
+		fail("cannot write into the pipe");
+	else {
+		fd_zero(rset);
+		fd_set_(rset, fds[0]);
+		n = select(fds[0] + 1, rset, NULL, NULL, &tv);
+		if (n != 1 || !fd_isset(rset, fds[0]))
+			fail("a byte in the pipe did not make its read end "
+			    "ready");
+		else
+			printf("ttyprobe: PASS select, asked once, sees a "
+			    "pipe go from empty to readable\n");
+	}
+
+	/* 10. a wait the clock has to end. */
+	if (read(fds[0], &c, 1) != 1 || c != 'x')
+		fail("the byte did not come back out of the pipe");
+	fd_zero(rset);
+	fd_set_(rset, fds[0]);
+	tv.tv_sec  = 0;
+	tv.tv_usec = 40000;
+	t0 = now_ms();
+	n  = select(fds[0] + 1, rset, NULL, NULL, &tv);
+	t1 = now_ms();
+	if (n != 0)
+		fail("an empty pipe was reported ready during a timed wait");
+	else if (t1 - t0 < 40)
+		fail("select came back before its 40 ms were up");
+	else
+		printf("ttyprobe: PASS a 40 ms wait on an empty pipe parked "
+		    "and was ended by the clock, after %ld ms\n", t1 - t0);
+
+	/* 11. the writer leaves with a byte still inside. */
+	if (write(fds[1], "y", 1) != 1)
+		fail("cannot write the second byte");
+	(void)close(fds[1]);
+	pf.fd      = fds[0];
+	pf.events  = POLLIN;
+	pf.revents = 0;
+	n = poll(&pf, 1, 0);
+	if (n != 1 || (pf.revents & POLLIN) == 0 ||
+	    (pf.revents & POLLHUP) == 0)
+		fail("poll did not report both the byte and the writer's "
+		    "departure");
+	else
+		printf("ttyprobe: PASS poll reports POLLIN and POLLHUP on a "
+		    "read end whose writer has gone\n");
+	(void)close(fds[0]);
+
+	/* 12. a descriptor that is not there. */
+	fd_zero(rset);
+	fd_set_(rset, fds[0]);
+	tv.tv_usec = 0;
+	n = select(fds[0] + 1, rset, NULL, NULL, &tv);
+	if (n != -1 || *__error() != EBADF)
+		fail("select accepted a closed descriptor");
+	pf.fd      = fds[0];
+	pf.events  = POLLIN;
+	pf.revents = 0;
+	n = poll(&pf, 1, 0);
+	if (n != 1 || pf.revents != POLLNVAL)
+		fail("poll did not flag a closed descriptor");
+	else
+		printf("ttyprobe: PASS a closed descriptor is EBADF to select "
+		    "and POLLNVAL to poll\n");
 }
 
 int
@@ -266,6 +441,8 @@ entry(void)
 	else
 		printf("ttyprobe: PASS the terminal is canonical again, with "
 		    "echo\n");
+
+	readiness_checks();
 
 	if (fails != 0) {
 		printf("ttyprobe: %d check(s) FAILED\n", fails);
