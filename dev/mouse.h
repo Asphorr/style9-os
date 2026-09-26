@@ -52,7 +52,11 @@ int	mouse_getpkt_block(uint8_t *out);
  * can prove feed -> ring -> driver-thread -> Mach-message end to end
  * without depending on physical mouse motion.  Not used in normal
  * operation.
+ *
+ * Returns 0 once the packet is on the ring, or -1 without feeding
+ * anything if the assembler was part-way through a live packet -- three
+ * bytes fed then would not be one packet.
  */
-void	mouse_selftest_feed(uint8_t b0, uint8_t b1, uint8_t b2);
+int	mouse_selftest_feed(uint8_t b0, uint8_t b1, uint8_t b2);
 
 #endif /* !_DEV_MOUSE_H_ */

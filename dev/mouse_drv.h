@@ -26,8 +26,13 @@
  * zero-allocation inline send path applies, just like kbd_drv:
  *	bit  24		1 -- valid-event marker (msgh_id is never 0)
  *	bits 18..16	buttons: bit 0 Left, bit 1 Right, bit 2 Middle
- *	bits 15..8	dy: signed int8, raw PS/2 Y delta
- *	bits  7..0	dx: signed int8, raw PS/2 X delta
+ *	bits 15..8	dy: signed int8, PS/2 Y delta
+ *	bits  7..0	dx: signed int8, PS/2 X delta
+ *
+ * The device's deltas are nine bits wide (sign in byte 0); each is
+ * rebuilt at that width and clamped to [-128, 127], so a fast move
+ * saturates in its own direction rather than wrapping into the opposite
+ * one.  An overflowed axis reads as full scale.
  *
  * dx is the conventional screen X (right positive); dy follows the raw
  * PS/2 sign (up positive), so a consumer that wants screen Y negates it.

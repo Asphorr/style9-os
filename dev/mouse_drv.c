@@ -5,6 +5,7 @@
  * All rights reserved.
  */
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -20,8 +21,45 @@
 
 extern struct port	*port_create_kernel_owned(uint8_t kind, void *arg);
 
+/* Byte 0 of a PS/2 movement packet (full layout in mouse.h). */
+#define	PKT_BTN_MASK	0x07	/* bits 0..2: L, R, M               */
+#define	PKT_XSIGN	0x10	/* bit 4: X delta is negative       */
+#define	PKT_YSIGN	0x20	/* bit 5: Y delta is negative       */
+#define	PKT_XOVF	0x40	/* bit 6: X counter overflowed      */
+#define	PKT_YOVF	0x80	/* bit 7: Y counter overflowed      */
+
+/*
+ * Boot self-test vectors: a raw packet and the event it must come out as.
+ * The first is the ordinary case; the rest are the ones a byte-as-int8
+ * decode gets wrong.
+ */
+struct mouse_selftest {
+	const char	*mst_what;
+	uint8_t		 mst_pkt[3];
+	uint8_t		 mst_btn;
+	int8_t		 mst_dx;
+	int8_t		 mst_dy;
+};
+
+static const struct mouse_selftest	mouse_selftests[] = {
+	{ "L +5,-3",		{ 0x29, 0x05, 0xFD },
+	    MOUSE_MSG_BTN_LEFT,		   5,	-3 },
+	{ "+200 clamps",	{ 0x08, 0xC8, 0x00 },
+	    0,				 127,	 0 },
+	{ "-200,-1",		{ 0x38, 0x38, 0xFF },
+	    0,				-128,	-1 },
+	{ "R, sign on 0",	{ 0x1A, 0x00, 0x00 },
+	    MOUSE_MSG_BTN_RIGHT,	   0,	 0 },
+	{ "M, X overflow",	{ 0x5C, 0x12, 0x00 },
+	    MOUSE_MSG_BTN_MIDDLE,	-128,	 0 },
+};
+
+#define	MOUSE_NSELFTESTS	\
+	(sizeof(mouse_selftests) / sizeof(mouse_selftests[0]))
+
 mach_port_name_t	mouse_input_port;
 
+static int	mouse_axis(uint8_t lo, bool negative, bool overflow);
 static int	mouse_drv_dispatch(const struct mach_msg_header *req,
 		    struct port_space *from);
 static uint32_t	mouse_pack(const uint8_t *pkt);
@@ -86,20 +124,61 @@ mouse_drv_dispatch(const struct mach_msg_header *req, struct port_space *from)
 }
 
 /*
+ * One axis of a PS/2 packet, as the int8 the wire layout has room for.
+ *
+ * The device counts in nine bits: the low eight in the data byte, the
+ * sign in byte 0.  The data byte on its own is NOT the delta -- a quick
+ * flick right of +200 arrives as 0xC8 with the sign clear, and read as an
+ * int8 that is -56, the pointer thrown the wrong way.  So the nine-bit
+ * value is rebuilt first and clamped after.
+ *
+ * Two edges, each decided rather than left to the arithmetic:
+ *
+ *	sign set on a zero byte	-256 by the letter, but devices set the
+ *				sign on no motion at all; read as none
+ *				(Linux psmouse does the same).
+ *	overflow bit		the device's counter ran past nine bits
+ *				before it could report; the low byte is
+ *				then meaningless but the sign is not, so
+ *				a full-scale step that way.
+ */
+static int
+mouse_axis(uint8_t lo, bool negative, bool overflow)
+{
+	int	v;
+
+	if (overflow)
+		return (negative ? INT8_MIN : INT8_MAX);
+	if (lo == 0)
+		return (0);
+	v = (int)lo - (negative ? 256 : 0);
+	if (v > INT8_MAX)
+		return (INT8_MAX);
+	if (v < INT8_MIN)
+		return (INT8_MIN);
+	return (v);
+}
+
+/*
  * Pack a raw 3-byte PS/2 packet into the msgh_id wire layout documented
- * in mouse_drv.h.  The overflow flags (byte 0 bits 6,7) are dropped: a
- * delta that overflowed int8 is clamped by the byte cast, the
- * conventional handling for a simple mover.
+ * in mouse_drv.h.
  */
 static uint32_t
 mouse_pack(const uint8_t *pkt)
 {
 	uint32_t	id;
+	int		dx;
+	int		dy;
+
+	dx = mouse_axis(pkt[1], (pkt[0] & PKT_XSIGN) != 0,
+	    (pkt[0] & PKT_XOVF) != 0);
+	dy = mouse_axis(pkt[2], (pkt[0] & PKT_YSIGN) != 0,
+	    (pkt[0] & PKT_YOVF) != 0);
 
 	id = MOUSE_MSG_EVENT;
-	id |= (uint32_t)(pkt[0] & 0x07) << 16;
-	id |= (uint32_t)pkt[2] << 8;		/* dy */
-	id |= (uint32_t)pkt[1];			/* dx */
+	id |= (uint32_t)(pkt[0] & PKT_BTN_MASK) << 16;
+	id |= (uint32_t)(uint8_t)dy << 8;
+	id |= (uint32_t)(uint8_t)dx;
 	return (id);
 }
 
@@ -150,46 +229,66 @@ mouse_drv_thread(void *arg)
 /*
  * Boot self-test: prove feed -> ring -> driver-thread -> Mach-message end
  * to end, deterministically, without needing physical mouse motion.
- * Inject one synthetic packet (Left button, dx=+5, dy=-3) through the
- * same assembly path the IRQ uses, then recv the resulting event off
+ * Inject each synthetic packet in mouse_selftests through the same
+ * assembly path the IRQ uses, then recv the resulting event off
  * mouse_input_port and check the decode.  Bounded by a timeout so a
  * regression can never wedge the boot; loud on mismatch.
+ *
+ * Live motion during the test can still land an event of its own between
+ * the drain and a recv and read as a mismatch.  The test says so rather
+ * than guessing: it is a boot diagnostic, not an invariant.
  */
 static void
 mouse_drv_selftest(void)
 {
-	struct mach_msg_header	msg;
-	unsigned		btn;
-	int			dx;
-	int			dy;
-	int			rv;
+	const struct mouse_selftest	*t;
+	struct mach_msg_header		 msg;
+	size_t				 i;
+	unsigned			 btn;
+	int				 dx;
+	int				 dy;
+	int				 rv;
 
 	/* Discard any event already queued (e.g. live motion at boot). */
 	while (mach_msg_recv_timed(kernel_space, mouse_input_port, &msg,
 	    sizeof(msg), MACH_TIMEOUT_NONE) == MACH_MSG_OK)
 		continue;
 
-	mouse_selftest_feed(0x09, 0x05, 0xFD);	/* L + dx=+5 + dy=-3 */
+	for (i = 0; i < MOUSE_NSELFTESTS; i++) {
+		t = &mouse_selftests[i];
+		if (mouse_selftest_feed(t->mst_pkt[0], t->mst_pkt[1],
+		    t->mst_pkt[2]) != 0) {
+			kprintf("mouse_drv: SELF-TEST skipped -- a live "
+			    "packet was half-assembled (path NOT proven)\n");
+			return;
+		}
 
-	rv = mach_msg_recv_timed(kernel_space, mouse_input_port, &msg,
-	    sizeof(msg), 2000);
-	if (rv != MACH_MSG_OK) {
-		kprintf("mouse_drv: SELF-TEST recv rv=%s (path NOT proven)\n",
-		    mach_msg_strerror(rv));
-		return;
+		rv = mach_msg_recv_timed(kernel_space, mouse_input_port,
+		    &msg, sizeof(msg), 2000);
+		if (rv != MACH_MSG_OK) {
+			kprintf("mouse_drv: SELF-TEST \"%s\" recv rv=%s "
+			    "(path NOT proven)\n", t->mst_what,
+			    mach_msg_strerror(rv));
+			return;
+		}
+
+		btn = (unsigned)((msg.msgh_id >> 16) & PKT_BTN_MASK);
+		dy = (int)(int8_t)(uint8_t)(msg.msgh_id >> 8);
+		dx = (int)(int8_t)(uint8_t)msg.msgh_id;
+
+		if ((msg.msgh_id & MOUSE_MSG_EVENT) == 0 ||
+		    btn != t->mst_btn || dx != t->mst_dx ||
+		    dy != t->mst_dy) {
+			kprintf("mouse_drv: SELF-TEST MISMATCH \"%s\" "
+			    "id=0x%08x btn=0x%x dx=%d dy=%d, want btn=0x%x "
+			    "dx=%d dy=%d (live motion also reads as this)\n",
+			    t->mst_what, (unsigned)msg.msgh_id, btn, dx, dy,
+			    (unsigned)t->mst_btn, t->mst_dx, t->mst_dy);
+			return;
+		}
 	}
 
-	btn = (unsigned)((msg.msgh_id >> 16) & 0x07);
-	dy = (int)(int8_t)(uint8_t)(msg.msgh_id >> 8);
-	dx = (int)(int8_t)(uint8_t)msg.msgh_id;
-
-	if ((msg.msgh_id & MOUSE_MSG_EVENT) == 0 ||
-	    btn != MOUSE_MSG_BTN_LEFT || dx != 5 || dy != -3) {
-		kprintf("mouse_drv: SELF-TEST MISMATCH id=0x%08x btn=0x%x "
-		    "dx=%d dy=%d\n", (unsigned)msg.msgh_id, btn, dx, dy);
-		return;
-	}
-
-	kprintf("mouse_drv: self-test event btn=L dx=%d dy=%d "
-	    "(feed->ring->thread->port OK)\n", dx, dy);
+	kprintf("mouse_drv: self-test %u events decoded, sign and clamp "
+	    "included (feed->ring->thread->port OK)\n",
+	    (unsigned)MOUSE_NSELFTESTS);
 }

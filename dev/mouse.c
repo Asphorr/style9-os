@@ -5,6 +5,7 @@
  * All rights reserved.
  */
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -369,11 +370,29 @@ mouse_getpkt_block(uint8_t *out)
 	}
 }
 
-void
+/*
+ * The self-test is a second producer into the assembler the IRQ owns, so
+ * it borrows the IRQ's own exclusion: interrupts off on this CPU, which is
+ * the one IRQ12 is delivered to (the 8259 reaches the boot processor only,
+ * and the self-test runs there, before the others are released).  And it
+ * feeds only at a packet boundary: three bytes appended to a half-built
+ * live packet would complete THAT packet and leave two of the test's own
+ * behind.
+ */
+int
 mouse_selftest_feed(uint8_t b0, uint8_t b1, uint8_t b2)
 {
+	int	rv;
+	bool	was_on;
 
-	mouse_feed_byte(b0);
-	mouse_feed_byte(b1);
-	mouse_feed_byte(b2);
+	was_on = intr_save_disable();
+	rv = -1;
+	if (mouse_phase == 0) {
+		mouse_feed_byte(b0);
+		mouse_feed_byte(b1);
+		mouse_feed_byte(b2);
+		rv = 0;
+	}
+	intr_restore(was_on);
+	return (rv);
 }
