@@ -53,17 +53,21 @@
 
 /*
  * RX ring buffer.  Single-producer (COM1 IRQ) / single-consumer
- * (uart_getc_block, called by the uart_drv thread).  Same locking
- * discipline as the keyboard ring in dev/kbd.c: head/tail are 32-bit
- * naturally atomic on amd64, writes from the IRQ run with IF=0.
+ * (uart_getc_block, called by the uart_drv thread).  The keyboard ring's
+ * discipline, dev/kbd.c: one writer per index, the byte stored before
+ * head is released past it and read before tail is, each side acquiring
+ * the other's index first.
  */
 #define	UART_BUF_SIZE		256
 #define	UART_BUF_MASK		(UART_BUF_SIZE - 1)
 
+_Static_assert(UART_BUF_SIZE > 0 && (UART_BUF_SIZE & UART_BUF_MASK) == 0,
+    "UART_BUF_SIZE must be a power of two");
+
 static uint16_t	uart_base = UART_COM1_BASE;
 
-static volatile uint32_t	uart_buf_head;
-static volatile uint32_t	uart_buf_tail;
+static uint32_t			uart_buf_head;	/* IRQ's      */
+static uint32_t			uart_buf_tail;	/* consumer's */
 static char			uart_buf[UART_BUF_SIZE];
 
 static struct thread *volatile	uart_waiter;
@@ -72,6 +76,7 @@ static volatile int		uart_wake_pending;
 static void	uart_send_raw(char);
 static void	uart_irq(struct trapframe *);
 static void	uart_buf_push(char);
+static int	uart_buf_take(void);
 
 void
 uart_init(void)
@@ -144,22 +149,39 @@ uart_enable_rx(void)
 	outb(COM_IER(uart_base), IER_ERBFI);
 }
 
+/* Take the next byte off the ring, or -1 if it is empty.  Consumer only. */
+static int
+uart_buf_take(void)
+{
+	uint32_t	head;
+	uint32_t	tail;
+	char		c;
+
+	tail = __atomic_load_n(&uart_buf_tail, __ATOMIC_RELAXED);
+	head = __atomic_load_n(&uart_buf_head, __ATOMIC_ACQUIRE);
+	if (head == tail)
+		return (-1);
+
+	c = uart_buf[tail & UART_BUF_MASK];
+	__atomic_store_n(&uart_buf_tail, tail + 1, __ATOMIC_RELEASE);
+	return ((unsigned char)c);
+}
+
 int
 uart_getc_block(void)
 {
 	struct thread	*self;
-	char		 c;
+	int		 c;
 
 	self = current_thread;
 	/* Noted for the length of the loop -- see kbd_getc_block. */
 	thread_slot_note(self, &uart_waiter);
 
 	for (;;) {
-		if (uart_buf_head != uart_buf_tail) {
-			c = uart_buf[uart_buf_tail & UART_BUF_MASK];
-			uart_buf_tail++;
+		c = uart_buf_take();
+		if (c >= 0) {
 			thread_slot_forget(self);
-			return ((unsigned char)c);
+			return (c);
 		}
 
 		/* An exchange, not a store -- kbd_getc_block says why. */
@@ -167,13 +189,12 @@ uart_getc_block(void)
 		(void)__atomic_exchange_n(&uart_waiter, self,
 		    __ATOMIC_ACQ_REL);
 
-		if (uart_buf_head != uart_buf_tail) {
+		c = uart_buf_take();
+		if (c >= 0) {
 			__atomic_store_n(&uart_waiter, NULL,
 			    __ATOMIC_RELAXED);
-			c = uart_buf[uart_buf_tail & UART_BUF_MASK];
-			uart_buf_tail++;
 			thread_slot_forget(self);
-			return ((unsigned char)c);
+			return (c);
 		}
 
 		if (__atomic_load_n(&uart_wake_pending,
@@ -218,14 +239,16 @@ static void
 uart_buf_push(char ch)
 {
 	struct thread	*w;
-	uint32_t	 next;
+	uint32_t	 head;
+	uint32_t	 tail;
 
-	next = uart_buf_head + 1;
-	if (next - uart_buf_tail > UART_BUF_SIZE)
+	head = __atomic_load_n(&uart_buf_head, __ATOMIC_RELAXED);
+	tail = __atomic_load_n(&uart_buf_tail, __ATOMIC_ACQUIRE);
+	if (head - tail >= UART_BUF_SIZE)
 		return;
 
-	uart_buf[uart_buf_head & UART_BUF_MASK] = ch;
-	uart_buf_head = next;
+	uart_buf[head & UART_BUF_MASK] = ch;
+	__atomic_store_n(&uart_buf_head, head + 1, __ATOMIC_RELEASE);
 
 	w = __atomic_exchange_n(&uart_waiter, NULL, __ATOMIC_ACQ_REL);
 	if (w != NULL) {

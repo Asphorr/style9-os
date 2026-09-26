@@ -56,38 +56,57 @@
 #define	MOUSE_CASCADE_IRQ	2	/* slave reaches the CPU via IRQ2      */
 
 #define	I8042_SPIN		100000	/* bounded poll: never hang on no HW   */
+#define	I8042_DRAIN_MAX		32	/* stale bytes discarded, at most      */
 
 #define	MOUSE_PKT_BYTES		3
 #define	PKT_BYTE0_ALWAYS1	0x08	/* byte 0 bit 3 is always set          */
-#define	PKT_BTN_MASK		0x07	/* byte 0 bits 0..2: L, R, M           */
 
 /*
- * Ring of completed packets.  Single-producer (mouse_feed_byte, from the
- * IRQ12 handler or the boot self-test) / single-consumer (the mouse-drv
- * thread in mouse_getpkt_block).  Same lock-free discipline as kbd.c: the
- * producer runs with IF=0 (interrupt gate) and head/tail are 32-bit
- * aligned, so no lock is needed.
+ * Ring of completed packets.  Single-producer (mouse_feed_byte: the IRQ12
+ * handler, or the boot self-test borrowing its exclusion) / single-
+ * consumer (mouse_getpkt, and so mouse_getpkt_block: the mouse-drv
+ * thread).
+ *
+ * head and tail are free-running counters -- unsigned wrap is what keeps
+ * head - tail the fill level -- and each has one writer.  The producer
+ * fills a slot, THEN releases head past it; the consumer reads a slot out,
+ * THEN releases tail past it; each acquires the other's index before
+ * touching a slot.  That pairing is what orders the packet bytes against
+ * the index that publishes them.  volatile never did: it orders volatile
+ * accesses among themselves, and the slots are not volatile.
  */
-#define	MOUSE_RING_SIZE		32	/* must be a power of two */
+#define	MOUSE_RING_SIZE		32
 #define	MOUSE_RING_MASK		(MOUSE_RING_SIZE - 1)
+
+_Static_assert(MOUSE_RING_SIZE > 0 &&
+    (MOUSE_RING_SIZE & MOUSE_RING_MASK) == 0,
+    "MOUSE_RING_SIZE must be a power of two");
 
 struct mouse_packet {
 	uint8_t	mp_byte[MOUSE_PKT_BYTES];
 };
 
-static volatile uint32_t	mouse_ring_head;
-static volatile uint32_t	mouse_ring_tail;
+static uint32_t			mouse_ring_head;	/* producer's */
+static uint32_t			mouse_ring_tail;	/* consumer's */
 static struct mouse_packet	mouse_ring[MOUSE_RING_SIZE];
 
-/* In-progress packet assembly -- producer side only. */
+/*
+ * In-progress packet assembly -- producer side only, which is to say
+ * under the IRQ's exclusion: IRQ12 itself, or mouse_selftest_feed with
+ * interrupts off on the one CPU IRQ12 is delivered to.
+ */
 static uint8_t			mouse_pkt[MOUSE_PKT_BYTES];
 static uint8_t			mouse_phase;
 
 /*
- * Single-consumer block-on-read support, mirroring kbd.c byte for byte:
- * the IRQ pushes a packet, atomically harvests any parked consumer, and
- * defers the wake via sched_post_irq_wake; wake_pending closes the race
- * where a wake lands between the consumer's recheck and its block.
+ * Single-consumer block-on-read support, the protocol kbd.c's is (its
+ * kbd_getc_block has the reasoning): the consumer names itself in
+ * mouse_waiter BY EXCHANGE and re-checks the ring; the IRQ, having
+ * published a packet, exchanges the slot empty and posts a deferred wake
+ * to whoever it found.  Two exchanges on one slot, so one sees the other.
+ * wake_pending lets a consumer harvested between its re-check and its
+ * block skip the block; a wake that reaches it after that is kept by
+ * thread_wake as th_wake_pending, which thread_block honours.
  */
 static struct thread *volatile	mouse_waiter;
 static volatile int		mouse_wake_pending;
@@ -163,7 +182,7 @@ i8042_drain(void)
 {
 	int	i;
 
-	for (i = 0; i < MOUSE_RING_SIZE; i++) {
+	for (i = 0; i < I8042_DRAIN_MAX; i++) {
 		if ((inb(I8042_STATUS) & STS_OBF) == 0)
 			return;
 		(void)inb(I8042_DATA);
@@ -359,15 +378,20 @@ int
 mouse_getpkt(uint8_t *out)
 {
 	struct mouse_packet	*slot;
+	uint32_t		 head;
+	uint32_t		 tail;
 
-	if (mouse_ring_head == mouse_ring_tail)
+	tail = __atomic_load_n(&mouse_ring_tail, __ATOMIC_RELAXED);
+	head = __atomic_load_n(&mouse_ring_head, __ATOMIC_ACQUIRE);
+	if (head == tail)
 		return (-1);
 
-	slot = &mouse_ring[mouse_ring_tail & MOUSE_RING_MASK];
+	slot = &mouse_ring[tail & MOUSE_RING_MASK];
 	out[0] = slot->mp_byte[0];
 	out[1] = slot->mp_byte[1];
 	out[2] = slot->mp_byte[2];
-	mouse_ring_tail++;
+	/* Read out; only now is the slot the producer's again. */
+	__atomic_store_n(&mouse_ring_tail, tail + 1, __ATOMIC_RELEASE);
 	return (0);
 }
 
@@ -402,9 +426,12 @@ mouse_irq(struct trapframe *tf)
  * boot self-test, mirroring how kbd.c shares kbd_decode_scancode between
  * its IRQ and polled paths.
  *
- * Resync: byte 0 of a PS/2 packet always has bit 3 set.  At phase 0 a
- * byte lacking it means the stream is misaligned -- drop it and keep
- * waiting for a real byte 0.
+ * Resync, such as it is: byte 0 of a PS/2 packet always has bit 3 set, so
+ * at phase 0 a byte lacking it cannot be a byte 0 -- drop it and wait for
+ * one that could be.  A heuristic, not a guarantee: a delta byte can have
+ * bit 3 set too, and after a lost byte the stream may settle on the wrong
+ * boundary until one of those checks fails.  Nothing stricter is
+ * available -- any value, 0xFA included, is a legal delta.
  */
 static void
 mouse_feed_byte(uint8_t b)
@@ -427,23 +454,28 @@ mouse_ring_push(const uint8_t *pkt)
 {
 	struct mouse_packet	*slot;
 	struct thread		*w;
-	uint32_t		 next;
+	uint32_t		 head;
+	uint32_t		 tail;
 
-	next = mouse_ring_head + 1;
-	if (next - mouse_ring_tail > MOUSE_RING_SIZE)
+	head = __atomic_load_n(&mouse_ring_head, __ATOMIC_RELAXED);
+	tail = __atomic_load_n(&mouse_ring_tail, __ATOMIC_ACQUIRE);
+	if (head - tail >= MOUSE_RING_SIZE)
 		return;				/* ring full, drop packet */
 
-	slot = &mouse_ring[mouse_ring_head & MOUSE_RING_MASK];
+	slot = &mouse_ring[head & MOUSE_RING_MASK];
 	slot->mp_byte[0] = pkt[0];
 	slot->mp_byte[1] = pkt[1];
 	slot->mp_byte[2] = pkt[2];
-	mouse_ring_head = next;
+	/* Whole; only now is it the consumer's to see. */
+	__atomic_store_n(&mouse_ring_head, head + 1, __ATOMIC_RELEASE);
 
 	/*
 	 * Harvest a parked consumer atomically against one installing
 	 * itself concurrently, then defer the wake (sched_post_irq_wake
 	 * must not take sched_lock from IRQ context); wake_pending covers
-	 * the recheck-and-block race.  Identical to kbd_buf_push.
+	 * the recheck-and-block race.  Acquire-release: the release half
+	 * carries the head store above to a consumer whose exchange reads
+	 * this one.
 	 */
 	w = __atomic_exchange_n(&mouse_waiter, NULL, __ATOMIC_ACQ_REL);
 	if (w != NULL) {

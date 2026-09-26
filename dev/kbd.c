@@ -26,8 +26,11 @@
 #define	SC_RSHIFT	0x36
 #define	SC_LCTRL	0x1D	/* RCtrl is 0xE0 0x1D, handled in extended */
 
-#define	KBD_BUF_SIZE	128	/* must be power of two */
+#define	KBD_BUF_SIZE	128
 #define	KBD_BUF_MASK	(KBD_BUF_SIZE - 1)
+
+_Static_assert(KBD_BUF_SIZE > 0 && (KBD_BUF_SIZE & KBD_BUF_MASK) == 0,
+    "KBD_BUF_SIZE must be a power of two");
 
 /*
  * Scancode-set-1 -> ASCII translation, US layout.  Indexed by the low
@@ -67,14 +70,17 @@ static const char	sc_table_shift[128] = {
 };
 
 /*
- * Single-producer (IRQ1 handler) / single-consumer (kbd_getc, called
- * from kmain's idle loop) ring buffer.  No lock needed: writes to head
- * happen only with interrupts disabled (the IRQ handler runs with IF=0
- * thanks to the interrupt gate), and reads of head from kbd_getc are
- * 32-bit aligned and naturally atomic on i386.
+ * Single-producer (IRQ1 handler) / single-consumer (kbd_getc, and so
+ * kbd_getc_block: the kbd-drv thread) ring buffer.  No lock: head and tail
+ * are free-running counters with one writer each.  The IRQ stores a byte,
+ * THEN releases head past it; the consumer takes a byte, THEN releases
+ * tail past it; each acquires the other's index first.  That pairing is
+ * what orders a byte against the index that publishes it -- with the
+ * consumer on another processor since the APs joined the scheduler, an
+ * aligned 32-bit access being atomic is not the question any more.
  */
-static volatile uint32_t	kbd_buf_head;
-static volatile uint32_t	kbd_buf_tail;
+static uint32_t			kbd_buf_head;	/* IRQ's      */
+static uint32_t			kbd_buf_tail;	/* consumer's */
 static char			kbd_buf[KBD_BUF_SIZE];
 
 static volatile uint8_t		kbd_shift;	/* either Shift key down */
@@ -127,13 +133,17 @@ kbd_init(void)
 int
 kbd_getc(void)
 {
-	char	c;
+	uint32_t	head;
+	uint32_t	tail;
+	char		c;
 
-	if (kbd_buf_head == kbd_buf_tail)
+	tail = __atomic_load_n(&kbd_buf_tail, __ATOMIC_RELAXED);
+	head = __atomic_load_n(&kbd_buf_head, __ATOMIC_ACQUIRE);
+	if (head == tail)
 		return (-1);
 
-	c = kbd_buf[kbd_buf_tail & KBD_BUF_MASK];
-	kbd_buf_tail++;
+	c = kbd_buf[tail & KBD_BUF_MASK];
+	__atomic_store_n(&kbd_buf_tail, tail + 1, __ATOMIC_RELEASE);
 	return ((unsigned char)c);
 }
 
@@ -320,14 +330,16 @@ static void
 kbd_buf_push(char ch)
 {
 	struct thread	*w;
-	uint32_t	 next;
+	uint32_t	 head;
+	uint32_t	 tail;
 
-	next = kbd_buf_head + 1;
-	if (next - kbd_buf_tail > KBD_BUF_SIZE)
+	head = __atomic_load_n(&kbd_buf_head, __ATOMIC_RELAXED);
+	tail = __atomic_load_n(&kbd_buf_tail, __ATOMIC_ACQUIRE);
+	if (head - tail >= KBD_BUF_SIZE)
 		return;				/* buffer full, drop */
 
-	kbd_buf[kbd_buf_head & KBD_BUF_MASK] = ch;
-	kbd_buf_head = next;
+	kbd_buf[head & KBD_BUF_MASK] = ch;
+	__atomic_store_n(&kbd_buf_head, head + 1, __ATOMIC_RELEASE);
 
 	/*
 	 * Harvest any parked consumer and signal it.  The exchange

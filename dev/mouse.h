@@ -39,16 +39,19 @@
  *	byte 1	X delta, two's complement (sign in byte 0 bit 4)
  *	byte 2	Y delta, two's complement (sign in byte 0 bit 5)
  *
- * Single-consumer: at most one thread may park in mouse_getpkt_block (the
- * mouse-drv thread, in this kernel), exactly as for kbd_getc_block.
+ * Single-consumer, across BOTH readers: one thread at a time calls
+ * mouse_getpkt and mouse_getpkt_block between them (the mouse-drv thread,
+ * in this kernel) -- the ring's tail has one writer, and it is that
+ * caller.  Exactly as for kbd_getc / kbd_getc_block.
  */
 
 void	mouse_init(void);
 
 /*
- * Copy the next assembled packet into out[0..2].  mouse_getpkt returns 0
- * on success or -1 if the ring is empty; mouse_getpkt_block parks the
- * caller until a packet arrives and always returns 0.
+ * Copy the next assembled packet into out[0..2] -- out must have room for
+ * three bytes.  mouse_getpkt returns 0 on success or -1 if the ring is
+ * empty; mouse_getpkt_block parks the caller until a packet arrives and
+ * always returns 0.
  */
 int	mouse_getpkt(uint8_t *out);
 int	mouse_getpkt_block(uint8_t *out);
