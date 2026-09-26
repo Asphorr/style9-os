@@ -4,16 +4,12 @@
  * Copyright (c) 2026 The Hobby OS Project
  * All rights reserved.
  *
- * loopchild -- pure ring-3 compute-loop daemon for the async-kill v2
- * demo.  Registers its task-self port under bootstrap so the parent can
- * acquire a SEND right + issue SYS_TASK_KILL, then enters a syscall-
- * free spin.  Validates the IRQ-return-to-user detection point: PIT
- * timer hits the kernel, intr_dispatch's tail kill check fires,
- * thread_exit retires the thread before iretq'ing back to ring 3.
- *
- * Without that detection point the child would loop forever -- it
- * never voluntarily enters the kernel, so the syscall-boundary check
- * (which covers echod's mach_msg_recv pattern) cannot catch it.
+ * loopchild -- pure ring-3 compute loop for the async-kill demo.
+ * Registers its task-self port under bootstrap so the parent can get a
+ * send right and issue SYS_TASK_KILL, then spins without syscalls.  It
+ * never enters the kernel on its own, so only the IRQ-return check can
+ * kill it: the timer interrupt's tail in intr_dispatch sees the kill and
+ * thread_exit retires the thread before the iretq to ring 3.
  */
 
 #include "style9.h"
@@ -34,13 +30,10 @@ main(void)
 	    MACH_PORT_TASK_SELF);
 	if (rv != MACH_MSG_OK) {
 		/*
-		 * Duplicate-name on a re-run is the common case: a previous
-		 * loopchild was killed before getting a chance to deregister,
-		 * so the bootstrap entry lingers.  We don't strictly need the
-		 * registration when the parent already holds the taskport via
-		 * SYS_SPAWN_RETURNS_TASKPORT.  Carry on into the compute loop
-		 * so both the bootstrap-mediated and the parent-managed kill
-		 * paths can exercise this binary.
+		 * Usually a duplicate name: an earlier loopchild was killed
+		 * before it could deregister.  A parent that spawned us with
+		 * SYS_SPAWN_RETURNS_TASKPORT already holds the task port, so
+		 * carry on; both kill paths use this binary.
 		 */
 		printf("loopchild: bootstrap_register rv=%d "
 		    "(continuing, parent must hold taskport)\n", rv);
@@ -52,11 +45,9 @@ main(void)
 	printf("loopchild: entering syscall-free compute loop\n");
 
 	/*
-	 * Pure ring-3 work.  No syscalls -- specifically NO printf or
-	 * yield inside the loop, otherwise the syscall-boundary kill
-	 * check would catch us before the IRQ-return path gets a chance
-	 * to.  spin_counter is volatile so the compiler can't strip the
-	 * loop as dead code.
+	 * No syscalls (no printf, no yield) in the loop, or the
+	 * syscall-boundary check would catch us first.  spin_counter is
+	 * volatile so the loop is not stripped as dead code.
 	 */
 	while (1)
 		spin_counter++;

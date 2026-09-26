@@ -11,31 +11,25 @@
 #include "port.h"
 
 /*
- * Mouse driver -- the Mach bridge over the IRQ-fed packet ring in mouse.c,
- * the exact sibling of kbd_drv.c.
+ * Mouse driver: the Mach bridge over mouse.c's packet ring, kbd_drv.c's
+ * sibling.
  *
- * mouse_drv_init allocates `mouse_input_port` in kernel_space with
- * RECEIVE | SEND, registers a control port as "dev/mouse" speaking the
- * dev_proto protocol (INFO + OPEN_STREAM), and spawns the `mouse-drv`
- * kernel thread.  That thread parks in mouse_getpkt_block, decodes each
- * 3-byte PS/2 packet, and sends one tagged mach_msg to mouse_input_port.
- * A consumer holding a SEND right (obtained via DEV_OP_OPEN_STREAM, or by
- * holding RECEIVE directly the way the keyboard's shell does) recvs them.
+ * mouse_drv_init allocates `mouse_input_port' in kernel_space with
+ * RECEIVE | SEND, registers "dev/mouse" (INFO + OPEN_STREAM), and starts
+ * the `mouse-drv' thread, which decodes each packet and sends it to
+ * mouse_input_port.  The consumer holds the RECEIVE right, moved to it by
+ * DEV_OP_OPEN_STREAM.
  *
- * The decoded event rides entirely in msgh_id -- no body, so the
- * zero-allocation inline send path applies, just like kbd_drv:
+ * The event rides entirely in msgh_id, with no body:
  *	bit  24		1 -- valid-event marker (msgh_id is never 0)
  *	bits 18..16	buttons: bit 0 Left, bit 1 Right, bit 2 Middle
  *	bits 15..8	dy: signed int8, PS/2 Y delta
  *	bits  7..0	dx: signed int8, PS/2 X delta
  *
- * The device's deltas are nine bits wide (sign in byte 0); each is
- * rebuilt at that width and clamped to [-128, 127], so a fast move
- * saturates in its own direction rather than wrapping into the opposite
- * one.  An overflowed axis reads as full scale.
- *
- * dx is the conventional screen X (right positive); dy follows the raw
- * PS/2 sign (up positive), so a consumer that wants screen Y negates it.
+ * The nine-bit device deltas are clamped to [-128, 127], so a fast move
+ * saturates rather than wraps; an overflowed axis reads as full scale.
+ * dx is screen X (right positive); dy keeps the PS/2 sign (up positive),
+ * so a consumer wanting screen Y negates it.
  */
 
 #define	MOUSE_MSG_EVENT		0x01000000u	/* bit 24: valid-event marker */

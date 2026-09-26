@@ -14,27 +14,21 @@
 /*
  * Kernel autopsy primitives.
  *
- *	panic(fmt, ...)		hard stop: emits formatted message, walks
- *				the frame-pointer chain to produce a
- *				backtrace, then halts.  Never returns.
+ *	panic(fmt, ...)		hard stop: prints the message and a
+ *				frame-pointer backtrace, then enters ddb.
+ *				Never returns; a recursive panic halts.
  *
- *	backtrace_print(rbp, n)	walk up to n frames starting from the
- *				supplied RBP.  Caller provides RBP so the
- *				trap dispatcher can backtrace from the
- *				faulting context rather than from itself.
+ *	backtrace_print(rbp, n)	walk up to n frames from the supplied
+ *				RBP, so the trap dispatcher can start
+ *				from the faulting context.
  *
- *	KASSERT(cond, msg)	if cond is false, calls kassert_fail()
- *				which prints the source location and
- *				message and panics.  Cheap to leave on
- *				(one CMP + JNE per call); BSD kernels
- *				ship thousands of these on the theory
- *				that one missed invariant is worth more
- *				than every assertion's cycle cost.
+ *	KASSERT(cond, msg)	if cond is false, kassert_fail() panics
+ *				with the source location and message.
+ *				Always on: one compare and branch.
  *
- *	panic_in_progress	non-zero once panic() has started running.
- *				Modules that may be called from the panic
- *				path (e.g. tty, dbgcon) consult this to
- *				bypass any synchronisation that would
+ *	panic_in_progress	true once panic() has started.  Code the
+ *				panic path calls (the tty) checks it to
+ *				bypass synchronisation that would
  *				otherwise self-deadlock.
  */
 

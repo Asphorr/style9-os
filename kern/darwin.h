@@ -12,24 +12,17 @@
 #include <stdint.h>
 
 /*
- * Darwin (XNU) syscall personality -- the second rung of the Mach-O
- * compatibility ladder (S2).  S1 taught the kernel to map the Mach-O
- * container (kern/macho.c); this teaches it to answer the syscalls a
- * genuine Apple-ABI binary issues.  A task is opted in when its image
- * declared PLATFORM_MACOS (see macho.h / TASK_PERSONALITY_DARWIN); for
- * those tasks syscall_dispatch calls darwin_dispatch instead of the native
- * style9 table, leaving the native path untouched.
+ * Darwin (XNU) syscall personality: the syscalls a genuine Apple-ABI binary
+ * issues, mapped onto style9 primitives (kern/macho.c loads the image).  A
+ * task whose image declared PLATFORM_MACOS gets TASK_PERSONALITY_DARWIN,
+ * and syscall_dispatch sends its calls to darwin_dispatch instead of the
+ * native table.
  *
- * Apple encodes a CLASS in the high byte of the syscall number in %rax and
- * the call number in the low 24 bits.  The argument registers
- * (rdi, rsi, rdx, r10, r8, r9) are exactly the order the style9 entry stub
- * already marshals into struct syscall_frame, so no register shuffling is
- * needed -- only the number decode and the return convention differ.
- *
- * We honour a deliberately small subset, enough to prove the personality
- * end to end and translate each call onto the style9 primitive that already
- * implements it.  The mach_msg trap (S3) routes onto the kernel's existing
- * message path; MIG stub generation and a real libSystem stay userspace/S4.
+ * Apple encodes a class in the high byte of the number in %rax and the
+ * call number in the low 24 bits.  The argument registers (rdi, rsi, rdx,
+ * r10, r8, r9) match struct syscall_frame's order, so only the number
+ * decode and the return convention differ.  A subset is implemented;
+ * mach_msg routes onto the kernel's own message path.
  */
 
 #define	DARWIN_SYSCALL_CLASS_SHIFT	24
@@ -45,19 +38,16 @@
 #define	DARWIN_SYSCALL_CLASS_IPC	5	/* IPC                     */
 
 /*
- * style9-private syscall class -- NOT one of Apple's.  Our clean-room dyld
- * (user/dyld.c) issues it to ask the kernel to map a dependency by path: the
- * stand-in for the open()+mmap() / dyld-shared-cache machinery we deliberately
- * do not have.  A genuine Apple binary never encodes this class; only our own
- * linker does.  Chosen well clear of Apple's 0..5 so the two cannot collide.
+ * style9-private syscall class, not one of Apple's, well clear of 0..5.
+ * Only our clean-room dyld (user/dyld.c) and libSystem issue it, e.g. to
+ * map a dependency by path in place of open()+mmap() or a shared cache.
  */
 #define	DARWIN_SYSCALL_CLASS_STYLE9	0x2A
 
 /*
- * BSD (class 2) call numbers we translate -- Darwin's numbering from
- * bsd/kern/syscalls.master, NOT Linux's.  A class-2 call returns its result
- * in %rax with the carry flag clear, or a positive errno in %rax with carry
- * set; see darwin.c.
+ * BSD (class 2) call numbers we translate, from Darwin's
+ * bsd/kern/syscalls.master (not Linux's).  The result is in %rax with carry
+ * clear, or a positive errno with carry set; see darwin.c.
  */
 #define	DARWIN_SYS_exit		1
 #define	DARWIN_SYS_fork		2
@@ -93,22 +83,16 @@
 #define	DARWIN_SYS_mmap		197
 #define	DARWIN_SYS_lseek	199
 /*
- * getcwd(3) is not a syscall on Darwin; libc calls __getcwd(2), which fills a
- * caller-supplied buffer with the absolute path or fails with ERANGE.  The
- * number is Darwin's, not an invention.
+ * getcwd(3) is not a syscall on Darwin; libc calls __getcwd(2), which fills
+ * a caller-supplied buffer with the absolute path or fails with ERANGE.
  */
 #define	DARWIN_SYS___getcwd	326
 
 /*
- * READINESS, AND THE CALLS THAT ARRIVED WITH IT
- *
- * Numbers are Darwin's.  access(2) is 33, select(2) 93, mkfifo(2) 132,
- * ftruncate(2) 201, poll(2) 230 -- each checked against the class-2 table
- * the way every number above was.  pselect is NOT here: XNU has had a
- * native pselect since around 10.14, but its number was not verified from a
- * source at hand, and a number written down from memory would be exactly
- * the kind of "faithful" that is not.  It rides the style9-private class
- * instead (DARWIN_S9_pselect below), where libSystem is the only caller.
+ * More class-2 numbers, checked like those above.  pselect is not here:
+ * XNU's native number was not verified from a source, so it rides the
+ * style9-private class instead (DARWIN_S9_pselect), called only by our
+ * libSystem.
  */
 #define	DARWIN_SYS_access	33
 #define	DARWIN_SYS_select	93
@@ -123,10 +107,10 @@
 #define	DARWIN_R_OK		4
 
 /*
- * select(2)'s fd_set is FD_SETSIZE bits in 32-bit words; poll(2)'s pollfd is
- * {int fd; short events; short revents}.  The event bits are <sys/poll.h>'s.
- * Only POLLIN, POLLOUT and the three answers a caller cannot ask for (ERR,
- * HUP, NVAL) mean anything here; PRI is accepted and never reported.
+ * select(2)'s fd_set is FD_SETSIZE bits in 32-bit words; poll(2)'s pollfd
+ * is {int fd; short events; short revents}, with <sys/poll.h>'s bits.
+ * Only POLLIN, POLLOUT and the unrequested ERR, HUP and NVAL are ever
+ * set; PRI is accepted but never reported.
  */
 #define	DARWIN_FD_SETSIZE	1024
 #define	DARWIN_NFDBITS		32
@@ -146,12 +130,9 @@ struct darwin_pollfd {
 _Static_assert(sizeof(struct darwin_pollfd) == 8, "pollfd is 8 bytes");
 
 /*
- * open(2)'s vocabulary, as Darwin's <sys/fcntl.h> spells it.
- *
- * The access mode is NOT a bitmask of the other flags: it is the low two bits,
- * where 0 means read, 1 write and 2 both -- so "is this open for writing" is a
- * comparison and not a bit test, and treating it as one is how O_RDONLY|O_TRUNC
- * (a legal, if odd, request) gets mistaken for a write.
+ * open(2) flags, Darwin <sys/fcntl.h>.  The access mode is the low two bits
+ * (0 read, 1 write, 2 both), so "open for writing" is a comparison under
+ * O_ACCMODE, not a bit test.
  */
 #define	DARWIN_O_ACCMODE	0x0003
 #define	DARWIN_O_RDONLY		0x0000
@@ -163,10 +144,8 @@ _Static_assert(sizeof(struct darwin_pollfd) == 8, "pollfd is 8 bytes");
 #define	DARWIN_O_EXCL		0x0800
 
 /*
- * mmap(2)'s vocabulary, as <sys/mman.h> spells it on Darwin.  The protection
- * bits happen to match this kernel's VM_PROT_READ/WRITE/EXEC one for one --
- * both descend from the same BSD ancestor -- but the syscall layer translates
- * them explicitly rather than trusting a coincidence to survive.
+ * mmap(2) flags, Darwin <sys/mman.h>.  The PROT bits happen to match
+ * VM_PROT_*, but darwin.c translates them explicitly.
  */
 #define	DARWIN_PROT_NONE	0x00
 #define	DARWIN_PROT_READ	0x01
@@ -198,12 +177,9 @@ _Static_assert(sizeof(struct darwin_pollfd) == 8, "pollfd is 8 bytes");
 #define	DARWIN_SIG_SETMASK	3
 
 /*
- * fcntl(2) commands (Darwin <sys/fcntl.h>).  F_DUPFD is the one with real
- * semantics here (a shell parks its saved fds at 10+ with it); the fd-flag
- * and status-flag commands are accepted and answer 0 -- there is nothing
- * to set on this fd table (no close-on-exec: exec already preserves fds
- * deliberately, and a shell's FD_CLOEXEC requests are about hygiene it
- * re-establishes anyway).
+ * fcntl(2) commands (Darwin <sys/fcntl.h>).  Only F_DUPFD does anything (a
+ * shell saves fds at 10+ with it); the flag commands answer 0, as the fd
+ * table has no flag bits (no close-on-exec).
  */
 #define	DARWIN_F_DUPFD		0
 #define	DARWIN_F_GETFD		1
@@ -213,9 +189,8 @@ _Static_assert(sizeof(struct darwin_pollfd) == 8, "pollfd is 8 bytes");
 #define	DARWIN_F_DUPFD_CLOEXEC	67	/* dash's savefd uses this one */
 
 /*
- * Mach traps (class 1) we answer -- positive indices into xnu's
- * mach_trap_table.  These return a port name or a kern_return_t directly in
- * %rax with no carry convention.
+ * Mach traps (class 1): positive indices into xnu's mach_trap_table.  They
+ * return a port name or kern_return_t in %rax, no carry convention.
  */
 #define	DARWIN_MACH_mach_reply_port	26
 #define	DARWIN_MACH_thread_self_trap	27
@@ -224,26 +199,26 @@ _Static_assert(sizeof(struct darwin_pollfd) == 8, "pollfd is 8 bytes");
 #define	DARWIN_MACH_mach_msg_trap	31	/* classic combined mach_msg() */
 
 /*
- * style9-private calls (class DARWIN_SYSCALL_CLASS_STYLE9), issued only by our
- * dyld.  map_image(const char *path) maps the embedded dylib registered under
- * `path` into the caller's task and returns the base it landed at in %rax (0 +
- * carry on failure).
+ * style9-private calls (class DARWIN_SYSCALL_CLASS_STYLE9), issued only by
+ * our dyld and libSystem.  map_image(const char *path) maps the embedded
+ * dylib registered under `path` into the caller's task and returns the
+ * base it landed at; carry and an errno on failure.
  */
 #define	DARWIN_S9_dyld_map_image	1
 
 /*
- * fs_stat(const char *path, struct fs_fat_statbuf *out): report whether a file
- * exists in the read-only FS, plus its size / type / inode, WITHOUT the kernel
- * knowing anything about Apple's struct stat.  libSystem's stat$INODE64 issues
- * this, then fills the macOS-ABI struct itself (keeping the layout knowledge in
- * the clean-room ABI layer, not the kernel).  Copies the small fs_fat_statbuf
- * (fs/fat/fat.h) out to *out; returns 0 in %rax (carry clear), or carry set on
- * absence.
+ * fs_stat(const char *path, struct fs_statbuf *out): size, type, inode and
+ * times of a file, in fs/fs.h's neutral struct; libSystem's stat$INODE64
+ * builds Apple's struct stat from it, keeping that layout out of the
+ * kernel.  Returns 0, or carry set (ENOENT when absent).
  *
- * fs_readdir(const char *path, uint32_t index, struct fs_fat_dirent *out):
- * fill *out with the index-th entry of the directory at `path`.  Returns 1 in
- * %rax when an entry was written, 0 at end-of-directory, carry set on error.
+ * fs_readdir(const char *path, uint32_t index, struct fs_dirent *out):
+ * fill *out with the index-th entry of the directory at `path`.  Returns 1
+ * when an entry was written, 0 at end-of-directory, carry set on error.
  * libSystem's opendir/readdir drive it (stateless: re-resolved per index).
+ *
+ * uname, fs_fstat and fs_fdpath are described with their structs below and
+ * in darwin.c.
  */
 #define	DARWIN_S9_fs_stat		2
 #define	DARWIN_S9_fs_readdir		3
@@ -254,19 +229,16 @@ _Static_assert(sizeof(struct darwin_pollfd) == 8, "pollfd is 8 bytes");
 /*
  * pselect(int nfds, uint32_t *in, uint32_t *ou, uint32_t *ex,
  *     const struct darwin_timespec *ts, const uint32_t *sigmask):
- * select(2) with a signal mask swapped in for the duration of the wait --
- * the primitive select(2) is the special case of.  Why it is in this class
- * and not class 2 is said next to DARWIN_SYS_select.
+ * select(2) with a signal mask swapped in for the wait.  In this class
+ * rather than class 2: see DARWIN_SYS_select.
  */
 #define	DARWIN_S9_pselect		7
 
 /*
- * fs_fstat(int fd, struct darwin_fdstat *out): the fd-flavored sibling of
- * fs_stat, behind libSystem's fstat64.  The kernel classifies what the fd
- * actually holds (regular buffered file / console / pipe end) into this
- * neutral struct and libSystem reshapes it into Apple's struct stat --
- * same division of ABI knowledge as fs_stat.  Returns 0 (carry clear) or
- * carry set with EBADF/EFAULT.
+ * fs_fstat(int fd, struct darwin_fdstat *out): fs_stat's fd sibling,
+ * behind libSystem's fstat64.  The kernel classifies what the fd holds
+ * (file, directory, console or /dev/null, pipe end) and libSystem builds
+ * Apple's struct stat.  Returns 0, or carry set with EBADF/EFAULT.
  */
 #define	DARWIN_FDSTAT_REG	0
 #define	DARWIN_FDSTAT_CHR	1
@@ -275,12 +247,8 @@ _Static_assert(sizeof(struct darwin_pollfd) == 8, "pollfd is 8 bytes");
 
 struct darwin_fdstat {
 	/*
-	 * The inode, so that two descriptors onto the same file say so and
-	 * two onto different files do not.  It was absent, and every
-	 * regular file fstat'd as inode 0: cat, which refuses to copy a file
-	 * onto itself by comparing exactly this, refused the second of any
-	 * two inputs once the first had been written -- "input file is
-	 * output file", about a file that was neither.
+	 * Tells descriptors on the same file from different ones; cat
+	 * compares it to refuse copying a file onto itself.
 	 */
 	uint64_t	fds_ino;
 	uint32_t	fds_size;	/* byte length (regular files)   */
@@ -288,20 +256,12 @@ struct darwin_fdstat {
 };
 
 /*
- * THE TERMINAL, as Darwin describes one.
- *
- * struct termios is written into and read out of a genuine Apple binary's own
- * storage, so none of this is ours to choose.  The layout is not guessed
- * either: Darwin encodes the size of the argument INTO the ioctl number --
- * _IOR('t', 19, struct termios) is 0x40000000 | (size << 16) | ('t' << 8) | 19
- * -- and the number the world calls TIOCGETA is 0x40487413, which says the
- * size is 0x48.  The _Static_assert below is the same claim, made by the
- * compiler.  (FIONREAD, 0x4004667f, was already in this tree and encodes a
- * 4-byte int the same way, which is how the arithmetic was checked.)
- *
- * tcflag_t and speed_t are unsigned long -- 64 bits here -- and cc_t is a
- * single byte, so c_cc lands at 32 and the four bytes after it are pure
- * alignment, exactly like the padding spelled out in struct timeval below.
+ * struct termios, Darwin x86_64 layout, read and written in an Apple
+ * binary's own storage.  The ioctl number encodes the argument size:
+ * _IOR('t', 19, struct termios) is 0x40000000 | (size << 16) | ('t' << 8)
+ * | 19, and TIOCGETA is 0x40487413, so the size is 0x48 (asserted below).
+ * tcflag_t and speed_t are 64-bit unsigned long and cc_t one byte, so c_cc
+ * sits at 32 followed by four bytes of alignment padding.
  */
 #define	DARWIN_NCCS	20
 
@@ -356,7 +316,7 @@ _Static_assert(sizeof(struct darwin_winsize) == 8, "the 8 in TIOCGWINSZ");
 #define	DARWIN_CREAD	0x00000800UL
 #define	DARWIN_CLOCAL	0x00008000UL
 
-/* c_lflag -- the four this discipline actually acts on, and their neighbours */
+/* c_lflag */
 #define	DARWIN_ECHOKE	0x00000001UL
 #define	DARWIN_ECHOE	0x00000002UL
 #define	DARWIN_ECHOK	0x00000004UL
@@ -380,22 +340,16 @@ _Static_assert(sizeof(struct darwin_winsize) == 8, "the 8 in TIOCGWINSZ");
 #define	DARWIN_VTIME	17
 
 /*
- * The speed a terminal that is not a serial line reports.  BSD keeps the
- * number itself rather than an index, so this IS 38400 baud.
+ * The speed a non-serial terminal reports.  BSD stores the baud rate
+ * itself, not an index.
  */
 #define	DARWIN_B38400	38400UL
 
 /*
- * struct timeval, EXACTLY as x86_64 Darwin lays it out -- this one is written
- * into a genuine Apple binary's own storage, so the layout is not ours to
- * choose.  tv_sec is time_t (64-bit); tv_usec is suseconds_t, a 32-BIT int at
- * offset 8, with the last four bytes pure alignment padding.  Spelling the
- * padding out beats writing a 64-bit microsecond field and relying on
- * little-endian byte order to make it come out right.
- *
- * The time is UTC.  There is no timezone database in this kernel, and the
- * second argument gettimeofday(2) accepts for one has been ignored by every
- * real system for decades.
+ * struct timeval, x86_64 Darwin layout (written into Apple binaries'
+ * storage): 64-bit tv_sec, then tv_usec as a 32-bit suseconds_t at offset
+ * 8, then four bytes of explicit padding.  The time is UTC;
+ * gettimeofday(2)'s timezone argument is ignored.
  */
 struct darwin_timeval {
 	int64_t		tv_sec;
@@ -415,15 +369,10 @@ _Static_assert(sizeof(struct darwin_timeval) == 16,
     "struct timeval is 16 bytes on x86_64 Darwin");
 
 /*
- * uname(struct darwin_uname *out): report the machine's identity card.  A
- * libSystem-only tool that asks "what am I running on?" (guname) reaches here
- * via libSystem's uname(3); the kernel is the thing claiming to be Darwin, so
- * the (fabricated) identity it answers with lives here.  As with fs_stat, the
- * kernel hands back a neutral struct and libSystem reshapes it into Apple's
- * struct utsname (256-byte fields) -- the macOS ABI layout stays in the
- * clean-room library, not the kernel.  Fields are generously sized for the
- * (long) version string; libSystem bounds the copy into utsname.  Returns 0 in
- * %rax (carry clear); carry set only if *out faults.
+ * uname(struct darwin_uname *out): the Darwin identity the kernel claims,
+ * behind libSystem's uname(3) (guname).  As with fs_stat, a neutral struct
+ * that libSystem reshapes into Apple's struct utsname (256-byte fields),
+ * bounding each copy.  Returns 0, or carry set if *out faults.
  */
 #define	DARWIN_UNAME_FIELD	128
 
@@ -436,17 +385,16 @@ struct darwin_uname {
 };
 
 /*
- * Base VA at which the first dylib is mapped into a Darwin task; further
- * dylibs bump upward from there (struct task.t_darwin_dylib_next).  Inside the
- * style9 user-VA window [0x40000000, 0x80000000) and clear of the main image
- * (0x50000000), dyld (0x60000000), and the user stack (0x4000F000).
+ * Base VA of the first dylib in a Darwin task; further dylibs bump upward
+ * from it (t_darwin_dylib_next).  Inside the user window [0x40000000,
+ * 0x80000000), above the main image (0x50000000) and dyld (0x60000000);
+ * the stack grows down from DARWIN_STACK_TOP (0x50000000).
  */
 #define	DARWIN_DYLIB_BASE	0x70000000ULL
 
 /*
- * BSD errno values (Darwin <sys/errno.h>) for the failures we can produce.
- * style9 has no errno of its own -- the kernel speaks MACH_E_* / ELF_E_* --
- * so darwin.c maps its internal failures onto these on the carry-set path.
+ * BSD errno values (Darwin <sys/errno.h>) we produce.  style9 has no errno
+ * of its own, so darwin.c maps internal failures onto these.
  */
 #define	DARWIN_EPERM	1
 #define	DARWIN_ENOENT	2
@@ -477,10 +425,9 @@ struct darwin_uname {
 #define	DARWIN_ENOSYS	78
 
 /*
- * mach_msg option flags + the mach_msg_return_t values darwin_dispatch
- * produces (Darwin <mach/message.h>).  mach_msg_trap returns one of these in
- * %rax with NO carry convention -- it is a Mach trap (class 1), so even a
- * receive timeout comes back as a code in %rax with carry clear.
+ * mach_msg option flags and the mach_msg_return_t values we produce
+ * (Darwin <mach/message.h>).  Returned in %rax with carry clear, even a
+ * receive timeout: mach_msg_trap is a class-1 trap.
  */
 #define	DARWIN_MACH_SEND_MSG		0x00000001u
 #define	DARWIN_MACH_RCV_MSG		0x00000002u
@@ -509,34 +456,32 @@ long	darwin_dispatch(struct syscall_frame *f);
 
 /*
  * Open-file table lifecycle (kern/darwin.c).  darwin_files_teardown
- * releases every typed slot in t's table -- FILE buffers freed, pipe-end
- * references dropped -- and is the one teardown path task_deref calls.
- * darwin_files_fork_copy clones the parent's table into the child at
- * fork: FILE slots get their own copy of the buffer, CONSOLE slots copy
- * plainly, PIPE slots share the pipe object with the matching end's
- * reference count bumped.  Returns 0 or a negative SYS_E_* (the caller
- * derefs the half-built child; teardown releases what was cloned).
+ * releases every slot in t's table (files closed, pipe ends dropped) and
+ * the console claim.  The task's last thread calls it in thread_exit,
+ * since closing can block; task_deref calls it again as an idempotent
+ * fallback.  darwin_files_fork_copy clones the parent's table into the
+ * child at fork: files take another fs hold (a built-in's buffer is
+ * copied), pipe ends bump the matching count.  Returns 0 or -1; the caller
+ * derefs the half-built child, and teardown releases what was cloned.
  */
 void	darwin_files_teardown(struct task *t);
 int	darwin_files_fork_copy(struct task *parent, struct task *child);
 
 /*
- * The Darwin console (kern/darwin.c) -- a terminal in canonical mode, whose
- * line discipline lives behind darwin_cons_input: echo, erase, Ctrl-C to a
- * signal, Ctrl-D to end-of-file, and delivery a line at a time to the
- * personality's read(2) on a console fd.
+ * The Darwin console (kern/darwin.c): a terminal whose line discipline,
+ * behind darwin_cons_input, does echo, erase, Ctrl-C to a signal and
+ * Ctrl-D to end-of-file per the termios flags, and feeds read(2) on a
+ * console fd.
  *
- * Two producers feed it.  darwin_cons_sink is the keyboard driver's: it
- * answers whether a Darwin task currently holds the console and, if so,
- * swallows the key -- the ONE place the keyboard is arbitrated between a
- * Darwin binary and the native shell's Mach input port.  darwin_cons_feed is
- * the scripted one behind the SYS_CONS_FEED native syscall, which pushes a
- * canned session through the same discipline and then declares end-of-input,
- * so the boot demo drives the interactive path rather than a parallel one.
+ * darwin_cons_sink is the keyboard driver's producer: if a Darwin task
+ * holds the console it takes the key, else returns false and the key goes
+ * to the native shell's Mach input port; nothing else arbitrates the
+ * keyboard.  darwin_cons_feed loads a canned session for SYS_CONS_FEED,
+ * released a line at a time through the same discipline, then
+ * end-of-input.
  *
- * darwin_cons_release drops the claim when its owner dies; task teardown
- * calls it, because a claim that outlives its task routes every keystroke
- * into a ring nobody drains.
+ * darwin_cons_release drops the claim (and restores default settings) when
+ * its owner dies; file teardown calls it.
  */
 bool	darwin_cons_input(char c);
 bool	darwin_cons_sink(char c);
@@ -546,116 +491,93 @@ void	darwin_cons_stats(void);
 void	darwin_wait_stats(void);
 
 /*
- * Wake a parent parked in wait4(2) for the pid `ppid`.  Called wherever a
- * child's fate changes: where a zombie is recorded, and from task teardown,
- * where the change is that the child no longer exists at all.  A no-op for
- * ppid 0, which names no Darwin parent.
+ * Wake a parent parked in wait4(2) for the pid `ppid`.  Called where a
+ * zombie is recorded and from task teardown, when the child is gone.  A
+ * no-op for ppid 0 (no Darwin parent).
  */
 void	darwin_child_news(unsigned long long ppid);
 
 /*
  * Zombie bookkeeping (kern/darwin.c).  Records {pid, ppid, wait4-format
  * status} for a dying Darwin task so the parent's wait4 can reap it; a
- * ppid of 0 (no Darwin parent) records nothing.  Also sweeps the dying
- * task's own unreaped zombie children -- orphans no one is left to wait
- * for.  Called from the exit(2) path and from the execve point-of-no-
- * return failure path (arch/amd64/usermode.c).
+ * ppid of 0 records nothing.  Also drops the dying task's own unreaped
+ * zombie children, which no one is left to wait for.  Called on every
+ * Darwin death: exit(2), signal termination, kill(2), a bad sigreturn
+ * frame, and the execve point-of-no-return failure (arch/amd64/usermode.c).
  */
 void	darwin_zombie_record(unsigned long long pid, unsigned long long ppid,
 	    int status);
 
 /*
- * Signal subsystem (kern/darwin.c).  darwin_signal_post OR's `signo` into
- * `t`'s pending set from any context -- it never delivers synchronously, the
- * signal takes effect at `t`'s next return to user.  darwin_signal_deliver is
- * that return-to-user hook: it applies the current task's deliverable set,
- * silently discarding ignored (and default-ignore) signals, leaving a caught
- * signal pending for phase-2 on-stack delivery, and, for a signal whose
- * default action is terminate, recording the wait4 status and retiring the
- * thread -- NORETURN in that case.  Both no-op on a NULL task; deliver is
- * only ever called for a TASK_PERSONALITY_DARWIN task.
+ * Signal subsystem (kern/darwin.c).  darwin_signal_post ORs `signo` into
+ * `t`'s pending set from any context and wakes t's sleepers; the signal
+ * takes effect at t's next return to user.  darwin_signal_deliver is a
+ * return-to-user hook without a frame: it discards ignored and
+ * default-ignore signals, leaves a caught one pending for on-stack
+ * delivery, and for a default-terminate one records the wait4 status and
+ * retires the thread (no return).  Both no-op on a NULL task; deliver is
+ * called only for TASK_PERSONALITY_DARWIN tasks.
  */
 void	darwin_signal_post(struct task *t, int signo);
 
 /*
- * Has `t` a signal posted that will actually DO something?  The question every
- * wait in this personality has to ask before it goes round again, asked
- * through one function so the four places that wait cannot drift apart on the
- * answer -- three of them used to ask only whether the task had been killed,
- * which is a different and much narrower question.
+ * Has `t` a pending, unblocked signal that will act (caught or fatal)?
+ * Every interruptible wait in the personality asks this, alongside
+ * task_kill_pending.  Ignored and default-ignore signals do not count: they
+ * are consumed on the way to ring 3, and SIGCHLD would otherwise make wait4
+ * return EINTR the moment its child died.  A true answer delivers nothing;
+ * the caller returns EINTR and delivery happens on the way out.
  *
- * "Will do something" is the operative part, and posted-and-unblocked is not
- * it.  A signal whose disposition is SIG_IGN, or whose default is to be
- * ignored, is consumed on the way back to ring 3 and leaves no trace; a wait
- * that ended for one would report EINTR for nothing at all.  SIGCHLD is
- * default-ignore and arrives exactly when a parent sits in wait4, so counting
- * it makes wait4 fail the moment its child dies -- which is what the first
- * version of this did.
- *
- * A true answer delivers nothing.  It means the caller should stop waiting and
- * return EINTR; delivery happens where it always has, on the way out.
- *
- * Safe to call only on the current thread's own task: t_sig_mask and
- * t_sig_handler have a single writer and this reads them without a lock.
+ * Only for the current thread's own task: t_sig_mask and t_sig_handler
+ * have a single writer and are read without a lock.
  */
 bool	darwin_signal_pending(struct task *t);
 void	darwin_signal_deliver(struct task *t);
 
 /*
- * Phase-2 on-stack delivery.  darwin_signal_deliver_syscall is the
- * syscall-exit variant of darwin_signal_deliver: with the caller's
- * syscall_frame in hand (and `rv`, the value the syscall was about to
- * return), it can deliver a CAUGHT signal to a ring-3 handler -- it saves
- * the interrupted context into a darwin_sigframe on the user stack, then
- * reshapes the frame so the sysret enters the task's registered _sigtramp
- * with (signo, siginfo, ucontext, handler).  Default-terminate and ignore
- * are handled exactly as darwin_signal_deliver.  The trampoline calls the
- * handler then issues DARWIN_SYS_sigreturn, which restores the sigframe.
+ * darwin_signal_deliver_syscall: the syscall-exit variant.  With the
+ * syscall_frame and `rv` (the value about to be returned) it delivers a
+ * caught signal on-stack: saves the context in a darwin_sigframe on the
+ * user stack and reshapes the frame so the sysret enters the task's
+ * _sigtramp with (signo, siginfo, ucontext, handler).  Terminate and
+ * ignore as darwin_signal_deliver.  The trampoline calls the handler, then
+ * DARWIN_SYS_sigreturn restores the sigframe.
  */
 struct syscall_frame;
 void	darwin_signal_deliver_syscall(struct syscall_frame *f, long rv);
 
 /*
- * Phase-3 asynchronous delivery.  darwin_signal_deliver_trap is the IRQ- and
- * fault-return variant: it delivers a caught signal to a thread that is not
- * at a syscall boundary at all -- a pure ring-3 compute loop that a timer
- * IRQ happens to interrupt.  Because the interrupted code was mid-expression
- * rather than mid-ABI-call, the saved context has to be the WHOLE machine
- * state (all 15 GPRs and the FPU file), and the resume has to be an IRETQ.
- * Default-terminate and ignore behave exactly as darwin_signal_deliver.
+ * darwin_signal_deliver_trap: the IRQ- and fault-return variant, for a
+ * thread not at a syscall boundary (say, a ring-3 loop a timer IRQ
+ * interrupted).  Nothing is dead there, so the frame holds the whole
+ * machine state (all 15 GPRs and the FPU file) and the resume is an IRETQ.
+ * Terminate and ignore as darwin_signal_deliver.
  */
 struct trapframe;
 void	darwin_signal_deliver_trap(struct trapframe *tf);
 
 /*
- * On-stack signal context the kernel writes at delivery and reads back at
- * sigreturn.  Private to the clean-room ABI (our _sigtramp is the only
- * producer of the sigreturn call), so the layout is ours to define.
+ * On-stack signal context, written at delivery and read back at sigreturn.
+ * Private to the clean-room ABI (our _sigtramp is the only sigreturn
+ * caller), so the layout is ours.  Two flavours, by the magic at offset 0:
  *
- * Two flavours, told apart by the magic at offset 0 -- how much state has to
- * be saved depends on where the signal was taken:
+ *	SGFR1	taken at a syscall boundary, where the ABI makes argument
+ *		and scratch registers dead: rip/rsp/rflags/rax suffice and
+ *		the resume uses the ordinary SYSRET exit.
+ *	SGFR2	taken asynchronously: every GPR and the FPU file are saved
+ *		and sigreturn leaves via IRETQ.
  *
- *	SGFR1	taken at a syscall boundary.  The SysV/SYSCALL ABI already
- *		declares the argument and scratch registers dead across the
- *		call, so saving rip/rsp/rflags/rax is enough and the resume
- *		can ride the ordinary SYSRET exit.
- *	SGFR2	taken asynchronously from the IRQ path.  Nothing is dead:
- *		every GPR and the FPU file must come back bit-exact, so the
- *		frame carries all of it and sigreturn leaves via IRETQ.
- *
- * Both carry the signal mask in force at delivery: the kernel blocks the
- * signal being handled for the duration of its handler (POSIX) and restores
- * the saved mask at sigreturn.
+ * Both record the mask in force at delivery; the handled signal is blocked
+ * during its handler (POSIX) and the mask restored at sigreturn.
  */
 #define	DARWIN_SIGFRAME_MAGIC		0x5347465231ULL	/* "SGFR1" */
 #define	DARWIN_SIGFRAME_MAGIC_FULL	0x5347465232ULL	/* "SGFR2" */
 
 /*
- * RFLAGS bits a sigreturn is allowed to restore: CF PF AF ZF SF DF OF.  The
- * saved value comes back through the user's own stack, so it is attacker-
- * controlled in the limit; masking keeps a forged frame from handing ring 3
- * IOPL (I/O port access + CLI/STI), NT, or a single-step trap.  IF and the
- * must-be-set bit 1 are OR'd back in unconditionally.
+ * RFLAGS bits a sigreturn may restore: CF PF AF ZF SF DF OF.  The saved
+ * value comes from the user stack, so masking keeps a forged frame from
+ * granting IOPL, NT or a single-step trap.  IF and reserved bit 1 are
+ * ORed back in.
  */
 #define	DARWIN_SIGRETURN_RFLAGS_MASK	0x00000CD5ULL
 
@@ -704,14 +626,12 @@ _Static_assert(__builtin_offsetof(struct darwin_sigframe_full, sf_fpu) % 16 == 0
 
 /*
  * Process-lifecycle arch hooks (arch/amd64/usermode.c).  arch_darwin_fork
- * builds the child task -- address-space copy, fd-table clone, a thread
- * that iretqs to the parent's saved user rip/rsp with %rax = 0 -- and
- * returns the child's pid, or a negative SYS_E_*.  arch_darwin_execve
- * replaces the calling task's user address space with `image` (argv is a
- * kernel-owned flat block) and rewrites the frame's user rip/rsp so the
- * sysret lands in the fresh image; returns 0, and does not return at all
- * if setup fails past the point of no return (the task exits with wait4
- * status 127).
+ * builds the child (address-space copy, fd-table clone, a thread that
+ * iretqs to the parent's user rip/rsp with %rax = 0) and returns its pid,
+ * or a negative SYS_E_*.  arch_darwin_execve replaces the caller's address
+ * space with `image` (argv and envp kernel-owned) and rewrites the frame's
+ * user rip/rsp to enter it; returns 0, or does not return at all on a
+ * failure past the point of no return (wait4 status 127).
  */
 long	arch_darwin_fork(struct syscall_frame *f);
 long	arch_darwin_execve(const unsigned char *image,

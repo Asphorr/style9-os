@@ -16,8 +16,8 @@
  *
  * Memory-mapped at physical 0xB8000.  Eighty columns by twenty-five
  * rows, each cell two bytes: low = CP437 code point, high = attribute
- * (fg:4 | bg:3 | blink:1).  No locking yet -- there is exactly one
- * CPU and no scheduler.
+ * (fg:4 | bg:4; blink is turned off at init).  Output is serialised per
+ * write by the console lock in dev/tty.c, which is recursive per CPU.
  */
 
 #define	TTY_COLS		80
@@ -52,58 +52,42 @@ void	tty_puts(const char *);
 void	tty_write(const char *, size_t);
 
 /*
- * Where the cursor is, asked two different ways: tty_cursor_cell is
- * what this driver thinks, tty_cursor_hw is what the CRT controller was
- * actually told.  They exist as a pair because the only interesting
- * question about a hardware cursor is whether those two agree, and a
- * test that asked the driver twice would answer it wrongly every time.
- * Both return a cell offset, row * TTY_COLS + col.
+ * The cursor as a cell offset (row * TTY_COLS + col), two ways:
+ * tty_cursor_cell is what the driver thinks, tty_cursor_hw what the CRT
+ * controller was told.  Tests compare the latter with an expected value.
  */
 uint16_t	tty_cursor_cell(void);
 uint16_t	tty_cursor_hw(void);
 
 /*
- * Bracket a run of output so the hardware cursor is programmed once at
- * the end of it instead of once per character.  Nesting is counted, so
- * these may be used by anything that emits more than one byte -- see
- * the note in dev/tty.c for the measurement that made them necessary.
- * Callers that write a single character need not bother: tty_putc is
- * already exactly one write.
+ * Bracket a run of output: the console is held for the whole run, so
+ * other CPUs' output cannot interleave with it, and the hardware cursor
+ * is programmed once at the end.  Nesting is counted.  A single tty_putc
+ * is already one write.
  */
 void	tty_batch_begin(void);
 void	tty_batch_end(void);
 
-/* Characters blitted and cursor moves programmed, for the boot log. */
+/* Print characters, writes, cursor programmings and console waits. */
 void	tty_stats(void);
 
 /*
- * Prove, at boot and out loud, that the underline on the screen is
- * where the next character will go.  Scribbles on the console and
- * clears it afterwards, so it must run before anything worth reading
- * has been printed.
+ * Boot selftests.  Each scribbles on the console and clears it, so they
+ * must run before anything worth reading is printed.
+ *
+ *	tty_selftest		the hardware cursor follows the text, and a
+ *				write programs it once
+ *	tty_wrap_selftest	a line exactly TTY_COLS wide costs one row
+ *	tty_region_selftest	rows above the top margin stay put while the
+ *				region scrolls; hiding the cursor reaches
+ *				the hardware
+ *	tty_colour_selftest	the DAC holds our palette, all sixteen
+ *				backgrounds are colours, and SGR handles
+ *				reverse video and extended colours
  */
 void	tty_selftest(void);
-
-/*
- * And that a line exactly TTY_COLS wide costs one row rather than two.
- * Same scribble-and-clear discipline as tty_selftest, and runs beside
- * it for the same reason.
- */
 void	tty_wrap_selftest(void);
-
-/*
- * And that rows above the top margin stay put while the rows below
- * them scroll -- the property a status bar is built on.  Also checks
- * that hiding the cursor reaches the hardware.
- */
 void	tty_region_selftest(void);
-
-/*
- * And that the sixteen colours on the screen are the ones this kernel
- * chose, that all sixteen backgrounds are colours rather than eight
- * colours and a blink bit, and that the SGR parser neither loses
- * reverse video nor reads a 24-bit colour's channels as commands.
- */
 void	tty_colour_selftest(void);
 
 #endif /* !_SYS_TTY_H_ */

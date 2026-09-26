@@ -6,38 +6,34 @@
  */
 
 /*
- * Multiboot1 entry stub + 32-to-64 transition.
+ * Boot entry stub (PVH or multiboot2) and the 32-to-64 transition.
  *
- * Bootloader hands us 32-bit protected mode with:
- *	eax = MULTIBOOT_BOOTLOADER_MAGIC (0x2BADB002)
- *	ebx = phys ptr to struct multiboot_info
- *	cs/ds/es/ss = bootloader's flat 32-bit selectors
+ * The loader hands us 32-bit protected mode with:
+ *	eax = boot magic: MB2_BOOTLOADER_MAGIC under multiboot2; memmap_init
+ *	      takes 0 to mean PVH
+ *	ebx = phys ptr to the multiboot2 info or the hvm_start_info
+ *	cs/ds/es/ss = flat 32-bit selectors
  *	cr0.PE = 1, cr0.PG = 0, cr4.PAE = 0
  *
  * We:
- *   1.  Stash mb_magic / mb_info in BSS so we can clobber GPRs freely.
+ *   1.  Stash eax / ebx in .data so we can clobber GPRs freely.
  *   2.  Build a 3-level page-table tree (PML4 -> PDPT -> PD) that
  *	 identity-maps the low 1 GiB via 2 MiB huge pages.
- *   3.  Enable CR4.PAE, set IA32_EFER.LME, enable CR0.PG (now in
- *	 compatibility mode).
+ *   3.  Enable CR4.PAE, set IA32_EFER.LME and NXE, enable CR0.PG and
+ *	 CR0.WP (now in compatibility mode).
  *   4.  lgdt the temporary 64-bit GDT, far-jump to entry64 in the
  *	 64-bit code segment (this is the real long-mode transition).
- *   5.  In 64-bit: reload data segs, set up the stack, restore
- *	 mb_magic/mb_info into the SysV arg registers (rdi/rsi), call
- *	 kmain.  Halt forever if it returns.
+ *   5.  In 64-bit: reload data segs, set up the stack, pass the stashed
+ *	 values to kmain in rdi/rsi.  Halt forever if it returns.
  */
 
 /*
  * Boot headers.
  *
- * QEMU's -kernel loader scans an ELF64 kernel for a PVH "Xen" ELF note
- * (type 18, XEN_ELFNOTE_PHYS32_ENTRY); multiboot1/2 are rejected for
- * 64-bit images.  The note points at _start, which is still .code32
- * code -- PVH entry hands us 32-bit protected mode with %ebx = phys
- * addr of the hvm_start_info structure.
- *
- * We retain a multiboot2 header alongside it so the same ELF can also
- * boot under bootloaders that recognise mb2 (e.g. GRUB).
+ * QEMU's -kernel loader takes an ELF64 kernel only through the PVH "Xen"
+ * ELF note (type 18, XEN_ELFNOTE_PHYS32_ENTRY), which points at _start,
+ * still .code32.  The multiboot2 header lets the same ELF boot under mb2
+ * loaders such as GRUB.
  */
 
 	.set MB2_MAGIC, 0xE85250D6
@@ -96,8 +92,8 @@ boot_stack_top:
 	.align	16
 boot_gdt:
 	.quad	0
-	.quad	0x00AF9A000000FFFF		/* code64: P/DPL0/S/type=code, L=1 */
-	.quad	0x00CF92000000FFFF		/* data:   P/DPL0/S/type=data, G/D=1 */
+	.quad	0x00AF9A000000FFFF		/* code64: P, DPL0, S, L=1 */
+	.quad	0x00CF92000000FFFF		/* data: P, DPL0, S, G, D=1 */
 boot_gdt_end:
 
 	.align	16
@@ -113,7 +109,7 @@ mb_info_saved:
 	.long	0
 
 /* ---------------------------------------------------------------------- *
- * 32-bit entry from the multiboot bootloader.				  *
+ * 32-bit entry (PVH or multiboot2).					  *
  * ---------------------------------------------------------------------- */
 
 	.section .text
@@ -128,7 +124,7 @@ _start:
 	/* Provisional stack so the next routines may push if they wish. */
 	movl	$boot_stack_top, %esp
 
-	/* --- Build the page-table tree.  All entries are PRESENT | WRITE. --- */
+	/* --- Page-table tree; every entry PRESENT | WRITE. --- */
 
 	/* PML4[0] = boot_pdpt | flags */
 	movl	$boot_pdpt, %eax
@@ -168,29 +164,15 @@ _start:
 	movl	$0xC0000080, %ecx		/* IA32_EFER */
 	rdmsr
 	orl	$0x100, %eax			/* EFER.LME */
-	orl	$0x800, %eax			/* EFER.NXE -- bit 63 of a   */
-						/* PTE is the NX bit; without */
-						/* NXE the CPU treats it as a */
-						/* reserved bit and any walk  */
-						/* lands in a reserved-bit #PF*/
+	orl	$0x800, %eax			/* EFER.NXE -- else NX (PTE   */
+						/* bit 63) is a reserved bit  */
 	wrmsr
 
 	movl	%cr0, %eax
 	orl	$0x80000000, %eax		/* CR0.PG */
 	orl	$0x00010000, %eax		/* CR0.WP -- ring 0 obeys the */
-						/* read-only bit too.  Off at */
-						/* reset, and while it is off */
-						/* a read-only page is only   */
-						/* read-only to ring 3: any   */
-						/* kernel store through that  */
-						/* same VA lands silently.    */
-						/* Nothing above can build a  */
-						/* shared page it protects by */
-						/* clearing W -- copy-on-write*/
-						/* first of all -- until the  */
-						/* hardware enforces it for   */
-						/* the side that does the     */
-						/* copying.                   */
+						/* read-only bit too, which   */
+						/* copy-on-write relies on.   */
 	movl	%eax, %cr0
 
 	lgdt	boot_gdtr

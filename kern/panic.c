@@ -17,11 +17,9 @@
 #include "tty.h"
 
 /*
- * Bounds the backtrace walk to memory we know exists: the kernel sits
- * just above 1 MiB, the identity map covers 0 .. 1 GiB, and the boot
- * stack lives in .bss.  Anything outside the kernel image bounds is
- * almost certainly a corrupted RBP and we should stop rather than
- * follow it into a fault.
+ * Bounds for the backtrace walk: the 1 GiB boot identity map, which holds
+ * every kernel stack (the boot stack in .bss, kstacks from kmalloc).  An
+ * RBP outside it is corrupt; stop rather than follow it into a fault.
  */
 #define	BT_MIN_RBP	0x000000000000FFFFULL
 #define	BT_MAX_RBP	0x0000000040000000ULL
@@ -37,11 +35,7 @@ panic(const char *fmt, ...)
 	uintptr_t	rbp;
 	void		*caller;
 
-	/*
-	 * Disable interrupts unconditionally; we are about to render and
-	 * walk the frame chain in a context that cannot tolerate being
-	 * pre-empted by an IRQ that might also touch the console.
-	 */
+	/* No interrupt may touch the console or preempt the autopsy. */
 	__asm__ __volatile__ ("cli");
 
 	if (panic_in_progress) {
@@ -74,10 +68,8 @@ panic(const char *fmt, ...)
 }
 
 /*
- * KASSERT failure path.  file:line + the failed expression are baked
- * into the panic message; the "called from" line in panic() points
- * inside kassert_fail itself, but file:line is sufficient to find the
- * assertion site and the backtrace shows the calling chain.
+ * KASSERT failure.  panic's "called from" names kassert_fail, but the
+ * message carries file:line and the backtrace the calling chain.
  */
 void
 kassert_fail(const char *cond, const char *file, int line, const char *msg)

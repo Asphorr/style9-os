@@ -23,8 +23,7 @@
 
 /*
  * Register offsets from the APIC's page base.  Every access is a single
- * aligned 32-bit read or write; the architecture does not define anything
- * else, and a wider access is not a slow access but an undefined one.
+ * aligned 32-bit read or write; anything wider is undefined.
  */
 #define	LAPIC_ID		0x020	/* this CPU's hardware APIC id     */
 #define	LAPIC_VERSION		0x030	/* version + max LVT entry         */
@@ -51,9 +50,9 @@
 #define	LVT_TIMER_PERIODIC	(1u << 17)
 
 /*
- * Interrupt-command fields.  DELIVERY_PENDING is the one that has to be
- * waited on: the ICR is a single register for the whole APIC, so writing a
- * second message while the first is still going out loses one of them.
+ * Interrupt-command fields.  DELIVERY_PENDING must be waited on: the ICR
+ * is one register, and a second message written while the first is still
+ * going out loses one of them.
  */
 #define	ICR_DELIVERY_PENDING	(1u << 12)
 #define	ICR_MODE_INIT		(5u << 8)
@@ -61,41 +60,30 @@
 #define	ICR_LEVEL_ASSERT	(1u << 14)
 
 /*
- * How long to wait for a message to leave.  Generous by two orders of
- * magnitude -- delivery to a processor on the same die is measured in
- * nanoseconds -- because the point of the bound is to return with an answer
- * instead of hanging the boot if the message never goes out at all.
+ * How long to wait for a message to leave.  Delivery takes nanoseconds;
+ * the bound only exists so a message that never goes out returns an
+ * answer instead of hanging the boot.
  */
 #define	LAPIC_ICR_WAIT_US	100
 
 /*
- * Divide the APIC's input clock by 16 before it reaches the counter.  Any
- * divisor would do for a ratio measured against the PIT; 16 is chosen so
- * that a full 32-bit count cannot wrap during the calibration window on any
- * plausible bus frequency -- at 1 GHz undivided that would be four seconds,
- * and we measure for a tenth of one.
+ * Divide the APIC's input clock by 16.  Any divisor would do for a rate
+ * measured against the TSC; 16 keeps a full 32-bit count from wrapping in
+ * the calibration window at any plausible bus clock (undivided at 1 GHz it
+ * would last four seconds; the window is a tenth of one).
  */
 #define	LAPIC_DCR_DIV16		0x3
 #define	LAPIC_DIVISOR		16
 
 /*
- * How long to measure for, and how long to then let the timer run while its
- * interrupts are counted.  In microseconds of TSC time.
+ * How long to measure for, and how long to then let the timer run while
+ * its interrupts are counted, in microseconds of TSC time.
  *
- * ⚠ THE PIT WAS THE RULER HERE AND IT WAS THE WRONG ONE, which took a
- * measurement to notice.  Waiting for ten PIT INTERRUPTS is not the same as
- * waiting a tenth of a second: this host delivers them in bursts, so ten of
- * them can arrive in ninety milliseconds of real time, and the counting rate
- * derived from that window comes out ten percent low.  Two boots in four
- * calibrated 56.4 MHz where the other two read 61.8 and 62.3, and every one of
- * those numbers went straight into the timer's reload count -- a slice of
- * 18.1 ms wearing a constant that says 20.
- *
- * The TSC is READ, not delivered.  Nothing can compress a window measured by a
- * counter the CPU increments itself, and its own rate is anchored well enough
- * to check by eye: it prints ~3.58 GHz on a part sold as 3.6.  The PIT is
- * still counted alongside, because the difference between the two is exactly
- * the PIT's delivery deficit and that is worth being able to see.
+ * The ruler is the TSC, not PIT interrupts.  This host delivers PIT
+ * interrupts in bursts, so ten of them can arrive in 90 ms and read the
+ * counting rate 10% low -- straight into the reload count and every slice.
+ * A counter the CPU reads cannot be hurried.  The PIT is still counted
+ * alongside; the gap between the two is its delivery deficit.
  */
 #define	LAPIC_CAL_US		100000	/* 100 ms                          */
 #define	LAPIC_PROBE_US		200000	/* 200 ms                          */
@@ -107,10 +95,9 @@ static bool		 lapic_ok;		/* (c)                     */
 static uint32_t		 lapic_hz;		/* (c) ticks/s at DIV16    */
 
 /*
- * Set once, by lapic_timer_start, while the timer is still masked -- so the
- * ISR that reads it cannot be running yet and no ordering is needed.  False
- * during lapic_timer_probe deliberately: the probe delivers twenty
- * interrupts and none of them should spend anybody's slice.
+ * Set once, by lapic_timer_start, while the timer is still masked, so no
+ * ordering against the ISR is needed.  False during lapic_timer_probe:
+ * its twenty interrupts must not spend anybody's slice.
  */
 static bool		 lapic_preempting;	/* (c) after timer_start   */
 static unsigned int	 lapic_tick_hz;		/* (c) rate it now keeps   */
@@ -172,10 +159,8 @@ lapic_base_pa(void)
 }
 
 /*
- * Wait for the last interrupt command to leave, with a bound.  Returns false
- * if it never did, which the caller reports rather than retries: a message
- * still pending after a hundred microseconds is not a message that is about
- * to be sent.
+ * Wait, bounded, for the last interrupt command to leave.  False if it
+ * never did; callers report that rather than retry.
  */
 static bool
 lapic_icr_idle(void)
@@ -195,9 +180,8 @@ lapic_icr_idle(void)
 }
 
 /*
- * Send one interrupt command to one processor, named by its APIC id.  The
- * destination goes in the high half FIRST -- writing the low half is what
- * sends the message, so the order is not a preference.
+ * Send one interrupt command to the processor with this APIC id.  The
+ * destination goes in the high half first: writing the low half sends.
  */
 static bool
 lapic_ipi_send(uint32_t apic_id, uint32_t cmd)
@@ -219,11 +203,8 @@ lapic_ipi_init(uint32_t apic_id)
 {
 
 	/*
-	 * Assert only.  The de-assert half of the sequence is for the discrete
-	 * 82489DX, which had no way to tell an INIT from the level it arrived
-	 * at; every integrated APIC since treats INIT as edge-triggered and
-	 * ignores the de-assert, and the machines this runs on have never seen
-	 * that chip.
+	 * Assert only.  The INIT de-assert is for the discrete 82489DX;
+	 * integrated APICs ignore it.
 	 */
 	return (lapic_ipi_send(apic_id, ICR_MODE_INIT | ICR_LEVEL_ASSERT));
 }
@@ -234,11 +215,9 @@ lapic_ipi_startup(uint32_t apic_id, uint64_t tramp_pa)
 	uint32_t	vec;
 
 	/*
-	 * The startup message carries a PAGE NUMBER in its low byte, which is
-	 * the whole reason the trampoline lives in the first megabyte: there is
-	 * no room in this field for an address above 0xFF000.  A caller that
-	 * hands over something else gets a refusal rather than a processor
-	 * started at a rounded-down address.
+	 * STARTUP carries a page number in its low byte, so the trampoline
+	 * must be page-aligned and below 0x100000.  Anything else is refused
+	 * rather than started at a rounded-down address.
 	 */
 	if ((tramp_pa & 0xFFF) != 0 || (tramp_pa >> 12) > 0xFF)
 		return (false);
@@ -253,10 +232,8 @@ lapic_ipi_vector(uint32_t apic_id, uint8_t vec)
 {
 
 	/*
-	 * Fixed delivery, physical destination, edge triggered -- which is
-	 * every field at zero except the vector and the assert bit, so the
-	 * command is almost the vector itself.  Spelled out anyway, because a
-	 * command word made of defaults is one nobody can check.
+	 * Fixed delivery, physical destination, edge triggered: every field
+	 * zero but the vector and the assert bit.
 	 */
 	if (vec < INTR_LOCAL_BASE)
 		return (false);
@@ -270,24 +247,16 @@ lapic_timer_isr(struct trapframe *tf)
 
 	(void)tf;
 
-	/*
-	 * Counted in THIS CPU's block.  A single counter for the machine was
-	 * right while one processor delivered into it and became a lie the
-	 * moment a second did: the report divides the tally by elapsed time to
-	 * get a tick rate, and N processors ticking read as N times too fast.
-	 */
+	/* Per-CPU, so the report's per-CPU tick rate is honest. */
 	__atomic_add_fetch(&curcpu()->cp_timer_ticks, 1, __ATOMIC_RELAXED);
 
 	/*
-	 * The slice, from the moment this timer owns it.  Charged to whatever
-	 * is running on THIS CPU, which is the CPU that took the interrupt,
-	 * which is the CPU whose slice is being spent -- and that is the whole
-	 * reason the debit moved here from the PIT, which could only ever
-	 * charge one of them.
+	 * Debit the slice of whatever runs on this CPU, once this timer owns
+	 * the job; the one PIT could only ever charge one CPU.
 	 *
 	 * Not gated on preempt_is_enabled: the gate belongs at the schedule
-	 * point and not at the flag-set point, so that a critical section
-	 * which ends later still owes the reschedule it earned here.
+	 * point, so a critical section that ends later still owes the
+	 * reschedule earned here.
 	 */
 	if (lapic_preempting && preempt_quantum_tick())
 		preempt_resched_request();
@@ -314,11 +283,8 @@ lapic_init(void)
 	base = rdmsr(MSR_APIC_BASE);
 
 	/*
-	 * x2APIC reaches the same registers through MSRs, and in that mode
-	 * the MMIO window is not there to be read.  Nobody has put us in it
-	 * -- we would have to ask -- but a machine that arrives already in
-	 * x2APIC mode would answer every register read below with a fault,
-	 * so the possibility is checked rather than assumed away.
+	 * In x2APIC mode the registers are MSRs and the MMIO window is gone;
+	 * a machine that arrives in it would fault on every read below.
 	 */
 	if ((base & APIC_BASE_EXTD) != 0) {
 		kprintf("lapic: found in x2APIC mode, which this driver does "
@@ -326,11 +292,7 @@ lapic_init(void)
 		return (false);
 	}
 
-	/*
-	 * The global enable bit is set out of reset, but say so explicitly:
-	 * a kernel that relies on the state firmware left is a kernel that
-	 * works until the firmware changes.
-	 */
+	/* Globally enabled out of reset; set anyway, not trusting firmware. */
 	if ((base & APIC_BASE_EN) == 0) {
 		base |= APIC_BASE_EN;
 		wrmsr(MSR_APIC_BASE, base);
@@ -339,13 +301,11 @@ lapic_init(void)
 	pa = base & APIC_BASE_ADDR_MASK;
 
 	/*
-	 * Mapped identity and UNCACHEABLE.  The identity VA is free: the
-	 * kernel's own map covers the low gigabyte and ring 3 lives in the
-	 * one above it, while the APIC sits near the top of the 32-bit
-	 * range.  Uncacheable is not an optimisation choice -- these are
-	 * device registers whose value changes underneath the CPU, and a
-	 * cached read of the timer's current count would answer with
-	 * whatever it said the first time.
+	 * Mapped identity and uncacheable.  The identity VA is free: the
+	 * kernel map covers the low gigabyte and ring 3 the one above, while
+	 * the APIC sits near the top of the 32-bit range.  Uncacheable because
+	 * these are device registers; a cached read of the timer's current
+	 * count would repeat the first answer.
 	 */
 	if (!pmap_kenter(pa, pa,
 	    VM_PROT_READ | VM_PROT_WRITE | PMAP_NOCACHE)) {
@@ -360,38 +320,23 @@ lapic_init(void)
 	ver = lapic_read(LAPIC_VERSION);
 
 	/*
-	 * Accept interrupts of every priority.  The task-priority register
-	 * comes out of reset holding zero on the boot CPU, but an AP's does
-	 * not have to, and a non-zero TPR silently drops everything below
-	 * it -- a symptom that looks exactly like a missing interrupt
-	 * source.
+	 * Accept every priority.  TPR is zero out of reset on the boot CPU,
+	 * but an AP's need not be, and a non-zero TPR silently holds off
+	 * everything below it.
 	 */
 	lapic_write(LAPIC_TPR, 0);
 
 	/*
-	 * THE TWO LEGACY PINS, BEFORE THE ENABLE TAKES EFFECT ANYWHERE.
-	 * LINT0 carries the 8259's output and LINT1 the NMI line, and both
-	 * LVT entries are masked out of reset; software-enabling the APIC
-	 * with them still masked disconnects the PIT, the keyboard and the
-	 * disk in one instruction.  ExtINT means "the vector comes from the
-	 * 8259, go and ask it", which is what makes the existing interrupt
-	 * path keep working unchanged.
+	 * The two legacy pins, before the enable.  LINT0 carries the 8259's
+	 * output and LINT1 the NMI line; both are masked out of reset, and
+	 * enabling the APIC with them masked cuts off the PIT, keyboard and
+	 * disk at once.  ExtINT means "ask the 8259 for the vector", which
+	 * keeps the legacy interrupt path working unchanged.  Written
+	 * unconditionally, not trusting what firmware left.
 	 *
-	 * Written unconditionally rather than after checking what the
-	 * firmware left, because the state a previous owner of this register
-	 * left it in is exactly the thing that is not worth depending on.
-	 * (There IS a firmware in the path, whatever an earlier version of
-	 * this comment claimed: the ACPI tables the MADT probe reads are put
-	 * in low memory by it, and they say 'BOCHS'.)
-	 */
-	/*
-	 * And only on the BOOT processor.  There is one 8259 and its output is
-	 * wired to one CPU's LINT0; an application processor that also claimed
-	 * ExtINT would be offering to answer legacy interrupts that were never
-	 * routed to it, and the day interrupts are enabled over there the same
-	 * IRQ0 could be taken by either -- which is not a race this kernel
-	 * needs to have an opinion about yet.  The NMI pin is per-processor and
-	 * every CPU wants it.
+	 * ExtINT on the boot CPU only: the one 8259 is routed to one LINT0,
+	 * and an AP claiming it too could take the same IRQ.  Every CPU
+	 * wants its own NMI pin.
 	 */
 	if (cpu_id() == 0)
 		lapic_write(LAPIC_LVT_LINT0, LVT_DELIVERY_EXTINT);
@@ -404,22 +349,17 @@ lapic_init(void)
 	lapic_write(LAPIC_LVT_ERROR, LVT_MASKED);
 
 	/*
-	 * Software-enable, and name the spurious vector.  A spurious
-	 * interrupt is what the CPU takes when an interrupt it was about to
-	 * accept is withdrawn between the arbitration and the acknowledge;
-	 * it needs a gate to land on and DELIBERATELY has no handler, so the
-	 * dispatcher's "nothing installed" path ignores it -- which is
-	 * correct, because there is no in-service bit behind it and writing
-	 * EOI would retire a real interrupt belonging to somebody else.
+	 * Software-enable, and name the spurious vector: what the CPU takes
+	 * when an interrupt is withdrawn between arbitration and acknowledge.
+	 * It deliberately has no handler, so the dispatcher ignores it
+	 * without an EOI -- there is no in-service bit behind it.
 	 */
 	lapic_write(LAPIC_SVR, LAPIC_VEC_SPURIOUS | LAPIC_SVR_ENABLE);
 
 	/*
-	 * The id, now from the register, over the one CPUID gave cpu_bsp_init
-	 * before any of this existed.  They are the same field read two ways
-	 * and a machine where they differ has renumbered its APICs behind us,
-	 * so the disagreement is worth a line of its own rather than a silent
-	 * overwrite.
+	 * The id from the register replaces the one recorded earlier (CPUID
+	 * in cpu_bsp_init on the boot CPU, the MADT via cpu_register on an
+	 * AP).  A disagreement means the APICs were renumbered; say so.
 	 */
 	if (curcpu()->cp_lapic_id != (lapic_read(LAPIC_ID) >> 24))
 		kprintf("lapic: *** cpuid called this processor %u, the APIC's "
@@ -459,21 +399,17 @@ lapic_timer_probe(void)
 	}
 
 	/*
-	 * Preemption off across both halves.  Not for correctness of the
-	 * ratio -- every clock in sight runs whoever is on the CPU, so being
-	 * descheduled would not skew it -- but because the window is a
-	 * tenth of a second, which is five of this kernel's quanta, and a
-	 * measurement that reports what it measured is easier to trust than
-	 * one that reports what it asked for.  Interrupts stay ON: the second
-	 * half is about interrupts arriving.
+	 * Preemption off across both halves.  Not needed for the ratio --
+	 * being descheduled would not skew it -- but the windows span several
+	 * quanta, and the loops should measure what they asked for.
+	 * Interrupts stay on: the second half counts them arriving.
 	 */
 	preempt_disable();
 
 	/*
-	 * Calibration.  Count down from the top with the timer MASKED, so
-	 * nothing is delivered and nothing is disturbed, and read the counter
-	 * against elapsed TSC time.  The elapsed time is used as MEASURED
-	 * rather than as requested, since the loop can only overshoot.
+	 * Calibration: count down from the top with the timer masked and
+	 * read the counter against elapsed TSC time -- as measured, not as
+	 * requested, since the loop can only overshoot.
 	 */
 	lapic_write(LAPIC_TIMER_DCR, LAPIC_DCR_DIV16);
 	lapic_write(LAPIC_LVT_TIMER, LVT_MASKED);
@@ -496,10 +432,9 @@ lapic_timer_probe(void)
 	lapic_hz = (uint32_t)(((uint64_t)elapsed * 1000000) / cal_us);
 
 	/*
-	 * Delivery.  Ask for LAPIC_PROBE_HZ periodic and count what arrives.
-	 * This is the half that cannot be argued: the mapping, the enable, the
-	 * LVT, the vector, the IDT gate and the dispatcher all have to be
-	 * right for a single one of these to be counted.
+	 * Delivery: run periodic at LAPIC_PROBE_HZ and count what arrives.
+	 * A single count needs the mapping, enable, LVT, vector, IDT gate and
+	 * dispatcher all to be right.
 	 */
 	__atomic_store_n(&curcpu()->cp_timer_ticks, 0, __ATOMIC_RELAXED);
 	intr_install_local(LAPIC_VEC_TIMER, lapic_timer_isr);
@@ -529,11 +464,8 @@ lapic_timer_probe(void)
 	    (unsigned long long)cal_us);
 
 	/*
-	 * A tally rather than an assertion, and for the reason this kernel
-	 * has learned twice: an absolute count over a window nothing
-	 * controls is a gauge.  What WOULD be a defect is zero -- that says
-	 * the chip is not delivering at all, which no amount of load
-	 * explains -- so that alone is called out.
+	 * A tally, not an assertion: a count over an uncontrolled window is a
+	 * gauge.  Only zero, which no load explains, is called out.
 	 */
 	kprintf("lapic: timer delivered %llu interrupt(s) at %u Hz, "
 	    "want about %u (the PIT delivered %llu)%s\n",
@@ -543,10 +475,9 @@ lapic_timer_probe(void)
 }
 
 /*
- * Arm THIS CPU's timer periodic at `hz', and start its clock running for the
- * report.  Everything below the hand-over: the divisor, the vector and the
- * count, in that order, because writing the count is what starts the timer and
- * everything it will be delivered as has to be true before it can fire.
+ * Arm this CPU's timer periodic at `hz' and start its clock for the
+ * report.  Divisor, LVT, then count: writing the count starts the timer,
+ * so everything it is delivered as must be set first.
  */
 static bool
 lapic_timer_arm(unsigned int hz)
@@ -579,15 +510,10 @@ lapic_timer_arm(unsigned int hz)
 }
 
 /*
- * The same timer, on a processor that arrived after the hand-over.
- *
- * ⚠ AT THE RATE MEASURED ON THE BOOT PROCESSOR, which is an assumption and is
- * stated as one: the APIC timer counts off the bus clock, which is one clock
- * for the package, so all of these should count at the same speed.  It is not
- * asserted here because it is CHECKED elsewhere and better -- lapic_timer_report
- * prints every CPU's delivered rate separately, so an APIC counting at a
- * different speed shows up as that CPU's Hz being wrong rather than as
- * nothing at all.
+ * The same timer on an AP, after the hand-over, at the counting rate
+ * measured on the boot CPU.  That assumes every APIC timer counts off the
+ * same bus clock; lapic_timer_report checks it, printing each CPU's
+ * delivered rate.
  */
 bool
 lapic_timer_start_ap(void)
@@ -607,23 +533,15 @@ lapic_timer_start(void)
 		return (false);
 
 	/*
-	 * THE RATE IS THE PIT'S, and not a number of this file's choosing.
-	 * The slice is counted in TICKS -- PREEMPT_QUANTUM_TICKS of them --
-	 * and that count was measured against a 100 Hz tick, on a curve with
-	 * a knee at two ticks.  Keeping the old rate is what makes the old
-	 * measurement still describe the new timer; changing the rate here
-	 * would quietly change the quantum without touching the constant that
-	 * is supposed to express it.
+	 * The PIT's rate.  The slice is PREEMPT_QUANTUM_TICKS ticks, tuned
+	 * against a 100 Hz tick; another rate here would silently change the
+	 * quantum without touching the constant that expresses it.
 	 */
 	hz = pit_hz();
 	if (hz == 0)
 		return (false);
 
-	/*
-	 * Asked before anything is given up, because the hand-over below is
-	 * one-way: a rate this timer cannot count would relieve the PIT of a
-	 * job nobody then does.
-	 */
+	/* Checked first: the hand-over below is one-way. */
 	if (lapic_hz / hz == 0) {
 		kprintf("lapic: %u Hz is faster than this timer can count "
 		    "(%u ticks/s) -- preemption stays with the PIT\n",
@@ -632,17 +550,12 @@ lapic_timer_start(void)
 	}
 
 	/*
-	 * The hand-over, and it is one-way.  EXACTLY ONE timer may debit the
-	 * slice: two would spend it twice as fast, and the symptom of that is
-	 * not an error message but a quantum silently halved -- the kind of
-	 * change this kernel spent a whole rung measuring.  So the PIT is
-	 * relieved BEFORE this timer is unmasked.  The gap costs at most one
-	 * tick of one thread's slice; the overlap would cost the number the
-	 * scheduler is tuned around.
+	 * The hand-over.  Exactly one timer may debit the slice; two would
+	 * silently halve the quantum.  So the PIT is relieved before this
+	 * timer is unmasked: the gap costs at most one tick of one slice.
 	 *
-	 * The PIT keeps ticking, and must: it is the machine's clock, the
-	 * ruler this timer was calibrated against, the thing timeouts and the
-	 * busy-sleeps are counted in.  It stops debiting, not ticking.
+	 * The PIT keeps ticking: timeouts and busy-sleeps are counted in its
+	 * ticks.  It stops debiting, not ticking.
 	 */
 	pit_release_preempt();
 
@@ -692,12 +605,9 @@ lapic_timer_report(void)
 	pit = pit_ticks() - lapic_start_pit;
 
 	/*
-	 * ONE LINE PER PROCESSOR, and that is the point of the line rather
-	 * than a tidier way of printing one number.  The slice is what
-	 * PREEMPT_QUANTUM_TICKS actually means, and it means it separately on
-	 * every CPU: a processor whose timer never started, or started at the
-	 * wrong rate, or stopped being delivered, differs from its neighbours
-	 * here and nowhere else in this kernel.
+	 * One line per CPU: the slice is a per-CPU fact, and a timer that
+	 * never started, runs at the wrong rate or stopped being delivered
+	 * shows up here and nowhere else.
 	 */
 	for (i = 0; i < cpu_present_count(); i++) {
 		cp = &cpus[i];
@@ -721,13 +631,8 @@ lapic_timer_report(void)
 	}
 
 	/*
-	 * And the PIT beside them, which is the check that survives from the
-	 * rung where the ruler turned out to be wrong.  Measured against the
-	 * TSC and not against the PIT, for the reason written up at
-	 * LAPIC_CAL_US: the PIT is DELIVERED and can fall behind, so a
-	 * disagreement between the two would leave us unable to say which of
-	 * them was at fault.  Its count is printed anyway because the gap IS
-	 * that deficit, and seeing it is how the wrong ruler was found.
+	 * And the PIT beside them, over the same TSC time: it is delivered
+	 * and can fall behind (see LAPIC_CAL_US), and the gap is its deficit.
 	 */
 	us = tsc_to_us(now - cpus[0].cp_timer_start);
 	if (us == 0)

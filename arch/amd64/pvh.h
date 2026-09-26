@@ -14,12 +14,11 @@
  * Xen PVH boot ABI -- used by QEMU's ELF64 -kernel loader when the
  * image carries an XEN_ELFNOTE_PHYS32_ENTRY note (see boot.S).
  *
- * On entry from the loader %ebx points at a hvm_start_info structure
- * placed somewhere below 4 GiB.  All embedded pointers are physical
- * and also below 4 GiB; the identity map serves the reads.
+ * On entry %ebx points at a hvm_start_info structure below 4 GiB, and
+ * its embedded pointers are physical and below 4 GiB too.  memmap reads
+ * them through the boot identity map, which covers only the low 1 GiB.
  *
- * Layout is imposed by the Xen PVH boot ABI; reordering fields
- * desynchronises the parser from what the loader writes.
+ * Layout is fixed by the ABI; do not reorder fields.
  */
 
 #define	PVH_START_MAGIC		0x336EC578U	/* HVM_START_MAGIC_VALUE */
@@ -42,7 +41,7 @@ struct pvh_start_info {
 struct pvh_memmap_entry {
 	uint64_t	pme_base;
 	uint64_t	pme_length;
-	uint32_t	pme_type;		/* E820 codes; see multiboot.h */
+	uint32_t	pme_type;		/* E820 type; see multiboot.h */
 	uint32_t	pme_reserved;
 } __attribute__((packed));
 

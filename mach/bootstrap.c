@@ -17,11 +17,7 @@
 #include "spinlock.h"
 #include "task.h"
 
-/*
- * Hooks into port.c.  port_create_kernel_owned mints a port object the
- * kernel itself owns (RECEIVE held, no name in any port_space) with a
- * p_special tag pre-set; we use it to mint the single bootstrap port.
- */
+/* From port_object.c; the first creates the bootstrap port. */
 extern struct port	*port_create_kernel_owned(uint8_t special_kind,
 			    void *special_arg);
 
@@ -31,9 +27,9 @@ extern int		 port_install_send_in_kernel(struct port *p,
 extern struct port_space	*kernel_space;
 
 /*
- * Service-registry entry.  Stores the name + the kernel-side name of
- * the port (NOT a port object pointer) so the dispatcher can reuse the
- * existing mach_msg_send descriptor-translation path on the reply.
+ * A registered service: its name and the port's name in kernel_space
+ * (not a pointer), so a lookup reply can use mach_msg_send's ordinary
+ * descriptor translation.
  */
 struct bootstrap_service {
 	char			bs_name[BOOTSTRAP_NAME_MAX];
@@ -65,13 +61,11 @@ bootstrap_init(void)
 }
 
 /*
- * Publish a persistent kernel_space SEND for the bootstrap port so
- * task_get_special_port can COPY_SEND it (leak-free: the caller's copy is
- * released on its own deallocate; this kernel name lives for the kernel's
- * life).  Must run AFTER task_subsystem_init -- kernel_space reserves the
- * well-known low names (TASK_SELF=1, BOOTSTRAP=2) for kernel_task, so
- * grabbing a kernel_space name before those are claimed would bump the
- * task-self install off name 1.  Idempotent.
+ * Give the bootstrap port a permanent SEND name in kernel_space, for
+ * task_get_special_port to COPY_SEND.  Must run after
+ * task_subsystem_init: kernel_task's TASK_SELF (1) and BOOTSTRAP (2) must
+ * be claimed first, or the task-self install lands off name 1.
+ * Idempotent.
  */
 void
 bootstrap_publish(void)
@@ -92,9 +86,8 @@ bootstrap_get_port(void)
 }
 
 /*
- * Persistent kernel_space SEND name for the bootstrap port (minted in
- * bootstrap_init).  task_get_special_port COPY_SENDs it; MACH_PORT_NULL
- * before bootstrap_init has run.
+ * The bootstrap port's kernel_space name, or MACH_PORT_NULL before
+ * bootstrap_publish has run.
  */
 mach_port_name_t
 bootstrap_get_kernel_name(void)
@@ -196,11 +189,8 @@ bootstrap_unregister(const char *name, mach_port_name_t *kn_out)
 			continue;
 		*kn_out = registry[i].bs_kname;
 		/*
-		 * Compact the table in place; registry is a flat array
-		 * walked linearly by bootstrap_lookup_locked, so order is
-		 * irrelevant -- swap-last-into-hole would do too, but
-		 * shift-down keeps the BSD-bar registration-order
-		 * semantics that bootstrap_snapshot reports.
+		 * Shift down rather than move the last entry into the hole,
+		 * so bootstrap_snapshot keeps reporting registration order.
 		 */
 		for (j = i; j + 1 < registry_count; j++)
 			registry[j] = registry[j + 1];
@@ -225,10 +215,8 @@ bootstrap_lookup_locked(const char *name)
 }
 
 /*
- * Send a bare status reply (no descriptors) to req->msgh_local with the
- * given status word in the body.  Used by REGISTER and DEREGISTER
- * dispatches; LOOKUP has its own shapes (COMPLEX with a port_descriptor
- * on hit, plain BOOTSTRAP_REPLY_NOT_FOUND on miss).
+ * Reply to req->msgh_local with a bare bootstrap_status_reply, for
+ * REGISTER and DEREGISTER.
  */
 static int
 bootstrap_send_status(const struct mach_msg_header *req,
@@ -251,33 +239,15 @@ bootstrap_send_status(const struct mach_msg_header *req,
 }
 
 /*
- * Lookup dispatcher.  Resolves the named service in the registry and
- * posts a reply back via msgh_local.  On a hit the reply is COMPLEX
- * with a single port_descriptor carrying COPY_SEND to the service; on
- * a miss the reply is a bare 24-byte header tagged with
- * BOOTSTRAP_REPLY_NOT_FOUND.
+ * BOOTSTRAP_OP_LOOKUP.  A hit replies COMPLEX with one port descriptor
+ * carrying COPY_SEND to the service; a miss replies with a bare header,
+ * msgh_id BOOTSTRAP_REPLY_NOT_FOUND.
  *
- * Cross-space mechanics for the success path:
- *
- *	The registered service port is named in kernel_space, but the
- *	caller (the original sender of the lookup) lives in some other
- *	port_space.  If we asked mach_msg_send to translate the reply's
- *	port_descriptor against the caller's space, the lookup of
- *	svc_name would fail (or worse, "succeed" against a coincidentally
- *	co-numbered name).  Instead we send the reply FROM kernel_space:
- *
- *	  1. resolve the caller's reply port via the caller's space,
- *	  2. install a fresh SEND for it in kernel_space (so kernel_space
- *	     has a name we can use as msgh_remote),
- *	  3. build the reply with msgh_remote = that kernel name and
- *	     MOVE_SEND disposition, so the send consumes our temporary
- *	     install -- no kernel_space leak even after delivery,
- *	  4. pd.name is svc_name, which already lives in kernel_space,
- *	     and send_xlate_desc resolves it correctly.
- *
- *	The receive side is unchanged: deliver_msg sees a port_descriptor
- *	carrying SEND, installs a fresh name in the caller's space, and
- *	patches pd.name accordingly.
+ * The service is named in kernel_space, not in the caller's space, so
+ * the hit is sent from kernel_space: the caller's reply port gets a
+ * temporary SEND name there, used as msgh_remote with MOVE_SEND so the
+ * send consumes it, and pd.name is the service's kernel name.  Delivery
+ * then installs a fresh name for the service in the caller's space.
  */
 static int
 bootstrap_dispatch_lookup(const struct mach_msg_header *req,
@@ -300,10 +270,8 @@ bootstrap_dispatch_lookup(const struct mach_msg_header *req,
 	int			 rv;
 
 	/*
-	 * Payload starts right after the 24-byte header.  We accept any
-	 * msgh_size that is at least header + lookup_request; a larger
-	 * size just means the caller used a bigger buffer (e.g. one big
-	 * enough to receive a complex reply with the port_descriptor).
+	 * The name follows the header.  A larger msgh_size is fine: the
+	 * caller's buffer may be sized for the complex reply.
 	 */
 	if (req->msgh_size < sizeof(struct mach_msg_header) +
 	    sizeof(struct bootstrap_lookup_request))
@@ -330,12 +298,7 @@ bootstrap_dispatch_lookup(const struct mach_msg_header *req,
 		return (mach_msg_send(from, &reply_fail));
 	}
 
-	/*
-	 * Cross-space reply: install caller's reply port into kernel_space
-	 * so we can address it from there alongside svc_name.  Look it up
-	 * in the caller's space (where the lookup request named it via
-	 * msgh_local), then install a fresh SEND in kernel_space.
-	 */
+	/* The caller's reply port, given a SEND name in kernel_space. */
 	reply_port = space_lookup(from, req->msgh_local,
 	    MACH_PORT_RIGHT_SEND, &dummy);
 	if (reply_port == NULL)
@@ -366,10 +329,8 @@ bootstrap_dispatch_lookup(const struct mach_msg_header *req,
 	rv = mach_msg_send(kernel_space, &reply_ok.hdr);
 
 	/*
-	 * On send failure roll back the kernel_space install we did
-	 * above; the MOVE_SEND clause inside mach_msg_send only fires on
-	 * the success path.  space_drop_one_right port_derefs the SEND
-	 * for us so refs balance with the space_install above.
+	 * A failed send did not consume the temporary name (MOVE_SEND
+	 * happens only on success): drop it, and its ref.
 	 */
 	if (rv != MACH_MSG_OK)
 		(void)space_drop_one_right(kernel_space, kernel_reply_name,
@@ -378,23 +339,16 @@ bootstrap_dispatch_lookup(const struct mach_msg_header *req,
 }
 
 /*
- * Ring-3 service publish.  Request layout is the complex shape:
+ * BOOTSTRAP_OP_REGISTER, from ring 3.  Request:
  *
  *	[ mach_msg_header | mach_msg_body | port_descriptor | name(32) ]
  *
- * The port_descriptor carries COPY_SEND of the port the caller wants
- * to publish (resolved against the caller's space), and the trailing
- * 32-byte buffer holds the registration name.
+ * The descriptor names, with COPY_SEND, the caller's port to publish.
+ * The kernel gives it its own SEND name in kernel_space and registers
+ * that; the caller keeps its right.
  *
- * The dispatcher takes a kernel-side SEND ref for the named port by
- * installing it into kernel_space, then stores that kernel name in the
- * registry.  The caller retains their own SEND under whatever name they
- * passed in pd.name -- COPY_SEND semantics, not MOVE_SEND.
- *
- * No authentication: any task can claim any unused name.  Lifetime of
- * the registration is the kernel's SEND ref; bootstrap_unregister (or
- * a future DEAD_NAME-driven cleanup) is the only way for the entry to
- * disappear.
+ * No authentication: any task can claim any unused name.  The entry
+ * lasts until deregistered; nothing removes it when the port dies.
  */
 static int
 bootstrap_dispatch_register(const struct mach_msg_header *req,
@@ -443,14 +397,9 @@ bootstrap_dispatch_register(const struct mach_msg_header *req,
 	name_buf[BOOTSTRAP_NAME_MAX - 1] = '\0';
 
 	/*
-	 * Look up the port in the SENDER's space (where pd.name lives),
-	 * then install a fresh SEND right in kernel_space.  space_install
-	 * bumps the port's SEND count by one; the kernel keeps that ref
-	 * alive for as long as the registration stands.
-	 *
-	 * No ref bump from space_lookup itself; the sender is blocked in
-	 * the RPC waiting for our reply, so their name table can't drop
-	 * pd.name from under us.
+	 * pd.name is in the sender's space.  space_lookup takes no ref --
+	 * the sending thread is inside this very send -- and the
+	 * kernel_space install takes the SEND ref the registration holds.
 	 */
 	p = space_lookup(from, pd->name, MACH_PORT_RIGHT_SEND, &dummy);
 	if (p == NULL)
@@ -468,16 +417,13 @@ bootstrap_dispatch_register(const struct mach_msg_header *req,
 }
 
 /*
- * Ring-3 service unpublish.  Request layout is plain:
+ * BOOTSTRAP_OP_DEREGISTER, from ring 3.  Request:
  *
  *	[ mach_msg_header | name(32) ]
  *
- * Removes the registry entry for `name` and drops the kernel-side SEND
- * ref that backed it.  If `name` was a kernel-resident service (the
- * five from services_init), this will still succeed and orphan it --
- * nothing in v1 distinguishes ring-3 publishers from kernel-init ones.
- * A future revision may stamp ownership at register time so deregister
- * can refuse to remove a kernel service.
+ * Removes the entry and drops the kernel's SEND ref behind it.  Entries
+ * carry no owner, so a kernel service can be deregistered too, and is
+ * then orphaned.
  */
 static int
 bootstrap_dispatch_deregister(const struct mach_msg_header *req,

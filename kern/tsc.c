@@ -16,20 +16,16 @@
 static uint64_t	tsc_freq_hz;
 
 /*
- * The end-of-calibration instant, latched from both clocks at once.  This
- * pair is what lets a caller read time BETWEEN PIT ticks: the tick count is a
- * coarse but drift-free base, and the TSC delta since the same instant fills
- * in the microseconds the 100 Hz tick cannot express.  (c) as above.
+ * The end-of-calibration instant, latched from both clocks at once, so a
+ * caller can read time between PIT ticks: the anchor's tick count plus
+ * the TSC delta since it.  (c) as above.
  */
 static uint64_t	tsc_anchor_tsc;
 static uint64_t	tsc_anchor_pit;
 
 /*
- * Calibration loop: spin until the PIT tick counter has advanced by
- * `samples` ticks, sampling TSC at both ends.  At PIT_DEFAULT_HZ this
- * is `samples * 10 ms` of wall clock.  We use ACQUIRE-ordered tick
- * reads to make sure we observe the IRQ handler's bump before we
- * commit to leaving the loop.
+ * Spin until the PIT tick counter has advanced by `samples' ticks,
+ * sampling the TSC at both ends: `samples' * 10 ms at PIT_DEFAULT_HZ.
  */
 void
 tsc_calibrate(void)
@@ -38,9 +34,8 @@ tsc_calibrate(void)
 	uint64_t	delta_tsc, delta_pit;
 
 	/*
-	 * 25 ticks at 100Hz == 250 ms; smaller than that and an SMI on
-	 * a single tick produces noticeable error, larger drags out
-	 * boot pointlessly.
+	 * 25 ticks at 100 Hz == 250 ms: shorter, and an SMI on one tick
+	 * shows as noticeable error; longer only slows boot.
 	 */
 	samples = 25;
 
@@ -97,11 +92,9 @@ tsc_anchor_ticks(void)
 }
 
 /*
- * tsc_to_ns / tsc_to_us: scale cycles into wall time.  Compute as
- * cycles * 10^N / hz with 128-bit-safe ordering (multiply first only
- * when the multiplication won't overflow uint64; otherwise divide
- * first to keep within u64).  At 10 GHz a 64-bit cycle count covers
- * ~58 years, so this is forgiving in practice.
+ * tsc_to_ns / tsc_to_us: cycles * 10^N / hz, multiplying first only when
+ * the product fits in 64 bits, dividing first otherwise.  0 before
+ * calibration.
  */
 uint64_t
 tsc_to_ns(uint64_t cycles)

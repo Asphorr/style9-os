@@ -15,73 +15,51 @@
 #include "spinlock.h"
 
 /*
- * Machine-independent VM bookkeeping: per-task sorted record of which
- * virtual ranges are live, what each is backing, and what protection
- * it carries.  Sits one layer above the machine-dependent pmap, which
- * stays authoritative for the actual hardware page tables.
+ * Machine-independent VM: per task, the sorted record of which virtual
+ * ranges are live, what backs them and with what protection.  The pmap
+ * below it stays authoritative for the hardware page tables.
  *
- * vm_map is the per-task source of truth for live virtual ranges.
- * vm_map_enter records a mapping the caller has already installed via
- * pmap_kenter (kernel master) or pmap_enter (per-task pmap); the OOL
- * recv path uses vm_map_find_space to place a fresh range without
- * stomping the receiver's existing mappings; vm_map_release_anon walks
- * VME_F_ANON entries at task teardown to drop the backing frames
- * before pmap_destroy frees the page-table tree itself.
+ * vm_map_enter records a range, whose pages the caller installs with
+ * pmap_enter; vm_map_find_space places a fresh range (OOL receive,
+ * vm_allocate, mmap); vm_map_release_anon drops the owned frames at task
+ * teardown, before pmap_destroy frees the page tables.
  *
- * Design notes:
+ *	- Entries are a singly-linked list sorted by vme_start, with no
+ *	  overlaps.  Lookup is O(N), and N is a handful per task.
  *
- *	- Entries form a singly-linked list, head-sorted by vme_start,
- *	  with no overlaps.  Lookup is O(N) but N is tiny for the
- *	  workloads here (a few code/stack/heap entries per task); a
- *	  future BST swap-in is a local change.
+ *	- Adjacent entries are allowed and are not coalesced.
  *
- *	- Adjacency (entry A's vme_end == entry B's vme_start) is
- *	  permitted; they just stay separate entries.  Coalescing is a
- *	  follow-up nicety.
+ *	- vme_object is the pager for a lazy range: NULL for zero-fill, a
+ *	  file object for a mapped file (vm/vm_object.h).
  *
- *	- vme_object is a placeholder for future vm_object support;
- *	  it is currently always NULL and vme_flags tells the consumer
- *	  where the pages actually came from (anonymous frames pmm
- *	  allocated, or an objcopy-embedded blob for ELF .text/.rodata).
- *
- *	- Protections reuse the existing VM_PROT_* bits from
- *	  arch/amd64/pmap.h so call sites do not have to translate.
+ *	- Protections are the VM_PROT_* bits of arch/amd64/pmap.h.
  */
 
-struct vm_object;	/* kern/vm_object.h -- what the pages are made of */
+struct vm_object;	/* vm/vm_object.h -- what the pages are made of */
 struct task;
 
 /*
- * What an entry says about its pages.  The three questions are separate and
- * this is the vocabulary for all of them:
+ * What an entry says about its pages; three separate questions.
  *
- *	VME_F_ANON  -- the frames under this range are owned, not borrowed.
- *	  Teardown drops the entry's reference to each of them, which returns
- *	  a frame to the allocator only if nobody else still holds one (see
- *	  vm/pmm.h).  True of every mapping here, including a private file
- *	  mapping: its frames hold that file's bytes but belong to the task,
- *	  which is what MAP_PRIVATE means.  What the initial content was is a
- *	  separate question, answered by vme_object (NULL = zeroes).
+ *	VME_F_ANON  -- the frames under the range are owned, not borrowed.
+ *	  Teardown drops the entry's reference on each, which frees a frame
+ *	  only if no one else holds one (vm/pmm.h).  Set on every range but
+ *	  borrowed image pages (vm_map_image), private file mappings
+ *	  included: their frames hold the file's bytes but belong to the
+ *	  task (MAP_PRIVATE).  The initial content is vme_object's business.
  *
- *	VME_F_COW   -- pages in this range may be shared with another map, and
- *	  the page-table entries under it have had their write bit cleared to
- *	  make sure a store cannot go unnoticed.  This is the only flag that
- *	  makes a *protection* fault fixable rather than fatal: vm_fault
- *	  responds by giving the writer a private copy, or, if it turns out to
- *	  be the last owner, simply by handing the write bit back.
+ *	VME_F_COW   -- pages may be shared with another map, and their
+ *	  page-table entries have the write bit cleared so no store goes
+ *	  unnoticed.  The only flag that makes a protection fault fixable:
+ *	  vm_fault gives the writer a private copy, or, if it is the last
+ *	  owner, just the write bit back.  It means "may be shared" and can
+ *	  stay set after every sharer is gone; the pmm count is the
+ *	  authority, the flag only says whether to ask.
  *
- *	  The flag says "may be shared", never "is shared".  It stays set on
- *	  ranges whose pages have all since been copied or whose sharers have
- *	  all died, and that is harmless: the count in pmm is the authority on
- *	  how many owners a given frame has, and the flag only decides whether
- *	  it is worth asking.
- *
- *	VME_F_LAZY  -- the range is promised but not populated.  There are no
- *	  page-table leaves under it yet; the first touch of each page takes
- *	  a fault, and vm_fault installs a frame then.  Without this flag an
- *	  entry is fully populated at creation and a missing leaf inside it
- *	  is a bug, not an invitation to page something in -- which is why
- *	  vm_fault refuses to fill an entry that does not carry it.
+ *	VME_F_LAZY  -- the range is promised but not populated; each page's
+ *	  first touch faults and vm_fault installs a frame.  Without it an
+ *	  entry is fully populated at creation, a missing leaf is a bug, and
+ *	  vm_fault refuses to fill it.
  */
 #define	VME_F_ANON		0x01	/* anonymous (pmm) backing       */
 #define	VME_F_COW		0x02	/* may be shared; copy on write  */
@@ -91,13 +69,11 @@ struct vm_map_entry {
 	uint64_t		 vme_start;	/* (m) inclusive       */
 	uint64_t		 vme_end;	/* (m) exclusive       */
 	uint64_t		 vme_offset;	/* (m) into vme_object */
-	struct vm_object	*vme_object;	/* (m) NULL until vm_object lands */
+	struct vm_object	*vme_object;	/* (m) pager; NULL: zeroes */
 	uint8_t			 vme_prot;	/* (c) VM_PROT_*       */
 	/*
-	 * (m) VME_F_*.  Was const-after-create until fork learned to share:
-	 * turning a range into a copy-on-write one is a change to an entry
-	 * that already exists, in the PARENT's map, and it happens while the
-	 * parent sits quiescent inside the fork syscall.
+	 * (m) VME_F_*.  Not (c): VME_F_COW is added to live entries, by fork
+	 * in the quiescent parent and by vm_pages_capture_user under vm_lock.
 	 */
 	uint8_t			 vme_flags;
 	uint16_t		 vme_pad;
@@ -118,11 +94,7 @@ struct vm_map {
 	size_t			 vm_count;	/* (m) live entry count    */
 };
 
-/*
- * Defaults for vm_map_create: the user-VA window the current loader +
- * usermode launcher hands out.  Kept in vm.h so future per-VM ranges
- * (e.g. heap, mmap pool) can be sliced out of the same constants.
- */
+/* The user-VA window a task's map is created with. */
 #define	VM_USER_VA_LO		0x40000000ULL
 #define	VM_USER_VA_HI		0x80000000ULL
 
@@ -132,25 +104,20 @@ struct vm_map		*vm_map_create(uint64_t lo, uint64_t hi);
 void			 vm_map_destroy(struct vm_map *);
 
 /*
- * Record a mapping in `map`.  Fails (returns false) if [va, va+size)
- * overlaps an existing entry or escapes [vm_lo, vm_hi).  Does NOT
- * touch pmap -- the caller is responsible for the hardware install
- * (pmap_kenter into the kernel master pmap, or pmap_enter into the
- * task's per-task pmap).
+ * Record a mapping in `map`; false if [va, va+size) is unaligned,
+ * overlaps an entry or leaves [vm_lo, vm_hi).  The pmap is not touched:
+ * installing the pages is the caller's job.
  */
 bool			 vm_map_enter(struct vm_map *,
 			    uint64_t va, uint64_t size,
 			    uint8_t prot, uint8_t flags);
 
 /*
- * vm_map_enter with a pager attached: pages of this range start life holding
- * the bytes of `obj` from `offset` onward (NULL `obj` means zero-fill, and is
- * exactly what vm_map_enter passes).  On success the entry takes over the
- * caller's reference on `obj`; on failure the caller still owns it.
- *
- * Only meaningful together with VME_F_LAZY -- an eagerly populated entry has
- * already been filled by whoever populated it, and nothing will ever consult
- * its object.
+ * vm_map_enter with a pager: the range's pages start out holding `obj`'s
+ * bytes from `offset` on (NULL `obj`, as vm_map_enter passes, means
+ * zeroes).  On success the entry takes over the caller's reference on
+ * `obj`; on failure the caller keeps it.  Only VME_F_LAZY entries ever
+ * consult their object.
  */
 bool			 vm_map_enter_backed(struct vm_map *,
 			    uint64_t va, uint64_t size,
@@ -158,39 +125,34 @@ bool			 vm_map_enter_backed(struct vm_map *,
 			    struct vm_object *obj, uint64_t offset);
 
 /*
- * Remove every entry that lies fully inside [va, va+size); one that merely
- * overlaps is left alone.  That is not a limitation but a division of labour:
- * making the edges of a request into entry boundaries is the caller's job
- * (vm_map_release does it), and once done, "fully inside" describes exactly
- * the entries meant.  Returns the number of entries removed.
+ * Remove every entry lying wholly inside [va, va+size); one that only
+ * overlaps is left alone.  Cutting the request's edges into entry
+ * boundaries is the caller's job (vm_map_release does it).  The pmap is
+ * not touched.  Returns the number of entries removed.
  */
 size_t			 vm_map_remove(struct vm_map *,
 			    uint64_t va, uint64_t size);
 
 /*
- * Find an unmapped hole of at least `size` bytes within [lo, hi),
- * page-aligned.  Writes the chosen start to *va_out and returns true.
- * Used by the OOL recv path to place an incoming range without
- * stomping the receiver's existing mappings.
+ * Find a hole of `size` bytes (page-rounded) in [vm_lo, vm_hi), next-fit
+ * from vm_hint and then once more from the floor.  Writes the start to
+ * *va_out and returns true; nothing is reserved.
  */
 bool			 vm_map_find_space(struct vm_map *,
 			    uint64_t size, uint64_t *va_out);
 
 /*
- * Returns the entry covering `va`, or NULL if `va` falls in a hole.
- * Caller must hold vm_lock OR be confident no concurrent
- * vm_map_remove can run (e.g. during single-thread task teardown).
+ * The entry covering `va`, or NULL in a hole.  Caller holds vm_lock, or
+ * knows no one can change the map (single-threaded teardown).
  */
 struct vm_map_entry	*vm_map_lookup(struct vm_map *, uint64_t va);
 
 void			 vm_map_print(struct vm_map *);
 
 /*
- * Wire-format snapshot of one entry in a vm_map.  Returned in arrays
- * by SYS_TASK_GET_VM_REGIONS.  Mirrors struct vm_map_entry's externally
- * meaningful fields -- the head/list pointers + vm_object placeholder
- * stay kernel-private.  ABI-stable; future revisions may append new
- * trailing fields but never reorder.
+ * One vm_map entry as SYS_TASK_GET_VM_REGIONS returns it: the entry's
+ * public fields, without its pointers.  ABI-stable: fields may be
+ * appended, never reordered.
  */
 #define	MACH_VM_REGION_MAX		64
 
@@ -198,155 +160,128 @@ void			 vm_map_print(struct vm_map *);
 struct mach_vm_region_entry {
 	uint64_t	mvr_start;	/* inclusive base VA              */
 	uint64_t	mvr_end;	/* exclusive top VA               */
-	uint64_t	mvr_offset;	/* into vm_object (0 today)       */
+	uint64_t	mvr_offset;	/* into vm_object                 */
 	uint8_t		mvr_prot;	/* VM_PROT_*                      */
 	uint8_t		mvr_flags;	/* VME_F_*                        */
 	uint8_t		mvr_pad[6];
 };
 
 /*
- * Snapshot every live entry in `map` into `out`, up to `max_entries`.
- * Best-effort: walks under vm_lock, copies field-by-field.  Returns
- * the number of entries written.  Drives the userspace `vmmap` tool
- * (Darwin's `vmmap(1)` analog -- shows a process's VM layout, again
- * a question Linux has no equivalent to without /proc/pid/maps).
+ * Copy up to `max_entries` of `map`'s entries into `out`, under vm_lock,
+ * and return how many.  Backs the userspace `vmmap` tool.
  */
 size_t			 vm_map_snapshot(struct vm_map *map,
 			    struct mach_vm_region_entry *out,
 			    size_t max_entries);
 
 /*
- * O(1) live-region count for a map.  Reads vm_count under vm_lock so
- * the value is internally consistent with the snapshot walk.  Drives
- * the per-task region column in the "tasks" service / top(1).
+ * The map's entry count (vm_count, under vm_lock), for the "tasks"
+ * service's region column.
  */
 size_t			 vm_map_region_count(struct vm_map *map);
 
 struct pmap;
 
 /*
- * Walk every VME_F_ANON entry in `map`, pmap_extract each 4 KiB page
- * out of `pm`, drop the mapping, and pmm_free_page the frame.  Called
- * from task teardown after the per-task threads have stopped running
- * (so there are no concurrent vm_map mutators) and before pmap_destroy
- * tears down the page tables themselves.  No-op on the map's entries
- * past the walk -- vm_map_destroy still has to free vme storage.
+ * Unmap every present page of every VME_F_ANON entry and drop the
+ * reference on its frame (pmm frees it with its last owner).  Called at
+ * task teardown once the task's threads have stopped, before
+ * pmap_destroy, and by execve before vm_map_reset; the entries stay.
  */
 void			 vm_map_release_anon(struct vm_map *,
 			    struct pmap *pm);
 
 /*
- * Tear down an anonymous range: unmap each present pmap leaf, drop the
- * kernel's reference to the frame under it, and remove the entries that
- * described it.  Used by SYS_VM_DEALLOCATE, by send_capture_ool's
- * deallocate-on-send hook, and by the Darwin personality's munmap.
+ * Tear down an anonymous range: unmap each present page, drop the
+ * reference on its frame, and remove the entries.  For
+ * SYS_VM_DEALLOCATE, OOL deallocate-on-send and the Darwin munmap.
+ * `va` and `size` must be page-aligned.
  *
- * (va, size) need not match how the memory was obtained.  Part of an entry,
- * or a run spanning several, is served by cutting the entries at the edges of
- * the request first -- which is what munmap(2) means and what this refused to
- * do until the map could cut.
+ * The range need not match how the memory was obtained: entries
+ * sticking out of it are cut at its edges first, as munmap(2) expects.
+ * Refused, leaving the map as it was:
  *
- * Two things are still refused, both because they mean the caller is confused
- * rather than merely specific:
+ *	a hole -- some page of the range is not mapped.  POSIX munmap
+ *	  would allow it; here naming memory you do not have is an error.
  *
- *	a hole -- some page of [va, va+size) is not mapped at all.  POSIX
- *	  would have munmap shrug at this; naming memory you do not have is
- *	  worth an error in a kernel this size.
+ *	a non-anonymous entry -- its frames are borrowed from the kernel
+ *	  image and shared by every task running that program.
  *
- *	a non-anonymous entry anywhere in the range.  Those frames are
- *	  borrowed from the kernel image and shared with every other task
- *	  running the same program; they are not this task's to hand back.
- *
- * Either refusal leaves the map exactly as it was.  Returns true on success.
+ * Also false if a cut runs out of memory.  Returns true on success.
  */
 bool			 vm_map_release(struct vm_map *,
 			    struct pmap *pm, uint64_t va, uint64_t size);
 
 /*
- * Drop every entry in `map` but keep the map itself usable -- the
- * execve(2) middle step.  The caller must already have released the
- * anonymous backing frames (vm_map_release_anon); this only frees the
- * vme storage and rewinds the allocation hint.  Same single-thread
- * invariant as vm_map_destroy: the owning task is between images, its
- * only thread is the one running this teardown.
+ * Drop every entry but keep the map, for execve(2).  The caller has
+ * already released the frames (vm_map_release_anon); this frees the
+ * entries and rewinds the hint.  No lock: the task is between images and
+ * its only thread is the one running this.
  */
 void			 vm_map_reset(struct vm_map *map);
 
 /*
- * Duplicate `src`'s address space into `dst` -- the fork(2) engine.  Every
- * entry is re-entered in dst's map with identical range, prot and flags, and
- * every present 4 KiB leaf in src_pm becomes a leaf at the same VA in dst_pm
- * pointing at the SAME frame, with one more owner recorded against it.
+ * Duplicate `src`'s address space into `dst`, for fork(2).  Each entry
+ * is re-entered in dst with the same range, prot, pager and flags, and
+ * each present leaf in src_pm is mapped at the same VA in dst_pm to the
+ * same frame -- with one more owner recorded, unless the frame is a
+ * borrowed image page.
  *
- * Nothing is copied here.  A writable range has the write bit cleared in both
- * page tables -- the parent's as much as the child's, because "who writes
- * first" is not known and the one that does must be the one that faults --
- * and both entries are marked VME_F_COW so vm_fault knows the fault is a
- * request for a private copy rather than a violation.  A read-only range
- * needs none of that: it is shared outright and its frames simply have two
- * owners until one of the maps goes away.
+ * Nothing is copied.  A writable range has the write bit cleared in both
+ * page tables, since either side may write first, and both entries get
+ * VME_F_COW so vm_fault treats the fault as a request for a copy.  A
+ * read-only range is simply shared.
  *
- * Returns false on allocation failure with dst partially populated -- the
- * caller derefs the child task, whose normal teardown (vm_map_release_anon +
- * vm_map_destroy) drops the references taken so far.  Caller guarantees src
- * is quiescent (its one thread is parked in the fork syscall), which is what
- * makes it safe both to walk src's entries unlocked and to change their flags.
+ * Returns false on allocation failure, with dst partly populated; the
+ * caller drops the child task, whose teardown releases what was taken.
+ * src must be quiescent (its one thread parked in fork): its entries are
+ * walked unlocked and their flags changed.
  */
 bool			 vm_map_fork_share(struct vm_map *src,
 			    struct pmap *src_pm, struct vm_map *dst,
 			    struct pmap *dst_pm);
 
 /*
- * CARRYING A PAYLOAD OF PAGES BETWEEN ADDRESS SPACES
+ * Payloads of pages carried between address spaces (Mach OOL data).  The
+ * sender names a range of its memory and the receiver finds it mapped in
+ * its own; mach/ moves only an array of physical addresses.
  *
- * A Mach message can carry bulk data out of line: the sender names a range of
- * its own memory, and the receiver finds that data mapped somewhere in its
- * own.  What has to happen in between is a question about frames, not about
- * messages, so it lives here and mach/ moves nothing but an array of physical
- * addresses.
+ * While in flight the captured frames are owned by the message: whoever
+ * holds the array either installs it in a receiver, handing ownership
+ * over, or releases it.  Returns the page count, or 0 on failure with
+ * nothing held.
  *
- * The captured pages are OWNED BY THE MESSAGE while it is in flight.  That is
- * the whole contract: whoever holds the array is responsible for either
- * installing it into a receiver, which transfers the ownership, or releasing
- * it, which ends it.  A message that is destroyed undelivered releases; one
- * that is delivered does not.
+ * Capture from a user range shares a page rather than copying it when
+ * the payload starts page-aligned, one anonymous entry covers all of it,
+ * the page is already present, and it lies wholly inside the payload --
+ * so a partial last page, which would expose the sender's bytes past its
+ * buffer, is always copied.  Shared or copied, the receiver cannot tell.
  *
- * Capture from a user range shares rather than copies wherever it legally
- * can.  A page qualifies when the payload's page boundaries coincide with the
- * sender's -- which needs the sender's address to be page-aligned -- and the
- * page lies wholly inside the payload.  That second condition is what keeps a
- * partial last page out: sharing it would hand the receiver whatever the
- * sender happens to keep in the bytes past the end of its own buffer.  Those
- * pages, and every page of an unaligned payload, are copied instead, so a
- * captured array is uniform and the receiver cannot tell which is which.
- *
- * Sharing a page means write-protecting it in the SENDER too, and marking the
- * sender's range copy-on-write.  The receiver is promised the bytes as they
- * were at the instant of the send, and a sender that could still write to the
- * frame would be editing a message already posted.
+ * A shared page is write-protected in the sender too, and the sender's
+ * range marked copy-on-write: the receiver gets the bytes as they were
+ * at the send.
  */
 size_t			 vm_pages_capture_user(struct vm_map *map,
 			    struct pmap *pm, uint64_t addr, uint64_t size,
 			    uint64_t *pa_out, size_t max_pages);
 
 /*
- * The same, for a payload the kernel itself is sending out of its own memory
- * -- a rendered man page, a service reply.  Always copies: kernel addresses
- * are not in any task's map, there is nothing to write-protect, and the
- * source is usually .rodata that must not become a task's writable page.
+ * The same for a payload from kernel memory (a rendered man page).
+ * Always copies: a kernel address is in no task's map, and .rodata must
+ * not become a task's writable page.
  */
 size_t			 vm_pages_capture_kernel(const void *src,
 			    uint64_t size, uint64_t *pa_out,
 			    size_t max_pages);
 
 /*
- * Land a captured payload in `map` at a fresh address, returning it.  The
- * range is mapped writable but its page-table entries are installed
- * read-only, so a receiver that only reads keeps sharing the sender's frames
- * and one that writes takes a copy-on-write fault and gets its own.
+ * Map a captured payload into `map` at a fresh address, returned in
+ * *va_out.  The entry is writable and copy-on-write, the page-table
+ * entries read-only: a receiver that only reads goes on sharing, one
+ * that writes faults and gets its own copy.
  *
- * On success the pages belong to the receiver and the caller must not release
- * them.  On failure nothing is installed and the caller still owns them.
+ * On success the frames belong to the receiver and the caller must not
+ * release them; on failure nothing is installed and the caller keeps them.
  */
 bool			 vm_pages_install(struct vm_map *map, struct pmap *pm,
 			    const uint64_t *pas, size_t npages,
@@ -359,53 +294,37 @@ void			 vm_pages_release(const uint64_t *pas, size_t npages);
 void			 vm_pages_stats(void);
 
 /*
- * Outcomes of vm_map_image.  Two failures rather than one because the
- * loaders above distinguish them: out of memory is a machine that is full,
- * a mapping failure is an image asking for something impossible.
+ * Outcomes of vm_map_image.  The loaders tell the failures apart: out of
+ * memory, or an image asking for an impossible mapping.
  */
 #define	VM_IMAGE_OK		0
 #define	VM_IMAGE_NOMEM		1
 #define	VM_IMAGE_MAP		2
 
 /*
- * Bring one segment of an image that is ALREADY RESIDENT IN THE KERNEL into
- * a task: `vmsize` bytes at `seg_va`, of which the first `filesize` come from
- * `bytes` and the rest are zero.  Both program loaders reduce to exactly this
- * -- kern/elf.c calls it with a PT_LOAD, kern/macho.c with an LC_SEGMENT_64 --
- * and they call the same function rather than each keeping their own copy,
- * because what it decides is subtle enough that two copies would drift.
+ * Map one segment of an image resident in the kernel into a task:
+ * `vmsize` bytes at `seg_va`, the first `filesize` from `bytes`, the rest
+ * zero.  Both loaders use it -- kern/elf.c for a PT_LOAD, kern/macho.c for
+ * an LC_SEGMENT_64 -- so its subtle decisions live in one place.
  *
- * BORROWING INSTEAD OF COPYING
- *
- * These images are not files being read off a disk.  They are part of the
- * kernel image: already resident, already read-only, at a physical address
- * that can be computed.  Allocating a frame to hold a second copy of
- * something that will never change is work with no product -- and it is done
- * once PER TASK, which is how thirty tasks came to hold thirty private copies
- * of the same libSystem.
- *
- * So a page is not copied at all when all three of these hold.  Its
- * page-table entry points straight at the image's own frame and the task
- * reads the kernel's only copy:
+ * The images are part of the kernel image: resident, read-only, at a
+ * computable physical address.  So instead of a private copy per task, a
+ * page is borrowed -- its leaf points at the image's own frame -- when
+ * all three hold:
  *
  *	read-only    -- a writable page must be private, or one task's store
- *	  would rewrite the image every other task is running.
+ *	  would rewrite the image every task runs.
  *
- *	wholly file-backed -- a page that runs past `filesize` has a zero-fill
- *	  tail, and the image's frame holds whatever the linker put next in
- *	  the kernel rather than zeroes.  Those pages stay private, which is
- *	  also what keeps anything past the end of an image out of sight.
+ *	wholly file-backed -- a page reaching past `filesize` needs a zero
+ *	  tail, but the image's frame holds whatever the linker put next.
  *
- *	page-aligned -- a frame can only be mapped whole, so the image's
- *	  physical address and the segment's virtual address must agree modulo
- *	  the page size.  The build aligns the embedded images to make this
- *	  true; if it ever stops, this quietly falls back to copying, which is
- *	  what the counters in vm_image_stats are for.
+ *	page-aligned -- the image's physical address and `seg_va` must
+ *	  agree modulo the page size.  The build aligns the images; if that
+ *	  ever stops, this silently copies instead (see vm_image_stats).
  *
- * The borrowed pages get their own vm_map_entry WITHOUT VME_F_ANON, so a
- * segment can end up as up to three entries.  That is not tidiness: teardown
- * reads that flag and frees every present frame under an entry carrying it,
- * and some of these frames are the kernel's own.
+ * Borrowed pages get their own entry without VME_F_ANON, so a segment
+ * can become three entries: teardown frees the frames under every
+ * VME_F_ANON entry, and these frames are the kernel's.
  */
 int			 vm_map_image(struct vm_map *map, struct pmap *pm,
 			    uint64_t seg_va, uint64_t vmsize,
@@ -413,24 +332,21 @@ int			 vm_map_image(struct vm_map *map, struct pmap *pm,
 			    uint8_t prot);
 
 /*
- * How the loaders have been paying for program pages: borrowed from the
- * kernel image, or allocated and filled.  Every borrowed page is one that
- * used to be a fresh frame plus a 4 KiB copy, once per task.
+ * Program pages so far: borrowed from the kernel image, or allocated and
+ * filled.  Each borrowed page saved a frame and a 4 KiB copy.
  */
 void			 vm_image_stats(void);
 
 /*
- * Release traffic, and how much of it needed an entry cut in two.  The split
- * count is the mechanism; the "needing a cut" count is the outcome it
- * changed.  Both are here because a live mechanism and a dead one look
- * identical from one number.
+ * vm_map_release counts: whole, needing a cut, refused, and entries
+ * split.  Splits show the mechanism ran; releases needing a cut show it
+ * changed an outcome.
  */
 void			 vm_map_stats(void);
 
 /*
- * Outcomes of a fault.  Only VM_FAULT_OK means "resume the instruction";
- * every other value means the faulting thread should be retired the way an
- * unhandled fault always was.
+ * Outcomes of a fault.  VM_FAULT_OK resumes the instruction; anything
+ * else retires the thread as for an unhandled fault.
  */
 #define	VM_FAULT_OK		0
 #define	VM_FAULT_NOMAP		1	/* no entry, or not a lazy one  */
@@ -439,26 +355,22 @@ void			 vm_map_stats(void);
 #define	VM_FAULT_NOMEM		4	/* out of frames                */
 
 /*
- * Resolve the fault on the page containing `va` in `map`/`pm`.  Called from
- * the #PF handler, and it answers two different faults:
+ * Resolve a #PF on the page holding `va` in `map`/`pm`.  Two kinds:
  *
- *	nothing mapped -- turn a VME_F_LAZY promise into memory.  An
- *	  anonymous range gets a zeroed frame, a file-backed range gets a
- *	  frame holding that file's bytes.
+ *	nothing mapped -- fill a VME_F_LAZY range: a zeroed frame, or one
+ *	  holding the file's bytes.
  *
- *	mapped, but written to without the write bit -- on a VME_F_COW range
- *	  this is the copy-on-write fault: the writer gets a private copy of
- *	  the frame, or the original outright if it turns out to be the only
- *	  owner left.
+ *	mapped, written without the write bit -- on a VME_F_COW range, the
+ *	  copy-on-write fault: the writer gets a private copy, or the
+ *	  original if it is the last owner.
  *
- * `write` is the fault's access type, so a store to a range that is not
- * writable at all is refused here rather than papered over with a writable
- * page.  vme_prot is what the range PERMITS; the page tables under it may
- * grant less while copy-on-write is pending, and that difference is exactly
- * what makes the second fault above possible.
+ * `write` is the access type, so a store to a range that is not writable
+ * is refused.  vme_prot is what the range permits; the page tables may
+ * grant less while copy-on-write is pending, which is what makes the
+ * second kind possible.
  *
- * MUST be called with no locks held: filling a file-backed page reads the
- * disk, and that sleeps.
+ * Must be called with no locks held: filling a file-backed page reads
+ * the disk, which sleeps.
  */
 int			 vm_fault(struct vm_map *map, struct pmap *pm,
 			    uint64_t va, bool write);

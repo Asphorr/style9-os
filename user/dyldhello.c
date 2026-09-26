@@ -6,14 +6,13 @@
  */
 
 /*
- * dyldhello -- the S4 dynamic-linking test program.  Ordinary compiler
- * output, NOT a hand stub: clang compiles it for the Darwin target and
- * ld64.lld links it as a real dynamic Mach-O that imports write/exit from
- * /usr/lib/libSystem.B.dylib via LC_DYLD_CHAINED_FIXUPS, with an
- * LC_LOAD_DYLINKER naming /usr/lib/dyld.  The kernel maps it plus our dyld
- * and hands off; our dyld (user/dyld.c) binds the imports against our
- * libSystem and jumps to the LC_MAIN entry here.  Entry is _entry (ld -e),
- * so no crt is required.
+ * dyldhello -- the dynamic-linking test program.  Ordinary compiler
+ * output, not a hand stub: clang and ld64.lld make a dynamic Mach-O that
+ * imports write/exit from /usr/lib/libSystem.B.dylib via
+ * LC_DYLD_CHAINED_FIXUPS, with LC_LOAD_DYLINKER naming /usr/lib/dyld.  The
+ * kernel maps it plus our dyld (user/dyld.c), which binds the imports
+ * against our libSystem and jumps to the LC_MAIN entry.  Entry is _entry
+ * (ld -e), so no crt.
  *
  * Relinked low (-pagezero_size 0x50000000) into the style9 user-VA window
  * [0x40000000,0x80000000); a stock 4 GiB __TEXT base would be outside it.

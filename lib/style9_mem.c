@@ -53,14 +53,9 @@ memcmp(const void *a, const void *b, size_t n)
 
 /* ---- bump allocator -------------------------------------------------
  *
- * One 4 KiB .bss arena per program, served linearly.  No bookkeeping
- * means free() is a NOP; this is fine for the workloads phase 1 + 2
- * care about (a shell, a top-style viewer, a hex editor) where peak
- * working-set is small and we tear down the whole program on exit.
- *
- * Override the size at compile time with -DSTYLE9_HEAP_BYTES=N if a
- * particular program runs out.  When a real allocator lands here it
- * keeps the same prototypes so callers don't move.
+ * One .bss arena per program (4 KiB unless -DSTYLE9_HEAP_BYTES=N), served
+ * linearly; free() is a no-op.  Enough for small programs whose memory
+ * goes away with them at exit.
  */
 
 #ifndef	STYLE9_HEAP_BYTES
@@ -77,9 +72,9 @@ malloc(size_t n)
 	void	*p;
 
 	/*
-	 * Align bumps to 16 bytes so the returned pointer satisfies any
-	 * stricter alignment a caller's struct might want (the SysV ABI
-	 * pegs max alignment at 16).
+	 * 16-byte steps, the SysV maximum alignment.  The arena itself is
+	 * 16-aligned: SysV requires that of any global array of 16 bytes
+	 * or more.
 	 */
 	aligned = (n + 15u) & ~(size_t)15u;
 	if (heap_cursor + aligned > sizeof(heap_arena))

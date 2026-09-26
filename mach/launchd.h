@@ -12,27 +12,19 @@
 #include "services.h"
 
 /*
- * In-kernel launchd analog.  Registers itself with the global
- * bootstrap port under SVC_LAUNCHD_NAME, handles LAUNCHCTL_OP_*
- * messages synchronously, owns a small fixed-size service registry
- * (LAUNCHD_MAX_SERVICES rows) protected by an internal spinlock.
+ * In-kernel launchd.  Registered with bootstrap as SVC_LAUNCHD_NAME, it
+ * handles LAUNCHCTL_OP_* synchronously over a fixed registry of
+ * LAUNCHD_MAX_SERVICES jobs.  The wire protocol and states are in
+ * mach/services.h.
  *
- * Wire protocol + state model live in mach/services.h alongside the
- * other kernel-side services.  Implementation in mach/launchd.c.
- *
- * Bring-up is TWO calls, in this order, and the order is load-bearing:
+ * Bring-up is two calls, in this order:
  *
  *	launchd_subsystem_init()	from services_init
- *	launchd_load_catalog()		from kmain, AFTER progreg_init
+ *	launchd_load_catalog()		from kmain, after progreg_init
  *
- * The split exists because the boot catalog names programs by string and
- * resolves them through the program registry, which services_init runs too
- * early to see.  Materialising the catalog from the worker thread instead
- * only appeared to fix that: it made the load wait for the scheduler rather
- * than for progreg_init, and the two are not the same thing.  See the
- * comment above launchd_load_catalog in mach/launchd.c.
- *
- * Calling it twice is harmless -- the second call returns immediately.
+ * The boot catalog names programs that only progreg_init makes
+ * resolvable, and services_init runs before it.  launchd_load_catalog
+ * is idempotent.
  */
 void	launchd_subsystem_init(void);
 void	launchd_load_catalog(void);

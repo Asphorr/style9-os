@@ -43,12 +43,9 @@ uart_drv_init(void)
 	uart_enable_rx();
 
 	/*
-	 * Two-direction driver: the RX side mirrors kbd_drv (a stream
-	 * port the consumer recvs on), the TX side accepts DEV_OP_WRITE
-	 * messages and pushes the bytes out through uart_putc.  Both ride
-	 * the same control port; the kind reports STREAM_RX because RX
-	 * is the canonical use, with DEV_F_WRITABLE indicating WRITE is
-	 * also valid.
+	 * One control port for both directions: RX is a stream port as in
+	 * kbd_drv, TX takes DEV_OP_WRITE and sends through uart_putc.  The
+	 * kind says STREAM_RX; DEV_F_WRITABLE advertises WRITE.
 	 */
 	ctl = port_create_kernel_owned(PORT_SPECIAL_SERVICE,
 	    (void *)(uintptr_t)uart_drv_dispatch);

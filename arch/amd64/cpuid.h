@@ -11,14 +11,8 @@
 #include <stdint.h>
 
 /*
- * CPUID, in one place, on the third copy of it -- the same rule msr.h was
- * written under.  Two identical static inlines in two files is a coincidence;
- * three is a header nobody got round to.
- *
- * The subleaf argument is not optional padding.  Leaves 7 and 0xB take one in
- * ECX and answer differently per value, so a wrapper that only passes a leaf
- * cannot ask them anything -- and those are exactly the leaves that describe
- * SMAP and the topology.
+ * CPUID with an explicit subleaf in ECX: leaves 7 (SMAP among the feature
+ * flags) and 0xB (topology) answer differently per subleaf.
  */
 static inline void
 cpuid_count(uint32_t leaf, uint32_t subleaf,
@@ -31,11 +25,8 @@ cpuid_count(uint32_t leaf, uint32_t subleaf,
 }
 
 /*
- * CPUID_1_EBX_APICID: this processor's INITIAL local-APIC id, which is worth
- * naming because of when it can be asked.  The APIC's own ID register needs
- * the APIC found, mapped and enabled; this needs nothing at all, so a
- * processor can learn which one it is before it has touched a page table --
- * which is precisely the position an application processor wakes up in.
+ * This processor's initial local-APIC id, available before the APIC is
+ * found, mapped or enabled.
  */
 #define	CPUID_1_EBX_APICID(ebx)		((uint32_t)((ebx) >> 24))
 

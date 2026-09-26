@@ -39,12 +39,9 @@ shell_run(void)
 	shell_len = 0;
 
 	/*
-	 * Fan-in: both the keyboard and the serial console drive the
-	 * same shell.  Allocate a port set and add each input port as
-	 * a member; the recv_block on the set delivers whichever
-	 * member has the next message.  No extra threads needed -- the
-	 * existing kbd-drv and uart-drv threads each send into their
-	 * own port and the set surfaces both streams as one.
+	 * Keyboard and serial console both drive the shell: their driver
+	 * threads each send into their own input port, and a port set
+	 * merges the two streams.
 	 */
 	input_set = port_set_allocate(kernel_space);
 	if (input_set == MACH_PORT_NULL)
@@ -60,12 +57,7 @@ shell_run(void)
 	tty_puts("\nstyle9-os shell.  type 'help' for commands.\n");
 	prompt();
 
-	/*
-	 * Input arrives as one mach_msg per character, sent by either
-	 * driver thread.  msgh_id carries the byte; we ignore
-	 * msgh_bits / voucher.  Blocking recv on the set parks the
-	 * shell until any member port has data.
-	 */
+	/* One message per character, the byte in msgh_id. */
 	for (;;) {
 		rv = mach_msg_recv_block(kernel_space, input_set,
 		    &hdr, sizeof(hdr));
@@ -96,11 +88,7 @@ shell_run(void)
 			continue;
 		}
 
-		/*
-		 * Ignore characters that would overflow the buffer
-		 * rather than truncating mid-line; the caller can
-		 * backspace and retry.
-		 */
+		/* A full line drops further characters; backspace works. */
 		if (shell_len + 1 >= SHELL_LINE_MAX)
 			continue;
 
@@ -129,10 +117,8 @@ is_blank(char c)
 }
 
 /*
- * In-place argv split: walk the line, replace runs of blanks with
- * NULs, point argv[i] at each token's first non-blank.  Caller owns
- * the underlying buffer; no kmalloc here so this is safe to call from
- * any context.
+ * In-place argv split: blanks become NULs and argv[i] points at each
+ * token.  No allocation.
  */
 static int
 split_argv(char *line, char *argv[], int argv_max)

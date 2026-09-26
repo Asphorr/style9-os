@@ -29,9 +29,9 @@ extern struct port	*port_create_kernel_owned(uint8_t kind, void *arg);
 #define	PKT_YOVF	0x80	/* bit 7: Y counter overflowed      */
 
 /*
- * Boot self-test vectors: a raw packet and the event it must come out as.
- * The first is the ordinary case; the rest are the ones a byte-as-int8
- * decode gets wrong.
+ * Boot self-test vectors: a raw packet and the event it must become.  The
+ * first is the ordinary case; the rest are what a byte-as-int8 decode gets
+ * wrong.
  */
 struct mouse_selftest {
 	const char	*mst_what;
@@ -79,9 +79,8 @@ mouse_drv_init(void)
 		panic("mouse_drv_init: port_allocate failed");
 
 	/*
-	 * Control port: handles the dev-NAME protocol (INFO + OPEN_STREAM).
-	 * OPEN_STREAM hands back a SEND right naming mouse_input_port -- the
-	 * port the mouse-drv thread feeds decoded events into.
+	 * Control port: INFO and OPEN_STREAM, which moves the RECEIVE right
+	 * for mouse_input_port to the caller.
 	 */
 	ctl = port_create_kernel_owned(PORT_SPECIAL_SERVICE,
 	    (void *)(uintptr_t)mouse_drv_dispatch);
@@ -103,9 +102,8 @@ mouse_drv_init(void)
 }
 
 /*
- * dev/mouse control-port dispatcher.  Synchronous: runs in the caller's
- * thread the moment they send to dev/mouse, so the inline-reply fast path
- * lands the answer straight into their reply buffer.
+ * dev/mouse control-port dispatcher.  Runs synchronously in the sender's
+ * thread, so the reply lands straight in its reply buffer.
  */
 static int
 mouse_drv_dispatch(const struct mach_msg_header *req, struct port_space *from)
@@ -124,23 +122,16 @@ mouse_drv_dispatch(const struct mach_msg_header *req, struct port_space *from)
 }
 
 /*
- * One axis of a PS/2 packet, as the int8 the wire layout has room for.
- *
- * The device counts in nine bits: the low eight in the data byte, the
- * sign in byte 0.  The data byte on its own is NOT the delta -- a quick
- * flick right of +200 arrives as 0xC8 with the sign clear, and read as an
- * int8 that is -56, the pointer thrown the wrong way.  So the nine-bit
- * value is rebuilt first and clamped after.
- *
- * Two edges, each decided rather than left to the arithmetic:
+ * One axis of a PS/2 packet, as an int8.  The device counts in nine bits,
+ * the sign in byte 0: +200 arrives as 0xC8 with the sign clear, which as
+ * an int8 is -56.  So the nine-bit value is rebuilt first, then clamped.
  *
  *	sign set on a zero byte	-256 by the letter, but devices set the
  *				sign on no motion at all; read as none
- *				(Linux psmouse does the same).
- *	overflow bit		the device's counter ran past nine bits
- *				before it could report; the low byte is
- *				then meaningless but the sign is not, so
- *				a full-scale step that way.
+ *				(as Linux psmouse does).
+ *	overflow bit		the counter ran past nine bits; the low
+ *				byte is meaningless but the sign is not,
+ *				so a full-scale step that way.
  */
 static int
 mouse_axis(uint8_t lo, bool negative, bool overflow)
@@ -159,10 +150,7 @@ mouse_axis(uint8_t lo, bool negative, bool overflow)
 	return (v);
 }
 
-/*
- * Pack a raw 3-byte PS/2 packet into the msgh_id wire layout documented
- * in mouse_drv.h.
- */
+/* Pack a raw PS/2 packet into the msgh_id layout (mouse_drv.h). */
 static uint32_t
 mouse_pack(const uint8_t *pkt)
 {
@@ -183,13 +171,9 @@ mouse_pack(const uint8_t *pkt)
 }
 
 /*
- * Bridge between the IRQ-fed packet ring and Mach IPC.  Park in
- * mouse_getpkt_block until a packet arrives, then ship the decoded event
- * to the input port as a tagged message.  msgh_id carries the whole
- * event, so no complex body is needed.
- *
- * Never returns: a kernel driver thread is part of the kernel for the
- * lifetime of the system.
+ * Bridge from the IRQ-fed packet ring to Mach IPC: park in
+ * mouse_getpkt_block, then send each decoded event to the input port as a
+ * bare header with the event in msgh_id.  Never returns.
  */
 static void
 mouse_drv_thread(void *arg)
@@ -214,10 +198,9 @@ mouse_drv_thread(void *arg)
 
 		rv = mach_msg_send(kernel_space, &msg);
 		/*
-		 * A send failure means the port died (a consumer deallocated
-		 * it -- not expected here, the kernel holds RECEIVE).  Drop
-		 * the event and keep going so a transient outage does not
-		 * bring the driver down.
+		 * The send blocks on a full queue, so a failure means the
+		 * port died (its receiver went away).  Drop the event and
+		 * keep going.
 		 */
 		if (rv != MACH_MSG_OK) {
 			kprintf("mouse_drv: send rv=%s, dropping event\n",
@@ -227,16 +210,12 @@ mouse_drv_thread(void *arg)
 }
 
 /*
- * Boot self-test: prove feed -> ring -> driver-thread -> Mach-message end
- * to end, deterministically, without needing physical mouse motion.
- * Inject each synthetic packet in mouse_selftests through the same
- * assembly path the IRQ uses, then recv the resulting event off
- * mouse_input_port and check the decode.  Bounded by a timeout so a
- * regression can never wedge the boot; loud on mismatch.
- *
- * Live motion during the test can still land an event of its own between
- * the drain and a recv and read as a mismatch.  The test says so rather
- * than guessing: it is a boot diagnostic, not an invariant.
+ * Boot self-test of feed -> ring -> thread -> port, without real motion:
+ * feed each vector through the IRQ's assembly path, receive the event off
+ * mouse_input_port and check the decode.  Each receive has a timeout, so
+ * a regression cannot wedge boot.  Live motion during the test can show
+ * up as a mismatch, and the message says so: a diagnostic, not an
+ * invariant.
  */
 static void
 mouse_drv_selftest(void)

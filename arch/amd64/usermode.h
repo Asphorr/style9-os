@@ -14,55 +14,32 @@
 /*
  * Ring-3 bring-up.
  *
- * usermode_run_first_blob() spawns a kernel thread that:
- *	- allocates user code + stack pages and maps them U=1,
- *	- copies the inline user_blob (arch/amd64/user_blob.S) into
- *	  the code page,
- *	- installs the per-thread kernel-stack top in this CPU's TSS
- *	  and in its per-CPU block (cpu_set_kernel_rsp),
- *	- iretq's to the user RIP with user CS/SS/RSP.
- *
- * The blob makes two syscalls (SYS_PRINT, SYS_EXIT) and exits.  The
- * kernel will reap the thread on the next idle pass.
+ * usermode_run_first_blob() (currently uncalled) spawns a kernel thread
+ * that maps a user code and stack page, copies in user_blob
+ * (arch/amd64/user_blob.S), installs its kstack top in this CPU's TSS and
+ * cp_kernel_rsp, and iretqs to it.  The blob makes SYS_PRINT and SYS_EXIT;
+ * the idle thread reaps the rest.
  */
 
 #define	USER_CODE_VA	0x40000000ULL	/* just past the 1 GiB boot map */
 
 /*
- * The initial user stack, and the ceiling it puts over a program's
- * image.
- *
- * This was 0x4000F000, which left a native program sixty kilobytes for
- * text, rodata, data and bss together -- and nothing said so.  sh.elf
- * grew into it: its .bss ended 432 bytes past the stack page, the
- * loader's vm_map_enter for the stack found the range already taken,
- * and the boot died in
- *
- *	*** kernel panic: usermode_elf_launcher: setup_image sh rv=-4
- *
- * which names neither the section that overflowed nor the address it
- * ran into.  The shell had been within 3.5 KiB of that cliff for some
- * time with no warning anywhere.
- *
- * A ring-3 stack address is just a number, so the ceiling is now
- * sixteen megabytes rather than sixty kilobytes -- still inside the
- * user window [0x40000000, 0x80000000) and still far below the Darwin
- * main image at 0x50000000 and the stack that grows down from it.
- * user/user.ld asserts the image ends below this, so the next program
- * to outgrow it gets a link error naming the number instead of a panic
- * in the middle of boot.
+ * The initial user stack, and so the ceiling on a native program's image:
+ * text, data and bss must end below USER_STACK_VA, just under 16 MiB above
+ * USER_CODE_VA.  Inside the user window [0x40000000, 0x80000000) and well
+ * below the Darwin stack and main image, which meet at 0x50000000.
+ * user/user.ld asserts the image fits, so outgrowing it is a link error,
+ * not a panic when the stack mapping collides at spawn.
  */
 #define	USER_STACK_VA	0x40FFF000ULL
 #define	USER_STACK_TOP	(USER_STACK_VA + 0x1000ULL)
 
 /*
- * A dynamically-linked Darwin image (figlet et al.) runs with a larger stack
- * than the single page a style9 ELF gets: real Apple binaries build sizable
- * frames and probe variable-length allocations via ____chkstk_darwin, which a
- * 4 KiB stack would overflow.  The region grows down from DARWIN_STACK_TOP,
- * placed just below the relocated main-image base (MACHO_IMAGE_BASE =
- * 0x50000000) in the otherwise-empty low user window, clear of the image, dyld
- * (0x60000000), and the dylibs (0x70000000+).
+ * A dynamically-linked Darwin image gets a bigger stack than a style9
+ * ELF's one page: real Apple binaries build large frames and probe with
+ * ____chkstk_darwin.  It grows down from just below the main image
+ * (MACHO_IMAGE_BASE, 0x50000000), clear of it, dyld (0x60000000) and the
+ * dylibs (0x70000000+).
  */
 #define	DARWIN_STACK_TOP	0x50000000ULL
 #define	DARWIN_STACK_PAGES	64		/* 256 KiB */
@@ -70,36 +47,25 @@
 void	usermode_run_first_blob(void);
 
 /*
- * arch_spawn_user: create a task, load the named ELF blob into it via
- * the program registry's image pointer, and start a user thread that
- * iretq's into ring 3 on e_entry.  Wired up by progreg_spawn() in
- * kern/progreg.c; ring-3 callers reach it via SYS_SPAWN.
+ * arch_spawn_user: create a task, load the program registry's image (ELF
+ * or Mach-O) into it, and start a thread that enters ring 3 at its entry.
+ * Called by the progreg_spawn* family in kern/progreg.c (SYS_SPAWN and
+ * friends).
  *
- * `inject_port` is optional: when non-NULL, the launcher installs a
- * SEND right on the port into the child's port_space at name
- * MACH_PORT_PARENT before transitioning to ring 3.  Caller must hold
- * one SEND ref; the ref is transferred into the child on success and
- * dropped on any failure path.  Used by SYS_SPAWN_WITH_PORT to hand
- * a private channel to a child task.
+ * `inject_port', if non-NULL, carries one SEND ref the caller holds; the
+ * launcher installs it in the child's space at MACH_PORT_PARENT, and any
+ * failure drops it (SYS_SPAWN_WITH_PORT).
  *
- * `caller_space` + `out_taskport_name` are the optional second pair:
- * when both are non-NULL, a SEND right on the new task's task-self
- * port is installed in `caller_space` and the resulting name is
- * written back through the out-pointer.  Pass NULL/NULL for the
- * SYS_SPAWN / SYS_SPAWN_WITH_PORT shapes; pass both for the
- * SYS_SPAWN_RETURNS_TASKPORT shape (parent-managed children, used by
- * the shell + task-manager-style services).
+ * `caller_space' and `out_taskport_name', if both non-NULL, get a SEND
+ * right on the new task's task-self port and its name
+ * (SYS_SPAWN_RETURNS_TASKPORT: parent-managed children).
  *
- * `argc` + `argv` carry the child's command line: `argv` is a
- * kernel-owned flattened block (the leading char* slots point into the
- * trailing packed strings) or NULL when argc==0.  The launcher copies
- * the strings onto the child's initial stack in the SysV layout
- * (`argc` at the entry %rsp, then the argv pointer array + NULL
- * terminator) and frees the block; on every failure path here the
- * block is kfree'd before returning.  Pass 0/NULL for the no-argument
- * spawn shapes.
+ * `argv', if non-NULL, is a kernel-owned flattened block (argc char *
+ * slots pointing into the packed strings that follow).  The launcher lays
+ * it out SysV-style on the child's stack and frees it; every failure path
+ * here frees it too.
  *
- * Returns the new task's t_id on success, negative SYS_E_* on failure.
+ * Returns the new task's t_id, or a negative SYS_E_*.
  */
 struct port;
 struct port_space;
@@ -112,10 +78,9 @@ long	arch_spawn_user(const char *name, const uint8_t *image,
 	    int argc, char **argv);
 
 /*
- * usermode_enter: never returns to its caller.  Pushes a synthetic
- * iretq frame (SS, RSP, RFLAGS, CS, RIP) for user-mode and iretq's.
- * Called from the launcher thread once the page mappings + RSP0
- * bookkeeping are in place.
+ * usermode_enter: push a synthetic iretq frame (SS, RSP, RFLAGS, CS, RIP)
+ * and iretq to ring 3; never returns.  For launcher threads, once the
+ * mappings and RSP0 are in place.
  */
 void	usermode_enter(uint64_t user_rip, uint64_t user_rsp)
 	    __attribute__((noreturn));

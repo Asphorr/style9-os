@@ -17,23 +17,20 @@
 #include "task.h"
 #include "thread.h"
 
-/* See mutex.h for what this is and why it had to exist. */
+/* See mutex.h. */
 
 /*
- * Counted because a lock that is never contended never exercises the half of
- * itself that is hard: the park and the wake.  A test that passes while
- * mutex_n_slept stayed at zero has proved only that uncontended acquisition
- * works, and would go on passing while the sleep path was broken.
+ * Counted so a test can tell whether it exercised the park and the wake,
+ * not just uncontended acquisition (see mutex_blocks).
  */
 static uint64_t	mutex_n_acquire;	/* (g) successful mutex_lock calls */
 static uint64_t	mutex_n_slept;		/* (g) ...that had to block first  */
 
 /*
- * Waiters are linked through th_wait_link -- the field an OBJECT'S queue owns,
- * shared with the port waiter lists in mach/port_msg.c because a thread is on
- * exactly one of them at a time.  Not through th_runq_link, which it used to
- * be: see the field's own comment in kern/thread.h for what the scheduler does
- * to a list it does not know it is holding.
+ * Waiters are linked through th_wait_link, the field object queues own,
+ * shared with the port waiter lists in mach/port_msg.c: a thread is on at
+ * most one of them at a time.  Never th_runq_link (kern/thread.h says
+ * why).
  */
 static void
 waiter_push(struct mutex *m, struct thread *th)
@@ -63,9 +60,8 @@ waiter_pop(struct mutex *m)
 }
 
 /*
- * Take a specific thread off the waiter list if it is still on it, exactly
- * as the port layer's port_unbind_waiter_locked does and for the same
- * caller: the unconditional detach after a park, whatever ended it.
+ * Take `th' off the waiter list if it is still on it -- the unconditional
+ * detach after a park, as port_unbind_waiter_locked does for ports.
  */
 static void
 waiter_unbind(struct mutex *m, struct thread *th)
@@ -103,12 +99,10 @@ mutex_lock(struct mutex *m)
 {
 
 	/*
-	 * Checked before the guard is taken, because taking it disables
-	 * preemption and would make the question unanswerable.  A caller
-	 * arriving here with preemption already off is either in interrupt
-	 * context or holding a spinlock; both mean the block below would park
-	 * this thread where nothing can wake it, and a panic naming the lock
-	 * is worth far more than the wedge that would otherwise follow.
+	 * Checked before the guard is taken, since taking it disables
+	 * preemption.  Preemption already off means interrupt context or a
+	 * spinlock held, where the block below could never be woken; better
+	 * a panic naming the lock than that wedge.
 	 */
 	KASSERT(preempt_is_enabled(),
 	    "mutex_lock with preemption disabled -- spinlock held, or IRQ?");
@@ -122,38 +116,30 @@ mutex_lock(struct mutex *m)
 		thread_wait_note(current_thread, &m->mtx_waiters_head,
 		    &m->mtx_waiters_tail, &m->mtx_guard);
 		/*
-		 * Drops the guard under sched_lock, so an unlock racing this
-		 * park has to spin on sched_lock and cannot slip its wake in
-		 * between the release and the switch.
+		 * Drops the guard under sched_lock, so a racing unlock spins
+		 * on sched_lock and cannot slip its wake in before the switch.
 		 */
 		thread_block_release(THREAD_BLOCK_SLEEP, m, &m->mtx_guard);
 		spin_lock(&m->mtx_guard);
 		/*
-		 * Off the list unconditionally, whatever it was that ended
-		 * the park -- the lesson the port's recv loop wrote down and
-		 * this loop had not yet learned.  An unlock that woke us
-		 * already popped us; a park that DECLINED TO PARK (a wake
-		 * was pending) did not, and the push above would then link
-		 * the tail into itself: a one-element cycle, and every wake
-		 * the unlock hands out goes to the phantom for ever.
+		 * Off the list unconditionally, whatever ended the park.  An
+		 * unlock that woke us already popped us; a park declined for a
+		 * pending wake did not, and the next push would then link the
+		 * tail to itself.
 		 */
 		waiter_unbind(m, current_thread);
 		thread_wait_forget(current_thread);
 		/*
-		 * Re-check rather than assume.  Being woken means the lock was
-		 * free at that moment, not that it is ours: a thread that never
-		 * slept can take it between the wake and this reacquisition.
-		 * Handing ownership over directly would fix that and introduce
-		 * a worse problem, since the winner would then be holding a
-		 * lock it has not yet returned to.
+		 * Re-check: being woken means the lock was free, not that it
+		 * is ours -- a thread that never slept may have taken it.  A
+		 * direct handoff would make the woken thread an owner before
+		 * it has even run.
 		 */
 	}
 	m->mtx_owner = current_thread;
 	/*
-	 * The count the kill checks read (see th_mutex_depth in
-	 * kern/thread.h): while it is up, a kill declines to retire this
-	 * thread, because a mutex dies with its owner.  Moved only by its
-	 * own thread, here and in unlock, so it needs no lock of its own.
+	 * Read by the kill checks (th_mutex_depth, kern/thread.h).  Only
+	 * this thread moves it, here and in unlock: no lock needed.
 	 */
 	current_thread->th_mutex_depth++;
 	mutex_n_acquire++;
@@ -207,22 +193,17 @@ mutex_unlock(struct mutex *m)
 	current_thread->th_mutex_depth--;
 	w = waiter_pop(m);
 	/*
-	 * Held from under the guard, where the waiter is provably alive: a
-	 * thread on this list cannot finish exiting without taking the guard
-	 * to unbind itself.  Between the unlock below and the wake, it can --
-	 * a kill fan-out wakes it, it retires, the reaper frees it -- and
-	 * the hold is what makes the reaper wait for our wake to land.
+	 * Hold taken under the guard, where the waiter is provably alive: it
+	 * cannot finish exiting without taking the guard to unbind itself.
+	 * After the unlock below it can (a kill wakes it, it retires, the
+	 * reaper runs), and the hold keeps the reaper off until our wake
+	 * lands.
 	 */
 	if (w != NULL)
 		thread_hold(w);
 	spin_unlock(&m->mtx_guard);
 
-	/*
-	 * Outside the guard.  thread_wake takes sched_lock, and this kernel
-	 * drains deferred wakes only when no lock is held -- waking from under
-	 * the guard would queue the wake behind the very release that is
-	 * trying to let someone run.
-	 */
+	/* The wake itself goes outside the guard. */
 	if (w != NULL) {
 		thread_wake(w);
 		thread_unhold(w);
@@ -234,9 +215,8 @@ mutex_held(const struct mutex *m)
 {
 
 	/*
-	 * Read without the guard on purpose.  The only answer a caller can act
-	 * on is "yes, I hold it", and that one cannot change underneath the
-	 * thread asking, because only the owner releases it.
+	 * No guard needed: the only actionable answer is "yes, I hold it",
+	 * and only the owner can change that.
 	 */
 	return (m->mtx_owner == current_thread);
 }
@@ -244,21 +224,14 @@ mutex_held(const struct mutex *m)
 /* ---- selftest -------------------------------------------------------- */
 
 /*
- * WHAT A KILL DOES TO A THREAD HOLDING ONE LOCK AND WAITING FOR ANOTHER --
- * which is every disk write in this kernel, seen from close up: the outer
- * lock is fs_lock, the inner wait is the drive's interrupt, and a kill that
- * landed there used to retire the thread on the spot, taking the outer lock
- * to the grave with it.  Every later acquirer then parks behind a corpse,
- * which for fs_lock means the machine never touches the disk again.
- *
- * The scene is that shape with the driver taken out, so it is deterministic:
- * the victim takes an outer lock and parks acquiring an inner one this test
- * is holding.  The kill lands mid-park and DECLINES -- th_mutex_depth is up
- * -- so the victim stays parked, still owning what it owned.  Then the inner
- * lock is released, and a thread the kernel has already agreed to kill
- * finishes the walk: takes the inner lock, gives both back, and only then
- * retires.  The asserts are on what it leaves behind: two locks anyone can
- * take, and a flag proving it lived past its own death warrant.
+ * A kill landing on a thread that holds one lock and waits for another --
+ * the shape of every disk write (fs_lock held, waiting on the drive),
+ * here without the driver so it is deterministic.  The victim takes the
+ * outer lock and parks acquiring the inner one, which this test holds.
+ * The kill lands mid-park and is declined (th_mutex_depth is up), so the
+ * victim stays parked, owning the outer lock.  Once the inner lock is
+ * released it takes it, gives both back, and only then retires.  Checked:
+ * both locks free afterwards, and a flag showing it outlived the kill.
  */
 #define	MK_WAIT_MS	4000u
 
@@ -328,13 +301,11 @@ mutex_kill_selftest(void)
 	task_request_terminate(vt->t_id);
 
 	/*
-	 * Let the kill's wake fan-out land and be declined.  The victim
-	 * wakes, reads its own death warrant, sees the outer lock in its
-	 * hand, and parks again -- so nothing here may have changed: the
-	 * victim has not moved past a lock this test still holds, and the
-	 * outer lock still has a living owner.  (A kill that retired it
-	 * anyway would leave the outer lock latched for ever, which is
-	 * exactly what the trylock probes.)
+	 * Let the kill's wake land and be declined: the victim wakes, sees
+	 * it holds the outer lock, and parks again.  So it must not have got
+	 * past the inner lock, and the outer lock must still be owned -- a
+	 * victim retired anyway would leave it latched, which the trylock
+	 * probes.
 	 */
 	sched_nap_ms(50);
 	if (mk.mk_done != 0) {

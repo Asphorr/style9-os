@@ -6,36 +6,23 @@
  *
  * lsmp -- list mach ports.
  *
- * Userspace tool that mirrors Darwin's `lsmp(1)` debugger surface:
- * dumps the calling task's port_space as a column-formatted table
- * with one row per populated name.  The concept is meaningless on
- * Linux (no Mach ports there); only an XNU-flavored kernel can
- * answer the question.
+ * Counterpart to Darwin's lsmp(1): the calling task's port_space as a
+ * table, one row per populated name.
  *
- * The kernel surface is one syscall, SYS_TASK_GET_PORT_SNAPSHOT,
- * which copies wire-format mach_port_snapshot_entry records back to
- * the caller -- name, kind (port or port_set), rights mask, refs +
- * queue counters per port, member count per set, and a
- * PORT_SPECIAL_* tag that distinguishes the kernel's well-known
- * ports (task_self, bootstrap, ...) from ordinary user-allocated
- * ones.  v1 only supports introspecting self (task_id == 0).
+ * One syscall, SYS_TASK_GET_PORT_SNAPSHOT, returns
+ * mach_port_snapshot_entry records: name, kind (port or port set),
+ * rights, refs and queue counters per port, member count per set, and a
+ * PORT_SPECIAL_* tag marking the kernel's well-known ports.  Only self
+ * (task_id == 0) is supported.
  *
- * Before snapshotting, this tool stands up a deliberately varied
- * port state -- one RECV+SEND port, one SEND-only name (obtained by
- * dropping the RECV right via mod_refs), a port_set with one member,
- * and a per-type exception port slot -- so the rendered table
- * exercises every column.  In a real debugger workflow the inspected
- * task would arrive at its own port_space organically; here we
- * synthesize the variety so a single run of `lsmp` from the shell
- * paints all the row shapes.
+ * Before the snapshot the tool builds a varied port state -- a
+ * receive+send port, a dead send-only name, a one-member port set and an
+ * exception port -- so one run shows every row shape.
  */
 
 #include "style9.h"
 
-/*
- * Decode a PORT_SPECIAL_* tag into a short human label.  Used for the
- * "description" column on the right side of every row.
- */
+/* PORT_SPECIAL_* tag as a label for the description column. */
 static const char *
 special_name(uint8_t special)
 {
@@ -54,11 +41,7 @@ special_name(uint8_t special)
 	}
 }
 
-/*
- * Map well-known slot numbers to their conventional roles.  Returns
- * NULL when the slot has no fixed meaning so the description column
- * falls through to special_name().
- */
+/* Role of a well-known slot, or NULL if the slot has no fixed meaning. */
 static const char *
 slot_name(mach_port_name_t name)
 {
@@ -76,10 +59,8 @@ slot_name(mach_port_name_t name)
 }
 
 /*
- * Build a 6-char mnemonic for a rights mask -- one letter per right
- * kind, "-" when absent.  Layout chosen to match port_space_print's
- * style (R / S / O for receive / send / send-once), padded out to a
- * fixed width so columns line up.
+ * 6-char rights mnemonic, one letter per right or "-", in
+ * port_space_print's style (R / S / O / P), padded to a fixed width.
  */
 static void
 fmt_rights(char out[7], uint8_t r)
@@ -115,9 +96,8 @@ print_row(const struct mach_port_snapshot_entry *e)
 	fmt_rights(rights, e->mpse_rights);
 
 	/*
-	 * Description: prefer the well-known slot label
-	 * (task-self / bootstrap / parent), fall back to the
-	 * port-special tag, then the dead marker, then nothing.
+	 * Description: the well-known slot label, else the port-special
+	 * tag, else "port-set" for a set.  " DEAD" is appended apart.
 	 */
 	sn = slot_name(e->mpse_name);
 	if (sn != NULL)
@@ -152,9 +132,8 @@ print_row(const struct mach_port_snapshot_entry *e)
 }
 
 /*
- * Stand up a varied port_space so the rendered table covers every
- * row shape.  Failures of the individual setup steps are non-fatal:
- * the snapshot just shows whatever state was reached.
+ * Build a varied port_space.  A failed step is harmless: the snapshot
+ * shows whatever state was reached.
  */
 static void
 seed_demo_state(void)
@@ -164,50 +143,34 @@ seed_demo_state(void)
 	mach_port_name_t	set_name;
 	mach_port_name_t	member;
 
-	/*
-	 * 1. RECV+SEND port -- the canonical "I own this endpoint" name.
-	 */
+	/* 1. Receive+send port. */
 	recv_port = mach_port_allocate(MACH_PORT_RIGHT_RECEIVE |
 	    MACH_PORT_RIGHT_SEND);
 	if (recv_port == MACH_PORT_NULL)
 		return;
 
 	/*
-	 * 2. SEND-only name on a port whose RECV we then drop.
-	 *
-	 * Mach semantics: a port lives only while its receiver is
-	 * alive.  Dropping the RECV right here kills the underlying
-	 * port -- the name in OUR space still carries SEND and is
-	 * perfectly visible to the snapshot, but the port object
-	 * itself transitions to DEAD.  port_space_snapshot reports
-	 * this via PORT_SNAPSHOT_FLAG_DEAD, and lsmp's print_row
-	 * decorates the description with " DEAD".  This is the
-	 * principled way the introspection surface signals a real
-	 * stale-handle situation (e.g. service crashed, holders of
-	 * SEND rights still have names that no longer refer to
-	 * anything reachable).  The live SEND-only shape -- where
-	 * RECV is held by SOME OTHER task -- is already covered by
-	 * the well-known MACH_PORT_BOOTSTRAP and MACH_PORT_PARENT
-	 * entries the kernel + parent set up at task creation.
+	 * 2. Send-only name on a dead port.  A port lives only while its
+	 * receive right does, so dropping it kills the port; our name keeps
+	 * the send right and the snapshot flags it PORT_SNAPSHOT_FLAG_DEAD,
+	 * as a crashed service's clients would see.  The live send-only
+	 * shape is already there in MACH_PORT_BOOTSTRAP and
+	 * MACH_PORT_PARENT.
 	 */
 	send_port = mach_port_allocate(MACH_PORT_RIGHT_RECEIVE |
 	    MACH_PORT_RIGHT_SEND);
 	if (send_port != MACH_PORT_NULL)
 		(void)mach_port_mod_refs(send_port, MACH_PORT_RIGHT_RECEIVE);
 
-	/*
-	 * 3. Port set with one member -- exercises the SET kind row.
-	 * Member port is RECV only since insert requires it.
-	 */
+	/* 3. Port set with one member (insert needs the receive right). */
 	set_name = mach_port_set_allocate();
 	member   = mach_port_allocate(MACH_PORT_RIGHT_RECEIVE);
 	if (set_name != MACH_PORT_NULL && member != MACH_PORT_NULL)
 		(void)mach_port_set_insert(set_name, member);
 
 	/*
-	 * 4. Per-type exception port slot, using our RECV+SEND name
-	 * from step 1 -- bumps that port's send_count so the column
-	 * shows non-trivial bookkeeping.
+	 * 4. Exception port slot on the port from step 1, which raises its
+	 * send count.
 	 */
 	(void)task_set_exception_ports(EXC_MASK_BAD_INSTRUCTION, recv_port);
 }

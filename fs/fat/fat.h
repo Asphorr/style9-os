@@ -12,21 +12,15 @@
 #include <stdint.h>
 
 /*
- * Minimal read-only FAT12/16 filesystem.
+ * Minimal read-only FAT12/16 filesystem: open a file by name, read it,
+ * stat it, and enumerate a directory, for the Darwin binaries' stdio and
+ * directory walkers (figlet fonts, tree(1)).
  *
- * A real VFS rung: enough to OPEN a file by name off the ATA disk, READ its
- * bytes, STAT it, and ENUMERATE a directory -- so a Darwin binary's
- * fopen()/fread()/stat()/opendir() can pull data files (e.g. figlet fonts)
- * from storage instead of a baked-in blob, and a directory walker (tree(1))
- * can descend the volume.
- *
- * Names match by 8.3 short name (no long-name matching); a path descends real
- * subdirectories.  Two consumers want two behaviours, so the open/stat path
- * tries the literal path and FALLS BACK to the basename in the root directory:
- * that lets a binary's baked-in macOS path (whose leading directories do not
- * exist on our small disk) still find a font placed in the root, while a real
- * on-disk path resolves exactly.  No writes.  Block I/O goes straight to
- * ata_kread (no Mach round-trip from the kernel).
+ * Names match by 8.3 short name (no long names); a path descends real
+ * subdirectories.  open/stat try the literal path and fall back to the
+ * basename in the root directory, so a binary's baked-in macOS path, whose
+ * directories do not exist here, still finds a font placed in the root.
+ * No writes.  Block I/O goes through the block cache (bio_read).
  */
 
 /* Largest file the slurp path will read (bounds the kmalloc). */
@@ -44,9 +38,8 @@
 #define	FS_FAT_E_INVAL		(-6)	/* bad path / chain             */
 
 /*
- * One directory entry, as fs_fat_readdir reports it.  This is also the wire
- * format copied out to libSystem's readdir (user/libsystem.c mirrors the
- * layout), so keep the field order stable.
+ * One directory entry, as fs_fat_readdir reports it; fs.c converts it to
+ * struct fs_dirent (fs.h), the wire format.
  */
 struct fs_fat_dirent {
 	uint32_t	fde_ino;	/* stable inode (first cluster) */
@@ -56,17 +49,13 @@ struct fs_fat_dirent {
 };
 
 /*
- * A file's metadata, as fs_fat_stat2 reports it.  Also the wire format behind
- * libSystem's stat$INODE64 (which turns it into Apple's struct stat); keep the
- * field order in sync with user/libsystem.c.
+ * A file's metadata, as fs_fat_stat2 reports it; fs.c converts it to struct
+ * fs_statbuf (fs.h), the wire format.
  *
- * FAT records less than a Unix caller asks for, and the honest thing is to be
- * explicit about which fields are READ and which are INVENTED.  Read: the
- * write time and date, the access date, the create time and date, and the
- * read-only attribute.  Invented: the owner and group (0, the only user this
- * system has), the link count (1, FAT has no hard links), and the permission
- * bits, which are derived from the one attribute bit FAT does keep.  A
- * timestamp of zero means the entry did not carry one.
+ * Read from the volume: the write time and date, the access date, the
+ * create time and date, and the read-only attribute.  Synthesised: the
+ * permission bits, from that one attribute bit (owner, group and link count
+ * are filled in by fs.c).  A timestamp of zero means none was recorded.
  */
 struct fs_fat_statbuf {
 	uint64_t	fs_mtime_ns;	/* last write   (0 if unrecorded) */
@@ -80,10 +69,8 @@ struct fs_fat_statbuf {
 };
 
 /*
- * The modes FAT can express.  A volume with one attribute bit for "read only"
- * and no notion of an owner cannot report more than these two shapes, so they
- * are named here rather than open-coded: a caller reading 0755 out of a FAT
- * stat should be able to find the line that decided it.
+ * The modes FAT can express: one read-only bit and no owner.  Named here so
+ * a 0755 read out of a FAT stat can be traced to where it was decided.
  */
 #define	FS_FAT_MODE_DIR		0040755
 #define	FS_FAT_MODE_FILE	0100644
@@ -92,8 +79,8 @@ struct fs_fat_statbuf {
 
 /*
  * Probe the first ATA drive for a FAT volume and mount it.  Called once at
- * boot, after ata_drv_init and kmem_init.  Logs the geometry on success and a
- * one-line reason on failure; a failed mount just leaves the FS unavailable.
+ * boot, after ata_drv_init and bio_init.  Logs the geometry, or a one-line
+ * reason on failure, which leaves the FS unavailable.
  */
 void	fs_fat_init(void);
 
@@ -101,46 +88,40 @@ void	fs_fat_init(void);
 int	fs_fat_ready(void);
 
 /*
- * Read the whole file named by `path` into a freshly kmalloc'd buffer.  The
- * literal path is resolved through real subdirectories; on a miss it falls
- * back to the 8.3 basename in the root directory.  On success returns
- * FS_FAT_E_OK, stores the buffer in *out_buf (the caller kfree's it) and the
- * real byte length in *out_size.  Returns a negative FS_FAT_E_* otherwise.
+ * Read the whole file at `path' into a fresh kmalloc'd buffer, resolving
+ * the literal path and falling back to the 8.3 basename in the root.
+ * Returns FS_FAT_E_OK with the buffer (the caller kfree's it) in *out_buf
+ * and the byte length in *out_size, or a negative FS_FAT_E_*.
  */
 int	fs_fat_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size);
 
 /*
- * Resolve `path` to its starting cluster and byte length -- the expensive
- * half of reading, paid once instead of per call.  Same path resolution as
- * fs_fat_slurp.  Directories are refused.
+ * Resolve `path' (as fs_fat_slurp does) to its starting cluster and byte
+ * length, the expensive half of reading, paid once.  Directories are
+ * refused.
  */
 int	fs_fat_open(const char *path, uint64_t *id_out, uint64_t *size_out);
 
 /*
- * Read at most `len` bytes of the resolved file (`id` = starting cluster,
- * `size` = its length) starting at file offset `off` into the caller's buffer,
- * reporting the count delivered through *out_got.  Reads that begin at or past
- * end-of-file return FS_FAT_E_OK with zero bytes; reads that run off the end
- * come back short.
+ * Read at most `len' bytes of a resolved file (`id' = starting cluster,
+ * `size' = its length) at offset `off' into `buf', the count in *out_got.
+ * A read at or past end-of-file returns FS_FAT_E_OK with zero bytes; one
+ * that runs off the end is short.
  */
 int	fs_fat_pread(uint64_t id, uint64_t size, uint64_t off, uint8_t *buf,
 	    uint32_t len, uint32_t *out_got);
 
 /*
- * Report a file-or-directory's metadata without reading it -- the existence +
- * size + type probe behind the Darwin stat path.  Same path resolution as
- * fs_fat_slurp.  Returns FS_FAT_E_OK and fills *out, or a negative FS_FAT_E_*.
+ * Metadata for a file or directory, resolved as fs_fat_slurp does.
+ * Returns FS_FAT_E_OK and fills *out, or a negative FS_FAT_E_*.
  */
 int	fs_fat_stat2(const char *path, struct fs_fat_statbuf *out);
 
 /*
- * Fill *out with the `index`-th live entry of the directory named by `path`
- * (resolved through real subdirectories -- NO basename fallback, since a
- * directory listing must be exact).  Returns 1 when an entry was written, 0 at
- * end-of-directory, or a negative FS_FAT_E_* on error.  Enumeration is
- * stateless: each call re-resolves and re-scans to `index`, which is fine for
- * the small read-only directories this serves and keeps no per-fd cursor in
- * the kernel.
+ * Fill *out with the `index'-th live entry of the directory at `path'
+ * (exact resolution, no basename fallback).  Returns 1 when an entry was
+ * written, 0 at end-of-directory, or a negative FS_FAT_E_*.  Stateless:
+ * each call re-resolves and re-scans to `index'.
  */
 int	fs_fat_readdir(const char *path, uint32_t index,
 	    struct fs_fat_dirent *out);

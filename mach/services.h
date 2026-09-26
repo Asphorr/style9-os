@@ -16,17 +16,11 @@
  * Kernel-side Mach services.
  *
  * Each is a PORT_SPECIAL_SERVICE port with a synchronous dispatcher,
- * registered with the global bootstrap port under a stable string
- * name.  Reachable identically from any kernel thread (via
- * mach_msg_rpc against kernel_space) and from ring-3 (via SYS_MSG_RPC
- * preceded by a bootstrap_lookup).
+ * registered with bootstrap under a fixed name by services_init, and
+ * reached the same way from a kernel thread (mach_msg_rpc in
+ * kernel_space) or ring 3 (bootstrap_lookup, then SYS_MSG_RPC).
  *
- * Boot-time wiring in services_init.
- *
- * Wire structs below are ABI-stable: existing fields keep their offsets,
- * new fields append, and the size is pinned by _Static_assert.  Reordering
- * an existing field breaks any consumer compiled against an older layout.
- * Each is preceded by a WIRE FORMAT banner for grep-ability.
+ * WIRE FORMAT structs are ABI-stable, as in port.h.
  */
 
 /* ---- "clock" service ---- */
@@ -94,42 +88,25 @@ _Static_assert(sizeof(struct svc_tasks_reply) ==
 
 /* ---- "progreg" service ---- */
 /*
- * What can be spawned.
+ * What can be spawned: the names in the program registry, for the
+ * shell.
  *
- * kern/progreg.h has said since it was written that its snapshot call
- * exists so the shell can answer "what can I spawn?", and nothing ever
- * called it: sh.elf carried a hand-written list of four names while the
- * registry held thirty-eight, and `help` had been quietly wrong for
- * thirty-four programs.  This is the seam that was missing.
+ * The names come back packed, NUL-separated in one byte array.  Fixed
+ * slots would bring the reply close to svc_reply_inline's 1024-byte
+ * ceiling; packed, the current registry takes about 350 bytes.
  *
- * The names come back PACKED -- NUL-separated in one byte array rather
- * than in fixed-width slots.  Fixed slots would have been simpler and
- * would also have made this reply 968 bytes against the 1024-byte
- * ceiling in svc_reply_inline, leaving room for exactly two more
- * programs before the service started failing at runtime instead of at
- * build time.  Packed, thirty-eight names cost about 350 bytes.
- *
- * pr_count is what fits, pr_total is what exists.  They differ only if
- * the registry outgrows the blob, and then the caller can say so rather
- * than print a shorter list that looks complete -- which is the exact
- * failure being fixed here.
+ * pr_count names fit, pr_total exist.  If the registry outgrows the
+ * array the two differ, and the caller can say the list is short
+ * rather than print one that looks complete.
  */
 #define	SVC_PROGREG_NAME	"progreg"
 #define	PROGREG_OP_LIST		1
 #define	SVC_PROGREG_BYTES	768
 
 /*
- * pr_macho carries one bit per packed name, in packing order: set means
- * the image is a Mach-O container and the program is a genuine Darwin
- * binary rather than a native style9 ELF.  A bitmap rather than a byte
- * per entry because it costs eight bytes for the whole registry and
- * because the question really is one bit; sixty-four is comfortably
- * past PROGREG_MAX and the packing gives up long before then anyway.
- *
- * It exists so the shell can SAY which is which.  Half the programs in
- * this registry are real Apple binaries running under a clean-room
- * dyld, which is the most interesting fact about the list, and a list
- * that renders them identically hides it.
+ * pr_macho has one bit per packed name, in packing order: set if the
+ * image is Mach-O, a Darwin binary rather than a native ELF, so the
+ * shell can show which is which.  64 bits cover PROGREG_MAX.
  */
 
 /* WIRE FORMAT.  ABI-stable. */
@@ -145,27 +122,22 @@ _Static_assert(sizeof(struct svc_progreg_reply) == 16 + SVC_PROGREG_BYTES,
 
 /* ---- "man" service ---- */
 /*
- * Manual-page registry.  Holds a small static table of embedded
- * mdoc-rendered text blobs (built from the docs/man .9 pages via the Makefile
- * mandoc pipeline).  Op MAN_OP_GET takes the page name in the inline
- * body and ships the rendered text back as a single OOL descriptor.
+ * Manual pages: the .9 pages in docs/man, rendered at build time with
+ * `mandoc -Tutf8 | col -b` and linked in with objcopy.  MAN_OP_GET takes
+ * a page name and returns the text as one OOL descriptor.  A new page is
+ * a docs/man/<name>.9 plus an entry in mach/services.c.
  *
- * Wire format (request):
+ * Request:
  *	mach_msg_header	(msgh_id = MAN_OP_GET, msgh_size = header + body)
- *	body bytes	NUL-terminated short name (e.g. "port"), <= 32 chars
+ *	body bytes	name (e.g. "port"), NUL included, <= MAN_NAME_MAX
  *
- * Wire format (reply, success):
+ * Reply, found:
  *	mach_msg_header	(MACH_MSGH_BITS_COMPLEX)
  *	mach_msg_body	(descriptor_count = 1)
  *	mach_msg_ool_descriptor	(PHYSICAL_COPY, points at receiver VA)
  *
- * Wire format (reply, not found):
+ * Reply, not found:
  *	mach_msg_header	(no COMPLEX bit, msgh_id = MAN_NOT_FOUND)
- *
- * Pages are auto-rendered at build time via `mandoc -Tutf8 | col -b`
- * (no backspace overstrike) and embedded as ld -b binary blobs.
- * Adding a new page = drop docs/man/<name>.9 on disk and register it
- * by name in mach/services.c.
  */
 #define	SVC_MAN_NAME		"man"
 #define	MAN_OP_GET		1
@@ -174,59 +146,40 @@ _Static_assert(sizeof(struct svc_progreg_reply) == 16 + SVC_PROGREG_BYTES,
 
 /* ---- "echool" service ---- */
 /*
- * Tiny OOL round-trip oracle.  Caller sends a complex message carrying
- * a single OOL descriptor; the dispatcher reads `size` bytes from the
- * sender's address (sender's pmap is current under a special-port
- * intercept), folds them through FNV-1a, and replies with the resulting
- * 32-bit checksum riding in msgh_id.  The reply is an inline bare
- * header on the reply port from msgh_local.
- *
- * Purpose: lets ring-3 prove its OOL wire-format construction byte-for-
- * byte against the kernel's parser without dragging in a worker-thread
- * receiver.  Stress_ool already covers the deliver_msg + recv_install_ool
- * leg via a kernel-space worker task.
+ * OOL oracle.  The caller sends one OOL descriptor; the dispatcher reads
+ * the payload straight from the sender's address space and replies with
+ * a bare header whose msgh_id is its FNV-1a checksum.  Lets ring 3 check
+ * its OOL descriptors against the kernel's parser; the receive side is
+ * covered by stress_ool.
  */
 #define	SVC_ECHOOL_NAME		"echool"
 #define	ECHOOL_OP_CHECKSUM	1
 
 /* ---- "launchd" service ---- */
 /*
- * Minimal launchd analog: a registry of managed services.  Each entry
- * names a registered string (the "label" -- Apple calls it Label),
- * the program to spawn (a name registered with progreg, e.g. "echod"),
- * and tracks lifecycle state + task id.
+ * launchd (mach/launchd.c): a registry of managed jobs, each a label
+ * (Apple's Label), a progreg program name (e.g. "echod"), a state and a
+ * task id.
  *
- * v1 ops:
- *	LAUNCHCTL_OP_LIST	enumerate every loaded entry.  Re-validates
- *				task liveness via task_is_alive at snapshot
- *				time -- if a RUNNING entry's task is gone,
- *				its row is updated to EXITED before being
- *				written to the reply.
- *	LAUNCHCTL_OP_LOAD	register a label+program pair, spawn the
- *				program immediately, and record the task id.
- *				State transitions: RUNNING on success, FAILED
- *				if the spawn returned an error.  Duplicate
- *				labels are rejected with MACH_E_INVAL.
- *	LAUNCHCTL_OP_UNLOAD	drop the entry from the registry.  Real
- *				kill not implemented yet (no SYS_TASK_KILL);
- *				a still-running task continues until it
- *				exits on its own.  Operation succeeds either
- *				way; the entry is gone from launchd's table.
+ *	LAUNCHCTL_OP_LIST	every entry; a RUNNING entry whose task is
+ *				gone is marked EXITED first.
+ *	LAUNCHCTL_OP_LOAD	register a label + program and spawn it:
+ *				RUNNING, or FAILED if the spawn failed.  A
+ *				duplicate label is MACH_E_INVAL.
+ *	LAUNCHCTL_OP_UNLOAD	remove the entry and kill its task.
+ *	LAUNCHCTL_OP_STOP	kill the task, keep the entry STOPPED.
+ *	LAUNCHCTL_OP_START	respawn an entry that is not RUNNING.
  *
- * Wire shapes are inline-only -- no OOL.  Total reply for LIST is
- * 8 + LAUNCHD_MAX_SERVICES * sizeof(entry).
- *
- * Deferred to v2: STOP / START (need a kill primitive), restart-on-
- * exit policies, .plist-equivalent manifest loading from disk, cross-
- * task auth, persistent service catalog.
+ * All inline, no OOL.  Not done: loading job files from disk, auth
+ * between tasks.
  */
 #define	SVC_LAUNCHD_NAME	"launchd"
 
 #define	LAUNCHCTL_OP_LIST	1
 #define	LAUNCHCTL_OP_LOAD	2
 #define	LAUNCHCTL_OP_UNLOAD	3
-#define	LAUNCHCTL_OP_STOP	4	/* kill task, keep entry (v2)    */
-#define	LAUNCHCTL_OP_START	5	/* respawn a stopped entry (v2)  */
+#define	LAUNCHCTL_OP_STOP	4	/* kill task, keep entry         */
+#define	LAUNCHCTL_OP_START	5	/* respawn a stopped entry       */
 
 #define	LAUNCHD_MAX_SERVICES	8
 #define	LAUNCHD_NAME_MAX	24
@@ -236,11 +189,11 @@ _Static_assert(sizeof(struct svc_progreg_reply) == 16 + SVC_PROGREG_BYTES,
 #define	LAUNCHD_LOAD_FLAG_KEEPALIVE	0x1u	/* respawn on unexpected exit */
 
 /*
- * State machine.  LOAD always tries to spawn, so an entry never
- * lingers in a fresh "loaded but never started" state -- that maps
- * directly to RUNNING-or-FAILED.  EXITED is the catch-all "task is
- * gone now" reached either when LIST observes task_is_alive == false
- * or (future) when a death notification fires.
+ * Entry states.  LOAD always spawns, so a loaded entry is RUNNING or
+ * FAILED; only a catalog job without runatload starts out STOPPED.
+ * EXITED means the task was found gone (LIST, STOP, START).  The
+ * keep_alive worker respawns a dead keep_alive job, or parks it
+ * THROTTLED.
  */
 #define	LAUNCHD_STATE_RUNNING	0
 #define	LAUNCHD_STATE_EXITED	1
@@ -261,7 +214,7 @@ struct svc_launchctl_load_req {
 _Static_assert(sizeof(struct svc_launchctl_load_req) == 56,
     "svc_launchctl_load_req must be 56 bytes (wire format)");
 
-/* WIRE FORMAT.  ABI-stable.  UNLOAD request body (label only). */
+/* WIRE FORMAT.  ABI-stable.  UNLOAD / STOP / START request body. */
 struct svc_launchctl_byname_req {
 	char		lr_name[LAUNCHD_NAME_MAX];
 };
@@ -269,7 +222,7 @@ struct svc_launchctl_byname_req {
 _Static_assert(sizeof(struct svc_launchctl_byname_req) == 24,
     "svc_launchctl_byname_req must be 24 bytes (wire format)");
 
-/* WIRE FORMAT.  ABI-stable.  LOAD / UNLOAD reply body. */
+/* WIRE FORMAT.  ABI-stable.  Reply body for all but LIST. */
 struct svc_launchctl_status_reply {
 	int32_t		ls_status;	/* MACH_MSG_OK or MACH_E_*       */
 	uint32_t	ls_state;	/* LAUNCHD_STATE_* after the op  */
@@ -307,9 +260,10 @@ _Static_assert(sizeof(struct svc_launchctl_list_reply) ==
     8 + LAUNCHD_MAX_SERVICES * sizeof(struct svc_launchctl_entry),
     "svc_launchctl_list_reply layout pinned");
 
-/* Bring up + register all four services.  Call after bootstrap_init
- * and task_subsystem_init (so kernel_task exists for thread/task ID
- * accounting). */
+/*
+ * Create and register the services above, launchd included.  After
+ * bootstrap_init and task_subsystem_init.
+ */
 void	services_init(void);
 
 #endif /* !_SYS_SERVICES_H_ */

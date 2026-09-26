@@ -18,33 +18,22 @@
 #include "kprintf.h"
 
 /*
- * APFS container probe.  See apfs.h for what the format is doing, apfs_priv.h
- * for the state this file keeps and the self-tests read; this file is the
- * mechanics of getting at it.
- *
- * Block I/O goes through the block cache (fs/bio.c) -- no Mach round trip
- * from inside the kernel.  It speaks 512-byte sectors, so one APFS block is
- * APFS_BLOCK_SIZE / 512 of them.  The cache earns its keep here more than it
- * would for a simpler filesystem: every descent re-reads the root and the
- * interior node under it, so the same few blocks are asked for constantly.
+ * APFS container reader and writer.  See apfs.h for the format, apfs_priv.h
+ * for the state this file keeps and the self-tests read.  Block I/O goes
+ * through the block cache (fs/bio.c), APFS_BLOCK_SIZE / 512 sectors to a
+ * block; every descent re-reads the same few blocks.
  */
 
 #define	ATA_SECTOR_BYTES	512
 #define	APFS_SECTORS_PER_BLOCK	(APFS_BLOCK_SIZE / ATA_SECTOR_BYTES)
 
 /*
- * The mounted container.  Its shape is in apfs_priv.h rather than here,
- * because the self-tests read it: what a test asks of the DISK it has to be
- * able to compare against what this kernel believes.
+ * The mounted container.  Its shape is in apfs_priv.h because the self-tests
+ * compare what they read off the disk against it.
  */
 struct apfs_mount	g_apfs;
 
-/*
- * What reading the tree costs.  Counted rather than argued about: it was the
- * measurement that settled whether the whole-tree walk this reader started
- * with was a real cost or a theoretical one, and it is the measurement the
- * descent that replaced it is judged by.
- */
+/* What reading the tree costs: whole-tree walks against keyed descents. */
 uint64_t	g_n_walks;	/* reads that visited every record */
 uint64_t	g_n_seeks;	/* reads that descended on a key   */
 uint64_t	g_n_nodes;	/* B-tree nodes read during them   */
@@ -52,10 +41,9 @@ uint64_t	g_n_recs;	/* records handed to a callback    */
 uint64_t	g_n_cmps;	/* keys compared while descending  */
 
 /*
- * The ephemeral layer, in memory.  These two are the objects whose home is
- * RAM and whose disk copies are per-checkpoint: the space manager, and the
- * bitmap of the internal pool that holds the allocation metadata.  Both are
- * read at mount, changed here, and written by fs_apfs_checkpoint.
+ * The ephemeral layer, whose home is RAM and whose disk copies are
+ * per-checkpoint: the space manager and the internal pool bitmap.  Read at
+ * mount, changed here, written by fs_apfs_checkpoint.
  */
 static uint8_t	*g_sm;		/* the space manager        */
 uint8_t	*g_fq[APFS_SFQ_COUNT];	/* its free-queue B-trees   */
@@ -63,26 +51,14 @@ static uint8_t	*g_ipbm;	/* the internal pool bitmap */
 
 
 /*
- * And the device's own allocation metadata, on the same terms: the chunk
- * bitmaps this kernel is holding, their chunk-info block, and the blocks
- * released by the checkpoint being built.  Written by alloc_flush when a
- * checkpoint is closed, and only then.
- *
- * THE BITMAPS ARE PLURAL, and that is this rung.  A chunk bitmap is one block
- * covering thirty-two thousand blocks of container, and until now the kernel
- * held exactly one -- the chunk the volume's metadata lives in -- which was
- * enough while everything it allocated and everything it released was
- * metadata.  A file's bytes are not.  In this container the only real file has
- * its content at block 5970, in chunk 0, while the metadata being copied
- * around it is at 98304, in chunk 3; moving those bytes therefore frees in one
- * chunk and allocates in another within a single transaction, and a kernel
- * holding one bitmap cannot do it.  free_blocks said exactly that, by name.
- *
- * So bitmaps are admitted on demand and held until the checkpoint writes them.
- * The set is small and fixed: an admission that does not fit is refused out
- * loud, because the alternative -- evicting a dirty bitmap mid-transaction --
- * means copying it into the pool and copying it again on the next bit set,
- * which is the cost the once-per-checkpoint flush exists to avoid.
+ * The device's own allocation metadata, on the same terms: the resident
+ * chunk bitmaps (one block covering 32768 blocks each) and their chunk-info
+ * block, written by alloc_flush when a checkpoint closes and only then.  One
+ * transaction can free in one chunk and allocate in another, so bitmaps are
+ * admitted on demand and held until the checkpoint writes them.  The set is
+ * fixed; an admission that does not fit is refused out loud, since evicting
+ * a dirty bitmap would copy it into the pool now and again on its next bit
+ * set.
  */
 #define	APFS_CHUNKS_RESIDENT	4
 
@@ -95,15 +71,9 @@ static uint64_t	 alloc_n_given;	/* ...and released         */
 static uint64_t	 chunk_n_admit;	/* bitmaps brought into memory */
 
 /*
- * The writers reach for these before the file gets to them.  Space management
- * is one subject and stays in one place, below, rather than being hoisted up
- * here a function at a time to satisfy the order a reader happens to want.
- *
- * alloc_blocks takes a hint: the block the caller would like to be near.  A
- * copy that lands in the chunk it came from keeps the release reachable, and
- * for file data it is also the difference between a file's bytes staying
- * together and being scattered across the container a write at a time.  Zero
- * means "anywhere", which for metadata means the chunk it already lives in.
+ * Space management lives below; the writers need these first.  alloc_blocks
+ * takes a hint, the block the caller would like to be near; zero means
+ * anywhere, which for metadata is the chunk it already lives in.
  */
 int	alloc_blocks(uint32_t count, uint64_t near, uint64_t *first_out);
 int	free_blocks(uint64_t first, uint32_t count);
@@ -111,28 +81,17 @@ static int	alloc_flush(uint64_t xid);
 struct alloc_chunk *chunk_for(uint64_t bno);
 
 /*
- * EVERYTHING AN OBJECT MAP CAN BE TOLD, IN ONE COPY OF ITS NODE
+ * Everything an object map is told, in one copy of its node: separate calls
+ * would copy the node, and six spine objects with it, once each.  Which
+ * fields a caller fills in says what it did:
  *
- * Three kinds of change, and they travel together because they are one event.
- * The map node is copied once per transaction -- that is the rule the whole
- * spine is built on -- so a caller that made three calls would copy it three
- * times, and the second copy would be replacing an entry in a node the first
- * had already released.  Correct, and six spine objects more expensive each
- * time.
- *
- * Which of the three a caller fills in says what it did:
- *
- *	oe_oids/oe_paddrs	an object MOVED.  Every writer here does this,
- *				because every write is a copy.
- *	oe_new/oe_new_paddrs	an object was MADE, and writing its block did
- *				not make it reachable -- this entry does.  A
- *				split makes one; a root that splits makes two,
- *				since it must keep its own oid.
- *	oe_gone			an object is GONE: a node that lost its last
- *				record and left the tree.  The map is the only
- *				place that still names it, and a map that goes
- *				on naming it is answered with "Omap record:
- *				oid-xid combination is never used".
+ *	oe_oids/oe_paddrs	an object moved; every write is a copy.
+ *	oe_new/oe_new_paddrs	an object was made, and this entry makes it
+ *				reachable: one per split, two when a root
+ *				splits (it keeps its own oid).
+ *	oe_gone			a node that lost its last record.  A map still
+ *				naming it draws "Omap record: oid-xid
+ *				combination is never used".
  */
 struct omap_edit {
 	const uint64_t	*oe_oids;
@@ -170,28 +129,14 @@ static int	drec_key(uint64_t parent, const char *name, uint32_t nlen,
 		    uint8_t *out, uint32_t *klen_out, bool complain);
 
 /*
- * The transaction id a READ should ask about.
- *
- * An object map holds an entry per version, keyed by the transaction that
- * made it, and a lookup takes the newest one no later than the xid it is
- * given.  So once this kernel has copied something, the answer it wants is
- * the one it has just written -- keyed by a transaction that has not
- * committed yet -- and asking with the committed xid finds the version
- * before the copy, or nothing at all.
- *
- * That is not a hypothetical: the first boot with a copied inode read the
- * file back as an I/O error, because the leaf it had just moved was invisible
- * to a lookup that still believed in the committed checkpoint.
- *
- * AND THE VIEW, which is the same question with the opposite answer.  A
- * reader can be pointed at a checkpoint OLDER than the mount (apfs.h, "the
- * published past"), and then every one of these three answers is that
- * checkpoint's: its xid, its volume object map, its root.  The three travel
- * together because they are one statement about one checkpoint, and a reader
- * that took the root from one and the map from another would resolve the
- * tree's children through a map that never named them.  g_view is the view
- * entered, or NULL when readers answer for the live volume; nothing in this
- * file reads the three fields it shadows except through these.
+ * The transaction id, volume object map and root a read should use.  A map
+ * lookup takes the newest entry no later than the xid given, and once this
+ * kernel has copied something the version it wants is keyed by the
+ * uncommitted transaction.  A reader pointed at an older checkpoint (apfs.h,
+ * "the published past") gets all three from it; they travel together, since
+ * a root resolved through another checkpoint's map finds children that map
+ * never named.  g_view is the view entered, or NULL for the live volume;
+ * nothing here reads the three fields it shadows except through these.
  */
 static const struct fs_apfs_view	*g_view;
 static uint64_t	 view_n_open;	/* checkpoints resolved into views */
@@ -224,12 +169,10 @@ view_root(void)
 }
 
 /*
- * A view is read-only by construction, and this is the construction: the
- * three doors through which this file changes the container -- a block
- * written, a block taken, a block given back -- each ask this first.  It
- * cannot happen, since the volume lock keeps a view and a writer apart, and
- * that is exactly why it is checked at the doors rather than trusted at the
- * gates: the failure it would be is a reader silently becoming a writer.
+ * A view is read-only by construction: the three places this file changes
+ * the container (a block written, taken, given back) ask this first.  The
+ * volume lock already keeps views and writers apart; this catches a reader
+ * silently becoming a writer.
  */
 static bool
 view_forbids(const char *what)
@@ -312,9 +255,8 @@ fs_apfs_fletcher64(const void *p, uint32_t len)
 	uint32_t	 i;
 
 	/*
-	 * The modulus is 2^32-1 (not 2^32), which is what makes this Fletcher
-	 * rather than a plain running sum: it keeps a word of zeroes from
-	 * being indistinguishable from a missing word.
+	 * The modulus is 2^32-1, not 2^32: that is what makes this Fletcher
+	 * rather than a plain running sum.
 	 */
 	w = (const uint32_t *)p;
 	sum1 = 0;
@@ -345,16 +287,9 @@ read_block_raw(uint64_t bno, void *buf)
 static void	wlog_note(uint64_t bno, bool sealed);
 
 /*
- * Write one APFS block back with no checksum work.
- *
- * This is for FILE DATA, and the absence of a checksum is the format's doing,
- * not a shortcut: only metadata blocks carry an obj_phys header, and a data
- * block is 4096 bytes of file with nowhere to record a sum of them.  It is
- * also why overwriting file bytes is the cheapest thing this writer does --
- * there is nothing to reseal and nothing else that has to agree.
- *
- * Every write in this file funnels through here, which is why the write log
- * below is noted from here and nowhere else.
+ * Write one APFS block with no checksum work: file data has no obj_phys
+ * header and nowhere to record a sum.  Every write in this file funnels
+ * through here, so the write log is noted here.
  */
 static int
 write_block_raw(uint64_t bno, const void *buf)
@@ -370,18 +305,11 @@ write_block_raw(uint64_t bno, const void *buf)
 }
 
 /*
- * ⚠ DIAGNOSTIC, not a feature.  The last few hundred block writes, and whether
- * each was SEALED (a metadata block, whose checksum was recomputed over it) or
- * RAW (file bytes, or a bitmap -- no header, nothing to reseal).
- *
- * The question it answers is the one the failure signature raises.  A block
- * that comes back claiming the right oid, the right type and a plausible xid,
- * and fails only its checksum, is not a stale block and not a random one: it is
- * a block whose first eight bytes belong to one version and whose body belongs
- * to another.  A raw write over live metadata makes exactly that -- it replaces
- * the body and leaves the header's checksum standing.  So if the failing block
- * appears in this log as sealed and then again as raw, the allocator handed one
- * block to two owners, and the argument is over.
+ * Diagnostic: the last WLOG_N block writes, each sealed (metadata, checksum
+ * recomputed) or raw (file bytes, bitmaps).  A block that fails only its
+ * checksum has a header from one version and a body from another, which is
+ * what a raw write over live metadata leaves: if the failing block shows
+ * here as sealed and then as raw, the allocator gave it to two owners.
  */
 #define	WLOG_N		512
 
@@ -406,9 +334,8 @@ wlog_note(uint64_t bno, bool sealed)
 }
 
 /*
- * Every write goes through write_block_raw, so the note is made there and the
- * one caller that sealed it says so afterwards -- nothing runs in between,
- * because every writer holds fs_lock.
+ * write_block_raw made the note; the one caller that sealed the block marks
+ * it afterwards.  Nothing runs in between: every writer holds fs_lock.
  */
 static void
 wlog_seal_last(void)
@@ -441,22 +368,13 @@ wlog_report(uint64_t bno)
 }
 
 /*
- * ⚠ A READ-BACK-AND-COMPARE AFTER EVERY SEALED WRITE LIVED HERE, and what it
- * measured is why it does not any more: across a whole boot, 2779 metadata
- * blocks were written, read straight back off the device around the cache, and
- * compared byte for byte -- and 2779 of them were identical.  The write path
- * was never the one lying.  It doubles the device I/O of a boot, so the number
- * is kept and the check is not.
+ * No read-back-and-compare after sealed writes: over a boot, 2779 of 2779
+ * came back identical, and the check doubles a boot's device I/O.
  */
 
 /*
- * Write one METADATA block back, sealing it first.
- *
- * The Fletcher-64 runs forward here for the first time in this filesystem --
- * every other caller compares it.  It covers the block from offset 8 to the
- * end, so the result must be stored after it is computed and cannot be part
- * of its own input; getting that backwards produces a block that fails its
- * own checksum on the very next read, which is at least a loud failure.
+ * Write one metadata block, sealing it first.  The Fletcher-64 covers the
+ * block from offset 8 to the end, so it is computed first and stored after.
  */
 int
 fs_apfs_write_block(uint64_t bno, void *buf)
@@ -488,15 +406,11 @@ fs_apfs_write_block_raw(uint64_t bno, const void *buf)
 }
 
 /*
- * A block that does not check out is worth an autopsy rather than a return
- * code, because the return code cannot distinguish the three things it might
- * mean and they need different fixes.  The block may be wrong on the platter
- * (a torn write); it may be right on the platter and wrong in the cache (a
- * page this layer mangled); or the bytes handed back may belong to some other
- * block entirely (a driver that answered the wrong question).
- *
- * One read back through the cache and one read straight at the device separate
- * all three, and both are cheap here because this path has already failed.
+ * A block that fails its checksum gets an autopsy, because the return code
+ * cannot tell apart three failures with different fixes: wrong on the
+ * platter (a torn write), right on the platter but wrong in the cache, or
+ * another block's bytes (a driver that answered the wrong question).  One
+ * read through the cache and one straight at the device separate them.
  */
 static void
 block_autopsy(uint64_t bno, const void *got)
@@ -632,12 +546,10 @@ block_is_nxsb(const void *buf)
 }
 
 /*
- * Scan the checkpoint descriptor ring for the newest superblock that still
- * checksums, and adopt it.  The ring holds superblocks interleaved with
- * checkpoint-map blocks, so most slots are legitimately not superblocks;
- * only a slot that IS one and fails its checksum would be a torn write, and
- * even that is not fatal -- an older checkpoint is still a consistent
- * filesystem, which is the entire point of committing this way.
+ * Scan the checkpoint descriptor ring for the newest superblock that
+ * checksums, and adopt it.  Superblocks are interleaved with checkpoint-map
+ * blocks, so most slots are not superblocks.  A torn superblock is not
+ * fatal: an older checkpoint is still a consistent filesystem.
  */
 static int
 adopt_newest_checkpoint(const struct apfs_nx_superblock *anchor, void *scratch)
@@ -671,21 +583,19 @@ adopt_newest_checkpoint(const struct apfs_nx_superblock *anchor, void *scratch)
 		g_apfs.ac_fs_oid      = nx->nx_fs_oid[0];
 		g_apfs.ac_block_count = nx->nx_block_count;
 		/*
-		 * Where this checkpoint's own descriptor blocks are, and the
-		 * one ephemeral oid worth chasing.  Taken from the superblock
-		 * that WON, not from the anchor at block 0: the anchor is a
-		 * copy of some earlier checkpoint and its indices point at that
-		 * one's blocks.
+		 * This checkpoint's descriptor blocks and the space manager's
+		 * ephemeral oid, from the superblock that won, not the anchor
+		 * at block 0: the anchor is a copy of some earlier checkpoint
+		 * and its indices point at that one's blocks.
 		 */
 		g_apfs.ac_xp_desc_index = nx->nx_xp_desc_index;
 		g_apfs.ac_xp_desc_len   = nx->nx_xp_desc_len;
 		g_apfs.ac_spaceman_oid  = nx->nx_spaceman_oid;
 
 		/*
-		 * And what only a writer needs.  ac_sb_bno matters most: a
-		 * checkpoint is built by copying the superblock that closed
-		 * the last one, and copying it from the anchor instead would
-		 * carry some earlier checkpoint's ring indices forward.
+		 * What only a writer needs.  A checkpoint is built by copying
+		 * the superblock that closed the last one, so ac_sb_bno must be
+		 * this slot: the anchor would carry older ring indices forward.
 		 */
 		g_apfs.ac_sb_bno         = base + i;
 		g_apfs.ac_next_xid       = nx->nx_next_xid;
@@ -707,19 +617,10 @@ adopt_newest_checkpoint(const struct apfs_nx_superblock *anchor, void *scratch)
 }
 
 /*
- * Read the adopted checkpoint's own descriptor blocks and record every
- * ephemeral object they place.
- *
- * The ring holds one checkpoint after another; nx_xp_desc_index and
- * nx_xp_desc_len name the run belonging to THIS one, and the run wraps.  Its
- * last block is the superblock that closes the checkpoint -- which is how a
- * reader knows the checkpoint was completed -- and the blocks before it are
- * checkpoint maps.  So a slot that is not a map is not an error; it is either
- * that superblock or a slot from a neighbouring checkpoint, and both are
- * simply skipped.
- *
- * Nothing is resolved here beyond recording oid -> block.  Reading the objects
- * themselves is a separate question, and every one of them is optional.
+ * Record every ephemeral object the adopted checkpoint's descriptor blocks
+ * place (oid -> block only).  nx_xp_desc_index/len name this checkpoint's
+ * run in the ring, which wraps; its last block is the closing superblock
+ * and the rest are checkpoint maps.
  */
 static int
 read_checkpoint_maps(void *scratch)
@@ -815,16 +716,9 @@ ephemeral_is_free_queue(uint64_t oid)
 }
 
 /*
- * Find and read the space manager.  Read-only, and deliberately so: what this
- * establishes is that the kernel can SEE the container's accounting, which is
- * the thing every later question about allocation has to start from.
- *
- * The free-queue lines are the ones worth reading.  Blocks a transaction gives
- * up do not return to the bitmap when it commits -- they go into one of these
- * trees keyed by that transaction's xid, and come back only once no reader can
- * still be looking at the old state.  A count above zero here means the
- * container is holding space that is neither in use nor available, which is
- * exactly the bookkeeping an allocator would have to join.
+ * Find and read the space manager, and keep it in memory (g_sm).  Blocks a
+ * transaction gives up go into a free-queue tree keyed by its xid, not back
+ * to the bitmap, until no reader can still be looking at the old state.
  */
 static int
 read_spaceman(void *scratch)
@@ -879,19 +773,10 @@ read_spaceman(void *scratch)
 	g_apfs.ac_sm_valid = true;
 
 	/*
-	 * THREE CROSS-CHECKS, AND WHY THEY ARE NOT DECORATION
-	 *
-	 * Every field above was read at an offset taken from the published
-	 * layout.  A layout that is remembered slightly wrong produces numbers
-	 * that look entirely reasonable -- a plausible free count, a plausible
-	 * chunk size -- and nothing about the block itself says otherwise.  So
-	 * the block is made to agree with things that were read from OTHER
-	 * blocks, by other code, at offsets already known to be right.
-	 *
-	 * The strongest of the three is the last.  The checkpoint map named
-	 * some B-trees as free queues, and the space manager, sixty bytes into
-	 * a different block, names the same oids.  Nothing but a correct
-	 * sm_fq offset makes those two lists match.
+	 * Cross-checks against other blocks, because a layout remembered
+	 * slightly wrong gives plausible numbers.  The strongest is the last:
+	 * only a correct sm_fq offset names the free-queue oids the checkpoint
+	 * map did.
 	 */
 	if (sm->sm_dev[APFS_SD_MAIN].sm_block_count != g_apfs.ac_block_count)
 		kprintf("apfs: WARNING spaceman says %llu blocks, superblock "
@@ -918,12 +803,8 @@ read_spaceman(void *scratch)
 	}
 
 	/*
-	 * And keep it.  An ephemeral object is one whose home is memory: the
-	 * disk holds a copy per checkpoint, and the checkpoint writer's job
-	 * is to put the current one down.  Reading it back off the platter to
-	 * change it -- which is what this file did until now -- works only
-	 * while the change is also written back into the same block, and that
-	 * is the in-place write the checkpoint exists to stop.
+	 * Keep it: an ephemeral object lives in memory, and the checkpoint
+	 * writer puts each checkpoint's copy down.
 	 */
 	g_sm = kmalloc(APFS_BLOCK_SIZE);
 	if (g_sm == NULL)
@@ -934,20 +815,12 @@ read_spaceman(void *scratch)
 }
 
 /*
- * THE INTERNAL POOL
- *
- * Allocation is described by the chunk bitmaps and the chunk-info blocks, and
- * those cannot be stored in the space they describe -- moving a bitmap would
- * change the answer to the question "which blocks are free" while that answer
- * was being written.  So they live in a small reserved pool, and which pool
- * blocks are in use is itself a bitmap, kept in a ring so that the version
- * belonging to a checkpoint that has not been superseded is never overwritten.
- *
- * The shape below was measured on a real container rather than remembered,
- * and its own history confirms every part of the model: over four
- * checkpoints, the chunk-info block ping-pongs between two pool blocks
- * (21017, 21019, 21017, 21019), the pool bitmap advances one ring slot each
- * time (0, 1, 2, 3), and the free-list head and tail advance with it.
+ * The internal pool.  The chunk bitmaps and chunk-info blocks cannot live in
+ * the space they describe, so they live in a small reserved pool.  Which
+ * pool blocks are in use is itself a bitmap, kept in a ring so that the
+ * version of a checkpoint not yet superseded is never overwritten.  On a
+ * real container the pool bitmap advances one ring slot per checkpoint and
+ * the chunk-info block ping-pongs between two pool blocks.
  */
 static uint16_t
 ip_tbl_u16(uint32_t off, uint32_t i)
@@ -971,12 +844,10 @@ sm_mem(void)
 }
 
 /*
- * Read the pool's geometry and its live bitmap.  Everything here is checked
- * against something read elsewhere: the offsets must land inside the block,
- * the ring slot must be one of the ring's, and -- the strongest of the three
- * -- the two blocks the chunk walk already found (the chunk's bitmap and its
- * chunk-info block) must be inside the pool AND marked taken in it.  Nothing
- * but a correct reading of all these fields makes that last one true.
+ * Read the pool's geometry and its live bitmap, checked against what was
+ * read elsewhere: the offsets must land inside the block, the ring slot must
+ * be one of the ring's, and -- strongest -- the chunk bitmap and chunk-info
+ * block the chunk walk found must be inside the pool and marked taken in it.
  */
 static int
 ip_load(void)
@@ -1004,9 +875,8 @@ ip_load(void)
 		return (FS_APFS_E_INVAL);
 	}
 	/*
-	 * The three tables are byte offsets into this same block, so a wrong
-	 * reading of any of them is a read of the block's own bytes as a
-	 * table -- which produces numbers, not a fault.  Bound them.
+	 * The three tables are offsets into this block, and a wrong one reads
+	 * the block's own bytes as a table: numbers, not a fault.  Bound them.
 	 */
 	if (sm->sm_ip_bm_xid_offset + sizeof(uint64_t) > APFS_BLOCK_SIZE ||
 	    sm->sm_ip_bitmap_offset + sizeof(uint16_t) > APFS_BLOCK_SIZE ||
@@ -1032,10 +902,8 @@ ip_load(void)
 	}
 
 	/*
-	 * Only one chunk-info block is handled, because only then is the
-	 * space manager's cib_addr[] a single number to move.  Every
-	 * container this has been run against has one; a bigger one needs
-	 * the walk, not a bigger constant.
+	 * One chunk-info block only, so the space manager's cib_addr[] is a
+	 * single number to move.  More needs the walk, not a bigger constant.
 	 */
 	if (g_apfs.ac_sm_cib_count != 1 || g_apfs.ac_sm_cab_count != 0) {
 		kprintf("apfs: %u chunk-info blocks and %u address blocks -- "
@@ -1083,12 +951,9 @@ ip_load(void)
 	}
 
 	/*
-	 * And the chunk-info block, for the same reason: it changes many times
-	 * per checkpoint and is written once.  The bitmaps it names are brought
-	 * in one at a time, as blocks in their chunks are wanted -- starting
-	 * with the one metadata comes from, which is admitted here so that a
-	 * container whose allocator cannot start says so at mount rather than
-	 * at the first write.
+	 * The chunk-info block is held too.  The bitmaps it names are admitted
+	 * as wanted; metadata's is admitted here, so an allocator that cannot
+	 * start says so at mount rather than at the first write.
 	 */
 	g_cib = kmalloc(APFS_BLOCK_SIZE);
 	if (g_cib == NULL)
@@ -1148,9 +1013,8 @@ ip_load(void)
 }
 
 /*
- * Take a pool block, or 0 if the pool is full.  A block that has been
- * released but not yet let go by the free queue is still marked in use here,
- * which is exactly how the queue keeps it out of reach.
+ * Take a pool block, or 0 if the pool is full.  A block released but not yet
+ * let go by the free queue is still marked in use here.
  */
 static uint64_t
 ip_alloc(void)
@@ -1174,9 +1038,8 @@ ip_alloc(void)
 }
 
 /*
- * Give a pool block back -- which means putting it in the pool's free queue,
- * not clearing its bit.  It stays marked in use, so nothing hands it out,
- * until the transaction that released it is far enough behind.
+ * Give a pool block back: into the pool's free queue, not by clearing its
+ * bit, so nothing hands it out until its transaction is far enough behind.
  */
 static void
 ip_free(uint64_t bno)
@@ -1202,9 +1065,8 @@ ip_free(uint64_t bno)
 }
 
 /*
- * Blocks have become free again: move the two counters that say so.  The
- * bits are the caller's business; this is the half that keeps the chunk-info
- * and the space manager agreeing with them.
+ * Blocks have become free again: move the chunk-info and space manager
+ * counters to agree with the bits the caller has cleared.
  */
 static void
 alloc_count_free(const struct alloc_chunk *ch, uint64_t count)
@@ -1222,32 +1084,16 @@ alloc_count_free(const struct alloc_chunk *ch, uint64_t count)
 }
 
 /*
- * THE FREE QUEUES
+ * The free queues.  A block released by a copy is not free: the older
+ * checkpoints the ring keeps still point at it, and one is a filesystem only
+ * while its blocks are not reused.  So a release goes into a queue keyed by
+ * its transaction, and the block stays marked in use until that transaction
+ * is far enough behind.  Two such B-trees, device and internal pool, both
+ * named by the space manager and both ephemeral.
  *
- * A block released by a copy is not free.  The checkpoint that is still live
- * points at it, and so do the checkpoints behind that one -- the descriptor
- * ring keeps them on purpose, and the whole claim of a ring is that an older
- * checkpoint is still a filesystem.  Hand the block back at once and that
- * claim quietly stops being true: the superblock is still there, still
- * checksums, and leads to blocks something else has since written.
- *
- * That is not hypothetical.  Before this, a container this kernel had been
- * writing for a while held twelve superblocks of which four were corpses:
- *
- *	xid 2   block 98304 is no longer an omap (type 0x03)
- *	xid 5   the omap tree at 98323 no longer maps the volume
- *
- * So a release goes into a queue instead, keyed by the transaction that made
- * it, and the block stays marked in use until that transaction is far enough
- * behind for nobody to want it.  The format has a place for exactly this --
- * two B-trees, one for the device and one for the internal pool, both named
- * by the space manager and both ephemeral -- and the container arrives with
- * entries already in them.
- *
- * Their shape was measured rather than assumed: fixed-size keys and values,
- * key (xid, paddr) of 16 bytes, value a block count of 8 -- and an offset of
- * 0xFFFF where a value would be, which means the count is one and no value is
- * stored.  Both forms appear in the container as mkapfs leaves it.
+ * Measured shape: fixed-size keys (xid, paddr) of 16 bytes and values of a
+ * block count, 8 bytes -- or a value offset of 0xFFFF, meaning a count of
+ * one with no value stored.  mkapfs leaves both forms.
  */
 #define	APFS_FQ_GHOST		0xFFFFU		/* "no value; the count is 1" */
 
@@ -1312,20 +1158,12 @@ fq_count_at(const struct fq_node *fn, uint32_t i)
 }
 
 /*
- * Give a removed key or value back to the node's free list.
- *
- * NOT OPTIONAL, though it looked it.  A node's key area is divided between
- * the keys the table of contents points at and a chain of holes -- each hole
- * holding, in its first four bytes, the offset of the next and its own length
- * -- and the header carries the total.  A checker rebuilds both sides and
- * compares: "B-tree: wrong free space total for key area" is what it says
- * about space that is neither used nor listed, which is what dropping an
- * entry without this leaves behind.
- *
- * A freed key is sixteen bytes and a freed value eight, so each is large
- * enough to hold the four-byte header its own hole needs.  Value offsets are
- * measured back from the end of the value area, which is the convention the
- * table of contents already uses.
+ * Give a removed key or value back to the node's free list.  A node's key
+ * area is the keys the table of contents points at plus a chain of holes
+ * (each holding the next hole's offset and its own length), with the total
+ * in the header; a checker rebuilds both ("B-tree: wrong free space total
+ * for key area").  A freed key (16 bytes) or value (8) has room for its
+ * hole's header.  Value offsets count back from the end of the value area.
  */
 static void
 fq_free_key(struct apfs_btree_node_phys *n, const struct fq_node *fn,
@@ -1357,21 +1195,10 @@ fq_free_val(struct apfs_btree_node_phys *n, const struct fq_node *fn,
 
 /*
  * Put (xid, paddr, count) into queue `q`, keeping the table of contents in
- * key order.
- *
- * Space comes from a HOLE a release left behind if there is one, and only
- * otherwise from the node's free span.  Every hole in this node is exactly the
- * right size -- one queue key is as long as any other, and so is one count --
- * so taking one is popping the head of a list rather than searching it, which
- * is why the fs tree's inserts can go on ignoring their own free lists and
- * this one cannot.
- *
- * WITHOUT THAT THE NODE BLEEDS, and it took a busier boot to see it.  The span
- * only ever shrinks and the chain only ever grows, so a container that queues
- * and releases for long enough runs out of span while the queue is nearly
- * empty and starts losing blocks it has no room to record.  Measured the first
- * time truncation gave a boot enough work to reach it: "free queue 1 is still
- * full" printed with EIGHT keys in a node that had just been holding ninety.
+ * key order.  Space comes from a hole a release left if there is one, else
+ * from the free span; every hole here is the right size, so taking one is
+ * popping the head of the list.  Without the reuse the span only shrinks,
+ * and a long-running container runs out of it with the queue nearly empty.
  */
 static int
 fq_insert(uint32_t q, uint64_t xid, uint64_t paddr, uint64_t count)
@@ -1398,9 +1225,8 @@ fq_insert(uint32_t q, uint64_t xid, uint64_t paddr, uint64_t count)
 	fq_layout(g_fq[q], &fn);
 
 	/*
-	 * The list's total is what says whether there is a hole: a chain with
-	 * bytes in it has a head, and asking the total rather than the head
-	 * keeps this from depending on which value means "none".
+	 * Whether there is a hole is asked of the list's total, which does not
+	 * depend on which head value means "none".
 	 */
 	keyhole = n->btn_key_free_list.nl_len >= sizeof(*k);
 	valhole = n->btn_val_free_list.nl_len >= 8u;
@@ -1409,12 +1235,10 @@ fq_insert(uint32_t q, uint64_t xid, uint64_t paddr, uint64_t count)
 	if ((uint32_t)(fn.fn_nkeys + 1) * 4u > fn.fn_toc_len ||
 	    n->btn_free_space.nl_len < need) {
 		/*
-		 * The queue is one node, so the history it can hold is
-		 * bounded, and this is where the bound bites.  Rather than
-		 * lose the block, give up the history: everything but the
-		 * newest transaction is let go early and the insert is tried
-		 * once more.  Loudly, because a container doing this
-		 * regularly has stopped keeping the promise the ring makes.
+		 * The queue is one node, so its history is bounded.  Rather
+		 * than lose the block, let go of everything but the newest
+		 * transaction early and try once more -- loudly, since the
+		 * ring's promise is broken.
 		 */
 		kprintf("apfs: free queue %u is full (%u keys) -- releasing "
 		    "everything before xid %llu early\n", (unsigned)q,
@@ -1504,41 +1328,22 @@ fq_insert(uint32_t q, uint64_t xid, uint64_t paddr, uint64_t count)
 }
 
 /*
- * THE FLOOR OF THE WINDOW: the oldest checkpoint whose every block the free
- * queue still holds, which is the oldest a view may be opened on.
- *
- * Recorded, not computed.  The arithmetic says ac_xid - APFS_FQ_KEEP, and
- * the arithmetic is right whenever a checkpoint write runs to completion;
- * but the release happens at the START of the write, in memory, and a write
- * that then fails leaves the queue having let go of one more slice than any
- * superblock on the platter accounts for.  The open transaction may already
- * be handing those blocks out.  So the floor is whatever fq_release was last
- * told to release, and a floor that moved without a checkpoint landing is
- * the failed write telling the truth about itself.
- *
- * At mount it is the checkpoint before the one adopted, and one step short
- * of this kernel's own arithmetic on purpose: a fresh mount does not know
- * who wrote the container last.  Any writer able to fall back after a torn
- * checkpoint must hold at least the previous checkpoint's blocks -- that is
- * what falling back means -- so ac_xid - 1 is the floor the format itself
- * guarantees, while ac_xid - APFS_FQ_KEEP is only what THIS writer keeps.
- * The first checkpoint written after mount brings the window to its full
- * APFS_FQ_KEEP + 1 checkpoints, and every one after that slides it.
+ * The floor of the view window: the oldest checkpoint whose every block the
+ * free queue still holds, so the oldest a view may be opened on.  Recorded
+ * rather than computed as ac_xid - APFS_FQ_KEEP: the release happens in
+ * memory at the start of a checkpoint write, and a write that then fails has
+ * let go of a slice no superblock accounts for.  At mount it is ac_xid - 1:
+ * a fresh mount does not know who wrote the container, and any writer that
+ * can fall back after a torn checkpoint keeps the previous one's blocks.
  */
 static uint64_t	fq_floor;
 
 /*
  * Let go of everything queued at `upto_xid` or earlier: clear the bits, move
- * the counters, and drop the entries.
- *
- * This is the only place a block becomes free again, and the xid is what
- * makes it safe -- by the time a transaction is APFS_FQ_KEEP checkpoints
- * behind, no superblock still worth mounting refers to what it released.
- *
- * Every entry at or below `upto_xid` was queued by a transaction that had
- * stopped using its block, so the last checkpoint to name that block is one
- * older still: after this, nothing older than `upto_xid` itself is whole,
- * and the floor above records exactly that.
+ * the counters, drop the entries.  The only place a block becomes free
+ * again.  An entry at or below `upto_xid` was queued by a transaction that
+ * had stopped using its block, so after this nothing older than `upto_xid`
+ * is whole, which is what fq_floor records.
  */
 static void
 fq_release(uint32_t q, uint64_t upto_xid)
@@ -1557,10 +1362,8 @@ fq_release(uint32_t q, uint64_t upto_xid)
 	uint32_t			 kept;
 
 	/*
-	 * Before the queue is even looked at: what is asked to be released is
-	 * what the floor records, and a queue that cannot be reached right now
-	 * has still been TOLD -- the next call that can reach it lets go on
-	 * these terms.
+	 * The floor moves first: a queue that cannot be reached now has still
+	 * been told, and the next call that reaches it lets go on these terms.
 	 */
 	if (upto_xid > fq_floor)
 		fq_floor = upto_xid;
@@ -1584,12 +1387,9 @@ fq_release(uint32_t q, uint64_t upto_xid)
 		count = fq_count_at(&fn, i);
 
 		/*
-		 * Two reasons to keep an entry: it is too young to let go, or
-		 * its chunk is not in reach.  The second used to drop the entry
-		 * anyway -- the block stayed marked in use with nothing left to
-		 * say who owed it, which is a leak that survives the mount.
-		 * Holding it costs a queue slot and gets another go next
-		 * checkpoint, by which time the resident set has usually moved.
+		 * Keep an entry that is too young, or whose chunk is not
+		 * resident: dropping that would leave its block marked in use
+		 * with nothing owing it.  It gets another go next checkpoint.
 		 */
 		hold = (xid > upto_xid);
 		ch   = NULL;
@@ -1647,18 +1447,9 @@ fq_release(uint32_t q, uint64_t upto_xid)
 	sm->sm_fq[q].sfq_oldest_xid = oldest;
 
 	/*
-	 * An empty queue gets its node back.  Key and value space is not
-	 * returned entry by entry, so without this the node would slowly fill
-	 * with holes; emptying is common enough that this is all the
-	 * housekeeping it needs.
-	 *
-	 * THE FREE LISTS HAVE TO GO WITH IT.  A node records its holes in two
-	 * chains threaded through the key and value areas -- a length in the
-	 * header and, at each hole, an offset to the next -- and a checker
-	 * walks them.  Widening the free span without emptying those chains
-	 * leaves them pointing into space that is now unallocated, so the walk
-	 * reads whatever is there as a hole header: "B-tree node: free key is
-	 * too small", which is what apfsck said the first time this ran.
+	 * Released entries become holes, not span; an empty queue gets its
+	 * whole node back as span, with the hole chains emptied too -- left,
+	 * they point into free space ("B-tree node: free key is too small").
 	 */
 	if (kept == 0) {
 		n->btn_free_space.nl_off = 0;
@@ -1698,42 +1489,20 @@ fs_apfs_dirty(void)
 }
 
 /*
- * Does the open transaction need publishing NOW rather than when the caller's
- * policy would get around to it?
+ * Does the open transaction need publishing now, whatever the caller's
+ * policy?  Every block an edit releases is one entry in a single-node free
+ * queue, held until its transaction is APFS_FQ_KEEP checkpoints behind, so
+ * closing a transaction frees nothing and the cap goes on what a policy
+ * controls: the open transaction's own entries, the tail of the node's
+ * (xid, paddr) order.
  *
- * The bound is physical, not chosen: every block an edit releases becomes one
- * entry in a single-node free queue, held there until the transaction that
- * released it is APFS_FQ_KEEP checkpoints behind.  That LAG is the part a
- * first draft of this function got wrong, and a live boot caught it: it
- * capped the node's total occupancy, but closing a transaction removes
- * nothing -- a giant batch, published in perfectly good time, still sits in
- * the node for KEEP more checkpoints while the transactions after it pile
- * on top, and the node went to the brim with every entry too young to
- * release.  So the cap goes on the one number a policy actually controls:
- * the OPEN transaction's own entries, which sit at the tail of the node's
- * (xid, paddr) order and are counted from there.
- *
- * Two triggers, and the arithmetic between them is the point.  The BUDGET
- * caps the open transaction at a fifth of the node, so a closed slice --
- * budget plus the one edit that lands after crossing it -- stays around a
- * third; retention holds APFS_FQ_KEEP closed slices plus the open one, and
- * with KEEP at 2 that is three thirds with the belt still to spare.  The
- * BELT fires on total occupancy at two thirds of the node: from there every
- * mutation publishes, and each publish releases a slice from two
- * checkpoints back -- a lag the belt's remaining third comfortably covers.
- * That lag is what the first arithmetic of this function missed and a live
- * boot caught: releases trail insertions by KEEP checkpoints, and at KEEP's
- * old value of 4 the node could brim over faster than forced publishing
- * aged the big slices out.  fq_insert's early-release fallback is the
- * container degrading out loud; a policy that can reach it has not bounded
- * anything, and this one, checked slice by slice, cannot.
- *
- * This is also the honest ceiling on batching itself, worth naming: a
- * single-node queue budgeted a fifth at a time caps a batch at a couple of
- * edits.  Raising it means a free queue that can grow a level, and THAT
- * means a checkpoint writer that can re-emit a multi-block ephemeral
- * object, which it currently refuses; the ceiling belongs to that rung,
- * not this one.
+ * The budget caps those at a fifth of the node, so a closed slice stays near
+ * a third, and retention holds APFS_FQ_KEEP (2) closed slices plus the open
+ * one.  The belt fires at two thirds full, or with room for fewer than
+ * APFS_CKPT_HEADROOM entries: then every mutation publishes, and each
+ * publish releases a slice.  Followed, this never reaches fq_insert's early
+ * release.  It caps a batch at a couple of edits; more needs a queue that can
+ * grow a level, and a checkpoint writer that re-emits multi-block objects.
  */
 #define	APFS_CKPT_HEADROOM	32u
 
@@ -1782,12 +1551,9 @@ fs_apfs_ckpt_due(void)
 
 /*
  * Put the pool's bitmap down in a fresh ring slot and tell the space manager
- * where it went.  The slot it replaces goes to the TAIL of the free list, not
- * the head, which is what makes the ring a queue and gives the checkpoints
- * behind this one their bitmaps for as long as the ring is deep.
- *
- * Written before the space manager that names it, and both before the
- * superblock: nothing here is reachable until that last write lands.
+ * where it went.  The replaced slot goes to the tail of the free list, which
+ * makes the ring a queue: older checkpoints keep their bitmaps as long as
+ * the ring is deep.  Nothing here is reachable until the superblock lands.
  */
 static int
 ip_rotate(uint64_t xid, uint32_t *slot_out)
@@ -1817,11 +1583,9 @@ ip_rotate(uint64_t xid, uint32_t *slot_out)
 	sm->sm_ip_bm_free_head = (uint16_t)next;
 	/*
 	 * The slot just taken leaves the list, and a slot outside the list is
-	 * spelled 0xFFFF -- not merely unreferenced.  A checker walks the
-	 * chain from head to tail, counts it, and requires exactly
-	 * sm_ip_bm_size_in_blocks slots to be missing from it; leaving this
-	 * entry pointing at its old successor makes the live bitmap look
-	 * free, and the count comes out one short.
+	 * spelled 0xFFFF, not merely unreferenced.  A checker walks the chain
+	 * and requires exactly sm_ip_bm_size_in_blocks slots missing from it;
+	 * a stale link here makes the live bitmap look free.
 	 */
 	ip_tbl_set_u16(sm->sm_ip_bm_free_next_offset, s, 0xFFFFU);
 	if (sm->sm_ip_bm_free_tail < g_apfs.ac_ipbm_slots)
@@ -1838,7 +1602,7 @@ ip_rotate(uint64_t xid, uint32_t *slot_out)
 	return (FS_APFS_E_OK);
 }
 
-/* Blocks reported free by one chunk's bitmap: the CLEAR bits in it. */
+/* Blocks reported free by one chunk's bitmap: the clear bits in it. */
 uint32_t
 bitmap_free_count(const uint8_t *bm, uint32_t blocks)
 {
@@ -1854,23 +1618,12 @@ bitmap_free_count(const uint8_t *bm, uint32_t blocks)
 }
 
 /*
- * Walk the chunk-info blocks and, for as many chunks as the budget allows,
- * count the bits.
- *
- * There are two costs here and they scale differently, which is why they are
- * separated.  Reading the chunk-info blocks is cheap and bounded by the
- * container's size divided by four million blocks -- a terabyte is sixty-five
- * of them -- so the totals they record are always checked.  Counting bits
- * means one block read per chunk, which for that same terabyte is eight
- * thousand reads at mount time, so it stops after APFS_BM_SCAN_MAX chunks and
- * SAYS how many it did not look at.  A verification that quietly examined a
- * fraction and reported success would be worse than none.
- *
- * The check itself is three numbers that come from three places: the space
- * manager's free count, the sum of the per-chunk counts recorded in the
- * chunk-info blocks, and the number of clear bits actually in the bitmaps.
- * Any pair agreeing while the third differs says exactly where the reader is
- * wrong.
+ * Walk the chunk-info blocks and count the bits of up to APFS_BM_SCAN_MAX
+ * chunks (a terabyte has 65 chunk-info blocks but 8192 chunks), saying how
+ * many were skipped.  Three numbers from three places -- the space
+ * manager's free count, the chunk-info counts, the clear bits -- and two
+ * agreeing while the third differs says where the reader is wrong.  The
+ * first chunk with room is where metadata allocation starts (ac_alloc_*).
  */
 #define	APFS_BM_SCAN_MAX	64
 
@@ -1890,10 +1643,8 @@ verify_chunk_bitmaps(void *sm_buf, void *cib_buf, void *bm_buf)
 	if (!g_apfs.ac_sm_valid)
 		return (FS_APFS_E_INVAL);
 	/*
-	 * A container large enough to need chunk-info ADDRESS blocks has one
-	 * more level between the space manager and the chunks.  Nothing here
-	 * produces one, and guessing at a level this code has never seen read
-	 * would be worse than declining.
+	 * Chunk-info address blocks add a level this code has never read, so
+	 * it declines rather than guesses.
 	 */
 	if (g_apfs.ac_sm_cab_count != 0) {
 		kprintf("apfs: %u chunk-info address block(s) -- bitmap check "
@@ -1945,10 +1696,9 @@ verify_chunk_bitmaps(void *sm_buf, void *cib_buf, void *bm_buf)
 
 			if (ci->ci_bitmap_addr == 0) {
 				/*
-				 * No bitmap at all.  The chunk is wholly free,
-				 * and a chunk claiming otherwise without one
-				 * is a reader that has the convention
-				 * backwards.
+				 * No bitmap: the chunk is wholly free, and one
+				 * claiming otherwise means this reader has the
+				 * convention backwards.
 				 */
 				g_apfs.ac_bm_wholly_free++;
 				g_apfs.ac_bm_free_counted += ci->ci_block_count;
@@ -1957,8 +1707,7 @@ verify_chunk_bitmaps(void *sm_buf, void *cib_buf, void *bm_buf)
 				continue;
 			}
 			if (g_apfs.ac_bm_scanned >= APFS_BM_SCAN_MAX) {
-				/* Budget spent; its free count is taken on
-				 * trust, and the summary says so. */
+				/* Budget spent: its count is taken on trust. */
 				g_apfs.ac_bm_free_counted += ci->ci_free_count;
 				continue;
 			}
@@ -1970,14 +1719,10 @@ verify_chunk_bitmaps(void *sm_buf, void *cib_buf, void *bm_buf)
 				return (FS_APFS_E_INVAL);
 			}
 			/*
-			 * Read RAW.  A bitmap block is bits and nothing else:
-			 * no obj_phys, so no checksum, so its first eight
-			 * bytes are the allocation state of the chunk's first
-			 * sixty-four blocks and not a Fletcher-64.  Reading it
-			 * through the checked reader rejects every bitmap in
-			 * the container -- which is exactly what it did, and
-			 * silently, until this walk started saying why it
-			 * stopped.
+			 * Raw: a bitmap block is bits and nothing else.  Its
+			 * first eight bytes are the state of the chunk's first
+			 * 64 blocks, not a Fletcher-64, and the checked reader
+			 * would reject every bitmap in the container.
 			 */
 			if (read_block_raw(ci->ci_bitmap_addr, bm_buf) !=
 			    FS_APFS_E_OK) {
@@ -2108,9 +1853,8 @@ fs_apfs_omap_lookup(uint64_t tree_bno, uint64_t oid, uint64_t xid,
 
 	rv = FS_APFS_E_INVAL;
 	/*
-	 * Bounded descent.  A malformed tree must not be able to spin the
-	 * kernel: the depth cap is the backstop, since a cycle in the child
-	 * pointers is exactly what a corrupt image would produce.
+	 * Bounded descent: a cycle in the child pointers is what a corrupt
+	 * image would produce, and it must not spin the kernel.
 	 */
 	for (depth = 0; depth < 16; depth++) {
 		rv = fs_apfs_read_block(tree_bno, node);
@@ -2181,7 +1925,7 @@ mount_volume(void *scratch)
 	uint64_t			 ctr_omap_tree;
 	int				 rv;
 
-	/* The container omap oid is PHYSICAL: it is already a block number. */
+	/* The container omap oid is physical: it is already a block number. */
 	rv = fs_apfs_read_block(g_apfs.ac_omap_oid, scratch);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
@@ -2239,27 +1983,23 @@ mount_volume(void *scratch)
 	g_apfs.ac_vol_omap_tree = vol_omap_tree;
 
 	/*
-	 * The rest of the spine, which only a writer needs.  Reading a file
-	 * needs the fs tree and the omap that finds its nodes; changing one
-	 * needs every object BETWEEN that tree and the container superblock,
-	 * because moving a block means telling whatever points at it, all the
-	 * way up.
+	 * The rest of the spine, which only a writer needs: moving a block
+	 * means telling whatever points at it, all the way up to the container
+	 * superblock.
 	 */
 	g_apfs.ac_ctr_omap_tree  = ctr_omap_tree;
 	g_apfs.ac_vol_sb_bno     = apsb_bno;
 	g_apfs.ac_vol_omap_bno   = sb->apfs_omap_oid;
 	g_apfs.ac_root_tree_oid  = sb->apfs_root_tree_oid;
 	/*
-	 * And the other tree that names a file's blocks.  PHYSICAL, so its oid
-	 * is already the block it lives in and no map is asked.
+	 * The other tree that names a file's blocks.  Physical, so its oid is
+	 * the block it lives in.
 	 */
 	g_apfs.ac_extref_bno     = sb->apfs_extentref_tree_oid;
 	/*
-	 * And what the volume claims to own.  A container-wide free count is
-	 * not the same statement: this one says how many blocks belong to THIS
-	 * volume, and apfsck checks it against the extents it can reach --
-	 * "Volume superblock: bad block count", which is what the first file
-	 * this kernel lengthened produced.
+	 * The blocks this volume owns, as distinct from the container's free
+	 * count.  apfsck checks it against the extents it can reach ("Volume
+	 * superblock: bad block count").
 	 */
 	g_apfs.ac_fs_alloc_count = sb->apfs_fs_alloc_count;
 	return (FS_APFS_E_OK);
@@ -2269,11 +2009,9 @@ mount_volume(void *scratch)
 
 /*
  * The superblock of checkpoint `xid`, out of the ring, into `buf`.  A slot is
- * asked its magic and xid before it is checksummed, because the ring is
- * mostly checkpoint maps and superblocks of other checkpoints, and summing
- * every one of them to find the one wanted would make a view cost a ring's
- * worth of arithmetic.  The one match IS checksummed: a torn slot carrying
- * the right xid is not that checkpoint, it is the crash that interrupted it.
+ * asked its magic and xid before it is checksummed, so a view does not cost
+ * a ring's worth of Fletcher-64.  The match is checksummed: a torn slot
+ * carrying the right xid is the crash that interrupted that checkpoint.
  */
 static int
 ring_find(uint64_t xid, void *buf)
@@ -2316,13 +2054,11 @@ view_admits(uint64_t xid)
 }
 
 /*
- * The walk mount_volume does, done again for one older checkpoint, with one
- * difference that is the whole of the safety argument: every block on the
- * way is asked whether it is the checkpoint's own.  A block the queue had let
- * go of and the allocator had handed out again would checksum perfectly --
- * that is what a reused block IS -- and only its header would say it belongs
- * to a newer transaction, or to another object.  The floor is meant to make
- * that impossible; this is what catches the floor being wrong.
+ * fs_apfs_view_open repeats mount_volume's walk for an older checkpoint,
+ * reading each block through this: is it the checkpoint's own?  A block the
+ * queue let go of and the allocator handed out again checksums perfectly;
+ * only its header says it belongs to a newer transaction or another object.
+ * The floor should make that impossible; this catches the floor being wrong.
  */
 static int
 view_read_own(uint64_t bno, uint64_t oid, uint64_t xid, void *buf)
@@ -2508,10 +2244,9 @@ fs_apfs_view_list(uint64_t *xids, uint32_t cap, uint32_t *n_out)
 
 	/*
 	 * One pass over the ring, keeping what the window admits, in order.
-	 * The window is APFS_FQ_KEEP + 1 wide at most, so the sort is an
-	 * insertion into a handful of entries and not worth a better one.
-	 * A slot is checksummed only once it is known to be wanted, for the
-	 * reason ring_find gives.
+	 * The window is at most APFS_FQ_KEEP + 1 wide, so insertion is sort
+	 * enough.  A slot is checksummed only once it is wanted, as in
+	 * ring_find.
 	 */
 	n  = 0;
 	rv = FS_APFS_E_OK;
@@ -2548,20 +2283,10 @@ fs_apfs_view_list(uint64_t *xids, uint32_t cap, uint32_t *n_out)
 /* ---- file-system tree ----------------------------------------------------- */
 
 /*
- * Order two file-system tree keys: negative, zero, positive.
- *
- * Records sort by object id FIRST and type second, which is the opposite of
- * what comparing the raw first word would do -- the type is in the top bits.
- * Beyond that the order is per type; the only one this needs is the file
- * extent, whose remaining key is its offset within the file.  Two keys with
- * the same object and type and no rule to separate them compare equal, which
- * is honest: this returns an order, not a total order over records it has
- * never been asked about.
- *
- * This lived with the writer until now, because only the writer needed it: a
- * reader that visits every record in turn never has to know which of two keys
- * comes first.  The reader below descends on them, so the order stopped being
- * a property of one operation and became a property of the tree.
+ * Order two file-system tree keys: negative, zero, positive.  Records sort
+ * by object id, then type (not by the raw first word, whose top bits are
+ * the type), then per type: file extents by offset, directory entries by
+ * name.  Keys with no rule to separate them compare equal.
  */
 int
 jkey_cmp(const uint8_t *a, uint32_t alen, const uint8_t *b, uint32_t blen)
@@ -2592,11 +2317,10 @@ jkey_cmp(const uint8_t *a, uint32_t alen, const uint8_t *b, uint32_t blen)
 		return (0);
 	}
 	/*
-	 * Directory entries, because a node's separator can be one and getting
-	 * two of them the wrong way round would put a record in the wrong half
-	 * of a split.  Hashed volumes sort by the word holding the name's
-	 * length and hash and then by the name; plain ones by the name alone.
-	 * Which of the two this volume is was settled at mount.
+	 * Directory entries, since a separator can be one and a split must put
+	 * each record in the right half.  Hashed volumes sort by the word
+	 * holding the name's length and hash, then by the name; plain ones by
+	 * the name alone.  Which this volume is was settled at mount.
 	 */
 	if (ta == APFS_TYPE_DIR_REC) {
 		uint32_t	ha, hb;
@@ -2625,28 +2349,16 @@ jkey_cmp(const uint8_t *a, uint32_t alen, const uint8_t *b, uint32_t blen)
 }
 
 /*
- * WHERE A KEY GOES IN A NODE THE CALLER IS HOLDING
+ * Where a key goes in a node the caller is holding.  An interior node is
+ * asked which child to go down: the last whose separator is not greater
+ * than the key, a child being filed under its first key.  A leaf is asked
+ * (node_lower) for the first record not less than the key.  Binary search,
+ * counted in g_n_cmps.
  *
- * Two questions, and they are not the same one.  An INTERIOR node is asked
- * which child to go down: the last one whose separator is not greater than the
- * key, because a child is filed under its own first key, so a key belongs
- * under the last child that starts at or before it.  A LEAF is asked where the
- * key would be: the first record that is not less than it, which is the record
- * itself when it exists and the one after it when it does not.
- *
- * Binary, not linear.  A linear pass over one node is what the whole-tree walk
- * already did and would have made this a shorter walk rather than a different
- * shape.  The nodes here hold up to fifty-odd records, so it is five
- * comparisons instead of fifty, and the count of comparisons is printed with
- * the rest of the statistics because a claim about cost that nobody measures
- * is decoration.
- *
- * A separator that compares EQUAL to several children's first keys would make
- * the first answer skip records, and jkey_cmp does return equal for record
- * types it has no rule for.  That is not a hazard here and it is not an
- * assumption either: the self-test seeks every record on the volume by its own
- * key and demands the same record back, which is exactly the case that would
- * break if two keys the tree keeps apart compared the same.
+ * A separator equal to several children's first keys would make the first
+ * answer skip records, and jkey_cmp returns equal for types it has no rule
+ * for; the self-test seeks every record on the volume by its own key to
+ * catch that.
  */
 static uint32_t
 node_child_for(const struct btree_layout *bl, const uint8_t *key, uint32_t klen)
@@ -2687,37 +2399,16 @@ node_lower(const struct btree_layout *bl, const uint8_t *key, uint32_t klen)
 }
 
 /*
- * DESCENDING ON THE KEY
+ * Read the file-system tree in order from `key`, or from the start when
+ * there is none (the whole-tree walk, the self-test's oracle).  Interior
+ * nodes name children by virtual oid, so every step down costs an
+ * object-map lookup.
  *
- * Read the volume's file-system tree in order, starting at `key` -- or at the
- * smallest key on the volume when there is none, which is the whole-tree walk
- * every reader here used to do and which is still what the self-test uses as
- * its oracle.
- *
- * Unlike the container's object map, this tree's interior nodes point at
- * children by VIRTUAL oid, so every descent costs an object-map lookup --
- * that indirection is the price copy-on-write charges for being able to
- * rewrite a node without touching its parent.
- *
- * WHY IT TOOK THIS LONG.  The original walk visited everything rather than
- * descending, and the reason was written down beside it: whole-tree order
- * needs no key ordering at all, and a reader that needs no key ordering needs
- * no name hash -- which was the one part of this format nobody had published.
- * That reasoning expired.  The hash was measured for the writer three rungs
- * ago (drec_key), the ordering is jkey_cmp above, and both have been trusted
- * to decide which half of a splitting node a record belongs in ever since.
- * The reader was the last thing still reading fifty-four records to answer a
- * question about one.
- *
- * THE SCAN IS THE WALK, ENTERED PART-WAY.  It is deliberately the same
- * recursion and the same callback, because the two have to agree about order
- * and the cheapest way to make them agree is for there to be one of them.
- * The key prunes only the LEFTMOST path: at every level the first child
- * visited is entered at the key, and every child after it from its beginning,
- * because once the descent has passed the key everything to the right of it
- * is wanted whole.  A caller that wants a RUN -- one file's extents, one
- * directory's entries -- therefore gets its records consecutively and returns
- * false when it sees the first record that is not its own.
+ * The scan is the walk entered part-way, one recursion and one callback, so
+ * the two agree about order.  The key prunes only the leftmost path: past it
+ * everything to the right is wanted whole.  A caller that wants a run (one
+ * file's extents, one directory's entries) returns false at the first
+ * record not its own.
  */
 bool
 btree_scan(uint64_t bno, const uint8_t *key, uint32_t klen, apfs_rec_fn fn,
@@ -2802,16 +2493,9 @@ btree_walk(uint64_t bno, apfs_rec_fn fn, void *arg, int depth, bool *stopped)
 }
 
 /*
- * WHICH LEAF A KEY BELONGS IN -- the question an insert asks, and the one
- * question here that is not about a record that exists.
- *
- * The same descent, stopped at the leaf and asked nothing further: the last
- * child whose first key is not greater than this one, all the way down.  The
- * walk-based answer this replaces said "the last leaf holding a key no greater
- * than the wanted one, and the first leaf if there is none", and the two are
- * the same sentence read from different ends -- which is why the self-test
- * checks them against each other over every key on the volume rather than
- * taking my word for it.
+ * Which leaf a key belongs in -- the question an insert asks, about a record
+ * that may not exist: the same descent, stopped at the leaf.  The self-test
+ * checks it over every key on the volume against leaf_find's walk.
  */
 int
 leaf_home(const uint8_t *key, uint32_t klen, uint64_t *bno_out)
@@ -2858,15 +2542,11 @@ leaf_home(const uint8_t *key, uint32_t klen, uint64_t *bno_out)
 }
 
 /*
- * Name inside a directory-record key.  The fixed part is the 8-byte record
- * header plus either a 4-byte length-and-hash (hashed volumes) or a 2-byte
- * length; the name follows, NUL-terminated, and the recorded length counts
- * that NUL.
- *
- * APFS_DREC_KEY_MAX is the widest key that layout can produce, and it is the
- * bound every buffer holding a BUILT one uses -- see drec_key.  Note that it
- * is the reading limit and not the writing one: this kernel makes names far
- * shorter than it is willing to look up.
+ * Name inside a directory-record key: the 8-byte record header, a 4-byte
+ * length-and-hash (hashed volumes) or 2-byte length, then the name with the
+ * NUL the length counts.  APFS_DREC_KEY_MAX is the widest such key, the
+ * bound for buffers holding one built by drec_key -- the reading limit, not
+ * the writing one.
  */
 #define	APFS_DREC_KEY_MAX	(12u + FS_APFS_NAME_MAX + 1u)
 
@@ -2894,14 +2574,11 @@ drec_name(const uint8_t *key, uint32_t klen, uint32_t *len_out)
 }
 
 /*
- * The key every one of a directory's entries sorts AFTER: its object id, the
- * entry type, and a name word of zero.
- *
- * Zero is what makes it a floor rather than a name.  On a volume that hashes
- * names that word holds the hash and the length together, and on one that does
- * not it holds the length alone -- and the length counts a trailing NUL, so no
- * real entry can record zero for it.  A scan from here therefore begins at the
- * directory's first name whichever kind of volume this is.
+ * The key every one of a directory's entries sorts after: its object id, the
+ * entry type, and a name word of zero.  The name word holds the hash and
+ * length, or the length alone, and the length counts a trailing NUL, so no
+ * real entry records zero: a scan from here begins at the directory's first
+ * name on either kind of volume.
  */
 static void
 drec_low_key(uint64_t dir, uint8_t *out, uint32_t *klen_out)
@@ -2951,10 +2628,9 @@ dirent_match(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 		}
 	}
 	/*
-	 * Not this name.  A read that DESCENDED on it has already had its
-	 * answer: the first record handed over is either the entry or the one
-	 * that sorts after it, and there is nothing further to look at.  A read
-	 * that started at the beginning of the tree has to keep going.
+	 * Not this name.  A read that descended on it has its answer already:
+	 * the first record handed over is the entry or the one after it.  A
+	 * read from the start of the tree keeps going.
 	 */
 	if (!hit)
 		return (!ds->ds_keyed);
@@ -3001,12 +2677,9 @@ fs_apfs_lookup(const char *path, uint64_t *oid_out, int *is_dir_out)
 		ds.ds_is_dir  = false;
 		stopped = false;
 		/*
-		 * An entry sorts under its parent's object id and the hash of
-		 * its own name, and this kernel can compute both -- so the
-		 * whole of a path component costs one descent.  A name it
-		 * cannot fold still reads: anything outside ASCII on a volume
-		 * that hashes names has no key this kernel can build, and for
-		 * those the tree is read the way it always was.
+		 * An entry sorts under its parent's id and its name's hash, so
+		 * a component costs one descent -- unless the name cannot be
+		 * folded (non-ASCII on a hashing volume): then the whole walk.
 		 */
 		ds.ds_keyed = drec_key(oid, comp, (uint32_t)(p - comp), dkey,
 		    &dklen, false) == FS_APFS_E_OK;
@@ -3033,12 +2706,10 @@ fs_apfs_lookup(const char *path, uint64_t *oid_out, int *is_dir_out)
 /* ---- inodes, sizes, and bytes -------------------------------------------- */
 
 /*
- * What an inode record tells us.  ii_private_id is the one field worth
- * explaining: file extents are keyed on it rather than on the inode's own
- * object id, and the two differ once hard links exist -- several names, one
- * stream of bytes.  They are equal for every file on a freshly written volume,
- * which is exactly why keying on the wrong one works right up until it
- * silently doesn't.
+ * What an inode record tells us.  File extents are keyed on ii_private_id,
+ * not the inode's own object id.  The two are equal on a freshly written
+ * volume and can differ once hard links exist, so keying on the wrong one
+ * works until it silently does not.
  */
 struct inode_info {
 	uint64_t	ii_oid;
@@ -3056,12 +2727,10 @@ struct inode_info {
 	uint16_t	ii_mode;
 	bool		ii_found;
 	/*
-	 * No names left, which ii_nlink cannot say.  That field reports 1 for a
-	 * file whose record claims none, because a file off the image may claim
-	 * none and still be perfectly reachable -- so the one state where the
-	 * count is meant literally is the one the count is rounded away from.
-	 * Asked of the record rather than of ii_nlink, and only ever true of a
-	 * file waiting in the private directory.
+	 * No names left, which ii_nlink cannot say: it reports 1 for a file
+	 * whose record claims none, since a file off the image may claim none
+	 * and still be reachable.  Asked of the record, and only ever true of
+	 * a file waiting in the private directory.
 	 */
 	bool		ii_orphan;
 };
@@ -3105,12 +2774,10 @@ inode_pick(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 	ii->ii_ctime      = iv->ai_change_time;
 	ii->ii_btime      = iv->ai_create_time;
 	/*
-	 * One field, two meanings, told apart by the mode: for a directory
-	 * APFS counts CHILDREN here, for anything else it counts links.  A
-	 * directory's link count in POSIX terms is 2 plus its subdirectories
-	 * -- itself, its "." and each child's ".." -- but APFS has no such
-	 * entries to count, so reporting the honest 1 beats inventing a
-	 * number no reader of this volume can verify.
+	 * One field, two meanings, told apart by the mode: a directory's
+	 * children, anything else's links.  POSIX would give a directory 2
+	 * plus its subdirectories, but APFS has no "." or ".." entries to
+	 * count, so a directory reports 1.
 	 */
 	ii->ii_nlink = (iv->ai_mode & APFS_S_IFMT) == APFS_S_IFDIR ? 1u :
 	    (iv->ai_nchildren_or_nlink > 0 ?
@@ -3120,8 +2787,7 @@ inode_pick(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 	ii->ii_found = true;
 
 	/*
-	 * No extended fields at all is normal, not an error: that is what an
-	 * inode with nothing to say beyond its fixed part looks like.  Its
+	 * No extended fields is normal: nothing beyond the fixed part.  The
 	 * size stays 0, which for a directory is the right answer.
 	 */
 	if (vlen < sizeof(*iv) + sizeof(*blob))
@@ -3216,16 +2882,10 @@ fs_apfs_stat(const char *path, struct fs_apfs_statbuf *out)
 }
 
 /*
- * The key one of a data stream's runs sorts under, and -- with `logical` zero
- * -- the key every one of them sorts at or after.
- *
- * That second use is how every read of a file's bytes starts, and it starts
- * there rather than at the byte it wants ON PURPOSE.  A run is keyed by where
- * it BEGINS, so the run covering some offset can begin long before it, and a
- * descent to the offset itself would land past the record that holds it.
- * Beginning at the stream's first run costs the records before the window and
- * cannot be wrong; the descent has already skipped every other object on the
- * volume, which is where the cost was.
+ * The key one of a data stream's runs sorts under; with `logical` zero, the
+ * key all of them sort at or after.  Every read of a file's bytes starts
+ * there, not at the byte it wants: a run is keyed by where it begins, so a
+ * descent to an offset would land past the run covering it.
  */
 static void
 extent_key(uint64_t id, uint64_t logical, uint64_t *out)
@@ -3237,11 +2897,10 @@ extent_key(uint64_t id, uint64_t logical, uint64_t *out)
 }
 
 /*
- * Copying part of a file's extents into a buffer.  The wanted byte window is
- * [er_lo, er_hi) of the file and er_buf holds er_lo; a whole-file read is just
- * the window [0, size).  er_bounce holds the one partial block a window whose
- * edges do not land on block boundaries needs -- allocated once by the caller
- * rather than per extent.
+ * Copying part of a file's extents into a buffer: the byte window
+ * [er_lo, er_hi) of the file, er_buf holding er_lo; a whole-file read is
+ * [0, size).  er_bounce holds a partial block at the window's edges,
+ * allocated once by the caller.
  */
 struct extent_read {
 	uint64_t	 er_id;		/* the dstream this belongs to */
@@ -3286,11 +2945,9 @@ extent_copy(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 	if (logical >= er->er_size)
 		return (true);
 	/*
-	 * Past the window.  Records sort by (oid, logical), so once one of
-	 * this file's extents starts beyond what was asked for, no later
-	 * record can be wanted either -- stop the walk rather than read the
-	 * rest of the tree for nothing.  For a whole-file read the window is
-	 * the whole file and this never fires.
+	 * Past the window.  Records sort by (oid, logical), so no later record
+	 * can be wanted either: stop the walk.  A whole-file read never gets
+	 * here.
 	 */
 	if (logical >= er->er_hi)
 		return (false);
@@ -3300,7 +2957,7 @@ extent_copy(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 	for (off = 0; off < len; off += APFS_BLOCK_SIZE) {
 		dst = logical + off;		/* file offset of this block */
 		/*
-		 * An extent is an ALLOCATED run and can reach past the end of
+		 * An extent is an allocated run and can reach past the end of
 		 * the file; the tail of its last block is not ours to copy.
 		 */
 		if (dst >= er->er_size || dst >= er->er_hi)
@@ -3308,7 +2965,7 @@ extent_copy(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 		if (dst + APFS_BLOCK_SIZE <= er->er_lo)
 			continue;		/* entirely before the window */
 
-		/* The slice of this block that is both real content and wanted. */
+		/* The slice of this block that is real content and wanted. */
 		lo = (dst < er->er_lo) ? er->er_lo : dst;
 		hi = dst + APFS_BLOCK_SIZE;
 		if (hi > er->er_size)
@@ -3367,7 +3024,7 @@ fs_apfs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size)
 	if (st.afs_size > FS_APFS_MAX_FILE)
 		return (FS_APFS_E_TOOBIG);
 
-	/* kmalloc(0) is not a thing worth defining; an empty file gets a byte. */
+	/* kmalloc(0) is not worth defining; an empty file gets a byte. */
 	buf = kmalloc(st.afs_size != 0 ? (size_t)st.afs_size : 1);
 	if (buf == NULL)
 		return (FS_APFS_E_NOMEM);
@@ -3414,12 +3071,9 @@ fs_apfs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size)
 }
 
 /*
- * Resolve a path to the two things a ranged read actually needs: the dstream
- * id its extents are keyed on, and how many of its bytes are real.
- *
- * This is the expensive half of reading, and splitting it out is the point:
- * one walk per path component plus one for the inode, paid once, instead of
- * once per 4 KiB the pager asks for.
+ * Resolve a path to what a ranged read needs: the dstream id its extents are
+ * keyed on, and how many of its bytes are real.  The expensive half of
+ * reading, paid once per open instead of once per 4 KiB the pager asks for.
  */
 int
 fs_apfs_open(const char *path, uint64_t *id_out, uint64_t *size_out,
@@ -3452,14 +3106,11 @@ fs_apfs_open(const char *path, uint64_t *id_out, uint64_t *size_out,
 }
 
 /*
- * The ranged read behind fs_pread.  Same extent walk as the slurp above,
- * pointed at a window instead of at the whole file: the caller's buffer holds
- * file byte `off`, and only the blocks overlapping [off, off+len) are read.
- * One tree walk, no path resolution -- that was done once, by fs_apfs_open.
- *
- * The buffer is zeroed first for the same reason the slurp zeroes its own --
- * a hole has no block to read, so its bytes have to be put there by hand --
- * and that also covers a window that reaches past end-of-file.
+ * The ranged read behind fs_pread: the slurp's extent walk pointed at a
+ * window.  The caller's buffer holds file byte `off`, and only the blocks
+ * overlapping [off, off+len) are read; the path was resolved once, by
+ * fs_apfs_open.  The buffer is zeroed first, as in the slurp, because a hole
+ * has no block to read.
  */
 int
 fs_apfs_pread(uint64_t id, uint64_t size, uint64_t off, uint8_t *buf,
@@ -3521,39 +3172,15 @@ fs_apfs_pread(uint64_t id, uint64_t size, uint64_t off, uint8_t *buf,
 /* ---- writing -------------------------------------------------------------- */
 
 /*
- * WRITING A FILE'S BYTES, WHICH MEANS MOVING THEM
+ * Writing a file's bytes means moving them: overwritten in place, every
+ * older checkpoint in the ring would lead to the new contents.  So a write
+ * takes fresh blocks, copies into them, and moves the record.
  *
- * Until this rung a write went straight onto the block the extent record
- * named, and the checkpoint machinery around it was half a promise.  The ring
- * of old superblocks was intact -- copy-on-write, the spine and the free
- * queues saw to that -- and every one of them pointed at a file whose contents
- * had since been overwritten underneath it.  Measured on the container rather
- * than argued about; the leaf describing /var/db/big.txt moves from checkpoint
- * to checkpoint and the block holding its bytes does not:
- *
- *	xid 3   leaf 98320   extent (logical 0, 155648 bytes) at block 5970
- *	xid 5   leaf 98310   extent (logical 0, 155648 bytes) at block 5970
- *	...
- *	xid 17  leaf 98337   extent (logical 0, 155648 bytes) at block 5970
- *
- *	distinct leaf blocks across the ring: 5
- *	distinct data blocks across the ring: 1
- *
- * So a write now takes fresh blocks, copies into them, and moves the record --
- * and the run it moves is THE WHOLE EXTENT, not the part written.  That is the
- * expensive choice and it is deliberate.  Writing twelve bytes into a
- * thirty-eight block extent ought to relocate one block and leave the extent
- * split in three, which is two more records than there were; a record has to
- * be inserted, a node with no room has to split, and that is the rung after
- * this one.  Moving the run whole keeps every count identical -- one file
- * extent in and one out, one physical extent in and one out -- so nothing
- * inserts, nothing splits, and no tree changes shape.  The cost is honest and
- * it is the file's size: this container's write self-test moves 152 KiB to
- * change twelve bytes.
- *
- * Two trees name those blocks and both have to be told.  The file-system tree
- * says where the file's bytes are; the extent reference tree says who owns the
- * run -- see extref_move, which is where the interesting half of that lives.
+ * The whole extent moves, not the part written: relocating one block would
+ * split the extent in three, while moving the run keeps every count the same
+ * and no tree changes shape.  The cost is the extent's size (the self-test
+ * moves 152 KiB to change twelve bytes).  Both trees naming the blocks are
+ * told: the file-system tree and the extent reference tree (extref_move).
  */
 
 /* How many extents one write may move before it is refused as unbounded. */
@@ -3561,15 +3188,14 @@ fs_apfs_pread(uint64_t id, uint64_t size, uint64_t off, uint8_t *buf,
 
 /*
  * The extent record covering one file offset, and the leaf holding it.  A
- * locate pass, exactly like inode_locate below and for the same reason:
- * btree_walk frees its node buffer on the way out, so the patch has to re-read
- * the block it was told about.
+ * locate pass, like inode_locate below: the scan frees its node buffer on
+ * the way out, so the patch re-reads the block it was told about.
  */
 struct extent_locate {
 	uint64_t	el_id;		/* the dstream being written   */
 	uint64_t	el_want;	/* the file offset to cover    */
 	uint64_t	el_logical;	/* what was found: its start   */
-	uint64_t	el_len;		/* ...its length, in BYTES     */
+	uint64_t	el_len;		/* ...its length, in bytes     */
 	uint64_t	el_phys;	/* ...and its first block      */
 	uint64_t	el_bno;		/* the leaf the record is in   */
 	bool		el_found;
@@ -3585,7 +3211,7 @@ extent_locate(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 	uint64_t				 len;
 
 	el = arg;
-	/* Past this stream's runs: the offset asked about is in none of them. */
+	/* Past this stream's runs: the offset is in none of them. */
 	if (type != APFS_TYPE_FILE_EXTENT || oid != el->el_id)
 		return (false);
 	if (klen < 16 || vlen < sizeof(*fe))
@@ -3630,13 +3256,9 @@ extent_at(uint64_t id, uint64_t off, uint64_t *phys_out)
 /*
  * Move the run this extent describes, putting the caller's bytes in as the
  * copy goes past them, and leave *pos at the first file byte beyond it.
- *
- * The copy is what makes the partial blocks at either end correct for free.
- * Every block of the old run is read whole and written whole; the window only
- * decides which of its bytes are replaced on the way.  There is no
- * read-modify-write special case because there is nothing special about it --
- * the bytes of a block that the caller did not ask about are the file's, and
- * the copy carries them across because it carries everything across.
+ * Every block of the old run is read whole and written whole, and the
+ * window only decides which bytes are replaced on the way, so partial blocks
+ * at either end need no read-modify-write case.
  */
 static int
 extent_relocate(const struct extent_locate *el, const uint8_t *buf,
@@ -3666,9 +3288,8 @@ extent_relocate(const struct extent_locate *el, const uint8_t *buf,
 	xid = g_apfs.ac_xid + 1;
 
 	/*
-	 * Near the run it replaces.  Not a preference: the release below has
-	 * to clear bits in the old run's chunk, so a copy that lands in that
-	 * same chunk is a copy this transaction can finish.
+	 * Near the run it replaces: the old run's chunk is resident for the
+	 * release below anyway, and the file's bytes stay together.
 	 */
 	rv = alloc_blocks((uint32_t)blocks, el->el_phys, &first);
 	if (rv != FS_APFS_E_OK)
@@ -3692,10 +3313,9 @@ extent_relocate(const struct extent_locate *el, const uint8_t *buf,
 	}
 
 	/*
-	 * The record, found again inside our own copy of the leaf with the
-	 * same layout code the reader uses.  Keyed by (object, offset in the
-	 * file), neither of which this changes -- only the block number in the
-	 * value does, so the record stays exactly where it is in the node.
+	 * The record, found again in our copy of the leaf with the reader's
+	 * layout code.  Only the block number in its value changes, so it
+	 * stays where it is in the node.
 	 */
 	rv = fs_apfs_read_block(el->el_bno, node);
 	if (rv != FS_APFS_E_OK)
@@ -3747,9 +3367,8 @@ extent_relocate(const struct extent_locate *el, const uint8_t *buf,
 
 	/*
 	 * Past this point nothing can be given back quietly: the leaf has
-	 * moved, and a failure leaves a transaction that must not be written.
-	 * Both remaining steps say so and refuse the checkpoint rather than
-	 * publish half of one.
+	 * moved, so a failure leaves a transaction that must not be written,
+	 * and both remaining steps say so.
 	 */
 	rv = extref_move(el->el_phys, first, blocks, xid, node);
 	if (rv != FS_APFS_E_OK) {
@@ -3810,10 +3429,9 @@ fs_apfs_pwrite(uint64_t id, uint64_t size, uint64_t off, const uint8_t *buf,
 		return (FS_APFS_E_OK);
 
 	/*
-	 * Growth needs a record inserted, not just moved; refuse the whole
-	 * write rather than do the prefix that happens to fit.  A short write
-	 * that reports success is how a file ends up half-updated with nobody
-	 * told.
+	 * Growth needs a record inserted, not just moved: refuse the whole
+	 * write rather than do the prefix that fits.  A short write reporting
+	 * success leaves a file half-updated with nobody told.
 	 */
 	if (off >= size || off + (uint64_t)len > size)
 		return (FS_APFS_E_NOALLOC);
@@ -3849,21 +3467,18 @@ fs_apfs_pwrite(uint64_t id, uint64_t size, uint64_t off, const uint8_t *buf,
 			goto out;
 		}
 		/*
-		 * Coverage, checked rather than assumed.  A range no extent
-		 * record describes is not an error the walk reports -- it
-		 * simply never mentions those bytes -- so an unbacked file
-		 * would otherwise come back as a flawless write of nothing.
-		 * Silence is not success.
+		 * Coverage, checked: a range no extent record describes is not
+		 * an error the walk reports, so an unbacked file would come
+		 * back as a flawless write of nothing.
 		 */
 		if (!el.el_found) {
 			rv = FS_APFS_E_NOALLOC;
 			goto out;
 		}
 		/*
-		 * A hole overlapping the write.  Reading one costs nothing
-		 * because its bytes are defined to be zero; writing one means
-		 * finding it a run and giving the file a record it does not
-		 * have, which is the insert this rung does not do.
+		 * A hole overlapping the write.  Writing one means finding it a
+		 * run and giving the file a record it does not have, an insert
+		 * this path does not do.
 		 */
 		if (el.el_phys == 0) {
 			rv = FS_APFS_E_NOALLOC;
@@ -3883,10 +3498,8 @@ out:
 
 /*
  * Where an inode record lives.  The locate pass records the block and stops;
- * the patch re-reads it.  Splitting it that way keeps btree_walk read-only --
- * it frees its node buffer on the way out, so anything written into that
- * buffer would be discarded, and a walker that both reads and writes is a
- * walker whose callbacks have to know which they are.
+ * the patch re-reads it.  That keeps the scan read-only: it frees its node
+ * buffer on the way out, so anything written into it would be lost.
  */
 struct inode_locate {
 	uint64_t	il_oid;
@@ -3913,12 +3526,8 @@ inode_locate(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 }
 
 /*
- * The leaf an inode record lives in.
- *
- * An inode's key is nothing but its object id and the record type, so this is
- * the plainest descent in the file -- and it had been written out longhand
- * around a whole-tree walk in six places, which is what made it worth being a
- * function rather than a shape.
+ * The leaf an inode record lives in.  An inode's key is only its object id
+ * and the record type, so this is the plainest descent in the file.
  */
 int
 inode_where(uint64_t oid, uint64_t *bno_out)
@@ -3943,22 +3552,10 @@ inode_where(uint64_t oid, uint64_t *bno_out)
 }
 
 /*
- * AMENDING AN INODE'S FIXED PART.
- *
- * Two callers want this and they differ by one line: a touch moves the times,
- * a chmod moves the permission bits and the change time with them.  Everything
- * else -- finding the record, re-deriving its offset with the reader's own
- * layout code, copy-on-writing the leaf, telling the spine where it went -- is
- * identical, and identical code that exists twice is code that gets fixed
- * once.  Same argument as make_at and unmake_at, and the same shape: one
- * function with a question in it.
- *
- * The MODE is amended in its low bits only.  The type nibble is not a
- * permission and moving it is not a chmod: apfsck checks an inode's type
- * against the type in the directory entry that names it, so a chmod that
- * turned a directory into a regular file would leave a volume the checker
- * rejects by name ("file mode doesn't match dentry type").  Unix agrees --
- * chmod(2) takes the file's type as given.
+ * Amend an inode's fixed part: a touch moves the times, a chmod the
+ * permission bits and the change time.  The mode is amended in its low bits
+ * only: apfsck checks an inode's type against the directory entry naming it
+ * ("file mode doesn't match dentry type"), and chmod(2) leaves the type.
  */
 #define	INODE_AMEND_TIME	0x1u	/* modification and change times   */
 #define	INODE_AMEND_MODE	0x2u	/* permission bits, and change time */
@@ -3997,12 +3594,10 @@ inode_amend(uint64_t oid, uint32_t what, uint64_t ns, uint16_t perm)
 		goto out;
 
 	/*
-	 * Find the record again inside our own copy, using the same layout
-	 * code the reader uses.  Re-deriving the offset rather than carrying
-	 * one out of the walk is what keeps writer and reader from ever
-	 * disagreeing about where a value begins -- and the root-node case,
-	 * where 40 bytes of btree_info shift the value base, is exactly the
-	 * kind of detail two copies of that arithmetic would drift on.
+	 * Find the record again inside our own copy with the reader's layout
+	 * code.  Re-deriving the offset, rather than carrying one out of the
+	 * walk, keeps writer and reader from disagreeing about where a value
+	 * begins -- in a root node, 40 bytes of btree_info shift it.
 	 */
 	btree_layout(node, &bl);
 	rv = FS_APFS_E_NOTFOUND;
@@ -4032,10 +3627,8 @@ inode_amend(uint64_t oid, uint32_t what, uint64_t ns, uint16_t perm)
 		goto out;			/* nothing has been written */
 
 	/*
-	 * COPY-ON-WRITE, and the node is VIRTUAL: it keeps the oid it had,
-	 * because that oid is the name the object map answers.  Only its
-	 * address changes, and making that address the answer is what
-	 * spine_update does.
+	 * Copy-on-write.  The node is virtual: it keeps its oid, the name the
+	 * object map answers, and only its address changes (spine_update).
 	 */
 	o        = (struct apfs_obj_phys *)node;
 	leaf_oid = o->o_oid;
@@ -4063,10 +3656,9 @@ inode_amend(uint64_t oid, uint32_t what, uint64_t ns, uint16_t perm)
 		goto out;
 	}
 	/*
-	 * If what moved WAS the tree root, the reader's shortcut to it is now
-	 * a stale address.  It is not, in this container -- the root is an
-	 * index node and inodes live in leaves -- but a container with one
-	 * node of file-system tree would take this branch on its first write.
+	 * If what moved was the tree root, the reader's shortcut to it is now
+	 * stale.  A root that is an index node never moves here, but a
+	 * one-node fs tree takes this branch on its first write.
 	 */
 	if (leaf_oid == g_apfs.ac_root_tree_oid)
 		g_apfs.ac_root_tree_bno = new_bno;
@@ -4084,13 +3676,10 @@ fs_apfs_touch(uint64_t oid, uint64_t mtime_ns)
 }
 
 /*
- * chmod: the permission bits, and the change time that goes with them.
- *
- * The record does not move and does not change LENGTH -- a mode is sixteen
- * bits inside a value that is already there -- so this is the cheapest edit
- * this writer can make, and the only one that cannot fail for want of room.
- * It still copies the leaf and updates the spine, because a block written in
- * place would be a block the live checkpoint still names.
+ * chmod: the permission bits, and the change time that goes with them.  The
+ * record neither moves nor changes length, so this cannot fail for want of
+ * room.  It still copies the leaf and updates the spine: a block written in
+ * place would be one the live checkpoint still names.
  */
 int
 fs_apfs_chmod(uint64_t oid, uint16_t perm, uint64_t now_ns)
@@ -4102,52 +3691,28 @@ fs_apfs_chmod(uint64_t oid, uint16_t perm, uint64_t now_ns)
 /* ---- growing -------------------------------------------------------------- */
 
 /*
- * A FILE GETS LONGER
- *
- * Every write until now replaced a record; this one ADDS one, which is the
- * first thing in this file that changes a tree's shape.  Three records have to
- * agree afterwards and they live in two different trees:
+ * A file gets longer.  This adds a record, so a tree changes shape, and
+ * three records in two trees must agree afterwards:
  *
  *	the file extent    (object, offset in the file) -> run
  *	the physical extent          (first block)      -> length, owner, count
  *	the inode's dstream                             -> length, allocated
  *
- * Room was measured before any of it was designed.  The leaf holding this
- * container's file extents has 193 bytes of free span and six spare entries in
- * its table of contents, against 48 bytes and one entry for a file extent
- * record -- so four inserts fit and the fifth does not.  That bound is real and
- * it is reported rather than worked around: a node with no room has to SPLIT,
- * a split changes the index above it, and that is the next rung.  Refusing out
- * loud leaves a filesystem that still says the truth about itself.
- *
- * The table of contents is the reason a node has any bound at all.  It is a
- * fixed reservation at the front, and the key area begins where it ends, so
- * growing it would move every key under every offset already recorded.
+ * An insert that does not fit is refused, and the caller splits the node and
+ * asks again.  (The table of contents cannot grow: the key area begins where
+ * it ends, so growing it would move every key.)
  */
 
 /*
- * A HOLE IS ROOM, AND UNTIL NOW IT WAS NOT
+ * A hole is room: if inserts took only from the free span, a node whose
+ * records come and go would lose a record's worth of room per cycle.  These
+ * holes differ in size, unlike the free queue's, so the chain is searched.
+ * `step` is +1 for the key area and -1 for the value area, whose offsets
+ * count back from the end of the node.
  *
- * Deleting a record threads its bytes onto one of the node's free-list chains;
- * inserting one took only from the free span.  The span is a one-way ratchet,
- * so a node that has records come and go loses a record's worth of room per
- * cycle and eventually refuses an insert while claiming plenty of free bytes.
- *
- * That is exactly the bug the free queue had, and the free queue could be fixed
- * the easy way: every hole in it is the same size, so taking one is popping the
- * head of a list.  Here they are not.  A directory entry, an inode record and
- * an extent record are three different lengths, and the chain has to be
- * searched rather than popped.
- *
- * `step` is +1 for the key area, whose offsets grow with the address, and -1
- * for the value area, whose offsets are measured backwards from the end of the
- * node.  That sign is the whole of the difference between the two.
- *
- * A hole is usable only if it fits exactly or leaves at least a link behind:
- * a remainder too small to hold its own nloc could not stay on the chain, and
- * quietly dropping it would leave bytes belonging to nothing -- which is
- * precisely the accounting apfsck recomputes.  Every byte of this node is
- * either inside a record or on a chain, before and after.
+ * A hole is usable only if it fits exactly or leaves room for a link: a
+ * smaller remainder could not stay on the chain and would be bytes belonging
+ * to nothing, which apfsck counts.
  */
 static uint32_t
 hole_find(const struct apfs_nloc *head, const uint8_t *base, int step,
@@ -4168,15 +3733,9 @@ hole_find(const struct apfs_nloc *head, const uint8_t *base, int step,
 }
 
 /*
- * Take `need` bytes out of the hole at `at`, which hole_find has already said
- * will do, and report where they are.
- *
- * The bytes come off the FAR end.  A hole's own nloc sits at its first byte and
- * whoever points at the hole names that byte, so shrinking one from the far end
- * is an edit inside it with nothing above to tell; only a hole consumed exactly
- * has to be unlinked, and the link that names it is either the previous hole's
- * or the head in the node's header, which are the same four bytes in two
- * places.
+ * Take `need` bytes out of the hole at `at` (hole_find's choice) and return
+ * where they are.  They come off the far end, since a hole's link names its
+ * first byte; only a hole consumed exactly is unlinked.
  */
 static uint32_t
 hole_take(struct apfs_nloc *head, uint8_t *base, int step, uint32_t need,
@@ -4204,14 +3763,10 @@ hole_take(struct apfs_nloc *head, uint8_t *base, int step, uint32_t need,
 }
 
 /*
- * Put a record into a variable-KV node, at the position the caller worked out,
- * and refuse if there is no room.
- *
- * Keys grow up from the start of the key area and values grow down from the
- * end of the node; the free span in the middle is what both eat into, and the
- * node header carries where it starts and how much is left.  Either end may
- * instead come out of a hole a delete left behind, and the two are independent:
- * a key can be threaded into a hole while its value takes from the span.
+ * Put a record into a variable-KV node at the position the caller worked
+ * out, or refuse if there is no room.  Keys grow up from the key area and
+ * values down from the end of the node, both into the free span; either may
+ * instead come out of a hole, independently of the other.
  */
 static int
 leaf_insert(uint8_t *node, uint32_t pos, const void *key, uint32_t klen,
@@ -4242,10 +3797,8 @@ leaf_insert(uint8_t *node, uint32_t pos, const void *key, uint32_t klen,
 	}
 
 	/*
-	 * Both ends are placed before either is written, because a record that
-	 * fitted its key and then found nowhere for its value would have to put
-	 * the key back -- and the room question has to be answerable without
-	 * changing anything, which is what the split path asks it for.
+	 * Both ends are placed before either is written, so a refusal changes
+	 * nothing and a key never has to be put back.
 	 */
 	khole = hole_find(&n->btn_key_free_list, bl.bl_keys, 1, klen);
 	vhole = hole_find(&n->btn_val_free_list, bl.bl_vals, -1, vlen);
@@ -4277,9 +3830,9 @@ leaf_insert(uint8_t *node, uint32_t pos, const void *key, uint32_t klen,
 		hole_n++;
 	} else {
 		/*
-		 * The value's offset is measured BACKWARDS from the end of the
-		 * node, so it is whatever is left of the free span after this
-		 * value is taken off the bottom of it.
+		 * The value's offset is measured back from the end of the node,
+		 * so it is whatever is left of the free span after this value
+		 * is taken off the bottom of it.
 		 */
 		n->btn_free_space.nl_len =
 		    (uint16_t)(n->btn_free_space.nl_len - vlen);
@@ -4305,27 +3858,10 @@ leaf_insert(uint8_t *node, uint32_t pos, const void *key, uint32_t klen,
 }
 
 /*
- * Take a record OUT of a variable-KV node.
- *
- * Its bytes do not go back to the free span.  That span is one stretch in the
- * middle of the node, with the keys growing up into it and the values growing
- * down; a record removed from anywhere but the very edge leaves a hole that is
- * not next to it.  What the format keeps instead is a CHAIN -- the hole holds
- * an nloc naming the next hole and its own length, and the node header holds
- * the head of the chain and the total it comes to.
- *
- * That total is checked, which is how this was settled before it was written:
- * deleting a record on a copy of the image without threading its bytes onto
- * the chain makes apfsck answer "B-tree: wrong free space total for key area",
- * and threading them on makes it silent.  The value side is the same chain
- * measured backwards from the end of the node, exactly as the values are.
- *
- * The room this returns IS room a later insert can use -- see hole_find above.
- * It was not, once, and that was survivable only while the one thing that could
- * delete was a truncate: a file that is made shorter and never longer again
- * gives its bytes back once.  A name that comes and goes is a cycle, and a node
- * that loses a record's worth of room per cycle stops working after fifteen of
- * them.
+ * Take a record out of a variable-KV node.  Its bytes become holes on the
+ * key and value chains, not free span, which is one stretch in the middle:
+ * each hole holds an nloc naming the next and its own length, and the header
+ * holds the head and the total, which apfsck checks.  hole_find reuses them.
  */
 static int
 leaf_delete(uint8_t *node, uint32_t pos)
@@ -4345,9 +3881,9 @@ leaf_delete(uint8_t *node, uint32_t pos)
 
 	/*
 	 * A hole has to be big enough to say where the next one is.  Nothing
-	 * this kernel deletes is that small -- its shortest key is eight bytes
-	 * and its shortest value four -- but a hole that cannot hold its own
-	 * link would corrupt the chain instead of extending it.
+	 * this kernel deletes is that small (shortest key eight bytes, value
+	 * four), but a hole that cannot hold its own link would corrupt the
+	 * chain.
 	 */
 	if (klen < sizeof(*hole) || vlen < sizeof(*hole)) {
 		kprintf("apfs: a %u-byte key and %u-byte value cannot be put "
@@ -4379,8 +3915,8 @@ leaf_delete(uint8_t *node, uint32_t pos)
 }
 
 /*
- * How many records a tree holds is written ONCE, in the btree_info at the end
- * of its root node -- not in the leaf the record went into.  So an insert into
+ * How many records a tree holds is written once, in the btree_info at the end
+ * of its root node, not in the leaf the record went into.  So an insert into
  * a leaf moves two nodes, and the root is the second.
  */
 static void
@@ -4395,11 +3931,9 @@ tree_count_add(uint8_t *root, int64_t delta)
 
 /*
  * And the longest key and value it has ever held, in the same footer, raised
- * to cover a record that is longer than anything before it.
- *
- * Never lowered.  A footer that claims more than any record needs is accepted
- * and one that claims less is refused -- measured, not assumed -- so a delete
- * has nothing to do here, and does not have to walk the tree to find out.
+ * to cover a record longer than any before it.  Never lowered: a footer that
+ * claims more than any record needs is accepted and one that claims less is
+ * refused, so a delete has nothing to do here.
  */
 static void
 tree_longest_raise(uint8_t *root, uint32_t klen, uint32_t vlen)
@@ -4418,11 +3952,9 @@ tree_longest_raise(uint8_t *root, uint32_t klen, uint32_t vlen)
 }
 
 /*
- * The longest key and value in one node, raising what the caller already has.
- *
- * A node of FIXED key and value size has none: its two sizes are stated in the
- * footer's own fixed part and the longest-* fields of such a tree are zero, so
- * measuring one would put a number where the format wants none.
+ * The longest key and value in one node, raising what the caller has.  A
+ * fixed-KV node has none: the footer states its sizes and leaves the
+ * longest-* fields zero.
  */
 static void
 node_longest(const uint8_t *node, uint32_t *klen, uint32_t *vlen)
@@ -4444,29 +3976,14 @@ node_longest(const uint8_t *node, uint32_t *klen, uint32_t *vlen)
 }
 
 /*
- * THE EXTENT REFERENCE TREE CAN NOW BE TWO LEVELS DEEP.
- *
- * It was a single node that was its own root, and that was an honest edge
- * for as long as nothing lived on it: sixteen records, refused out loud.
- * Then the volume's steady state grew to within a record of sixteen, and the
- * first boot whose layout touched the ceiling refused perfectly ordinary
- * writes on a volume that was nearly empty.  An edge a full disk hits is a
- * limit; one an idle disk hits is a defect.
- *
- * The shape is the catalog's root division with the virtual half removed: a
- * PHYSICAL tree names its children by block address, so there is no object
- * map to tell, no oid to mint, and the root -- whose address the volume
- * superblock carries, rewritten by the spine every checkpoint -- keeps being
- * the one name anybody holds.  What is left is the walk: every writer below
- * reads the root, follows one child when there is an index level, edits the
- * leaf, and writes the pair back through cow_physical -- the leaf first,
- * then the root that must name the leaf's new address.
- *
- * The root's copy of a leaf's FIRST key is refreshed on every settle,
- * unconditionally: all keys here are eight bytes, so the separator update
- * that cost the catalog a reindex pass with delete-and-insert is a single
- * aligned store, and storing it always is cheaper than deciding whether the
- * first record moved.
+ * The extent reference tree, one or two levels deep: the catalog's root
+ * division without the virtual half.  A physical tree names children by
+ * block, so there is no object map to tell and no oid to mint, and the
+ * volume superblock names the root's address.  Every writer below reads the
+ * root, follows one child when there is an index level, edits the leaf, and
+ * writes both back through cow_physical, leaf first.  The root's copy of a
+ * leaf's first key is refreshed on every settle: keys here are eight bytes,
+ * so that is one store.
  */
 struct extref_walk {
 	uint64_t	ew_leaf_bno;	/* where the records are          */
@@ -4480,7 +3997,7 @@ static uint64_t	 extdrop_n;	/* ...and emptied ones taken out       */
 
 /*
  * Read the root and, when the tree has an index level, the leaf covering
- * `start`.  With one level the root IS the leaf and the caller works in the
+ * `start`.  With one level the root is the leaf and the caller works in the
  * root buffer; `leaf` is not touched.
  */
 static int
@@ -4535,19 +4052,11 @@ extref_descend(uint64_t start, uint8_t *root, uint8_t *leaf,
 }
 
 /*
- * The edited node goes back to the device, and everything that names it
- * follows: the leaf through cow_physical, the root's value for that child,
- * the root's copy of the child's first key, and the root itself -- whose new
- * address lands in ac_extref_bno for the spine to write into the volume
- * superblock.  With one level this is just the root's own copy-out.
- *
- * The first-key refresh is stricter than the checker asks, and knowingly:
- * apfsck was measured holding "index key absent from child node" to the
- * CATALOG and accepting a stale-but-lower separator here (the probe left one
- * behind and the volume passed).  A separator below the child's first key
- * still orders every descent correctly -- it is identity, not order, that
- * lapses -- but Apple's own trees keep the identity, and eight bytes stored
- * unconditionally is cheaper than a class of drift nobody is watching for.
+ * Write the edited leaf back through cow_physical, point the root's entry
+ * (value and first-key copy) at it, and copy the root, leaving its new
+ * address in ac_extref_bno for the spine.  With one level, just the root.
+ * apfsck accepts a stale, lower separator here, unlike in the catalog, but
+ * Apple's trees keep the key exact, and so does this.
  */
 static int
 extref_settle(struct extref_walk *ew, uint64_t xid, uint8_t *root,
@@ -4587,12 +4096,11 @@ extref_settle(struct extref_walk *ew, uint64_t xid, uint8_t *root,
 }
 
 /*
- * The root is full and still a leaf: divide it down, the way the catalog's
- * root divides -- its records go to two new nodes at its own level and it
- * rebuilds in place one level up, holding a separator for each.  The volume
- * superblock names this tree's ROOT, so the root is the one node that may
- * not move away underneath it, and it does not: only its address moves, as
- * it does on every checkpoint.
+ * The root is full and still a leaf: divide it down, as the catalog's root
+ * divides.  Its records go to two new nodes at its level and it rebuilds one
+ * level up, holding a separator for each.  The volume superblock names this
+ * tree's root, so the root stays the root; only its address moves, as on
+ * every checkpoint.
  */
 static int
 extref_grow_level(uint64_t xid)
@@ -4638,12 +4146,9 @@ extref_grow_level(uint64_t xid)
 	if (rv != FS_APFS_E_OK)
 		goto out;
 	/*
-	 * The new root is NOT a leaf any more, and the flag has to say so
-	 * itself: the level alone does not, and a level-one node still
-	 * flagged LEAF is what the checker calls "nonleaf node flagged as
-	 * leaf".  The catalog's division never met this, because a catalog
-	 * root was an index already; this tree's root is losing leafhood for
-	 * the first time in its life right here.
+	 * The new root is not a leaf, and the flag must say so: a level-one
+	 * node flagged LEAF is "nonleaf node flagged as leaf".  A catalog root
+	 * is an index already and never meets this.
 	 */
 	rv = node_rebuild_as(root, 0, 0, nr,
 	    (uint16_t)(bl.bl_flags & ~APFS_BTNODE_LEAF), APFS_OBJ_BTREE_ROOT);
@@ -4661,9 +4166,8 @@ extref_grow_level(uint64_t xid)
 		goto out;
 	}
 	/*
-	 * PHYSICAL: each half's object id IS its block number, which is the
-	 * whole difference from the catalog's division -- nothing is minted
-	 * and no map is told.
+	 * Physical: each half's object id is its block number, so nothing is
+	 * minted and no map is told.
 	 */
 	for (i = 0; i < 2; i++) {
 		n = (struct apfs_btree_node_phys *)(i == 0 ? lo : hi);
@@ -4713,12 +4217,11 @@ out:
 }
 
 /*
- * A LEAF of the two-level tree is full: split it where it stands.  The upper
+ * A leaf of the two-level tree is full: split it where it stands.  The upper
  * half is a new node, the lower keeps the leaf's block (and so its place in
- * the root), and the root gains one separator -- and when the ROOT has no
- * room for that, the refusal is out loud and nothing has moved: this writer
- * walks two levels, which is about two hundred and fifty runs, and a volume
- * that outgrows THAT has outgrown the honest edge of this rung.
+ * the root), and the root gains one separator.  When the root has no room
+ * for it, the refusal is out loud and nothing has moved: this writer walks
+ * two levels, about two hundred and fifty runs.
  */
 static int
 extref_split_leaf(uint64_t start, uint64_t xid)
@@ -4811,12 +4314,10 @@ out:
 }
 
 /*
- * A newly allocated run belongs to somebody: say so in the extent reference
- * tree.  The record count lives in the ROOT's footer whichever node takes
- * the record, and a full node is no longer the end of the answer -- a root
- * that is its own leaf divides down, a full leaf under an index splits, and
- * the insert is asked again.  Three rounds bound it: a division, a split,
- * and the insert that then cannot be refused for room.
+ * Record a newly allocated run's owner in the extent reference tree; the
+ * record count is in the root's footer.  A full node divides (a root that is
+ * its own leaf) or splits (a leaf under an index) and the insert is asked
+ * again: a division, a split, then an insert that fits.
  */
 static int
 extref_insert_pv(uint64_t start, const struct apfs_phys_ext_val *pv,
@@ -4887,15 +4388,9 @@ extref_insert(uint64_t start, uint64_t blocks, uint64_t owner, uint64_t xid,
 }
 
 /*
- * A run has grown at its end: say so in the extent reference tree, instead of
- * giving it a second record for blocks that touch the first.
- *
- * This is what keeps appending from being quadratic in records.  Two runs
- * that touch, with one owner between them, ARE one run; the format says so
- * by giving the record a length, and writing two records for them is the
- * thing that should never have been asked of the tree.  The length grows in
- * place and the key does not change, so no separator above can be wrong
- * afterwards.
+ * A run has grown at its end: lengthen its record rather than add one for
+ * touching blocks, which keeps appending from being quadratic in records.
+ * The key does not change, so no separator above can go wrong.
  */
 static int
 extref_extend(uint64_t start, uint64_t extra, uint64_t xid, void *buf)
@@ -4941,22 +4436,10 @@ out:
 }
 
 /*
- * A run has lost blocks off its END, or lost all of them: say so in the extent
- * reference tree.
- *
- * The key is where the run STARTS, and a truncation only ever moves its end,
- * so a shortened record does not re-sort and the edit is a length in place --
- * the same shape, and the same reason, as extref_extend.
- *
- * Leaving it out is not a leak nobody notices.  apfsck recomputes what the
- * volume owns from exactly these records, and a copy of the image whose file
- * extent had been shortened but whose reference had not drew "Physical extent
- * record: bad reference count" -- measured, before this existed.
- *
- * A run somebody else also names is refused rather than quietly de-referenced.
- * Nothing in this kernel makes one yet; a clone would, and the difference
- * between shortening a run and dropping one reference to it is the whole of
- * what a clone is.
+ * A run has lost blocks off its end, or all of them: say so in the extent
+ * reference tree, from which apfsck recomputes what the volume owns.  The key
+ * is the run's start, so this is a length in place.  A run somebody else
+ * also names (a clone; none are made here) is refused, not de-referenced.
  */
 static int
 extref_shrink(uint64_t start, uint64_t keep, uint64_t xid, void *buf,
@@ -5017,14 +4500,11 @@ extref_shrink(uint64_t start, uint64_t keep, uint64_t xid, void *buf,
 			    (pv->pe_len_and_kind & ~APFS_PEXT_LEN_MASK) | keep;
 
 		/*
-		 * A LEAF WITH NOTHING IN IT LEAVES THE TREE.  Settling one
-		 * would refresh the root's separator from a first record the
-		 * leaf no longer has, and a separator over an empty node is
-		 * the shape the catalog measured as "index key absent from
-		 * child node".  So the root's entry goes instead, and the
-		 * block goes back.  A root left holding ONE empty child --
-		 * a volume with no owned runs at all -- folds back to being
-		 * its own leaf, which is where this tree began.
+		 * A leaf with nothing in it leaves the tree: settling it would
+		 * refresh the root's separator from a first record it no
+		 * longer has ("index key absent from child node").  So the
+		 * root's entry goes, and the block goes back.  A root left
+		 * holding one empty child folds back to being its own leaf.
 		 */
 		if (gone && ew.ew_two) {
 			struct btree_layout	 rb;
@@ -5071,16 +4551,10 @@ out:
 }
 
 /*
- * Which leaf a key belongs in: the last one holding a key no greater than it.
- *
- * A walk in tree order is enough to answer that, and it was how every writer
- * here asked -- until the reader learned to descend, and leaf_home came to
- * answer the same question in three block reads instead of the whole tree.
- *
- * This is kept because two answers are worth more than one when the question
- * is where a write lands.  The self-test asks both about every key on the
- * volume and requires them to agree, so the descent is checked against the
- * thing it replaced rather than against itself.
+ * Which leaf a key belongs in, by a walk in tree order: the last one holding
+ * a key no greater than it.  leaf_home answers the same question by descent;
+ * the self-test asks both about every key on the volume and requires them to
+ * agree.
  */
 bool
 leaf_find(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
@@ -5105,34 +4579,16 @@ leaf_find(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 /* ---- splitting ------------------------------------------------------------ */
 
 /*
- * A NODE RUNS OUT OF ROOM
+ * A node runs out of room.  A split makes a new object, and of the three
+ * counters involved two are traps:
  *
- * Every insert so far has been able to refuse, and the refusal was honest
- * while nothing depended on it.  It cannot stay: four appends fill this
- * container's extent leaf, and a filesystem that stops working after four
- * appends is not one.
+ *	nx_next_oid       the container's: the source of a new virtual oid
+ *	apfs_next_obj_id  the volume's, numbering inodes -- another namespace
+ *	bt_node_count     in the root's footer, one more after a split;
+ *	                  bt_key_count does not move
  *
- * A split is the first operation here that makes a NEW object rather than
- * moving one, and that is the part measurement had to settle.  Three counters
- * had to be found before any of it could be written, and two of them are
- * traps:
- *
- *	nx_next_oid      1126  the CONTAINER's, and the source of a fresh
- *	                       virtual object id
- *	apfs_next_obj_id   40  the VOLUME's, which numbers inodes -- a
- *	                       different namespace, and already far behind
- *	                       the tree's own nodes at 1125
- *	bt_node_count       3  in the root's footer, and one more after this;
- *	                       bt_key_count does NOT move, because the same
- *	                       records are still there
- *
- * The new half is a virtual object, so writing it does not make it reachable:
- * the volume's object map has to gain an ENTRY, which is an insert into a
- * fixed-size-KV tree, and the parent has to gain a separator, which is an
- * insert into a variable one.  Both had room, measured before the code -- the
- * object map has 109 spare entries in its table of contents and the root six.
- * A parent with none would have to split in turn and the tree would gain a
- * level; that is refused out loud, and it is the honest edge of this rung.
+ * The new half is virtual, so writing it does not make it reachable: the
+ * volume's object map gains an entry and the parent a separator.
  */
 
 /* Would a record of this size go into this node as it stands? */
@@ -5152,11 +4608,9 @@ leaf_has_room(const uint8_t *node, uint32_t klen, uint32_t vlen)
 		return (false);
 	need = klen + vlen;
 	/*
-	 * Asked exactly the way leaf_insert answers it, holes and all.  Not of
-	 * a FIXED-KV node: leaf_insert_fixed takes from the span and only from
-	 * there, and the two fixed trees here -- the object map and the free
-	 * queues -- never reach this, so the difference is a rule stated rather
-	 * than a case ever taken.
+	 * Asked the way leaf_insert answers it, holes and all -- except for a
+	 * fixed-KV node, which leaf_insert_fixed fills from the span only
+	 * (omap_slot_drop leaves no holes behind).
 	 */
 	if (!bl.bl_fixed) {
 		if (hole_find(&n->btn_key_free_list, bl.bl_keys, 1, klen) !=
@@ -5170,11 +4624,9 @@ leaf_has_room(const uint8_t *node, uint32_t klen, uint32_t vlen)
 }
 
 /*
- * The same insert, for a node whose keys and values are all one size.  The
- * object map is such a tree, and a split needs an entry in it -- so this and
- * leaf_insert are the same arithmetic told apart by four bytes of table entry
- * against eight, which is the whole of the difference between the two node
- * layouts this format has.
+ * The same insert, for a node whose keys and values are all one size (the
+ * object map, which a split needs an entry in).  The arithmetic is
+ * leaf_insert's; only the table entry differs, four bytes against eight.
  */
 static int
 leaf_insert_fixed(uint8_t *node, uint32_t pos, const void *key, uint32_t klen,
@@ -5227,23 +4679,13 @@ leaf_insert_fixed(uint8_t *node, uint32_t pos, const void *key, uint32_t klen,
 }
 
 /*
- * Build a node holding records [from, to) of another, laid out afresh, and
- * SAYING WHAT KIND OF NODE IT IS.
- *
- * Rebuilding rather than moving bytes about is the point.  A node's key area
- * accumulates holes as records come and go, and half of one copied verbatim
- * would carry a free-list chain describing space that is no longer in it.
- * Re-inserting each record produces a layout correct by construction, through
- * the same insert every other writer here goes through.
- *
- * The kind is an argument because the tree can now gain a level, and the two
- * halves a root splits into are not roots.  Three things say so and the
- * checker reads all three: the ROOT flag, which also decides whether the last
- * forty bytes are a btree_info or free space; the object type, which is
- * BTREE_ROOT for one and BTREE_NODE for the others; and the level.  Leaving
- * the flag on a half was answered with "B-tree node: wrong object type for
- * root" and leaving the type behind with "wrong object type for nonroot" --
- * the same obligation seen from either side.
+ * Build a node holding records [from, to) of another, laid out afresh and
+ * saying what kind of node it is.  Re-inserting each record gives a layout
+ * correct by construction; half a node copied verbatim would carry a hole
+ * chain describing space no longer in it.  The kind is an argument because
+ * a root's halves are not roots: the ROOT flag (which also decides whether
+ * the last 40 bytes are a btree_info), the object type and the level must
+ * all say so ("B-tree node: wrong object type for root" / "for nonroot").
  */
 static int
 node_rebuild_as(const uint8_t *src, uint32_t from, uint32_t to, uint8_t *dst,
@@ -5275,11 +4717,10 @@ node_rebuild_as(const uint8_t *src, uint32_t from, uint32_t to, uint8_t *dst,
 	    (((d->btn_flags & APFS_BTNODE_ROOT) != 0) ?
 	    APFS_BTREE_INFO_SIZE : 0));
 	/*
-	 * No holes, and the chains have to SAY so.  0xFFFF is the format's
-	 * "no such offset"; a zero would name the first byte of the key area
-	 * as a hole, and a checker walking the chain would read a live record
-	 * as a hole header -- which is the mistake the free queues made once
-	 * already ("B-tree node: free key is too small").
+	 * No holes, and the chains must say so.  0xFFFF is the format's "no
+	 * such offset"; a zero would name the first byte of the key area as a
+	 * hole, and a checker would read a live record as a hole header
+	 * ("B-tree node: free key is too small").
 	 */
 	d->btn_key_free_list.nl_off = APFS_BTOFF_INVALID;
 	d->btn_key_free_list.nl_len = 0;
@@ -5312,7 +4753,7 @@ node_rebuild(const uint8_t *src, uint32_t from, uint32_t to, uint8_t *dst)
 }
 
 /*
- * How many NODES a tree has, which lives beside the record count in the
+ * How many nodes a tree has, which lives beside the record count in the
  * btree_info at the end of the root -- so every split moves the root as well,
  * whether or not the root is the node that split.
  */
@@ -5328,8 +4769,8 @@ tree_nodes_add(uint8_t *root, int64_t delta)
 
 /*
  * And the same number read back, from a buffer the caller says is a root.
- * Says so rather than trusting: the forty bytes are a btree_info only in a
- * node carrying the ROOT flag, and in any other node they are records.
+ * Checked: the last 40 bytes are a btree_info only in a node carrying the
+ * ROOT flag, and records in any other.
  */
 bool
 tree_nodes_of(const uint8_t *root, uint64_t *out)
@@ -5345,20 +4786,11 @@ tree_nodes_of(const uint8_t *root, uint64_t *out)
 }
 
 /*
- * WHO IS ABOVE A NODE
- *
- * A split hands its parent a separator, and until now "the parent" was a word
- * for the root: the tree was two levels deep and there was nothing else it
- * could be.  A tree that can gain a level has to be asked.
- *
- * By SEARCH and not by key.  Descending on the key is faster and is what a
- * lookup does, but it answers a different question -- which node a key BELONGS
- * in -- and the two agree only while the tree is in order, which is exactly
- * what the caller is in the middle of maintaining.  Following the child
- * pointers until the block turns up cannot be fooled by a separator that is
- * wrong, and the cost is a handful of node reads once per split.
- *
- * The path it fills in is in apfs_priv.h, because the split test reads one.
+ * Who is above a node, found by following child pointers until the block
+ * turns up rather than by descending on its key: the two agree only while
+ * the tree is in order, which the caller is in the middle of maintaining.
+ * A handful of reads per split.  The path is in apfs_priv.h because the
+ * split test reads one.
  */
 static bool
 path_walk(uint64_t bno, uint64_t want, struct tree_path *tp, uint32_t depth)
@@ -5412,27 +4844,12 @@ path_to(uint64_t want, struct tree_path *tp)
 }
 
 /*
- * MORE THAN ONE NODE AT A TIME
- *
- * The records one operation touches are not always neighbours, and a tree that
- * splits keeps making that truer.  A name's records never were: an entry sorts
- * under the PARENT's object id while the inode and its data-stream reference
- * sort under the child's.  A file's records LOOK like neighbours -- the inode,
- * its dstream id and its extents share an object id and differ only in the
- * record type -- but neighbours in key order are in the same node only until a
- * split falls between them, and then a truncate that could edit one node could
- * not do its job at all.
- *
- * So this is the shape every writer here uses to change several nodes as one
- * event: name the leaves, read them all, edit them in memory, and commit.  A
- * refusal therefore costs nothing, which matters more than it sounds -- the
- * alternative is a writer that has already copied one node when it discovers
- * the second has no room.
- *
- * ONE COPY PER NODE PER TRANSACTION is the rule underneath it.  Copying a node
- * twice would leave the second copy replacing a node the first had already
- * released, so the leaves are de-duplicated as they are named and every edit
- * lands in the one buffer that stands for that node.
+ * More than one node at a time.  A name's records are never neighbours (an
+ * entry sorts under the parent's id, the inode under the child's), and a
+ * split can fall between a file's inode and its extents.  So every writer
+ * here names the leaves, reads them all, edits them in memory, and commits:
+ * a refusal costs nothing.  One copy per node per transaction: the leaves
+ * are de-duplicated as they are named.
  */
 
 /*
@@ -5455,10 +4872,7 @@ struct leaf_edit {
 
 /*
  * Remember a leaf, once, and say which slot it took -- or APFS_EDIT_LEAVES if
- * there is no room for another, which the caller must check.  Answering with
- * the count itself rather than writing past the end is the difference between
- * a refusal and a corrupted stack: this used to trust its callers to know how
- * many leaves they could touch, which was true of the two that existed.
+ * there is no room for another, which the caller must check.
  */
 static uint32_t
 edit_leaf(struct leaf_edit *ne, uint64_t bno)
@@ -5475,7 +4889,7 @@ edit_leaf(struct leaf_edit *ne, uint64_t bno)
 }
 
 /*
- * Empty, and SAFE TO FREE.  Called before the first leaf is named, because
+ * Empty, and safe to free.  Called before the first leaf is named, because
  * every one of these operations can refuse before it reads anything and they
  * all release through the same label on the way out.
  */
@@ -5495,15 +4909,10 @@ edit_init(struct leaf_edit *ne)
 }
 
 /*
- * Has any of it reached the disk yet?
- *
- * A commit refuses before its first copy -- room is settled in memory, which is
- * the whole point of the shape above -- so a caller whose commit was refused
- * can put back the volume counters it had already adjusted, and MUST: nothing
- * was written, and the next checkpoint would otherwise publish a file count for
- * a file that is still there.  Once a copy has landed the answer is yes and the
- * checkpoint is not to be written at all, so what the counters say stops
- * mattering.
+ * Has any of it reached the disk yet?  A commit refuses before its first
+ * copy, so a caller whose commit was refused must put back the volume
+ * counters it adjusted; once a copy has landed, the checkpoint must not be
+ * written at all.
  */
 static bool
 edit_moved(const struct leaf_edit *ne)
@@ -5564,52 +4973,9 @@ edit_free(struct leaf_edit *ne)
 }
 
 /*
- * A NODE'S FIRST KEY IS ALSO ITS PARENT'S BUSINESS
- *
- * The key an index node stores for a child is that child's own first key, and
- * the checker does not treat that as a convention:
- *
- *	B-tree: index key absent from child node.
- *
- * Which means a delete has a consequence a delete does not look like it has.
- * Take the first record out of a leaf and the leaf is still sorted, still
- * reachable, still correct to read -- and the key its parent files it under
- * describes a record that is no longer in it.  The same is true of an insert
- * that lands before everything else in a node.
- *
- * So every node this edit touched is held up against what its parent says
- * about it, and the parent is corrected where they disagree.  BY ASKING THE
- * PARENT rather than by remembering the key beforehand: the parent's copy is
- * the thing that has to be true, so comparing against it checks the invariant
- * itself instead of a proxy for it.
- *
- * The correction can cascade.  Fixing a parent's first entry changes the
- * parent's own first key, which makes ITS parent stale -- so a corrected node
- * joins the edit and the loop reaches it, all the way to the root, which has
- * nobody above it to tell.
- *
- * The key is REPLACED and not patched, because keys are not all one size: an
- * extent key is sixteen bytes, an inode's is eight, a name's is as long as the
- * name.  So it is a delete and an insert in the same slot -- the entry cannot
- * move, since the new key is still inside the range that child owns -- and
- * that can fail for want of room, which is why this runs before anything has
- * been copied.
- */
-/*
- * A NODE THAT HAS LOST ITS LAST RECORD LEAVES THE TREE
- *
- * It cannot stay.  A node is filed above under a key that is its own first
- * key, and a node with no records has no first key, so the index above it
- * describes a record nobody can find -- which is not a matter of tidiness:
- * an emptied node left in place was answered with
- *
- *	B-tree: keys are out of order.
- *
- * measured on a copy of the image before this was written.  Which is why the
- * writer used to refuse the delete outright rather than leave one behind.
- *
- * Taking it out is five things, and the same measurement says what each one is
- * for -- everything below done except one:
+ * A node that has lost its last record leaves the tree: with no first key it
+ * cannot be filed above.  Five things, each with the complaint its omission
+ * draws:
  *
  *	the parent stops naming it	B-tree: keys are out of order
  *	the object map forgets its oid	Omap record: oid-xid combination is
@@ -5618,19 +4984,10 @@ edit_free(struct leaf_edit *ne)
  *	the tree counts one node fewer	Catalog: wrong node count in info footer
  *	the volume owns one block fewer	Volume superblock: bad block count
  *
- * This does the first; the other four happen in edit_commit, which is where
- * blocks move and where the object map is told.  The node is not copied at
- * all -- it is marked gone, and a gone node's block is released instead.
- *
- * WHAT THIS DOES NOT DO is give a LEVEL back.  A root left with a single child
- * could be replaced by that child, and the same measurement says it does not
- * have to be: a root with one child is accepted in silence.  So the tree can
- * end up taller than its contents need, which costs a lookup one hop and is
- * not a correctness question.  Collapsing it is its own rung.
- *
- * The cascade IS here, though, and it falls out of the shape rather than being
- * arranged: the parent joins the edit, and if it was holding nothing but this
- * child it is now empty itself, and the pass over the edit reaches it.
+ * This does the first; edit_commit does the rest.  The node is not copied,
+ * only marked gone.  A level is never given back (a root with one child is
+ * accepted), but the cascade happens: the parent joins the edit, and if it
+ * is now empty the pass reaches it.
  */
 static int
 node_drop(struct leaf_edit *ne, uint32_t i, uint8_t *scratch)
@@ -5678,10 +5035,10 @@ node_drop(struct leaf_edit *ne, uint32_t i, uint8_t *scratch)
 		return (FS_APFS_E_NOTFOUND);
 	}
 	/*
-	 * The root is the one node that cannot go, since the volume superblock
-	 * names it -- so a tree whose last leaf has emptied stops here rather
-	 * than unmaking itself.  Nothing can reach this while the volume holds
-	 * a single file, because the root directory's own records are in it.
+	 * The root cannot go, since the volume superblock names it, so a tree
+	 * whose last leaf has emptied stops here.  Nothing reaches this while
+	 * the volume holds anything: the root directory's own records are in
+	 * it.
 	 */
 	if (bl.bl_nkeys == 1 && ne->le_oid[pslot] == g_apfs.ac_root_tree_oid) {
 		kprintf("apfs: the tree's last node has emptied -- a tree with "
@@ -5703,6 +5060,16 @@ node_drop(struct leaf_edit *ne, uint32_t i, uint8_t *scratch)
 	return (FS_APFS_E_OK);
 }
 
+/*
+ * A node's first key is also its parent's business: an index node files a
+ * child under the child's first key ("B-tree: index key absent from child
+ * node"), so deleting or inserting at the front of a leaf leaves the parent
+ * stale.  Each node in the edit is compared against its parent's entry and
+ * the parent corrected, which can cascade up to the root, a corrected parent
+ * joining the edit.  Keys differ in size, so the key is replaced by a delete
+ * and an insert in the same slot, which can fail for room: this runs before
+ * anything is copied.
+ */
 static int
 edit_reindex_one(struct leaf_edit *ne, uint32_t i, uint8_t *scratch)
 {
@@ -5801,16 +5168,10 @@ edit_reindex(struct leaf_edit *ne, uint8_t *scratch)
 	int		rv;
 
 	/*
-	 * The bound is re-read every time round, because correcting a parent
-	 * puts that parent INTO this list -- and it may need correcting too.
-	 *
-	 * And the whole pass repeats until nothing changes, because a node can
-	 * be dealt with and then invalidated by a node dealt with after it: a
-	 * parent already walked past is emptied by the LAST of its children
-	 * going, and an empty node that nobody looks at again is exactly what
-	 * this is here to prevent.  Two numbers say whether anything happened
-	 * -- how many nodes the edit holds, and how many have left the tree --
-	 * and a pass that moves neither is a pass that found nothing to do.
+	 * Repeat until nothing changes: correcting a parent adds it to the
+	 * list (so the bound is re-read), and a parent already passed can be
+	 * emptied by its last child going.  A pass that moves neither le_n nor
+	 * le_dropped is done.
 	 */
 	do {
 		settled = ne->le_n + ne->le_dropped;
@@ -5846,23 +5207,20 @@ edit_commit(struct leaf_edit *ne, int64_t records, uint64_t xid,
 	int			rv;
 
 	/*
-	 * FIRST, and in memory: an index that no longer describes its child is
-	 * the one thing here that can still refuse, and it can add nodes to
-	 * the list this function is about to copy.  It is also where a node
-	 * that has lost its last record leaves the tree, which takes nodes OUT
-	 * of that list -- so the two counts below are not both le_n.
+	 * First, in memory: the reindex is the one thing here that can still
+	 * refuse, and it can add nodes to the list about to be copied.  It is
+	 * also where an emptied node leaves the tree, taking it out of that
+	 * list, so the two counts below are not both le_n.
 	 */
 	rv = edit_reindex(ne, scratch);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
 
 	/*
-	 * What the longest record in this edit turned out to be, measured after
-	 * the reindex above rather than passed in by the caller.  Measured
-	 * because an index key is a COPY of a leaf's first key, so an edit that
-	 * puts a long key at the start of a leaf makes the node ABOVE it hold
-	 * one too -- and the reindex is what puts it there.  No caller could
-	 * report that about itself.
+	 * The longest record in this edit, measured after the reindex: an
+	 * index key is a copy of a leaf's first key, so a long key at the
+	 * start of a leaf puts one in the node above too, which no caller
+	 * could report about itself.
 	 */
 	klen = 0;
 	vlen = 0;
@@ -5922,7 +5280,7 @@ edit_commit(struct leaf_edit *ne, int64_t records, uint64_t xid,
 
 	/*
 	 * The volume owns one block fewer per node dropped, and it has to say
-	 * so BEFORE the spine runs -- the volume superblock carrying that count
+	 * so before the spine runs: the volume superblock carrying that count
 	 * is one of the things the spine copies.
 	 */
 	g_apfs.ac_fs_alloc_count -= ne->le_dropped;
@@ -5937,24 +5295,10 @@ edit_commit(struct leaf_edit *ne, int64_t records, uint64_t xid,
 }
 
 /*
- * THE TREE GAINS A LEVEL
- *
- * Every other split has somewhere to put its separator.  The root does not:
- * there is nothing above it, and there cannot be -- the volume superblock
- * names the root's OID, so a root that made way for a new node above it would
- * be a root the volume could no longer find.
- *
- * So the root does not move.  It splits DOWNWARD: its records go into two new
- * nodes at the level it used to occupy, and the root itself is rebuilt in
- * place, one level higher, holding two records that name them.  It keeps its
- * oid, its block moves the way every copy's does, and the tree is a level
- * deeper without anything outside it having to be told.
- *
- * Both halves are therefore NEW objects -- which is why the object map's
- * insertion side had to become a list; a leaf split makes one and this makes
- * two, in a node that has to be copied once either way.
- *
- * What the checker asks for, leaving out one obligation at a time:
+ * The tree gains a level.  Nothing can go above the root, which the volume
+ * superblock names by oid, so it splits downward: its records go into two
+ * new nodes, and it is rebuilt one level higher naming them, keeping its
+ * oid.  What apfsck says to each obligation left out:
  *
  *	leaving out			apfsck answers
  *	  the root's new level		"B-tree: node levels are corrupted"
@@ -5966,11 +5310,8 @@ edit_commit(struct leaf_edit *ne, int64_t records, uint64_t xid,
  *	  the volume's block count	"Volume superblock: bad block count"
  *	  the container's next oid	"Object header: unassigned object id"
  *
- * The last is the container's nx_next_oid, and it is the same trap the create
- * rung found in the volume's apfs_next_obj_id one namespace down: it is not a
- * counter kept for tidiness, it is an assertion that everything at or above it
- * is unused, and an object handed a number the container still calls free is
- * caught by the header check before anything else is looked at.
+ * nx_next_oid, like apfs_next_obj_id, asserts that everything at or above it
+ * is unused, so an object numbered from the free range fails first.
  */
 int
 tree_grow(uint64_t xid, uint8_t *scratch)
@@ -6049,7 +5390,7 @@ tree_grow(uint64_t xid, uint8_t *scratch)
 
 	/*
 	 * And the root: the same node with no records in it, one level up.
-	 * Rebuilding an EMPTY range is how it keeps its flags, its object type
+	 * Rebuilding an empty range is how it keeps its flags, its object type
 	 * and its btree_info without any of that being written out again here.
 	 */
 	rv = node_rebuild_as(scratch, 0, 0, nr, bl.bl_flags,
@@ -6133,37 +5474,19 @@ broken:
 }
 
 /*
- * Split the node at `bno` in two and tell everything that has to know.
+ * Split the node at `bno` in two and tell everything that has to know: the
+ * lower half (keeping its oid), the upper half (a new object), the parent
+ * gaining a separator, the root counting the nodes, the volume's object map
+ * gaining an entry, and the spine.  Nothing between them moves: interior
+ * nodes name children by oid, and the object map absorbs the difference.
  *
- * Objects move together and none of them is reachable until the checkpoint
- * commits: the lower half (keeping the oid it had), the upper half (a brand
- * new object), the parent that gains a separator, the ROOT whose btree_info
- * counts the tree's nodes, the volume's object map that gains an entry, and
- * the spine above all of it.  The parent and the root are the same node in a
- * two-level tree and different ones in a deeper tree, which is the whole of
- * what changed when the tree learned to grow.
+ * Room above is asked for first, before a block is allocated: a split that
+ * found the parent full half way would have nowhere to put its new half.  A
+ * full parent splits in turn, and a full root grows the tree (tree_grow).
  *
- * NOTHING BETWEEN THEM MOVES, and that is worth saying because it looks like
- * an omission.  An interior node names its children by oid, and a copy keeps
- * its oid -- so a node three levels down can be rewritten without the levels
- * above it knowing, and the object map absorbs the whole difference.  That
- * indirection is what copy-on-write buys with the lookup it costs on every
- * descent.
- *
- * ROOM ABOVE IS ASKED FOR FIRST, before a block is allocated or a byte
- * written.  A split that got half way and found the parent full would have
- * nowhere to put the half it had already made.  A full parent makes room the
- * same way this node is about to -- by splitting, which asks the same question
- * one level up -- and the recursion ends at the root, which cannot split
- * sideways and grows the tree instead.  Either way the question is then asked
- * again of a parent that is half empty by construction.
- *
- * `at` is where to cut, and zero means the middle.  A caller that cares is a
- * TEST: putting a chosen record at the start of the upper half is how the
- * index self-test arranges for that record to be deleted afterwards, which is
- * the one thing that makes a parent's key wrong and which no ordinary writer
- * can be relied on to do on demand.  Zero is not a special value being stolen
- * -- a split there would leave the lower half empty and is refused anyway.
+ * `at` is where to cut, zero meaning the middle; only the index self-test
+ * cares, placing a chosen record first in the upper half so that deleting it
+ * makes the parent's key wrong.
  */
 int
 node_split_at(uint64_t bno, uint32_t at, uint64_t xid, uint8_t *scratch)
@@ -6231,7 +5554,7 @@ node_split_at(uint64_t bno, uint32_t at, uint64_t xid, uint8_t *scratch)
 		/*
 		 * The separator is the first key of the upper half, which is
 		 * this node's key at `half` -- known before the halves exist,
-		 * because its LENGTH is what the parent needs room for.
+		 * because its length is what the parent needs room for.
 		 */
 		btree_entry_loc(&bl, half, &koff, &klen, &voff, &vlen);
 		if (klen == 0 || klen > APFS_BLOCK_SIZE) {
@@ -6261,18 +5584,9 @@ node_split_at(uint64_t bno, uint32_t at, uint64_t xid, uint8_t *scratch)
 			goto out;
 		}
 		/*
-		 * The parent is full, so it has to make room of its own before
-		 * this node can hand it anything -- and what it does about that
-		 * is the same question one level up.  A full node that is not
-		 * the root SPLITS, which hands its own parent a separator; a
-		 * full ROOT cannot, and grows the tree instead.  So the
-		 * recursion always ends, and it ends at the only node that has
-		 * another way out.
-		 *
-		 * Whatever happens up there, everything worked out below is
-		 * stale afterwards -- the parent may be a different node now --
-		 * so the loop starts again from the victim rather than trying
-		 * to patch up what it had.
+		 * The parent is full, so it makes room first -- it splits, or a
+		 * full root grows the tree -- and since that can move the
+		 * parent, the loop starts again from this node.
 		 */
 		rv = under_root ? tree_grow(xid, scratch) :
 		    node_split_at(parent_bno, 0, xid, scratch);
@@ -6316,7 +5630,7 @@ node_split_at(uint64_t bno, uint32_t at, uint64_t xid, uint8_t *scratch)
 	}
 
 	o = (struct apfs_obj_phys *)lo;
-	o->o_oid = lo_oid;	/* virtual: the oid is a name, and it keeps it */
+	o->o_oid = lo_oid;	/* virtual: the oid is a name, kept */
 	o->o_xid = xid;
 	o = (struct apfs_obj_phys *)hi;
 	o->o_oid = hi_oid;
@@ -6344,11 +5658,8 @@ node_split_at(uint64_t bno, uint32_t at, uint64_t xid, uint8_t *scratch)
 	if (rv != FS_APFS_E_OK)
 		goto broken;
 	/*
-	 * One more node in the tree.  The RECORD count does not move: the same
-	 * records are still there, in two nodes instead of one.  The count is
-	 * in the root, which is the parent only while the tree is two levels
-	 * deep -- otherwise it is a second node to copy, above a parent that
-	 * has already been dealt with.
+	 * One more node in the tree (the record count does not move).  The
+	 * count is in the root, which is the parent only in a two-level tree.
 	 */
 	if (under_root)
 		tree_nodes_add(par, 1);
@@ -6376,27 +5687,17 @@ node_split_at(uint64_t bno, uint32_t at, uint64_t xid, uint8_t *scratch)
 	}
 
 	/*
-	 * The object map learns where all of them are: the halves and the
-	 * nodes above by replacement, the new half by insertion, all inside
-	 * one copy of its node.
-	 */
-	/*
-	 * One more block belongs to this volume: two nodes were written where
-	 * one was freed.  The count is the volume's own claim about itself and
-	 * apfsck recomputes it, so a split that forgets produces the same
-	 * "Volume superblock: bad block count" that growing a file did -- what
-	 * it counts is blocks, not what is in them, and the fixture's own
-	 * arithmetic says so: 91 extent blocks, 3 tree nodes, 2 for the object
-	 * map, 1 for the extent reference tree and 1 for the volume superblock
-	 * itself add up to the 98 it stores.
-	 *
-	 * BEFORE the spine, and this is the second time that ordering has bitten
-	 * in this file: the superblock carrying the count is copied by
-	 * spine_update, so a count raised afterwards belongs to no transaction
-	 * at all and is lost at the next mount.
+	 * One more block for the volume: two written, one freed.  apfsck counts
+	 * all of a volume's blocks ("Volume superblock: bad block count").
+	 * Raised before the spine, which copies the superblock carrying it.
 	 */
 	g_apfs.ac_fs_alloc_count += 1;
 
+	/*
+	 * The object map learns where all of them are: the lower half and the
+	 * nodes above by replacement, the new half by insertion, all inside
+	 * one copy of its node.
+	 */
 	omap_edit_init(&oe);
 	oe.oe_oids       = oids;
 	oe.oe_paddrs     = paddrs;
@@ -6436,16 +5737,10 @@ broken:
 }
 
 /*
- * Make a file longer.
- *
- * Two cases, and the cheap one is worth having: a file whose last block is
- * only partly used grows into that block without any record changing except
- * its length.  Only when the allocation really is exhausted does this take a
- * run, hand it to both trees, and pay for a record.
- *
- * The new run is ZEROED.  A block just taken from the allocator holds whatever
- * the file that had it last left there, and handing that to a reader as the
- * tail of their file is a disclosure, not a bug in the arithmetic.
+ * Make a file longer.  A partly used last block grows with only the length
+ * changing; only when the allocation is exhausted does this take a run.  The
+ * new run is zeroed: a block fresh from the allocator holds whatever its
+ * last owner left, and handing that out as a file's tail is a disclosure.
  */
 static int
 grow_once(uint64_t ino, uint64_t id, uint64_t new_size, uint64_t *full_leaf)
@@ -6501,9 +5796,8 @@ grow_once(uint64_t ino, uint64_t id, uint64_t new_size, uint64_t *full_leaf)
 	edit_init(&ne);		/* before the first thing that can fail out */
 
 	/*
-	 * A run, if the file has run out of one.  Taken next to the bytes it
-	 * extends, which keeps the release of the whole thing reachable later
-	 * and keeps a growing file from scattering across the container.
+	 * A run, if the file has run out.  Taken next to the bytes it extends,
+	 * so a growing file does not scatter across the container.
 	 */
 	merge          = false;
 	last.el_found  = false;
@@ -6524,10 +5818,9 @@ grow_once(uint64_t ino, uint64_t id, uint64_t new_size, uint64_t *full_leaf)
 				goto out;
 			}
 			/*
-			 * The block just PAST the run, not its start: what
-			 * this wants is to continue it, and alloc_blocks
-			 * takes the hint literally when what is there is
-			 * free.
+			 * The block just past the run, not its start: this
+			 * wants to continue it, and alloc_blocks takes the
+			 * hint literally when that block is free.
 			 */
 			if (last.el_found && last.el_phys != 0)
 				near = last.el_phys +
@@ -6538,13 +5831,9 @@ grow_once(uint64_t ino, uint64_t id, uint64_t new_size, uint64_t *full_leaf)
 			goto out;
 
 		/*
-		 * TWO RUNS THAT TOUCH ARE ONE RUN.  If the allocator handed
-		 * back the blocks immediately after the file's last extent --
-		 * which, asked to stay near them, it usually does -- then
-		 * lengthening that extent says the same thing as adding a
-		 * record and costs nothing.  Appending block by block would
-		 * otherwise spend a record per block in each of two trees, and
-		 * the extent reference tree is one node: it filled after four.
+		 * Two runs that touch are one run: if the allocator handed back
+		 * the blocks right after the file's last extent, lengthen that
+		 * extent rather than add a record to each of two trees.
 		 */
 		if (last.el_found && last.el_phys != 0 &&
 		    last.el_logical + last.el_len == alloced &&
@@ -6570,23 +5859,16 @@ grow_once(uint64_t ino, uint64_t id, uint64_t new_size, uint64_t *full_leaf)
 	}
 
 	/*
-	 * The inode's length lives in an extended field of its record, so the
-	 * patch is a fixed-size edit inside a value that is not: find the
-	 * dstream by walking the field table, exactly as the reader does.
+	 * The inode's length is in an extended field: find the dstream by
+	 * walking the field table, as the reader does.
 	 */
 	rv = inode_where(ino, &ino_leaf);
 	if (rv != FS_APFS_E_OK)
 		goto give_back;
 
 	/*
-	 * WHICH LEAF THE EXTENT BELONGS IN, which need not be the inode's.
-	 *
-	 * A file's records sort together -- they share an object id -- but
-	 * sorting together is not living together: a split falls where the tree
-	 * needs it, and after enough of them a file's bytes and its length are
-	 * in different nodes.  Both leaves are read and edited as one edit, and
-	 * the de-duplication in edit_leaf means the common case (one leaf,
-	 * named twice) still copies a single node.
+	 * Which leaf the extent belongs in, which need not be the inode's; both
+	 * are edited as one edit, and edit_leaf copies a shared leaf once.
 	 */
 	extent_key(id, alloced, key);
 	ext_leaf = ino_leaf;
@@ -6610,10 +5892,9 @@ grow_once(uint64_t ino, uint64_t id, uint64_t new_size, uint64_t *full_leaf)
 		goto give_back;
 
 	/*
-	 * Room, asked before anything is changed.  Saying which leaf was full
-	 * rather than merely that one was is what lets the caller split it and
-	 * come back: after a split the record may belong in either half, so
-	 * everything above has to be worked out again from scratch.
+	 * Room, asked before anything is changed.  Naming the full leaf lets
+	 * the caller split it and come back; after a split the record may
+	 * belong in either half, so everything here is worked out again.
 	 */
 	if (blocks != 0 && !merge && !leaf_has_room(ne.le_node[ext_slot],
 	    (uint32_t)sizeof(key), (uint32_t)sizeof(fe))) {
@@ -6624,10 +5905,9 @@ grow_once(uint64_t ino, uint64_t id, uint64_t new_size, uint64_t *full_leaf)
 
 	if (blocks != 0 && merge) {
 		/*
-		 * Lengthen the record that is already there.  Its key does not
-		 * move -- it is keyed on where the run starts in the file, and
-		 * that is unchanged -- so this is the same shape of edit as
-		 * stamping a modification time.
+		 * Lengthen the record already there.  It is keyed on where the
+		 * run starts in the file, which is unchanged, so this is an
+		 * edit in place.
 		 */
 		btree_layout(ne.le_node[ext_slot], &bl);
 		rv = FS_APFS_E_NOTFOUND;
@@ -6722,24 +6002,11 @@ grow_once(uint64_t ino, uint64_t id, uint64_t new_size, uint64_t *full_leaf)
 	}
 
 	/*
-	 * THE EXTENT-REFERENCE TREE, AND WHY ITS REFUSAL GIVES THE BLOCKS BACK.
-	 *
-	 * A full node is no longer among the refusals -- the tree divides and
-	 * splits now -- but refuse these still can: a run extend cannot find,
-	 * a tree deeper than the walk, an allocator with nothing to give the
-	 * split itself.  Every such ending cleans up after its own attempt
-	 * (the split paths free what they took), the catalog edit above is
-	 * still only in memory, and so the blocks this grow took out of the
-	 * bitmap are the one thing that has changed.
-	 *
-	 * They used to be kept.  The failure printed "this checkpoint must not
-	 * be written", which was a wish rather than a mechanism: the boot went
-	 * on, the next checkpoint wrote the bitmap with those blocks marked
-	 * used, and nothing on the volume named them.  What apfsck calls
-	 * that is "Space manager: bad allocation bitmap", three boots later,
-	 * with every
-	 * self-test passing in between.  Giving them back turns a silent
-	 * corruption into an honest refusal.
+	 * The extent reference tree can still refuse (a run extend cannot
+	 * find, a tree deeper than the walk, no block for a split).  The
+	 * catalog edit above is still in memory, so the blocks this grow took
+	 * are the one thing changed; kept, the next checkpoint would write them
+	 * as used with nothing naming them.  So they go back.
 	 */
 	if (blocks != 0 && merge) {
 		merge_n++;
@@ -6765,10 +6032,9 @@ grow_once(uint64_t ino, uint64_t id, uint64_t new_size, uint64_t *full_leaf)
 	}
 
 	/*
-	 * The volume owns more blocks than it did, and it says so itself -- a
-	 * count apfsck recomputes from the extents it can reach.  Set before
-	 * the spine copies the superblock that carries it, because that copy is
-	 * the only chance to write it.
+	 * The volume owns more blocks, a count apfsck recomputes from the
+	 * extents it can reach.  Set before the spine copies the superblock
+	 * carrying it: that copy is the only chance to write it.
 	 */
 	g_apfs.ac_fs_alloc_count += blocks;
 
@@ -6800,17 +6066,10 @@ broken:
 }
 
 /*
- * And the same, with one retry behind a split.
- *
- * Split first and grow afterwards, rather than splitting halfway through: a
- * split moves the leaf, the root and the object map, so every address the
- * grow had worked out is stale the moment it happens.  Starting over is a
- * wasted allocation and a re-walk, once, against a page of state to unpick.
- *
- * Once and not in a loop.  A single record cannot need two splits to fit, so
- * a second refusal means something other than a full node -- and a writer that
- * kept splitting in the hope it would help would turn that into a tree full of
- * half-empty nodes rather than an error message.
+ * And the same, with one retry behind a split.  Split first and grow after,
+ * not halfway through: a split moves the leaf, the root and the object map.
+ * Once, not in a loop: a single record cannot need two splits, so a second
+ * refusal is not a full node.
  */
 int
 fs_apfs_grow(uint64_t ino, uint64_t id, uint64_t new_size)
@@ -6837,12 +6096,9 @@ fs_apfs_grow(uint64_t ino, uint64_t id, uint64_t new_size)
 }
 
 /*
- * The records a truncation has to touch: every one whose run reaches past
- * where the file is about to end.
- *
- * Bounded, because the collecting happens inside a tree walk and the walk's
- * callback has nowhere to allocate from.  A file with more runs than this past
- * its new end is refused out loud rather than shortened halfway.
+ * The records a truncation touches: every run reaching past the new end.
+ * Bounded, since the collecting is inside a tree walk whose callback cannot
+ * allocate; a file with more runs than this is refused, not half-shortened.
  */
 #define	APFS_TRUNC_MAX	8
 
@@ -6894,11 +6150,8 @@ extent_cut_pick(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 }
 
 /*
- * Make a file shorter.
- *
- * The mirror of fs_apfs_grow, and the ladder it climbs was measured against
- * apfsck on a copy of this container before a line of it was written.  Every
- * rung is an obligation, and the checker names the one that is missing:
+ * Make a file shorter, the mirror of fs_apfs_grow.  Each obligation, and
+ * what apfsck says while it is the one missing:
  *
  *	the file's own extent record and the length in its inode
  *		-- and nothing complains yet, which is the trap
@@ -6912,22 +6165,10 @@ extent_cut_pick(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
  *	   threaded onto the node's free lists
  *		"B-tree: wrong free space total for key area"
  *
- * The first rung is the one worth remembering: a truncate that shortens only
- * the file's own record leaves a container the checker still calls valid on
- * three of its five questions, and a reader still reads the file correctly.
- * The damage is entirely in what nobody is asked.
- *
- * The blocks go to the free QUEUE rather than straight back to the bitmap, and
- * this is what the queue is for: checkpoints still on the platter name the
- * leaf this one is about to replace, and that leaf still names these blocks.
- * Clearing their bits now would let the next allocation overwrite bytes an
- * older checkpoint promises.  fq_release hands them back when no checkpoint
- * that could still be read names them.
- *
- * Cutting inside a block costs nothing but a length.  A file of 12235 bytes
- * shortened to 12000 keeps all three of its blocks, because its allocation was
- * always the size rounded up to a block and still is; that falls out of
- * rounding the new size up here rather than being a case anybody wrote.
+ * Shortening only the file's own record reads back correctly and passes three
+ * of the checker's five questions.  The blocks go to the free queue, not the
+ * bitmap: older checkpoints still name them.  Cutting inside a block costs
+ * only a length (12235 bytes cut to 12000 keeps all three blocks).
  */
 int
 fs_apfs_truncate(uint64_t ino, uint64_t id, uint64_t new_size)
@@ -6997,17 +6238,8 @@ fs_apfs_truncate(uint64_t ino, uint64_t id, uint64_t new_size)
 		return (rv);
 
 	/*
-	 * WHICH LEAVES THIS TOUCHES, worked out before anything is changed.
-	 *
-	 * A file's records look like neighbours -- the inode and every extent
-	 * share an object id -- and they are, in key order.  That is not the
-	 * same as being in one node: a split falls where the tree needs it to,
-	 * not where a file would like it to, and the more a volume is used the
-	 * likelier it is that a file's bytes and its length end up in different
-	 * leaves.  This used to refuse that outright, which was honest while
-	 * only one node could be edited at a time, and stopped being tolerable
-	 * the moment a shell could redirect into a file: `>` on an existing
-	 * file is a truncate.
+	 * Which leaves this touches, worked out before anything is changed: a
+	 * split can put a file's extents and its inode in different leaves.
 	 */
 	edit_init(&ne);
 	for (i = 0; i < ec.ec_n; i++) {
@@ -7028,7 +6260,7 @@ fs_apfs_truncate(uint64_t ino, uint64_t id, uint64_t new_size)
 
 	/*
 	 * And every block about to be given back has to be in a chunk this
-	 * kernel can reach, asked NOW rather than when the giving back happens:
+	 * kernel can reach, asked now rather than when the giving back happens:
 	 * by then the leaf has moved and there is nothing left to refuse.
 	 */
 	freed = 0;
@@ -7055,10 +6287,8 @@ fs_apfs_truncate(uint64_t ino, uint64_t id, uint64_t new_size)
 
 	/*
 	 * The records, each in the copy of the leaf it lives in.  Each is found
-	 * by its KEY and not by a slot number remembered from the walk: a
-	 * delete slides every entry after it down one, and a second pass
-	 * trusting the old numbering would shorten whatever had moved into the
-	 * place.
+	 * by its key, not by a slot number remembered from the walk: a delete
+	 * slides every entry after it down one.
 	 */
 	dropped = 0;
 	for (i = 0; i < ec.ec_n; i++) {
@@ -7185,17 +6415,14 @@ fs_apfs_truncate(uint64_t ino, uint64_t id, uint64_t new_size)
 	}
 
 	/*
-	 * The volume owns fewer blocks than it did, and it says so itself.
-	 * Set before the spine copies the superblock that carries it, because
-	 * that copy is the only chance to write it -- the same order, and the
-	 * same reason, as growing.
+	 * The volume owns fewer blocks.  Set before the spine copies the
+	 * superblock carrying it, as in growing.
 	 */
 	g_apfs.ac_fs_alloc_count -= freed;
 
 	/*
-	 * And every leaf that changed, in one transaction with the root whose
-	 * record count a delete moved.  Last, because everything above it can
-	 * still refuse: until this call nothing about the file's records has
+	 * And every leaf that changed, with the root whose record count a
+	 * delete moved.  Last: until here nothing about the file's records has
 	 * reached the disk.
 	 */
 	rv = edit_commit(&ne, -(int64_t)dropped, xid, node);
@@ -7226,31 +6453,14 @@ broken:
 /* ---- names --------------------------------------------------------------- */
 
 /*
- * A DIRECTORY ENTRY HAS TO GO WHERE THE VOLUME ALREADY PUTS THEM
- *
- * The reader never had to know how.  It descends on the object id -- the
- * primary sort key, the same on every volume -- and compares names once it is
- * in the right directory, which is exact and hash-independent.  A writer has no
- * such luxury: a new entry must sort where an implementation that DOES hash
- * would have put it, or what comes out is a volume only this kernel can read.
- *
- * So the hash had to be recovered, and it was recovered from the container
- * rather than from the specification: CRC-32C over the name's code points, each
- * written out as four little-endian bytes, case-folded, started at all ones and
- * taken without a final complement, of which the low 22 bits are kept.  All
- * twenty-six names already in this volume come out right.
- *
- * The near miss is the part worth keeping.  The same computation WITHOUT case
- * folding reproduces twenty-five of the twenty-six: every name in the container
- * is lower case except one, "Cellar", and that single directory is the entire
- * evidence separating the two candidates.  A writer built on the wrong one
- * would misplace mixed-case names only, which is exactly the kind of wrong that
- * survives a test suite.
- *
- * Folding is ASCII, and anything else is refused out loud.  Doing it the way
- * Apple does means normalising to NFD and folding through the full Unicode
- * tables, neither of which this kernel carries -- and a guess at them would be
- * silently wrong rather than absent, which is the worse of the two.
+ * A directory entry must sort where an implementation that hashes names
+ * would put it, or only this kernel can read the volume; lookups descend on
+ * the same key.  The hash, recovered from the container: CRC-32C over the
+ * case-folded name's code points, each as four little-endian bytes, started
+ * at all ones, no final complement, low 22 bits kept.  All twenty-six names
+ * in the test volume match; without folding twenty-five do (only "Cellar"
+ * tells them apart).  Folding is ASCII and anything else is refused: Apple
+ * folds through NFD and the full Unicode tables, which this kernel lacks.
  */
 uint32_t
 crc32c(uint32_t crc, const uint8_t *p, uint32_t n)
@@ -7270,16 +6480,10 @@ crc32c(uint32_t crc, const uint8_t *p, uint32_t n)
 }
 
 /*
- * Build the key a directory entry sorts under: the parent's object id with the
- * record type on top, then either the hash-and-length word or a bare length,
- * then the name and the NUL that the recorded length counts.  `out` holds
- * APFS_DREC_KEY_MAX bytes.
- *
- * `complain` is for the difference between the two callers.  A WRITE that
- * cannot fold a name has to say why it is refusing, in the one message that
- * explains what is missing.  A LOOKUP has somewhere else to go -- the walk
- * that needs no key at all -- and would be printing a warning about a file it
- * is about to find.
+ * Build the key a directory entry sorts under: the parent's object id with
+ * the record type on top, the hash-and-length word or a bare length, then
+ * the name and its NUL; `out` holds APFS_DREC_KEY_MAX bytes.  `complain`: a
+ * write says why it refuses a name; a lookup falls back to the walk quietly.
  */
 static int
 drec_key(uint64_t parent, const char *name, uint32_t nlen, uint8_t *out,
@@ -7331,13 +6535,9 @@ drec_key(uint64_t parent, const char *name, uint32_t nlen, uint8_t *out,
 }
 
 /*
- * A NODE OF THE FILE-SYSTEM TREE, INTO THE CHECKPOINT BEING BUILT
- *
- * Not cow_physical, which is for objects whose oid IS their block: a tree node
- * is VIRTUAL, its oid is a name the object map resolves, and the copy keeps
- * that name.  Every writer here had this open-coded; a create moves three nodes
- * at once and open-coding it a third time is where it stops being a shape and
- * starts being a function.
+ * Copy a node of the file-system tree into the checkpoint being built.  Not
+ * cow_physical, which is for objects whose oid is their block: a tree node
+ * is virtual, its oid a name the object map resolves, and the copy keeps it.
  */
 static int
 node_cow(uint8_t *node, uint64_t old_bno, uint64_t xid, uint64_t *new_bno)
@@ -7363,12 +6563,9 @@ node_cow(uint8_t *node, uint64_t old_bno, uint64_t xid, uint64_t *new_bno)
 }
 
 /*
- * Find a record by key in a node the caller is holding, and say where it is.
- *
- * By KEY and not by a slot remembered from a walk: an insert or a delete slides
- * everything after it, and a second pass trusting the old numbering would edit
- * whatever had moved into the place.  That has its own comment in the truncate
- * above because it was learned there.
+ * Find a record by object id and type in a node the caller is holding, and
+ * say where it is.  By key, not by a slot remembered from a walk: an insert
+ * or a delete slides everything after it.
  */
 static bool
 node_slot(const uint8_t *node, uint64_t oid, uint32_t type, uint32_t *pos_out,
@@ -7441,104 +6638,51 @@ dir_children_add(uint8_t *node, uint64_t dir, int32_t delta, uint64_t now)
 }
 
 /*
- * MAKING AND UNMAKING A NAME
- *
- * The ladder was measured against apfsck on a copy of this container before a
- * line of either was written, and the two are not symmetric.  Leaving one
- * obligation out at a time, on an otherwise complete edit:
+ * Making and unmaking a name.  What apfsck answers when one obligation is
+ * left out of an otherwise complete edit:
  *
  *	CREATE, leaving out		apfsck answers
  *	  apfs_next_obj_id		"Inode record: free inode number in use"
- *	  the directory entry		"Inode record: wrong directory child count"
+ *	  the directory entry		"Inode record: wrong directory child
+ *					 count"
  *	  the inode record		"Inode record: wrong link count"
  *	  the dstream id record		"Data stream: missing reference count"
- *	  the parent's child count	"Inode record: wrong directory child count"
- *	  the tree's key count		"Catalog: wrong key count in info footer"
+ *	  the parent's child count	"Inode record: wrong directory child
+ *					 count"
+ *	  the tree's key count		"Catalog: wrong key count in info
+ *					 footer"
  *	  apfs_num_files		nothing at all
  *
  *	UNLINK, leaving out
  *	  the entry, or the parent's count	as above
  *	  the inode and dstream records	"Inode record: wrong link count"
- *	  the tree's key count		"Catalog: wrong key count in info footer"
- *	  the extent reference record	"Physical extent record: bad reference count"
+ *	  the tree's key count		as above
+ *	  the extent reference record	"Physical extent record: bad
+ *					 reference count"
  *	  apfs_fs_alloc_count		"Volume superblock: bad block count"
  *	  the blocks, given back	"Space manager: bad allocation bitmap"
- *	  the deleted bytes, threaded	"B-tree: wrong free space total for key area"
+ *	  the deleted bytes, threaded	"B-tree: wrong free space total for
+ *					 key area"
  *	  apfs_num_files		nothing at all
  *
- * Two of those are worth remembering.  The first thing the checker notices
- * about a created file is not the file: it is that the volume still calls the
- * number free, and that one complaint MASKS every other -- a cumulative ladder
- * built in the obvious order says the same thing at every rung and teaches
- * nothing.  And apfs_num_files, the count that looks most like the thing a
- * create ought to be updating, is never checked in either direction.  It is
- * updated anyway, for the same reason the truncate updated what nobody asked
- * about: something other than this checker will read it.
- *
- * The unlink half of the ladder is the truncate's ladder with three rungs on
- * top, and that is not a coincidence -- unlink DOES a truncate.  Cutting the
- * file to nothing is what gives back its blocks, its extent records and its
- * ownership records, all of which are already written and already proven; what
- * is left over is three records and two counters.
- *
- * A DIRECTORY IS ALMOST THE SAME EDIT, and measuring is how one finds out
- * where "almost" stops.  The same ladder, run again for a mkdir and an rmdir:
- *
- *	MKDIR, leaving out		apfsck answers
- *	  apfs_next_obj_id		"Inode record: free inode number in use"
- *	  the directory entry		"Inode record: wrong directory child count"
- *	  the inode record		"Inode record: no name for primary link"
- *	  the parent's child count	"Inode record: wrong directory child count"
- *	  the tree's key count		"Catalog: wrong key count in info footer"
+ *	MKDIR and RMDIR differ in
+ *	  the inode record (mkdir)	"Inode record: no name for primary
+ *					 link"
+ *	  the inode record (rmdir)	"Inode record: directory has hard
+ *					 links"
  *	  apfs_num_directories		"Volume superblock: bad directory count"
  *
- *	RMDIR, leaving out
- *	  the entry, or the parent's count	as above
- *	  the inode record		"Inode record: directory has hard links"
- *	  the tree's key count		"Catalog: wrong key count in info footer"
- *	  apfs_num_directories		"Volume superblock: bad directory count"
- *	  the deleted bytes, threaded	"B-tree: wrong free space total for key
- *					area"
+ * The free inode number masks every other complaint, so omissions are
+ * tried one at a time.  apfs_num_files is never checked; it is kept for
+ * other readers.  Unlink truncates first, which handles the blocks and the
+ * records naming them.
  *
- * Four things there that reasoning would not have produced.
- *
- * THE COUNT A CREATE MAY OMIT, A MKDIR MAY NOT.  apfs_num_files is checked by
- * nothing in either direction and apfs_num_directories is checked exactly.
- * The two sit next to each other in the volume superblock and look like a
- * pair; they are not one.  (Nor does either count the root or the private
- * directory: this volume holds fourteen directories and says twelve, and the
- * checker agrees with the twelve.)
- *
- * A DIRECTORY HAS NO DATA STREAM, and that is not a convention either --
- *
- *	Inode record: has dstream but isn't a regular file.
- *
- * is the answer to a directory inode carrying the extended field a file's
- * does.  So a mkdir's record is not a create's with the mode changed: it is
- * shorter by an extended field and a dstream, and there is no dstream id
- * record beside it.
- *
- * THE ENTRY AND THE INODE MUST AGREE ABOUT WHAT THEY DESCRIBE.  A directory
- * entry carries a type of its own beside the object id, and
- *
- *	Inode record: file mode doesn't match dentry type.
- *
- * answers either of them being written the other's way round.  The mode and
- * the entry type are therefore written from the same question and not from
- * two that happen to agree.
- *
- * AND A DIRECTORY THAT STILL HOLDS A NAME MAY NOT GO.  Removing one anyway
- * leaves the names behind, and the first of them is answered with
- *
- *	Dentry record: parent inode missing
- *
- * so emptiness is not a courtesy this kernel extends to POSIX -- it is an
- * obligation of the format, and it is asked of the tree.
- *
- * All of which is why each of these is ONE function with a question in it
- * rather than two that agree today.  The difference between making a file and
- * making a directory is eight lines out of two hundred, and eight lines is
- * exactly the size of a difference that gets fixed on one side only.
+ * A directory also has no data stream ("Inode record: has dstream but isn't
+ * a regular file"), its inode's mode must match the entry's type ("file
+ * mode doesn't match dentry type"), and it may not go while it holds a name
+ * ("Dentry record: parent inode missing").  apfs_num_directories counts
+ * neither the root nor the private directory.  One function with a question
+ * in it per direction keeps the few lines that differ from drifting apart.
  */
 
 /* Longest name this kernel will make, as against the 255 it will read. */
@@ -7548,19 +6692,14 @@ dir_children_add(uint8_t *node, uint64_t dir, int32_t delta, uint64_t now)
  * Put a name into a directory, and under it an empty file -- or, when `isdir`,
  * an empty directory.
  *
- * A FILE has a dstream from the moment it exists, holding no bytes and no
- * blocks.  That is not the same as having none: an inode without one names
- * something with no length at all, and every path that makes a file longer
- * looks for a length to move.  Creating without one would produce a file that
- * could be opened, read as empty, and never written to.  A DIRECTORY must not
- * have one at all, which is the measured half of the same fact and the reason
- * the record below is assembled around a question instead of copied.
+ * A file has a dstream from the moment it exists, holding no bytes: every
+ * path that makes a file longer looks for a length to move, so a file made
+ * without one could be opened and read but never written.  A directory must
+ * not have one at all.
  *
- * A leaf with no room refuses and NAMES the leaf, which is the only thing a
- * caller can act on: a split moves that leaf, its parent, the root and the
- * object map, so every address worked out below is stale the moment one
- * happens and there is nothing here to resume.  make_at, underneath, turns
- * that refusal into room and asks again from the beginning.
+ * A leaf with no room refuses and names the leaf (*full_leaf): a split moves
+ * that leaf, its parent, the root and the object map, so nothing worked out
+ * here survives one.  make_at splits it and asks again from the beginning.
  */
 static int
 make_once(uint64_t dir, const char *name, uint64_t now, bool isdir,
@@ -7619,14 +6758,14 @@ make_once(uint64_t dir, const char *name, uint64_t now, bool isdir,
 	}
 
 	/*
-	 * The key first, because the name has to have one before anything else
-	 * is worth doing -- and because the question after this is asked BY it.
+	 * The key first: the name needs one before anything else is worth
+	 * doing, and the next question is asked by it.
 	 */
 	rv = drec_key(dir, name, nlen, dkey, &dklen, true);
 	if (rv != FS_APFS_E_OK)
 		return (rv);
 
-	/* And the name must be free, which is a question only the tree can answer. */
+	/* And the name must be free. */
 	ds.ds_name    = name;
 	ds.ds_namelen = nlen;
 	ds.ds_parent  = dir;
@@ -7652,15 +6791,13 @@ make_once(uint64_t dir, const char *name, uint64_t now, bool isdir,
 	refs             = 1;
 
 	/*
-	 * The inode record: a fixed part, then the extended fields, in
-	 * ascending order of type, then their data each padded up to a multiple
-	 * of eight.  Both the order and the padding were read off the inodes
-	 * already in this volume rather than taken from the layout.
+	 * The inode record: a fixed part, then the extended fields in ascending
+	 * order of type, then their data, each padded up to a multiple of
+	 * eight -- order and padding as read off the inodes on this volume.
 	 *
-	 * A file has two of those fields and a directory has one.  The count,
-	 * the used-data total, the record's length and whether a dstream id
-	 * record follows are four statements of that same one fact, which is
-	 * why they are written from one variable rather than four constants.
+	 * A file has two fields and a directory one.  The count, the used-data
+	 * total, the record's length and whether a dstream id record follows
+	 * all state that one fact, so they are written from one variable.
 	 */
 	mem_zero(rec, (uint32_t)sizeof(rec));
 	pad   = (nlen + 1u + 7u) & ~7u;
@@ -7674,14 +6811,11 @@ make_once(uint64_t dir, const char *name, uint64_t now, bool isdir,
 	iv->ai_change_time        = now;
 	iv->ai_access_time        = now;
 	iv->ai_internal_flags     = APFS_INODE_NO_RSRC_FORK;
-	/* One field, two meanings: a directory counts children, and has none. */
+	/* A directory counts children here, and has none yet. */
 	iv->ai_nchildren_or_nlink = isdir ? 0 : 1;
 	/*
-	 * The type is the writer's and the permission bits are the caller's.
-	 * This used to stamp 0755 and 0644 regardless of what was asked for,
-	 * because there was no umask to subtract and no chmod to correct it
-	 * afterwards; there are both now, so a mode arrives here already
-	 * reduced and is written as given.
+	 * The type is the writer's and the permission bits the caller's,
+	 * already reduced by the umask and written as given.
 	 */
 	iv->ai_mode               = (uint16_t)((isdir ? APFS_S_IFDIR :
 	    APFS_S_IFREG) | (perm & 07777u));
@@ -7724,21 +6858,11 @@ make_once(uint64_t dir, const char *name, uint64_t now, bool isdir,
 		goto out;
 
 	/*
-	 * Every edit, in memory.  A file's inode record and its dstream id go
-	 * in together because their keys are adjacent -- same object,
-	 * neighbouring types -- and, HERE, adjacent is enough: neither record
-	 * exists yet, a node boundary falls between two records that do, and
-	 * nothing of this brand new object id can be sitting between them.
-	 * That is a fact about creating and not about the pair: once both are
-	 * on the volume a split can land between them, which is why unmaking a
-	 * name asks for the second one's leaf rather than assuming this one.
-	 *
-	 * Which leaf is being asked is recorded as each is asked, so that a
-	 * refusal names it.  Asked rather than measured beforehand because the
-	 * two leaves are sometimes ONE leaf -- a name and the inode it makes
-	 * can land in the same node while the tree is small -- and then the
-	 * question is not whether either record fits but whether all of them
-	 * do.  The insert answering it in turn is that question, exactly.
+	 * Every edit, in memory.  A file's inode and dstream id records go in
+	 * together: their keys are adjacent and, the object id being new,
+	 * nothing lies between them (once both exist a split can, which is
+	 * why unmaking asks for the second one's leaf).  *full_leaf names each
+	 * leaf as it is asked, so a refusal names the full one.
 	 */
 	slot = edit_leaf(&ne, drec_leaf);
 	*full_leaf = drec_leaf;
@@ -7772,8 +6896,7 @@ make_once(uint64_t dir, const char *name, uint64_t now, bool isdir,
 
 	/*
 	 * The volume's own claims, set before the spine copies the superblock
-	 * that carries them -- the same ordering, and the same reason, as the
-	 * block count in every writer above.
+	 * that carries them, as with the block count above.
 	 */
 	g_apfs.ac_next_ino = ino + 1;
 	if (isdir)
@@ -7824,25 +6947,18 @@ out:
 }
 
 /*
- * And the same, with the room made underneath it.
+ * And the same, with room made underneath it.
  *
- * TWO leaves can be the full one, and that is the whole of what makes this
- * harder than growing a file: a name's entry sorts under the PARENT's object
- * id and the inode it names sorts under the CHILD's, so once the tree has more
- * than one leaf they are different nodes and either can be the one with no
- * room.  Splitting the first and asking again can therefore be answered by the
- * second, which is why this is a loop and not the single retry above.
+ * Two leaves can be the full one: a name's entry sorts under the parent's
+ * object id and the inode under the child's, so either can lack room, and
+ * splitting the first can be answered by the second.  Hence a loop, not
+ * fs_apfs_grow's single retry.
  *
- * It stops after two.  Each of the two leaves needs at most one split -- a half
- * empty node has room for three records the size of these by a wide margin --
- * so a third refusal is not a full node at all, and a writer that kept
- * splitting in the hope that it would help would answer a bug elsewhere by
- * filling the volume with half-empty nodes.
- *
- * The split happens BEFORE the attempt it makes room for, never half way
- * through one, for the reason make_once gives: nothing it computed survives a
- * split.  Starting over costs a re-walk of a tree that is a few nodes deep and
- * buys a writer with no half-finished state to unpick.
+ * It stops after two splits.  Each leaf needs at most one (a half-empty node
+ * has room for three such records by a wide margin), so a third refusal is
+ * not a full node, and splitting on would fill the volume with half-empty
+ * nodes.  Each split happens before the attempt it makes room for, never
+ * half way through one: nothing make_once computed survives it.
  */
 static int
 make_at(uint64_t dir, const char *name, uint64_t now, bool isdir, uint16_t perm,
@@ -7855,11 +6971,10 @@ make_at(uint64_t dir, const char *name, uint64_t now, bool isdir, uint16_t perm,
 
 	for (tries = 0; ; tries++) {
 		/*
-		 * Cleared before each attempt: a refusal that has nothing to do
-		 * with a full node -- an unmounted volume, an allocator with
-		 * nowhere to write -- answers FS_APFS_E_NOALLOC as well, and
-		 * splitting a leaf on the strength of it would be splitting one
-		 * at random.
+		 * Cleared before each attempt: refusals unrelated to a full
+		 * node (an allocator with nowhere to write) answer
+		 * FS_APFS_E_NOALLOC too, and splitting on one would split a
+		 * leaf at random.
 		 */
 		full = 0;
 		rv = make_once(dir, name, now, isdir, perm, ino_out, &full);
@@ -7928,13 +7043,10 @@ dirent_any(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 }
 
 /*
- * Does this directory hold a name?
- *
- * Asked of the TREE, and not of the child count in the directory's own inode
- * record.  The count is a claim about the records, the records are the thing,
- * and the case this question exists for -- a count that does not match what is
- * there -- is exactly the case where the cheaper of the two answers wrong.  It
- * costs one descent, which is the depth of the tree rather than its size.
+ * Does this directory hold a name?  Asked of the tree, not of the child count
+ * in the directory's inode: the count is only a claim about the records, and
+ * the case this guards against is the one where the claim is wrong.  One
+ * descent.
  */
 static int
 dir_empty(uint64_t dir, bool *empty_out)
@@ -7958,14 +7070,11 @@ dir_empty(uint64_t dir, bool *empty_out)
 /*
  * And take a name back out, with what was under it.
  *
- * A FILE's blocks are not this function's problem: cutting it to nothing is,
- * and that is a call to the truncate above, which already gives back the runs,
- * the records in both trees that name them and the volume's block count.  What
- * is left is the three records the create made and the two counters it moved.
- *
- * A DIRECTORY has no blocks, no dstream and nothing to cut.  What it has
- * instead is a question that must be answered before anything is touched, and
- * being empty is the whole of it.
+ * A file is first cut to nothing by the truncate, which gives back the runs,
+ * the records in both trees that name them and the volume's block count;
+ * what is left is the three records the create made and the two counters it
+ * moved.  A directory has no blocks and no dstream; instead it must be
+ * empty, asked before anything is touched.
  */
 static int
 unmake_at(uint64_t dir, const char *name, uint64_t now, bool isdir)
@@ -8025,11 +7134,10 @@ unmake_at(uint64_t dir, const char *name, uint64_t now, bool isdir)
 	if (inode_info(child, &ii) != FS_APFS_E_OK)
 		return (FS_APFS_E_NOTFOUND);
 	/*
-	 * An ORPHAN is exempt, and explicitly rather than by arithmetic: it has
-	 * no names at all, ii_nlink rounds that up to one, and the guard would
-	 * therefore let it through by accident.  What comes through here is a
-	 * file being let go from the private directory, which is the one caller
-	 * for which "how many names does it have" is already settled.
+	 * An orphan is exempt, explicitly: it has no names at all, which
+	 * ii_nlink rounds up to one, so the guard would pass it by accident.
+	 * It comes through here only as a file being let go from the private
+	 * directory.
 	 */
 	if (!isdir && !ii.ii_orphan && ii.ii_nlink != 1) {
 		kprintf("apfs: inode %llu has %u links and this kernel makes "
@@ -8050,10 +7158,8 @@ unmake_at(uint64_t dir, const char *name, uint64_t now, bool isdir)
 	}
 
 	/*
-	 * The bytes first, and through the truncate rather than beside it.  It
-	 * moves leaves, so everything below has to be located afterwards.  A
-	 * directory has no bytes, which is the one thing these two do not
-	 * share.
+	 * The bytes first, through the truncate.  It moves leaves, so
+	 * everything below is located afterwards.
 	 */
 	if (!isdir && (ii.ii_size != 0 || ii.ii_alloced != 0)) {
 		rv = fs_apfs_truncate(child, ii.ii_private_id, 0);
@@ -8071,19 +7177,11 @@ unmake_at(uint64_t dir, const char *name, uint64_t now, bool isdir)
 	if (rv != FS_APFS_E_OK)
 		return (rv);
 	/*
-	 * AND THE DATA STREAM RECORD IS ASKED FOR SEPARATELY, though it sorts
-	 * immediately after the inode's and was written into the same node.
-	 * Adjacent in key order means the same node only until a SPLIT falls
-	 * between them, and a split can: both records exist by then, so a cut
-	 * at the midpoint of a leaf full of inodes lands between one and its
-	 * own stream as readily as between two files.
-	 *
-	 * Looking only where the inode is left the stream record behind, and
-	 * quietly: the branch below reads "this file has none", which is a real
-	 * case for a file that came off the image, so it printed a line and
-	 * carried on.  What the volume was left with is what apfsck calls
-	 * "Data stream: has no references", and it took a create filling a leaf
-	 * with twenty inodes and splitting it to produce one.
+	 * The data stream record is asked for separately, though it sorts
+	 * right after the inode's and was written into the same node: both
+	 * exist by now, so a split can have landed between them.  Left behind
+	 * (the branch below takes "none here" for a file off the image), it is
+	 * what apfsck calls "Data stream: has no references".
 	 */
 	ds_leaf = ino_leaf;
 	if (!isdir) {
@@ -8138,11 +7236,9 @@ unmake_at(uint64_t dir, const char *name, uint64_t now, bool isdir)
 	}
 
 	/*
-	 * How many records actually left, counted rather than assumed, because
-	 * the tree's key count is told this number at the end.  A file this
-	 * kernel made has a dstream id record and a directory has none, and
-	 * this used to say three whatever it had found -- which would have told
-	 * the tree that a record it still holds is gone.
+	 * How many records actually left, counted, because the tree's key
+	 * count is told this number at the end: a file this kernel made has a
+	 * dstream id record and a directory has none.
 	 */
 	slot = edit_leaf(&ne, ds_leaf);
 	if (node_slot(ne.le_node[slot], child, APFS_TYPE_DSTREAM_ID, &pos,
@@ -8237,14 +7333,12 @@ fs_apfs_rmdir(uint64_t dir, const char *name, uint64_t now)
 }
 
 /*
- * MOVING A NAME
+ * Moving a name.
  *
- * A rename is the two writers above run together, and the half that had to be
- * measured is not the half it looks like.  Taking the old entry out and
- * putting a new one in is the obvious work; what is easy to leave out is the
- * INODE record, which carries a name and a parent of its own and has to be
- * made to agree with the entry naming it.  Each of those left out in turn, on
- * an otherwise complete move:
+ * A rename is the two writers above run together.  What is easy to leave
+ * out is the inode record, which carries a name and a parent of its own that
+ * must agree with the entry naming it.  Each left out in turn, on an
+ * otherwise complete move:
  *
  *	RENAME, leaving out		apfsck answers
  *	  the name in the record	"Inode record: wrong name for only link"
@@ -8252,27 +7346,17 @@ fs_apfs_rmdir(uint64_t dir, const char *name, uint64_t now)
  *	  either parent's child count	"Inode record: wrong directory child
  *					count"
  *
- * The first two were measured before a line of this was written, by a host
- * tool that poked one field of one record on a copy of this container and
- * re-sealed the block: the disagreement a forgetful rename leaves behind is
- * exactly the disagreement a poked record has, and producing it that way costs
- * no kernel at all.  The third is the create ladder's, unchanged.
+ * "for only link": a volume with hard links keeps the other names in
+ * SIBLING_LINK records; nothing here makes a second link, and unmake_at
+ * refuses an inode that has one.
  *
- * "for only link" is the checker saying what this kernel happens to be true
- * of.  A volume with hard links keeps the other names in SIBLING_LINK records
- * and the question becomes which of them moved; nothing here makes a second
- * link, and unmake_at already refuses an inode that has one.
- *
- * THE RECORD CHANGES LENGTH, which is what makes this rung unlike every edit
- * above it.  A name lives in an extended field, the fields are packed with
- * each datum padded to eight bytes, and a rename from "a" to "bbbbbbbbb"
- * makes the record eight bytes longer.  So the inode record is not amended
- * where it lies, the way a chmod amends a mode: it is built beside the old
- * one, deleted, and put back.  Everything that is not the name and the parent
- * is carried across verbatim -- and the DSTREAM field is why that matters,
- * since it holds the file's length and the blocks it has, and a rename that
- * rebuilt the record the way a create writes one would quietly empty every
- * file it moved.
+ * The record changes length.  A name lives in an extended field, each datum
+ * padded to eight bytes, so renaming "a" to "bbbbbbbbb" makes the record
+ * eight bytes longer.  So the inode record is not amended in place, as a
+ * chmod is: a new one is built beside it, the old one deleted, the new one
+ * inserted.  Everything but the name and the parent is carried across; the
+ * dstream field holds the file's length and blocks, and a record rebuilt the
+ * way a create writes one would empty every file it moved.
  */
 
 /*
@@ -8348,11 +7432,10 @@ inode_renamed(const uint8_t *old, uint32_t olen, uint64_t ndir,
 			mem_copy(out + ndata, old + odata, size);
 		}
 		/*
-		 * The old field's datum is padded past the end of the record
-		 * only if the record is malformed -- but `olen - odata` below
-		 * is unsigned, so a record that IS would wrap the next round's
-		 * bounds check and read whatever follows the node.  It comes
-		 * off the disk, so it is bounded rather than trusted.
+		 * Only a malformed record pads a datum past its end, but
+		 * `olen - odata` is unsigned, so one would wrap the next
+		 * round's bounds check and read past the node.  It comes off
+		 * the disk: bounded, not trusted.
 		 */
 		odata += (size + 7u) & ~7u;
 		if (odata > olen)
@@ -8361,10 +7444,9 @@ inode_renamed(const uint8_t *old, uint32_t olen, uint64_t ndir,
 		used  += pad;
 	}
 	/*
-	 * An inode with no name field is one this kernel cannot move: the
-	 * checker requires the record to name the link, and there would be
-	 * nowhere to write the new name without inventing a field.  Nothing on
-	 * this volume is like that, and saying so beats writing one that is.
+	 * An inode with no name field cannot be moved: the checker requires
+	 * the record to name the link, and there is nowhere to write the new
+	 * name without inventing a field.
 	 */
 	if (!named) {
 		kprintf("apfs: the inode record has no name field -- there is "
@@ -8379,11 +7461,10 @@ inode_renamed(const uint8_t *old, uint32_t olen, uint64_t ndir,
 /*
  * Is `dir` the directory `top`, or somewhere underneath it?
  *
- * Asked before a directory moves, because moving one into itself detaches the
- * whole subtree: every record in it stays in the tree, nothing left in the
- * volume names it, and walking up from anything inside it goes round for ever.
- * The walk is up the parent chain, which is as deep as the path is long, and
- * it ends at the root -- whose parent is an object id that is not an object.
+ * Asked before a directory moves: moving one into itself detaches the
+ * subtree, whose records stay in the tree with nothing naming them, and
+ * walking up from inside it goes round for ever.  The walk goes up the
+ * parent chain to the root, whose parent is an id that is not an object.
  */
 static int
 dir_under(uint64_t dir, uint64_t top, bool *under)
@@ -8401,9 +7482,8 @@ dir_under(uint64_t dir, uint64_t top, bool *under)
 			return (FS_APFS_E_OK);
 		}
 		/*
-		 * A chain longer than any tree here could be is a chain with a
-		 * loop in it, and a loop is the very thing this exists to keep
-		 * out.  Refusing beats walking it.
+		 * A chain longer than any tree here could be has a loop in it,
+		 * the very thing this keeps out: refuse rather than walk it.
 		 */
 		if (hops > 64) {
 			kprintf("apfs: the parents of inode %llu do not reach "
@@ -8454,34 +7534,25 @@ orphan_name(uint64_t ino, char *out)
 }
 
 /*
- * One attempt at moving a name, which NAMES the leaf that had no room -- the
- * same bargain make_once strikes, and for the same reason: a split moves the
- * leaf, its parent, the root and the object map, so nothing worked out below
- * survives one.
+ * One attempt at moving a name, naming the leaf that had no room, as
+ * make_once does: a split moves the leaf, its parent, the root and the
+ * object map, so nothing worked out here survives one.
  *
- * ORPHANING IS THE SAME MOVE, and is done here rather than beside here because
- * the three ways it differs are three lines and the two hundred it would share
- * are the hard ones.  A file whose last name is taken away while something
- * still holds it open moves into the private directory, and there it must say
- * what the format wants said of an orphan: a parent that is not the private
- * directory (the root, which cannot be removed out from under it), and a link
- * count of zero.  Everything else -- building the record before deleting it,
- * carrying the entry's value across whole, the counters, the split retry -- is
- * the same problem with the same answer.
+ * Orphaning is the same move.  A file whose last name goes while something
+ * still holds it open moves into the private directory, and there it must
+ * say what the format wants of an orphan: a parent that is not the private
+ * directory (the root, which cannot be removed out from under it), and a
+ * link count of zero.  The rest is the same problem with the same answer.
  *
- * AND A TAKEN NAME IS TAKEN OVER, in this same edit, because POSIX asks a
- * rename to be atomic and the checkpoint is the only atom this volume has: an
- * "unlink then move" would write a state in which the name is not there at
- * all, which is the one state rename exists to keep readers from seeing.  The
- * occupant does not have to DIE in the edit for that -- only its NAME has to
- * go -- so a file standing where the move lands is orphaned right here, by the
- * mechanism above: its record rebuilt under the derived name, its entry
- * rewritten to the newcomer, and not one extent touched.  Whether anything
- * still holds it is not this layer's question; the caller learns the inode
- * through *victim_out and reaps it or leaves it to the close that will.  A
- * DIRECTORY standing there cannot wait in the private directory, and does not
- * need to: it must be empty before it may be replaced, and an empty directory
- * is two records and two counters, taken out right here.
+ * A taken name is taken over in this same edit: POSIX asks a rename to be
+ * atomic, the checkpoint is this volume's only atom, and "unlink then move"
+ * could publish a state without the name at all.  Only the occupant's name
+ * has to go, so a file standing where the move lands is orphaned here: its
+ * record rebuilt under the derived name, its entry rewritten to the
+ * newcomer, no extent touched.  The caller learns the inode through
+ * *victim_out and reaps it or leaves it to the last close.  A directory
+ * standing there must be empty, and an empty directory is two records and
+ * two counters, taken out here.
  */
 static int
 move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
@@ -8547,12 +7618,10 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 		return (rv);
 
 	/*
-	 * The same name, in the same directory, is a rename POSIX says must
-	 * succeed and change nothing -- and it is answered on the KEYS rather
-	 * than on the strings, because the key is what the tree is ordered on
-	 * and two names that differ only in case are two keys.  Renaming "a" to
-	 * "A" therefore does the whole move, and the volume keeps the case the
-	 * caller asked for.
+	 * The same name in the same directory must succeed and change nothing
+	 * (POSIX).  Compared on the keys, which the tree is ordered on: names
+	 * differing only in case are two keys, so renaming "a" to "A" does the
+	 * whole move and keeps the case asked for.
 	 */
 	if (oklen == nklen) {
 		for (i = 0; i < oklen && okey[i] == nkey[i]; i++)
@@ -8577,11 +7646,9 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 	isdir = ds.ds_is_dir;
 
 	/*
-	 * And whatever already stands under the destination.  Finding something
-	 * is not a refusal any more: it is the occupant, and POSIX says the
-	 * move happens over it.  What kind of thing it is decides which of two
-	 * endings it gets, and both are decided further down, after the checks
-	 * that apply to every move.
+	 * Whatever already stands under the destination is the occupant, and
+	 * the move happens over it (POSIX).  Its kind decides which of two
+	 * endings it gets, below, after the checks every move needs.
 	 */
 	ds.ds_name    = nname;
 	ds.ds_namelen = nnlen;
@@ -8609,12 +7676,10 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 	}
 
 	/*
-	 * The destination has to BE a directory, asked of its record.  Finding
-	 * the old name proved that much about the source -- something filed an
-	 * entry under it -- but nothing has asked anything of the destination
-	 * yet, and "the name is free" is exactly as true of a regular file.
-	 * Handing one to dir_children_add would add a child to something that
-	 * counts LINKS in that field.
+	 * The destination has to be a directory, asked of its record: finding
+	 * the old name proved it of the source, but "the name is free" is as
+	 * true of a regular file, where dir_children_add would add a child to
+	 * a field that counts links.
 	 */
 	if (inode_info(ndir, &ii) != FS_APFS_E_OK)
 		return (FS_APFS_E_NOTFOUND);
@@ -8633,11 +7698,10 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 		return (FS_APFS_E_NOALLOC);
 	}
 	/*
-	 * A DIRECTORY CANNOT WAIT IN THERE.  Not a limitation of this writer:
-	 * an orphaned directory would still hold entries, and their parent
-	 * would be a place no path reaches -- so every name under it becomes
-	 * unreachable while remaining perfectly valid, which is the one shape
-	 * of damage a checker cannot tell from a healthy volume.
+	 * A directory cannot wait in there: an orphaned directory would still
+	 * hold entries whose parent no path reaches, every name under it
+	 * unreachable yet valid -- damage a checker cannot tell from a healthy
+	 * volume.
 	 */
 	if (orphan && isdir) {
 		kprintf("apfs: \"%s\" is a directory -- one held open while "
@@ -8666,14 +7730,11 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 
 	/*
 	 * What the occupant must be, before anything is touched.  The kinds
-	 * have to agree -- POSIX gives each mismatch its own answer -- and a
-	 * directory about to be replaced must be EMPTY, asked of the tree the
-	 * way rmdir asks: replacing one over its children would leave every
-	 * entry in it valid, reachable by nothing, which is the one shape of
-	 * damage a checker cannot tell from a healthy volume.  A file about to
-	 * be replaced is bound for the private directory, where several names
-	 * cannot follow one inode -- so more links than one is refused with
-	 * the same words the source gets.
+	 * must agree (POSIX gives each mismatch its own answer).  A directory
+	 * being replaced must be empty, asked of the tree as rmdir asks, for
+	 * the reason above.  A file being replaced goes to the private
+	 * directory, where several names cannot follow one inode, so more
+	 * than one link is refused as it is for the source.
 	 */
 	vsize = 0;
 	vklen = 0;
@@ -8722,11 +7783,10 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 	}
 
 	/*
-	 * Eight leaves at the most -- two parents, two entries and the inode,
-	 * and when the destination is occupied, the occupant's inode, the
-	 * private directory's and its new entry's -- against the nine an edit
-	 * can hold, so the slots below are not checked for overflow the way a
-	 * wider writer's would have to be.
+	 * Eight leaves at most -- two parents, two entries and the inode, and
+	 * with an occupant, its inode, the private directory's and its new
+	 * entry's -- against the nine an edit holds, so the slots below are
+	 * not checked for overflow.
 	 */
 	rv = inode_where(odir, &opar_leaf);
 	if (rv != FS_APFS_E_OK)
@@ -8781,14 +7841,12 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 		goto out;
 
 	/*
-	 * THE OCCUPANT STEPS DOWN FIRST, while everything about it is still a
-	 * record.  A file is orphaned exactly as the mechanism above orphans
-	 * one -- rebuilt under the derived name with the root for a parent and
-	 * no links, its record out and back in at its own unchanged key, its
-	 * entry moved to the private directory carrying its value whole -- and
-	 * not one of its extents is touched: the bytes are the reap's problem,
-	 * later, under no lock this edit needs.  An empty directory has two
-	 * records and no third thing, and simply loses both.
+	 * The occupant steps down first, while everything about it is still a
+	 * record.  A file is orphaned as above -- rebuilt under the derived
+	 * name with the root for a parent and no links, its record out and back
+	 * in at its own key, its entry moved to the private directory with its
+	 * value whole -- and no extent is touched: the bytes are the reap's,
+	 * later.  An empty directory just loses its two records.
 	 */
 	if (victim != 0) {
 		slot = edit_leaf(&ne, vic_leaf);
@@ -8826,9 +7884,9 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 		}
 
 		/*
-		 * Its entry out, by the exact key the newcomer's goes in by --
-		 * which is the whole event, seen from the directory: the same
-		 * key, a different file behind it.
+		 * Its entry out, by the exact key the newcomer's goes in by:
+		 * seen from the directory, the same key with a different file
+		 * behind it.
 		 */
 		slot = edit_leaf(&ne, ndrec_leaf);
 		btree_layout(ne.le_node[slot], &bl);
@@ -8869,10 +7927,9 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 	}
 
 	/*
-	 * THE NEW RECORD IS BUILT FIRST, while the old one is still a record.
-	 * A delete threads the value's bytes onto the node's free list by
-	 * writing a link into the first of them, so the moment the old record
-	 * goes the buffer it was in stops saying what it said.
+	 * The new record is built first, while the old one is still a record:
+	 * a delete threads the value's bytes onto the node's free list by
+	 * writing a link into the first of them.
 	 */
 	slot = edit_leaf(&ne, ino_leaf);
 	if (!node_slot(ne.le_node[slot], child, APFS_TYPE_INODE, &pos, &voff,
@@ -8887,17 +7944,15 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 	if (rv != FS_APFS_E_OK)
 		goto out;
 	/*
-	 * The parent went in above, as an argument; the link count goes on
-	 * afterwards, because inode_renamed carries the fixed part across
-	 * verbatim by design -- it rebuilds a record, it does not decide what
-	 * the file is.  Zero is not bookkeeping: it is the statement that no
-	 * name reaches this file, which is exactly what just became true.
+	 * The parent went in above as an argument; the link count goes on
+	 * after, since inode_renamed carries the fixed part across verbatim.
+	 * Zero states that no name reaches this file any more.
 	 */
 	if (orphan)
 		((struct apfs_inode_val *)rec)->ai_nchildren_or_nlink = 0;
 
 	/*
-	 * The old entry out.  By its exact key, like unmake_at: a directory has
+	 * The old entry out, by its exact key as in unmake_at: a directory has
 	 * one record per name and they differ only past the eighth byte, so
 	 * "the DIR_REC of this parent" names all of them at once.
 	 */
@@ -8914,7 +7969,7 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 		 * Carried across whole rather than rebuilt, so that whatever an
 		 * entry says beyond the object id and the type keeps saying it.
 		 * A shorter one than this kernel knows how to read is refused
-		 * BEFORE the delete, since there would be nothing to put back.
+		 * before the delete, since there would be nothing to put back.
 		 */
 		if (vlen < sizeof(dv)) {
 			rv = FS_APFS_E_INVAL;
@@ -8934,7 +7989,7 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 
 	/*
 	 * And the new entry in, carrying the old one's value: the object id it
-	 * names, its type, and the date it was ADDED, which is a fact about the
+	 * names, its type, and the date it was added, which is a fact about the
 	 * name and not about this move.  The delete came first so that a rename
 	 * within one directory has the old entry's room to put the new one in.
 	 */
@@ -8967,12 +8022,10 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 	*full_leaf = 0;
 
 	/*
-	 * The counts.  A name that stays in its directory changes neither
-	 * count, and the times still move: the directory was modified, and one
-	 * call with nothing to add says that in one place rather than two.
-	 * An occupant shifts each sum by one where it stood: its old directory
-	 * lost it, which cancels the newcomer's arrival there, and the private
-	 * directory gains what a file it takes in.
+	 * The counts.  A name that stays in its directory changes neither, but
+	 * the times still move, through one call with nothing to add.  An
+	 * occupant's directory loses it, cancelling the newcomer's arrival
+	 * there, and the private directory gains a file it takes in.
 	 */
 	slot = edit_leaf(&ne, opar_leaf);
 	if (odir == ndir)
@@ -9000,14 +8053,10 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 		goto out;
 	}
 	/*
-	 * Over a free name, two records out and two back in: the tree holds
-	 * exactly as many keys as it did and no total moves at all.  Over a
-	 * FILE, still none: the occupant's inode went out and came back, and
-	 * its entry left one directory for another -- the file itself is
-	 * still counted, because it still exists.  Over a DIRECTORY the tree
-	 * is two records short -- the occupant's entry was replaced and its
-	 * inode simply removed -- and the volume holds one directory fewer,
-	 * which is put back if the commit refuses before anything moved.
+	 * Over a free name or a file no total moves: records went out and came
+	 * back, and the file still exists.  Over a directory the tree is two
+	 * records short and the volume one directory fewer, put back if the
+	 * commit refuses before anything moved.
 	 */
 	keydelta = (victim != 0 && victim_isdir) ? -2 : 0;
 	if (victim != 0 && victim_isdir)
@@ -9068,18 +8117,12 @@ out:
 }
 
 /*
- * And the same, with the room made underneath it -- make_at's loop, for the
- * same two reasons and with a wider ceiling.
- *
- * FOUR inserts here can be refused: the new entry, which sorts under the
- * destination directory's object id; the inode record, which sorts under the
- * child's and comes back LONGER when the new name is longer than the old; and
- * when the destination is occupied, the occupant's inode coming back under
- * its derived name and its new entry in the private directory.  None of them
- * says anything about the others, so splitting for one can be answered by
- * another, and four is still the ceiling: each of those leaves needs at most
- * one split, and half a node is room enough for any of the records several
- * times over.
+ * And the same, with room made underneath it: make_at's loop with a wider
+ * ceiling.  Four inserts can be refused -- the new entry (under the
+ * destination's id), the inode record (under the child's, longer when the
+ * name is), and with an occupant, its inode under the derived name and its
+ * new entry in the private directory.  Splitting for one can be answered by
+ * another, and four is the ceiling: each leaf needs at most one split.
  */
 static int
 move_at(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
@@ -9123,13 +8166,8 @@ fs_apfs_rename(uint64_t odir, const char *oname, uint64_t ndir,
 }
 
 /*
- * Which object a name in a directory stands for.
- *
- * The orphan calls need this before they can do anything, because the entry a
- * file waits under is DERIVED from its object id -- so the id has to be known
- * before the name it moves to can be spelled.  One descent, and the writer
- * below resolves the name a second time; that is a descent, not a scan, and
- * paying it keeps the move in one function instead of two halves.
+ * Which object a name in a directory stands for.  The orphan calls need it
+ * first: the name a file waits under is derived from its object id.
  */
 static int
 dirent_find(uint64_t dir, const char *name, uint64_t *child, bool *isdir)
@@ -9201,12 +8239,10 @@ fs_apfs_reap(uint64_t ino, uint64_t now)
 		return (FS_APFS_E_NOMOUNT);
 
 	/*
-	 * ASKED FOR PROOF FIRST, because this destroys and the caller's word
-	 * for it is a counter kept somewhere else.  An inode that still has a
-	 * name has a link count, and taking its bytes on a caller's say-so
-	 * would leave a live entry pointing at nothing -- which is not a shape
-	 * this kernel can produce today and is exactly the shape a wrong
-	 * reference count would produce tomorrow.
+	 * Asked for proof first, because this destroys and the caller's word
+	 * is a counter kept elsewhere.  Taking the bytes of an inode that
+	 * still has a name would leave a live entry pointing at nothing, the
+	 * shape a wrong reference count would produce.
 	 */
 	rv = inode_info(ino, &ii);
 	if (rv != FS_APFS_E_OK)
@@ -9269,17 +8305,9 @@ fs_apfs_reap_all(uint64_t now, uint32_t *n_out)
 		return (FS_APFS_E_NOMOUNT);
 
 	/*
-	 * ONE AT A TIME, re-asking the tree after each, rather than listing
-	 * them and then removing the list.  Every reap rewrites leaves and can
-	 * split or drop one, so a list gathered beforehand is a list of places
-	 * that have since moved -- and the cost of asking again is a descent,
-	 * against a whole boot's worth of work already done by the time this
-	 * runs.
-	 *
-	 * The bound is not decoration.  If a reap ever answered success without
-	 * taking the entry out, this would sit here forever on the same one,
-	 * and a mount that never finishes is harder to diagnose than a mount
-	 * that says what it gave up on.
+	 * One at a time, asking the tree again after each: a reap rewrites
+	 * leaves, so a list gathered beforehand would go stale.  Bounded, so a
+	 * reap that succeeds without removing its entry cannot spin the mount.
 	 */
 	for (n = 0; n < 4096; n++) {
 		op.op_child = 0;
@@ -9434,10 +8462,9 @@ readdir_pick(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 	(void)bno;
 	rs = arg;
 	/*
-	 * Past this directory's entries.  The scan began at the first of them,
-	 * so a record belonging to anything else is the end of the directory --
-	 * which is also how an index beyond the last name reports that there is
-	 * no such entry.
+	 * Past this directory's entries: the scan began at the first of them,
+	 * so any other record ends the directory, which is also how an index
+	 * beyond the last name reports that there is no such entry.
 	 */
 	if (type != APFS_TYPE_DIR_REC || oid != rs->rs_dir)
 		return (false);
@@ -9496,10 +8523,9 @@ fs_apfs_readdir(const char *path, uint32_t index, struct fs_apfs_dirent *out)
 		return (0);
 
 	/*
-	 * A directory entry carries a name and an object id but no length --
-	 * that is in the inode, one more pass over the tree.  Deliberately not
-	 * fatal if it is missing: a name we can report with an unknown size
-	 * beats failing the whole enumeration.
+	 * A directory entry carries a name and an object id but no length;
+	 * that is in the inode, one more descent.  Not fatal if missing: a
+	 * name with an unknown size beats failing the whole enumeration.
 	 */
 	if (!out->ade_is_dir && inode_info(out->ade_ino, &ii) == FS_APFS_E_OK)
 		out->ade_size = ii.ii_size;
@@ -9507,12 +8533,10 @@ fs_apfs_readdir(const char *path, uint32_t index, struct fs_apfs_dirent *out)
 }
 
 /*
- * Mount-time listing.  Reading a container is only half the claim; walking
- * out of it by name is the other half, so the banner shows the tree it
- * actually resolved rather than asserting it could.  It also remembers the
- * first small regular file it saw, which fs_apfs_init then reads: a size out
- * of an inode proves the metadata path, and only bytes off the disk prove the
- * extent path.
+ * Mount-time listing, so the banner shows the tree actually resolved by
+ * name.  It also remembers the first small regular file it saw, which
+ * fs_apfs_init then reads: a size out of an inode proves the metadata path,
+ * and only bytes off the disk prove the extent path.
  */
 #define	APFS_PROBE_MAX	(64u * 1024u)	/* keep the boot-time read cheap */
 
@@ -9571,9 +8595,8 @@ list_dir(const char *path, int depth, struct mount_probe *mp)
 }
 
 /*
- * Read one file at mount and report what came back.  The sum is over every
- * byte, which makes it trivially reproducible on the host that wrote the
- * image -- the point is to be checkable, not to be a good checksum.
+ * Read one file at mount and report a byte sum: trivially reproducible on
+ * the host that wrote the image, which is the point.
  */
 static void
 probe_read(const struct mount_probe *mp)
@@ -9660,10 +8683,8 @@ fs_apfs_init(void)
 	    (unsigned long long)g_apfs.ac_omap_oid,
 	    (unsigned long long)g_apfs.ac_fs_oid);
 	/*
-	 * The floor of the view window, on the terms the essay at fq_floor
-	 * sets out: the checkpoint before this one is what any writer able
-	 * to fall back had to keep whole, and it is all a fresh mount vouches
-	 * for.
+	 * The floor of the view window, as fq_floor explains: the checkpoint
+	 * before this one is all a fresh mount can vouch for.
 	 */
 	fq_floor = g_apfs.ac_xid > 1 ? g_apfs.ac_xid - 1 : 1;
 
@@ -9675,10 +8696,8 @@ fs_apfs_init(void)
 	if (read_checkpoint_maps(scratch) == FS_APFS_E_OK) {
 		if (read_spaceman(scratch) == FS_APFS_E_OK) {
 			/*
-			 * The chunk walk needs three blocks live at once --
-			 * the space manager, a chunk-info block and a bitmap
-			 * -- so it borrows two more for the length of the
-			 * walk rather than keeping them for the mount.
+			 * The chunk walk needs three blocks live at once, so
+			 * it borrows two more for the walk only.
 			 */
 			void	*cib_buf;
 			void	*bm_buf;
@@ -9693,9 +8712,8 @@ fs_apfs_init(void)
 			kfree(cib_buf);
 			kfree(bm_buf);
 			/*
-			 * After the walk, because the strongest check the
-			 * pool can be given is that the two blocks the walk
-			 * found are inside it and marked taken in it.
+			 * After the walk: ip_load checks that the two blocks
+			 * it found are inside the pool and marked taken.
 			 */
 			(void)ip_load();
 		}
@@ -9712,9 +8730,8 @@ fs_apfs_init(void)
 
 	/*
 	 * Now that the volume is known, metadata comes from the chunk its own
-	 * metadata already lives in.  Before this it was whichever chunk the
-	 * bitmap walk met first, which is fine for taking blocks and useless
-	 * for keeping a copy near the thing it replaces.
+	 * metadata lives in, not whichever chunk the bitmap walk met first, so
+	 * that a copy lands near what it replaces.
 	 */
 	if (g_apfs.ac_ip_valid) {
 		struct alloc_chunk	*ch;
@@ -9762,13 +8779,9 @@ chunk_resident(uint64_t bno)
 }
 
 /*
- * Bring the chunk covering `bno` into memory, or say why not.
- *
- * A wholly free chunk has no bitmap block at all -- the format's way of saying
- * "nothing here is taken" -- and giving it one means allocating a block for it
- * and telling the chunk-info, which is a different operation from this one.
- * Nothing needs it yet: everything this kernel touches is in a chunk that has
- * a bitmap already.
+ * Bring the chunk covering `bno` into memory, or say why not.  A wholly free
+ * chunk has no bitmap block, and giving it one is a different operation
+ * that nothing here needs yet.
  */
 static struct alloc_chunk *
 chunk_admit(uint64_t bno)
@@ -9857,24 +8870,11 @@ chunk_for(uint64_t bno)
  * `first` of chunk `ch`: set the bits when `take` is true, clear them when it
  * is false, and move both counters the matching way.
  *
- * COPY-ON-WRITE, and this is where the checkpoint starts paying for itself.
- * The bitmap and the chunk-info block are not written back where they came
- * from; each is written to a block taken from the internal pool, and the
- * space manager -- which lives in memory now -- is pointed at the new one.
- * Until the checkpoint commits, the old pair is still on the platter saying
- * exactly what the live checkpoint believes, so a crash anywhere in here
- * loses the allocation and nothing else.
- *
- * The three edits still have to be correct together -- a bitmap that says a
+ * All in memory; alloc_flush writes the bitmap and the chunk-info block when
+ * the checkpoint closes.  The three edits must agree -- a bitmap that says a
  * block is taken while the chunk-info counts it free is a container apfsck
- * rejects, in those words -- but they no longer need a transaction to make
- * that so: nothing here is visible until a checkpoint publishes all of it.
- * That is why fs_txn is gone from this path and still used by the one that
- * writes an inode in place.
- *
- * The bitmap goes through the raw path because it has no header to check or
- * to seal; the chunk-info block is a physical object, so its oid is its own
- * block number and it carries the xid of the checkpoint being built.
+ * rejects -- but nothing here is visible until a checkpoint publishes all of
+ * it, so no other transaction is needed.
  *
  * Returns 0, or a negative FS_APFS_E_*.
  */
@@ -9980,13 +8980,9 @@ alloc_run_in(struct alloc_chunk *ch, uint32_t count, uint64_t *first_out)
 /*
  * Take a run of `count` consecutive blocks, near `near` if that can be
  * arranged, or refuse.  A block waiting in the free queue is still marked in
- * use, so this cannot pick one up.
- *
- * The hint is not cosmetic.  A copy that lands in the chunk it came from is a
- * copy whose release is reachable in the same transaction -- and for a file's
- * bytes it is also what keeps a file's extents from scattering one write at a
- * time.  When the hinted chunk cannot serve, metadata's own chunk is tried,
- * and only then does this fail.
+ * use, so this cannot pick one up.  Near keeps a copy's release in a chunk
+ * already held and a file's extents together; failing that, metadata's own
+ * chunk is tried.
  */
 int
 alloc_blocks(uint32_t count, uint64_t near, uint64_t *first_out)
@@ -10002,12 +8998,11 @@ alloc_blocks(uint32_t count, uint64_t near, uint64_t *first_out)
 	ch = (near != 0) ? chunk_for(near) : NULL;
 	if (ch != NULL) {
 		/*
-		 * EXACTLY there first, when exactly there is free.  A caller
-		 * naming a block usually wants the run to continue from it,
-		 * and first-fit gave it to them only four times in six -- the
-		 * metadata copies of the same transaction kept taking the
-		 * block in between.  Landing on it is the difference between
-		 * lengthening a record and adding one.
+		 * Exactly there first, when it is free: a caller naming a block
+		 * usually wants its run continued, and first-fit managed that
+		 * only four times in six, the transaction's metadata copies
+		 * taking the block in between.  Landing on it is lengthening a
+		 * record rather than adding one.
 		 */
 		if (near >= ch->ch_base && chunk_run_free(ch,
 		    (uint32_t)(near - ch->ch_base), count)) {
@@ -10036,14 +9031,10 @@ alloc_blocks(uint32_t count, uint64_t near, uint64_t *first_out)
 }
 
 /*
- * Give a run back: into the device's free queue, keyed by the transaction
- * doing the releasing.  The bits stay set and the counters do not move --
- * the block is not free, it is spoken for by checkpoints that still name it,
- * and fq_release is the only thing that ever makes it free again.
- *
- * The chunk is admitted here rather than at release time so that a run this
- * kernel cannot reach is refused by the caller that still has a choice, not by
- * a checkpoint that has none.
+ * Give a run back: into the device's free queue, keyed by the releasing
+ * transaction.  The bits stay set until fq_release, the only thing that
+ * makes a block free again.  The chunk is admitted here, so a run this
+ * kernel cannot reach is refused by a caller that still has a choice.
  */
 int
 free_blocks(uint64_t first, uint32_t count)
@@ -10068,23 +9059,13 @@ free_blocks(uint64_t first, uint32_t count)
 }
 
 /*
- * Put the bitmap and the chunk-info block down, if anything moved.  Called
- * once by the checkpoint writer, however many allocations there have been.
- *
- * COPY-ON-WRITE, and this is where the checkpoint starts paying for itself.
- * Neither block is written back where it came from; each goes to a block
- * taken from the internal pool, and the space manager is pointed at the new
- * chunk-info block.  Until the checkpoint commits, the old pair is still on
- * the platter saying exactly what the live checkpoint believes, so a crash
- * anywhere in here loses the allocations and nothing else.
- *
- * Once per checkpoint rather than once per allocation, and that is not a
- * refinement: a spine update takes half a dozen calls, each would have cost
- * two pool blocks, and the pool is fifteen.
- *
- * The bitmap goes through the raw path because it has no header to check or
- * to seal; the chunk-info block is a physical object, so its oid is its own
- * block number and it carries the xid of the checkpoint being built.
+ * Put the dirty chunk bitmaps and the chunk-info block down, once per
+ * checkpoint: each goes to a fresh internal-pool block and the space manager
+ * is pointed at the new chunk-info block, so until the checkpoint commits the
+ * old blocks still hold.  Not once per allocation: a spine update allocates
+ * half a dozen times, each costing two pool blocks, and the pool is fifteen.
+ * A bitmap is written raw (no header); the chunk-info block is physical, its
+ * oid its block number.
  */
 static int
 alloc_flush(uint64_t xid)
@@ -10107,10 +9088,8 @@ alloc_flush(uint64_t xid)
 		return (FS_APFS_E_INVAL);
 
 	/*
-	 * Every bitmap that changed moves, and the chunk-info block that names
-	 * them moves once at the end.  A chunk left clean is left where it is:
-	 * its block is still exactly what the live checkpoint believes, so
-	 * copying it would spend a pool block to say nothing.
+	 * Every bitmap that changed moves, then the chunk-info block that
+	 * names them; a clean chunk's bitmap is left where it is.
 	 */
 	cib = (struct apfs_chunk_info_block *)g_cib;
 	for (i = 0; i < g_chunk_n; i++) {
@@ -10156,26 +9135,16 @@ alloc_flush(uint64_t xid)
 }
 
 /*
- * THE SPINE
- *
- * A virtual object -- a node of the file-system tree, a volume superblock --
- * is found by asking an object map where its oid lives.  Copy one, and the
- * copy is unreachable until that map says so; change the map, and the map is
- * a physical object that must itself be copied; and so on, all the way to the
- * container superblock, which is the one thing a checkpoint writes by name.
- *
- * The chain was measured on the container rather than reasoned about, and it
- * is seven objects long for a single inode timestamp:
+ * The spine.  A virtual object -- a tree node, a volume superblock -- is
+ * found through an object map; a copy is unreachable until the map says so,
+ * the map is physical and must itself be copied, and so on up to the
+ * container superblock.  Seven objects for one inode timestamp:
  *
  *	leaf -> volume omap tree -> volume omap -> volume superblock
  *	     -> container omap tree -> container omap -> nx_superblock
  *
- * The measurement also removed half the work I had budgeted.  A virtual tree
- * addresses its children BY OID, so copying a leaf does not move anything the
- * nodes above it hold: the fs-tree root is not touched, and the path copy is
- * one node long.  The container's own history shows it -- its root sits at
- * xid 4 while both its children are still at xid 3, at the addresses they
- * had.
+ * Children are named by oid, so within the fs tree the path copy is one node
+ * long.  cow_physical copies a physical object, whose oid is its block.
  */
 static int
 cow_physical(uint64_t old_bno, uint64_t xid, void *buf, uint64_t *new_bno)
@@ -10188,7 +9157,7 @@ cow_physical(uint64_t old_bno, uint64_t xid, void *buf, uint64_t *new_bno)
 	if (rv != FS_APFS_E_OK)
 		return (rv);
 	o = (struct apfs_obj_phys *)buf;
-	o->o_oid = bno;		/* physical: the oid IS the block number */
+	o->o_oid = bno;		/* physical: the oid is the block number */
 	o->o_xid = xid;
 	rv = fs_apfs_write_block(bno, buf);
 	if (rv != FS_APFS_E_OK) {
@@ -10204,23 +9173,12 @@ cow_physical(uint64_t old_bno, uint64_t xid, void *buf, uint64_t *new_bno)
 }
 
 /*
- * Take an entry out of a node whose records are all one size.
- *
- * The variable-KV delete threads the freed bytes onto a chain, because the
- * records around them are all different lengths and a hole is only useful to a
- * record that fits it.  Here every key is sixteen bytes and so is every value,
- * which makes the chain unnecessary and, worse, a leak: leaf_insert_fixed takes
- * from the free span and never looks at a chain, so bytes put on one would
- * never come back, and an object map that gains and loses an entry per
- * transaction is a cycle -- the same shape that ate the free queue's node and
- * then the catalog's.
- *
- * So the hole is FILLED rather than remembered.  The last record placed in the
- * key area is moved into the freed key's bytes and the table entry that named
- * it is pointed at the new place; the same on the value side, measured from the
- * other end.  Which record that is has nothing to do with which record is last
- * in key ORDER -- the table of contents is what puts records in order, and the
- * areas it points into are just storage.
+ * Take an entry out of a node whose records are all one size.  No hole
+ * chain: leaf_insert_fixed takes only from the free span, so an object map
+ * gaining and losing an entry per transaction would leak room.  The hole is
+ * filled instead: the last record placed in the key area (not last in key
+ * order) moves into the freed bytes and its table entry is repointed; the
+ * same on the value side.
  */
 static int
 omap_slot_drop(uint8_t *node, uint32_t pos)
@@ -10288,13 +9246,10 @@ omap_slot_drop(uint8_t *node, uint32_t pos)
 }
 
 /*
- * Point an object map's entry for `oid` at `paddr`, and copy the node.
- *
- * REPLACES the entry rather than adding one.  A map may hold several versions
- * of an oid, keyed by the transaction that made them, and that is how a
- * snapshot keeps seeing the old one; with no snapshots there is nothing to
- * keep, and replacing avoids the question of what to do when the node has no
- * room left -- which is a B-tree split, and a different rung.
+ * Apply one struct omap_edit to an object map node -- repoint the moved
+ * oids, drop the gone ones, insert the new ones -- and copy the node.  A
+ * moved oid's entry is replaced, not given a second version: with no
+ * snapshots nothing needs the old one, and the node does not grow.
  */
 static int
 omap_replace_cow(uint64_t node_bno, const struct omap_edit *oe, uint64_t xid,
@@ -10322,12 +9277,9 @@ omap_replace_cow(uint64_t node_bno, const struct omap_edit *oe, uint64_t xid,
 		return (FS_APFS_E_INVAL);
 	}
 	/*
-	 * SEVERAL AT ONCE, and that is not a convenience.  One insert moves
-	 * both the leaf it lands in and the root whose key count it changes;
-	 * doing those as two passes would copy this node twice, and copying it
-	 * twice means the second copy replaces an entry in a node the first has
-	 * already released -- correct, and six spine objects more expensive
-	 * every time.
+	 * Several at once: one insert moves both the leaf it lands in and the
+	 * root whose key count it changes, and a pass for each would copy this
+	 * node, and six spine objects with it, once per pass.
 	 */
 	done = 0;
 	for (i = 0; i < bl.bl_nkeys && done < oe->oe_n; i++) {
@@ -10378,16 +9330,10 @@ omap_replace_cow(uint64_t node_bno, const struct omap_edit *oe, uint64_t xid,
 	}
 
 	/*
-	 * And wholly NEW objects, when some have just been made.  A split is
-	 * the only thing that does this: the upper half is an object nothing
-	 * has ever heard of, and writing its block does not make it
-	 * reachable -- this entry does.
-	 *
-	 * A LIST, since the tree learned to gain a level: a root that splits
-	 * makes TWO objects at once, because it has to keep its own oid -- the
-	 * volume superblock names it -- so both halves are new.  Inserting them
-	 * one call at a time would copy this node twice for the same reason the
-	 * replacements above are a list.
+	 * And new objects: the upper half of a split, or both halves of a root
+	 * that splits (it keeps its own oid, which the volume superblock
+	 * names).  Writing their blocks did not make them reachable; these
+	 * entries do.
 	 */
 	for (j = 0; j < oe->oe_nnew; j++) {
 		struct apfs_omap_key	 ik;
@@ -10417,25 +9363,13 @@ omap_replace_cow(uint64_t node_bno, const struct omap_edit *oe, uint64_t xid,
 }
 
 /*
- * A run of blocks has moved: tell the OTHER tree that names it.
- *
- * The file-system tree answers "where are this file's bytes"; the extent
- * reference tree answers the reverse -- who owns this run, and how many
- * references it has -- which is what lets a block be shared between clones and
- * counted.  Both describe the same run, and apfsck checks one against the
- * other, so a file whose bytes move without this is a file the checker finds.
- *
- * The record's KEY is the run's first block, which is what makes this
- * different from patching a file extent: the key changes, so the record sorts
- * somewhere else.  While both places are in ONE node -- always, until the
- * tree grew an index level -- the count is the same and so are the sizes, so
- * the key and value keep the bytes they already occupy and only their entry
- * in the table of contents moves.  When the two places are in different
- * LEAVES, the record is carried instead: taken out through the shrink and
- * put back through the insert, value verbatim, each half settling its own
- * nodes.  A failure between the two leaves this checkpoint unpublishable --
- * said out loud -- and the volume on disk still whole, because nothing here
- * lands until the checkpoint does.
+ * A run of blocks has moved: tell the extent reference tree, which says who
+ * owns a run and how many references it has; apfsck checks it against the
+ * file extents.  The record's key is the run's first block, so it changes
+ * and the record re-sorts.  Within one leaf only its table entry moves;
+ * across leaves it is carried out through the shrink and in through the
+ * insert, and a failure between the two leaves this checkpoint
+ * unpublishable, said out loud.
  */
 static int
 extref_move(uint64_t old_start, uint64_t new_start, uint64_t blocks,
@@ -10494,10 +9428,9 @@ extref_move(uint64_t old_start, uint64_t new_start, uint64_t blocks,
 	}
 
 	/*
-	 * Length in BLOCKS here, in bytes in the file extent.  Checked rather
-	 * than trusted: a run relocated as a whole must be exactly one record,
-	 * and moving a record that describes a different span would leave the
-	 * two trees each internally consistent and disagreeing with each other.
+	 * Length in blocks here, in bytes in the file extent.  Checked: moving
+	 * a record for a different span would leave the two trees each
+	 * consistent and disagreeing.
 	 */
 	pv = (struct apfs_phys_ext_val *)(bl.bl_vals - voff);
 	if ((pv->pe_len_and_kind & APFS_PEXT_LEN_MASK) != blocks) {
@@ -10564,7 +9497,7 @@ extref_move(uint64_t old_start, uint64_t new_start, uint64_t blocks,
 	kv[pos] = save;
 
 	/*
-	 * PHYSICAL, so nothing resolves an oid to find it: the volume
+	 * Physical, so nothing resolves an oid to find it: the volume
 	 * superblock names the root's block outright, and spine_update writes
 	 * ac_extref_bno in when it copies that superblock.
 	 */
@@ -10575,13 +9508,10 @@ out:
 }
 
 /*
- * A virtual object has moved to `paddr`.  Make that the answer everything
- * from here to the container superblock gives.
- *
- * Every step is a copy, so at no point does the live checkpoint stop being
- * true; the last of them leaves the new container object map in ac_omap_oid,
- * and the checkpoint writer puts THAT into the superblock it commits.  Until
- * it does, none of this is reachable from anything on the disk.
+ * Virtual objects have moved, been made or gone (`oe`): make that the answer
+ * everything up to the container superblock gives.  Every step is a copy;
+ * the last leaves the new container object map in ac_omap_oid for the
+ * checkpoint writer, and until then none of it is reachable.
  */
 static int
 spine_update_n(const struct omap_edit *oe, uint64_t xid, void *buf)
@@ -10617,7 +9547,7 @@ spine_update_n(const struct omap_edit *oe, uint64_t xid, void *buf)
 
 	/*
 	 * 3. the volume superblock, which names that object map.  This one is
-	 * VIRTUAL: its oid is a name the container's map resolves, so the
+	 * virtual: its oid is a name the container's map resolves, so the
 	 * copy keeps the oid it had and only its address changes.
 	 */
 	rv = fs_apfs_read_block(g_apfs.ac_vol_sb_bno, buf);
@@ -10626,26 +9556,18 @@ spine_update_n(const struct omap_edit *oe, uint64_t xid, void *buf)
 	vsb = (struct apfs_superblock *)buf;
 	vsb->apfs_omap_oid = new_vol_omap;
 	/*
-	 * The extent reference tree is named from here too, and it moves for
-	 * its own reasons -- a file's bytes changing address -- which have
-	 * nothing to do with the object map.  Writing it unconditionally is
-	 * what keeps the two from having to know about each other: whoever
-	 * moved it left the new address in ac_extref_bno, and if nobody did,
-	 * this writes back what is already there.
+	 * The extent reference tree is named from here too, and moves for its
+	 * own reasons.  Written unconditionally so the two need not know about
+	 * each other: whoever moved it left the new address in ac_extref_bno,
+	 * and otherwise this writes back what is already there.
 	 */
 	vsb->apfs_extentref_tree_oid = g_apfs.ac_extref_bno;
 	vsb->apfs_fs_alloc_count     = g_apfs.ac_fs_alloc_count;
 	/*
-	 * And what the volume says about its own contents.  Same terms as the
-	 * two above: whoever changed one left it in g_apfs, and if nobody did,
-	 * this writes back what was already there.
-	 *
-	 * The two are not equally load-bearing, and that was measured rather
-	 * than assumed.  apfs_next_obj_id is checked -- a created inode whose
-	 * number the volume still calls free stops apfsck before it looks at
-	 * anything else.  apfs_num_files is not checked at all, in either
-	 * direction; it is written because it is the volume's own claim about
-	 * itself and something other than this checker will read it.
+	 * And what the volume says about its own contents, on the same terms.
+	 * apfs_next_obj_id is checked (a created inode whose number the volume
+	 * still calls free stops apfsck first); apfs_num_files is not checked
+	 * at all, and is written as the volume's own claim for other readers.
 	 */
 	vsb->apfs_next_obj_id        = g_apfs.ac_next_ino;
 	vsb->apfs_num_files          = g_apfs.ac_num_files;
@@ -10689,9 +9611,8 @@ spine_update_n(const struct omap_edit *oe, uint64_t xid, void *buf)
 
 	/*
 	 * Believed only now, and all together.  A failure anywhere above
-	 * leaves blocks allocated to a chain nothing points at -- which the
-	 * next checkpoint publishes as a leak, and which is one of the
-	 * reasons the free queue is the rung after this one.
+	 * leaves blocks allocated to a chain nothing points at, which the next
+	 * checkpoint would publish as a leak.
 	 */
 	g_apfs.ac_vol_omap_tree = new_vol_tree;
 	g_apfs.ac_vol_omap_bno  = new_vol_omap;
@@ -10716,59 +9637,42 @@ spine_update(uint64_t oid, uint64_t paddr, uint64_t xid, void *buf)
 }
 
 /*
- * WRITING A CHECKPOINT
+ * Writing a checkpoint.
  *
- * Everything above this line changes the container by writing a block back
- * where it came from.  That is legal only while the container stays in the
- * checkpoint it booted in: a block's contents and its transaction id are one
- * statement, and rewriting the first without the second is a lie the format
- * cannot catch.  It also has no crash story -- there is no instant before
- * which the change had not happened and after which it had.
+ * Everything above builds the next state out of copies; a checkpoint is the
+ * instant it becomes the container's.  It too is written entirely into
+ * blocks nobody is reading:
  *
- * A checkpoint is that instant.  It is built entirely out of blocks nobody
- * is reading:
- *
+ *	0. once the free queues have let go of what is old enough, the
+ *	   allocation metadata and the pool bitmap (alloc_flush, ip_rotate);
  *	1. the ephemeral objects, copied into the next free slots of the data
  *	   ring, each carrying the new xid;
  *	2. a checkpoint map naming where they landed, into the next free slot
  *	   of the descriptor ring;
- *	3. a superblock after it, whose landing IS the commit -- before that
- *	   write the container is the old checkpoint entire, after it the new
- *	   one entire, and there is no third state;
+ *	3. a superblock after it, naming the new container object map, whose
+ *	   landing is the commit -- before that write the container is the old
+ *	   checkpoint entire, after it the new one entire, and there is no
+ *	   third state;
  *	4. block zero, a copy of that superblock.
  *
- * Step 4 is not bookkeeping.  A container whose block zero names an older
- * checkpoint than the ring holds is one apfsck calls "not unmounted cleanly"
- * -- measured on a real container, not assumed: a checkpoint written without
- * it is accepted in every other respect, and adding the copy is exactly what
- * silences the complaint.  A crash between 3 and 4 leaves that state on
- * purpose: consistent, mountable at the new xid, and honestly marked as
- * having been interrupted.
+ * Step 4 is not bookkeeping: a container whose block zero names an older
+ * checkpoint than the ring holds is one apfsck calls "not unmounted
+ * cleanly".  A crash between 3 and 4 leaves that state on purpose:
+ * consistent, mountable at the new xid, and marked as interrupted.
  *
- * ORDERING IS NOT ASSUMED EITHER.  It is a property of the path these writes
- * take: bio_write reaches the device before it touches the cache (fs/bio.c),
- * and ata_kwrite ends every write with FLUSH CACHE (dev/ata_drv.c).  Each
- * block here is therefore on the platter before the next one starts, and the
- * order written below is the order the disk sees.  That is also why this does
- * not go through fs_txn: a transaction is a SET of blocks with no order among
- * them, and here the order is the whole meaning.
- *
- * WHAT THIS DELIBERATELY DOES NOT DO is change anything in the object trees.
- * The checkpoint it writes says what the last one said, one xid later.  That
- * is the point: the skeleton can be proven alone -- the container advances,
- * the previous checkpoint stays intact and mountable, apfsck accepts both --
- * before anything is hung on it.  Copy-on-write of metadata is the next rung,
- * and it needs this one to have somewhere to put the top of its chain.
+ * Ordering holds because bio_write reaches the device before the cache
+ * (fs/bio.c) and ata_kwrite ends every write with FLUSH CACHE
+ * (dev/ata_drv.c): the order below is the order the disk sees.  Hence not
+ * fs_txn, whose transactions are unordered sets of blocks.
  */
 
 static uint64_t	ckpt_n_written;		/* checkpoints committed */
 static uint64_t	ckpt_n_refused;		/* asked for and declined */
 
 /*
- * Is slot `s` part of the run of `len` slots starting at `start` in a ring of
- * `blocks`?  Used to refuse writing a checkpoint over the one currently being
- * read -- which a ring makes possible after enough of them, and which nothing
- * later would catch, because the result checksums perfectly.
+ * Is slot `s` in the run of `len` slots from `start` in a ring of `blocks`?
+ * Refuses a checkpoint written over the one being read, which would
+ * checksum perfectly and which nothing later would catch.
  */
 static bool
 slot_in_run(uint32_t s, uint32_t start, uint32_t len, uint32_t blocks)
@@ -10807,11 +9711,10 @@ fs_apfs_checkpoint(void)
 	ip_slot = g_apfs.ac_ipbm_slot;
 
 	/*
-	 * A checkpoint that does not re-emit the ephemeral objects is a
-	 * checkpoint whose space manager is whatever the previous one left --
-	 * and the previous one's slots are the next to be reused.  So a table
-	 * that is empty, or that is known to be missing entries, is a reason
-	 * to refuse rather than to write three quarters of a checkpoint.
+	 * A checkpoint that does not re-emit the ephemeral objects leaves its
+	 * space manager in the previous one's slots, which are the next to be
+	 * reused.  So a table that is empty, or known to be missing entries,
+	 * refuses rather than writing three quarters of a checkpoint.
 	 */
 	if (g_apfs.ac_eph_count == 0 || g_apfs.ac_eph_over != 0) {
 		kprintf("apfs-ckpt: refusing -- %u ephemeral objects known, "
@@ -10859,11 +9762,9 @@ fs_apfs_checkpoint(void)
 	}
 
 	/*
-	 * The xid to write.  The superblock states what it expects to follow
-	 * it, and that should be one past its own; the two are derived
-	 * differently, so a disagreement means one of the two readings is
-	 * wrong and is worth saying out loud even though the answer taken is
-	 * the same either way.
+	 * The xid to write.  The superblock's nx_next_xid should agree; the two
+	 * are derived differently, so a disagreement is worth saying even
+	 * though the answer taken is the same.
 	 */
 	xid = g_apfs.ac_xid + 1;
 	if (g_apfs.ac_next_xid != 0 && g_apfs.ac_next_xid != xid)
@@ -10880,10 +9781,9 @@ fs_apfs_checkpoint(void)
 	}
 
 	/*
-	 * The superblock is read FIRST, before anything is written: it is the
-	 * one block whose contents this depends on, and finding it changed
-	 * under us -- or unreadable -- has to stop the checkpoint while the
-	 * disk is still untouched.
+	 * The superblock is read first: it is the one block this depends on,
+	 * and finding it changed or unreadable must stop the checkpoint while
+	 * the disk is untouched.
 	 */
 	if (fs_apfs_read_block(g_apfs.ac_sb_bno, sb) != FS_APFS_E_OK) {
 		kprintf("apfs-ckpt: superblock at %llu unreadable\n",
@@ -10903,12 +9803,10 @@ fs_apfs_checkpoint(void)
 	}
 
 	/*
-	 * 0. the allocation metadata, and then the pool's own bitmap.
-	 *
-	 * In that order, and it is the only order that works: putting the
-	 * chunk bitmap down takes two pool blocks and returns two, so a pool
-	 * bitmap written before it would be written stale.  Both go before
-	 * the space manager of step 1, which names what they landed in.
+	 * 0. the allocation metadata, then the pool's own bitmap: putting the
+	 * chunk bitmaps down takes pool blocks and returns as many, so a pool
+	 * bitmap written first would be stale.  Both go before the space
+	 * manager of step 1, which names where they landed.
 	 */
 	if (g_apfs.ac_ip_valid) {
 		/*
@@ -10942,8 +9840,8 @@ fs_apfs_checkpoint(void)
 			goto out;
 		}
 		/*
-		 * The space manager comes from memory, because that is where
-		 * it lives; every other ephemeral object is still only ever
+		 * The space manager and the free-queue trees come from memory,
+		 * where they live; any other ephemeral object is only ever
 		 * read, so its previous copy is its current value.
 		 */
 		if (g_sm != NULL &&
@@ -11013,17 +9911,14 @@ fs_apfs_checkpoint(void)
 	nx->nx_o.o_xid       = xid;
 	nx->nx_next_xid      = xid + 1;
 	/*
-	 * Where the next virtual object id comes from.  A node that SPLITS
-	 * needs one for its new half, and the counter is the container's
-	 * rather than the volume's -- apfs_next_obj_id numbers inodes, which
-	 * is a different namespace entirely and was 40 here while the tree's
-	 * own nodes were already at 1125.
+	 * Where the next virtual object id comes from: a split needs one for
+	 * its new half, and the counter is the container's, not the volume's
+	 * apfs_next_obj_id, which numbers inodes.
 	 */
 	nx->nx_next_oid      = g_apfs.ac_next_oid;
 	/*
-	 * The one pointer a copy-on-write of anything in the volume ends at.
-	 * Every object between an inode and here has been copied by now, and
-	 * this is the write that makes the whole chain reachable.
+	 * The one pointer every copy-on-write chain ends at; this write makes
+	 * the whole chain reachable.
 	 */
 	nx->nx_omap_oid      = g_apfs.ac_omap_oid;
 	nx->nx_xp_desc_index = map_slot;
@@ -11044,10 +9939,9 @@ fs_apfs_checkpoint(void)
 	}
 
 	/*
-	 * 4. block zero.  Past this point the checkpoint has happened
-	 * whatever else fails, so a failure here is reported and not
-	 * propagated: the container is the new checkpoint either way, and the
-	 * only difference is whether the next fsck calls it cleanly unmounted.
+	 * 4. block zero.  Past this point the checkpoint has happened, so a
+	 * failure is reported, not propagated: it only decides whether the
+	 * next fsck calls the container cleanly unmounted.
 	 */
 	if (fs_apfs_write_block(0, sb) != FS_APFS_E_OK)
 		kprintf("apfs-ckpt: xid %llu is committed, but block zero "
@@ -11070,12 +9964,7 @@ fs_apfs_checkpoint(void)
 		g_apfs.ac_eph[i].e_paddr = moved[i];
 	if (g_apfs.ac_sm_valid)
 		g_apfs.ac_sm_paddr = resolve_ephemeral(g_apfs.ac_spaceman_oid);
-	/*
-	 * And the pool: the bitmap that was written is now the live one, and
-	 * the blocks this checkpoint released stop being held back.  Nothing
-	 * in the committed container points at them any more, and the only
-	 * checkpoint that did has just been superseded.
-	 */
+	/* And the pool bitmap that was written is now the live one. */
 	if (g_apfs.ac_ip_valid)
 		g_apfs.ac_ipbm_slot = ip_slot;
 
@@ -11105,11 +9994,10 @@ fs_apfs_merges(void)
 }
 
 /*
- * Checkpoints written since boot.  A test that measures allocator behaviour
- * across a window needs this: a checkpoint is when the free queue lets go of
- * blocks, and blocks let go are holes a first-fit scan may prefer -- so a
- * claim about WHERE allocations land is only decidable over a window no
- * checkpoint interrupted, and this is how a test knows whether one did.
+ * Checkpoints written since boot.  A checkpoint is when the free queue lets
+ * go of blocks, which a first-fit scan may then prefer, so a test's claim
+ * about where allocations land holds only over a window no checkpoint
+ * interrupted; this is how the test knows whether one did.
  */
 uint64_t
 fs_apfs_ckpts(void)
@@ -11174,10 +10062,9 @@ fs_apfs_stats(void)
 	    (unsigned)g_apfs.ac_sm_blocks_per_chunk,
 	    (unsigned)g_apfs.ac_sm_cib_count);
 	/*
-	 * Blocks that are neither in use nor available: given up by some
-	 * transaction and waiting on its age.  This is the half of allocation
-	 * that a bitmap alone cannot express, and the reason freeing here is a
-	 * B-tree insert rather than clearing a bit.
+	 * Blocks neither in use nor available: given up by some transaction and
+	 * waiting on its age.  A bitmap alone cannot express that, which is why
+	 * freeing here is a B-tree insert rather than clearing a bit.
 	 */
 	kprintf("apfs: free queues -- ip %llu blk (xid %llu), main %llu blk "
 	    "(xid %llu), tier2 %llu blk; internal pool %llu blk @%llu\n",
@@ -11194,10 +10081,8 @@ fs_apfs_stats(void)
 		return;
 	}
 	/*
-	 * Three numbers from three places.  They are printed together, and the
-	 * count of chunks NOT bit-counted is printed with them, because a
-	 * verification that does not say how much of the disk it looked at is
-	 * not a verification.
+	 * How much of the disk the check looked at, printed with its result:
+	 * chunks not bit-counted are taken on trust.
 	 */
 	kprintf("apfs: %llu chunks over %llu blocks -- %llu wholly free, "
 	    "%llu bit-counted, %llu taken on trust\n",
@@ -11208,13 +10093,9 @@ fs_apfs_stats(void)
 	    (unsigned long long)(g_apfs.ac_bm_chunks -
 	    g_apfs.ac_bm_wholly_free - g_apfs.ac_bm_scanned));
 	/*
-	 * The three numbers, and they must be read at the same INSTANT to
-	 * mean anything.  The walk's totals are from mount; the space
-	 * manager's count moves as blocks are taken and released.  Comparing
-	 * one against the other two says only that the boot did some work --
-	 * which it printed as a disagreement the first time a free queue let
-	 * go of blocks the container arrived with.  So when the bitmap and
-	 * the chunk-info are in memory, all three come from there.
+	 * The three free counts must be read at one instant: the walk's
+	 * totals are from mount, so they are brought up to date with what each
+	 * resident chunk has changed since it was admitted.
 	 */
 	if (g_chunk_n != 0 && g_cib != NULL) {
 		const struct apfs_chunk_info_block	*mcib;
@@ -11252,10 +10133,8 @@ fs_apfs_stats(void)
 		    "all three agree" : "THEY DISAGREE");
 
 	/*
-	 * Two numbers, because one of them cannot show a checkpoint that was
-	 * never attempted.  A boot that writes none is a boot where nothing
-	 * asked for one; a boot that refuses them says so here rather than in
-	 * a line that scrolled past an hour ago.
+	 * Written and refused: written alone cannot tell a boot where nothing
+	 * asked for a checkpoint from one that refused them.
 	 */
 	if (ckpt_n_written != 0 || ckpt_n_refused != 0)
 		kprintf("apfs: %llu checkpoint(s) written, %llu refused -- now "
@@ -11266,10 +10145,9 @@ fs_apfs_stats(void)
 		    (unsigned long long)g_apfs.ac_sb_bno);
 
 	/*
-	 * The published past: how far back it reaches right now, and how
-	 * often it was asked for.  The refusals are printed with the rest
-	 * because a window that is never found closed is a window nobody
-	 * has tested the edge of.
+	 * The published past: how far back it reaches now, and how often it
+	 * was asked for, refusals included -- they show the window's edge was
+	 * tested.
 	 */
 	if (view_n_open != 0 || view_n_gone != 0 || view_n_forbid != 0)
 		kprintf("apfs: views -- checkpoints %llu..%llu readable, %llu "
@@ -11282,9 +10160,7 @@ fs_apfs_stats(void)
 		    (unsigned long long)view_n_gone,
 		    (unsigned long long)view_n_forbid);
 
-	/*
-	 * The pool and the spine, and what copy-on-write has cost them.
-	 */
+	/* The pool and the spine, and what copy-on-write has cost them. */
 	if (g_apfs.ac_ip_valid)
 		kprintf("apfs: pool %llu+%llu -- %llu taken, %llu returned; "
 		    "%llu metadata, %llu spine and %llu file blocks moved; "
@@ -11302,10 +10178,9 @@ fs_apfs_stats(void)
 		    (unsigned long long)chunk_n_admit);
 
 	/*
-	 * And what the tree has had done to its shape.  The last of these is
-	 * the quiet one: an index key corrected because the node under it no
-	 * longer starts where its parent said it did, which is a thing a
-	 * delete does without looking like it does.
+	 * And what the tree has had done to its shape.  The last is the quiet
+	 * one: an index key corrected because an edit moved the first record
+	 * of the node under it.
 	 */
 	if (split_n != 0 || deep_n != 0 || reidx_n != 0 || gone_n != 0)
 		kprintf("apfs: tree shape -- %llu node(s) split, %llu dropped, "
@@ -11314,17 +10189,9 @@ fs_apfs_stats(void)
 		    (unsigned long long)deep_n, (unsigned long long)reidx_n);
 
 	/*
-	 * And the queues.  The number to watch is what is still waiting: it
-	 * is how many blocks this kernel is holding out of use so that the
-	 * checkpoints behind the live one stay true, and it should rise while
-	 * a boot works and fall as the checkpoints age out.
-	 */
-	/*
-	 * "Let go" can exceed "queued", and legitimately: a container arrives
-	 * with entries already in its queues, and this kernel releases those
-	 * too.  So what is still waiting is read from the queues themselves
-	 * rather than subtracted from two counters that started counting at
-	 * different times.
+	 * And the queues: what is still waiting rises while a boot works and
+	 * falls as checkpoints age out.  Read from the queues, not as queued
+	 * minus let go: a container arrives with entries queued already.
 	 */
 	if (g_sm != NULL && (fq_n_queued != 0 || fq_n_released != 0))
 		kprintf("apfs: free queues -- %llu blocks queued, %llu let go, "

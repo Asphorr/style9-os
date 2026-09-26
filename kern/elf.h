@@ -19,11 +19,11 @@
  *	one or more PT_LOAD segments giving file -> VA mappings,
  *	e_entry naming the start address.
  *
- * elf_load() parses an image already resident in kernel memory, drops
- * the PT_LOAD segments into the target task's address space at their
- * requested VAs (all U=1, with R/W/X mirroring p_flags), and returns
- * the entry RIP.  Each segment is recorded in task->t_map alongside
- * the hardware install into task->t_pmap.
+ * elf_load() parses an image already resident in kernel memory, maps the
+ * PT_LOAD segments into the target task at their requested VAs (all U=1
+ * and readable, W/X from p_flags), and returns the entry RIP in
+ * *entry_out.  Each segment is recorded in t_map as well as installed in
+ * t_pmap.
  *
  * Layout below is imposed by the ELF64 specification; reordering fields
  * desynchronises the parser from what the linker writes.

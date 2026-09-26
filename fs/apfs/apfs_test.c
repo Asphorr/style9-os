@@ -16,39 +16,19 @@
 #include "kprintf.h"
 
 /*
- * WHAT THIS KERNEL CAN PROVE ABOUT ITS OWN WRITES
- *
- * Every claim the APFS writer makes is checked at boot, and this is where the
- * checking lives.  It is a fifth of everything that was in apfs.c and none of
- * it runs unless a test asks, which is the whole reason it is its own file:
- * reading the writer meant scrolling past the proofs of the rung before.
- *
- * These are not unit tests and they are not decoration.  Most of them exist
- * because something WAS wrong and passed everything else -- a split whose
- * separator came from the wrong half read back perfectly and left a tree
- * apfsck called out of order; a node emptied and left in place did the same;
- * a counter left decremented after a refused write was invisible to every
- * oracle there is.  So the shape they share is: arrange the case rather than
- * wait for it, then ask the DISK rather than the kernel's idea of the disk.
- *
- * apfsck from apfsprogs is the outside oracle for everything about the
- * FORMAT.  What it cannot check is what this kernel believes -- it reads a
- * volume with its own idea of key order and would agree with itself whatever
- * this code thought -- which is why apfs-seek exists and why its oracle is
- * the whole-tree walk that was right before the descent replaced it.
- *
- * The internals these reach for are declared in apfs_priv.h, which exists for
- * this file and nothing else.
+ * Boot-time self-tests of the APFS writer.  Each arranges its case rather
+ * than waiting for it, then asks the disk rather than the kernel's idea of
+ * the disk.  apfsck (apfsprogs) is the outside oracle for the format; what
+ * it cannot check is what this kernel believes about key order, hence
+ * apfs-seek, whose oracle is the whole-tree walk.  The internals used here
+ * come from apfs_priv.h.
  */
 
 /*
- * The three numbers, read OFF THE DISK from blocks the caller names.
- *
- * Naming them is the point.  Once the allocator copies rather than
- * overwrites, "the bitmap" is two different blocks depending on whether the
- * question is about the checkpoint that is live or the one being built, and a
- * reader that always follows the current pointers cannot ask the first
- * question at all.
+ * The three free counts, read off the disk from blocks the caller names:
+ * with copy-on-write, the live checkpoint's bitmap and the one being built
+ * are different blocks, and following the current pointers only finds the
+ * second.
  */
 struct alloc_snap {
 	uint64_t	as_dev_free;
@@ -87,13 +67,9 @@ alloc_snap_eq(const struct alloc_snap *a, const struct alloc_snap *b)
 }
 
 /*
- * Is every block of this run marked taken on the DISK right now?  1 yes,
- * 0 no, negative if the bitmap would not read.
- *
- * Asked of specific blocks rather than of the free counts, because the counts
- * move for reasons the caller does not control -- every checkpoint releases
- * whatever the queues have finished holding -- while these eight bits mean
- * exactly one thing.
+ * Is every block of this run marked taken on the disk right now?  1 yes,
+ * 0 no, negative if the bitmap would not read.  Asked of the bits, not the
+ * free counts, which every checkpoint moves as the queues release.
  */
 static int
 alloc_run_taken(uint64_t first, uint32_t count, void *bm_buf)
@@ -119,36 +95,18 @@ alloc_run_taken(uint64_t first, uint32_t count, void *bm_buf)
 }
 
 /*
- * ALLOCATE, LOOK, PUT BACK.
+ * Allocate, look, put back.
  *
- * The rung this belongs to was going to be "an allocator that only allocates"
- * -- take blocks, never give any back, and so never need the free queues or a
- * transaction id to key them by.  Trying it on the image first settled it: a
- * container with a block marked in use that nothing references is not valid,
- * and apfsck says so in one line.
+ * A block marked in use that nothing references is invalid ("Space manager:
+ * bad allocation bitmap" from apfsck): an allocation is only half of an
+ * operation whose other half is a reference.  So this proves everything up
+ * to that half -- take a run, see the disk agree, give it back -- and the
+ * state apfsck rejects does not outlive the call.
  *
- *	Space manager: bad allocation bitmap.
- *
- * That is not a complaint about the edit.  Rewriting a metadata block
- * resealed is invisible to apfsck, and a bitmap bit set with both counters
- * moved to match passes the chunk-info check -- it is the NEXT check that
- * fails, the one comparing the bitmap against the set of blocks something
- * actually points at.  In this format an allocation is not a thing on its own;
- * it is half of an operation whose other half is a reference, and the two are
- * only valid together.
- *
- * So what can be proved without the other half is everything up to it: find a
- * run, take it, see the disk agree, give it back, see the disk return to what
- * it was.  The volume is briefly in the state apfsck rejects, which is honest
- * -- it is exactly the state a half-finished allocation leaves -- and it does
- * not outlive the call.
- *
- * Since the metadata is copied rather than overwritten, the test can now also
- * ask the question that matters more than the arithmetic: after the
- * allocation and before the checkpoint, does the LIVE checkpoint still read
- * exactly as it did?  A writer that got copy-on-write subtly wrong -- copying
- * the bitmap but not the chunk-info, say, or moving the pointer before the
- * block -- passes every count in this test and fails that one.
+ * It also asks whether, after the allocation and before the checkpoint, the
+ * live checkpoint still reads exactly as it did.  A writer that got
+ * copy-on-write subtly wrong (the bitmap copied but not the chunk-info, the
+ * pointer moved before the block) passes every count and fails that.
  */
 void
 fs_apfs_alloc_selftest(void)
@@ -205,10 +163,8 @@ fs_apfs_alloc_selftest(void)
 	}
 
 	/*
-	 * THE FIRST CLAIM.  The allocation is complete as far as this kernel
-	 * is concerned, and the checkpoint that is still live must not be
-	 * able to tell.  Asked of the blocks it names, everything reads
-	 * exactly as it did before.
+	 * First: the allocation is complete as far as this kernel knows, and
+	 * the blocks the live checkpoint names still read as before.
 	 */
 	if (alloc_snapshot(old_cib, old_bm, old_sm, cib_buf, sm_buf, bm_buf,
 	    &live) != FS_APFS_E_OK) {
@@ -250,12 +206,9 @@ fs_apfs_alloc_selftest(void)
 	}
 
 	/*
-	 * THE SECOND CLAIM, and the one the free queue exists for.  Giving
-	 * the run back does NOT make it free: the checkpoints behind this one
-	 * still describe a container in which those blocks are in use, and
-	 * handing them out again would turn every one of those superblocks
-	 * into a lie.  So after the release, and after a checkpoint publishes
-	 * it, the bits are still set.
+	 * Second, the free queue's reason to exist: giving the run back does
+	 * not make it free, since the checkpoints behind this one still use
+	 * those blocks.  After the release is published the bits are still set.
 	 */
 	if (free_blocks(first, run) != FS_APFS_E_OK ||
 	    fs_apfs_checkpoint() != FS_APFS_E_OK) {
@@ -272,9 +225,8 @@ fs_apfs_alloc_selftest(void)
 	}
 
 	/*
-	 * AND THE THIRD.  It does not stay held for ever either.  Once the
-	 * transaction that released it is APFS_FQ_KEEP checkpoints behind,
-	 * the queue lets go and the blocks are free again.
+	 * Third: once the releasing transaction is APFS_FQ_KEEP checkpoints
+	 * behind, the queue lets go and the blocks are free again.
 	 */
 	for (i = 0; i <= APFS_FQ_KEEP; i++) {
 		if (fs_apfs_checkpoint() != FS_APFS_E_OK) {
@@ -292,32 +244,17 @@ fs_apfs_alloc_selftest(void)
 	}
 
 	/*
-	 * AND THE FOURTH, which is about the queue's own node rather than the
-	 * blocks recorded in it.
+	 * Fourth, about the queue's own node: a release puts the space of the
+	 * entry it removed on the node's free lists, and an insert must reuse
+	 * it.  A queue that empties has its node reset outright, but a busy one
+	 * never empties, and a node that only eats into its span loses an
+	 * entry's room per cycle until it refuses a release -- a leaked block.
 	 *
-	 * A release puts the key and count it took out onto the node's free
-	 * lists, and an insert has to take them back.  There is a reason that
-	 * looks unnecessary, and it is the reason this claim is written the
-	 * awkward way it is: a queue that reaches EMPTY has its node reset
-	 * outright -- span restored, chains cleared -- and in a quiet container
-	 * the queue empties all the time.  A BUSY one never does; there is
-	 * always something from the last few checkpoints in it, the reset never
-	 * fires, and a node that only ever ate into its span loses an entry's
-	 * worth of room per cycle until it refuses to record a release at all.
-	 * That refusal is a leaked block, and it is what a boot printed the
-	 * first time truncation gave it enough work to get there: "free queue 1
-	 * is still full" with EIGHT keys in a node that had been holding
-	 * ninety.
-	 *
-	 * So the queue is deliberately kept busy -- one release per checkpoint,
-	 * which is exactly what stops it emptying -- and the node is measured
-	 * over two stretches of that at the same depth.  The second stretch
-	 * must cost it nothing.
-	 *
-	 * Written this way because the obvious version does not work: two
-	 * take-and-release cycles with a drain between them PASS on a node that
-	 * reuses nothing, because the drain resets it.  That version was
-	 * written first, and it passed against a kernel broken on purpose.
+	 * So the queue is kept busy (one release per checkpoint stops it
+	 * emptying) and the node measured over two stretches at the same
+	 * depth; the second must cost it nothing.  Two cycles with a drain
+	 * between them would pass on a node that reuses nothing, because the
+	 * drain resets it.
 	 */
 	fqn = (struct apfs_btree_node_phys *)g_fq[APFS_SFQ_MAIN];
 	for (i = 0; i < 2u * (APFS_FQ_KEEP + 1u); i++) {
@@ -359,16 +296,11 @@ fs_apfs_alloc_selftest(void)
 	}
 
 	/*
-	 * AND THE FIFTH, which is the rung this test grew for.  A file's bytes
-	 * are not where its metadata is: in this container the one real file
-	 * keeps its content in the chunk at block 0 while everything being
-	 * copied around it lives in the chunk at 98304.  Relocating those bytes
-	 * therefore takes a run in one chunk and gives one back in another,
-	 * inside a single transaction, and the two are different bitmaps -- set
-	 * apart, dirtied apart, and written apart by the checkpoint.
-	 *
-	 * Asked of a chunk that is NOT the one metadata comes from, so that
-	 * failing to reach it fails here rather than at the first write.
+	 * Fifth: a file's bytes need not be in the chunk its metadata is
+	 * allocated from, so relocating them takes a run in one chunk and gives
+	 * one back in another within one transaction -- two bitmaps, dirtied
+	 * and written apart.  Asked of a chunk other than g_home, so failing to
+	 * reach it fails here rather than at the first write.
 	 */
 	away  = (g_home->ch_base == 0) ?
 	    g_home->ch_base + g_home->ch_blocks : 1;
@@ -442,18 +374,10 @@ out:
 }
 
 /*
- * A WRITE MOVES THE BYTES, AND THE CHECKPOINT BEHIND IT KEEPS ITS OWN
- *
- * The claim in one sentence: after a write, the block the live checkpoint
- * still names holds exactly what it held.  Everything the last several rungs
- * built is worth nothing to a file's contents unless that is true -- an intact
- * ring of superblocks leading to bytes that have since been overwritten is a
- * ring of superblocks that lies.
- *
- * Asked of the block rather than of the file, and read RAW, because the point
- * is what is on the platter at an address nothing in this kernel is pointing
- * at any more.  A reader that followed the current records would be shown the
- * new copy and would agree with itself all the way to being wrong.
+ * A write moves the bytes, and the checkpoint behind it keeps its own: after
+ * a write, the block the previous checkpoint names holds exactly what it
+ * held.  Asked of that block, read raw, since nothing current points at it;
+ * following the current records would only show the new copy.
  */
 #define	APFS_DATA_PATTERN	"style9 relocated these bytes."
 
@@ -519,9 +443,8 @@ fs_apfs_data_selftest(const char *path)
 	}
 
 	/*
-	 * THE FIRST CLAIM.  The bytes are somewhere else now.  A write that
-	 * landed back on the same block passes every read-back check in this
-	 * kernel and fails this one, which is the whole rung.
+	 * First: the bytes are somewhere else now.  A write in place passes
+	 * every read-back check and fails only this one.
 	 */
 	if (extent_at(id, 0, &new_phys) != FS_APFS_E_OK) {
 		kprintf("apfs-data: FAIL the extent is gone after the write\n");
@@ -535,7 +458,7 @@ fs_apfs_data_selftest(const char *path)
 		goto out;
 	}
 
-	/* THE SECOND.  The new block really did receive the write. */
+	/* Second: the new block received the write. */
 	if (fs_apfs_read_block_raw(new_phys, block) != FS_APFS_E_OK) {
 		kprintf("apfs-data: FAIL block %llu will not read\n",
 		    (unsigned long long)new_phys);
@@ -552,10 +475,8 @@ fs_apfs_data_selftest(const char *path)
 	}
 
 	/*
-	 * THE THIRD, and the one the rung exists for.  The old block is the
-	 * one every checkpoint written before this still names, and it has to
-	 * read as it did -- not merely "as something valid", but byte for byte
-	 * what was there before the write.
+	 * Third: the old block, which every earlier checkpoint names, reads
+	 * byte for byte as before the write.
 	 */
 	if (fs_apfs_read_block_raw(old_phys, block) != FS_APFS_E_OK) {
 		kprintf("apfs-data: FAIL block %llu will not read back\n",
@@ -625,37 +546,21 @@ leaf_probe(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 }
 
 /*
- * A NODE SPLITS AND NOTHING IS LOST
+ * A node splits and nothing is lost.  Asked for directly: appends merge
+ * touching extents, so a sequential writer never fills a leaf.
  *
- * The organic route to this stopped being organic.  Appending was meant to
- * fill a leaf four records at a time, and then extents that touch started
- * being merged instead -- which is right, and which means a sequential writer
- * never fills anything.  So the split is asked for directly.
- *
- * Two things are checked, and finding out that one was not enough is what
- * this comment is for.  Counting the records through the ordinary walk proves
- * none was lost or duplicated -- but a WALK CANNOT SEE A WRONG SEPARATOR.  It
- * visits every child of the index in turn whatever the keys say, so the count
- * comes out right, the file still reads, and the tree is quietly out of order.
- * Written with a separator taken from the wrong half on purpose, this test
- * passed; apfsck did not:
- *
- *	B-tree: keys are out of order.
- *
- * So the index is checked here as well, by the invariant a split has to keep:
- * the key the parent stores for a child is that child's own first key.  That
- * is a claim this kernel can make about itself, rather than one it has to send
- * a container away to have checked.
+ * Counting records through the walk proves none was lost or duplicated, but
+ * a walk cannot see a wrong separator -- it visits every child whatever the
+ * keys say, and the tree is quietly out of order ("B-tree: keys are out of
+ * order" from apfsck).  So the index is checked too, by the invariant a
+ * split must keep: the key a parent stores for a child is the child's own
+ * first key.
  */
 
 /*
  * Every separator in the tree against the child it names, at every level.
- *
- * Recursive since the tree can be more than two levels deep, and the level
- * that used to be the only one is now the least interesting: a wrong
- * separator written INTO an interior node by a split of another interior node
- * is invisible from the root, which still names the same child by the same
- * key it always did.
+ * Recursive, because a wrong separator written into an interior node by a
+ * split of another interior node is invisible from the root.
  */
 static bool
 index_check(uint64_t bno, uint32_t depth)
@@ -774,13 +679,9 @@ fs_apfs_split_selftest(void)
 	}
 
 	/*
-	 * HOW DEEP THE TREE IS BEFORE, because this test is the reason it
-	 * gets deeper.  It takes a node per boot and never gives one back, so
-	 * an image booted enough times reaches the day the root's table of
-	 * contents is full -- which used to be where this stopped and said so.
-	 * Now the split grows the tree instead, and the two are told apart
-	 * here by the level the root reports and by the counter the growth
-	 * bumps.
+	 * The depth before.  This test adds a node per boot and never gives
+	 * one back, so the root eventually fills and the split grows the tree
+	 * instead; the root's level and deep_n tell the two apart.
 	 */
 	deeper = deep_n;
 	was    = 0;
@@ -803,9 +704,8 @@ fs_apfs_split_selftest(void)
 	}
 	kfree(scratch);
 	/*
-	 * At least one, and more than one when the leaf's parent was full and
-	 * had to split before it could take a separator.  Both are the same
-	 * operation asking itself the same question a level up.
+	 * At least one, more when the leaf's parent was full and had to split
+	 * before it could take a separator.
 	 */
 	if (split_n <= splits) {
 		kprintf("apfs-split: FAIL the split was not counted\n");
@@ -837,11 +737,7 @@ fs_apfs_split_selftest(void)
 		return;
 	}
 
-	/*
-	 * Every separator against the child it names, at every level.  This is
-	 * the half the walk is blind to, and the half a wrong split shows up
-	 * in.
-	 */
+	/* The half the walk is blind to: every separator against its child. */
 	if (!index_check(g_apfs.ac_root_tree_bno, 0))
 		return;
 
@@ -853,10 +749,9 @@ fs_apfs_split_selftest(void)
 	}
 
 	/*
-	 * A GROWTH IS NOT A SPLIT AND HAS TO BE TOLD APART FROM ONE.  Both
-	 * leave a tree that walks and counts right; only one of them changes
-	 * how deep it is, and a level gained without the counter moving (or
-	 * the other way about) means the two disagree about what happened.
+	 * A growth is not a split.  Both leave a tree that walks and counts
+	 * right; only a growth changes the depth, and a level gained without
+	 * deep_n moving (or the reverse) means the two disagree.
 	 */
 	{
 		uint8_t			*root;
@@ -905,10 +800,8 @@ fs_apfs_split_selftest(void)
 }
 
 /*
- * Where an inode's own record is: the leaf holding it, its slot in that leaf,
- * and how many records that leaf has.  Asked of the tree each time rather than
- * remembered, because a split between two questions moves the record into a
- * block with a different number and a slot it did not have before.
+ * Where an inode's own record is: its leaf, its slot there, and the leaf's
+ * record count.  Asked afresh each time, since a split moves the record.
  */
 static bool
 inode_slot_of(uint64_t oid, uint8_t *scratch, uint64_t *bno_out,
@@ -944,31 +837,19 @@ inode_slot_of(uint64_t oid, uint8_t *scratch, uint64_t *bno_out,
 }
 
 /*
- * A NODE STOPS STARTING WHERE ITS PARENT SAYS IT DOES
+ * A node stops starting where its parent says it does.
  *
- * Waiting for this to happen is not a test.  It needs a delete to take the
- * FIRST record out of a leaf, which depends entirely on where the splits have
- * fallen, and an image can run for twenty boots without it coming up -- and
- * then produce a volume the checker rejects, which is how it was found.
+ * That needs a delete to take the first record out of a leaf, which depends
+ * on where splits fell, so it is arranged out of two files.  The leaf holding
+ * the first one's inode record is split at that record, making it the key
+ * the index files the upper half under; then the file is unlinked and the
+ * key must be corrected.  The second file, made just after, sorts into the
+ * same half and keeps it from emptying (that case is the next test).  Both
+ * are removed again, so the volume ends the boot as it began.
  *
- * So it is arranged, out of two files.  The leaf holding the first one's inode
- * record is split AT that record, which makes the record the upper half's
- * first and therefore the key the index above files that half under; then the
- * file is unlinked and the correction has to happen.  The second file is made
- * afterwards, so its key is just past the first's and it goes to the same
- * half: it is what stops that half emptying, which is a different question and
- * has its own test below.
- *
- * Both are taken away again, so the volume ends the boot as it began -- which
- * it could not do until a node that lost its last record could leave the tree.
- *
- * What has to survive it is the invariant apfsck states as
- *
- *	B-tree: index key absent from child node.
- *
- * and this checks it the same way the split test does, from inside, at every
- * level -- plus the counter, because an index that is right because nothing
- * needed correcting proves nothing about the correcting.
+ * The invariant is apfsck's "B-tree: index key absent from child node",
+ * checked from inside at every level as the split test does -- plus reidx_n,
+ * since an index right because nothing needed correcting proves nothing.
  */
 void
 fs_apfs_index_selftest(uint64_t now)
@@ -1032,11 +913,7 @@ fs_apfs_index_selftest(uint64_t now)
 		goto clean;
 	}
 
-	/*
-	 * Split so that the record starts the upper half.  The parent now
-	 * files that half under this record's key, and the file it belongs to
-	 * is about to go.
-	 */
+	/* Split so the record starts, and keys, the upper half. */
 	rv = node_split_at(bno, at, g_apfs.ac_xid + 1, scratch);
 	kfree(scratch);
 	if (rv != FS_APFS_E_OK) {
@@ -1099,30 +976,20 @@ clean:
 }
 
 /*
- * AND THE NODE ITSELF GOES
+ * And the node itself goes.
  *
- * The tree only ever gained nodes, and the writer refused a delete that would
- * have left an empty one behind rather than leave it -- which made an ordinary
- * unlink fail for a reason that had nothing to do with the file.
+ * A new file has the highest key on the volume, so splitting its leaf at
+ * its inode record leaves an upper half holding that file's records alone;
+ * unlinking it must take the half out of the tree.  Checked three ways --
+ * gone_n moved, the tree's node count fell, every node still starts where
+ * its parent says -- since the counter alone would pass a writer that
+ * unhooked the node without saying so ("wrong node count in info footer").
  *
- * Arranged the same way and more simply than the index test above, because a
- * freshly made file has the highest key on the volume: split the leaf holding
- * its inode record AT that record, and the upper half holds that file's
- * records and nothing else.  Unlink it and the half has to go.
- *
- * The claim is checked from three sides -- the counter moved, the tree says it
- * holds one node fewer than it did, and every node still starts where its
- * parent says it does -- because the first alone would pass on a writer that
- * unhooked the node and forgot to say so, which is precisely the state apfsck
- * calls "wrong node count in info footer".
- *
- * AND THE CASCADE IS ARRANGED TOO, when the tree is deep enough to allow it.
- * A node that empties takes its parent's last entry, and a parent left holding
- * nothing has to go the same way -- which no ordinary delete on this volume
- * reaches, because a split always leaves its parent with at least two
- * children.  So the node ABOVE the file's is split as well, at the entry that
- * names it, which leaves a node whose only child is the one about to empty.
- * Then the unlink takes two nodes out instead of one, and the count says so.
+ * The cascade is arranged too when the tree is deep enough: a parent left
+ * with nothing must go the same way, which no ordinary delete reaches, since
+ * a split leaves its parent at least two children.  So the node above is
+ * split at the entry naming the file's node, leaving that node an only
+ * child, and the unlink must take two nodes out.
  */
 void
 fs_apfs_drop_selftest(uint64_t now)
@@ -1201,10 +1068,8 @@ fs_apfs_drop_selftest(uint64_t now)
 	}
 
 	/*
-	 * What the upper half holds now.  Asked rather than assumed: the file
-	 * is expected to be alone in it, and a half holding anything else
-	 * would not empty when the file goes -- so the test would pass without
-	 * having tried what it says it tries.
+	 * The file must be alone in the upper half, or the half would not
+	 * empty and the test would pass without trying anything.
 	 */
 	scratch = kmalloc(APFS_BLOCK_SIZE);
 	if (scratch == NULL) {
@@ -1227,22 +1092,17 @@ fs_apfs_drop_selftest(uint64_t now)
 	}
 
 	/*
-	 * And the node above it, split at the entry that names this one -- so
-	 * that entry ends up alone in a node too, and the delete has to take
-	 * two nodes out rather than one.  Every step of it is a question the
-	 * tree might answer no to (the parent may BE the root, or may hold
-	 * this child anywhere but last), and a no just means the simpler
-	 * arrangement, which is still worth testing.
+	 * Split the node above at the entry naming this one, so the delete
+	 * takes two nodes out.  Where the tree does not allow it (the parent
+	 * is the root, or this child is not its last), the simpler case runs.
 	 */
 	expect = 1;
 	oid    = ((const struct apfs_obj_phys *)scratch)->o_oid;
 
 	/*
-	 * A node hanging straight off the root cannot be left an only child:
-	 * the root is the one node that may not go, so emptying it is refused
-	 * rather than cascaded.  A tree that shallow is grown a level first --
-	 * by the same operation a full root goes through -- which puts a node
-	 * between the leaf and the root for the arrangement below to use.
+	 * The root may not go, so a node hanging straight off it has no
+	 * cascade; a tree that shallow is grown a level first (tree_grow, as
+	 * for a full root) to put a node between the leaf and the root.
 	 */
 	if (path_to(bno, &tp) && tp.tp_n < 3) {
 		kprintf("apfs-drop: the tree is %u level(s) deep, so the node "
@@ -1382,10 +1242,7 @@ stream_see(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 	(void)vlen;
 	(void)bno;
 	sp = arg;
-	/*
-	 * The descent starts at the record's own key, so anything under a
-	 * larger object id is past the answer and the walk can stop there.
-	 */
+	/* The descent starts at the record's key; a larger oid is past it. */
 	if (oid != sp->sp_id)
 		return (false);
 	if (type == APFS_TYPE_DSTREAM_ID)
@@ -1394,35 +1251,18 @@ stream_see(uint64_t oid, uint32_t type, const uint8_t *key, uint32_t klen,
 }
 
 /*
- * AN INODE AND ITS DATA STREAM, IN TWO DIFFERENT NODES
+ * An inode and its data stream, in two different nodes.
  *
- * A file this kernel makes gets two records under its own object id, one after
- * the other: the inode, and the reference count of the stream its bytes hang
- * off.  They are written into the same node because nothing can sort between
- * them, and unlinking looked for the second where the first was on exactly that
- * reasoning.
+ * A file this kernel makes has two adjacent records under its object id: the
+ * inode, and the reference count of its data stream.  Adjacent is the same
+ * node only until a split falls between them, and an unlink that looks for
+ * the second in the first's leaf leaves the stream behind ("Data stream: has
+ * no references" from apfsck) -- while reporting success, since a file off
+ * the image may genuinely lack the record.
  *
- * It is the reasoning, not the arithmetic, that was wrong.  Adjacent in key
- * order means the same node only until a SPLIT falls between them -- and once
- * both records exist, a cut at the middle of a leaf full of inodes lands
- * between a file and its own stream as readily as between two files.  The
- * unlink then took the inode and the entry and left the stream record behind,
- * and said so in a line that reads as a normal case:
- *
- *	apfs: inode 332 has no dstream id record -- one fewer to take out
- *
- * which is what a file that came off the image genuinely looks like.  What the
- * volume was left with is what apfsck calls
- *
- *	Data stream: has no references.
- *
- * FOUND ON THE FOURTH BOOT, by the test below this one, which is another way of
- * saying it would have been found by a user.  So it is arranged here instead:
- * make a file, split the leaf holding its records AT the stream record so that
- * the inode ends the lower half and the stream starts the upper, and unlink it.
- * The claim is checked where the bug was invisible -- not that the unlink
- * answered success, which it always did, but that no record of that stream is
- * left anywhere in the tree afterwards.
+ * So: make a file, split its leaf at the stream record so the inode ends the
+ * lower half and the stream starts the upper, and unlink it.  The claim is
+ * not that the unlink succeeded but that no record of the stream is left.
  */
 void
 fs_apfs_stream_selftest(uint64_t now)
@@ -1481,10 +1321,8 @@ fs_apfs_stream_selftest(uint64_t now)
 		return;
 	}
 	/*
-	 * The stream record is the one after it, and the cut goes there.  A cut
-	 * at zero is refused and a record that is already last has nothing
-	 * after it to cut before, so both are honest reasons to leave this
-	 * boot alone rather than to fail.
+	 * The cut goes at the stream record, the one after.  A cut at zero is
+	 * refused and a last record has nothing after it: skips, not failures.
 	 */
 	if (at == 0 || at + 1 >= nkeys || bno == g_apfs.ac_root_tree_bno) {
 		kprintf("apfs-strm: inode %llu is at slot %u of %u in the node "
@@ -1509,9 +1347,8 @@ fs_apfs_stream_selftest(uint64_t now)
 	}
 
 	/*
-	 * And the arrangement is CHECKED before it is used.  A split that put
-	 * them back in the same node would leave this test passing on the very
-	 * writer it exists to catch.
+	 * Check the arrangement: records left in one node would let this pass
+	 * on the very writer it exists to catch.
 	 */
 	if (inode_where(ino, &ino_leaf) != FS_APFS_E_OK ||
 	    leaf_home((const uint8_t *)&skey, (uint32_t)sizeof(skey),
@@ -1540,9 +1377,8 @@ fs_apfs_stream_selftest(uint64_t now)
 	}
 
 	/*
-	 * The whole claim: not that the unlink said yes -- it always did -- but
-	 * that nothing of the stream is left.  Asked of the tree by descending
-	 * on the record's own key, which is where it would be if it were there.
+	 * The claim: nothing of the stream is left.  Asked by descending on the
+	 * record's own key, where it would be if it were there.
 	 */
 	sp.sp_id    = ino;
 	sp.sp_found = false;
@@ -1578,48 +1414,29 @@ clean:
 }
 
 /*
- * A CREATE MAKES ITS OWN ROOM
+ * A create makes its own room.
  *
- * Every writer here could once refuse for a reason that had nothing to do with
- * what it was asked: the leaf a record belonged in was full, and a full leaf
- * was somebody else's rung.  Growing a file stopped answering that way when it
- * learned to split and start over.  Making a name is the same answer to a
- * harder question, because a name's records do not all go in one place -- the
- * entry sorts under the DIRECTORY's object id and the inode under its OWN -- so
- * there are two leaves that can be the full one and splitting the first can be
- * answered by the second.
+ * A name's records go to two leaves -- the entry sorts under the directory's
+ * object id, the inode under its own -- so either can be the full one.  A
+ * full leaf is filled here rather than waited for: names go into a directory
+ * one at a time, each with its own checkpoint, as an ordinary caller makes
+ * them.
  *
- * WAITING FOR A FULL LEAF IS NOT A TEST.  Whether one turns up depends on how
- * many names an image happens to carry and on where earlier splits fell; the
- * make test skipped on it for a rung and a half, which is exactly as much
- * evidence as never having run.  So this fills one, honestly: names go into a
- * directory one at a time, each with its own checkpoint, the way an ordinary
- * caller makes them -- and around eighteen inode records fill a leaf of this
- * volume, so the bound below is generous rather than tight.
+ * Checked is what a split can get wrong and a create cannot notice: every
+ * name made before the split still resolves to the inode it was given (a
+ * record carried into the wrong half reads as a missing file), and every
+ * node still starts where its parent says ("index key absent from child
+ * node").
  *
- * WHAT IS CHECKED is what a split can get wrong and a create cannot notice.
- * Every name made before the split has to still be there afterwards under the
- * inode it was given: a record carried into the wrong half reads back as a
- * missing file, and the create that caused it has already reported success.
- * And every node has to still start where its parent says it does, which is the
- * invariant apfsck states as "index key absent from child node" and which no
- * amount of reading the volume from in here would notice.
- *
- * WHAT IT DOES NOT ARRANGE, and the honest limit of it: the leaf that fills
- * here is the one holding INODES, because an inode record is nine times the
- * size of an entry and the names all sort together under one directory.  A
- * create that finds BOTH of its leaves full in the same breath is handled by
- * construction -- the writer asks again after each split rather than once --
- * and is not reached by any arrangement here.
- *
- * They are all taken away again, so the volume ends the boot as it began.  The
- * nodes the splits made stay, and that is not untidiness: this tree does not
- * give a level back, and a node with room in it is what the next boot fills.
+ * Not arranged: the leaf that fills is the inodes' (an inode record is nine
+ * times an entry's size), so a create finding both its leaves full is left
+ * to make_at's retry loop.  All names are removed again; the nodes the splits
+ * made stay, for the next boot to fill.
  */
 /*
  * APFS_ROOM_LEAF is where the name starts in the path; APFS_ROOM_NAMES is a
- * bound and not an expectation (a leaf takes about eighteen inodes); and
- * APFS_ROOM_AFTER is how many creates have to work once one has split.
+ * bound, not an expectation (a leaf takes about eighteen inodes); and
+ * APFS_ROOM_AFTER is how many creates must work after the first split.
  */
 #define	APFS_ROOM_DIR		"/etc"
 #define	APFS_ROOM_LEAF		5
@@ -1627,9 +1444,8 @@ clean:
 #define	APFS_ROOM_AFTER		2
 
 /*
- * "/etc/roomNN.txt", written out a byte at a time rather than formatted: there
- * is no snprintf in here, and the name is wanted both whole, for a lookup by
- * path, and from the slash, for the calls that take a parent and a leaf.
+ * "/etc/roomNN.txt", byte by byte for want of snprintf.  Used whole for a
+ * lookup by path, and from APFS_ROOM_LEAF for calls taking a parent.
  */
 static void
 room_path(char *buf, uint32_t i)
@@ -1712,9 +1528,8 @@ fs_apfs_room_selftest(uint64_t now)
 			goto out;
 		}
 		/*
-		 * Stop a couple of names PAST the first split rather than at
-		 * it: a writer that split and then refused the very record it
-		 * had made room for would otherwise leave with a clean sheet.
+		 * Stop a couple of names past the first split, not at it, to
+		 * catch a writer that splits and then refuses the record.
 		 */
 		if (split_n == splits)
 			continue;
@@ -1798,47 +1613,29 @@ clean:
 }
 
 /*
- * A NAME THAT MOVES
+ * A name that moves.
  *
- * A rename creates nothing and destroys nothing, which is what makes it hard
- * to check from outside: the counts do not move, the record total does not
- * move, and a writer that did half the job leaves a volume with exactly as
- * many things in it as a writer that did all of it.  So this asks the two
- * questions the volume can answer -- does the new name resolve to the inode
- * the old one named, and has the old name stopped resolving -- after every
- * move, and one more that only a file can answer.
+ * A rename creates and destroys nothing, so no count shows a half-done one.
+ * After every move this asks what the volume can answer: does the new name
+ * resolve to the old one's inode, and has the old name stopped resolving?
  *
- * THE BYTES ARE THE POINT OF THE LONG NAMES.  A file's length and the blocks
- * under it live in an extended field of the inode record, beside the field
- * holding its name; the record is packed, so a name of a different length puts
- * everything after it somewhere else.  A rename that rebuilt that record the
- * way a create writes one -- which is the obvious way to write it -- would
- * produce a perfectly valid empty file.  So a file is given a length here,
- * moved to a longer name and then to a shorter one, and asked its length after
- * each: three sizes that must all be the one it was given.
+ * The long names are for the bytes: the file's length lives in an extended
+ * field after the name field in the packed inode record, and a rename that
+ * rebuilt the record as a create writes one would leave a valid empty file.
+ * So the file gets a length and is moved to a longer name and a shorter one,
+ * its length asked after each.
  *
- * WHAT IS NOT CHECKED IN HERE is the two directories' child counts, and that
- * is deliberate rather than forgotten.  The count is a claim about records
- * that a reader would have to re-derive to disprove, which is precisely what
- * apfsck does with it -- "Inode record: wrong directory child count" is the
- * measured answer to leaving either half out -- and the acceptance run checks
- * every boot with it.  What this test adds is the half apfsck cannot see: the
- * refusals, which leave no trace on the volume at all.
- *
- * A RENAME THAT MEETS A FULL LEAF takes the same loop a create does, and it is
- * arranged for the create by apfs-room rather than again here.  Whether one
- * turns up during these moves depends on how full the leaves already are, so
- * it is reported when it happens and not required.
+ * The directories' child counts are left to apfsck, which re-derives them
+ * ("Inode record: wrong directory child count"); this test adds what apfsck
+ * cannot see, the refusals, which leave no trace.  A move that meets a full
+ * leaf takes the create's retry loop (arranged by apfs-room), and is reported
+ * here when it happens, not required.
  */
 #define	APFS_MOVE_DIR		"/etc"
 #define	APFS_MOVE_OTHER		"/var"
 #define	APFS_MOVE_SIZE		9000u
 
-/*
- * One move, and the three things that must be true after it.  Every step below
- * is one of these, which is what keeps the test itself from being longer than
- * the writer.
- */
+/* One move, and the three things that must be true after it. */
 static bool
 moved_ok(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
     uint64_t now, const char *opath, const char *npath, uint64_t want)
@@ -1879,10 +1676,8 @@ moved_ok(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 }
 
 /*
- * The length the volume says a file has, or a complaint and false.
- *
- * Told which test is asking, because two of them now do and a failure line
- * that names the wrong one sends whoever reads it to the wrong writer.
+ * Does the volume still give the file length `want`?  Complains as `who`,
+ * since more than one test asks.
  */
 static bool
 size_still(const char *who, uint64_t ino, uint64_t want, const char *where)
@@ -1931,8 +1726,8 @@ fs_apfs_move_selftest(uint64_t now)
 
 	/*
 	 * Whatever an interrupted run left behind.  The directory is looked for
-	 * by path under each name it can be sitting at, and emptied through its
-	 * OBJECT ID -- which is the one thing about it that no move changed.
+	 * under each name it can have, and emptied through its object id, the
+	 * one thing no move changes.
 	 */
 	got = 0;
 	if (fs_apfs_lookup("/etc/mvdir", &got, &is_dir) == FS_APFS_E_OK ||
@@ -1964,10 +1759,7 @@ fs_apfs_move_selftest(uint64_t now)
 		    rv);
 		return;
 	}
-	/*
-	 * And bytes under it, because an empty file cannot tell a rename that
-	 * carried its data stream across from one that wrote a fresh record.
-	 */
+	/* Bytes under it: an empty file cannot show a lost data stream. */
 	rv = fs_apfs_grow(file, file, APFS_MOVE_SIZE);
 	if (rv == FS_APFS_E_OK)
 		rv = fs_apfs_checkpoint();
@@ -2007,10 +1799,9 @@ fs_apfs_move_selftest(uint64_t now)
 		goto clean;
 
 	/*
-	 * A name renamed to ITSELF changes nothing and says so.  POSIX requires
-	 * the success; what is checked here is that the file is still there
-	 * afterwards, since a writer that took the entry out before putting it
-	 * back would answer the same and leave nothing behind.
+	 * A name renamed to itself: POSIX requires success, and the file must
+	 * still be there, which a writer that removed the entry first would
+	 * not guarantee.
 	 */
 	rv = fs_apfs_rename(var, "mvone.txt", var, "mvone.txt", now, NULL);
 	if (rv != FS_APFS_E_OK) {
@@ -2025,7 +1816,7 @@ fs_apfs_move_selftest(uint64_t now)
 		goto clean;
 	}
 
-	/* A DIRECTORY MOVES WITH ALL OF IT, and none of it is touched. */
+	/* A directory moves with all of it, and none of it is touched. */
 	rv = fs_apfs_mkdir(etc, "mvdir", now, 0755, &dir);
 	if (rv == FS_APFS_E_OK)
 		rv = fs_apfs_checkpoint();
@@ -2045,10 +1836,8 @@ fs_apfs_move_selftest(uint64_t now)
 	    "/var/mvdir2", dir))
 		goto clean;
 	/*
-	 * The child was never mentioned in either move.  Its entry sorts under
-	 * the directory's object id, which did not change, and its own record
-	 * names that same id as its parent -- so a subtree moves by moving one
-	 * name, and this is what says so.
+	 * The child was in neither move: its entry sorts under the directory's
+	 * unchanged object id, so a subtree moves by moving one name.
 	 */
 	got = 0;
 	if (fs_apfs_lookup("/var/mvdir2/inner.txt", &got, &is_dir) !=
@@ -2059,7 +1848,7 @@ fs_apfs_move_selftest(uint64_t now)
 		goto clean;
 	}
 
-	/* THE REFUSALS, none of which may leave a mark. */
+	/* The refusals, none of which may leave a mark. */
 	rv = fs_apfs_rename(var, "mvone.txt", var, "mvdir2", now, NULL);
 	if (rv != FS_APFS_E_ISDIR) {
 		kprintf("apfs-move: FAIL moving a file onto a directory's "
@@ -2073,9 +1862,9 @@ fs_apfs_move_selftest(uint64_t now)
 		goto clean;
 	}
 	/*
-	 * And a directory into itself, asked twice: once directly, and once
-	 * through a child, because a check that only compared the two object
-	 * ids would pass the first and detach the volume on the second.
+	 * A directory into itself, directly and through a child: comparing the
+	 * two object ids alone would pass the first and detach the subtree on
+	 * the second.
 	 */
 	rv = fs_apfs_rename(var, "mvdir2", dir, "loop", now, NULL);
 	if (rv != FS_APFS_E_INVAL) {
@@ -2098,10 +1887,9 @@ fs_apfs_move_selftest(uint64_t now)
 		goto clean;
 	}
 	/*
-	 * And into something that is not a directory at all.  Finding the old
-	 * name says the SOURCE's parent holds entries; nothing says that of the
-	 * destination, and a file would have taken a child in the field it
-	 * counts links in.
+	 * Into something that is not a directory.  Finding the old name proves
+	 * the source's parent is a directory; nothing proves the destination's,
+	 * and a file would count the child in its link field.
 	 */
 	rv = fs_apfs_rename(var, "mvdir2", file, "loop", now, NULL);
 	if (rv != FS_APFS_E_NOTDIR) {
@@ -2132,9 +1920,8 @@ fs_apfs_move_selftest(uint64_t now)
 
 clean:
 	/*
-	 * Emptied through the directory's object id for the reason above: this
-	 * runs after a failure too, and a failure is exactly the case where
-	 * which name the directory is under is the thing not to be assumed.
+	 * Through the directory's object id: after a failure, which name it is
+	 * under cannot be assumed.
 	 */
 	if (dir != 0) {
 		(void)fs_apfs_rmdir(dir, "deeper", now);
@@ -2152,33 +1939,23 @@ clean:
 }
 
 /*
- * A FILE WITH NO NAME
+ * A file with no name.
  *
- * The rung this checks is not "a record moved into another directory" -- that
- * is the rename above, and it would pass this test without keeping any of the
- * promise.  What is checked is that the BYTES outlive the name: a file is given
- * a length, its name is taken away, and then the questions are asked that only
- * a file which is still whole can answer -- its length, its object id, its
- * records.  A writer that treated an orphan as a deletion with a delay would
- * fail on the first of those and pass the last two.
+ * What is checked is that the bytes outlive the name: a file is given a
+ * length, its name taken away, and then asked what only a whole file can
+ * answer -- its length, its object id, its records.  A writer that treated
+ * an orphan as a delayed deletion would fail the first.  The path must not
+ * resolve: an orphan reachable by name is not one.
  *
- * The path is asked about too, and must NOT resolve.  Both halves matter: an
- * orphan still reachable by name is not an orphan, and an orphan whose bytes
- * are gone is just an unlink that lied about when.
- *
- * And it is let go at the end, which is the part that keeps this test honest
- * about the volume rather than only about the writer: an orphan that is never
- * reaped is a leak apfsck calls perfectly valid, so the check that the private
- * directory is empty afterwards is the only thing standing between this rung
- * and a filesystem that quietly fills up.
+ * It is reaped at the end and the private directory checked empty: an orphan
+ * never reaped is a leak apfsck calls valid.
  */
 #define	APFS_ORPHAN_DIR		"/etc"
 #define	APFS_ORPHAN_SIZE	7000u
 
 /*
- * Is the private directory holding anything?  Asked of the TREE, like every
- * other emptiness question here, and for the same reason: the count in its
- * inode record is a claim about the records and the records are the thing.
+ * Is the private directory holding anything?  Asked of the tree, not the
+ * child count in its inode record.
  */
 static bool
 priv_dir_empty(uint64_t now)
@@ -2187,11 +1964,9 @@ priv_dir_empty(uint64_t now)
 
 	n = 0;
 	/*
-	 * Reaping nothing is how the question gets asked, since a reap-all over
-	 * an empty directory does no work and reports the count it found.  It
-	 * costs one descent and needs no second walker to go wrong -- and if
-	 * the answer is the unwanted one it has also cleaned up, which is why
-	 * it is given the real clock rather than a zero.
+	 * Asked by reaping: over an empty directory a reap-all does nothing and
+	 * reports zero.  If the answer is unwanted it has also cleaned up, so
+	 * it gets the real clock.
 	 */
 	if (fs_apfs_reap_all(now, &n) != FS_APFS_E_OK)
 		return (false);
@@ -2221,9 +1996,8 @@ fs_apfs_orphan_selftest(uint64_t now)
 	}
 
 	/*
-	 * Whatever an interrupted run left behind, by name and then by the
-	 * private directory -- an orphan has no name to be found under, so the
-	 * second sweep is the only one that can reach one.
+	 * Whatever an interrupted run left behind, by name and then through
+	 * the private directory, the only way to reach an orphan.
 	 */
 	(void)fs_apfs_unlink(etc, "orphan.txt", now);
 	left = 0;
@@ -2281,9 +2055,8 @@ fs_apfs_orphan_selftest(uint64_t now)
 		goto clean;
 
 	/*
-	 * A SECOND ORPHANING OF THE SAME FILE IS NOT POSSIBLE, and the reason
-	 * to ask is that it is the shape a wrong reference count upstairs
-	 * produces: a name already gone, taken away twice.
+	 * A second orphaning of the same name must fail: it is what a wrong
+	 * reference count in the layer above would produce.
 	 */
 	rv = fs_apfs_orphan(etc, "orphan.txt", now, &got);
 	if (rv != FS_APFS_E_NOTFOUND) {
@@ -2291,7 +2064,7 @@ fs_apfs_orphan_selftest(uint64_t now)
 		    "gone answered %d, not NOTFOUND\n", rv);
 		goto clean;
 	}
-	/* And a file that still has a name cannot be let go. */
+	/* An inode that still has a name (here /etc) cannot be let go. */
 	rv = fs_apfs_reap(etc, now);
 	if (rv != FS_APFS_E_INVAL) {
 		kprintf("apfs-orphan: FAIL letting go of a directory that is "
@@ -2333,9 +2106,8 @@ fs_apfs_orphan_selftest(uint64_t now)
 
 clean:
 	/*
-	 * Both sweeps again, and in this order: the file may still have its
-	 * name, or may be waiting with none, and after a failure which of those
-	 * is true is exactly what is not known.
+	 * Both sweeps: after a failure the file may still have its name or be
+	 * waiting with none.
 	 */
 	(void)fs_apfs_unlink(etc, "orphan.txt", now);
 	if (file != 0)
@@ -2344,23 +2116,17 @@ clean:
 }
 
 /*
- * A NAME TAKEN OVER
+ * A name taken over: rename onto a taken name, where POSIX says a reader
+ * sees the occupant or the newcomer, never an absent name.  The absence
+ * cannot be watched for from here, so what the one-edit shape implies is
+ * checked: the name answers with the newcomer at once, the occupant waits in
+ * the private directory with its bytes intact, the reap returns what it
+ * held, and a replaced empty directory is simply gone.
  *
- * The rung this checks is the one POSIX asks for by name: rename lands on a
- * name that is already taken, and a reader sees the occupant or the newcomer
- * and never an absent name.  The absence cannot be watched for from in here --
- * both endings of the edit leave a valid volume -- so what is checked instead
- * is everything the one-edit shape implies: the name answers with the
- * newcomer at once, the occupant waits in the private directory with its
- * bytes intact rather than dying in the move, the reap returns exactly what
- * it held, and a replaced directory -- which has nothing to defer -- is
- * simply gone.
- *
- * The two files get DIFFERENT lengths, and that is the test's whole grip: the
- * length rides in the data stream field of the packed inode record, so "the
- * name answers 5000 and the orphan answers 11000" tells apart every wrong
- * ending -- an entry rewritten but pointing at the old file, an occupant
- * whose record was rebuilt as a fresh one, a newcomer that arrived empty.
+ * The two files get different lengths, carried in the packed inode record's
+ * data stream field, so "the name answers 5000, the orphan 11000" tells
+ * every wrong ending apart: an entry pointing at the old file, an occupant
+ * rebuilt as a fresh record, a newcomer that arrived empty.
  */
 #define	APFS_CLOB_DIR		"/etc"
 #define	APFS_CLOB_OTHER		"/var"
@@ -2393,9 +2159,9 @@ fs_apfs_clobber_selftest(uint64_t now)
 	}
 
 	/*
-	 * Whatever an interrupted run left behind: the names, then the
-	 * private directory, which is the only place a half-finished takeover
-	 * can leave anything a name no longer reaches.
+	 * Whatever an interrupted run left behind: the names, then the private
+	 * directory, where a half-finished takeover leaves what no name
+	 * reaches.
 	 */
 	got = 0;
 	if (fs_apfs_lookup("/etc/cbfull", &got, &is_dir) == FS_APFS_E_OK)
@@ -2502,9 +2268,9 @@ fs_apfs_clobber_selftest(uint64_t now)
 	}
 
 	/*
-	 * ACROSS DIRECTORIES, onto an occupant with no bytes at all -- the
-	 * ends the first takeover did not pin: the counters of two parents
-	 * move in one edit, and an orphan with an empty stream is let go.
+	 * Across directories, onto an occupant with no bytes: two parents'
+	 * counts move in one edit, and an orphan with an empty stream is
+	 * reaped.
 	 */
 	rv = fs_apfs_create(var, "cbold.txt", now, 0644, &second);
 	if (rv == FS_APFS_E_OK)
@@ -2544,9 +2310,8 @@ fs_apfs_clobber_selftest(uint64_t now)
 	second = 0;
 
 	/*
-	 * A DIRECTORY REPLACED, which defers nothing: an empty directory is
-	 * two records, both taken out in the edit, so nothing waits and the
-	 * victim reported is zero.
+	 * A directory replaced: an empty one is two records, both removed in
+	 * the edit, so nothing waits and the victim reported is zero.
 	 */
 	rv = fs_apfs_mkdir(etc, "cbdir", now, 0755, &dold);
 	if (rv == FS_APFS_E_OK)
@@ -2592,11 +2357,10 @@ fs_apfs_clobber_selftest(uint64_t now)
 	inner = 0;
 
 	/*
-	 * THE REFUSALS, none of which may leave a mark.  A directory that
-	 * still holds a name may not be replaced -- its children would keep
-	 * their perfectly valid records and lose every path to them -- and
-	 * the two ends must be the same kind of thing, each mismatch with the
-	 * answer POSIX gives it.
+	 * The refusals, none of which may leave a mark.  A directory holding a
+	 * name may not be replaced (its children would lose every path), and
+	 * the two ends must be the same kind, each mismatch answered as POSIX
+	 * answers it.
 	 */
 	rv = fs_apfs_mkdir(etc, "cbfull", now, 0755, &full);
 	if (rv == FS_APFS_E_OK)
@@ -2660,9 +2424,8 @@ fs_apfs_clobber_selftest(uint64_t now)
 
 clean:
 	/*
-	 * Names first, then the private directory, as in the test above: after
-	 * a failure, which side of the takeover anything is on is exactly
-	 * what is not known.
+	 * Names, then the private directory: after a failure, which side of the
+	 * takeover anything is on is unknown.
 	 */
 	if (full != 0)
 		(void)fs_apfs_unlink(full, "held.txt", now);
@@ -2678,36 +2441,24 @@ clean:
 }
 
 /*
- * THE EXTENT REFERENCE TREE OUTGROWS ITS ROOT
+ * The extent reference tree outgrows its root.
  *
- * The volume's steady state ran within a record or two of the old ceiling --
- * a single node, sixteen records -- and one boot's layout touched it, so a
- * create on a nearly empty disk was refused for a reason that had nothing to
- * do with the file.  This arranges that same pressure on purpose and demands
- * the opposite ending.
+ * Two files grow one block at a time in alternation, so each append lands
+ * after the other file's and none can merge: every one is a fresh record.
+ * Twenty-eight force the root to divide and then a leaf to split, and every
+ * grow must be answered.
  *
- * Two files grow one block at a time IN ALTERNATION, which is the whole
- * arrangement: each append's blocks land right after the other file's, so no
- * append can merge with the run before it and every single one costs a fresh
- * record.  The old tree takes four of those; twenty-eight force the root to
- * divide and then a leaf to split, and every grow along the way must be
- * answered.
- *
- * The reads back are the CUTS.  Truncating both files to nothing makes the
- * writer find every one of those records again -- by descent, in whichever
- * leaf the splits left it -- and a record the split misplaced or the
- * separator hides fails the truncate right there.  What the cuts cannot ask,
- * apfsck asks after the boot: the bitmap, the counts, and both trees against
- * each other.
+ * The read-back is the cut: truncating both files to nothing makes the
+ * writer find every record again by descent, and one a split misplaced or a
+ * separator hides fails the truncate there.  apfsck checks the rest after
+ * the boot: the bitmap, the counts, and the two trees against each other.
  */
 #define	APFS_EXTREF_DIR		"/var/db"
 #define	APFS_EXTREF_ROUNDS	14u
 
 /*
- * Cut a file of many one-block runs down to nothing, IN STAGES, because the
- * truncate itself has an honest edge of its own: it takes out at most eight
- * runs per call, and the whole point of the file being cut here is that
- * every one of its fourteen blocks is a separate run.
+ * Cut a file of many one-block runs down to nothing, in stages: a truncate
+ * takes out at most eight runs per call (APFS_TRUNC_MAX in apfs.c).
  */
 static int
 extref_cut(uint64_t ino)
@@ -2757,10 +2508,7 @@ fs_apfs_extref_selftest(uint64_t now)
 		return;
 	}
 
-	/*
-	 * Whatever an interrupted run left behind -- cut in stages first,
-	 * since what it left is precisely files of many one-block runs.
-	 */
+	/* Whatever an interrupted run left behind, cut in stages first. */
 	a = 0;
 	b = 0;
 	if (fs_apfs_lookup("/var/db/exta.bin", &a, &is_dir) == FS_APFS_E_OK)
@@ -2772,12 +2520,10 @@ fs_apfs_extref_selftest(uint64_t now)
 	(void)fs_apfs_checkpoint();
 
 	/*
-	 * Which shape the tree is in NOW decides what can be demanded of it.
-	 * The first run through here finds it a single node and must see the
-	 * division and a split; every run after finds the index level already
-	 * there -- it never folds back while the volume owns a run -- and
-	 * what those runs prove is the standing claim: twenty-eight appends
-	 * past the old ceiling, all answered, through the two-level walk.
+	 * The tree's shape now decides what can be demanded.  A single node
+	 * must divide and split; once the index level exists (it never folds
+	 * back while the volume owns a run), the claim is that all twenty-eight
+	 * appends are answered through it.
 	 */
 	two = false;
 	node = kmalloc(APFS_BLOCK_SIZE);
@@ -2873,10 +2619,8 @@ fs_apfs_extref_selftest(uint64_t now)
 
 clean:
 	/*
-	 * The unlink truncates to nothing on its way, so a file still holding
-	 * many one-block runs has to be cut in stages first.  The same goes
-	 * for whatever an interrupted EARLIER run left, which is why the
-	 * sweep at the top resolves the names and comes through here too.
+	 * Unlink truncates to nothing in one call, so a file of many one-block
+	 * runs is cut in stages first (as the sweep at the top does).
 	 */
 	if (a != 0)
 		(void)extref_cut(a);
@@ -2888,36 +2632,25 @@ clean:
 }
 
 /*
- * A DESCENT FINDS WHAT A WALK FINDS
+ * A descent finds what a walk finds.
  *
- * Reading the whole tree needs no key ordering; descending on one is a claim
- * that this kernel's idea of the order is the order the volume was actually
- * written in.  apfsck cannot check that -- it reads the volume with its own
- * ordering and would agree with itself whatever this file believed -- so the
- * proof has to be here, and the only oracle worth having is the walk that was
- * right before.
+ * A walk needs no key order; a descent claims this kernel's order is the
+ * one the volume was written in.  apfsck cannot check that (it would agree
+ * with itself whatever this file believed), so the oracle is the walk.
  *
- * Every record on the volume is sought BY ITS OWN KEY, and three things are
- * demanded of the answer: the same record, out of the same leaf block, and
- * then the whole of the rest of the tree behind it in the same order.  That
- * last one is the part worth paying for.  A descent that lands correctly and
- * then skips a subtree on the way right would pass a test that only looked at
- * the first record, and skipping a subtree is exactly what an off-by-one in
- * the pruning does; so the tail is fingerprinted record by record, order and
- * contents both, and compared against the walk's own tail from the same place.
+ * Every record is sought by its own key and must come back as the same
+ * record, from the same leaf, followed by the rest of the tree in the same
+ * order.  The tail matters: an off-by-one in pruning lands correctly and
+ * then skips a subtree, so the tail is fingerprinted record by record and
+ * compared with the walk's tail from the same place.
  *
- * It runs over what Apple's tools put on this volume, not over what this
- * kernel writes: inodes, directory entries with hashed keys, data streams,
- * extents, extended attributes, sibling links.  Types this file has no
- * ordering rule for are in there too, and they are the ones that would break
- * it -- jkey_cmp returns EQUAL for two of them, and two records that compare
- * equal but are kept apart by the tree are a record the descent cannot reach.
- * If that is ever true of this volume, this test says so.
+ * It runs over what Apple's tools put on the volume -- inodes, hashed
+ * directory entries, data streams, extents, xattrs, sibling links --
+ * including types jkey_cmp has no ordering rule for; two records it calls
+ * equal but the tree keeps apart would be unreachable, and this says so.
  *
- * The insertion answer is checked against its own oracle in the same pass:
- * leaf_home descends to the leaf a key belongs in, the walk-based leaf_find it
- * replaces says the same thing a slower way, and the writer only changed over
- * once the two had agreed about every key here.
+ * leaf_home, where an insert would go, is checked in the same pass against
+ * the walk-based leaf_find.
  */
 #define	APFS_SEEK_KEY_MAX	160u
 #define	APFS_SEEK_RECS_MAX	1024u
@@ -3016,10 +2749,8 @@ fs_apfs_seek_selftest(void)
 	}
 
 	/*
-	 * What this costs, kept so the PASS line can say it.  The counters this
-	 * kernel prints at the end of a boot are about reading the FILESYSTEM,
-	 * and a test that reads the whole tree three times per record would
-	 * otherwise be most of what they measured.
+	 * This test's own cost, for the PASS line, so the boot's read counters
+	 * can be reported without it (it walks the tree three times a record).
 	 */
 	was_reads = g_n_walks + g_n_seeks;
 	was_nodes = g_n_nodes;
@@ -3087,9 +2818,8 @@ fs_apfs_seek_selftest(void)
 		}
 
 		/*
-		 * And everything behind it.  The walk's tail from the same
-		 * record, combined the same way -- a sum would pass on a
-		 * descent that returned the right records in the wrong order.
+		 * And everything after it, hashed as the walk's tail is: a sum
+		 * would pass the right records in the wrong order.
 		 */
 		expect = 0;
 		for (j = i; j < total; j++)
@@ -3133,10 +2863,9 @@ fs_apfs_seek_selftest(void)
 		}
 
 		/*
-		 * A key that is NOT on the volume, when the records leave room
-		 * for one: a type between two this object really has.  The
-		 * descent must land on the record after it, which is the whole
-		 * of what "where it would go" means.
+		 * A key not on the volume, where the records leave room: a type
+		 * between two this object has.  The descent must land on the
+		 * record after it.
 		 */
 		if (one.sp_oid == prev_oid && one.sp_type > prev_type + 1u) {
 			gap_key[0] = (one.sp_oid & APFS_J_OBJ_ID_MASK) |
@@ -3168,12 +2897,10 @@ fs_apfs_seek_selftest(void)
 	}
 
 	/*
-	 * Below everything and above everything.  An object id of zero names
-	 * nothing -- the root directory is 2 -- so a key under the smallest one
-	 * has to bring the whole tree back, and one over the largest nothing at
-	 * all.  Fifteen is the largest type the four bits above an object id
-	 * can hold, which is what makes the second key unreachable rather than
-	 * merely unlikely.
+	 * Below and above everything.  Object id zero names nothing, so a key
+	 * under the smallest must bring back the whole tree; the largest id
+	 * with type 15 (the most four bits hold) is above every record and must
+	 * bring back nothing.
 	 */
 	gap_key[0] = 0;
 	seek_probe_init(&tail, NULL, 0, 0);
@@ -3210,10 +2937,9 @@ out:
 }
 
 /*
- * Read the disk back and ask it the four questions a checkpoint claims to
- * have settled.  Every one of them is asked of the platter rather than of
- * g_apfs: the whole failure mode worth catching here is a kernel that
- * believes it wrote a checkpoint.
+ * Ask the disk the four questions a checkpoint claims to have settled -- of
+ * the platter, not g_apfs, since the failure worth catching is a kernel that
+ * only believes it wrote a checkpoint.
  */
 static int
 ckpt_verify(uint64_t want_xid, uint64_t prev_sb, uint64_t prev_xid,
@@ -3259,10 +2985,8 @@ ckpt_verify(uint64_t want_xid, uint64_t prev_sb, uint64_t prev_xid,
 	}
 
 	/*
-	 * Three: the checkpoint this one replaced is untouched.  This is the
-	 * property the whole scheme rests on -- a container that lost its
-	 * previous checkpoint has no state to fall back to, and would look
-	 * perfectly healthy right up to the crash that needed it.
+	 * Three: the checkpoint this one replaced is untouched -- the state a
+	 * crash falls back to, which nothing else would miss until then.
 	 */
 	if (read_block_raw(prev_sb, scratch) != FS_APFS_E_OK ||
 	    !block_is_nxsb(scratch)) {
@@ -3280,10 +3004,9 @@ ckpt_verify(uint64_t want_xid, uint64_t prev_sb, uint64_t prev_xid,
 	}
 
 	/*
-	 * Four: the map on disk names the objects we think it does, and each
-	 * one is where it says and carries the new xid.  Read from the block
-	 * rather than from ac_eph[], so that a map written wrong cannot be
-	 * confirmed by the table it was written from.
+	 * Four: the map on disk names the objects we think it does, each where
+	 * it says and at the new xid.  Read from the block, not ac_eph[], so a
+	 * wrong map is not confirmed by the table it was written from.
 	 */
 	if (fs_apfs_read_block(g_apfs.ac_xp_desc_base + g_apfs.ac_xp_desc_index,
 	    scratch) != FS_APFS_E_OK) {
@@ -3341,14 +3064,10 @@ ckpt_verify(uint64_t want_xid, uint64_t prev_sb, uint64_t prev_xid,
 }
 
 /*
- * Walk the whole spine from the COMMITTED superblock and check it arrives
- * where this kernel thinks it does.
- *
- * Every pointer in that chain lives in a different object, and a copy that
- * forgets to tell one of them leaves a container that still mounts, still
- * checksums, and still answers reads correctly -- out of memory.  Nothing
- * in-kernel notices until the next boot, when the chain from block zero
- * leads somewhere else.  This is that boot, asked for early.
+ * Walk the spine from the committed superblock and check it arrives where
+ * this kernel thinks it does.  A copy that forgets to update one link still
+ * mounts, checksums and reads correctly -- out of memory -- until the next
+ * boot follows the chain from block zero somewhere else.
  */
 static int
 spine_verify(void *buf)
@@ -3432,13 +3151,9 @@ spine_verify(void *buf)
 }
 
 /*
- * Write two checkpoints and check the disk after each.
- *
- * Two, not one, because the second is the only thing that tests the state
- * this kernel keeps ABOUT the checkpoint it wrote.  A writer that commits
- * perfectly and then forgets to move its ring cursors passes once and then
- * writes its second checkpoint over its first -- and the result would still
- * checksum, still mount, and still be wrong.
+ * Write two checkpoints and check the disk after each.  Two, because only
+ * the second tests the ring cursors: a writer that forgets to move them
+ * writes the second over the first, which still checksums and mounts.
  */
 void
 fs_apfs_ckpt_selftest(void)
@@ -3487,31 +3202,23 @@ out:
 }
 
 /*
- * THE PUBLISHED PAST READS BACK, AND EXACTLY AS FAR BACK AS PROMISED
+ * The published past reads back, exactly as far back as promised.
  *
- * apfs-ckpt above proves that a checkpoint's superblock survives the next
- * one.  That is a claim about one block.  What the free queue has promised
- * since it existed is a claim about every block: for APFS_FQ_KEEP checkpoints
- * after a transaction stops using a block, nothing is allowed to reuse it --
- * and nothing had ever gone back and READ through an old checkpoint to see
- * whether the promise was kept.  This does, byte for byte, on a file whose
- * every checkpoint left it a different shape.
+ * apfs-ckpt proves one block, a checkpoint's superblock, survives the next
+ * checkpoint.  The free queue promises every block: nothing a transaction
+ * stopped using is reused for APFS_FQ_KEEP checkpoints.  This reads through
+ * old checkpoints, byte for byte, to see the promise kept.
  *
- * The shape of the proof is a file that exists in three states across three
- * consecutive checkpoints -- absent, one block of one byte, two blocks of
- * another -- and then absent again in a fourth.  Every view is asked for the
- * state its checkpoint held, which "merely looks right" cannot satisfy: a
- * view that resolved the wrong root would answer with a shape from the wrong
- * column.  The mount is photographed before the views and compared after,
- * because a view that quietly moved the live root would pass every read and
- * corrupt the next write.
+ * A file takes three states across three consecutive checkpoints -- absent,
+ * one block of one byte, two blocks of another -- and is absent again in a
+ * fourth; each view must show its own checkpoint's state, so a view that
+ * resolved the wrong root answers from the wrong column.  The mount state is
+ * copied before the views and compared after: a view that moved the live
+ * root would pass every read and corrupt the next write.
  *
- * And the window's EDGE is asked for, not just its inside: the checkpoint
- * one older than the floor must be refused with GONE, and the listing must
- * name exactly the checkpoints inside it.  A window nobody has found closed
- * is a window whose width nobody has measured.  The expectations are written
- * against APFS_FQ_KEEP rather than against the number 2, so that repricing
- * the constant reprices the test with it.
+ * The window's edge is asked for too: the checkpoint just below the floor
+ * must be refused GONE, and the listing must name exactly those inside.
+ * Expectations are written against APFS_FQ_KEEP, not the number 2.
  */
 #define	APFS_VIEW_NAME	"view.txt"
 #define	APFS_VIEW_PATH	"/etc/view.txt"
@@ -3682,10 +3389,9 @@ fs_apfs_view_selftest(uint64_t now)
 	x2 = g_apfs.ac_xid;
 
 	/*
-	 * The name goes, and the transaction stays OPEN.  The live volume and
-	 * the newest published checkpoint now disagree about the file, which
-	 * is the state the sync policy leaves a volume in most of the time --
-	 * and exactly the state a view of the newest checkpoint is for.
+	 * The name goes and the transaction stays open, so the live volume and
+	 * the newest checkpoint disagree -- the usual state under the sync
+	 * policy, and what a view of the newest checkpoint is for.
 	 */
 	rv = fs_apfs_unlink(etc, APFS_VIEW_NAME, now);
 	if (rv != FS_APFS_E_OK) {
@@ -3724,9 +3430,8 @@ fs_apfs_view_selftest(uint64_t now)
 	}
 
 	/*
-	 * The checkpoint publishing the unlink slides the window.  Three
-	 * consecutive checkpoints written by this test stand behind it, and
-	 * which of them survive is APFS_FQ_KEEP's decision, not the test's.
+	 * Publishing the unlink slides the window over this test's three
+	 * checkpoints; which survive is APFS_FQ_KEEP's decision.
 	 */
 	if (fs_apfs_checkpoint() != FS_APFS_E_OK) {
 		kprintf("apfs-view: FAIL the publishing checkpoint was "

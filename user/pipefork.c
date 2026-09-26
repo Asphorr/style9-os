@@ -6,27 +6,26 @@
  */
 
 /*
- * pipefork -- the self-authored Darwin-ABI probe for the multi-process rung:
- * fork(2), execve(2), wait4(2), pipe(2), dup2(2).  Like dirlist before tree,
- * it is the "small probe built with the real toolchain" that de-risks the
+ * pipefork -- the self-authored Darwin-ABI probe for fork(2), execve(2),
+ * wait4(2), pipe(2) and dup2(2): as dirlist did for tree, it proves the
  * process syscalls before a genuine Apple binary (env, timeout, a shell)
  * depends on them.  Bound by our dyld against our libSystem, it imports the
  * same symbols a real binary would.
  *
  * Scenes:
- *	A. bare fork + wait4: the child _exits with a known code; the parent
- *	   must see exactly that code in the wait4 status.
- *	B. the full shell-redirection dance: pipe, fork, the child dup2s the
- *	   write end onto stdout and execve's /bin/gfactor 42, the parent
- *	   captures the pipe until EOF and reaps the child.  What flows
- *	   through the pipe is a REAL Apple binary's stdout crossing a task
- *	   boundary through a kernel pipe.
- *	C. SIGPIPE at its two default dispositions: ignored, and terminating.
- *	D. a CAUGHT SIGPIPE: the handler runs on the user stack and execution
- *	   resumes at the interrupted instruction.
+ *	A. fork + wait4: the parent sees the child's exit code exactly.
+ *	B. shell redirection: pipe, fork, the child dup2s the write end onto
+ *	   stdout and execs /bin/gfactor 42, the parent reads to EOF and
+ *	   reaps.  A real Apple binary's stdout crosses a task boundary.
+ *	C. SIGPIPE ignored, then at its terminating default.
+ *	D. a caught SIGPIPE: the handler runs on the user stack and execution
+ *	   resumes.
  *	E. a caught SIGINT raised at a syscall boundary (self-kill).
- *	F. a caught SIGINT delivered ASYNCHRONOUSLY, into a ring-3 compute
- *	   loop that never enters the kernel, and resumed bit-exact.
+ *	F. a caught SIGINT delivered asynchronously into a ring-3 loop that
+ *	   never enters the kernel, resumed bit-exact.
+ *	G. copy-on-write isolation after fork, in both directions.
+ *	H. a signal ends a blocked pipe read with EINTR.
+ *	I. what waiting costs: reap and pipe-wake latency.
  *
  * Freestanding (-fno-builtin, no SDK headers); entry is _entry (ld -e), no
  * crt; relinked low like dyldhello.
@@ -168,9 +167,8 @@ scene_pipeline(void)
 
 /*
  * Scene C: SIGPIPE.  A write to a pipe with no readers posts SIGPIPE.
- * Ignored, the write fails EPIPE and we run on; at the default disposition
- * it terminates the writer, which the parent reads out of wait4 as a
- * WIFSIGNALED status carrying signal 13.
+ * Ignored, the write fails EPIPE; at the default disposition it kills the
+ * writer, and wait4 reports WIFSIGNALED with signal 13.
  */
 static void
 scene_sigpipe(void)
@@ -183,11 +181,9 @@ scene_sigpipe(void)
 	char	byte;
 
 	/*
-	 * Part 1: SIG_IGN -- the broken-pipe write must not terminate us.
-	 * libSystem's write() returns the raw kernel result (it does not fold
-	 * the carry flag into -1/errno), so a broken pipe surfaces as the
-	 * positive EPIPE code rather than the 1 a good write returns; reaching
-	 * the check at all proves the ignored SIGPIPE let the writer live.
+	 * Part 1: SIG_IGN -- the write must not kill us.  libSystem's write()
+	 * returns the raw kernel result (no carry-flag fold into -1/errno), so
+	 * a broken pipe shows as positive EPIPE.
 	 */
 	signal(SIGPIPE, SIG_IGN);
 	if (pipe(fds) != 0) {
@@ -234,10 +230,8 @@ on_sigpipe(int signo)
 }
 
 /*
- * Scene D: a CAUGHT SIGPIPE runs its ring-3 handler and execution resumes.
- * The write to a reader-less pipe posts SIGPIPE; the kernel delivers it to
- * on_sigpipe on the user stack; sigreturn brings us back so the write still
- * reports EPIPE and the program runs on.
+ * Scene D: a caught SIGPIPE.  The kernel runs on_sigpipe on the user stack,
+ * sigreturn brings us back, and the write still reports EPIPE.
  */
 static void
 scene_sigpipe_handler(void)
@@ -269,10 +263,9 @@ on_sigint(int signo)
 }
 
 /*
- * Scene E: a caught SIGINT delivered to a handler.  Self-raised via
- * kill(getpid(), SIGINT) -- the kernel applies a self-signal at that kill's
- * own syscall exit, so the handler runs and kill returns normally.  Same
- * delivery path a Ctrl-C (SIGINT from the console) takes.
+ * Scene E: a caught SIGINT, self-raised with kill(getpid(), SIGINT).  The
+ * kernel delivers a self-signal at that kill's own syscall exit, so the
+ * handler runs before kill returns.
  */
 static void
 scene_sigint_handler(void)
@@ -295,23 +288,21 @@ on_sigint_spin(int signo)
 }
 
 /*
- * Sentinels parked in %rcx and %r11 across the spin loop.  Those two are the
- * registers the SYSCALL instruction destroys, so a signal resumed by SYSRET
- * structurally cannot bring them back; only the IRETQ return path can.
+ * Sentinels in %rcx and %r11 across the spin loop.  SYSCALL/SYSRET destroy
+ * those two, so only a resume through IRETQ can bring them back.
  */
 #define	RCX_SENTINEL	0x1234567890ABCDEFUL
 #define	R11_SENTINEL	0x0FEDCBA987654321UL
 
 /*
- * Bound on the spin so a failure to deliver ends the scene instead of hanging
- * the boot.  Delivery needs one timer tick; this is many thousands of them.
+ * Bound on the spin so a failed delivery ends the scene instead of hanging
+ * the boot.  Delivery needs one timer tick; this is thousands.
  */
 #define	SPIN_LIMIT	200000000UL
 
 /*
- * Spin on a volatile flag, touching nothing but registers and one memory
- * word -- no syscall, no library call, nothing that would enter the kernel
- * voluntarily.  Returns 1 if both sentinels survived whatever broke the loop.
+ * Spin on a volatile flag without entering the kernel.  Returns 1 if both
+ * sentinels survived whatever broke the loop.
  */
 static int
 spin_until_signal(unsigned long limit)
@@ -335,12 +326,11 @@ spin_until_signal(unsigned long limit)
 
 /*
  * Scene F: asynchronous delivery into a pure compute loop.  The child arms a
- * SIGINT handler and then spins in ring 3 without ever entering the kernel;
- * the parent, a separate task, kills it.  Only the timer IRQ brings the child
- * in, so the handler can run at all only if the kernel delivers signals off
- * the interrupt-return path -- and the resume has to be exact enough that the
- * sentinels come back intact.  A pipe byte sequences the kill after the
- * handler is armed, so the scene is deterministic rather than racy.
+ * SIGINT handler and spins in ring 3; the parent kills it.  Only the timer
+ * IRQ brings the child into the kernel, so the handler runs only if signals
+ * are delivered on the interrupt-return path, and the sentinels survive
+ * only if the resume is exact.  A pipe byte orders the kill after the
+ * handler is armed.
  */
 static void
 scene_async_sigint(void)
@@ -388,35 +378,21 @@ scene_async_sigint(void)
 }
 
 /*
- * Scene G: copy-on-write isolation.
+ * Scene G: copy-on-write isolation.  fork(2) gives the child the parent's
+ * frames with the write bit cleared, and only the write fault keeps the two
+ * from sharing a variable.  The test is that a write on either side stays
+ * there:
  *
- * fork(2) no longer copies the parent's pages; it hands the child the same
- * frames with the write bit cleared, and the ONLY thing between that and two
- * processes quietly sharing one variable is the kernel's write fault.  So the
- * thing to test is not that fork works -- every scene above already needs
- * that -- but that a write on either side stays on that side.
- *
- * Three things make this a real test rather than a shape of one:
- *
- *	- The buffer spans several pages.  A one-page version passes even if
- *	  the fault handler resolves the wrong page, which is the mistake most
- *	  worth catching.
- *
- *	- It is filled BEFORE the fork, so every page of it is genuinely
- *	  present and genuinely shared at that moment.  A buffer first touched
- *	  afterwards would be faulted in privately and prove nothing.
- *
- *	- The PARENT writes first, and the order is the whole point.  The
- *	  half-fix worth catching is a kernel that clears the write bit only
- *	  in the child and leaves the parent's page table writable over the
- *	  shared frame.  Let the child write first and that bug hides: the
- *	  child faults, takes its private copy, and the parent's later store
- *	  has nothing left to corrupt.  So the parent overwrites its whole
- *	  buffer while the child is still blocked and still sharing every
- *	  page of it, and the child then checks that it saw none of it.
- *
- *	- Both directions are checked, with two pipes as the clock: neither
- *	  process looks at its buffer until the other has certainly written.
+ *	- The buffer spans several pages; one page would pass even if the
+ *	  fault handler resolved the wrong page.
+ *	- It is filled before the fork, so every page is present and shared;
+ *	  a buffer first touched afterwards would be private anyway.
+ *	- The parent writes first.  A kernel that write-protects only the
+ *	  child's mapping leaves the parent writing into the shared frame;
+ *	  if the child wrote first it would take a private copy and hide
+ *	  that.  So the parent rewrites everything while the child still
+ *	  shares every page, and the child checks it saw none of it.
+ *	- Both directions are checked, with two pipes ordering the steps.
  */
 #define	COW_PAGES	3
 #define	COW_BYTES	(COW_PAGES * 4096)
@@ -470,9 +446,8 @@ scene_cow(void)
 		int	own;
 
 		/*
-		 * Touch nothing until the parent says it has rewritten its
-		 * whole buffer.  Every page here is still shared at this
-		 * instant, which is exactly the state the check needs.
+		 * Touch nothing until the parent has rewritten its buffer;
+		 * every page is still shared until then.
 		 */
 		(void)read(to_child[0], tok, 1);
 		unseen = cow_intact('A');
@@ -483,10 +458,7 @@ scene_cow(void)
 		_exit((unseen && own) ? 0 : 1);
 	}
 
-	/*
-	 * Parent: overwrite everything before the child has had a chance to
-	 * fault a single page of it, then let the child look.
-	 */
+	/* Parent: overwrite everything before the child faults a page. */
 	cow_fill('C');
 	(void)write(to_child[1], "c", 1);
 
@@ -505,20 +477,11 @@ scene_cow(void)
 }
 
 /*
- * Scene H: a signal interrupts a wait.
- *
- * A read on a pipe nobody is writing to waits, and until this scene existed
- * the only thing that could end that wait was data, end-of-file, or the task
- * being killed outright.  A signal -- SIGINT, SIGTERM, anything a program
- * would normally catch -- sat pending and did nothing.  Three of this
- * personality's four waits were like that; the console read was the only one
- * that asked.
- *
- * The child arms the sequence with a byte on a second pipe, so the parent is
- * already inside the read before the kill is sent.  Then, and this is the part
- * that matters for a test that lives in a boot, the child WRITES ANYWAY after
- * a long ring-3 delay: a kernel that ignores the signal finishes the read and
- * fails this check, instead of hanging the boot and telling nobody why.
+ * Scene H: a caught signal ends a pipe read that nothing would satisfy,
+ * with EINTR.  A byte on a second pipe sequences the kill after the parent
+ * heads into the read.  The child then writes anyway after a long delay, so
+ * a kernel that ignores the signal fails the check instead of hanging the
+ * boot.
  */
 #define	EINTR_DELAY	60000000UL
 #define	EINTR_SIG	SIGINT
@@ -578,25 +541,16 @@ scene_signal_interrupts_read(void)
 		byte = 0;
 		(void)read(sync[0], &byte, 1);	/* parent is about to block */
 		/*
-		 * ABOUT TO is not IN.  The sync byte says the parent has
-		 * written it, not that it has reached read(2) on the other
-		 * pipe -- and the signal has to land while it is parked
-		 * there, or there is no blocking read for it to end and the
-		 * scene proves nothing.  This burn is the gap between those
-		 * two, and it did not used to exist: the parent's write here
-		 * did not preempt it, so it stayed on the CPU long enough to
-		 * reach the read before this child ever ran.  Once a wake
-		 * carried a reschedule with it, that stopped being true and
-		 * this scene started passing its signal to a task sitting in
-		 * ring 3, where it was delivered harmlessly and the read that
-		 * followed was never interrupted at all.
+		 * The sync byte says the parent is about to read, not that it
+		 * is parked in read(2).  A signal landing before then is
+		 * delivered in ring 3 and interrupts nothing, so wait for the
+		 * parent to get there.
 		 */
 		burn(EINTR_DELAY / 4);
 		kill(getppid(), EINTR_SIG);
 		/*
-		 * Long enough that a kernel which honours the signal answered
-		 * many times over; short enough that one which does not still
-		 * ends the scene with a verdict.
+		 * Long enough for a working kernel to have answered, short
+		 * enough that a broken one still ends the scene.
 		 */
 		burn(EINTR_DELAY);
 		byte = 'x';
@@ -615,10 +569,9 @@ scene_signal_interrupts_read(void)
 	    n, *__error(), eintr_caught);
 
 	/*
-	 * Delivery happens on the way out of the syscall, so by the time the
-	 * return value is readable here the handler has already run.  Both
-	 * halves are checked: the wait ended, AND it ended because of the
-	 * signal rather than because the byte turned up.
+	 * Delivery happens on the way out of the syscall, so the handler has
+	 * run by now.  Check that the wait ended, and that the signal ended
+	 * it rather than the byte.
 	 */
 	check(n < 0, "a signal ends a read that nothing was going to satisfy");
 	if (n < 0) {
@@ -643,13 +596,9 @@ scene_signal_interrupts_read(void)
 }
 
 /*
- * G. What WAITING costs.
- *
- * Every scene above asks whether a wait ENDS correctly.  This one asks what it
- * costs while it lasts, which is a different question and one that a polling
- * implementation passes every other test on: a parent that polls for its child
- * instead of sleeping still gets the status back, still gets the exit code
- * right, still fails nothing.
+ * Scene I: what waiting costs.  The scenes above check that a wait ends
+ * correctly; a parent that polls instead of sleeping passes all of them.
+ * This one measures how long the news takes.
  */
 struct pf_timeval {
 	long	tv_sec;
@@ -671,55 +620,27 @@ pf_now_us(void)
 }
 
 /*
- * How long after a child is ready to die does its parent's wait4(2) hear about
- * it?  The child stamps the clock and _exits immediately; the parent stamps it
- * again the instant wait4 returns.  The difference is the kernel's reap
- * LATENCY, and it is the thing this rung actually changes.
+ * Reap latency: the child stamps the clock and _exits, the parent stamps it
+ * again when wait4 returns.  Throughput would not show a polling parent (a
+ * yield hands the CPU straight back, so it rarely looks); latency does, as
+ * news up to a quantum old -- tens of milliseconds per command at 100 Hz
+ * with a five-tick slice.  A parked parent is woken by the exit itself.
  *
- * This is the third instrument this scene has had, and the first that can tell
- * the two kernels apart.  What it replaced tried to measure THROUGHPUT -- the
- * share of the machine a child gets while its parent waits -- on the theory
- * that a polling parent must be eating half of it.  It is not: thread_yield
- * hands the CPU back at once, so a parent polling that way does not get it
- * again until the child has used a whole quantum, and it therefore looks
- * around two or three times over a child's entire life.  Measured with the
- * counters in the kernel: 22 fruitless trips against 14, for the same work.
- * The theory was wrong, and two versions of a throughput test agreed the
- * defect was absent because the defect was never a throughput defect.
- *
- * Latency is where a coarse poll shows: the news is a quantum old before
- * anybody looks.  At 100 Hz with a five-tick slice that is tens of
- * milliseconds per command, paid by every shell that runs one.  A parked
- * parent is woken by the exit itself and sees it at once.
- *
- * EACH ROUND IS TIMED IN TWO LEGS, because the whole is not one quantity and
- * reporting it as one wasted an afternoon.  The WAKE leg ends when the syscall
- * the parent parked in returns: that is a wake, and the kernel owns it end to
- * end.  Whatever remains is the parent waiting for the child to reach a place
- * it has not reached yet -- for the read-first order, a child that wrote its
- * byte but has not called _exit, and so has to be given the CPU again before
- * there is anything to reap.  That is a QUEUEING cost, it scales with the
- * quantum and with what else is runnable, and reading it as a wake is what made
- * this look like a defect in the pipe: 103 ms, of which the actual pipe wake
- * turned out to be 89 MICROseconds once the wake went to the front of the
- * runqueue and the rest stayed exactly where it was.
+ * Each round is timed in two legs.  The wake leg ends when the syscall the
+ * parent parked in returns, and the kernel owns it end to end.  The rest is
+ * the parent waiting for the child to get further -- in the read-first
+ * order, a child that wrote its byte but must run again to reach _exit.
+ * That is queueing, scaling with the quantum and the run queue, not wake
+ * cost: one 103 ms total held an 89 us pipe wake.
  */
 #define	LAT_ROUNDS	5
 
 /*
- * The bound is a HANG DETECTOR and deliberately nothing finer.
- *
- * What this scene measures is real, but it is not a quantity ring 3 can hold
- * the kernel to: the number includes however long the parent waits its turn
- * behind every other runnable thread, and this test controls none of them.  A
- * tight bound of 10 ms passed on a quiet boot and failed on a busy one, with
- * the kernel behaving correctly both times -- an assertion that depends on
- * what else the machine happens to be doing is not an assertion.
- *
- * The load-independent statement of the same property lives in the kernel and
- * is checked there: "0 explained by a lost wake" in the wait counters, which
- * says every wait that ended was ended by the news itself and not by the
- * deadline underneath it.  That is the invariant.  This is the gauge.
+ * The bound is a hang detector and nothing finer.  The figure includes the
+ * parent's wait behind every other runnable thread, which this test does not
+ * control, so a tight bound (10 ms) fails on a busy boot with a correct
+ * kernel.  The load-independent check lives in the kernel's wait counters:
+ * "0 explained by a lost wake".
  */
 #define	LAT_MAX_US	1000000L	/* 1 s: only a real hang trips this */
 
@@ -749,12 +670,10 @@ reap_latency_once(int read_first, long *wake_leg)
 		return (-1);
 	}
 	/*
-	 * WHICH WAKE IS BEING TIMED depends on the order, and the two are
-	 * different paths worth separating.  Reading first parks on the PIPE
-	 * and is woken by the child's write; waiting first parks on the WAIT
-	 * channel and is woken by its exit.  Whichever comes second finds its
-	 * answer already there and does not park at all, so each order times
-	 * exactly one of the two.
+	 * The order picks the wake being timed.  Reading first parks on the
+	 * pipe and is woken by the child's write; waiting first parks on the
+	 * wait channel and is woken by the exit.  The second call finds its
+	 * answer already there and does not park.
 	 */
 	stamp  = -1;
 	status = -1;
@@ -843,13 +762,10 @@ scene_wait_cost(void)
 		    order ? "pipe-then-reap latency" : "reap latency",
 		    n, best, worst, total / n);
 		/*
-		 * The wake leg on its own, which is the part the kernel decides
-		 * and the only part worth comparing between two kernels.  For
-		 * the reap order it is nearly the whole figure; for the other
-		 * one it is the pipe wake, and the remainder is the child
-		 * queueing for the CPU it needs to reach _exit.  Printing them
-		 * apart is the difference between "the pipe takes 100 ms" and
-		 * "the pipe takes 89 us and the quantum is 20".
+		 * The wake leg alone, the part the kernel decides.  For the
+		 * reap order it is nearly the whole figure; for the other it
+		 * is the pipe wake, and the rest is the child queueing to
+		 * reach _exit.
 		 */
 		if (wake_n != 0)
 			printf("[pipefork]   the wake itself: worst %ld us, "
@@ -862,13 +778,9 @@ scene_wait_cost(void)
 			    "that never came rather than one that queued\n");
 		/*
 		 * Only the reap order is judged, and only against the hang
-		 * bound.  The other order's total is a wake PLUS a queueing
-		 * cost this test controls nothing about, so holding it to one
-		 * wake's budget was a measurement error of mine -- the doubled
-		 * figure it produced very nearly got read as a defect in the
-		 * pipe.  Its wake leg is now reported separately and is the
-		 * number to compare; it is still not asserted on, for the
-		 * reason in LAT_MAX_US above.
+		 * bound: the other order's total adds a queueing cost this
+		 * test does not control.  Its wake leg is reported, not
+		 * asserted (see LAT_MAX_US).
 		 */
 		if (!order)
 			check(worst <= LAT_MAX_US,

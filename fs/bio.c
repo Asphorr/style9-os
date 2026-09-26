@@ -27,17 +27,13 @@ struct bio_buf {
 	bool		bb_busy;	/* claimed, fetch in progress    */
 	/*
 	 * Set when a write lands on this page while a fetch of it is in
-	 * flight.  The fetch may already have pulled the pre-write bytes off
-	 * the platter, so the buffer it is about to publish could be older
-	 * than the disk; the fetcher checks this on the way out and throws its
-	 * result away instead of caching a stale page.  Without it the window
-	 * is small, silent, and produces a cache that disagrees with a disk
-	 * nobody wrote to twice.
+	 * flight: the fetch may have read the pre-write bytes, so the fetcher
+	 * discards its result instead of caching it.
 	 */
 	bool		bb_stale;
 };
 
-/* (b) protected by bio_lock. */
+/* (b) protected by bio_lock; (i) set once in bio_init. */
 static struct spinlock	bio_lock;
 static struct bio_buf	bio_bufs[BIO_NBUFS];		/* (b) */
 static uint8_t		*bio_arena;			/* (i) one slab   */
@@ -69,9 +65,8 @@ bio_init(void)
 	spin_init(&bio_lock, "bio");
 
 	/*
-	 * One slab, sliced.  Allocating BIO_NBUFS separate 4 KiB blocks would
-	 * round each up to two pages in the large-allocation path and waste
-	 * half the cache on headers.
+	 * One slab, sliced: separate 4 KiB allocations would each round up
+	 * to two pages in the large-allocation path.
 	 */
 	bio_arena = kmalloc((size_t)BIO_NBUFS * BIO_PAGE_BYTES);
 	if (bio_arena == NULL) {
@@ -80,27 +75,10 @@ bio_init(void)
 		return;
 	}
 	/*
-	 * ⚠ AND A PAGE NUMBER NO DISK HAS, which is not decoration.
-	 *
-	 * bio_bufs is static, so an untouched buffer says it holds page 0 of
-	 * drive 0 -- and page 0 of drive 0 is the APFS container's anchor
-	 * superblock, the one block this kernel rewrites at the end of every
-	 * checkpoint.  Everything that looks a buffer up by (drive, page)
-	 * therefore MATCHED an empty buffer while looking for the busiest
-	 * block on the volume.
-	 *
-	 * The read path survived it by accident: it keeps scanning past a
-	 * match that is not valid.  The write path did not -- it stops at the
-	 * first buffer that claims the page, and stopping at an empty one
-	 * means the write never reaches the buffer that really holds it.  The
-	 * cache then serves the PREVIOUS superblock for as long as it stays
-	 * resident, and what comes back is a checksum that does not match, a
-	 * lookup that answers "the disk or the tree lied", and a program that
-	 * cannot open a file that is plainly there.
-	 *
-	 * One processor hid it because the order buffers get claimed in was
-	 * the same every boot; four made the order a race, and the answer
-	 * changed about one boot in three.
+	 * An identity no disk has.  A zeroed buffer would claim page 0 of
+	 * drive 0 -- the APFS container superblock, rewritten at every
+	 * checkpoint -- and a lookup by (drive, page) would match the empty
+	 * buffer instead of the one holding that page.
 	 */
 	for (i = 0; i < BIO_NBUFS; i++) {
 		bio_bufs[i].bb_data  = bio_arena + i * BIO_PAGE_BYTES;
@@ -116,21 +94,15 @@ bio_init(void)
 
 /*
  * Look up (drive, page), fetching it if absent.  Called with bio_lock held;
- * returns with it held, having possibly DROPPED it in the middle.
+ * returns with it held, but may drop it in between.
  *
- * Dropping it is not an optimisation, it is a correctness requirement.  The
- * driver underneath sleeps waiting for the disk interrupt, and in this kernel
- * the preempt counter is global: a thread that blocks while holding any
- * spinlock leaves the count above zero, and the deferred wake queue is only
- * drained when the count reaches zero.  Blocking with bio_lock held therefore
- * parks the thread and guarantees nothing will ever wake it.  Holding a
- * spinlock across device I/O is not slow here -- it is fatal.
- *
- * So a miss claims its buffer with a busy flag, drops the lock, fetches, and
- * takes the lock back.  The flag is what keeps a second thread from claiming
- * the same buffer or reading half-filled bytes out of it; a thread that finds
- * one busy yields and retries, which is legal precisely because it is holding
- * no lock at that point.
+ * It must be dropped for the fetch: the driver sleeps for the disk
+ * interrupt, and a spinlock (which holds off interrupts and preemption on
+ * its CPU) must never be held across a sleep.  So a miss claims its buffer
+ * with bb_busy, drops the lock, fetches, and retakes it.  bb_busy keeps
+ * another thread from claiming the buffer or reading it half-filled; a
+ * thread that finds it busy waits with the lock dropped and retries
+ * (*retry set, NULL returned).
  */
 static struct bio_buf *
 page_get(unsigned drive, uint64_t page, bool *retry)
@@ -146,15 +118,9 @@ page_get(unsigned drive, uint64_t page, bool *retry)
 		if (bio_bufs[i].bb_busy) {
 			/*
 			 * Someone else is fetching it; wait outside the lock.
-			 *
-			 * ⚠ AND WAIT IN TIME IF THERE WAS NOBODY TO YIELD TO.
-			 * The fetching thread is asleep on the disk, so with
-			 * several processors this CPU's runqueue can be empty
-			 * and the yield returns at once -- turning a wait for
-			 * a device into a spin that hammers the very lock the
-			 * fetcher needs to finish.  A yield that DID switch is
-			 * still a wait and costs nothing extra, which is why
-			 * the nap is the fallback and not the rule.
+			 * The fetcher sleeps on the disk, so this CPU's queue
+			 * may be empty and the yield return at once; then nap,
+			 * rather than spin on the lock the fetcher needs.
 			 */
 			spin_unlock(&bio_lock);
 			if (!thread_yield())
@@ -194,9 +160,9 @@ page_get(unsigned drive, uint64_t page, bool *retry)
 		bio_n_evict++;
 
 	/*
-	 * Claim it: invalid (so no one reads it) and busy (so no one takes
-	 * it), with its identity already set so a concurrent lookup for the
-	 * same page finds it busy rather than starting a second fetch.
+	 * Claim it: invalid (no one reads it), busy (no one takes it), and
+	 * already named, so a concurrent lookup of the page waits instead of
+	 * starting a second fetch.
 	 */
 	victim->bb_valid = false;
 	victim->bb_busy  = true;
@@ -217,10 +183,8 @@ page_get(unsigned drive, uint64_t page, bool *retry)
 	}
 	if (victim->bb_stale) {
 		/*
-		 * Someone wrote this page while the read was in flight, so what
-		 * came back may predate their bytes.  Drop it and make the
-		 * caller ask again -- the retry re-reads a disk that now holds
-		 * the write, which is the only version worth caching.
+		 * Written while the read was in flight, so the result may
+		 * predate the write.  Drop it; the retry re-reads the disk.
 		 */
 		victim->bb_stale = false;
 		victim->bb_page  = (uint64_t)-1;
@@ -269,9 +233,8 @@ bio_read(unsigned drive, uint64_t lba, uint32_t nsec, void *buf)
 			return (1);		/* the driver's error, flattened */
 		}
 		/*
-		 * Copy under the lock, and only from a buffer that is valid
-		 * and not busy -- page_get guarantees both, and the copy is
-		 * short enough that holding the lock for it costs nothing.
+		 * Copy under the lock; page_get returned a valid, non-busy
+		 * buffer.
 		 */
 		mem_copy(out + (size_t)done * BIO_SECTOR_BYTES,
 		    bb->bb_data + (size_t)within * BIO_SECTOR_BYTES,
@@ -296,11 +259,8 @@ bio_write(unsigned drive, uint64_t lba, uint32_t nsec, const void *buf)
 		return (0);
 
 	/*
-	 * The device first, and with no lock held -- ata_kwrite sleeps waiting
-	 * for the disk interrupt, and in this kernel the preempt counter is
-	 * global, so blocking under bio_lock would park this thread where
-	 * nothing can wake it.  Same rule as the fetch in page_get, same
-	 * reason.
+	 * The device first, with no lock held: ata_kwrite sleeps (see
+	 * page_get).
 	 */
 	rv = ata_kwrite(drive, lba, nsec, buf);
 	if (rv != 0)
@@ -309,10 +269,8 @@ bio_write(unsigned drive, uint64_t lba, uint32_t nsec, const void *buf)
 		return (0);
 
 	/*
-	 * Now make the cache agree.  Doing this second means a reader racing
-	 * the write sees either the old bytes or the new ones, never a page
-	 * this layer invented; doing it first would let a failed write leave
-	 * the cache holding bytes the disk never took.
+	 * Then make the cache agree.  Done second so a failed write never
+	 * leaves the cache holding bytes the disk did not take.
 	 */
 	in = buf;
 	spin_lock(&bio_lock);
@@ -333,12 +291,9 @@ bio_write(unsigned drive, uint64_t lba, uint32_t nsec, const void *buf)
 				break;
 			}
 			/*
-			 * Not "stop looking" -- "nothing to patch HERE".  A
-			 * buffer that claims the page without holding it is
-			 * not evidence that no other buffer holds it, which is
-			 * the assumption that made an empty cache serve stale
-			 * superblocks.  Keeping the scan going costs a handful
-			 * of compares and cannot be wrong.
+			 * Nothing to patch here, but keep scanning: an invalid
+			 * buffer naming the page does not mean no other buffer
+			 * holds it.
 			 */
 			if (!bio_bufs[i].bb_valid)
 				continue;

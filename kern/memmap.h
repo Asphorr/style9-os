@@ -14,15 +14,12 @@
 /*
  * Bootloader-independent view of physical memory.
  *
- * memmap_init() consumes the boot info pointer passed in via the boot
- * magic + struct address (mb1 / mb2 / PVH), normalises every entry
- * into the local enum, and stores them sorted by base address in the
- * fixed-size memmap_entries[] array.  Other subsystems (notably pmm)
- * iterate this view; they never look at the wire formats.
+ * memmap_init() parses the boot info (mb1 / mb2 / PVH, chosen by the boot
+ * magic), normalises every entry to the local types, and stores them
+ * sorted by base in memmap_entries[].  pmm and others use only this view.
  *
- * The table is fixed-size on purpose: it is consumed early, before any
- * allocator exists, so heap-backed storage is not an option.  64
- * entries is plenty -- in practice firmware reports under a dozen.
+ * Fixed-size because it is filled before any allocator exists;
+ * MEMMAP_MAX_ENTRIES is plenty (firmware reports under a dozen).
  */
 
 enum {

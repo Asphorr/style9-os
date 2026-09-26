@@ -9,23 +9,13 @@
 #define	_FS_APFS_PRIV_H_
 
 /*
- * APFS INTERNALS, AND WHO IS ALLOWED TO SEE THEM
- *
- * apfs.h is what the rest of the kernel may call.  This is what apfs.c and
- * apfs_test.c share and nothing else may touch: the mounted container's own
- * state, the shapes the tree is read through, and the handful of functions a
- * test needs to arrange a case the ordinary interface cannot ask for -- split
- * this node, grow the tree a level, tell me which leaf that key lives in.
- *
- * It exists because the self-tests moved out of apfs.c, and it is the honest
- * price of that move: a test that proves a node splits correctly has to be
- * able to split one.  What it deliberately does NOT export is the writing
- * machinery -- the leaf edit, the object-map edit, the checkpoint builder --
- * because a test that assembled its own transaction would be checking its own
- * arithmetic rather than the writer's.
- *
- * Everything here was static until the split.  Nothing outside the two files
- * that include this header may use any of it.
+ * APFS internals shared by apfs.c and apfs_test.c, and by nothing else: the
+ * mounted container's state, the shapes the tree is read through, and the
+ * few functions a test needs to arrange a case the public interface cannot
+ * ask for (split this node, grow the tree a level, which leaf holds this
+ * key).  The writing machinery -- leaf edit, object-map edit, checkpoint
+ * builder -- is deliberately not here: a test that assembled its own
+ * transaction would be checking its own arithmetic, not the writer's.
  */
 
 #include <stdbool.h>
@@ -35,24 +25,23 @@
 #include "apfs.h"
 
 /*
- * How many ephemeral objects one checkpoint may name before this reader stops
- * recording them.  A container holds the reaper, the space manager and one
+ * Ephemeral objects one checkpoint may name before the mount stops
+ * recording them.  A container has the reaper, the space manager and one
  * B-tree per free queue, plus a handful per mounted volume; 32 is far above
- * anything a single-volume container produces and is bounded storage in a
- * struct that lives for the life of the mount.
+ * what a single-volume container needs.
  */
 #define	APFS_EPH_MAX		32
 
 /*
  * Mounted container state.  (m) = written once by fs_apfs_init before any
- * reader exists, read-only afterwards.  (c) = the same, except that
- * fs_apfs_checkpoint moves it on to the checkpoint it just wrote; it does so
- * under the volume lock in fs.c, which every path that reads these holds.
+ * reader exists, read-only afterwards.  (c) = set at mount, then moved on by
+ * the writers and fs_apfs_checkpoint, under the volume lock (fs_lock in
+ * fs/fs.c) that every path reading these holds.
  */
 struct apfs_mount {
 	uint64_t	ac_block_count;		/* (m) */
 	uint64_t	ac_xid;			/* (c) newest checkpoint    */
-	uint64_t	ac_omap_oid;		/* (m) container object map */
+	uint64_t	ac_omap_oid;		/* (c) container object map */
 	uint64_t	ac_fs_oid;		/* (m) volume 0 superblock  */
 	uint64_t	ac_xp_desc_base;	/* (m) */
 	uint64_t	ac_vol_omap_tree;	/* (c) volume omap B-tree   */
@@ -64,13 +53,10 @@ struct apfs_mount {
 	uint64_t	ac_extref_bno;		/* (c) extent reference tree */
 	uint64_t	ac_fs_alloc_count;	/* (c) blocks this volume owns */
 	/*
-	 * The VOLUME's own next object id, which numbers inodes -- a different
-	 * namespace from the container's nx_next_oid, which numbers B-tree
-	 * nodes and is already a thousand ahead of it.  Advancing this is not
-	 * bookkeeping: the checker treats it as an assertion that everything at
-	 * or above it is unused, and a created inode whose number the volume
-	 * still calls free is the FIRST thing it complains about, ahead of the
-	 * file itself.
+	 * The volume's next object id, which numbers inodes; the container's
+	 * nx_next_oid numbers B-tree nodes, a separate namespace.  apfsck takes
+	 * it as a claim that every id at or above it is unused, so a create
+	 * must advance it.
 	 */
 	uint64_t	ac_next_ino;		/* (c) */
 	uint64_t	ac_num_files;		/* (c) */
@@ -84,12 +70,9 @@ struct apfs_mount {
 	bool		ac_mounted;		/* (m) */
 
 	/*
-	 * What writing the NEXT checkpoint needs, and nothing reading one
-	 * ever asked for: where the superblock we adopted came from, which
-	 * xid it said would follow it, and the two rings' free slots.  The
-	 * data ring is where ephemeral objects are re-emitted each time; the
-	 * reader never had to know it existed, because the checkpoint map
-	 * gave it their addresses directly.
+	 * What writing the next checkpoint needs: where the adopted superblock
+	 * came from, the xid it said follows, and the two rings' free slots.
+	 * Ephemeral objects are re-emitted into the data ring each time.
 	 */
 	uint64_t	ac_sb_bno;		/* (c) block the sb came from  */
 	uint64_t	ac_next_xid;		/* (c) what it said comes next */
@@ -102,12 +85,10 @@ struct apfs_mount {
 	uint32_t	ac_xp_data_next;	/* (c) first free data slot    */
 
 	/*
-	 * The checkpoint's ephemeral objects, resolved.  A fixed table because
-	 * the count is a property of the container's shape rather than of its
-	 * size: four here (reaper, space manager, two free-queue trees), and it
-	 * grows only with the number of mounted volumes.  ac_eph_over records
-	 * what did not fit, so a container that outgrows this says so instead
-	 * of quietly answering half the questions.
+	 * The checkpoint's ephemeral objects, resolved.  A fixed table: the
+	 * count follows the container's shape, not its size -- four here
+	 * (reaper, space manager, two free-queue trees).  ac_eph_over counts
+	 * what did not fit, and fs_apfs_checkpoint refuses while it is nonzero.
 	 */
 	struct {
 		uint64_t	e_oid;
@@ -123,7 +104,7 @@ struct apfs_mount {
 	/* What the space manager says, once it has been found and read. */
 	bool		ac_sm_valid;		/* (m) */
 	uint64_t	ac_sm_paddr;		/* (c) moves every checkpoint */
-	uint64_t	ac_sm_free;		/* (m) blocks free on device 0 */
+	uint64_t	ac_sm_free;		/* (c) blocks free on device 0 */
 	uint64_t	ac_sm_chunks;		/* (m) */
 	uint32_t	ac_sm_blocks_per_chunk;	/* (m) */
 	uint32_t	ac_sm_cib_count;	/* (m) */
@@ -144,10 +125,9 @@ struct apfs_mount {
 	uint64_t	ac_bm_wholly_free;	/* (m) chunks with no bitmap */
 	uint64_t	ac_bm_disagreed;	/* (m) chunks that did not  */
 	/*
-	 * What each chunk this kernel holds contributed to those two totals is
-	 * recorded per chunk, in alloc_chunk: subtract it, add what the bitmap
-	 * in memory says now, and the comparison is between three numbers from
-	 * the same instant again.
+	 * Each resident chunk's share of those two totals is kept in its
+	 * alloc_chunk, so the share can be swapped for the live figure and the
+	 * three numbers compared at one instant.
 	 */
 
 	/*
@@ -163,12 +143,10 @@ struct apfs_mount {
 	uint32_t	ac_ipbm_slot;		/* (c) the live one      */
 
 	/*
-	 * The chunk metadata is taken from, chosen during the walk: one that
-	 * has a real bitmap (so the edit exercises the bitmap path rather than
-	 * the wholly-free shortcut) and room to spare.  Where its bitmap lives
-	 * NOW is the resident chunk's business, below; these are what the walk
-	 * found, which is what the pool probe checks and what the admission
-	 * starts from.
+	 * The chunk metadata is allocated from, chosen during the walk: one
+	 * with a real bitmap (not the wholly-free shortcut) and room to spare.
+	 * These are what the walk found; where its bitmap lives now is the
+	 * resident chunk's (g_home) business.
 	 */
 	bool		ac_alloc_have;		/* (m) */
 	uint64_t	ac_alloc_cib;		/* (c) its chunk-info block  */
@@ -181,10 +159,8 @@ struct apfs_mount {
 extern struct apfs_mount	g_apfs;
 
 /*
- * What reading the tree costs, counted rather than argued about.  apfs.c
- * raises them and fs_apfs_stats prints them; the seek test reads them to say
- * what checking itself cost, so that the totals a boot reports stay about the
- * filesystem rather than about its proof.
+ * What reading the tree costs.  apfs.c raises them and fs_apfs_stats prints
+ * them; the seek test reads them to report its own cost apart.
  */
 extern uint64_t	g_n_walks;	/* reads that visited every record */
 extern uint64_t	g_n_seeks;	/* reads that descended on a key   */
@@ -196,12 +172,9 @@ extern uint64_t	g_n_cmps;	/* keys compared while descending  */
 extern uint8_t	*g_fq[APFS_SFQ_COUNT];
 
 /*
- * What has happened to the SHAPE of the tree, which is what the three tests
- * that arrange a shape check themselves against.  gone_n is the one to be
- * careful with: it counts NODES that left the tree, and there is a separate
- * drop_n counting RECORDS a truncate removed -- they were the same variable
- * for one rung, because the second was added without noticing the first, and
- * the tree-shape line reported their sum as nodes.
+ * What has happened to the tree's shape, which the tests that arrange a
+ * shape check against.  gone_n counts nodes that left a tree; records a
+ * truncate removed are drop_n, private to apfs.c.
  */
 extern uint64_t	split_n;	/* nodes split in two                 */
 extern uint64_t	deep_n;		/* levels the tree has gained         */
@@ -210,23 +183,16 @@ extern uint64_t	gone_n;		/* emptied nodes taken out of a tree  */
 
 /*
  * How many checkpoints a released block stays unavailable for.  Policy, not
- * format: it is how long this kernel promises an older checkpoint remains
- * readable, and the free queue holds blocks for exactly that long.
+ * format: how long an older checkpoint stays readable.
  *
- * It was 4, and batching repriced it.  The number is rent paid in free-queue
- * room -- a single node holds every unreleased entry of the last KEEP+1
- * transactions -- and at 4 it was priced for transactions of one edit each.
- * Once checkpoints became a policy and a transaction became several edits,
- * the arithmetic stopped closing: the belt in fs_apfs_ckpt_due catches a
- * filling node, but its releases lag insertion by KEEP checkpoints, and
- * with 4 the node could brim over faster than forced publishing aged the
- * big slices out (measured: "free queue 1 is full (144 keys)" once per busy
- * boot).  At 2 the lag is short enough for the belt to always win, and what
- * the promise actually protects is intact with room to spare: the torn
- * stand proved a crashed mount only ever falls back to the NEWEST intact
- * checkpoint, which needs just the open transaction's frees held -- keeping
- * one more checkpoint mountable behind it is the courtesy, kept at half the
- * old rent.
+ * The price is free-queue room: one node holds every unreleased entry of
+ * the last KEEP+1 transactions, and releases lag insertion by KEEP
+ * checkpoints.  With transactions of several edits, 4 let the node fill
+ * faster than the belt in fs_apfs_ckpt_due could age slices out ("free
+ * queue 1 is full (144 keys)" once per busy boot); at 2 the belt always
+ * wins.  A crashed mount falls back only to the newest intact checkpoint
+ * (tools/hosttorn.c), which needs just the open transaction's frees held;
+ * the one more checkpoint kept behind it is a courtesy.
  */
 #define	APFS_FQ_KEEP		2
 
@@ -242,11 +208,9 @@ struct alloc_chunk {
 	uint32_t	 ch_slot;	/* (m) its index in the chunk-info */
 	bool		 ch_dirty;	/* (c) */
 	/*
-	 * What the chunk said the moment it was brought in, so the running
-	 * totals can have this chunk's share subtracted and the live figure put
-	 * back.  Taken at admission rather than at mount because that is when
-	 * it is certainly still untouched: nothing can change a chunk that is
-	 * not resident, every bit going through the copy above.
+	 * What the chunk said when admitted, so the running totals can swap
+	 * this share for the live figure.  Taken at admission, when it is
+	 * certainly untouched: only a resident chunk's bits ever change.
 	 */
 	uint32_t	 ch_free_admit;
 	uint32_t	 ch_bits_admit;
@@ -256,10 +220,9 @@ struct alloc_chunk {
 extern struct alloc_chunk	*g_home;
 
 /*
- * Where a B-tree node keeps its three regions.  Pulled out because every
- * tree in the format is read this way and the value base is the one piece
- * that is easy to get subtly wrong: offsets run BACKWARDS from the end of
- * the node, and a root node reserves the last 40 bytes for its btree_info.
+ * Where a B-tree node keeps its three regions.  The value base is the easy
+ * one to get wrong: value offsets run backwards from the end of the node,
+ * and a root node reserves its last 40 bytes for the btree_info.
  */
 struct btree_layout {
 	const uint8_t	*bl_toc;
@@ -273,29 +236,24 @@ struct btree_layout {
 
 
 /*
- * How deep a descent will follow child pointers before it decides the tree is
- * lying to it.  Every loop here that walks down is bounded by it, and so is
- * the path a split records on its way back up.
+ * How deep a descent follows child pointers before calling the tree corrupt.
+ * Bounds every downward walk and the path a split records.
  */
 #define	APFS_TREE_MAX_DEPTH	8
 
 /*
  * Callback fired for every leaf record, in tree order.  Returning false
- * stops the walk -- a lookup that has found its answer should not keep
- * reading blocks.
+ * stops the walk.
  *
- * `bno` is the leaf block the record was found in.  Readers ignore it; it is
- * there for the writer, because a walker that can say what a record contains
- * but never where it lives cannot support changing one.  Note that it is the
- * block NUMBER and not a pointer into the node: the walk frees its buffer on
- * the way out, so a mutation re-reads the block and patches its own copy
- * rather than scribbling on one that is about to be dropped.
+ * `bno` is the leaf block holding the record, for the writer.  A block
+ * number, not a pointer: the walk frees its node buffer on the way out, so
+ * a writer re-reads the block and patches its own copy.
  */
 typedef bool (*apfs_rec_fn)(uint64_t oid, uint32_t type, const uint8_t *key,
     uint32_t klen, const uint8_t *val, uint32_t vlen, uint64_t bno, void *arg);
 
 
-/* Where a key belongs, when the question is which leaf rather than which record. */
+/* Where a key belongs: which leaf, rather than which record. */
 struct leaf_find {
 	const uint8_t	*lf_key;
 	uint32_t	 lf_klen;
@@ -305,9 +263,8 @@ struct leaf_find {
 };
 
 /*
- * A node's ancestry, block and oid at every level: in a copy-on-write tree
- * those are different questions, since a copy changes where a node is without
- * changing the name everything above it uses.
+ * A node's ancestry, block and oid at every level: a copy changes where a
+ * node is without changing the name everything above it uses.
  */
 struct tree_path {
 	uint64_t	tp_bno[APFS_TREE_MAX_DEPTH];
@@ -318,10 +275,10 @@ struct tree_path {
 /* ---- reading the container ------------------------------------------------ */
 
 /*
- * The three answers a reader descends from -- which transaction, which volume
- * object map, which root -- and they come from here rather than from g_apfs
- * because a view (apfs.h) can point all three at an older checkpoint at once.
- * view_floor is the oldest checkpoint a view may still be opened on.
+ * The three things a reader descends from -- transaction, volume object map,
+ * root -- taken from here rather than g_apfs because a view (apfs.h) points
+ * all three at an older checkpoint.  view_floor is the oldest checkpoint a
+ * view may still be opened on.
  */
 uint64_t	view_xid(void);
 uint64_t	view_omap(void);

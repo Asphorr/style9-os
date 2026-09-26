@@ -14,22 +14,16 @@
 /*
  * Structured kernel log.
  *
- * One ring buffer of fixed-size entries; each entry carries a level,
- * an 8-byte source tag, a wall-clock-ms stamp, a monotonic sequence
- * number, and up to KLOG_LINE_MAX bytes of text.  Submissions append
- * to the ring AND echo to tty (which already mirrors to COM1 +
- * debugcon), so the same write lands on the VGA console, the serial
- * port, and the QEMU debugcon stream in one call.
+ * A ring of fixed-size entries, each with a level, an 8-byte source tag,
+ * an uptime stamp in ms, a sequence number and up to KLOG_LINE_MAX bytes
+ * of text.  Each entry is also echoed through kprintf, and so reaches
+ * every console tty mirrors to.
  *
- * Exposed as a Mach service named "klog" so kernel internals + future
- * ring-3 code share the same producer interface.  Two ops:
+ * Also a Mach service, "klog", so ring-3 code can log the same way:
  *	KLOG_OP_WRITE  -- append a line (payload = klog_write_request)
  *	KLOG_OP_TAIL   -- read the last entries (reply = klog_tail_reply)
  *
- * Wire structs below are ABI-stable: existing fields keep their offsets,
- * new fields append, and the size is pinned by _Static_assert.  Reordering
- * an existing field breaks any consumer compiled against an older layout.
- * Each is preceded by a WIRE FORMAT banner for grep-ability.
+ * WIRE FORMAT structs are ABI-stable, as in port.h.
  */
 
 #define	KLOG_LEVEL_DEBUG	1
@@ -90,22 +84,18 @@ _Static_assert(sizeof(struct klog_tail_reply) ==
 void	klog_init(void);
 
 /*
- * Stand up the "klog" Mach service.  Allocates a PORT_SPECIAL_SERVICE
- * port, installs SEND in kernel_space, registers it with the bootstrap
- * port, and emits the first INFO entry as a smoke test.
- *
- * Must run after bootstrap_init + task_subsystem_init (so kernel_space
- * exists with a real owner), and after clock_init (klog stamps each
- * entry with clock_uptime_ms).
+ * Start the "klog" service: create its PORT_SPECIAL_SERVICE port,
+ * register it with bootstrap, and log a first INFO entry.  After
+ * bootstrap_init, task_subsystem_init and clock_init (entries are
+ * stamped with clock_uptime_ms).
  */
 void	klog_service_init(void);
 
 /*
- * Append a single line to the ring AND echo it to tty.  Idempotent if
- * `src` is NULL ("kern" is substituted).  If `text` is longer than
- * KLOG_LINE_MAX-1 bytes it is truncated; no embedded newlines are
- * filtered, but a missing trailing '\n' is added for the tty echo so
- * lines remain one-per-row on the VGA console.
+ * Append one line to the ring and echo it.  A NULL `src` becomes
+ * "kern", NULL `text` "(null)", and an unknown level INFO.  Text beyond
+ * KLOG_LINE_MAX-1 bytes is truncated; embedded newlines are not
+ * filtered, and the echo always ends the line.
  */
 void	klog(uint8_t level, const char *src, const char *text);
 
@@ -115,10 +105,7 @@ void	klog(uint8_t level, const char *src, const char *text);
  */
 size_t	klog_snapshot_tail(struct klog_entry *out, size_t max);
 
-/*
- * One-letter abbreviation of a level for prefix printing.  Useful
- * outside klog.c when constructing display strings.
- */
+/* Three-letter tag for a level ("DBG", "INF", "WRN", "ERR"). */
 const char	*klog_level_name(uint8_t level);
 
 #endif /* !_SYS_KLOG_H_ */

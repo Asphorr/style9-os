@@ -12,49 +12,33 @@
 #include <stdint.h>
 
 /*
- * A set of metadata blocks changed together, written together.
+ * A set of metadata blocks changed together, written together, in place.
  *
- * WHAT PROBLEM.  One filesystem operation touches several blocks.  Growing a
- * file by a block changes the allocation bitmap, the space manager's free
- * counts, the B-tree leaf that gains an extent record, and the inode's
- * recorded length -- four blocks, and a volume where two of them landed is a
- * volume that lies about itself.  Today's writer already has a small version
- * of this: fs_apfs_pwrite puts bytes down and then stamps the inode, and a
- * failure between them leaves contents that changed and a timestamp that did
- * not.
+ * Guarantee: nothing reaches the disk until every change has been computed.
+ * Any failure while building (no memory, a block failing its checksum, a
+ * record that will not fit) aborts having written nothing.
  *
- * WHAT THIS GUARANTEES, EXACTLY.  Nothing reaches the disk until every change
- * has been computed successfully.  Any failure while building -- out of
- * memory, a block that fails its own checksum, a record that will not fit --
- * aborts having written nothing at all.
+ * Not guaranteed: the flush itself is not atomic.  The drive takes the
+ * blocks one at a time, and a power cut mid-flush leaves some written.
+ * This is not a journal; it only narrows the window to the flush.
  *
- * WHAT IT DOES NOT GUARANTEE.  Once the flush begins it is not atomic: the
- * drive takes the blocks one at a time and a power cut in the middle leaves
- * some written.  This is not a journal and does not claim to be one.  It
- * narrows the window from "the whole operation" to "the flush", which is the
- * honest improvement available without copy-on-write -- and it is the shape
- * the real fix takes later, because a checkpoint writer is this same set of
- * blocks published by one final superblock write instead of applied in place.
+ * Metadata only: in APFS only metadata blocks carry an obj_phys header and
+ * a checksum, and metadata is a handful of blocks per operation, while
+ * file data can be megabytes and is streamed straight through.
  *
- * METADATA ONLY, and that is a design statement rather than a limit.  In APFS
- * only metadata blocks carry an obj_phys header and therefore a checksum;
- * file data is unchecked bytes.  Metadata is also bounded -- a handful of
- * blocks per operation -- while a write's data can be megabytes, so data is
- * streamed straight through and never buffered here.  Real filesystems draw
- * the line in the same place and for the same reasons.
+ * Blocks are coalesced by number: asking twice for a block yields the same
+ * buffer, so two records changed in one B-tree leaf make one read and one
+ * write rather than a lost update.
  *
- * Blocks are coalesced by number: asking twice for the same block yields the
- * same buffer, so two records changed in one B-tree leaf produce one read and
- * one write rather than a lost update.
+ * Nothing calls this at present: APFS allocation and checkpoint writes are
+ * copy-on-write (fs/apfs/apfs.c).
  */
 
 /*
- * How many distinct metadata blocks one operation may touch.  Sized for the
- * largest operation planned -- a file growing by one block: allocation
- * bitmap, chunk info, space manager, the extent leaf, the inode leaf, and
- * headroom for a B-tree split touching a node and its parent.  Exceeding it
- * is a bug in the caller rather than a condition to handle gracefully, so it
- * fails the operation loudly instead of growing.
+ * Distinct metadata blocks one operation may touch: enough for a file
+ * growing by a block (bitmap, chunk info, space manager, extent and inode
+ * leaves) plus a B-tree split.  Exceeding it is a caller bug and fails the
+ * operation.
  */
 #define	FS_TXN_MAX_BLOCKS	12
 
@@ -62,10 +46,7 @@ struct fs_txn_slot {
 	uint64_t	 ts_bno;
 	uint8_t		*ts_buf;	/* one block, kmalloc'd on first touch */
 	bool		 ts_dirty;
-	/*
-	 * This block carries no obj_phys, so it is neither verified on the way
-	 * in nor sealed on the way out.  See fs_txn_get_raw.
-	 */
+	/* No obj_phys: neither verified nor sealed (fs_txn_get_raw). */
 	bool		 ts_raw;
 };
 
@@ -84,37 +65,20 @@ struct fs_txn {
 void	fs_txn_begin(struct fs_txn *t);
 
 /*
- * Hand back block `bno` for modification, reading and CHECKSUM-VERIFYING it
- * on first touch.  Verifying matters: writing over a block that already fails
- * its own checksum would turn someone else's corruption into ours, and hand
- * it back freshly sealed so nothing downstream could tell.
- *
- * The buffer belongs to the transaction and stays valid until commit or
- * abort.  Returns FS_TXN_E_OK and stores the buffer in *buf_out, or a
- * negative FS_TXN_E_* -- after which the transaction is poisoned and will
- * refuse to commit, so a caller that ignores one error cannot write a
- * half-built change.
+ * Hand back block `bno' for modification, reading and checksum-verifying
+ * it on first touch, so a block already corrupt is not resealed as if
+ * sound.  The buffer belongs to the transaction until commit or abort.
+ * Returns FS_TXN_E_OK with the buffer in *buf_out, or a negative
+ * FS_TXN_E_*, after which the transaction is poisoned and will not commit.
  */
 int	fs_txn_get(struct fs_txn *t, uint64_t bno, void **buf_out);
 
 /*
- * The same, for a block that has no obj_phys header: read it without checking
- * a checksum it does not have, and write it back without sealing one over its
- * contents.
- *
- * There is exactly one such block in an operation of this kind, and it is the
- * reason the list at the top of this file names it first: an APFS allocation
- * bitmap is bits and nothing else.  Its first eight bytes are the allocation
- * state of sixty-four blocks, in the place where a metadata block keeps its
- * Fletcher-64 -- so the ordinary path rejects every bitmap in the container on
- * the way in, and would overwrite sixty-four blocks' worth of state on the way
- * out.  The distinction is the one write_block_raw already draws for file
- * data; this is the same line, drawn for a block that is neither data nor
- * checksummed metadata.
- *
- * A block may be fetched raw or checked, never both: asking for it the other
- * way after the first fetch poisons the transaction rather than quietly
- * handing back a buffer that will be written under the wrong rules.
+ * The same for a block with no obj_phys header -- an APFS allocation
+ * bitmap, whose first eight bytes are allocation bits where a metadata
+ * block keeps its Fletcher-64.  Read without a checksum check, written
+ * without sealing.  A block may be fetched raw or checked, never both;
+ * the other way after the first poisons the transaction.
  */
 int	fs_txn_get_raw(struct fs_txn *t, uint64_t bno, void **buf_out);
 
@@ -122,17 +86,17 @@ int	fs_txn_get_raw(struct fs_txn *t, uint64_t bno, void **buf_out);
 void	fs_txn_dirty(struct fs_txn *t, uint64_t bno);
 
 /*
- * Seal every dirty block with its Fletcher-64 and write them all, then
- * release the transaction.  Returns FS_TXN_E_OK, or a negative FS_TXN_E_* --
- * including when an earlier fs_txn_get failed, in which case nothing is
- * written.  The transaction is finished either way; do not reuse it.
+ * Seal every dirty checked block with its Fletcher-64, write all dirty
+ * blocks, and release the transaction.  Returns FS_TXN_E_OK, or a
+ * negative FS_TXN_E_* (nothing written if the transaction was poisoned).
+ * The transaction is finished either way.
  */
 int	fs_txn_commit(struct fs_txn *t);
 
 /* Throw the whole thing away, writing nothing.  Idempotent. */
 void	fs_txn_abort(struct fs_txn *t);
 
-/* Blocks written and transactions committed, for the boot banner. */
+/* Commits, blocks written and aborts; prints nothing if all are zero. */
 void	fs_txn_stats(void);
 
 #endif /* !_SYS_FS_TXN_H_ */

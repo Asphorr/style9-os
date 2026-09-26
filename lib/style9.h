@@ -9,21 +9,13 @@
 #define	_STYLE9_H_
 
 /*
- * libstyle9 -- user-side runtime library.
+ * libstyle9 -- the runtime every native ring-3 program links against:
+ * bare types, syscall stubs, a few libc-shaped helpers (string, memory,
+ * bump allocator, printf) and the Mach IPC wrappers.  All of it is
+ * declared here; the implementations are split across lib/style9_*.c.
  *
- * Every ring-3 program in this tree links against libstyle9.  It pulls
- * in the bare-types, the syscall stubs, the small handful of libc-shaped
- * helpers (string, memory, bump-allocator, printf), and the Mach IPC
- * wrappers that turn an integer syscall return into something a C
- * program wants to deal with.
- *
- * Layout mirrors the kernel's BSD-flavoured headers: one header per
- * library, all declarations centralised here so a user program writes
- * `#include <style9.h>` and gets the full surface.  Implementations are
- * sliced across lib/style9_*.c by topic.
- *
- * Calling convention:  the `_start` glue in crt0.S calls `main()`, then
- * `exit(rv)` with the return value.  Programs implement `int main(void)`.
+ * crt0.S calls main(argc, argv) and then exit() with its return value;
+ * `int main(void)' works as well.
  */
 
 /* ---- bare types ----------------------------------------------------- */
@@ -56,8 +48,8 @@ typedef long long		int64_t;
 #define	SYS_MSG_RECV		6
 #define	SYS_MSG_RECV_TIMED	7
 #define	SYS_MSG_RPC		8
-#define	SYS_SPAWN		9	/* phase 1b */
-#define	SYS_TASK_ALIVE		10	/* phase 2  */
+#define	SYS_SPAWN		9
+#define	SYS_TASK_ALIVE		10
 #define	SYS_VM_ALLOCATE		11
 #define	SYS_VM_DEALLOCATE	12
 #define	SYS_PORT_MOD_REFS	13
@@ -82,12 +74,7 @@ typedef long long		int64_t;
 #define	SYS_E_INVAL		(-3)
 #define	SYS_E_NOMEM		(-4)
 
-/*
- * Raw `syscall` instruction wrappers.  Each variant takes the syscall
- * number plus the right number of arguments and returns the kernel's
- * rax value verbatim.  Higher-level wrappers (`write`, `mach_msg_send`,
- * ...) live below and turn these into something C-typed.
- */
+/* Raw `syscall' wrappers; return the kernel's %rax verbatim. */
 long	syscall0(long nr);
 long	syscall1(long nr, long a0);
 long	syscall2(long nr, long a0, long a1);
@@ -98,41 +85,31 @@ long	syscall4(long nr, long a0, long a1, long a2, long a3);
 
 void	exit(int code) __attribute__((noreturn));
 /*
- * Give up the CPU.  Returns 1 if somebody else took it, 0 if there was nobody
- * to give it to -- which on a machine with more than one processor is the
- * common answer and does not mean the machine is idle, only that this CPU's
- * runqueue is.
+ * Give up the CPU.  Returns 1 if another thread took it, 0 if there was
+ * none -- which with several CPUs is common and means only that this
+ * CPU's runqueue is empty.
  */
 long	yield(void);
 
 /*
- * One turn of a poll loop: yield, and if that yielded to nobody, wait a
- * moment of real time instead.
- *
- * ⚠ EVERY BOUNDED "wait for the other task" LOOP MUST USE THIS RATHER THAN
- * yield().  A budget counted in yields was a budget counted in time only
- * while there was one processor: with several, the task being waited for runs
- * elsewhere instead of queueing behind this one, so the yields return at once
- * and sixty-four of them are spent in microseconds.  See style9_sys.c.
+ * One turn of a poll loop: about one timer tick of real time.  Every
+ * bounded "wait for the other task" loop must use this, not yield(): with
+ * several CPUs a yield returns at once and a budget of them is spent in
+ * microseconds.  See style9_sys.c.
  */
 long	poll_turn(void);
 
 /*
- * Spawn the named program (looks up in the kernel's progreg).  Returns
- * the new task's id on success, or a negative SYS_E_* code.  Fire-and-
- * forget: combine with task_alive() to wait for the child.
+ * Spawn the named program from the kernel's progreg.  Returns the new
+ * task's id or a negative SYS_E_*.  Wait for it with task_alive().
  */
 long	spawn(const char *name);
 
-/*
- * spawn_with_port: prototype lives below mach_port_name_t's typedef
- * (declared with the Mach ABI block further down).
- */
+/* spawn_with_port: declared with the Mach ABI below. */
 
 /*
  * task_alive: 1 if a task with this id is still running, 0 otherwise.
- * yield-spin around this to wait for a spawned child without baking in
- * a real notification path.
+ * Poll it with poll_turn() to wait for a spawned child.
  */
 int	task_alive(uint64_t task_id);
 
@@ -160,10 +137,8 @@ void	*memset(void *dst, int c, size_t n);
 int	memcmp(const void *a, const void *b, size_t n);
 
 /*
- * Bump-allocator malloc.  Backed by a fixed-size .bss arena (4 KiB
- * per program by default; raise STYLE9_HEAP_BYTES at compile time to
- * extend it).  free() is a NOP -- callers that need real reuse should
- * track lifetimes themselves until libstyle9 grows a freeing allocator.
+ * Bump allocator over a .bss arena (4 KiB unless STYLE9_HEAP_BYTES is
+ * set at compile time).  free() is a no-op.
  */
 void	*malloc(size_t n);
 void	free(void *p);
@@ -175,19 +150,18 @@ void	free(void *p);
 #define	VM_PROT_EXEC	0x04u
 
 /*
- * vm_allocate: request a page-aligned anonymous range from the kernel.
- * `bytes` is rounded up to a multiple of 4 KiB; `prot` is any OR of
- * VM_PROT_READ / WRITE / EXEC.  Returns the new VA on success, NULL on
- * failure (out of address space or out of frames).  The range is
- * zero-filled.
+ * vm_allocate: a zero-filled anonymous range of `bytes' rounded up to
+ * 4 KiB, `prot' any OR of VM_PROT_*.  Returns the VA, or NULL when out
+ * of address space or frames.
  */
 void	*vm_allocate(size_t bytes, uint32_t prot);
 
 /*
- * vm_deallocate: release a range previously returned by vm_allocate.
- * (va, bytes) MUST mirror the exact tuple vm_allocate handed out; partial
- * deallocate is rejected in v1.  Returns 0 on success, negative SYS_E_*
- * otherwise.
+ * vm_deallocate: release anonymous memory from vm_allocate.  `va' must be
+ * page-aligned and `bytes' is rounded up to 4 KiB; any part of an
+ * allocation, or a run across several, may be released.  A range with an
+ * unmapped page or non-anonymous memory in it is refused whole.  Returns
+ * 0, or a negative SYS_E_*.
  */
 int	 vm_deallocate(void *va, size_t bytes);
 
@@ -208,10 +182,8 @@ typedef uint32_t		mach_port_name_t;
 #define	MACH_PORT_PARENT		((mach_port_name_t)3)
 
 /*
- * Notification opcodes.  Mirror mach/port.h.  Passed to
- * mach_port_request_notification, and the kernel posts a
- * mach_notify_header back to the caller's notify port carrying
- * msgh_id = MACH_NOTIFY_<TYPE>.
+ * Notification types for mach_port_request_notification; the kernel's
+ * mach_notify_header carries the type as msgh_id.
  */
 #define	MACH_NOTIFY_FIRST		64
 #define	MACH_NOTIFY_NO_SENDERS		(MACH_NOTIFY_FIRST + 6)
@@ -219,9 +191,8 @@ typedef uint32_t		mach_port_name_t;
 #define	MACH_EXC_FAULT			100
 
 /*
- * Exception types.  Mirrors mach/port.h.  Use EXC_MASK_* bitmasks with
- * task_set_exception_ports; the kernel maps an x86 trap vector to one
- * of these and dispatches to the corresponding port slot.
+ * Exception types; the kernel maps an x86 trap vector to one of these and
+ * sends to that port slot.  task_set_exception_ports takes EXC_MASK_*.
  */
 #define	EXC_TYPE_BAD_ACCESS		0u
 #define	EXC_TYPE_BAD_INSTRUCTION	1u
@@ -277,18 +248,11 @@ typedef uint32_t		mach_port_name_t;
 #define	MACH_TIMEOUT_FOREVER		((uint64_t)~0ull)
 
 /*
- * Wire structs below mirror the kernel-side declarations in mach/port.h,
- * mach/bootstrap.h, dev/dev_proto.h, and mach/services.h.  They MUST stay
- * byte-identical: a field offset that disagrees between this header and
- * the kernel declaration silently misparses the on-wire layout, because
- * the compiled lib/style9_*.o objects read the field at THIS file's
- * offset.  The 2026-05-28 OOL bring-up bug was exactly this drift -- a
- * descriptor field reordered kernel-side, lib/style9_mach.o left stale
- * by missing Makefile dep tracking, userspace reading the wrong byte.
- *
- * Edit kernel-side first, edit here second, verify _Static_assert sizes
- * match across the boundary.  Each struct is preceded by a WIRE FORMAT
- * banner for grep-ability.
+ * The WIRE FORMAT structs below mirror the kernel's declarations
+ * (mach/port.h, mach/bootstrap.h, mach/services.h, mach/host.h,
+ * dev/dev_proto.h, vm/vm.h) and must stay byte-identical: a drifted
+ * offset misparses silently.  Change the kernel side first, then this,
+ * and check the _Static_assert sizes on both.
  */
 
 /* WIRE FORMAT.  Mirrors mach/port.h. */
@@ -308,7 +272,7 @@ struct mach_msg_body {
 
 /* WIRE FORMAT.  Mirrors mach/port.h. */
 struct mach_msg_port_descriptor {
-	uint8_t			type;		/* == MACH_MSG_PORT_DESCRIPTOR */
+	uint8_t			type;		/* MACH_MSG_PORT_DESCRIPTOR */
 	uint8_t			disposition;
 	uint8_t			pad1;
 	uint8_t			pad2;
@@ -316,24 +280,19 @@ struct mach_msg_port_descriptor {
 };
 
 /*
- * Packed to keep alignment at 4 instead of the 8 the uint64_t address
- * field would force; otherwise a 4-byte gap appears between body and
- * an OOL descriptor in a wire struct, which the kernel walker would
- * read as a bogus port descriptor.  See mach/port.h for the full
- * rationale.
- *
- * `deallocate = 1` asks the kernel to vm_release the source range
- * after the copy (mirrors a vm_allocate'd anonymous entry).  Best-
- * effort; non-matching ranges leave the sender's VM untouched.
+ * Packed: 8-byte alignment would open a 4-byte gap after the body, which
+ * the kernel's descriptor walker reads as a bogus port descriptor (see
+ * mach/port.h).  `deallocate = 1' asks the kernel to release the source
+ * range after the copy; best-effort.
  */
 /* WIRE FORMAT.  Mirrors mach/port.h. */
 struct mach_msg_ool_descriptor {
 	uint8_t			type;		/* == MACH_MSG_OOL_DESCRIPTOR */
 	uint8_t			copy;		/* MACH_MSG_PHYSICAL_COPY     */
-	uint8_t			deallocate;	/* 1: vm_release src post-copy */
+	uint8_t			deallocate;	/* 1: release src after copy  */
 	uint8_t			pad;
-	uint32_t		size;		/* bytes to ferry              */
-	uint64_t		address;	/* sender VA / receiver VA     */
+	uint32_t		size;		/* bytes to ferry             */
+	uint64_t		address;	/* sender VA / receiver VA    */
 } __attribute__((packed));
 
 /* WIRE FORMAT.  Mirrors mach/port.h. */
@@ -345,7 +304,7 @@ struct mach_notify_header {
 
 /* WIRE FORMAT.  Mirrors mach/port.h. */
 struct mach_exception_header {
-	struct mach_msg_header	hdr;		/* msgh_id = MACH_EXC_FAULT    */
+	struct mach_msg_header	hdr;		/* msgh_id = MACH_EXC_FAULT   */
 	uint32_t		eh_trapno;
 	uint32_t		eh_err;
 	uint64_t		eh_rip;
@@ -355,19 +314,14 @@ struct mach_exception_header {
 	uint64_t		eh_task_id;
 };
 
-/* WIRE FORMAT.  Mirrors mach/port.h.  Verdict reply from a RESUMABLE watcher. */
+/* WIRE FORMAT.  Mirrors mach/port.h.  A RESUMABLE watcher's verdict. */
 struct mach_exception_reply {
-	struct mach_msg_header	hdr;		/* msgh_id = MACH_EXC_REPLY    */
+	struct mach_msg_header	hdr;		/* msgh_id = MACH_EXC_REPLY   */
 	uint32_t		er_verdict;
 	uint32_t		er_rip_advance;
 };
 
-/*
- * Port-snapshot tags.  PORT_SPECIAL_NONE matches the kernel's
- * PORT_SPECIAL_NONE; the rest of the PORT_SPECIAL_* set is included
- * so lsmp can decode kernel-tagged ports (task_self / bootstrap /
- * service) without re-reading port.h.
- */
+/* Port-snapshot tags, as the kernel's PORT_SPECIAL_*, for lsmp. */
 #define	PORT_SPECIAL_NONE		0
 #define	PORT_SPECIAL_TASK_SELF		1
 #define	PORT_SPECIAL_BOOTSTRAP		2
@@ -380,16 +334,13 @@ struct mach_exception_reply {
 
 #define	MACH_PORT_SNAPSHOT_MAX		64
 
-/*
- * vm_map region snapshot.  Mirrors kern/vm.h.  vmmap(1) reads arrays
- * of these from SYS_TASK_GET_VM_REGIONS.
- */
+/* vm_map region snapshot, read by vmmap from SYS_TASK_GET_VM_REGIONS. */
 #define	MACH_VM_REGION_MAX		64
 
 #define	VME_F_ANON			0x01u	/* anonymous (pmm) backing  */
-#define	VME_F_COW			0x02u	/* future: copy-on-write    */
+#define	VME_F_COW			0x02u	/* shared; copy on write    */
 
-/* WIRE FORMAT.  Mirrors kern/vm.h. */
+/* WIRE FORMAT.  Mirrors vm/vm.h. */
 struct mach_vm_region_entry {
 	uint64_t	mvr_start;
 	uint64_t	mvr_end;
@@ -472,7 +423,7 @@ struct bootstrap_lookup_request {
 	char	blr_name[BOOTSTRAP_NAME_MAX];
 };
 
-/* WIRE FORMAT.  Mirrors mach/bootstrap.h.  Reply body for register / deregister. */
+/* WIRE FORMAT.  Mirrors mach/bootstrap.h.  (De)register reply body. */
 struct bootstrap_status_reply {
 	int32_t		bsr_status;
 	uint32_t	bsr_pad;
@@ -493,18 +444,16 @@ int		mach_msg_rpc(struct mach_msg_header *req,
 		    uint64_t timeout_ms);
 
 /*
- * mach_port_mod_refs: drop ONE specific right kind from a name without
- * tearing the whole slot down.  Use when a name carries both RECV and
- * SEND and the caller wants to relinquish only one.  Returns MACH_MSG_OK
+ * mach_port_mod_refs: drop one right kind from a name that carries
+ * several (say RECEIVE and SEND), keeping the rest.  Returns MACH_MSG_OK
  * or a MACH_E_*.
  */
 int		mach_port_mod_refs(mach_port_name_t name, uint8_t right);
 
 /*
- * Port-set wrappers.  A port set lets one mach_msg_recv serve any of
- * several member ports.  Allocate a set, insert ports holding RECEIVE,
- * then recv on the set name -- whichever member has the next message
- * gets delivered (set members are not consumed by membership).
+ * Port sets: insert ports whose RECEIVE right you hold, then
+ * mach_msg_recv on the set name to take the next message from any
+ * member.
  */
 mach_port_name_t mach_port_set_allocate(void);
 int		mach_port_set_insert(mach_port_name_t set_name,
@@ -513,168 +462,128 @@ int		mach_port_set_remove(mach_port_name_t set_name,
 		    mach_port_name_t port_name);
 
 /*
- * mach_port_set_extract: query which port set `port_name` belongs to.
- * Returns the set's name in the calling task's space, or MACH_PORT_NULL
- * when the port is standalone (also when the name is invalid or lacks
- * RECEIVE).  Symmetric introspection counterpart to insert / remove.
+ * mach_port_set_extract: the name of the set `port_name' belongs to, or
+ * MACH_PORT_NULL if none (or the name is invalid or lacks RECEIVE).
  */
 mach_port_name_t mach_port_set_extract(mach_port_name_t port_name);
 
 /*
- * mach_port_request_notification: ask the kernel to post a
- * MACH_NOTIFY_<TYPE> message to `notify_port` when the source `name`
- * reaches the matching event.  Caller must hold:
- *	NO_SENDERS -- RECEIVE on `name`, SEND on `notify_port`
- *	DEAD_NAME  -- SEND on `name`,    SEND on `notify_port`
- * `notify_msgid` is the user tag carried back in the notification's
- * nh_msgid field.  One-shot: re-arming requires another call after
- * each firing.
+ * mach_port_request_notification: have the kernel post a MACH_NOTIFY_<TYPE>
+ * message to `notify_port' when `name' reaches that event.  Caller holds:
+ *	NO_SENDERS -- RECEIVE on `name', SEND on `notify_port'
+ *	DEAD_NAME  -- SEND on `name',    SEND on `notify_port'
+ * `notify_msgid' comes back as nh_msgid.  One-shot: re-arm after each
+ * firing.
  */
 int		mach_port_request_notification(mach_port_name_t name,
 		    uint32_t notify_type, mach_port_name_t notify_port,
 		    uint32_t notify_msgid);
 
 /*
- * spawn_with_port: variant of spawn() that also hands the child a SEND
- * right at the well-known MACH_PORT_PARENT slot.  Caller must hold
- * SEND on `source_name`; the kernel transfers that right into the
- * child's port_space atomically before the child starts running.
- * Child detects the gift by mach_msg_send'ing to MACH_PORT_PARENT and
- * observing MACH_MSG_OK versus MACH_E_RIGHT (empty slot).  Returns
- * task_id on success, or a negative SYS_E_*.
+ * spawn_with_port: spawn(), also giving the child a SEND right to
+ * `source_name' (which the caller must hold SEND on) at MACH_PORT_PARENT,
+ * installed before the child runs.  The child tells by sending there:
+ * MACH_E_RIGHT means the slot is empty.  Returns task_id or a negative
+ * SYS_E_*.
  */
 long	spawn_with_port(const char *name, mach_port_name_t source_name);
 
 /*
- * task_kill: capability-based async terminate.  `target_port` is a
- * port name in the caller's space that the kernel verifies is a
- * task-self port (PORT_SPECIAL_TASK_SELF), holding SEND.  Self-kill is
- * trivial: task_kill(MACH_PORT_TASK_SELF).  Killing another task
- * requires having been handed its task-self port via OOL or parent
- * inject.  Returns MACH_MSG_OK on accept, MACH_E_RIGHT on missing
- * SEND, MACH_E_INVAL if the port is not a task-self port.  The
- * actual termination is asynchronous (the syscall returns before the
- * target retires); see [[project-task-async-kill-2026-05-28]] for the
- * detection-site model.
+ * task_kill: terminate the task whose task-self port `target_port' names
+ * (SEND held).  task_kill(MACH_PORT_TASK_SELF) kills the caller; another
+ * task needs its task-self port handed over first.  Returns MACH_MSG_OK
+ * when accepted, MACH_E_RIGHT without SEND, MACH_E_INVAL if the port is
+ * not a task-self port.  Asynchronous: it returns before the target has
+ * retired.
  */
 int	task_kill(mach_port_name_t target_port);
 
 /*
- * spawn_returns_taskport: like spawn(), but also writes a port name
- * carrying SEND on the new task's task-self port to `*out_taskport`.
- * The pair `(returned task_id, *out_taskport)` is the capability
- * needed by task_kill() to terminate the child later.  Shell uses
- * this for every fg/bg job so Ctrl-C + `kill <id>` are wired to the
- * child via the Mach-shaped path (no pid -> task lookup needed).
- * Returns task_id on success, negative SYS_E_* on failure; on
- * failure *out_taskport is untouched.
+ * spawn_returns_taskport: spawn(), also writing to *out_taskport a SEND
+ * right on the child's task-self port -- what task_kill() needs.
+ * Returns task_id, or a negative SYS_E_* with *out_taskport untouched.
  */
 long	spawn_returns_taskport(const char *name, mach_port_name_t *out_taskport);
 
 /*
- * spawn_args: spawn_returns_taskport plus a command line.  argv is the
- * usual vector; `argc` entries argv[0..argc-1] are copied into the
- * child, which receives them as main(argc, argv) (the kernel builds a
- * SysV-style initial stack and crt0 forwards it).  argv[0] is
- * conventionally the program name.  `out_taskport` is required (the
- * call always hands back the child's task-self SEND right, exactly as
- * spawn_returns_taskport does).  Returns the new task_id on success,
- * negative SYS_E_* on failure; on failure *out_taskport is untouched.
- * argc 0 behaves like spawn_returns_taskport.
+ * spawn_args: spawn_returns_taskport with a command line.  argv[0..argc-1]
+ * are copied into the child, which gets them as main(argc, argv);
+ * argv[0] is conventionally the program name.  `out_taskport' is
+ * required.  Returns as spawn_returns_taskport; argc 0 behaves like it.
+ * sh starts every job this way.
  */
 long	spawn_args(const char *name, int argc, char *const argv[],
 	    mach_port_name_t *out_taskport);
 
 /*
- * cons_feed: queue `len` bytes of console input in the kernel for an
- * interactive Darwin shell to read back through its real read(2) path.
- * v1 is single-shot: the feed marks end-of-input, so a shell that drains
- * it sees EOF and exits.  Returns the number of bytes accepted (capped in
- * the kernel) or a negative SYS_E_*.
+ * cons_feed: load `len' bytes as a scripted console session for an
+ * interactive Darwin shell, read back through its real read(2) path.  A
+ * new feed replaces the old; running out of script is end-of-input, so
+ * the shell exits.  Returns the bytes accepted (the kernel caps them) or
+ * a negative SYS_E_*.
  */
 long	cons_feed(const char *buf, unsigned long len);
 
 /*
- * task_set_exception_port: install (or replace) the calling task's
- * exception port for every type.  Equivalent to
- * task_set_exception_ports(EXC_MASK_ALL, notify_port).  Kept for
- * A v1 source compatibility -- new code should use the per-type
- * form below.  Returns MACH_MSG_OK or a MACH_E_*.
+ * task_set_exception_port: task_set_exception_ports(EXC_MASK_ALL,
+ * notify_port), kept for older callers.  Returns MACH_MSG_OK or a
+ * MACH_E_*.
  */
 int	task_set_exception_port(mach_port_name_t notify_port);
 
 /*
- * task_set_exception_ports: install (or clear) the calling task's
- * exception ports for every EXC_TYPE named in `types_mask`.  Each
- * matching slot is overwritten with `notify_port` (kernel takes one
- * SEND ref per slot), or cleared if `notify_port == MACH_PORT_NULL`.
- * Refs to whatever was in the slot before are released by the kernel.
+ * task_set_exception_ports: set the calling task's exception port for
+ * every EXC_TYPE in `types_mask' to `notify_port' (one SEND ref per slot),
+ * or clear them with MACH_PORT_NULL.  The previous refs are released.
  * Returns MACH_MSG_OK or a MACH_E_*.
  */
 int	task_set_exception_ports(uint32_t types_mask,
 	    mach_port_name_t notify_port);
 
 /*
- * thread_set_exception_ports: install (or clear) the calling
- * thread's per-type exception ports.  Slots are checked BEFORE the
- * task-level slots in user_fault_die, so a thread-level entry takes
- * precedence over a task-level one for the same type.  Same arg
- * semantics + return as task_set_exception_ports.
+ * thread_set_exception_ports: the same for the calling thread.  A
+ * thread-level port takes precedence over the task's for the same type.
  */
 int	thread_set_exception_ports(uint32_t types_mask,
 	    mach_port_name_t notify_port);
 
 /*
- * task_get_port_snapshot: copy one mach_port_snapshot_entry per
- * populated slot of the named task's port_space into `out`.  v1
- * accepts only task_id == 0 (the calling task); other values
- * return SYS_E_INVAL.  Capped at MACH_PORT_SNAPSHOT_MAX entries.
- *
- * Returns the number of entries written on success, or a negative
- * SYS_E_*.  Powers the userspace `lsmp` tool.
+ * task_get_port_snapshot: one entry per populated slot of the task's port
+ * space, at most MACH_PORT_SNAPSHOT_MAX.  Only task_id 0 (the caller) is
+ * accepted; anything else is SYS_E_INVAL.  Returns the count written or a
+ * negative SYS_E_*.  Used by lsmp.
  */
 long	task_get_port_snapshot(uint64_t task_id,
 	    struct mach_port_snapshot_entry *out, size_t max_entries);
 
 /*
- * task_get_vm_regions: copy one mach_vm_region_entry per live
- * vm_map entry in the named task into `out`.  v1 accepts only
- * task_id == 0 (calling task).  Capped at MACH_VM_REGION_MAX.
- * Returns the number of entries written, or a negative SYS_E_*.
- * Powers the userspace `vmmap` tool.
+ * task_get_vm_regions: likewise, one entry per vm_map entry, at most
+ * MACH_VM_REGION_MAX, task_id 0 only.  Used by vmmap.
  */
 long	task_get_vm_regions(uint64_t task_id,
 	    struct mach_vm_region_entry *out, size_t max_entries);
 
 /*
- * One-shot bootstrap lookup helper.  Builds the request, RPCs it to
- * MACH_PORT_BOOTSTRAP, returns the SEND name the kernel handed back
- * in the caller's space.  Returns MACH_PORT_NULL if the service is
- * not registered (or any error occurred).  The caller must
- * mach_port_deallocate() the returned name when done.
+ * Look `service' up with bootstrap.  Returns a SEND name in the caller's
+ * space, which the caller deallocates, or MACH_PORT_NULL if it is not
+ * registered or anything failed.
  */
 mach_port_name_t bootstrap_lookup(const char *service);
 
 /*
- * Publish `port` (a SEND-bearing name in the caller's space) under
- * `service` in the global bootstrap registry.  Caller retains its own
- * SEND right (COPY_SEND semantics).  Subsequent lookups by any task
- * return a fresh SEND naming the same underlying port.
- *
- * Returns MACH_MSG_OK on success, MACH_E_RIGHT if `port` does not name
- * a SEND right, MACH_E_NOSPACE if the registry is full, MACH_E_INVAL on
- * a bad or duplicate service name, or any MACH_E_* propagated from the
- * underlying RPC.
+ * Publish `port' (a SEND right; the caller keeps its own) as `service'.
+ * Later lookups by any task get a fresh SEND to the same port.  Returns
+ * MACH_MSG_OK, MACH_E_RIGHT if `port' is not a SEND right, MACH_E_NOSPACE
+ * if the registry is full, MACH_E_INVAL for a bad or duplicate name, or
+ * the RPC's MACH_E_*.
  */
 int		 bootstrap_register_service(const char *service,
 		    mach_port_name_t port);
 
 /*
- * Remove the registry entry for `service` and drop the kernel-side
- * SEND right that backed it.  Returns MACH_MSG_OK on success or
- * MACH_E_INVAL if `service` was not registered.  No authentication
- * in v1: any task can deregister any name -- including the kernel
- * services from services_init.  Use with care.
+ * Remove `service' and drop the SEND right behind it.  Returns
+ * MACH_MSG_OK, or MACH_E_INVAL if it was not registered.  Unchecked: any
+ * task can deregister any name, the kernel's own services included.
  */
 int		 bootstrap_deregister_service(const char *service);
 
@@ -718,26 +627,22 @@ struct dev_write_reply {
 };
 
 /*
- * dev_open_stream: bootstrap_lookup("dev/<name>") + RPC DEV_OP_OPEN_STREAM
- * + extract the port_descriptor + deallocate the control port.  Returns
- * the SEND right naming the driver's stream port, or MACH_PORT_NULL on
- * any failure.  Caller mach_msg_recv()s on the returned name to pull
- * bytes from the driver.  Caller must mach_port_deallocate() when done.
+ * dev_open_stream: DEV_OP_OPEN_STREAM to "dev/<short_name>".  Returns a
+ * SEND right to the driver's stream port, from which the caller
+ * mach_msg_recv()s bytes and which it deallocates when done, or
+ * MACH_PORT_NULL on any failure.
  */
 mach_port_name_t dev_open_stream(const char *short_name);
 
 /*
- * dev_info: query the named driver for its kind + capability flags.
- * Returns MACH_MSG_OK on success and fills *out; any negative MACH_E_*
- * otherwise.  Lightweight probe before opening a stream.
+ * dev_info: the driver's kind and capability flags into *out.  Returns
+ * MACH_MSG_OK or a MACH_E_*.
  */
 int		 dev_info(const char *short_name, struct dev_info_reply *out);
 
 /*
- * dev_write: send DEV_OP_WRITE to the driver named "dev/<short_name>".
- * Up to DEV_WRITE_MAX bytes; returns the number of bytes the driver
- * acknowledged, or a negative MACH_E_*.  Used by future TX consumers
- * (e.g. a network logger speaking dev/uart).
+ * dev_write: DEV_OP_WRITE of up to DEV_WRITE_MAX bytes (more is
+ * truncated).  Returns the bytes the driver acknowledged or a MACH_E_*.
  */
 ssize_t		 dev_write(const char *short_name,
 		    const void *buf, size_t len);
@@ -798,14 +703,11 @@ _Static_assert(sizeof(struct svc_tasks_reply) ==
     "svc_tasks_reply layout pinned");
 
 /*
- * "progreg" -- what can be spawned.
- *
- * The names arrive PACKED, NUL-separated in one byte array, because
- * fixed-width slots for the registry's forty entries would have put the
- * reply within two programs of the 1024-byte inline-reply ceiling.
- * pr_count is how many fit; pr_total is how many exist.  A caller that
- * sees them differ should say so rather than print a short list that
- * looks complete.
+ * "progreg" -- what can be spawned.  Names arrive packed, NUL-separated,
+ * to keep the reply well under svc_reply_inline's 1024 bytes.  pr_count
+ * is how many fit, pr_total how many exist; a caller that sees them
+ * differ should say so rather than print a short list that looks
+ * complete.
  *
  * WIRE FORMAT.  Mirrors mach/services.h.
  */
@@ -817,12 +719,8 @@ struct svc_progreg_reply {
 	uint32_t	pr_count;
 	uint32_t	pr_total;
 	/*
-	 * One bit per packed name, in packing order: set means the image
-	 * is a Mach-O container, so the program is a genuine Darwin
-	 * binary rather than a native style9 ELF.  Half this registry is
-	 * real Apple binaries running under a clean-room dyld, which is
-	 * the most interesting thing about the list and which a list that
-	 * renders them identically hides.
+	 * One bit per packed name, in packing order: set for a Mach-O
+	 * image, a genuine Darwin binary rather than a native ELF.
 	 */
 	uint64_t	pr_macho;
 	char		pr_names[SVC_PROGREG_BYTES];
@@ -862,11 +760,11 @@ struct svc_host_info_reply {
 /*
  * Host-port client helpers (lib/style9_mach.c).
  *
- *	mach_host_self	-- bootstrap_lookup("host"); returns a SEND-right name
- *			   (MACH_PORT_NULL on failure).  mach_port_deallocate
- *			   it when done.
- *	host_page_size	-- RPC HOST_OP_PAGE_SIZE; writes the page size out.
- *	host_info	-- RPC HOST_OP_INFO; fills *out with the host snapshot.
+ *	mach_host_self	-- bootstrap_lookup("host"); a SEND name to
+ *			   deallocate when done, or MACH_PORT_NULL.
+ *	host_page_size	-- HOST_OP_PAGE_SIZE into *page_size_out.
+ *	host_info	-- HOST_OP_INFO: CPU count and type, total and
+ *			   free memory, into *out.
  *
  * The two RPC helpers return MACH_MSG_OK or a MACH_E_* code.
  */
@@ -875,11 +773,12 @@ int		host_page_size(mach_port_name_t host, uint32_t *page_size_out);
 int		host_info(mach_port_name_t host, struct svc_host_info_reply *out);
 
 /*
- * Task-port client helpers (lib/style9_mach.c).  Drive vm_allocate /
- * vm_deallocate as Mach RPCs to a task port (MACH_PORT_TASK_SELF for the
- * caller's own task) -- the message interface a Darwin binary uses, not
- * the native SYS_VM_* fast path.  Both return MACH_MSG_OK or a MACH_E_*
- * code; task_vm_allocate writes the chosen VA through *addr_out.
+ * Task-port client helpers (lib/style9_mach.c): vm_allocate and
+ * vm_deallocate as RPCs to a task port (MACH_PORT_TASK_SELF for the
+ * caller), the interface a Darwin binary uses rather than SYS_VM_*.
+ * They return MACH_MSG_OK or a MACH_E_*; task_vm_allocate writes the VA
+ * through *addr_out.  task_get_special_port takes a TASK_SPECIAL_* index
+ * and returns a SEND name to deallocate.
  */
 int		task_vm_allocate(mach_port_name_t task, uint64_t size,
 		    uint32_t prot, uint64_t *addr_out);
@@ -888,10 +787,7 @@ int		task_vm_deallocate(mach_port_name_t task, uint64_t addr,
 int		task_get_special_port(mach_port_name_t task, uint32_t which,
 		    mach_port_name_t *port_out);
 
-/*
- * launchd service wire mirror.  Match mach/services.h exactly --
- * any size or field drift here silently misparses the on-wire shape.
- */
+/* launchd service.  Mirrors mach/services.h. */
 #define	SVC_LAUNCHD_NAME	"launchd"
 
 #define	LAUNCHCTL_OP_LIST	1
@@ -963,25 +859,18 @@ struct svc_launchctl_list_reply {
 #define	MAN_NAME_MAX		32
 
 /*
- * man_fetch: ask the kernel "man" service for the rendered text of the
- * named page (e.g. "port" for port.9).  On success returns MACH_MSG_OK
- * and writes the buffer address + length to *out_text and *out_len; the
- * buffer is an OOL-installed anonymous range in the caller's vm_map.
- * Pair every successful fetch with man_release to drop the backing
- * pages -- otherwise repeated fetches leak one mapping each.
- *
- * Returns MACH_E_NAME if no such page is registered, or any MACH_E_*
- * propagated from the underlying RPC.
+ * man_fetch: the rendered text of the named page ("port" for port.9),
+ * delivered as an OOL anonymous range in the caller's map.  Returns
+ * MACH_MSG_OK with *out_text and *out_len set, MACH_E_NAME if there is
+ * no such page, or the RPC's MACH_E_*.  Every successful fetch needs a
+ * man_release, or the mapping leaks.
  */
 int		 man_fetch(const char *name, const char **out_text,
 		    size_t *out_len);
 
 /*
- * man_release: tear down a buffer returned by a successful man_fetch.
- * Equivalent to vm_deallocate but takes the (text, len) tuple the
- * fetch handed out -- size is page-rounded internally to match what
- * the kernel allocated.  Returns 0 on success, negative SYS_E_* on
- * failure (e.g. the range does not match a known allocation).
+ * man_release: vm_deallocate of what man_fetch handed out, taking its
+ * (text, len) and page-rounding.  Returns 0 or a negative SYS_E_*.
  */
 int		 man_release(const char *text, size_t len);
 

@@ -11,11 +11,8 @@
 #include <stdint.h>
 
 /*
- * x86_64 Interrupt Descriptor Table.
- *
- * 256 16-byte gates.  Gates 0-47 are populated from the stub addresses
- * exported by isr.S; the rest stay zeroed (P=0) so an unexpected vector
- * raises #NP, routed through the panic path.
+ * x86_64 Interrupt Descriptor Table: 256 16-byte gates, every one an
+ * interrupt gate on the matching isr.S stub.
  */
 
 #define	IDT_NENTRIES		256
@@ -29,10 +26,8 @@
 void	idt_init(void);
 
 /*
- * Point THIS processor's IDTR at the table idt_init built.  Separate from
- * building it because the table is shared and the register is not: a CPU that
- * skips this has no handler for anything, and its first exception is a triple
- * fault rather than a message.
+ * Point this CPU's IDTR at the shared table idt_init built.  A CPU that
+ * skips it triple-faults on its first exception.
  */
 void	idt_load(void);
 void	idt_set_gate(unsigned int vec, uintptr_t handler,

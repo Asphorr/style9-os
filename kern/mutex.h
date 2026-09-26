@@ -14,42 +14,27 @@
 #include "spinlock.h"
 
 /*
- * A lock a thread may hold across sleeping.
+ * A lock a thread may hold across sleeping -- e.g. across disk I/O, which
+ * waits for the drive's interrupt.  A spinlock cannot be: it keeps
+ * preemption and interrupts off on its CPU, and deferred wakes are drained
+ * only when the preempt count returns to zero.
  *
- * WHY THIS HAD TO EXIST.  Until now the kernel's only lock was the spinlock,
- * and a spinlock in this kernel cannot be held across an operation that
- * blocks: preempt_count is global, so a thread that parks while holding one
- * leaves the count above zero, and the deferred wake queue is drained only
- * when it reaches zero.  Blocking under a spinlock therefore does not merely
- * stall the machine, it guarantees the sleeper is never woken.
+ * A thread that finds the lock held parks on its waiter list and is woken
+ * when the holder releases.  Not recursive: a second acquire by the owner
+ * panics.  Not a handoff: the woken thread re-checks the owner and may
+ * lose to a newcomer, so the wait is a loop.
  *
- * Every path that touches the disk blocks -- ata_kread and ata_kwrite both
- * wait for the drive's interrupt.  So there was no way to make a disk-touching
- * path mutually exclusive, and the code that needed it worked around the
- * absence: fs/bio.c marks a buffer busy, drops its spinlock, and has losers
- * spin on thread_yield until the flag clears.  That is a lock, hand-rolled out
- * of the only parts available, and it is one of ten such yield loops.
+ * Never from interrupt context (an IRQ has no thread to park), and never
+ * while holding a spinlock: mutex_lock asserts that preemption is enabled,
+ * catching the mistake when it is made.
  *
- * The filesystem got away without any lock at all for a different reason: its
- * volume state is filled at mount and read-only afterwards, so readers had
- * nothing to serialise.  Writing ended that, which is what makes this the
- * moment to build the primitive rather than a tenth workaround.
+ * The guard spinlock is held only to inspect and update the owner and the
+ * waiter list, never across the block: thread_block_release drops it under
+ * sched_lock, so a release between the drop and the switch cannot lose
+ * the wake.
  *
- * WHAT IT IS.  A thread that finds the lock held parks on its waiter list and
- * is woken when the holder releases.  Not recursive: a second acquire by the
- * owner is a bug, and panics rather than deadlocking silently.  Not a handoff
- * -- the woken thread re-checks the owner and may lose to a third thread that
- * arrived meanwhile, which is why the wait is a loop and not an if.
- *
- * WHAT IT IS NOT.  Never callable from interrupt context: an IRQ has no thread
- * to park.  Never acquirable while holding a spinlock, for the reason at the
- * top -- mutex_lock asserts that preemption is currently enabled, so that
- * mistake is caught at the moment it is made rather than as a wedge later.
- *
- * The guard spinlock inside is held only to inspect and update the owner and
- * the waiter list, never across the block itself: thread_block_release drops
- * it under sched_lock, so a release firing between the drop and the switch is
- * forced to spin on sched_lock and cannot lose the wake.
+ * A holder's kill is deferred until it holds no mutex (th_mutex_depth in
+ * kern/thread.h).
  *
  * Static initialiser:  static struct mutex m = MUTEX_INIT("name");
  * Dynamic init:        mutex_init(&m, "name");
@@ -78,17 +63,15 @@ void	mutex_init(struct mutex *, const char *name);
 void	mutex_lock(struct mutex *);
 
 /*
- * Release, waking the longest-waiting thread if there is one.  The wake is
- * posted AFTER the guard is dropped: this kernel drains deferred wakes only
- * once no lock is held, so waking from under one would defer the very wake
- * that lets the machine make progress.
+ * Release, waking the longest-waiting thread if there is one.  Only the
+ * owner may release.
  */
 void	mutex_unlock(struct mutex *);
 
 /*
- * Acquire only if free.  Returns true holding it, false having done nothing
- * and having slept not at all -- so unlike mutex_lock this is legal wherever
- * a spinlock would be, including with preemption disabled.
+ * Acquire only if free: true holding it, false having done nothing.  It
+ * never sleeps, so unlike mutex_lock it is legal with preemption disabled
+ * -- though it records current_thread as the owner.
  */
 bool	mutex_trylock(struct mutex *);
 
@@ -96,10 +79,8 @@ bool	mutex_trylock(struct mutex *);
 bool	mutex_held(const struct mutex *);
 
 /*
- * How many acquisitions have had to park, across every mutex.  A test that
- * passes with this at zero has exercised only the uncontended path and proves
- * nothing about the half that is hard, so the number is exposed rather than
- * inferred.
+ * How many acquisitions, across every mutex, had to park.  A test that
+ * passes with this at zero has exercised only the uncontended path.
  */
 uint64_t	mutex_blocks(void);
 void		mutex_stats(void);
@@ -107,7 +88,7 @@ void		mutex_stats(void);
 /*
  * Boot scene for the kill-vs-held-mutex contract (th_mutex_depth in
  * kern/thread.h): a thread killed while holding one lock and parked on
- * another must be left to give both back before it is allowed to die.
+ * another must be left to give both back before it dies.
  */
 void		mutex_kill_selftest(void);
 

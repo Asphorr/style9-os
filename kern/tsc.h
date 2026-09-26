@@ -11,27 +11,21 @@
 #include <stdint.h>
 
 /*
- * Time Stamp Counter: a free-running 64-bit cycle counter that has
- * existed on every x86 since the original Pentium.  Cheap to read
- * (rdtsc, 25-ish cycles), monotonic across CPL changes, but its
- * frequency is implementation-defined -- tsc_calibrate runs against
- * the PIT once at boot and treats the result as constant thereafter.
+ * Time Stamp Counter: a free-running 64-bit cycle counter, cheap to read
+ * (rdtsc) but of implementation-defined frequency.  tsc_calibrate measures
+ * it against the PIT once at boot and treats the result as constant.
  *
- * Calibration must run AFTER pit_init and AFTER sti, because it
- * advances the comparator by counting IRQ-driven PIT ticks.  Spinning
- * for hz/10 ticks (100ms at 100Hz) is enough to keep the relative
- * error in the parts-per-million range on QEMU.
+ * Calibration must run after pit_init and after sti: it counts
+ * IRQ-driven PIT ticks, 25 of them (250 ms at 100 Hz).
  */
 
 void		tsc_calibrate(void);
 uint64_t	tsc_hz(void);
 
 /*
- * The TSC value and the PIT tick count latched at the same instant, at the
- * end of calibration.  Together they are the reference a caller interpolates
- * from when it needs finer resolution than the 100 Hz tick: ticks give a
- * drift-free base, the TSC delta gives the microseconds between them.  Both
- * read 0 before tsc_calibrate has run.
+ * The TSC value and the PIT tick count latched together at the end of
+ * calibration: the reference for time finer than the tick (anchor ticks
+ * plus TSC delta since).  Both read 0 before tsc_calibrate has run.
  */
 uint64_t	tsc_anchor_cycles(void);
 uint64_t	tsc_anchor_ticks(void);

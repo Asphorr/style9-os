@@ -14,30 +14,23 @@
 /*
  * Which filesystem answers a path.
  *
- * There is one disk and one volume on it, so this is not a mount table and
- * not a VFS: it is the single question "who has the files?", asked once per
- * call.  APFS answers if a container was found at boot, FAT otherwise.  The
- * Darwin syscall layer talks only to this, so the two readers stay
- * interchangeable and neither leaks its own error numbering or its own idea
- * of how wide a size is into the syscall path.
- *
- * A real VFS -- mount points, vnodes, per-fd cursors -- is a different piece
- * of work.  This is the seam where it would go.
+ * One disk, one volume: not a mount table or a VFS, just "who has the
+ * files?", asked per call -- APFS if a container was found at boot, FAT
+ * otherwise.  The Darwin syscall layer talks only to this, so neither
+ * backend's error numbering or size width leaks into it.  A real VFS
+ * (mount points, vnodes) would go at this seam.
  */
 
 /*
- * Longest name reported.  APFS allows 255 bytes; FAT 8.3 needs 12.  This is
- * also the kernel<->libSystem wire format, so user/libsystem.c mirrors these
- * structs exactly and the static asserts below are duplicated there: two hand
- * written copies of a layout are exactly the kind of thing that drifts.
+ * Longest name reported (APFS allows 255 bytes, 8.3 needs 12).  The
+ * structs below are the kernel<->libSystem wire format; user/libsystem.c
+ * mirrors them and repeats the static asserts.
  */
 #define	FS_NAME_MAX	256
 
 /*
- * One directory entry.  Sizes and inode numbers are 64-bit because APFS's
- * are, and because the macOS ABI these end up in ($INODE64 struct stat, struct
- * dirent) is 64-bit too -- narrowing here would only have to be widened again
- * on the other side of the syscall.
+ * One directory entry.  Sizes and inode numbers are 64-bit, as in APFS
+ * and in the macOS ABI they end up in ($INODE64 stat, struct dirent).
  */
 struct fs_dirent {
 	uint64_t	fde_ino;
@@ -47,12 +40,9 @@ struct fs_dirent {
 };
 
 /*
- * The mode word's type field, spelled the way every Unix spells it.  These
- * live in the neutral header because three layers share the vocabulary: APFS
- * reports these bits straight off the disk, FAT synthesises them from an
- * attribute byte, and the Darwin syscall path copies them out to a libSystem
- * that hands them to an Apple binary expecting exactly them.  Only the two
- * types this filesystem can produce are listed.
+ * The mode word's type field, as every Unix spells it: APFS reports these
+ * bits off the disk, FAT synthesises them, and the Darwin path copies them
+ * out unchanged.  Only the two types produced here are listed.
  */
 #define	FS_S_IFMT	0170000
 #define	FS_S_IFREG	0100000
@@ -62,26 +52,14 @@ struct fs_dirent {
 #define	FS_ISREG(m)	(((m) & FS_S_IFMT) == FS_S_IFREG)
 
 /*
- * A file-or-directory's metadata, without reading it.
+ * A file's or directory's metadata, without reading its contents.
  *
- * This used to answer three questions -- how big, which inode, directory or
- * not -- because that is all any binary had asked.  `ls -l` asks the rest of
- * them, and the rest of them were being read off the disk and thrown away:
- * an APFS inode record carries the mode word, the link count, the owner and
- * group, and four timestamps in its FIXED part, so a stat that reported none
- * of it was paying for the tree walk and discarding the answer.
+ * Timestamps are nanoseconds since the Unix epoch, APFS's unit; FAT's
+ * two-second ticks since 1980 are converted.  Zero means the volume does
+ * not record that time.
  *
- * Timestamps are nanoseconds since the Unix epoch, which is APFS's own unit;
- * a filesystem with a coarser clock (FAT counts two-second ticks since 1980)
- * converts on the way out rather than making every caller know.  Zero means
- * "this volume does not record that time" and is distinguishable from a real
- * 1970 timestamp only in theory, which is the usual bargain.
- *
- * fs_mode is a POSIX mode word with its type bits set, so it already says
- * what fs_is_dir says.  Both are here on purpose: mode is what a filesystem
- * that HAS permissions reports, fs_is_dir is what one that does not can
- * always answer, and a caller that only wants to know whether to descend
- * should not have to know which kind of volume replied.
+ * fs_mode carries the type bits too, so it repeats fs_is_dir; fs_is_dir
+ * is for callers that only need to know whether to descend.
  */
 struct fs_statbuf {
 	uint64_t	fs_size;
@@ -110,7 +88,7 @@ _Static_assert(sizeof(struct fs_statbuf) == 72,
 #define	FS_E_NOMEM	(-4)	/* out of kernel heap         */
 #define	FS_E_TOOBIG	(-5)	/* file too large to slurp    */
 #define	FS_E_ROFS	(-6)	/* this volume cannot be written */
-#define	FS_E_NOALLOC	(-7)	/* the write would need a block allocator */
+#define	FS_E_NOALLOC	(-7)	/* a change this writer does not make */
 #define	FS_E_EXIST	(-8)	/* the name is already taken     */
 #define	FS_E_ISDIR	(-9)	/* ...and what it names is a directory */
 #define	FS_E_SPREAD	(-10)	/* the records are in more nodes than one
@@ -118,23 +96,20 @@ _Static_assert(sizeof(struct fs_statbuf) == 72,
 #define	FS_E_NOTDIR	(-11)	/* ...and what it names is NOT a directory */
 #define	FS_E_NOTEMPTY	(-12)	/* a directory that still holds a name     */
 /*
- * The request itself makes no sense -- a name this volume cannot spell, a
- * directory asked to move inside itself.  Distinct from FS_E_IO, which these
- * used to be answered with, because a caller can tell EINVAL from EIO: one
- * says ask differently and the other says the disk is lying.
+ * The request makes no sense: a name this volume cannot spell, a directory
+ * moved inside itself.  Not FS_E_IO: EINVAL says ask differently, EIO says
+ * the disk is wrong.
  */
 #define	FS_E_INVAL	(-13)
 /*
- * Too many files are open at once -- of the kernel's table of them, not of the
- * volume.  Its own code because it is not the disk being full and not the heap
- * being exhausted: nothing is wrong and the answer is to close something.
+ * The kernel's table of open files is full (not the volume, not the heap):
+ * close something.
  */
 #define	FS_E_NOSPACE	(-14)
 /*
- * A published checkpoint that was being read through /.xid (below) has been
- * let go of by the free queue since, and its blocks may belong to something
- * else now.  Not FS_E_NOTFOUND: the path was valid and answered until moments
- * ago, and a caller told "no such file" would look for a typo.
+ * A checkpoint being read through /.xid (below) has since been released
+ * by the free queue, and its blocks may be reused.  Not FS_E_NOTFOUND: the
+ * path was valid until moments ago.
  */
 #define	FS_E_GONE	(-15)
 
@@ -142,30 +117,21 @@ _Static_assert(sizeof(struct fs_statbuf) == 72,
 int		fs_ready(void);
 
 /*
- * THE PUBLISHED PAST, BY NAME
+ * The published past, by name.  Every checkpoint whose blocks the free
+ * queue still holds is a complete older volume on the platter
+ * (fs/apfs/apfs.h).  /.xid/<N> is the volume as checkpoint N left it,
+ * /.xid/<N>/etc/notes.txt that file as of then, and /.xid lists the
+ * reachable checkpoints, oldest first.  The window slides as checkpoints
+ * are written; a name under one that has slid out answers FS_E_GONE.
  *
- * Every checkpoint the free queue still holds the blocks of is a complete,
- * older volume sitting on the platter (fs/apfs/apfs.h, "the published past"),
- * and this is how a path reaches one: /.xid/<N> is the volume as checkpoint N
- * left it, /.xid/<N>/etc/notes.txt is that file as of then, and /.xid itself
- * lists the checkpoints that can be reached right now, oldest first.  The
- * listing is a window that slides -- each checkpoint the live volume writes
- * lets go of the oldest one behind it -- and a name under a checkpoint that
- * has slid out answers FS_E_GONE rather than a guess.
+ * Hidden as ZFS hides .zfs: the root's listing does not name it, so walkers
+ * do not descend into copies of the volume.  /.xid/<N> reports that
+ * checkpoint's root under a synthetic inode, matching its /.xid entry.
  *
- * Hidden, the way ZFS hides .zfs: the root's listing does not name it, so a
- * walker does not descend into a directory that is the whole volume again
- * several times over, and a program that knows the name asks for it.  A
- * checkpoint's directory reports itself as the volume's root as of then --
- * its times are that root's -- under a synthetic inode number no real inode
- * can carry, so that a stat of /.xid/<N> and the entry /.xid lists agree.
- *
- * Read-only, all of it, and by the filesystem's construction rather than by
- * a flag here: every path that would change something under /.xid answers
- * FS_E_ROFS, and a handle opened there refuses to write.  What a handle onto
- * the past carries is its checkpoint's number, and every read through it
- * asks the filesystem for that checkpoint again -- so the window's edge is
- * enforced at each read, not once at open.
+ * All read-only: every change under /.xid answers FS_E_ROFS, and a handle
+ * opened there refuses writes.  Such a handle carries its checkpoint
+ * number and every read resolves it again, so the window's edge is
+ * enforced per read, not once at open.
  */
 #define	FS_VIEW_DIR	"/.xid"
 
@@ -177,9 +143,8 @@ int		fs_ready(void);
 #define	FS_VIEW_INO(xid)	((uint64_t)1 << 63 | (uint64_t)(xid))
 
 /*
- * Non-zero when nothing at `path` may be changed -- it lies under /.xid.
- * Asked by open(2) so that a request to write is refused at the open, as
- * POSIX has it, rather than at the first write.
+ * Non-zero when `path' lies under /.xid and may not be changed.  open(2)
+ * asks, so a write request is refused at the open, as POSIX has it.
  */
 int		fs_readonly(const char *path);
 
@@ -193,34 +158,17 @@ const char	*fs_kind(void);
 int		fs_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size);
 
 /*
- * A file, resolved.
+ * A file, resolved.  Resolving a path is most of the cost of a read (one
+ * tree walk per component, 936 us per page for the pager before handles
+ * existed), so a handle keeps the answer: the backend's name for the
+ * content (an APFS dstream id, a FAT starting cluster) and the length to
+ * clamp ranged reads against.  No cursor; see fs_open for the hold.
  *
- * Reading by path means resolving the path, and resolving it is most of the
- * work: on APFS "/var/db/big.txt" costs one tree walk per component plus one
- * more for the inode, and only then does anything read a byte.  Doing that per
- * call is fine for a one-shot open; it is absurd for a pager, which asks for
- * the same file 4 KiB at a time.  Measured before this existed: 936 us per
- * page, nearly all of it re-answering a question already answered.
- *
- * So a handle is the answer to "which file", kept: the backend's own name for
- * the content (an APFS dstream id, a FAT starting cluster) plus the length,
- * which is what a ranged read needs to clamp against.  It is not an open file
- * -- no cursor, no reference count, nothing to close.
- *
- * It used to say here that a handle stays valid as long as the file does,
- * "which on a read-only volume is forever".  That sentence was true when it
- * was written and stopped being true the moment this filesystem could write:
- * fh_size is a COPY of a length that another writer can now change, and a
- * handle opened before a file grew would keep clamping reads to the old end
- * of it -- silently, since a short read is a legal answer.
- *
- * So the volume carries a generation number, bumped whenever any metadata
- * changes, and a handle remembers the generation it was made at.  A ranged
- * call whose handle predates the current generation refreshes its length from
- * the inode before using it.  The check costs a comparison; the refresh
- * happens only when something really did change, and needs no path -- fh_ino
- * names the inode record directly.  A volume nobody writes to therefore pays
- * exactly what it paid before.
+ * fh_size is a copy another writer can change.  So the volume has a
+ * generation, bumped on every metadata change, and a handle records the
+ * one it was made at; a ranged call on an older handle first refreshes
+ * the length from the inode (fh_ino, no path needed).  An unwritten
+ * volume pays one comparison.
  */
 #define	FS_HANDLE_NONE	0
 #define	FS_HANDLE_APFS	1
@@ -230,146 +178,100 @@ struct fs_handle {
 	uint64_t	fh_id;		/* the backend's name for the bytes */
 	uint64_t	fh_size;
 	/*
-	 * The file's inode, which is NOT fh_id: on APFS the extents are keyed
-	 * on a dstream id while the metadata record is keyed on the object id,
-	 * and the two are equal only until something is hard-linked.  A write
-	 * needs both -- one to find the bytes, the other to stamp the time --
-	 * so the handle carries both.  Zero where the backend has no such
-	 * notion.
+	 * The inode, which is not fh_id: APFS keys extents on a dstream id
+	 * and the inode record on the object id, equal only until a hard
+	 * link.  A write needs both, to find the bytes and to stamp the time.
+	 * Zero where the backend has no such notion.
 	 */
 	uint64_t	fh_ino;
-	/*
-	 * The volume generation this handle's fh_size was read at.  Compared,
-	 * not trusted: see the note above about the sentence that stopped
-	 * being true.
-	 */
+	/* The volume generation fh_size was read at (see above). */
 	uint64_t	fh_gen;
 	/*
 	 * The published checkpoint this handle reads, or 0 for the live
-	 * volume.  A handle onto the past has no row in the open table --
-	 * nothing it reads can be unlinked -- and no generation to refresh,
-	 * since a checkpoint does not change; what it has instead is an edge
-	 * to fall off, and fs_pread asks about that every time.
+	 * volume.  A handle onto the past has no open-table row and no
+	 * generation to refresh; fs_pread checks the window on every read.
 	 */
 	uint64_t	fh_xid;
 	uint8_t		fh_kind;	/* FS_HANDLE_*                      */
 };
 
 /*
- * Resolve `path` to a handle.  Directories are refused: a handle is a thing
- * to read.  Returns FS_E_OK, or a negative FS_E_*.
+ * Resolve `path' to a handle.  Directories are refused.  Returns FS_E_OK,
+ * or a negative FS_E_*.
  *
- * A HANDLE IS NOW A CLAIM, not just an answer.  The filesystem counts the files
- * something is holding, so that unlink can tell a name nobody is using from a
- * name a running program has open; the price is that every handle this hands
- * out has to be given back with fs_close, and every COPY of one -- fork, dup --
- * has to say so with fs_hold.  FS_E_NOSPACE means the kernel is already holding
- * as many distinct files as it can count.
+ * A live APFS handle is a hold on the file, so unlink can tell a name in
+ * use from a free one: every handle must be given back with fs_close, and
+ * every copy (fork, dup) announced with fs_hold.  FS_E_NOSPACE: the table
+ * of held files is full.
  */
 int		fs_open(const char *path, struct fs_handle *out);
 
-/*
- * One more holder of an already-open file, for the calls that duplicate a
- * descriptor rather than making one.  Cheap: no path, no tree, one row.
- */
+/* One more holder of an open file (dup, fork).  No path lookup. */
 int		fs_hold(const struct fs_handle *h);
 
 /*
- * Give a handle back, and empty it.  When the last holder of a file whose name
- * was taken away while it was open lets go, this is where the file's bytes
- * actually go -- see fs_unlink.  Harmless on a zeroed or non-disk handle, which
- * is what lets a caller close a descriptor without knowing what backs it.
+ * Give a handle back and empty it.  When the last holder of a file whose
+ * name was unlinked lets go, the file is reaped here (see fs_unlink).
+ * Harmless on a zeroed or non-disk handle.
  */
 int		fs_close(struct fs_handle *h);
 
 /*
- * Finish what an interrupted boot started: reap every file left waiting with no
- * name.  Called once from kmain after the volume mounts.  Reports how many only
- * in the log, since the number is zero on every clean boot.
+ * Reap every nameless file an interrupted boot left waiting.  Called once
+ * from kmain after the mount, before anything opens a file.
  */
 int		fs_reap_orphans(void);
 
 /*
- * Read at most `len` bytes of a resolved file starting at byte offset `off`
- * into `buf`, writing the count actually delivered through *out_got.  A read
- * that starts at or past end-of-file is not an error -- it returns FS_E_OK
- * with zero bytes, the way pread(2) does -- and a read that runs off the end
- * is short.
- *
- * This is the ranged read the whole-file fs_slurp cannot be: it is what backs
- * the pager (kern/vm_object.c), which needs one 4 KiB page of a file and has
- * nowhere to put the rest of it.
+ * Read at most `len' bytes of a resolved file at offset `off' into `buf',
+ * the count delivered in *out_got.  A read at or past end-of-file returns
+ * FS_E_OK with zero bytes, as pread(2) does; one running off the end is
+ * short.  Backs the pager (vm/vm_object.c) and read(2).
  */
 int		fs_pread(struct fs_handle *h, uint64_t off, uint8_t *buf,
 		    uint32_t len, uint32_t *out_got);
 
 /*
- * Overwrite `len` bytes of a resolved file at byte offset `off`, reporting the
- * count written through *out_put, and stamp the file's modification time.
- *
- * Stamping is done here rather than left to the caller because "the bytes
- * changed but the time did not" is not a state a filesystem should be able to
- * produce by forgetting a call.
- *
- * What this cannot do is grow a file or fill a hole: both need a block
- * allocator, which the APFS writer does not have (see fs/apfs/apfs.h for why
- * that boundary is where it is), and both return FS_E_NOALLOC having changed
- * nothing.  A backend with no write support at all returns FS_E_ROFS, which
- * is a different answer and means a different thing: not "this write was too
- * ambitious" but "not on this volume".
+ * Write `len' bytes of a resolved file at offset `off', the count written
+ * in *out_put, and stamp the modification time (here, so no caller can
+ * forget it).  A write running past the end grows the file first; one
+ * starting beyond the end would leave a hole and returns FS_E_NOALLOC,
+ * changing nothing.  A backend that cannot write returns FS_E_ROFS.
  */
 int		fs_pwrite(struct fs_handle *h, uint64_t off,
 		    const uint8_t *buf, uint32_t len, uint32_t *out_put);
 
 /*
- * Set a resolved file's length, in either direction, and stamp it.
- *
- * Shorter is the interesting one: the runs past the new end are shortened or
- * their records removed outright, and their blocks go back.  Longer is the
- * same call the write path already makes when a write runs off the end, so
- * the new bytes read as zeroes -- which is what POSIX says an extending
- * truncate produces, and is here because the blocks are zeroed on the way out
- * of the allocator rather than because anybody wrote a special case.
- *
- * The handle's length is updated, and the volume's generation moves, so every
- * other handle open on the file finds out.  A backend that cannot write at all
- * answers FS_E_ROFS.
+ * Set a resolved file's length, either way, and stamp it.  Shorter: runs
+ * past the new end are shortened or their records removed, and their
+ * blocks go back.  Longer: the write path's growth, so the new bytes read
+ * as zeroes (the allocator hands out zeroed blocks), as POSIX requires.
+ * The handle's length and the volume generation move, so other handles
+ * notice.  A backend that cannot write answers FS_E_ROFS.
  */
 int		fs_truncate(struct fs_handle *h, uint64_t new_size);
 
 /*
- * Make a file, and unmake one.
+ * Make and unmake files and directories.
  *
- * The two calls that change what a directory CONTAINS rather than what a file
- * holds, and the last thing between this filesystem and a volume programs could
- * live on: everything above works on a file that somebody else put there.
+ * fs_create makes an empty regular file and reports the inode number the
+ * volume gave it.  An existing name answers FS_E_EXIST; create is not
+ * create-or-replace.
  *
- * fs_create makes an empty regular file and reports the inode number it was
- * given, which is the volume's and not this layer's invention.  It answers
- * FS_E_EXIST rather than truncating an existing file, because "create" and
- * "create or replace" are different requests and only the caller knows which
- * one it made.
+ * fs_unlink removes the name and, usually, the file (this kernel makes no
+ * hard links).  If something holds the file open, the name goes now and
+ * the bytes when the last descriptor closes; in between the file lives in
+ * the volume's private directory (APFS_PRIV_DIR_INO).  A directory
+ * answers FS_E_ISDIR.
  *
- * fs_unlink removes the name and, USUALLY, the file with it: this kernel makes
- * no hard links, so the last name is the only name.  The exception is the one
- * Unix has always made -- if something still holds the file open, the name goes
- * now and the bytes go when the last descriptor closes.  In between, the file
- * is reachable through every open descriptor and through no path at all, which
- * is a state the volume itself provides for (see APFS_PRIV_DIR_INO) rather than
- * one this layer invents.  It answers FS_E_ISDIR for a directory, which is
- * fs_rmdir's business.
+ * fs_mkdir and fs_rmdir do the same for a directory.  fs_rmdir answers
+ * FS_E_NOTDIR for a non-directory and FS_E_NOTEMPTY for one that still
+ * holds a name.  These two accept a trailing separator ("/tmp/x/"); the
+ * file calls refuse it.
  *
- * fs_mkdir and fs_rmdir are the same two calls for a directory.  fs_rmdir
- * answers FS_E_NOTDIR for a name that is not one and FS_E_NOTEMPTY for one
- * that still holds a name: this removes a directory, it does not remove what
- * is in it, and doing both is a decision for whoever asked rather than for
- * this layer.  A directory being made or removed may have a trailing separator
- * ("/tmp/x/" names the same thing as "/tmp/x"), which the file calls refuse --
- * there the slash is a claim about the name that the call cannot honour.
- *
- * All four refuse a backend that cannot write with FS_E_ROFS, and all four
- * close a checkpoint on success, because a name and the inode under it are
- * several disk updates describing one event.
+ * All four answer FS_E_ROFS on a backend that cannot write, and leave the
+ * checkpoint to the batching policy (fs.c): a crash before it takes back
+ * the whole operation.
  */
 int		fs_create(const char *path, uint16_t perm, uint64_t *ino_out);
 int		fs_unlink(const char *path);
@@ -377,32 +279,21 @@ int		fs_mkdir(const char *path, uint16_t perm, uint64_t *ino_out);
 int		fs_rmdir(const char *path);
 
 /*
- * fs_rename: move a name, within a directory or between two, taking whatever
- * is under it -- a file with its bytes, a directory with everything in it --
- * and over whatever stands at the destination, which is what POSIX says the
- * call does.
+ * fs_rename: move a name, within a directory or between two, with whatever
+ * is under it, over whatever stands at the destination (POSIX).  One
+ * transaction, so a reader sees the old file or the new one, never half of
+ * each.  A replaced file still open somewhere keeps its bytes until its
+ * last descriptor closes, as an unlinked one does.
  *
- * ONE transaction, which is the whole reason this is a call of its own and not
- * an unlink beside a create.  A program that writes a temporary file and
- * renames it over the real one is relying on a reader seeing one file or the
- * other and never a half-written one, and that promise is only worth anything
- * if the two edits reach the disk together.  A replaced file keeps Unix's
- * other promise on the way out: still open somewhere, it loses its name and
- * not its bytes, and goes when its last descriptor does -- the same road an
- * unlinked open file takes.
- *
- * FS_E_ISDIR and FS_E_NOTDIR when the two ends are not the same kind of
- * thing, FS_E_NOTEMPTY for a directory that still holds a name, and
- * FS_E_INVAL for a directory asked to move inside itself, which would take
- * every name in it out of the volume.
+ * FS_E_ISDIR / FS_E_NOTDIR when the two ends differ in kind, FS_E_NOTEMPTY
+ * for a non-empty directory destination, FS_E_INVAL for a directory moved
+ * inside itself.
  */
 int		fs_rename(const char *opath, const char *npath);
 
 /*
- * fs_chmod: set the permission bits of an existing name.  Only the low twelve
- * are taken; the type belongs to the file and not to the caller.  FAT answers
- * FS_E_ROFS -- its directory entry has no mode to set, and pretending would
- * leave a program unable to tell a chmod that worked from one that did not.
+ * fs_chmod: set the permission bits of an existing name; only the low
+ * twelve are taken.  FAT answers FS_E_ROFS: it has no mode to set.
  */
 int		fs_chmod(const char *path, uint16_t mode);
 
@@ -410,240 +301,122 @@ int		fs_chmod(const char *path, uint16_t mode);
 int		fs_stat(const char *path, struct fs_statbuf *out);
 
 /*
- * Fill *out with the `index`-th entry of a directory.  Returns 1 when an entry
- * was written, 0 at end-of-directory, or a negative FS_E_*.  Stateless: each
- * call re-resolves and re-scans, so the kernel keeps no per-fd cursor.
+ * Fill *out with the `index'-th entry of a directory.  Returns 1 when an
+ * entry was written, 0 at end-of-directory, or a negative FS_E_*.
+ * Stateless: each call re-resolves and re-scans.
  */
 int		fs_readdir(const char *path, uint32_t index,
 		    struct fs_dirent *out);
 
 /*
- * Prove the write path against the mounted volume, at boot, out loud.
- *
- * A write is the one operation that cannot be checked by reading back what it
- * wrote: a cache that never reached the disk answers a read-back perfectly.
- * So this checks the things a plausible-but-wrong writer would get wrong --
- * that the bytes AROUND a partial-block write survived it, that a write which
- * would need an allocator is refused rather than truncated, that the file's
- * modification time moved -- and it leaves a marker behind, so the NEXT boot
- * can report finding it and thereby prove the bytes outlived the machine.
- *
- * Silently skipped when no writable volume is mounted.
+ * Boot self-test of the write path.  A read-back cannot prove a write
+ * reached the disk, so it checks what a plausible-but-wrong writer gets
+ * wrong -- the bytes around a partial-block write survive, a write
+ * starting past the end is refused, the mtime moves -- and leaves a marker
+ * for the next boot to find.  Skipped when no writable volume is mounted.
  */
 void		fs_write_selftest(void);
 
 /*
- * Close the volume's current transaction, so that what has been written is
- * written as of a point in time rather than gradually.
- *
- * On APFS this writes a checkpoint (see fs/apfs/apfs.h); the container is the
- * old one entire until the last block lands and the new one entire
- * afterwards.  Mutations no longer do this themselves -- they batch, and the
- * essay above ckpt_policy in fs.c says who collects the debt -- so this call
- * is the one that means NOW: it is what fsync(2) becomes, and a volume with
- * nothing owed answers success without spending a checkpoint on saying so.
- * On FAT there is nothing to close -- every write there is already final the
- * moment it reaches the platter -- so this succeeds without doing anything,
- * which is the honest answer rather than a refusal.
- *
- * Returns FS_E_OK or a negative FS_E_*.
+ * Close the volume's current transaction.  On APFS, write a checkpoint
+ * (fs/apfs/apfs.h): the container is the old one entire until the last
+ * block lands and the new one after.  Mutations batch (see FS_SYNC_MS in
+ * fs.c); this is the call that means now, what fsync(2) becomes.  A volume
+ * with nothing owed succeeds without writing.  On FAT there is nothing to
+ * close, and it succeeds.  Returns FS_E_OK or a negative FS_E_*.
  */
 int		fs_sync(void);
 
 /*
- * Start the syncer: the kernel thread that publishes a dirty volume on a
- * clock, so what a crash can lose is bounded in seconds as well as in edits.
- * Called once from kmain, after the self-tests and their closing sync --
- * nothing before that point wants a second writer of checkpoints appearing
- * mid-test.  Does nothing when the volume cannot be written.
+ * Start the syncer, the kernel thread that publishes a dirty volume every
+ * FS_SYNC_MS, bounding what a crash loses in time as well as in edits.
+ * Called once from kmain after the self-tests and their closing sync, so
+ * no second checkpoint writer appears mid-test.  Does nothing unless the
+ * volume is APFS.
  */
 void		fs_syncer_start(void);
 
 /*
- * Prove the checkpoint writer against the mounted container, at boot, out
- * loud.  Silently does nothing when the volume is not APFS.
+ * Boot self-tests.  Each does nothing unless the volume is APFS; the
+ * backend tests run under fs_lock.
+ *
+ *	fs_ckpt_selftest	the checkpoint writer
+ *	fs_data_selftest	writing a file moves its bytes: the run the
+ *				live checkpoint names still reads as it did
+ *	fs_trunc_selftest	a file gets shorter: the length moves, bytes
+ *				below the cut stay, blocks come back, a run
+ *				wholly past the end loses its record.  Runs
+ *				before fs_grow_selftest and first checks the
+ *				tail the previous boot's growth appended
+ *	fs_grow_selftest	a file gets longer and stays longer
+ *	fs_make_selftest	a file is made and unmade across boots: finds
+ *				and removes the previous boot's file, makes it
+ *				again and leaves it, reusing the node space
+ *				the removal gave back
+ *	fs_dirs_selftest	the same for a directory, which must also
+ *				hold a name made inside it and refuse removal
+ *				while it does; left empty for the next boot
+ *	fs_shell_selftest	a file a ring-3 shell wrote in the previous
+ *				boot survived; the first boot skips
+ *	fs_split_selftest	a B-tree node splits without losing a record
+ *	fs_index_selftest	the parent index is corrected when a node's
+ *				first record is deleted (apfsck rejects
+ *				otherwise); arranged on purpose
+ *	fs_drop_selftest	an emptied node leaves the tree: parent, omap,
+ *				block and tree counts all follow
+ *	fs_stream_selftest	a file whose inode and dstream records a split
+ *				put in different nodes is still removed whole
+ *	fs_room_selftest	a create in a full leaf splits it and succeeds
+ *	fs_extref_selftest	apfs-extref: the extent-reference tree outgrows
+ *				its root and appends are still answered
+ *	fs_move_selftest	a name moves (within and across directories,
+ *				longer and shorter) with its inode and bytes;
+ *				refusals are checked too
+ *	fs_orphan_selftest	apfs-orphan: a file kept whole only by an open
+ *				descriptor (fs/apfs/apfs.h)
+ *	fs_clobber_selftest	apfs-clobber, then fs-clobber: a rename onto a
+ *				held name; the holder still reads the old file,
+ *				which goes when it closes
+ *	fs_view_selftest	/.xid: earlier bytes by name, the listing,
+ *				writes refused, a handle falling out of the
+ *				window.  After every writer above
+ *	fs_seek_selftest	a lookup by key answers what a full walk does
+ *	fs_kill_selftest	a task killed mid-write surfaces with fs_lock
+ *				returned (th_mutex_depth, kern/thread.h) and
+ *				the volume answers after.  Runs late in boot
  */
 void		fs_ckpt_selftest(void);
-
-/*
- * Prove that writing a file MOVES its bytes: the run the live checkpoint still
- * names must read as it did.  Silently does nothing when the volume is not
- * APFS.
- */
 void		fs_data_selftest(void);
-
-/*
- * Prove that a file can get longer and stay longer.  Grows the file back to
- * the length the truncate test cut it to on the previous boot, and checks the
- * bytes read back.  Silently does nothing when the volume is not APFS.
- */
 void		fs_grow_selftest(void);
-
-/*
- * Prove that a file can get SHORTER: the length moves, the bytes below the cut
- * are untouched, the blocks come back, and a run that ends up entirely past
- * the new end loses its record rather than being left behind describing
- * nothing.
- *
- * Runs BEFORE the growth test, and takes over its persistence claim on the way
- * past: the file it finds is the one the previous boot grew, so the tail it
- * checks before cutting is proof that growth reached the platter.
- *
- * Silently does nothing when the volume is not APFS, and says so and stops if
- * the file is already at its shipped length -- which is what the first boot
- * after a fresh image sees.
- */
 void		fs_trunc_selftest(void);
-
-/*
- * Prove that a file can be MADE, and unmade, and that doing both costs the
- * volume nothing it does not get back.
- *
- * Runs last of the write tests, and it is the one that spans boots by
- * construction: it looks for the file the boot before left, checks the bytes in
- * it, removes it, makes it again and leaves it there.  So every boot after the
- * first does the whole cycle -- create, write, reboot, find, read, unlink --
- * and the volume ends each one exactly as it started, which is the claim that
- * matters: a node's free span only ever shrinks, and a create/unlink pair that
- * did not reuse the room it gave back would run the volume out of names.
- *
- * Silently does nothing when the volume is not APFS.
- */
 void		fs_make_selftest(void);
-
-/*
- * The same claim for a DIRECTORY, and one the file above cannot make: that a
- * directory this kernel wrote is a directory to the rest of the kernel.  A
- * name is made inside one that did not exist an instant earlier -- so the
- * lookup descended into it and the writer keyed an entry under it -- and the
- * removal is then asked for while that name is still there and must refuse.
- * The directory is left empty on the volume for the boot after.
- *
- * Silently does nothing when the volume is not APFS.
- */
 void		fs_dirs_selftest(void);
-
-/*
- * Prove that a RING-3 program wrote to this volume and that the bytes outlived
- * the machine being turned off.
- *
- * The one test here the kernel cannot satisfy by itself: it looks for the file
- * a real Apple shell redirected into during the PREVIOUS boot, which is a
- * claim about open(2), write(2), the checkpoint under them, and the disk.  The
- * first boot on a fresh volume skips, saying so.
- */
 void		fs_shell_selftest(void);
-
-/*
- * Prove that a B-tree node can be split without losing a record.  Silently
- * does nothing when the volume is not APFS.
- */
 void		fs_split_selftest(void);
-
-/*
- * Prove that the index above a node is corrected when the node stops starting
- * where the index says it does -- which is what a delete of a node's first
- * record does, and which the checker rejects.  Arranged on purpose, because
- * waiting for it is not a test.  Silently does nothing when the volume is not
- * APFS.
- */
 void		fs_index_selftest(void);
-
-/*
- * Prove that a node which has lost its last record leaves the tree -- the
- * parent stops naming it, the object map forgets its oid, its block goes back,
- * and both counts that describe the tree follow.  Arranged on purpose, like
- * the one above.  Silently does nothing when the volume is not APFS.
- */
 void		fs_drop_selftest(void);
-
-/*
- * And that a file whose inode record and data stream record a split has put in
- * different nodes is still removed whole -- the failure it guards against is
- * an unlink that answered success and left half a file behind.  Silently does
- * nothing when the volume is not APFS.
- */
 void		fs_stream_selftest(void);
-
-/*
- * And that a create whose leaf has no room splits it and carries on, rather
- * than refusing for a reason that has nothing to do with the name it was
- * asked for.  The full leaf is arranged by filling one.  Silently does
- * nothing when the volume is not APFS.
- */
 void		fs_room_selftest(void);
-
-/*
- * apfs-extref through this layer's lock: the tree that counts the volume's
- * runs outgrows its single-node root and every append is still answered.
- * Silently does nothing when the volume is not APFS.
- */
 void		fs_extref_selftest(void);
-
-/*
- * And that a name can move -- within a directory, into another one, to a
- * longer name and a shorter one -- carrying the inode, its bytes and, when it
- * is a directory, everything under it.  The refusals are asked for too, since
- * a refusal is the one outcome that leaves nothing on the volume to check
- * afterwards.  Silently does nothing when the volume is not APFS.
- */
 void		fs_move_selftest(void);
-
-/*
- * apfs-orphan through this layer's lock: a file kept whole by nothing but an
- * open descriptor.  See fs/apfs/apfs.h for what it arranges and why the
- * refusals are asked for.
- */
 void		fs_orphan_selftest(void);
-
-/*
- * apfs-clobber through this layer's lock -- a rename lands on a taken name and
- * the occupant is accounted for -- and then fs-clobber, the half only this
- * layer can ask: the name answers with the newcomer while a descriptor held
- * on the occupant goes on reading the occupant, which leaves for good when
- * that descriptor closes.  Silently does nothing when the volume is not APFS.
- */
 void		fs_clobber_selftest(void);
-
-/*
- * The published past, by name: a file's earlier bytes through /.xid/<N>, the
- * listing of /.xid, every write under it refused, a handle onto it read and
- * then found to have slid out of the window.  After every writer above, since
- * what it reads is what they published.  Silently does nothing when the
- * volume is not APFS.
- */
 void		fs_view_selftest(void);
 
 /*
- * fs-open: nothing the self-tests opened is still held.  Run after all of them
- * and before ring 3 gets going, because that is the only moment the answer is
- * knowable -- and because a leaked claim is silent until it turns some later
- * unlink into an orphaning and the boot after that into a wrong bitmap.
+ * fs-open: nothing the self-tests opened is still held.  Run after the
+ * self-tests that open files and before ring 3 starts; a leaked hold would
+ * otherwise turn a later unlink into an orphaning.
  */
 void		fs_open_check(void);
 
-/*
- * And that finding a record by descending on its key answers exactly what
- * reading every record in the tree answers -- the same record, out of the same
- * leaf, with the same tail behind it.  Silently does nothing when the volume
- * is not APFS.
- */
 void		fs_seek_selftest(void);
-
-/*
- * fs-kill: a task killed in the middle of a disk write must surface with
- * fs_lock returned rather than taking it to the grave (th_mutex_depth in
- * kern/thread.h), and the volume must answer afterwards.  Spawns and kills a
- * throwaway task, so it runs late in boot, after the scheduler and tasks are
- * proven.  Silently does nothing when the volume is not APFS.
- */
 void		fs_kill_selftest(void);
 
 /*
- * The volume generation, and what it has caught: how many handles were older
- * than the volume when used, and how many of those had a length that really
- * had moved.  The first number moving proves the check is alive; the second
- * stays at zero until files can grow.
+ * Print the batching tally, the volume generation with how many handles
+ * were found stale and how many had really changed length, and the
+ * orphan/reap counts.
  */
 void		fs_handle_stats(void);
 

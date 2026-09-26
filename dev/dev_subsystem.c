@@ -35,10 +35,9 @@ dev_register(const char *short_name, struct port *control_port)
 		return (rv);
 
 	/*
-	 * Compose "dev/<short_name>" in `full`.  Cap at BOOTSTRAP_NAME_MAX-1
-	 * so we always have room for the terminating NUL; long names get
-	 * silently truncated rather than rejected so a future verbose name
-	 * doesn't take a driver out of the registry.
+	 * Compose "dev/<short_name>", NUL-padded.  An over-long name is
+	 * truncated rather than rejected, so it cannot keep a driver out of
+	 * the registry.
 	 */
 	for (i = 0; i < DEV_PREFIX_LEN; i++)
 		full[i] = DEV_PREFIX[i];
@@ -115,44 +114,27 @@ dev_reply_info(const struct mach_msg_header *req, struct port_space *from,
 }
 
 /*
- * Stream OPEN reply: hand the caller MOVE_RECEIVE on `stream_kname`.
+ * Stream OPEN reply: hand the caller MOVE_RECEIVE on `stream_kname'.  A
+ * consumer that opens a stream wants to receive from it, so it gets the
+ * unique RECEIVE right out of kernel_space; the driver keeps its SEND
+ * right and goes on pushing into the port.
  *
- * Rationale: a consumer that "opens" the stream wants to recv bytes from
- * it, which requires the RECEIVE right.  COPY_SEND would only let the
- * caller send back into the port -- useless for a stream sink.  The
- * MOVE transfers the unique RECV out of kernel_space (the driver's
- * SEND right stays put, so the driver thread still pushes scancodes in
- * the same direction); the consumer becomes the sole receiver.
+ * Hence one OPEN_STREAM per stream port: afterwards the kernel has no
+ * RECEIVE to move and send_xlate_desc fails with MACH_E_RIGHT.  The move
+ * also requires that the port is in no port set and has no receiver
+ * parked on it (send_xlate_desc, port_msg.c) -- which is why the legacy
+ * kern/shell.c, which receives on these ports, must not run alongside
+ * sh.elf.
  *
- * Single-consumer limitation: only one OPEN_STREAM per stream port
- * succeeds.  After the move the kernel no longer holds RECV, so a
- * second OPEN_STREAM finds no name to MOVE and the send_xlate_desc
- * lookup returns MACH_E_RIGHT.  This is sufficient for the phase-2
- * shell-as-init world; the phase-3 design (per-open ports + fan-out
- * from the driver thread) is captured in MEMORY but not built yet.
+ * Cross-space mechanics, as in bootstrap_dispatch: `stream_kname' is a
+ * kernel_space name and `from' is the caller's space, so translating the
+ * descriptor against `from' would miss or hit an unrelated port.  So:
  *
- * MOVE_RECEIVE also requires that the port is NOT a current port_set
- * member and has no recv-blocked threads parked on it -- see the
- * send_xlate_desc MOVE_RECEIVE branch in port_msg.c.  kbd_drv and
- * uart_drv satisfy this naturally as long as nothing else in the
- * kernel parks a recv on the same port (the legacy kern/shell.c does,
- * which is why it must not be started when sh.elf is the init).
- *
- * Cross-space mechanics (mirrors bootstrap_dispatch):
- *
- *	`stream_kname` is a kernel_space name, but `from` is the caller's
- *	port_space -- if we asked mach_msg_send to translate the body
- *	descriptor against `from`, the lookup of stream_kname would fail
- *	(no such name in the caller's space) or "succeed" against a
- *	co-numbered unrelated port.  Same fix as bootstrap_dispatch:
- *
- *	  1. resolve the caller's reply port via the caller's space,
- *	  2. install a fresh SEND for it in kernel_space (gives kernel
- *	     a name we can use as msgh_remote),
- *	  3. build the reply with msgh_remote = that kernel name and
- *	     MOVE_SEND disposition -- the send consumes the temp install,
- *	  4. pd.name is stream_kname, already a kernel_space name, so
- *	     send_xlate_desc resolves it correctly with MOVE_RECEIVE.
+ *	1. resolve the caller's reply port in the caller's space,
+ *	2. install a temporary SEND for it in kernel_space,
+ *	3. send from kernel_space with msgh_remote = that name and
+ *	   MOVE_SEND, which consumes the temporary right,
+ *	4. pd.name is stream_kname, which resolves in kernel_space.
  */
 int
 dev_reply_stream(const struct mach_msg_header *req, struct port_space *from,

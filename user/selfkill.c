@@ -4,16 +4,13 @@
  * Copyright (c) 2026 The Hobby OS Project
  * All rights reserved.
  *
- * selfkill -- demonstrates SYS_TASK_KILL with the self-targeting
- * capability path: every task has SEND on its own task-self port at
- * the well-known MACH_PORT_TASK_SELF slot, so task_kill(MACH_PORT_
- * TASK_SELF) is the simplest possible exercise of the syscall.
+ * selfkill -- SYS_TASK_KILL on oneself: every task holds a send right to
+ * its own task port at MACH_PORT_TASK_SELF, so task_kill of that is the
+ * simplest use of the syscall.
  *
- * The print after the kill is intentionally unreachable -- detection
- * point #5 (syscall-exit kill check) retires this thread before the
- * sysretq, so user code below the task_kill call never runs.  Hello
- * checks the absence of the "BUG" line in the boot transcript to
- * confirm the syscall-exit check held.
+ * Detection point #5 (the syscall-exit kill check) retires the thread
+ * before sysretq, so nothing after task_kill runs and the "BUG" line must
+ * never appear in the boot transcript.
  */
 
 #include "style9.h"
@@ -29,12 +26,9 @@ main(void)
 	rv = task_kill(MACH_PORT_TASK_SELF);
 
 	/*
-	 * If we reach here, the syscall-exit kill check failed to
-	 * retire us.  The printf is a syscall that would catch us via
-	 * detection point #1 (entry check) as a fallback -- but the
-	 * BUG message itself proves the entry check happened "too late"
-	 * by one user-visible instruction.  Should not appear in the
-	 * boot transcript.
+	 * Reached only if the syscall-exit check failed.  The entry check
+	 * (#1) on this printf's write would then retire us, but only after
+	 * user code ran, which is the bug the line reports.
 	 */
 	printf("selfkill: BUG -- still alive after task_kill (rv=%d)\n", rv);
 	return (99);

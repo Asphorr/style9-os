@@ -21,38 +21,16 @@
 #include "witness.h"
 
 /*
- * WHERE THE INTERRUPT STATE OF A CRITICAL SECTION LIVES.
+ * Spin watchdog.  On SMP a wait can be unbounded (two CPUs each holding
+ * what the other wants), and it looks like a busy machine getting nothing
+ * done.  So a pathologically long wait reports the lock, the waiting CPU
+ * and site, and the holding CPU and site, both by symbol -- one address
+ * alone names a victim, not a cause.
  *
- * In the running thread, once there is one, and in the CPU before that.  The
- * choice matters and is argued in thread.h beside the fields: sched_lock is
- * held across a context switch, so a per-CPU answer would be restored by a
- * thread that never saved it.
- *
- * The two are never mixed within one acquire/release pair, because the only
- * thing that changes which one is in use is a thread coming into existence,
- * and that does not happen with a lock held.
- */
-/*
- * A SPIN THAT DOES NOT END IS NOT SLOWNESS, AND IT SHOULD SAY SO.
- *
- * On one processor a contended spinlock was nearly a contradiction: the
- * holder could not be preempted, so the wait was as long as the critical
- * section and no longer.  With four, a wait can be unbounded -- two CPUs each
- * holding what the other wants -- and the symptom is not a panic or a hang
- * but a machine that is busy and gets nothing done, which is the hardest kind
- * of failure to attribute.  The first four-processor boot of the scheduler
- * had exactly that, and there was nothing in the kernel able to name it.
- *
- * So a wait long enough to be pathological reports itself: which lock, which
- * CPU is holding it and from where, and who is waiting and from where.  Both
- * sites by symbol, because the pair is the answer -- one address alone names
- * a victim and not a cause.
- *
- * Reported and then waited on anyway.  A panic here would be a panic taken
- * with interrupts off on a machine whose other processors are also spinning,
- * and the report is worth more than the corpse.  Once per boot: the second
- * report would be the same deadlock seen by the next CPU to arrive, and a
- * console the wedged CPUs are queueing for is not one to flood.
+ * Reported, then waited on anyway: a panic with interrupts off while the
+ * other CPUs spin is worth less than the report.  Once per boot, since a
+ * second report would be the same deadlock seen by the next CPU, on a
+ * console the wedged CPUs are queueing for.
  */
 #define	SPIN_WATCHDOG_SPINS	(1u << 28)
 
@@ -77,6 +55,13 @@ spin_watchdog(const struct spinlock *sl, uintptr_t ra)
 	kprintf("\n");
 }
 
+/*
+ * Where a critical section's depth and saved interrupt state live: in the
+ * running thread once there is one, in the CPU before that (thread.h,
+ * th_spin_depth, says why per-thread).  The two are never mixed within one
+ * acquire/release pair: only a thread coming into existence changes which
+ * is in use, and that does not happen with a lock held.
+ */
 static inline int *
 spin_depth_slot(void)
 {
@@ -116,31 +101,17 @@ spin_lock(struct spinlock *sl)
 	ra = (uintptr_t)__builtin_return_address(0);
 
 	/*
-	 * ⚠ INTERRUPTS OFF FIRST, AND THIS IS WHAT MAKES THE LOCK AN SMP
-	 * LOCK RATHER THAN A UNIPROCESSOR ONE.
-	 *
-	 * The acquire below has always been a real atomic exchange, so two
-	 * processors could never both hold the lock.  What was missing is the
-	 * case of ONE processor against ITSELF: take a lock, be interrupted,
-	 * and have the handler ask for the same lock.  On one CPU that could
-	 * not happen, because no interrupt handler here takes a lock the
-	 * mainline can hold -- an argument about which handlers exist, not
-	 * about the lock, and one that stops being available the moment a
-	 * second processor runs kernel code with interrupts enabled.  So the
-	 * lock stops relying on it.
-	 *
-	 * Saved and restored rather than cleared and set: nested critical
-	 * sections must leave interrupts off until the OUTERMOST one ends,
-	 * and code that was already running with them off must not have them
-	 * turned on underneath it.
+	 * Interrupts off first, for the whole hold, so an interrupt handler
+	 * on this CPU can never spin on a lock its own mainline holds.  Saved
+	 * and restored rather than cleared and set: nested sections keep them
+	 * off until the outermost ends, and code already running with them
+	 * off never has them turned on underneath it.
 	 */
 	was_on = intr_save_disable();
 
 	/*
-	 * Bump preempt-disable BEFORE attempting acquire, so a timer
-	 * IRQ that fires mid-acquire sees us as in a critical section
-	 * and refuses to preempt.  Otherwise lock-holder preemption
-	 * happens and other waiters spin pointlessly.
+	 * Bump preempt-disable before the acquire, so a timer IRQ mid-acquire
+	 * sees a critical section and does not preempt a lock holder.
 	 */
 	preempt_disable();
 
@@ -149,12 +120,8 @@ spin_lock(struct spinlock *sl)
 
 	if (sl->sl_state != 0 && sl->sl_holder_cpu == (int)cpu_id()) {
 		/*
-		 * Spell out both sites with ksym_print BEFORE calling panic,
-		 * because panic's %lx formatter has no hook for symbol
-		 * resolution.  Doing it here means the recursive-acquire
-		 * report names the offending function on both sides:
-		 *	"attempted from sched_drain_irq_wakes+0x42, prior
-		 *	 holder thread_wake+0x10".
+		 * Name both sites with ksym_print before panicking; panic's
+		 * formatter cannot resolve symbols.
 		 */
 		kprintf("\n*** spin_lock(%s): recursive acquire\n",
 		    sl->sl_name != NULL ? sl->sl_name : "?");
@@ -168,18 +135,10 @@ spin_lock(struct spinlock *sl)
 	}
 
 	/*
-	 * ⚠ AND WHILE WAITING, ANSWER THE OTHER PROCESSORS.
-	 *
-	 * Interrupts are off from here to the release, so this CPU cannot take
-	 * the inter-processor interrupt that asks it to drop a stale page
-	 * translation -- and the CPU that sent it is waiting for the answer,
-	 * possibly while holding the very lock being waited for here.  Each is
-	 * waiting for the other, and neither is doing anything wrong.
-	 *
-	 * So the request is carried out from inside the wait.  It needs no
-	 * lock, touches nothing this CPU is in the middle of, and is two loads
-	 * and a compare when there is nothing outstanding, which is every time
-	 * but the one that would otherwise be fatal.
+	 * While waiting, answer TLB shootdowns.  With interrupts off this CPU
+	 * cannot take the IPI, and the sender may be waiting for the answer
+	 * while holding the lock wanted here.  pmap_tlb_poll needs no lock
+	 * and is two loads and a compare when nothing is outstanding.
 	 */
 	spins = 0;
 	while (__atomic_exchange_n(&sl->sl_state, 1u, __ATOMIC_ACQUIRE) != 0) {
@@ -212,13 +171,11 @@ spin_unlock(struct spinlock *sl)
 
 	/*
 	 * Interrupts back, if this was the outermost critical section and
-	 * they were on when it began.  Before preempt_enable, which may yield
-	 * -- so the switch happens with interrupts in the state the caller
-	 * had them, which is the state they were in before this rung too.
-	 *
-	 * Between the two, preemption is still disabled, so an interrupt
-	 * arriving in that window is serviced and returns rather than
-	 * rescheduling from inside a lock release.
+	 * they were on when it began.  Before preempt_enable, which may
+	 * yield, so the switch happens with interrupts as the caller had
+	 * them.  Preemption is still disabled in between, so an interrupt
+	 * there is serviced and returns rather than rescheduling from inside
+	 * a lock release.
 	 */
 	depth = spin_depth_slot();
 	KASSERT(*depth > 0, "spin_unlock with no critical section held");
@@ -226,11 +183,8 @@ spin_unlock(struct spinlock *sl)
 		intr_restore(*spin_saved_if_slot());
 
 	/*
-	 * Re-enable preemption.  If this drops us out of every
-	 * critical section AND a timer tick has set need_resched while we
-	 * were inside one, preempt_enable yields the CPU here so
-	 * the deferred schedule actually happens before the caller
-	 * runs another loop iteration.
+	 * If this leaves the last critical section and a reschedule was
+	 * requested meanwhile, preempt_enable yields here.
 	 */
 	preempt_enable();
 }
@@ -254,11 +208,9 @@ spin_trylock(struct spinlock *sl)
 	preempt_disable();
 	if (__atomic_exchange_n(&sl->sl_state, 1u, __ATOMIC_ACQUIRE) != 0) {
 		/*
-		 * Nothing was taken, so nothing is owed: put interrupts back
-		 * exactly as they were found.  Restoring from the saved value
-		 * rather than unconditionally enabling is what makes a failed
-		 * trylock inside another critical section harmless -- there
-		 * they were already off, and this leaves them off.
+		 * Nothing taken, nothing owed: restore interrupts as found, not
+		 * unconditionally on, so a failed trylock inside another
+		 * critical section leaves them off.
 		 */
 		intr_restore(was_on);
 		preempt_enable();

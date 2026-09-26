@@ -23,10 +23,9 @@
  *
  *	- pmap_create / pmap_destroy / pmap_enter / pmap_remove /
  *	  pmap_extract / pmap_activate operate on a struct pmap *, the
- *	  per-task page-table tree.  A fresh pmap shares the kernel's
- *	  upper-PML4 entries (so the boot identity map and any future
- *	  kernel-VA mapping is visible from every task) and owns its own
- *	  PDPT under PML4[0] -- that's where user-VA installs land.
+ *	  per-task page-table tree.  It shares the kernel's PML4 entries
+ *	  1..511 and owns a copy of the kernel's PDPT under PML4[0],
+ *	  where user VA lives.
  *
  * The boot identity map is 2 MiB huge pages covering 0 .. 1 GiB.  Any
  * caller within that range should use pmm_kva_from_pa() instead of
@@ -56,11 +55,9 @@ bool		 pmap_remove(struct pmap *, uint64_t va);
 uint64_t	 pmap_extract(struct pmap *, uint64_t va);
 
 /*
- * Install `pm` as the active address space (mov %rax, %cr3).  Caller
- * is responsible for being on a stack reachable in both the old and
- * new tree -- in practice this means a kernel kstack that lives in the
- * shared boot identity map (PDPT[0] of PML4[0]).  Idempotent if the
- * requested CR3 already matches the current CR3.
+ * Load `pm' into CR3, unless it is already there.  The caller's stack must
+ * be mapped in both trees -- in practice a kstack in the boot identity map
+ * (PDPT[0] of PML4[0]).
  */
 void		 pmap_activate(struct pmap *);
 
@@ -73,27 +70,18 @@ bool		pmap_kremove(uint64_t va);
 uint64_t	pmap_kextract(uint64_t va);
 
 /*
- * Drop one page's translation -- HERE AND ON EVERY OTHER ONLINE PROCESSOR,
- * and not until they have all said they have dropped it.
- *
- * invlpg is a local instruction and every processor's TLB is a private cache
- * of the same page tables, so a mapping changed on one CPU goes on being used
- * on the others with no fault and no bound.  That is why this waits: a caller
- * that removes a mapping and then frees the page is entitled to assume the
- * page is unreachable when this returns.
- *
- * Costs one load on a machine running one processor.  See pmap.c for how a
- * request reaches a processor whose interrupts are off, which is every
- * processor holding any spinlock in this kernel.
+ * Drop one page's translation here and on every other online CPU, and
+ * return only once all have: a caller that removes a mapping and then frees
+ * the page may assume it unreachable.  One load while only one CPU is
+ * online.  See pmap.c for how the request reaches a CPU that is spinning
+ * with interrupts off.
  */
 void		pmap_invlpg(uint64_t va);
 
 /*
- * Carry out an outstanding invalidation on THIS processor, if there is one.
- *
- * Called from the inter-processor interrupt, and -- the half that makes the
- * mechanism deadlock-free rather than merely fast -- from every loop in this
- * kernel that spins with interrupts off.  Must be called with interrupts off.
+ * Carry out an outstanding invalidation on this CPU, if any.  Called from
+ * the IPI and from every loop that spins with interrupts off; the latter is
+ * what makes the shootdown deadlock-free.  Interrupts must be off.
  */
 void		pmap_tlb_poll(void);
 
@@ -101,19 +89,16 @@ void		pmap_tlb_poll(void);
 void		pmap_tlb_init(void);
 
 /*
- * Send a thousand invalidations and check that every processor answered every
- * one of them.  An acknowledgement can only be written by the far processor,
- * so this is a test of the whole path -- APIC, IDT, handler, barriers -- and
- * not of this file's bookkeeping.
+ * Send a thousand invalidations and check that every CPU answered each.
+ * Only the far CPU can write an acknowledgement, so this tests the whole
+ * path: APIC, IDT, handler, barriers.
  */
 void		pmap_tlb_selftest(void);
 
 /*
- * Physical address of the kernel's top-level table -- the value CR3 wants.
- * Exists for the code that starts an application processor: that processor has
- * to be handed a page table before it can execute anything at a kernel
- * address, and it cannot read CR3 to find out, because the processor asking is
- * not the one that will use the answer.
+ * Physical address of the kernel's PML4 (the CR3 value), which mp.c hands
+ * to a starting AP: it needs a page table before it can run at any kernel
+ * address.
  */
 uint64_t	pmap_kernel_root_pa(void);
 

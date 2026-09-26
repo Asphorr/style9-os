@@ -8,22 +8,16 @@
 /*
  * libstyle9 ring-3 startup glue.
  *
- * The kernel's ELF loader installs PT_LOAD segments, lands the new
- * thread on `e_entry` with an empty stack at USER_STACK_TOP, and
- * iretq's to ring 3.  We are e_entry: zero the integer registers
- * (so a backtrace through main's prologue doesn't dig into garbage),
- * call main, then call exit with the return value.
+ * The kernel's ELF loader maps the PT_LOAD segments and iretq's to
+ * e_entry, which is _start: clear %rbp to end the frame chain, call
+ * main, then exit with its return value.  .bss needs no loop; the
+ * loader (vm_map_image) zero-fills it.
  *
- * .bss is already zero -- the loader allocates fresh frames and zeros
- * them before mapping in elf.c's load_segment().  No initializer loop
- * needed here.
- *
- * Argc / argv: the kernel launcher (arch/amd64/usermode.c
- * build_user_arg_stack) lays down a SysV-style frame at entry %rsp --
- * argc at 0(%rsp), the argv pointer array (argc entries + a NULL
- * terminator) starting at 8(%rsp).  %rsp is 16-byte aligned on entry.
- * An argument-free spawn still gets a valid (argc=0, argv[0]=NULL)
- * frame, so this path is taken unconditionally.  No envp / auxv yet.
+ * Entry %rsp is 16-byte aligned and points at a SysV-style frame laid
+ * down by build_user_arg_stack (arch/amd64/usermode.c): argc at
+ * 0(%rsp), then argc argv pointers and a NULL from 8(%rsp).  A spawn
+ * with no arguments still gets argc = 0, argv[0] = NULL.  No envp or
+ * auxv yet.
  */
 
 	.section .text._start, "ax", @progbits
@@ -38,11 +32,6 @@ _start:
 	call	main
 	movl	%eax, %edi		/* main return -> exit code     */
 	call	exit
-	/*
-	 * exit is __attribute__((noreturn)) but a defensive ud2 here
-	 * guarantees we never fall through into whatever happens to live
-	 * past the function in memory (the linker may or may not pad
-	 * with int3s depending on flags).
-	 */
+	/* exit is noreturn; trap rather than run into what follows. */
 	ud2
 	.size	_start, . - _start

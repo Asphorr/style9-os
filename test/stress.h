@@ -14,14 +14,14 @@
  * In-kernel stress tests.
  *
  * Each routine returns 0 on success, non-zero on the first detected
- * regression.  They are intended to be invoked from the shell (see
- * the 'stress' command in cmds.c) but are equally usable from kmain
- * for boot-time smoke tests.
+ * regression.  Run from the shell ('stress' in kern/cmds.c) or from
+ * kmain as boot-time smoke tests.
  *
  *	stress_mem(N)		mixed-size alloc/free churn for N
  *				iterations; verifies allocation count
- *				equals free count and the pmm used-page
- *				delta is within the cached-bucket budget.
+ *				equals free count and pages in use, less
+ *				the slab's cached pages, return to
+ *				baseline.
  *
  *	stress_mem_boundary()	allocates every interesting size around
  *				bucket boundaries, scribbles a known
@@ -42,10 +42,9 @@ int	stress_thread(unsigned int rounds);
 int	stress_preempt(unsigned int n_workers, unsigned int sleep_ms);
 
 /*
- * Mutual exclusion under real contention: N kernel threads increment a shared
- * counter non-atomically, yielding while holding the lock so the holder is
- * descheduled mid-critical-section.  Fails on a lost update, on two threads
- * being inside at once, or on a worker that is never woken.
+ * Mutual exclusion under contention: N kernel threads increment a shared
+ * counter non-atomically, yielding while holding the lock.  Fails on a lost
+ * update, two threads inside at once, or a worker never woken.
  */
 int	stress_mutex(unsigned int n_workers, unsigned int rounds);
 int	stress_sendonce(unsigned int rounds);

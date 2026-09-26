@@ -8,27 +8,16 @@
 #include "style9.h"
 
 /*
- * Ring-3 helpers for the dev-NAME generic-driver protocol.
- *
- * The kernel-side reference for the wire formats is dev/dev_proto.h;
- * the matching kernel registration code is dev/dev_subsystem.c.  A
- * driver registers its control port under "dev/<short>" in the
- * bootstrap registry, so opening a device from ring 3 is:
- *
- *	1. ctl = bootstrap_lookup("dev/<short>");
- *	2. rpc ctl with msgh_id = DEV_OP_*;
- *	3. parse the typed reply, deallocate ctl, return whatever
- *	   handle the call promises (a stream SEND, an info struct).
- *
- * Both dev_open_stream and dev_info follow that pattern -- the only
- * variance is the reply shape.
+ * Ring-3 helpers for the dev/NAME generic-driver protocol (wire formats
+ * in dev/dev_proto.h, registration in dev/dev_subsystem.c).  A driver
+ * registers its control port as "dev/<short>" with bootstrap, so every
+ * call here is: look up the control port, RPC one DEV_OP_*, deallocate
+ * the control port, decode the typed reply.
  */
 
 /*
- * Compose "dev/<short_name>" into `out`.  The composed string is what
- * gets handed to bootstrap_lookup; lookup itself caps at
- * BOOTSTRAP_NAME_MAX-1 anyway, so we mirror that cap here.  No error
- * on truncation: the lookup will simply miss and return MACH_PORT_NULL.
+ * Compose "dev/<short_name>" into `out', capped at BOOTSTRAP_NAME_MAX - 1
+ * as bootstrap_lookup is.  A truncated name simply misses in the lookup.
  */
 static void
 compose_devname(char *out, const char *short_name)

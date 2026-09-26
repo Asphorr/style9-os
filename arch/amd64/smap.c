@@ -13,23 +13,11 @@
 #include "smap.h"
 
 /*
- * Bring up Supervisor Mode Access Prevention infrastructure.
- *
- * Detection: CPUID leaf 7, sub-leaf 0, returns the structured extended
- * feature flags in EBX.  Bit 20 (1 << 20) advertises SMAP support; bit
- * 7 advertises SMEP (Supervisor Mode Execution Prevention -- not yet
- * wired here).
- *
- * v1 detects-and-records but does NOT yet set CR4.SMAP.  The kernel
- * has many ad-hoc user-pointer dereferences (msg->msgh_size, ...) that
- * still need to be wrapped before flipping the bit; the first
- * unwrapped deref after CR4.SMAP=1 #PFs the kernel.  See
- * smap_enable_runtime below: once the wrap arc completes, calling it
- * sets the bit and arms the discipline.
- *
- * The helpers (smap_user_access_begin / smap_user_access_end) gate on
- * smap_enabled, so brackets added today are no-ops until enable.
- * This lets coverage land incrementally without breaking boot.
+ * Supervisor Mode Access Prevention.  CPUID.(EAX=7,ECX=0):EBX bit 20
+ * advertises SMAP (bit 7 is SMEP, not used here).  smap_init only detects;
+ * kmain calls smap_enable_runtime right after it to set CR4.SMAP.  The
+ * bracket helpers (smap_user_access_begin/end) are no-ops until then, and
+ * once it is set an unbracketed user-pointer dereference #PFs the kernel.
  */
 
 bool	smap_enabled;
@@ -63,10 +51,9 @@ smap_init(void)
 }
 
 /*
- * Opt-in: set CR4.SMAP and arm the bracket helpers.  Returns true if
- * the bit is now set, false if the CPU does not support SMAP at all.
- * Idempotent.  Intended to be called from a future bringup point once
- * every kernel-side user-pointer deref is bracketed.
+ * Set CR4.SMAP (bit 21) on this CPU and arm the bracket helpers.  Returns
+ * false if the CPU lacks SMAP.  Idempotent.  Called from kmain before the
+ * APs are released; they copy the bit in smap_init_cpu.
  */
 bool
 smap_enable_runtime(void)
@@ -88,12 +75,9 @@ smap_enable_runtime(void)
 }
 
 /*
- * CR4.SMAP is per-processor, and smap_enabled is not.
- *
- * A processor brought up after the bit was turned on would otherwise run with
- * it clear -- and the failure that follows is the quiet kind: kernel code
- * would dereference a user pointer without faulting, on that CPU only, which
- * is the exact protection this exists to provide reading as "works".
+ * CR4.SMAP is per-CPU; smap_enabled is not.  A CPU brought up after the
+ * enable would otherwise let the kernel touch user memory without a fault,
+ * on that CPU only.
  */
 void
 smap_init_cpu(void)

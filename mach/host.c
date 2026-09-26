@@ -17,16 +17,13 @@
 #include "port_internal.h"
 
 /*
- * Host port -- the kernel-owned Mach object behind mach_host_self().  See
- * host.h for the acquisition model + wire protocol.  Structurally this is
- * a PORT_SPECIAL_SERVICE port like the ones in services.c; it lives in its
- * own file because the host is conceptually distinct (it is the machine,
- * not a kernel subsystem) and has room to grow more HOST_OP_* opcodes.
+ * The host port, the object behind mach_host_self(); host.h has the
+ * acquisition model and wire protocol.  A PORT_SPECIAL_SERVICE port like
+ * those in services.c, kept apart because it stands for the machine
+ * rather than a kernel subsystem.
  *
- * Hooks into port_object.c: port_create_kernel_owned mints a kernel-owned
- * port (RECEIVE held, no name in any space) with a p_special tag pre-set;
- * port_install_send_in_kernel wires a SEND right for it into kernel_space
- * so bootstrap can hand it out via the normal descriptor-translation path.
+ * From port_object.c: a kernel-owned port, and a SEND name for it in
+ * kernel_space for bootstrap to hand out.
  */
 extern struct port	*port_create_kernel_owned(uint8_t special_kind,
 			    void *special_arg);
@@ -37,10 +34,8 @@ static struct port	*the_host_port;		/* (c) */
 static mach_port_name_t	 the_host_kn;		/* (c) kernel_space SEND */
 
 /*
- * Reply helper: ship `body` of `body_size` bytes back to req->msgh_local as
- * a bare [header | body] message via COPY_SEND on the caller's space.  Same
- * shape as services.c's svc_reply_inline -- the host port hands out no
- * further capabilities, so no descriptors are needed.
+ * Reply to req->msgh_local with a bare [header | body] message, as
+ * services.c's svc_reply_inline does.  At most 64 bytes of body.
  */
 static int
 host_reply_inline(const struct mach_msg_header *req, struct port_space *from,
@@ -93,11 +88,9 @@ host_dispatch_info(const struct mach_msg_header *req, struct port_space *from)
 	uint64_t			used_pages;
 
 	/*
-	 * Single-CPU machine for now; report 1/1 rather than probing an
-	 * APIC count we do not yet track.  Memory comes straight off the
-	 * physical allocator's running totals -- the same numbers the
-	 * "stats" service reports, recast from pages to bytes here so a
-	 * Darwin caller reading HOST_BASIC_INFO sees byte counts.
+	 * CPUs are reported as 1/1, whatever number are running.  Memory is
+	 * the physical allocator's totals (as the "stats" service reports
+	 * them), in bytes as HOST_BASIC_INFO has it.
 	 */
 	total_pages = pmm_total_pages();
 	used_pages  = pmm_used_pages();
@@ -150,9 +143,8 @@ host_get_port(void)
 }
 
 /*
- * Persistent kernel_space SEND name for the host port, minted in host_init.
- * task_get_special_port COPY_SENDs it to hand the host port to a task;
- * MACH_PORT_NULL before host_init has run.
+ * The host port's kernel_space name, for task_get_special_port to
+ * COPY_SEND; MACH_PORT_NULL before host_init.
  */
 mach_port_name_t
 host_get_kernel_name(void)

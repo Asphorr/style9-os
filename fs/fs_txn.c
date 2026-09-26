@@ -15,17 +15,14 @@
 #include "kprintf.h"
 
 /*
- * See fs_txn.h for what this guarantees and what it deliberately does not.
+ * See fs_txn.h for what this guarantees and what it does not.
  *
- * The block primitives come from fs/apfs/apfs.c because APFS is the only backend
- * here that can be written; a second writable format would want its own read
- * and seal, and this would take them as arguments rather than by name.  The
- * orchestration -- collect, coalesce, all-or-nothing before the flush -- is
- * what is format-independent, and it is all that lives here.
+ * The block primitives are APFS's (fs/apfs/apfs.c), the only writable
+ * format; only the orchestration -- collect, coalesce, all-or-nothing
+ * before the flush -- is format-independent.
  *
- * No lock.  Every caller reaches this while holding the volume lock in fs.c,
- * and a transaction is a local variable belonging to one operation on one
- * thread; there is nothing here for a second thread to find.
+ * No lock: callers hold the volume lock (fs.c), and a transaction is a
+ * local of one operation on one thread.
  */
 
 static uint64_t	txn_n_commit;		/* transactions that reached the disk */
@@ -73,19 +70,13 @@ txn_get(struct fs_txn *t, uint64_t bno, void **buf_out, bool raw)
 		return (FS_TXN_E_IO);
 
 	/*
-	 * Already here?  Hand back the same buffer.  Without this, two changes
-	 * to one B-tree leaf would each read a fresh copy and the second write
-	 * would silently undo the first -- a lost update that leaves a block
-	 * with a perfectly correct checksum over the wrong contents.
+	 * Already here?  The same buffer, or a second change to one leaf
+	 * would read a fresh copy and its write would undo the first.
 	 */
 	for (i = 0; i < t->tx_n; i++) {
 		if (t->tx_slot[i].ts_bno != bno)
 			continue;
-		/*
-		 * The same block cannot be both.  Whichever caller is wrong
-		 * about what this block is, the commit would write it under
-		 * one set of rules while the other believed the other.
-		 */
+		/* Raw and checked at once: one caller is wrong about it. */
 		if (t->tx_slot[i].ts_raw != raw) {
 			t->tx_failed = true;
 			kprintf("fs_txn: block %llu fetched both raw and "
@@ -152,9 +143,8 @@ fs_txn_dirty(struct fs_txn *t, uint64_t bno)
 		}
 	}
 	/*
-	 * Marking a block the transaction never fetched means the caller is
-	 * confused about which block it changed, and the change it thinks it
-	 * made is somewhere else.  Poison rather than ignore.
+	 * A block never fetched: the caller's change went somewhere else.
+	 * Poison rather than ignore.
 	 */
 	t->tx_failed = true;
 	kprintf("fs_txn: dirty on block %llu, which was never fetched\n",
@@ -183,13 +173,9 @@ fs_txn_commit(struct fs_txn *t)
 		    fs_apfs_write_block(t->tx_slot[i].ts_bno,
 		    t->tx_slot[i].ts_buf)) != FS_APFS_E_OK) {
 			/*
-			 * Past this point the volume is already partly
-			 * updated, and there is no undo: the older version of
-			 * an in-place block is gone.  Report it and keep
-			 * going, because stopping here would leave FEWER
-			 * blocks written and no more consistency than
-			 * finishing does.  Rung three is where this stops
-			 * being the best available answer.
+			 * The volume is already partly updated and in-place
+			 * writes cannot be undone.  Report and keep going:
+			 * stopping would be no more consistent.
 			 */
 			kprintf("fs_txn: write of block %llu failed mid-commit\n",
 			    (unsigned long long)t->tx_slot[i].ts_bno);

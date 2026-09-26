@@ -36,7 +36,7 @@ struct task		*kernel_task;
 
 static struct spinlock	tasks_lock = SPINLOCK_INIT("tasks");
 static uint64_t		next_task_id;		/* (g) */
-static struct task	*tasks_head;		/* (g) all live tasks      */
+static struct task	*tasks_head;		/* (g) unused; see task_list */
 
 void
 task_subsystem_init(void)
@@ -53,18 +53,15 @@ task_subsystem_init(void)
 		panic("task_subsystem_init: kernel_task allocation failed");
 
 	/*
-	 * kernel_task is the unique exception that uses the pre-existing
-	 * kernel_space rather than the fresh one task_create made.  Two
-	 * fix-ups follow:
-	 *	1. Release the install task_create did into the throwaway
-	 *	   space (port_release_task_self drops the kernel-side
-	 *	   RECEIVE ref) so the port can be reaped along with that
-	 *	   space when we destroy it.
-	 *	2. Repoint t_port_space at kernel_space and re-run the
-	 *	   install there.  Because kernel_space is currently empty
-	 *	   (no allocations happen between port_subsystem_init and
-	 *	   here), the SEND right lands at name 1 -- the well-known
-	 *	   MACH_PORT_TASK_SELF slot.
+	 * kernel_task alone uses the pre-existing kernel_space rather than
+	 * the fresh one task_create made:
+	 *	1. Release the task-self install in the throwaway space
+	 *	   (dropping the kernel-side RECEIVE ref) so the port is
+	 *	   reaped with that space.
+	 *	2. Point t_port_space at kernel_space and install there.
+	 *	   kernel_space is still empty (nothing allocates between
+	 *	   port_subsystem_init and here), so the SEND right lands at
+	 *	   name 1, the well-known MACH_PORT_TASK_SELF.
 	 */
 	port_release_task_self(kernel_task);
 	port_space_destroy(kernel_task->t_port_space);
@@ -75,11 +72,9 @@ task_subsystem_init(void)
 		panic("task_subsystem_init: install bootstrap in kernel_space");
 
 	/*
-	 * The kernel runs on the page-table tree boot.S installed and
-	 * pmap_bootstrap wrapped as kernel_pmap.  task_create allocated a
-	 * fresh per-task pmap for kernel_task; drop it and point at the
-	 * authoritative kernel pmap instead so context switches between
-	 * kernel threads never reload CR3.
+	 * Likewise the pmap: kernel_task runs on kernel_pmap (the tree
+	 * boot.S installed), not a fresh one, so switches between kernel
+	 * threads never reload CR3.
 	 */
 	pmap_destroy(kernel_task->t_pmap);
 	kernel_task->t_pmap = kernel_pmap;
@@ -123,16 +118,12 @@ task_create(const char *name)
 	t->t_darwin_dylib_next = 0;
 	t->t_darwin_ppid = 0;
 	/*
-	 * A task starts at the root.  Set here rather than left zeroed: an
-	 * empty cwd is not a working directory, and every path resolution
-	 * would paste onto it and produce a path with no leading slash.
+	 * A task starts at the root; an empty cwd would make every resolved
+	 * path lose its leading slash.
 	 */
 	t->t_darwin_cwd[0] = '/';
 	t->t_darwin_cwd[1] = '\0';
-	/*
-	 * And with the historical mask, which is what makes `mkdir foo` come
-	 * out 0755 when the caller asked for 0777 -- as every one of them does.
-	 */
+	/* The traditional umask. */
 	t->t_darwin_umask = 022;
 	{
 		size_t	fi;
@@ -164,11 +155,9 @@ task_create(const char *name)
 	}
 
 	/*
-	 * Per-task VM map records the user-VA ranges this task has staked
-	 * out; per-task pmap is the hardware page-table tree those entries
-	 * land in.  The map is paired with the pmap from creation forward
-	 * -- callers that vm_map_enter a range are also expected to
-	 * pmap_enter the underlying frame in the same task->t_pmap.
+	 * The VM map records the user-VA ranges this task has staked out;
+	 * the pmap is the page-table tree they land in.  Whoever
+	 * vm_map_enters a range also pmap_enters its frames in t_pmap.
 	 */
 	t->t_map = vm_map_create(VM_USER_VA_LO, VM_USER_VA_HI);
 	if (t->t_map == NULL) {
@@ -194,10 +183,10 @@ task_create(const char *name)
 	}
 
 	/*
-	 * Install the SEND right to the global bootstrap port at the
-	 * second slot (MACH_PORT_BOOTSTRAP).  bootstrap_init must have
-	 * run before any task_create call -- kmain wires this in the
-	 * order port_subsystem_init -> bootstrap_init -> task_subsystem_init.
+	 * SEND right to the global bootstrap port at the second name
+	 * (MACH_PORT_BOOTSTRAP).  Needs bootstrap_init to have run: kmain
+	 * calls port_subsystem_init, bootstrap_init, task_subsystem_init in
+	 * that order.
 	 */
 	if (port_install_bootstrap(t) != MACH_MSG_OK) {
 		port_release_task_self(t);
@@ -208,17 +197,9 @@ task_create(const char *name)
 		return (NULL);
 	}
 
-	/* Link into global task list. */
+	/* Into the global task table (task_list, below). */
 	spin_lock(&tasks_lock);
-	/*
-	 * Reuse t_lock's _next_ slot via th_link in the future; for
-	 * now we keep the global list head pointer in tasks_head and
-	 * thread struct's intrusive pointer below.
-	 *
-	 * Single-linked list: insert at head.
-	 */
 	{
-		/* Type-pun next via t_refs's high half is ugly; use a real field. */
 		extern void task__chain_insert(struct task *);
 		task__chain_insert(t);
 	}
@@ -228,11 +209,8 @@ task_create(const char *name)
 }
 
 /*
- * Intrusive list-of-all-tasks: stored in a small parallel structure
- * since struct task should stay focused on its own fields.  A simple
- * static array is enough -- there will not be hundreds of tasks any
- * time soon, and it sidesteps cyclic includes between task.h and
- * thread.h.
+ * All live tasks: a static array rather than a link in struct task.
+ * TASK_LIST_MAX is plenty, and task__chain_insert panics when it is not.
  */
 #define	TASK_LIST_MAX	64
 static struct task	*task_list[TASK_LIST_MAX];	/* (g) */
@@ -298,33 +276,17 @@ task_deref(struct task *t)
 	spin_unlock(&tasks_lock);
 
 	/*
-	 * The task has left the live list, so a parent counting its children
-	 * will now count one fewer.  That is the news a parked wait4 needs and
-	 * this is the one place every route out of a task passes through --
-	 * told here rather than at each of the eight places a Darwin exit
-	 * records a status, because "every one of those was remembered" is a
-	 * claim to re-check whenever a ninth appears, and this is not.
+	 * Off the live list, so a parent counting children now counts one
+	 * fewer: tell a parked wait4.  Here because every route out of a
+	 * task passes through this point, unlike the several places a Darwin
+	 * exit records a status.
 	 */
 	darwin_child_news(t->t_darwin_ppid);
 
 	/*
-	 * Order: drop the per-space SEND on task_self BEFORE releasing
-	 * the kernel-side RECEIVE.  port_space_destroy walks every entry
-	 * (incl. our well-known name 1) and port_dereps each one, so by
-	 * the time the call returns there are no remaining SEND refs;
-	 * port_release_task_self then drops the last RECEIVE and the port
-	 * reaches zero refs and is reclaimed inside that deref.
-	 *
-	 * kernel_task is the bootstrap exception -- it shares
-	 * kernel_space, which lives for the duration of the kernel.
-	 * Its task_self port stays alive too; never get here in practice.
-	 */
-	/*
-	 * Release the kernel-held SEND ref on the task's exception port,
-	 * if any.  Done BEFORE port_space_destroy so the deref happens
-	 * outside the space's bulk-deref walk; the exc_port lives in some
-	 * OTHER task's space (typically a parent's), so it's untouched
-	 * by our own space destruction.
+	 * Drop the kernel-held SEND refs on the exception ports, before
+	 * port_space_destroy so they fall outside its bulk walk; the ports
+	 * live in some other task's space (typically a parent's).
 	 */
 	{
 		unsigned	exi;
@@ -339,25 +301,29 @@ task_deref(struct task *t)
 	}
 
 	/*
-	 * Release any Darwin open-file slots the task never close()d --
-	 * e.g. a crash with a font still open, or the far end of a pipe a
-	 * sibling still reads (the ref drop is what turns the reader's
-	 * next read into EOF).  The common path releases at close; this
-	 * catches abnormal exit.  kernel_task's slots are always empty,
-	 * so this is a no-op for it.
+	 * Release Darwin open files the task never closed (normally its last
+	 * thread closed them in thread_exit; this is the fallback).  Dropping
+	 * a pipe end is what turns the far reader's next read into EOF.
+	 * kernel_task's slots are always empty.
 	 */
 	darwin_files_teardown(t);
 
+	/*
+	 * kernel_task shares kernel_space, which lives as long as the
+	 * kernel, so it never gets here in practice.
+	 */
 	if (t != kernel_task) {
+		/*
+		 * Destroying the space drops every SEND in it, name 1's
+		 * task-self SEND included; port_release_task_self then drops
+		 * the last (RECEIVE) ref and the port is reclaimed.
+		 */
 		port_space_destroy(t->t_port_space);
 		port_release_task_self(t);
 		/*
-		 * Reclaim the anonymous backing frames the task's user VA
-		 * ever pulled in (image load pages, OOL recv installs, ...)
-		 * before pmap_destroy frees the page-table tree itself.
-		 * pmap_destroy only walks intermediate levels; without the
-		 * vm_map_release_anon pass each task drag along its
-		 * lifetime's worth of leaf frames forever.
+		 * Free the anonymous frames the task's user VA pulled in
+		 * (image pages, OOL receives, ...) before pmap_destroy, which
+		 * frees only the page-table levels, not leaf frames.
 		 */
 		vm_map_release_anon(t->t_map, t->t_pmap);
 		pmap_destroy(t->t_pmap);
@@ -413,11 +379,8 @@ task_print(struct task *t)
 	    (unsigned long long)t->t_id, t->t_name,
 	    t->t_nthreads, t->t_refs);
 	/*
-	 * BLOCKED IS NOT AN ANSWER, it is the question.  This line used to stop
-	 * at the state, so a wedged machine's ps said every thread was blocked
-	 * and nothing at all about what any of them was waiting for -- which is
-	 * the one fact a stall consists of.  The reason and the object are two
-	 * words each and they are what turns the list into a diagnosis.
+	 * For a blocked thread, say what it waits on: in a stall, that is
+	 * the one fact that matters.
 	 */
 	for (cur = t->t_threads; cur != NULL; cur = cur->th_task_link) {
 		if (cur->th_state != THREAD_BLOCKED) {
@@ -451,11 +414,9 @@ task_set_exception_ports(struct task *t, uint32_t types_mask, struct port *port)
 		return (MACH_MSG_OK);
 
 	/*
-	 * Take popcount(types_mask) refs on the new port BEFORE the
-	 * swap so any interleaving user_fault_die that snapshots one
-	 * of the slots between unlock and the prev-drop reads a live
-	 * ref.  Ordering: take-new-refs -> swap -> drop-prev mirrors
-	 * SYS_TASK_SET_EXC_PORT's A v1 pattern for the same reason.
+	 * Take popcount(types_mask) refs on the new port before the swap,
+	 * so a user_fault_die that snapshots a slot between the unlock and
+	 * the drop of the previous occupant reads a live ref.
 	 */
 	if (port != NULL) {
 		for (i = 0; i < EXC_TYPE_COUNT; i++) {
@@ -484,11 +445,10 @@ task_set_exception_ports(struct task *t, uint32_t types_mask, struct port *port)
 }
 
 /*
- * Inline reply helper for the task-self dispatcher: ship `body` of
- * `body_size` bytes back to req->msgh_local as a bare [header | body]
- * message via COPY_SEND on the caller's space.  Mirrors host.c's
- * host_reply_inline -- these ops hand out no further capabilities, so no
- * descriptors are needed.
+ * Reply for the task-self dispatcher: `body' back to req->msgh_local as a
+ * bare [header | body] message, COPY_SEND on the caller's space.  As
+ * host.c's host_reply_inline; these ops hand out no rights, so no
+ * descriptors.
  */
 static int
 task_reply_inline(const struct mach_msg_header *req, struct port_space *from,
@@ -540,14 +500,12 @@ task_vm_status(long rv)
 }
 
 /*
- * Port-carrying reply for TASK_OP_GET_SPECIAL_PORT: hand a SEND right to
- * the port named by the persistent kernel_space name `kname` back to the
- * caller as a COMPLEX [header | body | port_descriptor] message.  Mirrors
- * mach/bootstrap.c's lookup reply: install the caller's reply port into
- * kernel_space so we can address it alongside kname, then send FROM
- * kernel_space with a MOVE_SEND header (consumes the reply-port name) and a
- * COPY_SEND descriptor (kname is persistent, so the copy is leak-free --
- * the caller releases its name on deallocate).
+ * Reply for TASK_OP_GET_SPECIAL_PORT: a SEND right to the port named by
+ * the persistent kernel_space name `kname', as a COMPLEX [header | body |
+ * port_descriptor] message.  As mach/bootstrap.c's lookup reply: install
+ * the caller's reply port in kernel_space, then send from kernel_space
+ * with a MOVE_SEND header (consuming that name) and a COPY_SEND
+ * descriptor (kname persists; the caller releases its copy).
  */
 static int
 task_reply_port(const struct mach_msg_header *req, struct port_space *from,
@@ -600,24 +558,20 @@ task_reply_port(const struct mach_msg_header *req, struct port_space *from,
 }
 
 /*
- * Synchronous dispatcher for messages addressed to a task's task_self
- * port.  Invoked from inside mach_msg_send (port.c) for every send
- * whose destination's p_special tag is PORT_SPECIAL_TASK_SELF, so the
- * reply path executes in the caller's context -- there is no server
- * thread, no queueing on the request side, just a direct lookup + an
- * inline send of the reply via the caller's reply port (msgh_local).
+ * Synchronous dispatcher for messages to a task's task_self port, called
+ * from mach_msg_send for a destination tagged PORT_SPECIAL_TASK_SELF.  It
+ * runs in the sender's context: no server thread, no request queue.
  *
  * Ops (msgh_id; see TASK_OP_* in port.h):
  *	GET_INFO	task id, live thread count, name snapshot.
- *	VM_ALLOCATE	allocate an anonymous range in `target` and return
- *			its VA -- reuses syscall_vm_allocate so the path is
- *			byte-for-byte the SYS_VM_ALLOCATE path.
- *	VM_DEALLOCATE	release a range previously allocated above.
+ *	VM_ALLOCATE	allocate an anonymous range in `target' and return
+ *			its VA, via syscall_vm_allocate (the SYS_VM_ALLOCATE
+ *			path).
+ *	VM_DEALLOCATE	release a range allocated above.
+ *	GET_SPECIAL_PORT a SEND right to the host or bootstrap port.
  *
- * The reply uses COPY_SEND on msgh_local because mach_msg_rpc
- * allocates that reply port with RECEIVE+SEND in the caller's space;
- * the SEND right we lean on here was already there before the request
- * crossed into the kernel.
+ * Inline replies use COPY_SEND on msgh_local: mach_msg_rpc allocates
+ * that reply port with RECEIVE+SEND in the caller's space.
  */
 int
 task_self_dispatch(struct task *target, const struct mach_msg_header *req,
@@ -756,11 +710,8 @@ task_snapshot(struct task **out, size_t max)
 }
 
 /*
- * task_is_alive: best-effort, lock-only liveness check.  No ref bump --
- * the answer is stale once tasks_lock is dropped, so the shell must
- * yield-spin (and re-probe) until it stays 'false'.  Cheap enough for
- * that purpose: a single scan of TASK_LIST_MAX (64) slots under one
- * spinlock acquisition.
+ * task_is_alive: one scan of TASK_LIST_MAX slots under tasks_lock, no
+ * ref taken -- a hint, stale once the lock drops (see task.h).
  */
 bool
 task_is_alive(uint64_t id)
@@ -807,20 +758,13 @@ task_count_darwin_children(uint64_t ppid, uint64_t pid)
 }
 
 /*
- * task_self_port_for: take one SEND ref on `task_id`'s task-self port
- * and hand the port object back, or NULL if the id is unknown / names
- * kernel_task / has no self port.  The returned ref is the caller's to
- * drop with port_deref(.., MACH_PORT_RIGHT_SEND).
+ * task_self_port_for: see task.h.  Backs launchd's LOAD reply, which
+ * hands launchctl the new child's task-self SEND so it can arm a
+ * DEAD_NAME notification.
  *
- * Powers the launchd LOAD reply: launchd hands the freshly spawned
- * child's task-self SEND right to launchctl as an implicit-local port
- * descriptor so launchctl can arm a DEAD_NAME notification on it --
- * death-by-notification instead of the v1 task_alive yield-poll.
- *
- * Lock-order: tasks_lock -> p_lock (inside port_ref).  p_lock is a
- * leaf and nothing takes tasks_lock while holding it, so no cycle.
- * Taking the ref under tasks_lock guarantees the task cannot be
- * chain-removed + freed between the match and the ref bump.
+ * Lock order: tasks_lock -> p_lock (in port_ref); p_lock is a leaf.  The
+ * ref is taken under tasks_lock so the task cannot be removed and freed
+ * between the match and the ref.
  */
 struct port *
 task_self_port_for(uint64_t task_id)
@@ -846,15 +790,13 @@ task_self_port_for(uint64_t task_id)
 }
 
 /*
- * task_lookup_ref: resolve a task id to a ref'd, safe-to-deref task.
- * Mirrors task_self_port_for's scan, but bumps the task's own ref under
- * tasks_lock so the struct cannot be freed under the caller.  Returns
- * NULL for an unknown id -- the natural answer for a task-self port
- * whose task has already been reaped.  kernel_task is returned like any
- * other live task (callers that must exclude it check the id).
+ * task_lookup_ref: task_self_port_for's scan, taking the task's own ref
+ * under tasks_lock.  NULL for an unknown id -- e.g. a task-self port
+ * whose task is gone.  kernel_task is returned like any other; callers
+ * that must exclude it check the id.
  *
- * Lock-order: tasks_lock -> t_lock (inside task_ref); identical to the
- * edge task_request_terminate takes, so no new cycle.
+ * Lock order: tasks_lock -> t_lock (in task_ref), the edge
+ * task_request_terminate already takes.
  */
 struct task *
 task_lookup_ref(uint64_t id)
@@ -876,35 +818,24 @@ task_lookup_ref(uint64_t id)
 }
 
 /*
- * task_request_terminate: async-kill on a live target.  Three phases:
+ * task_request_terminate: async kill of a live task, in three steps.
  *
- *	1. Identify the target under tasks_lock + bump a ref so it
- *	   cannot teardown out from under the wake walk.  Refuse the
- *	   request if it names kernel_task; the kernel task hosts every
- *	   kernel-side thread (idle, drivers, services) and is by
- *	   construction not killable.
+ *	1. Find the target under tasks_lock and take a ref so it cannot
+ *	   be torn down under the wake walk.  kernel_task, which hosts
+ *	   every kernel thread (idle, drivers, services), is refused.
  *
- *	2. Atomic-store t_killed = true with RELEASE so the matching
- *	   ACQUIRE in task_kill_pending (called from the detection sites
- *	   in syscall_dispatch + thread_block_release) reads the freshly
- *	   set flag.  Done while still holding tasks_lock so concurrent
- *	   tasks_lock holders cannot observe the target before the flag
- *	   is set.
+ *	2. Store t_killed with RELEASE, pairing with task_kill_pending's
+ *	   ACQUIRE, still under tasks_lock so no other tasks_lock holder
+ *	   sees the target before the flag.
  *
- *	3. Walk t_threads under t_lock and thread_wake each entry.
- *	   thread_wake is a no-op for non-BLOCKED threads, so READY and
- *	   RUNNING members are correctly ignored.  Threads that were
- *	   already mid-park (acquired sched_lock but not yet committed
- *	   to BLOCKED) observe t_killed under sched_lock in
- *	   thread_block_release's pre-park check and retire without
- *	   needing a wake -- this covers the race where the kill arrives
- *	   between the would-be-parker reading "no message available"
- *	   and committing to the BLOCKED state.
+ *	3. thread_wake every thread in t_threads, under t_lock.  A
+ *	   BLOCKED thread wakes; a READY or RUNNING one gets
+ *	   th_wake_pending.  A thread mid-park, holding sched_lock but not
+ *	   yet BLOCKED, sees t_killed in thread_block_release's pre-park
+ *	   check and retires without a wake.
  *
- * Lock-order introduced: t_lock -> sched_lock -> th_lock (via the
- * thread_wake fan-out under t_lock).  Nothing in the existing code
- * acquires t_lock while holding sched_lock or th_lock, so the new
- * edge does not close a cycle.
+ * Lock order: t_lock -> sched_lock -> th_lock, via the wake fan-out.
+ * Nothing takes t_lock while holding sched_lock or th_lock.
  */
 void
 task_request_terminate(uint64_t task_id)

@@ -11,19 +11,15 @@
 #include <stdint.h>
 
 /*
- * Intel 8253 / 8254 Programmable Interval Timer.
+ * Intel 8253/8254 Programmable Interval Timer.
  *
- * Channel 0 is wired to IRQ0 on the master 8259 (vector 32 after the
- * project's pic_init remap).  pit_init programmes it in rate-generator
- * mode with the divisor that produces the requested hz, then installs
- * a handler that increments a monotonic tick counter.  Read with
- * pit_ticks().
+ * Channel 0 drives IRQ0 on the master 8259 (vector 32 after pic_init's
+ * remap).  pit_init programs it as a rate generator at the requested hz
+ * and installs a handler that bumps a monotonic tick count (pit_ticks).
  *
- *	PIT_INPUT_HZ	the canonical 1.193182 MHz input clock; divisor
- *			is integer so the actual rate is the nearest
- *			achievable (returned by pit_hz()).
- *	PIT_DEFAULT_HZ	100 Hz (10 ms tick) -- the rate clock_init uses
- *			when no override is supplied.
+ *	PIT_INPUT_HZ	the 1.193182 MHz input clock; the divisor is an
+ *			integer, so pit_hz() returns the rate achieved.
+ *	PIT_DEFAULT_HZ	100 Hz (10 ms tick), the rate clock_init uses.
  */
 
 #define	PIT_INPUT_HZ		1193182U
@@ -35,20 +31,15 @@ unsigned int	pit_hz(void);
 
 /*
  * Stop debiting the running thread's slice; keep ticking.  Called once, by
- * lapic_timer_start, when a per-CPU timer takes preemption over -- because
- * this chip interrupts one CPU and so can only ever spend one CPU's slice,
- * while the tick count, the timeouts and the busy-sleeps that are measured in
- * PIT ticks all stay exactly where they were.
- *
- * One-way on purpose.  The alternative to a hand-over is two timers debiting
- * the same quantum, which halves it in silence.
+ * lapic_timer_start, when the per-CPU timers take preemption over; the
+ * tick count, timeouts and busy-sleeps stay on PIT ticks.  One-way: two
+ * timers debiting one quantum would silently halve it.
  */
 void		pit_release_preempt(void);
 
 /*
- * How often the per-processor census is written straight at the UART, in
- * ticks; zero for never, which is the default.  See cpu_census_uart -- this
- * is the instrument for a machine whose console has stopped answering.
+ * Period, in PIT ticks, of the per-CPU census written straight at the
+ * UART (cpu_census_uart); zero, the default, for never.
  */
 extern uint64_t	pit_census_ticks;
 

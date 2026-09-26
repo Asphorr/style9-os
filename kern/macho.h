@@ -13,42 +13,29 @@
 #include <stdint.h>
 
 /*
- * Minimal Mach-O (thin x86-64, plus fat/universal slice picking) loader
- * for ring-3 programs -- the sibling of the ELF loader in elf.h.
+ * Minimal Mach-O loader (thin x86-64, plus fat/universal slice picking)
+ * for ring-3 programs, the sibling of elf.h.
  *
- * Apple ships every ring-3 binary as Mach-O; teaching the kernel to map
- * the container was the first rung of XNU binary compatibility (S1: the
- * container only).  By default the ABI INSIDE the container is unchanged --
- * the program still uses libstyle9's crt0 and the style9 SYS_* numbers,
- * so a Mach-O loaded by macho_load runs through the exact same launcher,
- * stack frame, and syscall path as an ELF.
+ * Without a platform tag the ABI inside the container is style9's
+ * (libstyle9 crt0, SYS_* numbers), and the image runs through the same
+ * launcher, stack frame and syscall path as an ELF.  An image whose
+ * LC_BUILD_VERSION declares PLATFORM_MACOS is tagged
+ * TASK_PERSONALITY_DARWIN, and syscall_dispatch routes its Apple
+ * class-encoded syscalls to darwin_dispatch (kern/darwin.c).  An image with
+ * an LC_LOAD_DYLINKER sets needs_dyld: the launcher maps our clean-room
+ * dyld (user/dyld.c) beside it and enters through dyld, which binds it
+ * against our libSystem (user/libsystem.c).
  *
- * The exception is the syscall personality (S2): an image that declares
- * PLATFORM_MACOS through an LC_BUILD_VERSION is tagged TASK_PERSONALITY_DARWIN
- * by macho_load, and syscall_dispatch then routes that task through
- * darwin_dispatch (kern/darwin.c), which decodes Apple's class-encoded
- * syscalls (Mach traps, BSD calls) and their carry-flag error convention.
- * Binary-exact mach_msg / MIG and a real libSystem remain later steps.
+ * macho_load() parses an image resident in kernel memory.  For a fat
+ * archive it picks the CPU_TYPE_X86_64 slice and loads it thin; the thin path
+ * maps every LC_SEGMENT_64 at its requested VA (R/W/X from initprot, all
+ * U=1), recording each in t_map as elf_load() does, and returns the entry
+ * RIP from LC_UNIXTHREAD or LC_MAIN.
  *
- * S4 adds dynamic linking: an image that carries an LC_LOAD_DYLINKER is
- * reported through macho_load_result.needs_dyld, and the launcher maps our
- * clean-room dyld (user/dyld.c) alongside it and enters through dyld, which
- * binds the image against our libSystem (user/libsystem.c).
- *
- * macho_load() parses an image already resident in kernel memory.  When
- * the image is a fat/universal archive it selects the CPU_TYPE_X86_64
- * slice and recurses on it; the thin path then drops every
- * LC_SEGMENT_64 into the target task's address space at its requested VA
- * (R/W/X from initprot, all U=1) and returns the entry RIP read from
- * LC_UNIXTHREAD or LC_MAIN.  Each segment is recorded in task->t_map
- * alongside the hardware install into task->t_pmap -- identical bookkeeping
- * to elf_load(), so the launcher treats the two formats interchangeably.
- *
- * The layouts below are imposed by the Mach-O file format (mach-o/loader.h
- * and mach-o/fat.h in Apple's headers); reordering fields desynchronises
- * the parser from what a Mach-O linker -- or our tools/elf2macho host
- * converter -- writes.  Fat headers are stored BIG-ENDIAN on disk; the
- * parser byte-swaps them (everything else is little-endian native).
+ * The layouts below are the file format's (Apple's mach-o/loader.h and
+ * mach-o/fat.h), as a linker or tools/elf2macho writes them.  Fat headers
+ * are big-endian on disk and byte-swapped by the parser; everything else
+ * is little-endian.
  */
 
 struct task;
@@ -75,10 +62,9 @@ struct task;
 #define	MACHO_LC_BUILD_VERSION	0x32
 
 /*
- * LC_BUILD_VERSION.platform.  macho_load reads this to choose the task's
- * syscall ABI personality: PLATFORM_MACOS flips the task to the Darwin
- * personality (S2 -- the kernel honours Apple's class-encoded syscalls);
- * any other value, or no LC_BUILD_VERSION at all, leaves it native style9.
+ * LC_BUILD_VERSION.platform.  PLATFORM_MACOS gives the task the Darwin
+ * syscall personality; any other value, or no LC_BUILD_VERSION, leaves it
+ * native style9.
  */
 #define	MACHO_PLATFORM_MACOS	1
 
@@ -154,11 +140,10 @@ struct mach_entry_point_command {
 };
 
 /*
- * WIRE FORMAT.  LC_LOAD_DYLINKER -- names the dynamic linker (e.g.
- * "/usr/lib/dyld").  `name` is an lc_str: a byte offset from the start of
- * this command to the inline NUL-terminated path that follows.  The path is
- * read past but not honoured -- the kernel maps its own embedded dyld -- so
- * only the command's presence matters.
+ * WIRE FORMAT.  LC_LOAD_DYLINKER names the dynamic linker (e.g.
+ * "/usr/lib/dyld"); `name` is an lc_str, the offset from this command's
+ * start to the inline NUL-terminated path.  Only the command's presence
+ * matters: the kernel maps its own embedded dyld.
  */
 struct mach_dylinker_command {
 	uint32_t	cmd;
@@ -167,9 +152,8 @@ struct mach_dylinker_command {
 };
 
 /*
- * WIRE FORMAT.  LC_BUILD_VERSION (per-tool build_tool_version entries, if
- * any, follow inline).  We honour only `platform`; minos/sdk/ntools are read
- * past but ignored.
+ * WIRE FORMAT.  LC_BUILD_VERSION (build_tool_version entries, if any,
+ * follow inline).  Only `platform' is used.
  */
 struct mach_build_version_command {
 	uint32_t	cmd;
@@ -216,11 +200,10 @@ _Static_assert(sizeof(struct mach_fat_arch) == 20, "fat_arch must be 20 bytes");
 #define	MACHO_E_NOENTRY		(-8)	/* no LC_UNIXTHREAD / LC_MAIN       */
 
 /*
- * Outcome of macho_load: the entry RIP the image declares (LC_UNIXTHREAD /
- * LC_MAIN), the VA its mach_header was mapped at (the fileoff-0 segment base,
- * which the launcher hands to dyld as the main-image handle), and whether the
- * image carries an LC_LOAD_DYLINKER -- i.e. is dynamically linked and must be
- * entered through dyld rather than at its own entry.
+ * Outcome of macho_load: the entry RIP (LC_UNIXTHREAD / LC_MAIN), the VA
+ * of the mach_header (the fileoff-0 segment's base, handed to dyld as the
+ * main-image handle), and whether an LC_LOAD_DYLINKER requires entering
+ * through dyld.
  */
 struct macho_load_result {
 	uint64_t	entry;
@@ -232,16 +215,12 @@ int	macho_load(struct task *target, const void *image, size_t image_size,
 	    struct macho_load_result *out);
 
 /*
- * Map a Mach-O dynamic library (MH_DYLIB) into `target` at `bias`, which is
- * added to every segment's vmaddr -- a dylib is linked relocatable (base 0),
- * so the caller chooses where it lands.  Unlike macho_load this resolves no
- * entry point and touches no syscall personality; a dylib has neither.  The
- * total page-rounded VA span consumed from `bias` upward is returned through
- * *out_span.  Returns MACHO_E_OK or a negative MACHO_E_*.
- *
- * Backs the clean-room dyld's "map image by path" backchannel (kern/darwin.c):
- * dyld reads a dependency path out of the main image's LC_LOAD_DYLIB, asks the
- * kernel to map it here, then binds against the export trie it reads back.
+ * Map a Mach-O dynamic library (MH_DYLIB) into `target` at `bias`, added
+ * to every segment's vmaddr (a dylib is linked at base 0).  No entry point
+ * and no personality change.  The page-rounded VA span used from `bias` up
+ * is returned in *out_span.  Returns MACHO_E_OK or a negative MACHO_E_*.
+ * Backs dyld's map-image-by-path backchannel (kern/darwin.c); dyld then
+ * binds against the dylib's export trie.
  */
 int	macho_map_dylib(struct task *target, const void *image,
 	    size_t image_size, uint64_t bias, uint64_t *out_span);

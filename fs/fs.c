@@ -20,72 +20,42 @@
 #include "thread.h"
 
 /*
- * One lock for the volume, and it lives here rather than in either backend.
+ * One lock for the volume, here rather than in either backend: every
+ * caller outside fs/ comes through the functions below, so it covers both
+ * backends and lets each stay straight-line code.  Two writers can target
+ * the same block, and a reader could see a 4 KiB block (eight sectors)
+ * mid-write.
  *
- * This is the only door: every caller outside fs/ reaches a filesystem
- * through the functions below, so a lock here covers both backends and any
- * later one, and lets each backend stay written as straight-line code.
- *
- * Until writing existed there was nothing to serialise.  The APFS reader
- * fills its volume state at mount and never touches it again -- the struct
- * says so, every field marked (m) -- so concurrent readers shared only
- * immutable data and the block cache, which has always had its own lock.
- * Writing ends that: two writers can now target the same block, and a reader
- * can now observe a block mid-write, since a 4 KiB APFS block is eight ATA
- * sectors and the drive is under no obligation to make them appear at once.
- *
- * It is a mutex and not a spinlock because every one of these calls reaches
- * the disk, and reaching the disk sleeps.  See kern/mutex.h for why that
- * distinction is not optional in this kernel.
- *
- * Held for the whole of an operation, including a slurp that may read
- * megabytes.  That is a deliberate choice of correctness over concurrency
- * while there is one disk and one lock: the alternative is per-file or
- * per-range locking, which is worth building when there is evidence of
- * contention rather than in anticipation of it.
+ * A mutex, not a spinlock: every call here reaches the disk, and that
+ * sleeps (kern/mutex.h).  Held for a whole operation, a slurp of megabytes
+ * included -- correctness over concurrency while there is one disk.
  */
 static struct mutex	fs_lock = MUTEX_INIT("fs");
 
 /*
  * Volume generation: bumped under fs_lock whenever metadata changes, so a
- * handle can tell whether the length it copied is still the length the file
- * has.  Starts at 1 rather than 0 so a zeroed handle -- one that was never
- * filled by fs_open -- can never accidentally match it.
+ * handle can tell whether the length it copied is still the file's.
+ * Starts at 1 so a zeroed handle never matches it.
  */
 static uint64_t		fs_gen = 1;
 
 /*
- * Two counters, not one, because they answer different questions.  fs_n_stale
- * says how often the mechanism FIRED -- a handle older than the volume -- and
- * is the only one that moves while nothing can change a file's length.
- * fs_n_resize says how often it CORRECTED something, and stays at zero until
- * files can grow.  Collapsing them into one number would make a working
- * mechanism indistinguishable from a dead one for as long as that is true.
+ * fs_n_stale: handles found older than the volume (the check fired).
+ * fs_n_resize: those whose length had really moved (it corrected one).
  */
 static uint64_t		fs_n_stale;
 static uint64_t		fs_n_resize;
 
 /*
- * WHAT IS OPEN
+ * What is open.  A file lives until its last name and its last descriptor
+ * are both gone, so unlink must know whether anything holds the file.  Not
+ * a vnode layer: a hold count per object id, which every handle carries.
+ * Descriptors onto one file share a row; a file nothing holds has none.
+ * Reads and writes never consult it -- only unlink ("is anyone holding
+ * this?") and close ("not any more").
  *
- * A descriptor used to be a private thing: the kernel handed one out and the
- * filesystem never heard of it again.  That is why unlink said out loud that it
- * did not keep Unix's promise -- a file lives until its last NAME and its last
- * DESCRIPTOR are both gone, and nothing here could answer the second half.
- *
- * This is that answer, and it is deliberately not a vnode layer.  What has to
- * be known is one bit per open file -- whether anything still holds it -- so
- * what is kept is a count per OBJECT ID, which every handle already carries.
- * Two descriptors onto one file share a row; a file nothing holds has no row.
- * There is nothing here to look a path up in, nothing to invalidate when a name
- * moves, and nothing that has to be right for reading and writing to work,
- * because reads and writes never consult it.  It is consulted by unlink, which
- * asks "is anyone holding this", and by close, which answers "not any more".
- *
- * Sized against the descriptor table rather than guessed: DARWIN_NOFILE is 16
- * per task, so 32 distinct open FILES is room for two tasks holding entirely
- * different sets with nothing shared -- and the rows are per file, so the usual
- * case of several tasks holding the same few is one row each.
+ * DARWIN_NOFILE is 16 per task, so 32 rows hold two tasks' entirely
+ * distinct sets; shared files take one row each.
  */
 #define	FS_OPEN_MAX	32
 
@@ -93,11 +63,8 @@ struct fs_open {
 	uint64_t	fo_ino;
 	uint32_t	fo_refs;
 	/*
-	 * Its last name is already gone and it is waiting in the volume's
-	 * private directory.  Kept here rather than read back off the record
-	 * because the question is asked on the close path, where a tree descent
-	 * per closed descriptor would be paid by every program that ever opens
-	 * a file, for a case almost none of them are in.
+	 * Its last name is gone and it waits in the volume's private
+	 * directory.  Kept here so close need not descend the tree to ask.
 	 */
 	bool		fo_nameless;
 };
@@ -119,12 +86,9 @@ open_row(uint64_t ino)
 }
 
 /*
- * One more holder of this file.  Called with fs_lock held.
- *
- * A FULL TABLE IS REFUSED RATHER THAN IGNORED.  The tempting alternative --
- * hand the descriptor out untracked -- puts the system back in the state this
- * whole rung exists to leave, except now it is in it only sometimes and only
- * under load, which is the shape of bug that gets diagnosed years later.
+ * One more holder of this file.  Called with fs_lock held.  A full table
+ * is refused (FS_E_NOSPACE), never ignored: an untracked handle is a file
+ * unlink could take from under its reader.
  */
 static int
 open_hold(uint64_t ino)
@@ -153,11 +117,9 @@ open_hold(uint64_t ino)
 }
 
 /*
- * Bring a handle's cached length up to date if the volume moved on since it
- * was made.  Called with fs_lock held, from the two calls that clamp against
- * it.  Nothing to do on FAT, which cannot be written and therefore cannot go
- * stale, and nothing to do in the overwhelmingly common case where the
- * generation has not changed at all.
+ * Bring a handle's cached length up to date if the volume moved on since
+ * it was made.  Called with fs_lock held, before a length is clamped
+ * against.  FAT cannot be written, so only APFS lengths are re-read.
  */
 static void
 handle_refresh(struct fs_handle *h)
@@ -176,22 +138,17 @@ handle_refresh(struct fs_handle *h)
 		h->fh_size = size;
 	}
 	/*
-	 * The generation is adopted even when the size turned out unchanged,
-	 * and even when the lookup failed.  Otherwise a handle to a file that
-	 * nobody is modifying would re-walk the tree on every single read for
-	 * the rest of its life, once any unrelated write had happened.
+	 * Adopted even when nothing changed or the lookup failed, or the
+	 * handle would re-walk the tree on every read after any unrelated
+	 * write.
 	 */
 	h->fh_gen = fs_gen;
 }
 
 /*
- * Picking a backend.  See fs.h for what this is and is not.
- *
- * APFS goes first because recognising a container is a far more specific
- * claim than recognising a FAT BPB: a Fletcher-64 over a checkpoint
- * superblock does not pass by accident, whereas plausible-looking BPB fields
- * turn up in all sorts of blocks.  In practice only one of the two ever
- * mounts, since there is one disk.
+ * Picking a backend (see fs.h): APFS is asked first, because a checksummed
+ * container superblock does not match by accident, while plausible BPB
+ * fields turn up anywhere.  With one disk, only one ever mounts.
  */
 
 static void
@@ -205,9 +162,8 @@ name_copy(char *dst, const char *src, size_t cap)
 }
 
 /*
- * Clear a statbuf before either backend fills it.  This is not tidiness: the
- * struct is copied out to userspace whole, so a field neither filesystem sets
- * would otherwise hand a Darwin binary whatever was on the kernel stack.
+ * Clear a statbuf before a backend fills it: it is copied out to userspace
+ * whole, and an unset field would leak kernel stack.
  */
 static void
 zero(void *p, size_t n)
@@ -276,15 +232,11 @@ fs_kind(void)
 }
 
 /*
- * THE PUBLISHED PAST, BY NAME.  See fs.h for what /.xid is; this is how a
- * path is told apart from a live one and how a checkpoint is entered and
- * left around a single backend call.
- *
- * Four answers to "what is this path": live (not under /.xid at all), the
- * directory of checkpoints itself, a checkpoint (with the path under it that
- * the backend is asked, "/" when nothing follows the number), or a name under
- * /.xid that is not a number -- which is not a checkpoint and not a live
- * name either, so it is simply absent.
+ * The published past by name (/.xid, see fs.h): how a path is told from a
+ * live one, and how a checkpoint is entered and left around one backend
+ * call.  A path is live (not under /.xid), the checkpoint directory
+ * itself, a checkpoint (with the path under it, "/" if nothing follows the
+ * number), or a non-number under /.xid, which names nothing.
  */
 #define	FS_PATH_LIVE	0
 #define	FS_PATH_VIEWS	1
@@ -335,9 +287,9 @@ fs_readonly(const char *path)
 }
 
 /*
- * Point the backend's readers at checkpoint `xid`.  Called with fs_lock held;
- * the caller leaves with fs_apfs_view_leave before letting go of the lock.
- * Only APFS has a past: FAT publishes nothing and so has nothing to view.
+ * Point the backend's readers at checkpoint `xid'.  Called with fs_lock
+ * held; the caller calls fs_apfs_view_leave before releasing it.  Only
+ * APFS has a past.
  */
 static int
 view_enter(uint64_t xid, struct fs_apfs_view *v)
@@ -371,32 +323,23 @@ view_name(char *dst, size_t cap, uint64_t xid)
 }
 
 /*
- * WHEN THE CHECKPOINT HAPPENS, which stopped being "now".
+ * When the checkpoint happens.  Mutations batch: an edit completes in
+ * memory and on fresh blocks -- readable through the writer's own view,
+ * reachable from no superblock yet -- and the checkpoint that publishes it
+ * is owed.  Three things collect the debt:
  *
- * Every mutation below used to end by writing one, and the write path said
- * what that cost out loud: one checkpoint per write is not how a filesystem
- * should batch.  Now it batches.  An edit completes in memory and on fresh
- * blocks -- readable through the writer's own view, reachable from no
- * superblock yet -- and the checkpoint that publishes it is owed rather than
- * written.  Three things collect the debt:
- *
- *	- the free queue running low on room, asked after every mutation.
- *	  fs_apfs_ckpt_due is the one bound that is physical: every block a
- *	  batch releases is an entry in a single node, and a batch that
- *	  outgrew it would start leaking blocks out loud;
+ *	- the free queue running low, asked after every mutation
+ *	  (fs_apfs_ckpt_due).  The one physical bound: every block a
+ *	  batch releases is an entry in a single node;
  *	- the syncer, a kernel thread that publishes a dirty volume every
- *	  FS_SYNC_MS, so the gap between "returned" and "on the platter" is
- *	  bounded by a clock rather than by luck;
- *	- fs_sync, for the caller who means NOW: fsync(2) lands there, and
- *	  so does the boot path after the self-tests, whose claims about
- *	  surviving a power cycle ride on it.
+ *	  FS_SYNC_MS, bounding the gap between return and platter;
+ *	- fs_sync, for a caller who means now: fsync(2), and the boot path
+ *	  after the self-tests.
  *
- * What a crash loses is the open transaction and nothing else.  Every edit
- * in the batch vanishes together, back to the last published checkpoint --
- * the torn-write stand stages power failures through a batch of four
- * different edits and holds the volume to exactly that.  Which is the
- * contract Unix has always sold: write(2) promises order, fsync(2) promises
- * the platter.
+ * A crash loses the open transaction and nothing else: every edit in the
+ * batch vanishes together, back to the last published checkpoint (the
+ * torn-write stand, tools/hosttorn.c, checks exactly that).  write(2)
+ * promises order; fsync(2) promises the platter.
  */
 #define	FS_SYNC_MS	2000
 
@@ -406,9 +349,8 @@ static uint64_t		fs_n_timer;	/* checkpoints the syncer wrote      */
 
 /*
  * A mutation just succeeded; decide about the checkpoint.  Called with
- * fs_lock held.  The edit is complete and readable whatever happens here, so
- * a checkpoint failure is returned exactly as the eager version returned it
- * -- and the volume stays dirty, for the syncer to retry out loud.
+ * fs_lock held.  The edit stands whatever happens here; a checkpoint
+ * failure is returned and the volume stays dirty for the syncer to retry.
  */
 static int
 ckpt_policy(void)
@@ -422,10 +364,8 @@ ckpt_policy(void)
 }
 
 /*
- * Each operation is written once, as a _locked body, and wrapped.  Wrapping
- * rather than sprinkling lock/unlock through the bodies is what keeps an
- * early return from leaking the lock -- several of these have four or five
- * exits, and the one that forgets is the one nobody finds.
+ * Each operation is a _locked body plus a wrapper that takes fs_lock, so
+ * no early return can leak the lock.
  */
 
 static int
@@ -499,10 +439,9 @@ open_locked(const char *path, struct fs_handle *out)
 		if (rv != FS_E_OK)
 			return (rv);
 		/*
-		 * NOT counted.  The open table exists so that unlink can tell
-		 * a held file from a free name, and nothing under a checkpoint
-		 * can be unlinked; what keeps this handle's bytes readable is
-		 * the free queue's retention, and that is asked at every read.
+		 * Not counted: nothing under a checkpoint can be unlinked.
+		 * The free queue's retention keeps the bytes, and every read
+		 * asks it again.
 		 */
 		out->fh_kind = FS_HANDLE_APFS;
 		out->fh_ino  = ino;
@@ -517,9 +456,8 @@ open_locked(const char *path, struct fs_handle *out)
 		if (rv != FS_APFS_E_OK)
 			return (apfs_err(rv));
 		/*
-		 * Counted BEFORE the handle is filled in, so that a refusal
-		 * leaves the caller with the zeroed handle it came in with
-		 * rather than a usable one the filesystem is not counting.
+		 * Counted before the handle is filled in, so a refusal leaves
+		 * it empty rather than usable and uncounted.
 		 */
 		rv = open_hold(ino);
 		if (rv != FS_E_OK)
@@ -564,14 +502,9 @@ fs_hold(const struct fs_handle *h)
 }
 
 /*
- * The last holder lets go, and if its name went while it was holding, this is
- * where the file actually stops existing.
- *
- * The reap happens HERE, in the filesystem, and not in whichever syscall
- * happened to close the last descriptor.  Every caller that can drop a
- * reference -- close, dup2 over a live slot, a task being torn down, an exec
- * replacing an address space -- would otherwise each have to know about the
- * private directory and each have to get it right.
+ * Drop a hold.  When the last holder of a file whose name is gone lets go,
+ * the file is reaped here, in the filesystem, so that close, dup2, task
+ * teardown and exec need not each know about the private directory.
  */
 int
 fs_close(struct fs_handle *h)
@@ -599,11 +532,8 @@ fs_close(struct fs_handle *h)
 	fo = open_row(ino);
 	if (fo == NULL) {
 		/*
-		 * Said out loud rather than shrugged off: a handle whose file
-		 * nothing is counting means a hold was lost somewhere, and the
-		 * consequence of that is an unlink taking bytes out from under
-		 * a live reader.  Nothing here can repair it; naming it is what
-		 * turns it into a bug report instead of a mystery.
+		 * A hold was lost somewhere, which lets unlink take bytes from
+		 * under a live reader.  Not repairable here; reported.
 		 */
 		kprintf("fs: closing inode %llu, which was not on the open "
 		    "list -- a reference was lost somewhere\n",
@@ -650,9 +580,8 @@ pread_locked(struct fs_handle *h, uint64_t off, uint8_t *buf,
 	case FS_HANDLE_APFS:
 		if (h->fh_xid != 0) {
 			/*
-			 * The checkpoint is resolved again for every read,
-			 * which is where a handle finds out it has fallen off
-			 * the window's edge: FS_E_GONE, and no bytes.
+			 * Resolved again for every read: a handle that fell
+			 * off the window gets FS_E_GONE.
 			 */
 			rv = view_enter(h->fh_xid, &v);
 			if (rv != FS_E_OK)
@@ -698,23 +627,14 @@ pwrite_locked(struct fs_handle *h, uint64_t off, const uint8_t *buf,
 	if (h->fh_xid != 0)
 		return (FS_E_ROFS);	/* and so does the past */
 
-	/*
-	 * Before the bounds check, not after: this call refuses a write that
-	 * would run past end-of-file, and deciding that against a length some
-	 * other writer has already moved is how a legal write gets rejected --
-	 * or, once files can grow, how an illegal one gets through.
-	 */
+	/* Refresh first: the checks below are against the current length. */
 	handle_refresh(h);
 
 	/*
-	 * A write that runs past the end makes the file longer first.  Not a
-	 * clamp and not a second write: the length moves, the records that say
-	 * so move with it, and only then are the bytes put down -- so a failure
-	 * to grow is a write that did not happen rather than one that half did.
-	 *
-	 * Starting BEYOND the end is still refused, by fs_apfs_pwrite.  That
-	 * would leave a gap no extent describes, which is a sparse file and a
-	 * different thing from a longer one.
+	 * A write running past the end grows the file first, so a failure to
+	 * grow is a write that did not happen rather than half of one.  A
+	 * write starting beyond the end is refused by fs_apfs_pwrite: the gap
+	 * would be a sparse file.
 	 */
 	if (off <= h->fh_size && off + (uint64_t)len > h->fh_size) {
 		rv = apfs_err(fs_apfs_grow(h->fh_ino, h->fh_id,
@@ -732,39 +652,25 @@ pwrite_locked(struct fs_handle *h, uint64_t off, const uint8_t *buf,
 		return (rv);
 
 	/*
-	 * The bytes are down; stamp the file.  A failure to stamp is reported
-	 * even though the write itself succeeded, because the alternative is
-	 * to return success for a file whose recorded modification time is a
-	 * lie -- and a caller told "written" has no way to find out.
-	 *
-	 * clock_walltime_us is microseconds since the epoch and APFS records
-	 * nanoseconds, so the stamp lands on a microsecond boundary.  That is
-	 * the clock this machine has, not a rounding choice.
+	 * The bytes are down; stamp the file.  A failed stamp is reported even
+	 * though the write succeeded, rather than leave a wrong mtime behind a
+	 * success.  The clock is in microseconds, so the stamp is too.
 	 */
 	now_ns = (uint64_t)clock_walltime_us() * 1000ULL;
 	rv = apfs_err(fs_apfs_touch(h->fh_ino, now_ns));
 
 	/*
-	 * Stamping the file no longer writes anything where it stood: the
-	 * inode's node is copied, and so is every object between it and the
-	 * container superblock, all of it reachable only from a checkpoint
-	 * that has not been written yet.  One used to be written HERE, once
-	 * per write, and this comment called that not how a filesystem
-	 * should batch.  Now the policy above decides, and what this call
-	 * promises shrank to what write(2) has always promised: the edit is
-	 * complete and ordered, and fsync(2) is the word for "and on the
-	 * platter".
+	 * The stamp copies the inode's node and everything up to the
+	 * superblock onto fresh blocks, published by a later checkpoint; the
+	 * policy decides when (see ckpt_policy).
 	 */
 	if (rv == FS_E_OK)
 		rv = ckpt_policy();
 
 	/*
-	 * Metadata moved, so every handle in the system is now suspect --
-	 * including this one, whose generation is advanced with it so the
-	 * writer does not immediately re-read what it just changed.  Bumped
-	 * even when the stamp failed: the bytes went down regardless, and a
-	 * generation that under-reports change is worse than one that
-	 * over-reports it.
+	 * Metadata moved, so every handle is suspect; this one's generation
+	 * moves with it.  Bumped even if the stamp failed: the bytes went
+	 * down, and over-reporting change is harmless.
 	 */
 	fs_gen++;
 	h->fh_gen = fs_gen;
@@ -778,10 +684,8 @@ fs_pwrite(struct fs_handle *h, uint64_t off, const uint8_t *buf,
 	int	rv;
 
 	/*
-	 * One acquisition covers the bytes AND the timestamp.  They are two
-	 * disk updates describing one event, and a reader that got between
-	 * them would see a file whose contents had changed and whose recorded
-	 * modification time had not.
+	 * One acquisition covers the bytes and the timestamp, so no reader
+	 * sees new contents with the old mtime.
 	 */
 	mutex_lock(&fs_lock);
 	rv = pwrite_locked(h, off, buf, len, out_put);
@@ -801,10 +705,8 @@ truncate_locked(struct fs_handle *h, uint64_t new_size)
 		return (FS_E_ROFS);
 
 	/*
-	 * Against the length the volume has now, not the one this handle was
-	 * opened with: "shorten it to n" and "lengthen it to n" are different
-	 * operations, and which one this is must be decided from what is
-	 * actually there.
+	 * Against the current length: whether this shortens or lengthens
+	 * depends on what is actually there.
 	 */
 	handle_refresh(h);
 	if (new_size == h->fh_size)
@@ -839,18 +741,12 @@ fs_truncate(struct fs_handle *h, uint64_t new_size)
 }
 
 /*
- * Split a path at its last separator: the directory that holds the last
- * component, and the component.
+ * Split a path at its last separator into the parent directory and the
+ * last component.  Parsing lives here, not in a backend: the APFS writer
+ * takes an object id and one name, which is what its records are keyed on.
  *
- * Path parsing belongs here and not in a backend.  The APFS writer is given an
- * object id and a single name, which is what the on-disk records are keyed on;
- * making it re-derive that from a string would put a second path parser next to
- * the first one, and two of those drift.
- *
- * A trailing separator is refused rather than ignored: "make /tmp/x/" says
- * something about directories, and this makes files.  The calls that DO make
- * directories take it off first -- see path_undress below, which exists so
- * that the refusal here can stay a refusal.
+ * A trailing separator is refused: "/tmp/x/" is a claim about a directory.
+ * The directory calls strip it first (path_undress).
  */
 static int
 path_split(const char *path, char *dir, size_t dircap, const char **leaf)
@@ -901,11 +797,8 @@ create_locked(const char *path, uint16_t perm, uint64_t *ino_out)
 	if (rv != FS_E_OK)
 		return (rv);
 	/*
-	 * Whether the create is published now is the policy's question.  A
-	 * crash before the checkpoint takes the whole of it back -- name,
-	 * inode and all, one state the volume is allowed to be in -- and
-	 * never the half-made one where a directory names an inode that
-	 * does not exist.
+	 * A crash before the checkpoint takes back the whole create, name
+	 * and inode, never leaving a name without its inode.
 	 */
 	rv = ckpt_policy();
 	fs_gen++;
@@ -949,11 +842,8 @@ unlink_locked(const char *path)
 		return (FS_E_NOTFOUND);
 
 	/*
-	 * WHICH FILE THIS IS, before deciding what taking its name away means.
-	 * A second descent, paid only by unlink, and it buys the only question
-	 * that matters here: is anything holding this open.  If something is,
-	 * the name goes and the file does not -- which is what Unix has always
-	 * promised and what the comment in the syscall used to apologise for.
+	 * Which file this is, to ask whether anything holds it open.  If so,
+	 * the name goes and the file stays (orphaned) until the last close.
 	 */
 	child = 0;
 	rv = apfs_err(fs_apfs_lookup(path, &child, &is_dir));
@@ -978,14 +868,10 @@ unlink_locked(const char *path)
 }
 
 /*
- * Everything an earlier boot left waiting.  See fs_apfs_reap_all: a volume that
- * comes up with files in its private directory is a volume whose last boot
- * ended between an unlink and the close that would have finished it, and the
- * format's answer is that they can simply be finished now.
- *
- * Run once, from kmain, after the volume is mounted and before anything opens
- * anything -- which is what makes it safe to reap every one of them without
- * consulting the open list: at this point nothing in the system holds a file.
+ * Reap what an earlier boot left in the private directory: files whose
+ * last close never came (fs_apfs_reap_all).  Run once from kmain after the
+ * mount and before anything opens a file, so the open list need not be
+ * consulted.
  */
 int
 fs_reap_orphans(void)
@@ -1002,9 +888,8 @@ fs_reap_orphans(void)
 	rv = apfs_err(fs_apfs_reap_all(now_ns, &n));
 	if (rv == FS_E_OK && n != 0) {
 		/*
-		 * Deferred like any other mutation.  Reaping is idempotent, so
-		 * a boot that dies before the publish simply finds the same
-		 * orphans and finishes them again.
+		 * Deferred like any mutation; reaping is idempotent, so a crash
+		 * before the publish just reaps them again next boot.
 		 */
 		rv = ckpt_policy();
 		fs_n_reap += n;
@@ -1026,14 +911,9 @@ fs_unlink(const char *path)
 }
 
 /*
- * Take the trailing separators off a path, keeping "/" itself.
- *
- * Only the two directory calls do this, and the asymmetry is the point.
- * "mkdir /tmp/x/" is a request that can be honoured exactly as written -- the
- * slash claims the name is a directory, and it is about to be one -- whereas
- * "create /tmp/x/" claims something the call cannot deliver, so path_split
- * goes on refusing it rather than quietly making a file with the name the
- * caller did not ask for.
+ * Take the trailing separators off a path, keeping "/" itself.  Only the
+ * directory calls do this: "mkdir /tmp/x/" can be honoured as written,
+ * while "create /tmp/x/" cannot, and path_split refuses it.
  */
 static int
 path_undress(const char *path, char *out, size_t cap)
@@ -1052,10 +932,8 @@ path_undress(const char *path, char *out, size_t cap)
 }
 
 /*
- * Making and removing a directory: the same two steps as for a file -- find
- * the directory that will hold the name, then hand the backend an object id
- * and one component -- and one function, because at this layer that is the
- * whole of both of them and they differ only in which call ends them.
+ * Make or remove a directory: find the parent, then hand the backend its
+ * object id and one component.  The two differ only in the final call.
  */
 static int
 dir_locked(const char *path, int make, uint16_t perm, uint64_t *ino_out)
@@ -1118,28 +996,20 @@ fs_rmdir(const char *path)
 }
 
 /*
- * MOVING A NAME, which is two path splits and ONE transaction.
+ * Move a name: two path splits and one edit.  POSIX wants rename atomic --
+ * programs rename a temporary file over the real one so a reader sees one
+ * or the other -- and the backend keeps that by changing every leaf it
+ * touches in memory before writing.  This layer must not split it into
+ * an unlink and a create.
  *
- * The transaction is the point.  A rename is the call POSIX asks to be atomic
- * -- programs write a temporary file and rename it over the real one precisely
- * so that a reader sees one or the other and never a half-written file -- and
- * that promise is kept below this layer, by an edit that names every leaf it
- * touches, changes them all in memory and only then writes.  What this layer
- * must not do is turn one such edit into two, which is why there is no
- * "unlink then create" anywhere in it.
+ * A taken destination is taken over in the same edit, and the occupant
+ * comes back as an object id for this layer, which knows the descriptors,
+ * to dispose of as unlink would: held open, it is marked nameless for the
+ * last close; held by nothing, it is reaped now, before the checkpoint, so
+ * both reach the platter as one state.  If the reap fails the file waits
+ * in the private directory for the next mount; the rename stands.
  *
- * A name that is already taken is taken OVER, in that same edit, and what
- * stood there comes back up as an object id: the writer below knows the
- * format and this layer knows the descriptors, so the occupant's fate is
- * decided here, exactly as an unlinked file's is.  Held open, it is marked on
- * its row and the last close will let it go; held by nothing, it is let go
- * right now, BEFORE the checkpoint, so the takeover and the reap reach the
- * platter as one published state.  If the reap refuses, the file simply waits
- * in the private directory for the next mount -- the rename itself has
- * already happened.
- *
- * A trailing separator is refused on both paths, as it is for a create.  It
- * claims the name is a directory, and this call moves whatever is there.
+ * A trailing separator is refused on both paths, as for a create.
  */
 static int
 rename_locked(const char *opath, const char *npath)
@@ -1217,14 +1087,9 @@ fs_rename(const char *opath, const char *npath)
 }
 
 /*
- * fs_chmod: the permission bits of something that already exists.
- *
- * FAT is refused rather than approximated.  Its directory entry has no mode
- * word at all -- what a stat of a FAT file reports is synthesised from the
- * read-only attribute and a convention -- so a chmod there could only pretend,
- * and a chmod that silently does nothing is worse than one that says no: a
- * program checks the mode afterwards, and only one of the two answers can be
- * told apart from success.
+ * fs_chmod: the permission bits of an existing name.  FAT is refused
+ * (FS_E_ROFS): its entry has no mode word to set, and a chmod that
+ * silently did nothing would look like success.
  */
 int
 fs_chmod(const char *path, uint16_t mode)
@@ -1277,10 +1142,8 @@ stat_locked(const char *path, struct fs_statbuf *out)
 	if (fs_apfs_ready()) {
 		if (kind == FS_PATH_VIEWS) {
 			/*
-			 * The directory of checkpoints reports itself as the
-			 * live root does -- its times, its owner -- under its
-			 * own inode and with the write bits off, since nothing
-			 * under it can be made.
+			 * /.xid reports the live root's times and owner under
+			 * its own inode, with the write bits off.
 			 */
 			rv = fs_apfs_stat("/", &asb);
 			if (rv != FS_APFS_E_OK)
@@ -1326,10 +1189,7 @@ stat_locked(const char *path, struct fs_statbuf *out)
 		out->fs_alloced  = fsb.fs_alloced;
 		out->fs_mtime_ns = fsb.fs_mtime_ns;
 		out->fs_atime_ns = fsb.fs_atime_ns;
-		/*
-		 * FAT records no inode-change time; the write time is the
-		 * closest true statement about when this entry last changed.
-		 */
+		/* FAT records no inode-change time; use the write time. */
 		out->fs_ctime_ns = fsb.fs_mtime_ns;
 		out->fs_btime_ns = fsb.fs_btime_ns;
 		out->fs_nlink    = 1;		/* FAT has no hard links */
@@ -1354,10 +1214,9 @@ fs_stat(const char *path, struct fs_statbuf *out)
 }
 
 /*
- * How many checkpoints the listing of /.xid can name.  The window is
- * APFS_FQ_KEEP + 1 wide and the constant is the backend's business; this is
- * bounded stack far above any value it has been priced at, and a window that
- * outgrew it would be listed short rather than overrun.
+ * How many checkpoints the /.xid listing can name.  The window is
+ * APFS_FQ_KEEP + 1 wide; a window larger than this is listed short, never
+ * overrun.
  */
 #define	FS_VIEW_LIST_MAX	16
 
@@ -1440,10 +1299,9 @@ fs_readdir(const char *path, uint32_t index, struct fs_dirent *out)
 }
 
 /*
- * The caller means NOW.  This is where every deferred checkpoint is
- * collected: fsync(2) lands here, and so does the boot path once the
- * self-tests are done.  A clean volume is a no-op rather than a checkpoint
- * of nothing -- writing one anyway would spend a ring slot saying so.
+ * Publish now: fsync(2) lands here, as does the boot path after the
+ * self-tests.  A clean volume is a no-op; a checkpoint of nothing would
+ * spend a ring slot.
  */
 int
 fs_sync(void)
@@ -1463,15 +1321,10 @@ fs_sync(void)
 }
 
 /*
- * THE SYNCER, which is the timer leg of the policy.
- *
- * A kernel thread, and deliberately a dumb one: sleep, and publish the volume
- * if it is dirty.  The dirty test is a bare read taken without the lock --
- * stale by at most one tick, and the lock is taken to act -- and a failed
- * checkpoint is retried on the next tick for as long as the volume stays
- * dirty, complaining each time, because a syncer that goes quiet about a
- * volume it cannot publish has turned the bounded loss window into an
- * unbounded one.
+ * The syncer, the timer leg of the policy: sleep, and publish the volume
+ * if it is dirty.  The dirty test reads without the lock (fs_sync takes
+ * it to act).  A failed checkpoint is retried every tick, and reported
+ * every time, while the volume stays dirty.
  */
 static void
 syncer_entry(void *arg)
@@ -1510,10 +1363,8 @@ fs_syncer_start(void)
 }
 
 /*
- * Under the same lock, because the test writes checkpoints: everything it
- * checks is state fs_apfs_checkpoint moves, and a reader arriving between the
- * write and the check would see a container the test has not finished
- * describing.
+ * Under fs_lock: the test writes checkpoints and checks the state they
+ * move, which no reader may see half-done.
  */
 void
 fs_ckpt_selftest(void)
@@ -1531,11 +1382,8 @@ fs_handle_stats(void)
 {
 
 	/*
-	 * The policy's own tally: how much batching actually happened, and
-	 * which leg collected the debt.  The syncer's count is usually the
-	 * small one -- the boot's write storm is published by the free
-	 * queue's headroom and by the explicit sync that follows the tests,
-	 * and the timer only catches what trickles in after.
+	 * The policy's tally: mutations batched, and which leg published
+	 * them (fs_sync's own count is not kept).
 	 */
 	if (fs_n_owed != 0)
 		kprintf("fs-sync: %llu mutation(s) batched, %llu checkpoint(s) "
@@ -1550,12 +1398,8 @@ fs_handle_stats(void)
 	    (unsigned long long)fs_gen, (unsigned long long)fs_n_stale,
 	    (unsigned long long)fs_n_resize);
 	/*
-	 * And the two the private directory is for.  Reported at the END of a
-	 * boot rather than with the self-test that checks the table, because
-	 * these only move when something in ring 3 unlinks a file it is holding
-	 * -- which happens long after the tests.  They need not balance within
-	 * one boot: a file orphaned by a kernel that then stopped is reaped by
-	 * the next one, which is what the difference across two boots says.
+	 * Orphans and reaps.  They need not balance within one boot: an
+	 * orphan left by a crashed boot is reaped by the next.
 	 */
 	if (fs_n_orphan != 0 || fs_n_reap != 0)
 		kprintf("fs: %llu name(s) taken from files something still had "
@@ -1567,13 +1411,10 @@ fs_handle_stats(void)
 /* ---- write self-test ------------------------------------------------------ */
 
 /*
- * The file this exercises.  It is the multi-extent one on the test image
- * (4096 bytes in one extent, the rest in another), which matters: the probe
- * offset below is chosen to straddle both the 4 KiB block boundary AND the
- * boundary between those two extents, so one 12-byte write has to find two
- * different physical runs and read-modify-write a partial block at each end.
- * A writer that handled only the easy aligned case would pass a gentler test
- * and corrupt this one.
+ * The multi-extent file on the test image (4096 bytes in one extent, the
+ * rest in another).  The probe straddles the block boundary, which is also
+ * the extent boundary, so one 12-byte write must find two physical runs
+ * and read-modify-write a partial block at each end.
  */
 #define	SELFTEST_PATH	"/var/db/big.txt"
 #define	SELFTEST_OFF	4090		/* 6 bytes before the boundary */
@@ -1582,15 +1423,9 @@ fs_handle_stats(void)
 #define	SELFTEST_PAD	10		/* SELFTEST_OFF - window start */
 
 /*
- * Left at offset 0 on purpose, and read on the next boot.  Reading back what
- * we just wrote proves the write path is self-consistent; finding it after a
- * power cycle proves it reached the platter, which is the only claim that
- * actually matters and the only one a cache cannot fake.
- */
-/*
- * The text used to read "style9 wrote this in place", which was true and is
- * the thing the write path stopped doing: bytes are copied to fresh blocks
- * now, so that the checkpoint behind this one keeps the contents it described.
+ * Left at offset 0 on purpose and looked for on the next boot: finding it
+ * after a power cycle proves it reached the platter, which no cache can
+ * fake.
  */
 #define	SELFTEST_MARK	"style9 moved these bytes to write them.\n"
 
@@ -1619,12 +1454,7 @@ void
 fs_write_selftest(void)
 {
 	struct fs_handle	h;
-	/*
-	 * The second handle lives up here rather than in the block that uses
-	 * it, so that the single exit below can give it back: a handle is a
-	 * claim on the file now, and one abandoned by an early return is a row
-	 * in the kernel's open-file table that nothing will ever free.
-	 */
+	/* Declared here so the single exit can close it: a handle is a hold. */
 	struct fs_handle	stale;
 	struct fs_statbuf	st0;
 	struct fs_statbuf	st1;
@@ -1641,11 +1471,7 @@ fs_write_selftest(void)
 	if (!fs_apfs_ready())
 		return;			/* nothing here can be written */
 
-	/*
-	 * Emptied before anything can jump to the exit, so that closing it
-	 * there is a no-op on the paths that never opened it.  fs_open zeroes
-	 * what it is given, but only the paths that reach it.
-	 */
+	/* Empty before any jump to the exit, so closing it there is a no-op. */
 	stale.fh_kind = FS_HANDLE_NONE;
 
 	rv = fs_open(SELFTEST_PATH, &h);
@@ -1666,13 +1492,9 @@ fs_write_selftest(void)
 	}
 
 	/*
-	 * A write that STARTS past the end must be refused outright.  Not
-	 * clamped and not grown into: the bytes between would belong to no
-	 * extent, which is a sparse file rather than a longer one, and a short
-	 * write reported as success is how a file ends up half-updated with
-	 * the caller told everything went in.  A write that merely runs off
-	 * the end is a different matter and now lengthens the file; see
-	 * fs_apfs_grow and the growth self-test.
+	 * A write starting past the end is refused (FS_E_NOALLOC), neither
+	 * clamped nor grown into: the gap would be a sparse file.  One that
+	 * merely runs off the end lengthens the file (fs_grow_selftest).
 	 */
 	rv = fs_pwrite(&h, h.fh_size + 4096, (const uint8_t *)marker, 8, &put);
 	if (rv != FS_E_NOALLOC) {
@@ -1707,10 +1529,8 @@ fs_write_selftest(void)
 		goto done;
 	}
 	/*
-	 * The half of this that matters.  Both ends of the write land inside
-	 * a block that is mostly not ours, and the read-modify-write is what
-	 * keeps the rest of it.  Damage here would sit outside the range
-	 * anyone thinks to check, which is exactly why it is checked.
+	 * The neighbours: both ends of the write land in blocks mostly not
+	 * ours, kept by the read-modify-write.
 	 */
 	if (!same(back, save, SELFTEST_PAD) ||
 	    !same(back + SELFTEST_PAD + SELFTEST_LEN,
@@ -1745,12 +1565,9 @@ fs_write_selftest(void)
 	}
 
 	/*
-	 * A second handle to the same file, opened BEFORE the write above and
-	 * therefore carrying a generation the write has since left behind.
-	 * Reading through it must notice.  Nothing observable changes yet --
-	 * this rung cannot alter a length -- so what is checked is that the
-	 * mechanism fires at all, which is exactly the part that would rot
-	 * unnoticed between now and the rung that needs it.
+	 * A second handle, opened before a write, carries a generation the
+	 * write leaves behind; reading through it must notice (fs_n_stale
+	 * moves).  The length does not change, so only the check is tested.
 	 */
 	{
 		uint64_t		n0;
@@ -1806,36 +1623,18 @@ fs_write_selftest(void)
 	    "find it\n", SELFTEST_PATH);
 done:
 	/*
-	 * BOTH HANDLES BACK, ON EVERY PATH.  This function had twenty-two exits
-	 * and gave nothing back at any of them, which was free while a handle
-	 * was only an answer to "which file".  It is a claim now, and one left
-	 * behind makes the next unlink of that file take the name only and
-	 * leave the bytes waiting for a close that never comes.
+	 * Both handles back on every path: a leaked hold would make the next
+	 * unlink of the file orphan it instead of freeing it.
 	 */
 	(void)fs_close(&stale);
 	(void)fs_close(&h);
 }
 
 /*
- * A FILE GETS LONGER, STAYS LONGER, AND FILLS A NODE DOING IT
- *
- * Three claims, and the third is why this appends more than once.  A file
- * extent record costs 48 bytes of the leaf it lands in and this container's
- * leaf had room for four, so a test that appended once would leave the
- * interesting case -- a node with no room -- permanently untested.  A block
- * per append reaches it in five.
- *
- * A block per append and not a byte: the length is always rounded up to a
- * block by the allocation behind it, so a whole block is the smallest append
- * guaranteed to need a new run, and a new run is what needs a new record.
- *
- * Bounded by the FILE rather than by a counter this kernel would have to keep:
- * the loop stops once the file is at least SELFTEST_GROW_TO bytes.  That used
- * to mean the growing happened once, ever, because there was no truncate and a
- * test that grew the file every boot would grow it without end.  There is one
- * now, it runs first, and it leaves the file at the length it ships at -- so
- * this appends again on every boot, and the whole path is exercised every time
- * rather than once in the life of an image.
+ * A file gets longer and stays longer.  Appends a block at a time -- the
+ * smallest append sure to need a new run -- until the file is at least
+ * SELFTEST_GROW_TO bytes.  fs_trunc_selftest runs first and cuts the file
+ * back to its shipped length, so this appends on every boot.
  */
 #define	SELFTEST_GROW_TO	(155648u + 6u * 4096u)
 #define	GROW_CHUNK		4096u
@@ -1881,11 +1680,9 @@ fs_grow_selftest(void)
 		at = h.fh_size;
 		rv = fs_pwrite(&h, at, chunk, GROW_CHUNK, &put);
 		/*
-		 * A REFUSAL THE WRITER DOCUMENTS IS NOT A FAILURE OF IT.  The
-		 * records of one file need not share a leaf, and the more the
-		 * tree splits the less likely it is that they do; an edit that
-		 * can move one node at a time says so and changes nothing.
-		 * Calling that FAIL teaches the reader to ignore the word.
+		 * FS_E_SPREAD is a documented refusal, not a failure: the
+		 * file's records are in more leaves than one edit can move,
+		 * and nothing was changed.  Reported as a skip.
 		 */
 		if (rv == FS_E_SPREAD) {
 			kprintf("apfs-grow: %s keeps its bytes and its inode "
@@ -1908,9 +1705,8 @@ fs_grow_selftest(void)
 			goto out;
 		}
 		/*
-		 * Read back through the file, not out of what was written: the
-		 * bytes have been through an allocation, a zeroing, a record
-		 * insert and a checkpoint since.
+		 * Read back through the file: the bytes have been through an
+		 * allocation, a zeroing and a record insert since.
 		 */
 		rv = fs_pread(&h, at, back, put, &got);
 		if (rv != FS_E_OK || got != put) {
@@ -1936,13 +1732,9 @@ fs_grow_selftest(void)
 
 	if (rounds == 0) {
 		/*
-		 * Nothing was appended, so the file arrived at this boot long
-		 * enough already -- which now means the truncate test did not
-		 * run, since it leaves the file at the length it ships at.
-		 * Saying so is better than reporting a pass for a path that
-		 * was not taken; the claim that the length outlives the
-		 * machine is checked where it can be, in fs_trunc_selftest,
-		 * against the tail this test wrote on the boot before.
+		 * Already long enough, so the truncate test did not run.  A
+		 * skip, not a pass.  That the length survives a reboot is
+		 * checked by fs_trunc_selftest, against this test's tail.
 		 */
 		kprintf("apfs-grow: %s is already %llu bytes -- nothing to "
 		    "append, skipped\n", SELFTEST_PATH,
@@ -1963,40 +1755,21 @@ fs_grow_selftest(void)
 	}
 
 	/*
-	 * THE THIRD CLAIM, and it is not the one this test was written with.
-	 * The plan was that six appends would fill a leaf and force a split;
-	 * what the boot showed instead was six appends and no split at all,
-	 * because the allocator kept handing back the blocks immediately after
-	 * the file's last run and two runs that touch are ONE run.  That is the
-	 * better answer -- a record per appended block, in each of two trees,
-	 * is how the extent reference tree filled at sixteen -- so the claim
-	 * became the one the code actually makes.
+	 * Appends merge: the allocator hands back the blocks right after the
+	 * file's last run, and touching runs are one run, so no new record
+	 * per block.  (Splits are proved by fs_split_selftest.)
 	 *
-	 * The split still has to be proved, and is, by asking for one outright:
-	 * see fs_apfs_split_selftest.
-	 *
-	 * All but the FIRST, and that exception arrived with the truncate test.
-	 * It ran a moment ago and gave back the blocks immediately past this
-	 * file's run; the free queue holds them for the checkpoints that still
-	 * name them, so the first append cannot be a continuation of anything
-	 * and is given a record of its own.  Every append after it merges into
-	 * that.  The claim is written as "all but one" rather than "all"
-	 * because the one that cannot merge is not a defect -- it is the queue
-	 * doing the only thing that makes an abandoned checkpoint safe.
+	 * All but the first: the truncate test just freed the blocks past
+	 * this file's run, and the free queue holds them for the checkpoints
+	 * that still name them, so the first append starts a new run.
 	 */
 	merges = fs_apfs_merges() - merges;
 	ckpts  = fs_apfs_ckpts() - ckpts;
 	if (merges + 1 < rounds) {
 		/*
-		 * Decidable only over an uninterrupted window, and the fourth
-		 * boot of an acceptance run is what taught it that.  A
-		 * checkpoint is when the free queue lets go of blocks, and
-		 * blocks let go are holes the first-fit scan may prefer over
-		 * the block that would have continued the run -- so once
-		 * checkpoints began landing by policy rather than once per
-		 * append, one inside this loop stopped being anyone's
-		 * mistake and started being the window's weather.  With no
-		 * checkpoint in the window the claim stands full strength.
+		 * Decidable only with no checkpoint in the loop: a checkpoint
+		 * makes the free queue release blocks, and first-fit may take
+		 * those holes over the block that would continue the run.
 		 */
 		if (ckpts != 0) {
 			kprintf("apfs-grow: %u append(s) merged %llu run(s) "
@@ -2021,43 +1794,29 @@ fs_grow_selftest(void)
 	    (unsigned long long)h.fh_size, (unsigned)rounds,
 	    (unsigned long long)merges);
 out:
-	/* The handle is a claim; every path through here ends it. */
+	/* The handle is a hold; every path releases it. */
 	(void)fs_close(&h);
 	kfree(chunk);
 	kfree(back);
 }
 
 /*
- * A FILE GETS SHORTER, AND A RECORD LEAVES A TREE
+ * A file gets shorter, and a record leaves a tree.  Cutting inside a run
+ * shortens it in place; cutting a run away entirely takes its record out
+ * of two B-trees.  Both are made to happen:
  *
- * Two halves, and only the second is hard.  Cutting inside a run shortens a
- * length in place; cutting away a run entirely takes its record out of two
- * B-trees, which is the first thing this kernel does that makes a tree
- * smaller.  A test that only ever did the first would pass on a truncate that
- * could not do the second at all.
- *
- * So it MAKES both happen rather than hoping the file is shaped right:
- *
- *	cut to the shipped length	-- undoes what the growth test appended
- *	append two blocks		-- one run, one allocation, one record
- *	cut away one of them		-- lands INSIDE that run: a shortening
- *	append one block		-- CANNOT continue the run, because the
- *					   block it would continue into was
- *					   given back one checkpoint ago and the
- *					   free queue is still holding it, so it
- *					   gets a record of its own
- *	cut it away			-- a whole run past the end: a dropping
+ *	cut to the shipped length	-- undoes the growth test's appends
+ *	append two blocks		-- one allocation, one run, one record
+ *	cut away one of them		-- inside that run: a shortening
+ *	append one block		-- cannot continue the run: the block
+ *					   past it was just freed and the free
+ *					   queue still holds it, so it gets a
+ *					   record of its own
+ *	cut it away			-- a whole run past the end: a drop
  *	cut back to the shipped length	-- leaves the file for the growth test
  *
- * The fourth step is the one worth reading twice.  It is deterministic not
- * because the allocator was asked for a fresh run but because it was asked for
- * the OLD one and refused: the free queue exists precisely so that a block an
- * abandoned checkpoint still names cannot be handed out, and that refusal is
- * what makes a second record certain here.
- *
- * On the way in it checks the tail of the file it was given, which the boot
- * before appended.  That is the growth test's persistence claim, checked here
- * because this is the last moment it is true.
+ * On the way in it checks the tail the previous boot's growth test
+ * appended: that test's persistence claim, checked while it still holds.
  */
 #define	SELFTEST_TRUNC_TO	155648u		/* what big.txt ships at */
 
@@ -2103,10 +1862,8 @@ fs_trunc_selftest(void)
 
 	if (was > SELFTEST_TRUNC_TO) {
 		/*
-		 * What the boot before left, checked before it is thrown away:
-		 * the file is longer than it ships because the growth test
-		 * appended to it, and its last block should still read as what
-		 * was appended.
+		 * Longer than shipped: the previous boot's growth test
+		 * appended, and the last block must still read as appended.
 		 */
 		rv = fs_pread(&h, was - GROW_CHUNK, back, GROW_CHUNK, &got);
 		if (rv != FS_E_OK || got != GROW_CHUNK) {
@@ -2137,12 +1894,9 @@ fs_trunc_selftest(void)
 
 	rv = fs_truncate(&h, SELFTEST_TRUNC_TO);
 	/*
-	 * A REFUSAL THE WRITER DOCUMENTS IS NOT A FAILURE OF IT.  A cut moves
-	 * the file's extent records and its inode record together, in one copy
-	 * of one node, and a tree that has been splitting for a while stops
-	 * keeping them in the same one.  The writer says so and changes
-	 * nothing; reporting FAIL for it is how a suite trains its reader to
-	 * stop believing the word.
+	 * FS_E_SPREAD is a documented refusal, not a failure: a cut edits the
+	 * extent and inode records in one node, and after enough splits they
+	 * are no longer in the same one.  Nothing changed; reported as a skip.
 	 */
 	if (rv == FS_E_SPREAD) {
 		kprintf("apfs-trunc: %s no longer keeps its runs and its "
@@ -2162,11 +1916,7 @@ fs_trunc_selftest(void)
 		goto out;
 	}
 
-	/*
-	 * Reading AT the new end gives nothing.  Not an error and not a short
-	 * read of stale bytes: the file stops there, and a truncate that moved
-	 * a length without moving the records would still answer this wrongly.
-	 */
+	/* Reading at the new end gives zero bytes and no error. */
 	rv = fs_pread(&h, SELFTEST_TRUNC_TO, back, GROW_CHUNK, &got);
 	if (rv != FS_E_OK || got != 0) {
 		kprintf("apfs-trunc: FAIL reading at the new end gave %u "
@@ -2176,9 +1926,8 @@ fs_trunc_selftest(void)
 	}
 
 	/*
-	 * And the volume agrees, about the length AND about the blocks.  The
-	 * second is the one that catches a truncate which edited a number and
-	 * left the space behind it spoken for.
+	 * The volume agrees on the length and on the blocks: the space past
+	 * the cut must have come back.
 	 */
 	if (fs_stat(SELFTEST_PATH, &st) != FS_E_OK) {
 		kprintf("apfs-trunc: FAIL cannot stat after cutting\n");
@@ -2220,10 +1969,9 @@ fs_trunc_selftest(void)
 	}
 
 	/*
-	 * One block back.  It cannot continue the run it follows: the block
-	 * immediately past that run was given back by the cut above, and the
-	 * free queue holds it for the checkpoints that still name it, so the
-	 * allocator has to go elsewhere and the file gets a SECOND record.
+	 * One block back.  The block right past the run was just freed and
+	 * the free queue holds it, so the allocator goes elsewhere and the
+	 * file gets a second record.
 	 */
 	rv = fs_pwrite(&h, SELFTEST_TRUNC_TO + GROW_CHUNK, chunk, GROW_CHUNK,
 	    &put);
@@ -2257,12 +2005,7 @@ fs_trunc_selftest(void)
 		goto out;
 	}
 
-	/*
-	 * Through all of that, the bytes below the cut never moved.  Read
-	 * through the file rather than compared to what was written: they have
-	 * been past four truncations, two allocations and five checkpoints
-	 * since anybody looked at them.
-	 */
+	/* Through all of that, the bytes below the cut never moved. */
 	rv = fs_pread(&h, SELFTEST_TRUNC_TO - SELFTEST_CTX, back, SELFTEST_CTX,
 	    &got);
 	if (rv != FS_E_OK || got != SELFTEST_CTX) {
@@ -2294,7 +2037,7 @@ fs_trunc_selftest(void)
 	    "the cut untouched\n", SELFTEST_PATH, (unsigned long long)was,
 	    (unsigned)SELFTEST_TRUNC_TO, (unsigned)SELFTEST_CTX);
 out:
-	/* As above: the file goes back however this ended. */
+	/* As above: the hold is released on every path. */
 	(void)fs_close(&h);
 	kfree(edge);
 	kfree(back);
@@ -2302,25 +2045,18 @@ out:
 }
 
 /*
- * The file this one MAKES, in a directory small enough that counting its
- * entries is a real check rather than a loop.
- *
- * It is left behind on purpose, and the next boot is what turns this from a
- * self-consistency check into a claim about the disk: a create that never
- * reached the platter answers every question in this function perfectly.
+ * The file this test makes, in a directory small enough to count.  Left
+ * behind on purpose: only the next boot finding it shows the create
+ * reached the platter.
  */
 #define	SELFTEST_MADE_DIR	"/etc"
 #define	SELFTEST_MADE		"/etc/made.txt"
 #define	SELFTEST_MADE_MARK	"style9 made this file from nothing.\n"
 
 /*
- * Take every name out of a directory, so a fixture somebody else has written
- * into can still be used.  Always removes entry ZERO rather than walking an
- * index up: the listing is a live view of a tree that this loop is editing,
- * and an index into it stops meaning what it meant the moment one goes.
- *
- * Returns false having said why -- a directory that will not empty is a bug in
- * the writer, which is exactly the thing this must not swallow.
+ * Take every name out of a directory someone else has written into.
+ * Always removes entry zero: the listing is live, and indices shift as
+ * names go.  Returns 0, having said why, if it will not empty.
  */
 static int
 dir_clear(const char *path, int held)
@@ -2428,9 +2164,8 @@ fs_make_selftest(void)
 
 	if (had) {
 		/*
-		 * What the boot before made, and wrote, and left.  This is the
-		 * whole claim: nothing in this function proves a create reached
-		 * the disk except finding one that a power cycle ago did.
+		 * What the previous boot made and left: the only proof that a
+		 * create reached the disk.
 		 */
 		if (st.fs_size != marklen) {
 			kprintf("apfs-make: FAIL %s is %llu bytes and the boot "
@@ -2447,13 +2182,8 @@ fs_make_selftest(void)
 			return;
 		}
 		/*
-		 * GIVEN BACK BEFORE THE UNLINK BELOW, and that is not tidiness.
-		 * A handle is a claim on the file now, so an unlink with this
-		 * one still held would do what Unix says and take the NAME only
-		 * -- the file would go and wait in the private directory, this
-		 * test would pass, and the volume would carry an orphan nothing
-		 * ever closes.  Which is exactly what happened: the second boot
-		 * of an acceptance run reported the removal as an orphaning.
+		 * Closed before the unlink below: with the hold still here the
+		 * unlink would take only the name and leave an orphan.
 		 */
 		(void)fs_close(&h);
 		for (i = 0; i < marklen; i++) {
@@ -2492,22 +2222,15 @@ fs_make_selftest(void)
 	}
 
 	/*
-	 * And make it.  The hole counter is read across this, not around the
-	 * whole test: when there was a file to remove, the delete just above
-	 * left holes exactly the size this create wants, and an insert that
-	 * ignored them would take the room from a span that never grows back.
+	 * And make it.  The hole counter is read across the create alone:
+	 * after the unlink above, the node has holes exactly the size this
+	 * create wants, and it must reuse them rather than take the room from
+	 * a span that never grows back.
 	 */
 	holes = fs_apfs_holes();
 	ino   = 0;
 	rv = fs_create(SELFTEST_MADE, 0644, &ino);
-	/*
-	 * A full leaf used to be answered here rather than by the writer, and
-	 * this test skipped on it.  It does not any more: a create splits the
-	 * leaf that has no room and starts over, so FS_E_NOALLOC has stopped
-	 * being a thing that happens to a create on a volume with free blocks
-	 * and gets no branch of its own.  What arranges a full leaf on purpose
-	 * and proves the split happens is apfs-room.
-	 */
+	/* The writer splits a full leaf rather than refuse (apfs-room). */
 	if (rv != FS_E_OK || ino == 0) {
 		kprintf("apfs-make: FAIL cannot make %s (rv=%d ino=%llu)\n",
 		    SELFTEST_MADE, rv, (unsigned long long)ino);
@@ -2560,10 +2283,8 @@ fs_make_selftest(void)
 	}
 
 	/*
-	 * Bytes into a file that has none: the first write to a file this
-	 * kernel made, which is the whole point of making one.  It goes
-	 * through the growth path, so the file gets its first block, its
-	 * first extent record and its first owner.
+	 * Bytes into a file that has none, through the growth path: its first
+	 * block, first extent record and first owner.
 	 */
 	if (fs_open(SELFTEST_MADE, &h) != FS_E_OK) {
 		kprintf("apfs-make: FAIL cannot open %s\n", SELFTEST_MADE);
@@ -2595,39 +2316,25 @@ fs_make_selftest(void)
 	    had ? ", the one the boot before left having been read and "
 	    "removed first" : "");
 done:
-	/*
-	 * ONE EXIT, so the claim goes back however this ended.  These tests
-	 * used to return from wherever they noticed a problem, which was
-	 * harmless while a handle was only an answer; it stopped being harmless
-	 * the moment a handle became a claim, and a leaked one is permanent.
-	 */
+	/* One exit after the open, so the hold is always released. */
 	(void)fs_close(&h);
 }
 
 /*
- * THE DIRECTORY THIS ONE MAKES
- *
- * Same shape as the file above and for the same reason: it is left on the
- * volume, and the boot after is what turns a self-consistency check into a
- * claim about the disk.  A mkdir that never reached the platter answers every
- * question here perfectly, once.
- *
- * What this asks that the file could not: whether the record written is a
- * directory to the REST OF THE KERNEL and not just to apfsck.  A name is put
- * into it -- which means the reader descended into a directory that did not
- * exist an instant ago, and the writer keyed an entry under it -- and then
- * the removal is asked for while that name is still there, and must be
- * refused.  Refusals are checked against the writer's own counter rather than
- * against the error code, because an error is also what a half-done edit
- * answers; the counter says whether anything happened.
+ * The directory this test makes, left on the volume for the next boot to
+ * find, as with the file above.  It also checks that the new directory is
+ * a directory to the rest of the kernel: a name is made inside it (the
+ * lookup descends into it, the writer keys an entry under it), and its
+ * removal is then refused while the name is there.  Outcomes are checked
+ * against the writer's own counters, not just the error codes, since a
+ * half-done edit also returns an error.
  */
 #define	SELFTEST_DIRS		"/etc/madedir"
 #define	SELFTEST_DIRS_SLASH	"/etc/madedir/"
 #define	SELFTEST_DIRS_FILE	"/etc/madedir/inside.txt"
 /*
- * The mode this test leaves on it, chosen because NOTHING ELSE PRODUCES IT: a
- * create here makes 0755, and a directory found wearing 0711 next boot got it
- * from a chmod that survived the machine being switched off.
+ * The mode this test leaves, which nothing else produces (mkdir here makes
+ * 0755): found next boot, it proves the chmod reached the platter.
  */
 #define	SELFTEST_DIRS_MODE	0711
 
@@ -2662,9 +2369,7 @@ fs_dirs_selftest(void)
 	}
 
 	if (had) {
-		/*
-		 * What a power cycle ago made and left.
-		 */
+		/* What the previous boot made and left. */
 		if (!st.fs_is_dir || st.fs_size != 0) {
 			kprintf("apfs-dirs: FAIL %s came back as %s of %llu "
 			    "bytes -- wanted a directory of none\n",
@@ -2673,11 +2378,8 @@ fs_dirs_selftest(void)
 			return;
 		}
 		/*
-		 * AND WEARING THE MODE THE LAST BOOT CHMODDED IT TO.  0755 is
-		 * accepted without complaint and reported: that is a directory
-		 * made by a boot from before chmod existed, and the first boot
-		 * on such an image would otherwise report a regression that is
-		 * really an upgrade.  Anything else is neither.
+		 * With the mode the previous boot set.  0755 is accepted too:
+		 * an image made before chmod existed.  Anything else fails.
 		 */
 		if ((st.fs_mode & 07777) == SELFTEST_DIRS_MODE)
 			kprintf("apfs-dirs: %s came back wearing %04o -- a "
@@ -2695,23 +2397,10 @@ fs_dirs_selftest(void)
 			return;
 		}
 		/*
-		 * IT MAY NOT COME BACK EMPTY, AND THAT IS NOT A FAILURE.
-		 *
-		 * This used to insist on empty, on the reasoning that the boot
-		 * which made it put a name in and took the name out, so
-		 * anything left meant a removal had not reached the disk.  That
-		 * reasoning held for exactly as long as nothing but this test
-		 * could write to the volume.  A person typing
-		 * `> /etc/madedir/hi.txt` at a real Apple shell -- which this
-		 * system now invites -- was enough to make the NEXT boot report
-		 * a regression that had not happened, and a test that cries
-		 * wolf about its own users is worse than one check short.
-		 *
-		 * So what survives the reboot is the claim worth making: the
-		 * directory is still a directory, it still lists, and whatever
-		 * it holds can still be taken out of it.  The names are cleared
-		 * and counted out loud, because a directory that will not empty
-		 * IS our bug.
+		 * It need not come back empty: a user may have written into it
+		 * from the shell.  The claim is that it still lists and can be
+		 * emptied; the names are cleared and reported, and failing to
+		 * empty it is a failure.
 		 */
 		held = dir_count(SELFTEST_DIRS, NULL, NULL);
 		if (held < 0) {
@@ -2799,9 +2488,8 @@ fs_dirs_selftest(void)
 	}
 
 	/*
-	 * A name is taken once, whatever kind of thing took it -- and asking
-	 * with the separator a directory is entitled to must reach the same
-	 * name, not a different one.
+	 * A name is taken once, whatever took it; with a trailing separator
+	 * it is still the same name.
 	 */
 	rv = fs_mkdir(SELFTEST_DIRS, 0755, NULL);
 	if (rv != FS_E_EXIST) {
@@ -2838,10 +2526,9 @@ fs_dirs_selftest(void)
 	}
 
 	/*
-	 * And a name INSIDE it, which is the part no amount of checking the
-	 * record could stand in for: the lookup descends into a directory this
-	 * kernel made a moment ago, the create keys an entry under its object
-	 * id, and the removal must then refuse while that entry is there.
+	 * A name inside it: the lookup descends into the new directory, the
+	 * create keys an entry under its object id, and removal must then be
+	 * refused.
 	 */
 	rv = fs_create(SELFTEST_DIRS_FILE, 0644, NULL);
 	if (rv == FS_E_NOALLOC) {
@@ -2900,15 +2587,7 @@ fs_dirs_selftest(void)
 		return;
 	}
 
-	/*
-	 * AND IT IS LEFT WEARING A MODE NOTHING ELSE WOULD PRODUCE.
-	 *
-	 * A chmod that reached a cache and no further answers every question
-	 * asked during this boot perfectly.  0711 is not a mode any create
-	 * here produces, so a directory that comes back wearing it next boot
-	 * can only have got it from a chmod that reached the platter -- which
-	 * is the one claim about chmod a single boot cannot make.
-	 */
+	/* Left with SELFTEST_DIRS_MODE for the next boot to find. */
 	rv = fs_chmod(SELFTEST_DIRS, SELFTEST_DIRS_MODE);
 	if (rv != FS_E_OK) {
 		kprintf("apfs-dirs: FAIL chmod of %s answered %d\n",
@@ -2938,22 +2617,14 @@ fs_dirs_selftest(void)
 }
 
 /*
- * WHAT A SHELL LEFT ON THE DISK, ONE BOOT AGO
+ * What a shell left on the disk one boot ago.  The file is written by dash
+ * redirecting into it (open(2) with O_CREAT, dup2 onto fd 1, echo) during
+ * the previous boot, after this test has run; so the first boot skips, and
+ * every later one checks that bytes a ring-3 program wrote survived a
+ * power cycle.
  *
- * Every other test here writes through this layer and reads back through it,
- * which proves the writer and proves nothing about who can reach it.  This one
- * cannot be satisfied by anything the kernel does: the file it looks for is
- * made by dash redirecting into it -- open(2) with O_CREAT, dup2 onto fd 1,
- * and the shell's own `echo` -- during the PREVIOUS boot, and by then this has
- * already run and found nothing.
- *
- * So the first boot skips, every boot after it checks, and what it checks is
- * that bytes a ring-3 program wrote survived a power cycle.  A write that
- * reached a cache and no further answers this with a missing file.
- *
- * The two lines are spelled out here and in user/hello.c, which is a
- * duplication on purpose: if the demo changes what it writes, this fails
- * loudly rather than quietly checking nothing.
+ * The text is duplicated in user/hello.c on purpose: if the demo changes,
+ * this fails rather than checking nothing.
  */
 #define	SELFTEST_SHELL		"/etc/notes.txt"
 #define	SELFTEST_SHELL_TEXT	"a line from a real Apple shell\n" \
@@ -2984,16 +2655,10 @@ fs_shell_selftest(void)
 		goto done;
 	}
 	/*
-	 * EMPTY IS A STATE THE DISK CAN HONESTLY BE IN, and it is worth
-	 * naming rather than failing on.  A redirection is two events -- the
-	 * file is created and emptied by open(2), then written -- and a
-	 * checkpoint is allowed to land between them, so a machine switched
-	 * off there leaves exactly this: the name, with nothing in it.  That
-	 * is a crash-consistent midpoint the checkpoint boundary exists to
-	 * produce, not a write that went missing.  (Under the deferred
-	 * policy the file can also be missing entirely, which the NOTFOUND
-	 * branch above already forgives.)  Anything ELSE in the file is a
-	 * failure, because nothing but the shell writes here.
+	 * Empty is a legal state: a redirection creates the file, then
+	 * writes it, and a checkpoint may land in between; power off there
+	 * leaves the name with nothing in it.  (It can also be missing
+	 * entirely, handled above.)  Any other content is a failure.
 	 */
 	if (h.fh_size == 0) {
 		kprintf("apfs-shell: %s is there but empty -- a boot was "
@@ -3022,11 +2687,14 @@ fs_shell_selftest(void)
 	    "into %s in an earlier boot are still there, byte for byte\n",
 	    (unsigned)wantlen, SELFTEST_SHELL);
 done:
-	/* As in the tests above: the claim goes back however this ended. */
+	/* As in the tests above: the hold is released on every path. */
 	(void)fs_close(&h);
 }
 
-/* As above, and about a node that is asked to run out of room. */
+/*
+ * Backend self-tests, each run under fs_lock as fs_ckpt_selftest is.  This
+ * one: a node asked to run out of room.
+ */
 void
 fs_split_selftest(void)
 {
@@ -3038,7 +2706,7 @@ fs_split_selftest(void)
 	mutex_unlock(&fs_lock);
 }
 
-/* As above, and about the same file every other write test uses. */
+/* And about the same file every other write test uses. */
 void
 fs_data_selftest(void)
 {
@@ -3051,9 +2719,9 @@ fs_data_selftest(void)
 }
 
 /*
- * As above, and about a node that stops starting where its parent says.  The
- * clock is passed in because fs/apfs/apfs.c has none -- the same reason create and
- * unlink take a timestamp rather than reading one.
+ * And about a node that stops starting where its parent says.  The time
+ * is passed in: fs/apfs/apfs.c reads no clock, which is also why create
+ * and unlink take a timestamp.
  */
 void
 fs_index_selftest(void)
@@ -3127,22 +2795,10 @@ fs_move_selftest(void)
 }
 
 /*
- * IS ANYTHING STILL HELD?
- *
- * Asked at the end of the boot's self-tests, and it is not bookkeeping.  A
- * handle became a CLAIM in this rung, and a claim dropped on the floor is
- * invisible: the row stays, the file stays counted, and the next unlink of
- * that file quietly does the RIGHT thing for a held file -- takes the name and
- * leaves the bytes waiting for a close that will never come.  The volume is
- * valid, every test passes, and an orphan nobody asked for rides to the next
- * boot.
- *
- * Which is exactly what happened.  These tests had twenty-odd exits between
- * them and gave nothing back at any of them; the second boot of an acceptance
- * run reported apfs-make's removal as an ORPHANING, and three boots later the
- * allocation bitmap was wrong.  Nothing failed until then.  So the invariant
- * gets asked for out loud, at the one moment it is knowable: after the tests
- * and before anything a user runs.
+ * Is anything still held?  Asked after the self-tests and before anything
+ * a user runs, the one moment the answer must be "nothing".  A leaked hold
+ * is otherwise invisible: the next unlink of that file correctly takes
+ * only the name, and the bytes wait for a close that never comes.
  */
 void
 fs_open_check(void)
@@ -3184,22 +2840,13 @@ fs_orphan_selftest(void)
 }
 
 /*
- * A RENAME LANDS ON A NAME SOMETHING IS READING
+ * A rename lands on a name something is reading.  The writer's own test
+ * (apfs-clobber, run first) proves the records.  This proves the promise
+ * about descriptors: a holder of the old file goes on reading it, from
+ * the platter, while every open of the name gets the new one.
  *
- * The writer's own test (apfs-clobber, run first below) proves the records:
- * the name answers with the newcomer, the occupant waits whole in the private
- * directory.  What only THIS layer can prove is the promise those records
- * exist for, because it is a promise about descriptors: a program that had
- * the old file open goes on reading the old file -- to the last byte, from
- * the platter, not from anything cached at open time -- while every open of
- * the name gets the new one.  Two files under one name at once, each to the
- * reader it belongs to.
- *
- * And the row is checked by name: after the rename the victim's row must say
- * NAMELESS, and after the close it must be gone -- because the close is where
- * the file actually stops existing, and a scene that only read bytes would
- * pass with the reap broken and the volume quietly keeping every replaced
- * file.
+ * The victim's row is checked too: nameless after the rename, gone after
+ * the close, since the close is where the file is reaped.
  */
 #define	FS_CLOB_NAME	"/etc/usurped.txt"
 #define	FS_CLOB_TEMP	"/etc/usurper.txt"
@@ -3258,10 +2905,7 @@ fs_clobber_scene(void)
 	if (fail == NULL && fs_rename(FS_CLOB_TEMP, FS_CLOB_NAME) != FS_E_OK)
 		fail = "the rename onto the held name was refused";
 
-	/*
-	 * The row: the occupant must now be marked nameless, and not because
-	 * this function marked it.
-	 */
+	/* The rename must have marked the occupant's row nameless. */
 	if (fail == NULL) {
 		mutex_lock(&fs_lock);
 		fo = open_row(vino);
@@ -3352,17 +2996,13 @@ fs_seek_selftest(void)
 }
 
 /*
- * WHAT A KILL DOES TO A TASK THAT IS WRITING TO THE DISK -- the scene the
- * mutex-kill selftest (kern/mutex.c) plays with the driver taken out, played
- * here with the driver in.  The victim hammers pwrites at a scratch file, so
- * at any given moment it is probably parked inside ata_wait_intr holding
- * fs_lock; the kill's wake fan-out breaks it out of that park, and before
- * th_mutex_depth the post-wake check retired it right there -- fs_lock died
- * with it, the ATA channel's ch_waiter slot kept its name, and the next
- * thing to touch the volume parked for ever.  Now the kill declines while
- * the lock is held: the victim surfaces from the write it was killed in,
- * reads its own death warrant between operations, and leaves with the lock
- * returned.  The proof is that the volume still answers afterwards.
+ * A kill landing on a task that is writing to the disk: mutex_kill_selftest
+ * (kern/mutex.c) with the driver in.  The victim hammers pwrites at a
+ * scratch file, so it is probably parked in ata_wait_intr holding fs_lock
+ * when the kill's wake arrives.  The kill is declined while a mutex is held
+ * (th_mutex_depth): the victim finishes the write, sees the kill between
+ * operations and leaves with the lock returned.  The volume must still
+ * answer afterwards.
  */
 #define	FK_FILE		"/var/db/kill-arena"
 #define	FK_SIZE		(64u * 1024u)
@@ -3394,10 +3034,8 @@ fs_kill_entry(void *arg)
 				break;
 			fk_ops++;
 			/*
-			 * A kernel-side worker has no syscall boundary, so
-			 * it reads its own death warrant where it holds
-			 * nothing -- between operations, with fs_lock
-			 * given back by the pwrite that took it.
+			 * No syscall boundary in a kernel worker: check for
+			 * the kill between operations, holding nothing.
 			 */
 			if (task_kill_pending(current_thread->th_task))
 				break;
@@ -3517,22 +3155,15 @@ fs_kill_selftest(void)
 }
 
 /*
- * THE PUBLISHED PAST, BY NAME -- what only this layer can prove.
+ * The published past by name, at this layer.  apfs-view (the backend's
+ * test) proves the mechanism.  This proves the promise about paths and
+ * descriptors: /.xid/<N>/etc/x answers with the bytes fsync published at
+ * N, /.xid lists what can be reached, every change under it is refused
+ * with FS_E_ROFS, and a handle onto the past reads until the window moves
+ * and then answers FS_E_GONE.
  *
- * apfs-view (run first, from the backend's own tests) proves the mechanism:
- * a checkpoint's spine resolves, its blocks read as they were, the window
- * has the width the free queue prices it at.  What THIS proves is the
- * promise a program can actually use, which is a promise about paths and
- * descriptors: that /.xid/<N>/etc/x answers with the bytes fsync published at
- * N, that /.xid lists what can be reached, that every way of changing
- * something under it is refused with the same word, and -- the half only a
- * descriptor can show -- that a handle opened onto the past goes on reading
- * it until the window moves, and then says GONE rather than something else.
- *
- * Checkpoints are counted from what fs_apfs_xid reports after each sync
- * rather than assumed to advance by one: the room-forced checkpoint of the
- * policy is allowed to land inside this test, and the claims are written so
- * that it may.
+ * Checkpoints are taken from fs_apfs_xid after each sync, not assumed to
+ * advance by one: a room-forced checkpoint may land inside the test.
  */
 #define	FS_VIEW_FILE	"/etc/viewpath.txt"
 #define	FS_VIEW_SCRATCH	"/etc/viewpath-scratch.txt"
@@ -3770,12 +3401,9 @@ fs_view_selftest(void)
 	}
 
 	/*
-	 * The window slides: two more publications, and what the free queue
-	 * lets go of is decided by its retention and not by this test -- so
-	 * the claims below are made about the listing's own width.  The
-	 * handle from before the slide is asked afterwards, which is the
-	 * moment a descriptor learns the difference between a snapshot and a
-	 * view.
+	 * Slide the window with two more publications.  What the free queue
+	 * lets go of is its retention's decision, so the claims below are
+	 * about the listing's own width; then the old handle is asked again.
 	 */
 	rv = fs_unlink(FS_VIEW_FILE);
 	if (rv == FS_E_OK)

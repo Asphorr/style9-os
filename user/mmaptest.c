@@ -6,34 +6,23 @@
  */
 
 /*
- * mmaptest -- a self-authored Darwin-ABI probe for mmap(2), in the same role
- * timeprobe played for the wall clock and pipefork for fork/exec: prove the
- * syscall from ring 3 with a small binary built by the real toolchain, before
- * anything larger leans on it.
+ * mmaptest -- a self-authored Darwin-ABI probe for mmap(2), as timeprobe
+ * is for the clock and pipefork for fork/exec: a small binary built by the
+ * real toolchain proves the syscall before anything larger leans on it.
  *
- * The interesting checks are the ones that are about demand paging rather than
- * about mmap's return value:
+ * The checks that matter are about demand paging:
  *
- *	- a mapping far larger than the memory in the machine still succeeds,
- *	  because nothing is allocated until it is touched;
- *
- *	- a page the KERNEL writes first (read(2) into a fresh mapping) is
- *	  filled just like one the program writes.  That fault arrives from
- *	  ring 0 rather than ring 3, on the same page, and before demand
- *	  paging it could only have been a bug;
- *
- *	- a file mapping's bytes are the file's bytes -- compared against what
- *	  read(2) returns for the same offsets, including an offset far enough
- *	  in to need a page the first fault did not bring;
- *
- *	- the tail of the last page of a file mapping reads as zero, which is
- *	  the one promise mmap makes that a file cannot keep by itself;
- *
- *	- unmapping a page out of the MIDDLE of a file mapping leaves the pages
- *	  on either side of it mapped and still showing their own part of the
- *	  file.  That is a question about the map's ability to cut an entry in
- *	  two, and about the offset arithmetic in the cut, which nothing else
- *	  here would notice going wrong.
+ *	- a mapping far larger than the machine's memory succeeds, since
+ *	  nothing is allocated until touched;
+ *	- a page the kernel writes first (read(2) into a fresh mapping) is
+ *	  filled like one the program writes; that fault comes from ring 0;
+ *	- a file mapping's bytes equal what read(2) returns at the same
+ *	  offsets, including one that needs a page the first fault did not
+ *	  bring;
+ *	- the tail of a file mapping's last page reads as zero;
+ *	- unmapping a page from the middle of a file mapping leaves both
+ *	  sides mapped and showing their own part of the file, which tests
+ *	  splitting a map entry and the offset arithmetic of the split.
  */
 
 typedef __UINT8_TYPE__		uint8_t;
@@ -81,9 +70,9 @@ bad(const char *what)
 }
 
 /*
- * Anonymous memory: it must arrive zeroed, hold what is written to it, and be
- * returnable.  The 64 KiB here is deliberately more than one page, so a write
- * at the far end proves a second fault was serviced and not just the first.
+ * Anonymous memory arrives zeroed, holds what is written, and can be
+ * returned.  64 KiB spans many pages, so more than the first fault is
+ * serviced.
  */
 static void
 test_anon(void)
@@ -119,11 +108,10 @@ test_anon(void)
 }
 
 /*
- * The point of laziness: ask for far more than the machine has.  This map is
- * 64 MiB on a machine with 127 MiB of RAM, most of it already spoken for, and
- * it succeeds because none of it exists yet.  Touching three pages should cost
- * three frames -- the kernel's fault counters are where that is visible; from
- * here all that can be checked is that it works at all.
+ * Ask for more than is free: 64 MiB on a 128 MiB guest with most of it in
+ * use succeeds because none of it exists yet.  Touching three pages should
+ * cost three frames; only the kernel's fault counters can show that, so
+ * here we check that it works.
  */
 static void
 test_lazy(void)
@@ -149,11 +137,9 @@ test_lazy(void)
 }
 
 /*
- * A page whose first toucher is the kernel.  read(2) copies into a mapping
- * this program has never written, so the fault comes from ring 0 in the middle
- * of a syscall rather than from the instruction stream.  Nothing else in the
- * system exercises that path, and it is the one that turns "mmap works" into
- * "mmap'd memory is memory".
+ * A page first touched by the kernel: read(2) into an unwritten mapping
+ * faults from ring 0 in the middle of a syscall, a path nothing else here
+ * exercises.
  */
 static void
 test_kernel_writes(const char *path)
@@ -205,10 +191,9 @@ test_kernel_writes(const char *path)
 }
 
 /*
- * The file mapping.  Compared against read(2) at three offsets: the very
- * start, a point deep enough to need a page no earlier fault brought in, and
- * the last bytes of the file.  Then the tail of the final page, which belongs
- * to no part of the file and has to read as zero.
+ * The file mapping, compared with read(2) at the start, at a page no
+ * earlier fault brought in, and at the last byte; then everything past
+ * EOF must read as zero.
  */
 static void
 test_file(const char *path)
@@ -234,11 +219,8 @@ test_file(const char *path)
 	}
 
 	/*
-	 * One page more than the file needs, deliberately.  A mapping longer
-	 * than the thing it maps is legal, and every byte past the end has to
-	 * read as zero -- including a whole page that no part of the file
-	 * reaches, which is the case a file whose length happens to be a
-	 * multiple of the page size would otherwise never test.
+	 * One page more than the file needs, so a whole page lies past EOF
+	 * even when the file length is a page multiple; it must read as zero.
 	 */
 	span = ((size + 0xFFFu) & ~(uint64_t)0xFFFu) + 4096u;
 	p = mmap(NULL, span, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -290,7 +272,7 @@ test_file(const char *path)
 	} else
 		bad("could not read the tail of the test file");
 
-	/* Past end-of-file, inside the last page: zero, by promise. */
+	/* Past end-of-file: zero. */
 	if (span > size) {
 		for (i = (size_t)size; i < (size_t)span; i++) {
 			if (p[i] != 0) {
@@ -326,10 +308,8 @@ test_refusals(void)
 		bad("munmap of a range nobody mapped succeeded");
 
 	/*
-	 * Half a mapping is now legal, so what is left to refuse is a range
-	 * with a hole in it: unmap the front page, then ask for both pages.
-	 * The second page is still there and the first is not, and this kernel
-	 * would rather say so than quietly do half the job.
+	 * Unmapping part of a mapping is allowed; a range with a hole is
+	 * not.  Unmap the front page, then ask for both.
 	 */
 	p = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE,
 	    -1, 0);
@@ -348,17 +328,10 @@ test_refusals(void)
 }
 
 /*
- * Cutting a file mapping in two.
- *
- * Unmapping a page out of the middle leaves two mappings where there was one,
- * and the half ABOVE the cut is the interesting one: it begins further into
- * the file by exactly the distance the cut moved, and a kernel that forgets to
- * carry that offset across produces a mapping that looks perfectly healthy
- * while showing the wrong part of the file.  Nothing but comparing bytes finds
- * it, and only on a page that was never touched before the cut -- a page that
- * had already faulted in holds the right bytes no matter what the entry says.
- *
- * So: map, touch nothing, cut, and only then look.
+ * Cutting a file mapping in two.  The half above the cut starts further
+ * into the file by the distance the cut moved; a kernel that drops that
+ * offset shows the wrong part of the file.  Only a page not faulted in
+ * before the cut can reveal it, so: map, touch nothing, cut, then look.
  */
 static void
 test_cut(const char *path)
@@ -409,9 +382,8 @@ test_cut(const char *path)
 	}
 
 	/*
-	 * The comparison below can only catch a lost offset when the file
-	 * actually differs at the two places.  Say so if it does not, rather
-	 * than pass for a reason that has nothing to do with the kernel.
+	 * A lost offset is only visible if the file differs at the two
+	 * places; otherwise skip rather than pass vacuously.
 	 */
 	differs = 0;
 	for (i = 0; i < sizeof(head); i++) {
@@ -475,11 +447,7 @@ test_cut(const char *path)
 		bad("munmap of the half above the cut failed");
 
 	(void)close(fd);
-	/*
-	 * Only claim it if it held.  A conclusion printed regardless of the
-	 * result is worse than no conclusion: the log then says the thing
-	 * worked two lines under the FAIL that says it did not.
-	 */
+	/* Claim success only if no check above failed. */
 	if (fail == before)
 		printf("mmaptest: cut a page out of the middle -- both halves "
 		    "still hold their own part of the file\n");

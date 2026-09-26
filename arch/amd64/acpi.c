@@ -16,11 +16,9 @@
 #include "pmm.h"
 
 /*
- * Where the Root System Description Pointer is allowed to be.  Two windows,
- * and both must be looked in: the first kilobyte of the Extended BIOS Data
- * Area, whose segment address is a 16-bit word the BIOS leaves at physical
- * 0x40E, and the BIOS read-only region at the top of the first megabyte.  The
- * structure is 16-byte aligned in both.
+ * Where the RSDP may be, 16-byte aligned: the first KiB of the EBDA (its
+ * real-mode segment is the word at physical 0x40E), and the BIOS region
+ * 0xE0000-0xFFFFF.
  */
 #define	ACPI_EBDA_PTR		0x40E
 #define	ACPI_BIOS_LOW		0xE0000
@@ -31,11 +29,9 @@
 #define	ACPI_RSDP_SIG_LEN	8
 
 /*
- * The checksummed prefix of the RSDP.  Revision 0 checksums 20 bytes and stops
- * there; revision 2 and up append a length and a 64-bit XSDT pointer and
- * checksum the whole thing again.  The first 20 bytes are checked either way,
- * so a revision-2 table with a broken extended checksum still yields a usable
- * RSDT rather than nothing.
+ * The RSDP prefix covered by the revision-0 checksum.  Revision 2+ adds a
+ * length, the XSDT pointer and an extended checksum; only these 20 bytes
+ * are checked, so a bad extended checksum still leaves a usable RSDT.
  */
 #define	ACPI_RSDP_V1_LEN	20
 
@@ -52,11 +48,8 @@ struct acpi_rsdp {
 } __attribute__((packed));
 
 /*
- * Every ACPI table starts with this, and the length in it is the length of the
- * whole table including the header.  The walk trusts that length for exactly
- * one thing -- how much to checksum -- and re-derives everything else, because
- * a length is the one field a corrupt table uses to make a reader run off the
- * end.
+ * Common table header; sh_length covers the whole table.  It is bounded
+ * against the identity map before it is used to checksum or walk.
  */
 struct acpi_sdt {
 	char		sh_signature[4];
@@ -79,9 +72,8 @@ struct acpi_madt {
 #define	ACPI_MADT_PCAT_COMPAT	(1u << 0)
 
 /*
- * MADT entry types.  Only the four that describe processors and interrupt
- * plumbing are named; the rest are skipped by length, which is why the length
- * is validated before it is used to advance.
+ * MADT entry types.  Any the walk does not handle is skipped by its
+ * length, which is validated before it is used to advance.
  */
 #define	ACPI_MADT_LAPIC		0
 #define	ACPI_MADT_IOAPIC	1
@@ -124,9 +116,8 @@ struct acpi_madt_x2apic {
 } __attribute__((packed));
 
 /*
- * A processor entry is usable if it is ENABLED, or if it is ONLINE_CAPABLE,
- * which is ACPI's way of saying "not running but could be started".  Neither
- * bit set means the firmware is describing a socket with nothing in it.
+ * A processor entry is usable if ENABLED or ONLINE_CAPABLE ("not running,
+ * but could be started"); neither bit means an empty socket.
  */
 #define	ACPI_LAPIC_ENABLED	(1u << 0)
 #define	ACPI_LAPIC_ONLINE_CAP	(1u << 1)
@@ -146,32 +137,10 @@ static const struct acpi_sdt	*acpi_find_table(const struct acpi_rsdp *rp,
 static void			 acpi_madt_walk(const struct acpi_madt *ma);
 
 /*
- * Sum of bytes must be zero mod 256.  This is the only integrity check ACPI
- * offers, and it is worth applying to every table rather than to the first
- * one: the tables are built by firmware that also has bugs, and a table that
- * fails here is one this kernel would otherwise believe.
- */
-/*
- * Read a table entry a byte at a time.
- *
- * Not fussiness: the XSDT's array of 64-bit pointers begins at offset 36, so
- * every entry in it is four-byte aligned and none of them is eight -- a
- * uint64_t load through a plain pointer would be reading an object at an
- * address that cannot hold one.  x86 tolerates that in hardware and the
- * language does not, which is the combination that produces code working until
- * the compiler picks a different instruction.  Spelling out the byte order also
- * says what ACPI's is: little-endian, always, whatever the machine's.
- */
-/*
- * One byte of physical memory, through the identity map.
- *
- * The address goes through a volatile local before it becomes a pointer, and
- * that indirection is the entire content of this function.  Handed a LITERAL
- * address, the compiler concludes the pointer refers to no declared object and
- * warns that every subscript of it is out of the bounds of nothing
- * (-Warray-bounds over `void[0]').  It is not wrong: C has no way to say "this
- * integer is an address the firmware chose".  Forcing the value through memory
- * it must actually load is how one says it anyway.
+ * One byte of physical memory, through the identity map.  The address
+ * passes through a volatile local: given a literal address, the compiler
+ * decides the pointer names no object and warns (-Warray-bounds over
+ * `void[0]').
  */
 static uint8_t
 acpi_peek8(uint64_t pa)
@@ -184,6 +153,11 @@ acpi_peek8(uint64_t pa)
 	return (*p);
 }
 
+/*
+ * Read a table entry a byte at a time, little-endian as ACPI always is.
+ * The XSDT's 64-bit pointers start at offset 36, so they are only 4-byte
+ * aligned, and a plain uint64_t load from them is undefined behaviour.
+ */
 static uint32_t
 acpi_read32(const uint8_t *p)
 {
@@ -208,6 +182,10 @@ acpi_read64(const uint8_t *p)
 	return (v);
 }
 
+/*
+ * Bytes must sum to zero mod 256: ACPI's only integrity check, applied to
+ * every table.
+ */
 static bool
 acpi_sum_ok(const void *p, size_t len)
 {
@@ -223,11 +201,9 @@ acpi_sum_ok(const void *p, size_t len)
 }
 
 /*
- * The tables are read through the boot identity map, which reaches one
- * gigabyte.  Every physical address taken out of a table is checked against
- * that before it is dereferenced -- firmware puts these tables in low memory
- * on every machine anyone has met, but "on every machine anyone has met" is
- * not a bound, and the fault would be a page fault in the middle of a probe.
+ * The tables are read through the boot identity map (PMM_HARD_CAP_BYTES,
+ * 1 GiB).  Every physical address taken from a table is checked against it
+ * before use; firmware keeps them low in practice, but nothing promises it.
  */
 static bool
 acpi_in_identity_map(uint64_t pa, size_t len)
@@ -264,10 +240,8 @@ acpi_scan_window(uint64_t base, uint64_t end)
 			continue;
 
 		/*
-		 * Signature without checksum is not a find.  The eight bytes
-		 * "RSD PTR " appear in the middle of other things -- a BIOS
-		 * that copied a table, a string in an option ROM -- and
-		 * following one of those leads to a table walk over nonsense.
+		 * A signature without a good checksum is not a find: "RSD PTR "
+		 * also turns up in stale copies and option-ROM strings.
 		 */
 		if (!acpi_sum_ok(rp, ACPI_RSDP_V1_LEN)) {
 			kprintf("acpi: rsdp signature at 0x%llx fails its "
@@ -286,13 +260,8 @@ acpi_find_rsdp(void)
 	uint64_t			 ebda;
 
 	/*
-	 * EBDA first, because that is where it is on a machine that has one,
-	 * and the BIOS region below is where it is on a machine that does not.
-	 * The word at 0x40E is a real-mode SEGMENT, so it is shifted, not
-	 * used: a value of 0x9FC0 means physical 0x9FC00.
-	 *
-	 * Read a byte at a time through acpi_peek8 -- see there for why a
-	 * literal address needs help getting past the compiler.
+	 * EBDA first, then the BIOS region.  The word at 0x40E is a real-mode
+	 * segment (0x9FC0 means physical 0x9FC00), read through acpi_peek8.
 	 */
 	if (acpi_in_identity_map(ACPI_EBDA_PTR, 2)) {
 		ebda = (uint64_t)(acpi_peek8(ACPI_EBDA_PTR) |
@@ -308,10 +277,9 @@ acpi_find_rsdp(void)
 }
 
 /*
- * Validate one table at a physical address and, optionally, insist on a
- * signature.  Two-step on purpose: the header has to be readable before its
- * length can be trusted, and the length has to be sane before the checksum
- * can be taken over it.
+ * Validate one table at a physical address, optionally insisting on a
+ * signature.  The header must be mapped before its length is read, and
+ * the length sane before the checksum is taken over it.
  */
 static const struct acpi_sdt *
 acpi_table_at(uint64_t pa, const char *sig)
@@ -340,12 +308,9 @@ acpi_table_at(uint64_t pa, const char *sig)
 }
 
 /*
- * Walk the root table's array of pointers looking for one signature.  The XSDT
- * is preferred where the RSDP offers it, because on a machine whose tables sit
- * above four gigabytes the RSDT physically cannot describe them -- its entries
- * are 32 bits wide.  If the XSDT does not check out, the RSDT is still tried:
- * two roots describing the same tables is ACPI's own redundancy and there is no
- * reason to refuse the working one.
+ * Find a table by signature through the root table.  The XSDT is preferred
+ * when offered (the RSDT's 32-bit entries cannot reach tables above 4 GiB);
+ * if it does not check out or lacks the table, the RSDT is tried.
  */
 static const struct acpi_sdt *
 acpi_find_table(const struct acpi_rsdp *rp, const char *sig)
@@ -409,10 +374,8 @@ acpi_madt_walk(const struct acpi_madt *ma)
 		me = (const struct acpi_madt_entry *)(const void *)p;
 
 		/*
-		 * A zero or short length would make this loop stand still or
-		 * step backwards, so it ends the walk rather than being
-		 * skipped: after a length nobody can trust, the position of
-		 * every following entry is a guess.
+		 * A short or overlong length ends the walk: after it, every
+		 * following entry's position is a guess.
 		 */
 		if (me->me_len < sizeof(*me) || p + me->me_len > end) {
 			kprintf("acpi: madt entry at +%u has length %u -- "
@@ -453,12 +416,9 @@ acpi_madt_walk(const struct acpi_madt *ma)
 			    ACPI_LAPIC_ONLINE_CAP)) == 0)
 				break;
 			/*
-			 * Counted and named, not registered.  An x2APIC-only
-			 * processor is one this kernel cannot address: the
-			 * driver speaks the MMIO interface, and ids above 254
-			 * do not fit in the register that sends a startup
-			 * message.  Saying so is better than a table that
-			 * quietly describes more CPUs than ever start.
+			 * Counted and reported, not registered: the driver
+			 * speaks xAPIC MMIO, whose ICR cannot address an id
+			 * above 254.
 			 */
 			x2apic_seen++;
 			break;
@@ -482,11 +442,7 @@ acpi_madt_walk(const struct acpi_madt *ma)
 				break;
 			mo = (const struct acpi_madt_lapic_ovr *)
 			    (const void *)p;
-			/*
-			 * The 64-bit address wins over the 32-bit one in the
-			 * table header, which is the entire point of the
-			 * entry existing.
-			 */
+			/* Overrides the header's 32-bit address. */
 			acpi_lapic_base = mo->mo_pa;
 			kprintf("acpi:   lapic address overridden to "
 			    "0x%llx\n", (unsigned long long)mo->mo_pa);
@@ -557,12 +513,9 @@ acpi_madt_probe(void)
 	acpi_madt_walk(ma);
 
 	/*
-	 * THE CROSS-CHECK, and the reason this probe is more than a printout:
-	 * the address above came from a table the firmware wrote, and the one
-	 * below came from a register on this processor.  Two independent
-	 * sources agreeing is evidence; one source is a claim.  They can
-	 * legitimately differ only if this CPU's APIC has been relocated,
-	 * which nothing here does.
+	 * Cross-check the firmware's APIC address against this CPU's
+	 * IA32_APIC_BASE MSR.  They may differ only if the APIC was
+	 * relocated, which nothing here does.
 	 */
 	hw = lapic_base_pa();
 	if (hw != 0 && acpi_lapic_base != 0 && hw != acpi_lapic_base)

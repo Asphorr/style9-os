@@ -9,65 +9,40 @@
 #define	_MACHINE_CPU_H_
 
 /*
- * Per-CPU state, and how a CPU finds its own.
+ * Per-CPU state, and how a CPU finds its own: through the GS segment base,
+ * set once per CPU, which makes `%gs:0' its block with nothing to look up.
+ * An array indexed by CPU id would need the id first, and reading it from
+ * the local APIC needs the APIC mapped.  cp_self, at offset zero, holds the
+ * block's own address because a segment-relative reference cannot produce
+ * a pointer.
  *
- * WHAT THIS REPLACES.  Everything a CPU needs to know about itself was a
- * plain global: which thread is running (current_thread), which stack a
- * SYSCALL lands on (syscall_kernel_rsp), how deep this CPU is inside
- * critical sections (preempt_count), whether it owes a reschedule
- * (need_resched), which thread to fall back on when nothing is runnable
- * (idle_thread).  Every one of those is a per-CPU quantity that happened to
- * be correct as a global because there was one CPU, and every new line of
- * kernel code written against them made the eventual move more expensive.
- * So the move comes first, on one CPU, where the answer is known: nothing
- * about the system's behaviour may change, and the whole boot must say so.
+ * Loading a segment register zeroes its base.  In long mode the %fs/%gs
+ * base lives only in the MSR, and `movw %ax, %gs' loads the descriptor's
+ * base, zero for every flat descriptor here -- so a stray %gs reload points
+ * this CPU's block at physical page zero.  Nothing may reload %gs once the
+ * base is set.
  *
- * HOW A CPU FINDS ITS BLOCK: the GS segment base.  Not an array indexed by
- * an id, because getting the id is the problem -- reading the local APIC
- * needs the APIC mapped, and a CPU coming up needs its stack and its
- * curthread before it has mapped anything.  The GS base is a register, set
- * once per CPU, and `%gs:0' is then one memory reference away from the
- * block with nothing to look up.  That is also why cp_self sits at offset
- * zero and holds the block's own linear address: a segment-relative
- * reference cannot produce a pointer, so the block stores one.
- *
- * ⚠ LOADING A SEGMENT REGISTER ZEROES ITS BASE.  In long mode the base of
- * %fs/%gs lives only in the MSR; writing the register from a descriptor
- * (movw %ax, %gs) loads that descriptor's base, which is zero for every
- * flat descriptor in our GDT.  So a stray %gs reload silently points this
- * CPU's per-CPU block at physical address zero, and the first thing to
- * notice is a corrupted low page.  gdt_init_cpu used to reload %gs along
- * with the other segment registers and no longer does; nothing else in the
- * kernel may either.
- *
- * ⚠ RING 3 SHARES THE BASE, deliberately, for now.  A Darwin binary reaches
- * its thread-local storage through %gs, so a real Darwin kernel keeps the
- * user value in the register and the kernel value in
- * IA32_KERNEL_GS_BASE, exchanging them with SWAPGS at every entry and
- * exit.  We have no ring-3 %gs user yet -- ring 3 ran with a zero base and
- * therefore never touched %gs at all -- so the base stays the kernel's in
- * both rings and no entry path needs swapgs.  That is a debt with a known
- * shape and a known price: the day a thread wants TLS, swapgs goes into
- * syscall_entry, isr_common and their two return paths, and NOT into the
- * NMI/#DF paths without the CS-check that keeps a nested entry from
- * swapping twice.  Until then a ring-3 %gs reference faults, which is what
- * it did before.
+ * Ring 3 shares the base, for now.  A Darwin binary reaches its TLS
+ * through %gs, so a real Darwin kernel keeps the user base in the register
+ * and the kernel's in IA32_KERNEL_GS_BASE, exchanging them with SWAPGS on
+ * every entry and exit.  Nothing in ring 3 uses %gs yet, so no entry path
+ * swaps.  The day a thread wants TLS, swapgs goes into syscall_entry,
+ * isr_common and their return paths -- and into the NMI/#DF paths only
+ * with the CS check that keeps a nested entry from swapping twice.  Until
+ * then a ring-3 %gs reference faults.
  */
 
 /*
- * Offsets the assembler needs.  syscall_entry.S reaches three fields
- * through %gs and cannot ask the compiler where they are, so they are
- * spelled out here and checked against the struct below -- a drift between
- * the two would land a syscall frame on the wrong stack, which is the kind
- * of bug that reads as random memory corruption several subsystems away.
+ * Offsets the assembler needs: syscall_entry.S reaches the two rsp fields
+ * through %gs, curcpu() reads CPU_SELF.  Checked against the struct below;
+ * a drift would land a syscall frame on the wrong stack.
  */
 #define	CPU_SELF		0
 #define	CPU_KERNEL_RSP		8
 #define	CPU_USER_RSP		16
 
 /*
- * How many CPUs the kernel is willing to bring up.  Sized for the machines
- * this runs on rather than for the architecture; raising it costs one
+ * How many CPUs the kernel will bring up.  Raising it costs one
  * cache-line-aligned block each in .data.
  */
 #define	MAXCPU			8
@@ -80,12 +55,7 @@
 
 struct thread;
 
-/*
- * Cache-line aligned so two CPUs updating their own counters do not fight
- * over one line.  On a single CPU that costs padding and buys nothing; it
- * is here because the cost of remembering later is a performance mystery
- * rather than a compile error.
- */
+/* Cache-line aligned so CPUs updating their own counters share no line. */
 struct cpu {
 	struct cpu		*cp_self;	/* (c) this block's address */
 	uint64_t		 cp_kernel_rsp;	/* (i) SYSCALL lands here   */
@@ -99,33 +69,25 @@ struct cpu {
 	uint32_t		 cp_acpi_id;	/* (c) as the MADT names it */
 
 	/*
-	 * Set by this CPU itself once it is running kernel code, and read by
-	 * whoever started it to find out whether it arrived.  Volatile
-	 * because that reader spins on it, and written last of everything the
-	 * arriving CPU sets up, so a starter that sees it can trust the rest
-	 * of the block.
+	 * Set by this CPU, last of its bring-up, and spun on by whoever
+	 * started it: a starter that sees it can trust the rest of the block.
 	 */
 	volatile int		 cp_online;	/* (a) it got here          */
 
 	/*
-	 * The same two facts as th_spin_depth / th_spin_saved_if, for the
-	 * stretch of boot before there is a thread to keep them in.  Locks
-	 * are taken from pmm, pmap and kmem long before the scheduler
-	 * exists, and no context switch can happen while that is true -- so
-	 * the CPU is the right owner exactly as long as it is the only
-	 * candidate.
+	 * th_spin_depth / th_spin_saved_if for while this CPU has no thread
+	 * to keep them in (early boot; an AP until it joins the scheduler).
+	 * No context switch can happen then, so the CPU is the right owner.
 	 */
 	int			 cp_spin_depth;		/* (i)              */
 	bool			 cp_spin_saved_if;	/* (i)              */
 
 	/*
-	 * The last TLB-invalidation request this CPU has carried out, as a
-	 * serial number.  Written by this CPU only, read by whichever CPU is
-	 * waiting for it -- see pmap_tlb_poll for why a serial number rather
-	 * than a count of outstanding acknowledgements: the same request may
-	 * be noticed twice, once by the interrupt and once by a spin loop
-	 * polling for it, and a number that is merely re-stored is harmless
-	 * where a second decrement would be a rout.
+	 * Serial number of the last TLB-invalidation request this CPU has
+	 * carried out; written only by it.  A serial rather than an ack count
+	 * because a request can be noticed twice (the IPI and a spin loop's
+	 * poll): re-storing a number is harmless, a second decrement is not.
+	 * See pmap_tlb_poll.
 	 */
 	volatile uint64_t	 cp_tlb_gen;		/* (a)              */
 
@@ -134,25 +96,19 @@ struct cpu {
 	volatile unsigned int	 cp_quantum_used;	/* (i) timer ticks  */
 
 	/*
-	 * Ticks this CPU's own APIC timer has delivered, and the TSC reading
-	 * at which it was armed.  Per-CPU because the rate they imply is a
-	 * per-CPU fact: one counter for the machine would read N times too
-	 * fast with N processors ticking into it, which is exactly what it
-	 * used to do.
+	 * Ticks this CPU's APIC timer has delivered, and the TSC when it was
+	 * armed.  Per-CPU: one machine-wide counter would run N times fast
+	 * with N CPUs ticking into it.
 	 */
 	volatile uint64_t	 cp_timer_ticks;	/* (a)              */
 	uint64_t		 cp_timer_start;	/* (c) TSC at arm   */
 
-	/* Context switches performed here.  Where the work actually went. */
+	/* Context switches performed here: where the work went. */
 	volatile uint64_t	 cp_switches;		/* (i)              */
 
 	/*
-	 * Set by the boot processor when the machine is finished enough for
-	 * this one to be allowed into the scheduler, and read by this one in
-	 * its parking loop.  The gap exists because a processor has to be
-	 * STARTED early -- the trampoline needs a page of low memory that
-	 * boot-time allocations would otherwise take -- and must not RUN
-	 * anything until the per-CPU state it will inherit is settled.
+	 * Set by mp_release_aps once the per-CPU state this CPU will inherit
+	 * is settled; the AP's parking loop waits for it.
 	 */
 	volatile int		 cp_release;		/* (a)              */
 } __attribute__((aligned(64)));
@@ -167,18 +123,14 @@ _Static_assert(offsetof(struct cpu, cp_user_rsp) == CPU_USER_RSP,
 extern struct cpu	cpus[MAXCPU];
 
 /*
- * The one primitive: this CPU's block, read out of the GS base.
+ * This CPU's block, read out of the GS base.  Volatile asm, so two calls
+ * in one function both re-read: the answer holds only while this thread
+ * cannot migrate, and the compiler cannot see where that window ends.
  *
- * Volatile asm rather than a cached load, so two calls in one function
- * re-read.  That matters the moment a thread can move between CPUs: the
- * answer is only valid for as long as this thread cannot be migrated, and
- * the compiler has no way to know where that window ends.
- *
- * ⚠ WHAT MAY OUTLIVE THE WINDOW.  current_thread is safe to hold across a
- * preemption point -- if the thread migrates, the new CPU's cp_curthread
- * is still this same thread -- but anything else derived from curcpu()
- * (cp_id above all) is stale the instant this thread can be moved, so read
- * it inside the critical section that uses it.
+ * current_thread may be held across a preemption point (after a
+ * migration the new CPU's cp_curthread is the same thread); anything else
+ * derived from curcpu(), cp_id above all, must be read inside the critical
+ * section that uses it.
  */
 static inline struct cpu *
 curcpu(void)
@@ -191,12 +143,7 @@ curcpu(void)
 	return (cp);
 }
 
-/*
- * The thread running on this CPU.  An lvalue, as the global it replaces
- * was, so that the move to per-CPU state is the whole of the change and
- * not a hundred rewritten uses -- the scheduler still says
- * `current_thread = next'.
- */
+/* The thread running on this CPU; an lvalue (`current_thread = next'). */
 #define	current_thread		(curcpu()->cp_curthread)
 
 static inline unsigned int
@@ -207,10 +154,9 @@ cpu_id(void)
 }
 
 /*
- * Point this CPU's ring-transition stack at `rsp'.  The SYSCALL stub reads
- * it out of the per-CPU block with no register to spare and no chance to
- * check it, so the scheduler owes it a correct value before every return
- * to ring 3; see switch_user_kstack in kern/sched.c.
+ * Point this CPU's SYSCALL stack at `rsp'.  The stub uses it unchecked,
+ * so it must be right before every return to ring 3; see
+ * switch_user_kstack in kern/sched.c.
  */
 static inline void
 cpu_set_kernel_rsp(uint64_t rsp)
@@ -220,75 +166,58 @@ cpu_set_kernel_rsp(uint64_t rsp)
 }
 
 /*
- * Install the GS base for the CPU executing this call and claim block
- * `id'.  Must run before ANY code that touches per-CPU state, which since
- * spin_lock counts preemption means before the first lock: it is the first
- * statement of kmain on the boot CPU, and will be the first statement an
- * application processor executes in C.
- *
- * Deliberately silent -- it runs before there is a console to print to.
- * cpu_print is the half that checks the result out loud.
+ * Point the boot CPU's GS base at block 0 and record its APIC id from
+ * CPUID.  Must run before anything touches per-CPU state -- spin_lock
+ * does, through the preempt count -- so it is the first statement of
+ * kmain.  (An AP sets its own base first thing in ap_entry.)  Silent: there
+ * is no console yet; cpu_print checks the result.
  */
 void		cpu_bsp_init(void);
 
 /*
- * Every control register and MSR that is per-processor and that this kernel
- * depends on: CR0.WP, the FPU's CR0/CR4 bits, CR4.SMAP, and the four SYSCALL
- * registers.  The boot processor collected them one at a time through kmain;
- * a processor arriving later inherits none of them, and every one of them
- * fails silently and somewhere else.  See cpu.c for the list of symptoms.
+ * The per-CPU control registers and MSRs this kernel depends on: CR0.WP,
+ * the FPU's CR0/CR4 bits, CR4.SMAP and the four SYSCALL MSRs.  For an AP,
+ * which inherits none of the boot CPU's; each missing one fails silently
+ * and elsewhere (symptoms in cpu.c).
  */
 void		cpu_state_init(void);
 
 /*
- * Prove the mechanism and say so: read this CPU's block back through the
- * segment base and compare it with the address the C side knows.  A boot
- * where the two disagree has a working kernel right up until the first
- * per-CPU write goes somewhere else, so it is worth one line of log and a
- * panic that names the fault.
+ * Read this CPU's block back through the GS base, compare it with
+ * &cpus[0], log it, and panic if they differ.
  */
 void		cpu_print(void);
 
 /*
- * One line per CPU the kernel knows about: what is running on it, what it
- * falls back on, and how much of its slice is gone.  Backs the shell's `cpu'.
+ * One line per CPU: what runs on it, its idle thread, its slice and switch
+ * count.  Backs the shell's `cpu'.
  */
 void		cpu_dump(void);
 
 /*
- * The same question asked of a machine that cannot answer it the usual way:
- * one line naming what is running on every processor and how many switches it
- * has performed, written byte by byte straight at the UART.  No lock, no
- * console, no formatting -- so it still speaks when the thing being diagnosed
- * is the console or the lock in front of it.
+ * One line naming each CPU's thread, task and switch count, written byte
+ * by byte at the UART with no lock or formatting, so it works when the
+ * console or its lock is the problem.
  */
 void		cpu_census_uart(void);
 
 /*
- * Claim a block for a processor the firmware described but nobody has started.
- * Called once per usable entry in the MADT, with the ids that table gives.
- * Fills the block far enough that the code which eventually starts this CPU
- * has somewhere to point its GS base -- cp_self above all, since a block whose
- * self-pointer is wrong is a CPU that cannot find itself.
- *
- * Returns the dense index claimed, or -1 if this is the processor already
- * running (matched by APIC id) or there is no room left.  It does NOT start
- * anything: cp_online stays zero until the CPU itself says otherwise.
+ * Claim a block for a processor the MADT describes, with the ids it gives;
+ * called once per usable entry.  Returns the dense index, or -1 if this is
+ * the running processor (matched by APIC id) or there is no room.  Starts
+ * nothing: cp_online stays zero until the CPU itself sets it.
  */
 int		cpu_register(uint32_t lapic_id, uint32_t acpi_id);
 
 /*
- * Say that the CALLING processor is now running kernel code: set the flag its
- * starter is waiting on and add it to the online count.  Takes no argument on
- * purpose -- a CPU announces itself and cannot be announced by somebody else.
+ * The calling processor is running kernel code: set the flag its starter
+ * waits on and count it online.  No argument: a CPU announces only itself.
  */
 void		cpu_mark_online(void);
 
 /*
- * Two different questions.  PRESENT is how many the firmware described and the
- * kernel has blocks for; ONLINE is how many are running kernel code.  They are
- * equal on a machine where every processor started, and the gap between them
- * is the interesting number on a machine where one did not.
+ * PRESENT: CPUs described by the firmware and given blocks.  ONLINE: CPUs
+ * running kernel code.  The gap is the CPUs that failed to start.
  */
 unsigned int	cpu_present_count(void);
 unsigned int	cpu_online_count(void);

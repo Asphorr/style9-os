@@ -11,35 +11,32 @@
 #include <stddef.h>
 
 /*
- * x87/SSE bring-up for ring 3.
+ * x87/SSE for ring 3.
  *
- * The kernel itself is built -mno-sse and never touches XMM, but ring-3 code
- * does: a real Apple binary is full of SSE2 (the x86_64 baseline), and even
- * clang on our own freestanding sources vectorises freely.  Until SSE is
- * enabled, the first XMM instruction in ring 3 faults #UD; once enabled, two
- * SSE-using tasks would clobber each other's register file without per-thread
- * save/restore.  This subsystem handles both.
+ * The kernel is built -mno-sse and never touches XMM, but ring-3 Darwin
+ * code does: SSE2 is the x86_64 baseline for Apple binaries, and clang
+ * vectorises our own Darwin-target sources.  Without OSFXSR the first XMM
+ * instruction #UDs; with it, each thread's XMM state must be saved.
  *
- * fpu_init enables the FPU + SSE on this CPU (CR0.MP=1, EM=0, TS=0;
- * CR4.OSFXSR=1, OSXMMEXCPT=1), runs FNINIT, loads the default MXCSR, and
- * captures a clean FXSAVE image as the template for new threads.  It MUST run
- * before any thread is created or any context switch (thread_switch_asm
- * FXSAVE/FXRSTORs through th_fpu on every switch).
+ * fpu_init sets up this CPU (CR0.MP=1, EM=0, TS=0; CR4.OSFXSR=1,
+ * OSXMMEXCPT=1), runs FNINIT, loads the default MXCSR and captures a clean
+ * FXSAVE image as the template for new threads.  It must run before any
+ * thread is created or switched: thread_switch_asm FXSAVEs/FXRSTORs th_fpu
+ * on every switch.
  *
- * fpu_clean_state copies that template into a thread's FXSAVE area so its
- * first FXRSTOR loads sane control words rather than zeros (a zero MXCSR would
- * unmask every SIMD exception).  The area is architecturally 512 bytes and
- * must be 16-byte aligned (FXSAVE/FXRSTOR #GP otherwise).
+ * fpu_clean_state copies the template into a thread's FXSAVE area, so the
+ * first FXRSTOR loads sane control words rather than zeros (a zero MXCSR
+ * unmasks every SIMD exception).  The area is 512 bytes and must be 16-byte
+ * aligned (FXSAVE/FXRSTOR #GP otherwise).
  */
 #define	FPU_XSAVE_AREA_SIZE	512
 
 void	fpu_init(void);
 
 /*
- * Just the control-register bits, for a processor that arrives after the
- * template has already been captured.  Every CPU owns its own CR0 and CR4,
- * and one that comes up without OSFXSR faults on the first FXRSTOR the
- * scheduler performs for it.
+ * Just the control-register bits, for a CPU that arrives after the template
+ * was captured: CR0 and CR4 are per CPU, and one without OSFXSR #UDs at the
+ * first FXRSTOR the scheduler does for it.
  */
 void	fpu_init_cpu(void);
 void	fpu_clean_state(void *area);

@@ -14,24 +14,18 @@
  *	rdx: outgoing thread's 16-byte-aligned FXSAVE area (th_fpu)
  *	rcx: incoming thread's 16-byte-aligned FXSAVE area (th_fpu)
  *
- * We save the SysV AMD64 callee-saved set (rbp, rbx, r12-r15) -- caller-
- * saved registers are clobbered as a side-effect of any C call site, so
- * the caller is already prepared for that.  After the 6 pushes %rsp is
- * stored into *rdi; loading %rsi into %rsp swaps stacks atomically with
- * respect to interrupts (the IRQ handler operates on whichever stack is
- * current, which is now the incoming one).
+ * Saves RFLAGS and the SysV callee-saved set (rbp, rbx, r12-r15); the
+ * caller has already given up the caller-saved ones.  After the 7 pushes
+ * %rsp is stored into *rdi, and the single load of %rsi swaps stacks
+ * atomically with respect to interrupts.
  *
- * The FPU/SSE register file is saved/restored eagerly around the swap:
- * FXSAVE the outgoing state to (%rdx) on entry, FXRSTOR the incoming state
- * from (%rcx) once on the new stack.  The kernel is built -mno-sse and never
- * touches XMM, so the only state in flight belongs to ring-3 threads, and
- * per-thread save/restore keeps two SSE-using tasks from corrupting each
- * other's registers.  Both areas are 16-byte aligned (FXSAVE/FXRSTOR #GP
- * otherwise) and pre-seeded clean by fpu_clean_state at thread create.
+ * The FPU/SSE file is switched eagerly: FXSAVE to (%rdx) on the way out,
+ * FXRSTOR from (%rcx) on the new stack.  The kernel is -mno-sse, so the
+ * state is always a ring-3 thread's.  Both areas must be 16-byte aligned
+ * (FXSAVE/FXRSTOR #GP otherwise); fpu_clean_state seeds them at create.
  *
- * For brand-new threads thread_create has pre-baked the stack with
- * 6 zero-quads + a RIP pointing at thread_trampoline, so the first time
- * we ret from here we land in C inside the new thread.
+ * A new thread's stack is pre-baked by thread_create: RFLAGS 0x202, six
+ * zero quads, and a return RIP of thread_trampoline.
  */
 
 	.section .text

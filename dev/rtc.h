@@ -12,18 +12,12 @@
 #include <stdint.h>
 
 /*
- * MC146818 CMOS real-time clock -- the only source of WALL time on this
- * machine.  Everything else the kernel calls "time" is uptime: the PIT counts
- * ticks since boot and the TSC interpolates between them, which answers "how
- * long since we started" and cannot answer "what year is it".  A filesystem
- * that stores timestamps (APFS does, to the nanosecond) and a program that
- * prints dates both need the second question answered, and this chip is where
- * the answer comes from.
+ * MC146818 CMOS real-time clock, the only source of wall time; everything
+ * else the kernel calls time is uptime.
  *
- * It is read exactly once, at boot: the RTC is slow to read (two port accesses
- * per field, and a field may be mid-update), while the TSC is a register.  So
- * boot anchors wall time to the RTC and every reading after that is the anchor
- * plus elapsed uptime -- accurate, monotonic, and cheap.  See kern/clock.c.
+ * It is read once, at boot, since it is slow to read (two port accesses
+ * per field, which may be mid-update).  Wall time after that is the boot
+ * anchor plus elapsed uptime: monotonic and cheap.  See kern/clock.c.
  */
 
 /* Broken-down UTC, as the chip reports it after decoding. */
@@ -33,28 +27,23 @@ struct rtc_time {
 	uint8_t		rt_day;		/* 1-31 */
 	uint8_t		rt_hour;	/* 0-23 */
 	uint8_t		rt_min;		/* 0-59 */
-	uint8_t		rt_sec;		/* 0-59 */
+	uint8_t		rt_sec;		/* 0-60 (leap second) */
 };
 
 /*
- * Read the chip.  Returns false if it reports something impossible (an
- * unset or dead RTC), in which case *out is untouched and the caller should
- * treat wall time as unavailable rather than trust a garbage year.
+ * Read the chip.  Returns false, leaving *out untouched, if it reports
+ * something impossible (an unset or dead RTC); treat wall time as
+ * unavailable then.
  */
 bool	rtc_read(struct rtc_time *out);
 
 /*
  * Seconds since 1970-01-01T00:00:00Z for a broken-down UTC time.  Pure
- * arithmetic, no chip access; exposed because the filesystem layer converts
- * timestamps the other way and both want the same civil-calendar rules.
+ * arithmetic, no chip access.
  */
 int64_t	rtc_to_epoch(const struct rtc_time *t);
 
-/*
- * The inverse: broken-down UTC from seconds since the epoch.  Anything that
- * PRINTS a time needs this -- the kernel's date command now, file timestamps
- * later, since a filesystem stores epoch counts and a listing shows dates.
- */
+/* The inverse: broken-down UTC from seconds since the epoch. */
 void	rtc_from_epoch(int64_t secs, struct rtc_time *out);
 
 #endif /* !_SYS_RTC_H_ */

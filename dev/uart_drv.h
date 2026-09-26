@@ -11,16 +11,13 @@
 #include "port.h"
 
 /*
- * Serial-console RX driver.  Mirrors dev/kbd_drv: at boot,
- * uart_drv_init() allocates `uart_input_port` in kernel_space with
- * RECEIVE | SEND, enables the COM1 receive IRQ, and spawns a
- * `uart-drv` kernel thread that bridges uart_getc_block to
- * mach_msg_send.  Each received byte arrives at uart_input_port as a
- * 24-byte header with the character in msgh_id, identical wire format
- * to the keyboard's events.
+ * Serial-console driver, after dev/kbd_drv: uart_drv_init() allocates
+ * `uart_input_port' in kernel_space with RECEIVE | SEND, enables the COM1
+ * receive IRQ, and starts the `uart-drv' thread, which sends each byte to
+ * the port in the keyboard's format (the character in msgh_id).  The
+ * control port also takes DEV_OP_WRITE for output.
  *
- * Shell can recv from kbd_input_port + uart_input_port via a port set
- * so either source drives the same input stream.
+ * kern/shell.c receives from both input ports through one port set.
  */
 
 extern mach_port_name_t	uart_input_port;

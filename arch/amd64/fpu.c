@@ -21,13 +21,9 @@
 static uint8_t	fpu_template[FPU_XSAVE_AREA_SIZE] __attribute__((aligned(16)));
 
 /*
- * The half of this that is a property of a PROCESSOR rather than of the
- * kernel: four control-register bits, which every CPU has its own copy of and
- * which come out of reset saying the wrong thing.  An application processor
- * whose OSFXSR is clear takes a #UD on the first FXRSTOR the scheduler does
- * for it -- that is, on its first context switch -- so this is not optional
- * bring-up, it is the difference between a processor that can run a thread
- * and one that cannot.
+ * The per-CPU half: control-register bits every CPU has its own copy of,
+ * wrong out of reset.  An AP with OSFXSR clear #UDs at the FXRSTOR of its
+ * first context switch.
  */
 void
 fpu_init_cpu(void)
@@ -55,10 +51,9 @@ fpu_init(void)
 	fpu_init_cpu();
 
 	/*
-	 * Bring the x87 + SSE state to a known-good baseline, then snapshot it
-	 * as the per-thread template.  FNINIT resets the x87 control/status;
-	 * 0x1F80 is the reset MXCSR (round-nearest, every SIMD exception
-	 * masked) so ring-3 SSE never trips an unexpected #XM.
+	 * Known baseline, then snapshot it as the template.  FNINIT resets
+	 * x87 control/status; 0x1F80 is the reset MXCSR (round-nearest, all
+	 * SIMD exceptions masked), so ring-3 SSE never trips a stray #XM.
 	 */
 	__asm __volatile("fninit");
 	mxcsr = 0x1F80;

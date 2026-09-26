@@ -23,9 +23,8 @@ extern struct port	*port_create_kernel_owned(uint8_t kind, void *arg);
 mach_port_name_t	kbd_input_port;
 
 /*
- * The optional second consumer (see kbd_drv.h).  Read by the driver thread,
- * written once at boot before any Darwin task exists, so no lock: a torn
- * read of a pointer written before the first keystroke is not reachable.
+ * The optional second consumer (kbd_drv.h).  Written once at boot, before
+ * any Darwin task exists, and read by the driver thread; no lock.
  */
 static kbd_sink_fn	kbd_sink;
 
@@ -46,11 +45,9 @@ kbd_drv_init(void)
 		panic("kbd_drv_init: port_allocate failed");
 
 	/*
-	 * Control port: handles the dev-NAME protocol (INFO + OPEN_STREAM).
-	 * The stream port (kbd_input_port) above is what OPEN_STREAM
-	 * hands back -- a SEND right naming the existing IRQ-fed FIFO.
-	 * Consumers that don't care about uniformity can still recv on
-	 * kbd_input_port directly the way the shell does today.
+	 * Control port: INFO and OPEN_STREAM.  OPEN_STREAM moves the
+	 * RECEIVE right for kbd_input_port to the caller (sh.elf); the
+	 * legacy kern/shell.c receives on it in kernel_space instead.
 	 */
 	ctl = port_create_kernel_owned(PORT_SPECIAL_SERVICE,
 	    (void *)(uintptr_t)kbd_drv_dispatch);
@@ -77,9 +74,8 @@ kbd_drv_set_sink(kbd_sink_fn fn)
 }
 
 /*
- * dev/kbd control-port dispatcher.  Synchronous: runs in the caller's
- * thread the moment they send to dev/kbd, so the inline-reply fast path
- * lands the bytes straight into their reply buffer.
+ * dev/kbd control-port dispatcher.  Runs synchronously in the sender's
+ * thread, so the reply lands straight in its reply buffer.
  */
 static int
 kbd_drv_dispatch(const struct mach_msg_header *req, struct port_space *from)
@@ -98,13 +94,9 @@ kbd_drv_dispatch(const struct mach_msg_header *req, struct port_space *from)
 }
 
 /*
- * Bridge between the IRQ-fed scancode ring and Mach IPC.  Park in
- * kbd_getc_block until a keypress arrives, then push it onto the input
- * port as a tagged message.  msgh_id carries the byte; the receiver
- * does not need a complex body because the payload is one character.
- *
- * Never returns: a kernel driver thread is part of the kernel for the
- * lifetime of the system.
+ * Bridge from the IRQ-fed ring to Mach IPC: park in kbd_getc_block, then
+ * send each character to the input port as a bare header with the byte in
+ * msgh_id.  Never returns.
  */
 static void
 kbd_drv_thread(void *arg)
@@ -121,12 +113,9 @@ kbd_drv_thread(void *arg)
 			continue;
 
 		/*
-		 * Offer the key to the registered sink first.  If it takes
-		 * it, the byte is spoken for and must NOT also go to the
-		 * Mach port -- a keystroke delivered twice is worse than one
-		 * delivered to the wrong reader, because the second copy
-		 * surfaces later, out of context, at whatever prompt is up
-		 * by then.
+		 * Offer the key to the sink first.  A key it takes must not
+		 * also go to the port: the second copy would surface later,
+		 * out of context, at whatever prompt is up by then.
 		 */
 		if (kbd_sink != NULL && kbd_sink((char)c))
 			continue;
@@ -141,12 +130,9 @@ kbd_drv_thread(void *arg)
 
 		rv = mach_msg_send(kernel_space, &msg);
 		/*
-		 * Send failure here means either the queue is full
-		 * past its blocking threshold (impossible, we use a
-		 * blocking send) or the port has died (the shell
-		 * deallocated it -- not expected in normal operation).
-		 * Drop the byte and keep going so a transient receiver
-		 * outage does not bring the driver down.
+		 * The send blocks on a full queue, so a failure means the
+		 * port died (its receiver went away).  Drop the byte and
+		 * keep going.
 		 */
 		if (rv != MACH_MSG_OK) {
 			kprintf("kbd_drv: send rv=%s, dropping byte 0x%02x\n",

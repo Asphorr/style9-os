@@ -6,19 +6,18 @@
  *
  * launchctl -- userspace CLI for the in-kernel launchd analog.
  *
- * v1 is a scripted demo (no argv passing across spawn yet): runs a
- * scripted load / list / use-the-service / unload cycle against the
- * `launchd` bootstrap service, exercising every wire op.  Maps 1:1
- * onto Darwin's `launchctl` subcommands:
+ * A scripted demo, taking no arguments: load / list / use the service /
+ * unload against the `launchd' bootstrap service, then stop/start,
+ * keepalive and respawn-throttle scenes.  The ops map onto Darwin's
+ * launchctl subcommands:
  *
  *	list                       LAUNCHCTL_OP_LIST
  *	load /path/foo.plist       LAUNCHCTL_OP_LOAD  (name + program)
  *	unload /path/foo.plist     LAUNCHCTL_OP_UNLOAD
+ *	stop / start <label>       LAUNCHCTL_OP_STOP / LAUNCHCTL_OP_START
  *
- * The middle of the demo also bootstraps_lookup the loaded service's
- * own port ("echo") and exercises it with an RPC so the LIST output
- * reflects a service that's not just been spawned but is actually
- * doing work.
+ * Between load and unload it looks up the loaded service's own port
+ * ("echo") and RPCs it, so the daemon is shown doing work.
  */
 
 #include "style9.h"
@@ -62,11 +61,7 @@ state_name(uint32_t s)
 
 /* ---- ops ------------------------------------------------------------- */
 
-/*
- * RPC LAUNCHCTL_OP_LIST.  Allocates the full list-reply buffer on
- * the stack (520 bytes) so caller does not have to know how big a
- * list-reply gets.
- */
+/* RPC LAUNCHCTL_OP_LIST into a full-size (520-byte body) stack reply. */
 static int
 do_list(mach_port_name_t launchd, const char *banner)
 {
@@ -111,9 +106,8 @@ do_list(mach_port_name_t launchd, const char *banner)
 }
 
 /*
- * Build a LAUNCHCTL_OP_LOAD message in `buf` with inline-body
- * carrying a svc_launchctl_load_req populated from (label, program).
- * Caller fills msgh_remote.
+ * Build a LAUNCHCTL_OP_LOAD message in `buf' to `dest', with an inline
+ * svc_launchctl_load_req from (label, program, flags).
  */
 static void
 build_load_req(uint8_t *buf, mach_port_name_t dest, const char *label,
@@ -241,9 +235,9 @@ do_unload(mach_port_name_t launchd, const char *label)
 }
 
 /*
- * do_stop / do_start: the v2 ops.  Both take a label (byname request)
- * and print the resulting state.  STOP kills the task but keeps the
- * entry (-> stopped); START respawns a stopped/exited entry (-> running).
+ * do_stop / do_start take a label and print the resulting state.  STOP
+ * kills the task but keeps the entry (-> stopped); START respawns a
+ * stopped or exited entry (-> running).
  */
 static int
 do_stop(mach_port_name_t launchd, const char *label)
@@ -306,10 +300,8 @@ do_start(mach_port_name_t launchd, const char *label)
 }
 
 /*
- * Exercise the now-running echod service via the regular bootstrap-
- * lookup + RPC path.  Each round drives one recv-in-echod's-loop
- * iteration, so by the time we finish (ECHO_RPC_ROUNDS), echod has
- * served that many rounds toward its self-imposed exit limit.
+ * RPC the running echod `rounds' times through the ordinary bootstrap
+ * lookup, checking each reply echoes its msgh_id.
  */
 static void
 poke_echo(uint32_t rounds)
@@ -351,11 +343,10 @@ poke_echo(uint32_t rounds)
 }
 
 /*
- * Arm a DEAD_NAME notification on `taskport` (a SEND right on a child's
- * task-self port, handed to us in the LOAD reply).  Returns a freshly
- * allocated notify port carrying the registration, or MACH_PORT_NULL if
- * anything failed (caller then falls back to the task_alive poll).  The
- * notify port is the caller's to deallocate.
+ * Arm a DEAD_NAME notification on `taskport' (a send right on the
+ * child's task port, from the LOAD reply).  Returns a new notify port,
+ * which the caller deallocates, or MACH_PORT_NULL on failure (the caller
+ * then polls task_alive).
  */
 static mach_port_name_t
 arm_dead_name(mach_port_name_t taskport)
@@ -417,22 +408,17 @@ main(void)
 		return (3);
 
 	/*
-	 * Arm the death watch NOW, while the child is alive -- DEAD_NAME
-	 * is a one-shot that can only be registered before the port dies.
-	 * The kernel handed us a SEND on the child's task-self port in the
-	 * LOAD reply (ls_taskport); when the child is reaped after UNLOAD
-	 * the RECEIVE drop fires the notification onto `notify`.
+	 * Arm the death watch while the child is alive: DEAD_NAME can only
+	 * be registered before the port dies.  When the child is reaped
+	 * after UNLOAD, its task port's receive right goes and the
+	 * notification lands on `notify'.
 	 */
 	notify = arm_dead_name(child_taskport);
 
 	if (do_list(launchd, "after-load") != MACH_MSG_OK)
 		return (4);
 
-	/*
-	 * Give echod a few yields to actually start serving before we
-	 * start poking it.  Without this the lookup race can see the
-	 * service registered but the daemon not yet in mach_msg_recv.
-	 */
+	/* Give echod a few turns to start serving before the first poke. */
 	for (i = 0; i < 16; i++)
 		(void)poll_turn();
 
@@ -448,16 +434,12 @@ main(void)
 		return (7);
 
 	/*
-	 * Death by notification (the v2 path): block on the notify port
-	 * instead of yield-polling task_alive.  UNLOAD's
-	 * task_request_terminate set t_killed + woke echod's parked
-	 * mach_msg_recv; the resumed thread retires, becomes a zombie,
-	 * and is reaped.  task_deref removes it from task_list (so
-	 * task_alive already reads false) and then port_release_task_self
-	 * drops the task-self port's RECEIVE right -- which, with our SEND
-	 * still outstanding, fires MACH_NOTIFY_DEAD_NAME onto `notify`.
-	 * Our recv parks us, yielding the CPU so all of that can happen
-	 * while we wait.
+	 * Wait on the notify port instead of polling task_alive.  UNLOAD's
+	 * kill wakes echod's parked receive; the thread retires and the
+	 * task is reaped.  task_deref takes it off the task list (so
+	 * task_alive already says no), then port_release_task_self drops
+	 * the task port's receive right, which with our send right still
+	 * held fires MACH_NOTIFY_DEAD_NAME onto `notify'.
 	 */
 	if (notify != MACH_PORT_NULL) {
 		rv = mach_msg_recv_timed(notify, &nh.hdr, sizeof(nh), 4000);
@@ -474,9 +456,8 @@ main(void)
 			    (unsigned long long)child_task_id);
 		}
 		/*
-		 * Single confirming probe (not a poll): task__chain_remove
-		 * runs before port_release_task_self, so by the time the
-		 * notification lands the id is already gone from task_list.
+		 * One confirming probe: task__chain_remove runs before
+		 * port_release_task_self, so the id is already gone.
 		 */
 		printf("  task_alive(%llu) confirm: %s\n",
 		    (unsigned long long)child_task_id,
@@ -485,10 +466,7 @@ main(void)
 		(void)mach_port_deallocate(notify);
 		(void)mach_port_deallocate(child_taskport);
 	} else if (child_task_id != 0) {
-		/*
-		 * Fallback when no taskport was handed back (older kernel)
-		 * or arming failed: the v1 bounded yield-poll on task_alive.
-		 */
+		/* No task port or arming failed: bounded poll of task_alive. */
 		alive = 1;
 		for (i = 0; i < 64 && alive; i++) {
 			(void)poll_turn();
@@ -501,11 +479,9 @@ main(void)
 	}
 
 	/*
-	 * v2 STOP / START demo on a separate, non-keepalive service so it
-	 * does not entangle with the echod DEAD_NAME watch above.  Loads a
-	 * syscall-free spinner, STOPs it (kill, entry survives as stopped),
-	 * then STARTs it (respawn -> running), confirming each transition
-	 * via LIST.  Final UNLOAD reaps it.
+	 * STOP / START on a separate, non-keepalive job: load a
+	 * syscall-free spinner, stop it (entry survives as stopped), start
+	 * it again, LIST after each step, then unload.
 	 */
 	printf("\nlaunchctl v2 STOP/START demo:\n");
 	if (do_load(launchd, SPIN_LABEL, SPIN_PROGRAM, 0, NULL, NULL) ==
@@ -519,12 +495,10 @@ main(void)
 	}
 
 	/*
-	 * v2 keep_alive demo: load a keep_alive job, then SIMULATE A CRASH
-	 * by killing its task directly through the capability handed back
-	 * in the load reply -- NOT launchd STOP, which intentionally
-	 * suppresses restart.  The launchd worker observes the DEAD_NAME
-	 * and respawns it; the post-crash LIST should show it RUNNING again
-	 * under a fresh task_id (compare against the printed original).
+	 * Keepalive: load a keepalive job, then simulate a crash by killing
+	 * its task through the task port from the load reply (not STOP,
+	 * which suppresses restart).  launchd sees the DEAD_NAME and
+	 * respawns it; LIST should show it running under a new task_id.
 	 */
 	printf("\nlaunchctl keep_alive demo:\n");
 	{
@@ -552,13 +526,10 @@ main(void)
 	}
 
 	/*
-	 * v2 respawn-throttle demo: load a keep_alive job whose program
-	 * (crasher) exits the instant it runs.  The worker respawns it, it
-	 * exits again, and after a few such fast exits launchd's throttle
-	 * trips and parks it in `throttled' instead of respawning forever.
-	 * We yield generously to let the crash loop play out, then LIST to
-	 * observe the throttled state and UNLOAD to clean up.  START would
-	 * revive it (clearing the fast-crash count), but here we just reap.
+	 * Respawn throttle: a keepalive job whose program (crasher) exits
+	 * at once.  After a few fast exits launchd parks it in `throttled'.
+	 * Wait out the crash loop, LIST, unload.  (START would revive it
+	 * and clear the fast-exit count.)
 	 */
 	printf("\nlaunchctl respawn-throttle demo:\n");
 	if (do_load(launchd, THR_LABEL, THR_PROGRAM,

@@ -62,9 +62,8 @@
  *	(p) protected by pm_lock
  *
  * The kernel pmap is the singleton initialised by pmap_bootstrap from
- * the live CR3; user pmaps come from pmap_create and share kernel_pmap's
- * upper-PML4 entries (so the boot identity map and any future kernel-VA
- * mapping is visible from every task).
+ * the live CR3; user pmaps come from pmap_create, which says what they
+ * share with it.
  */
 struct pmap {
 	struct spinlock	 pm_lock;
@@ -83,49 +82,26 @@ static struct pmap	 kernel_pmap_store = {
 struct pmap		*kernel_pmap = &kernel_pmap_store;
 
 /*
- * TLB SHOOTDOWN: TELLING THE OTHER PROCESSORS TO FORGET A TRANSLATION.
+ * TLB shootdown.  invlpg empties only the executing CPU's TLB; every other
+ * CPU caches the same page tables and may go on using a removed or changed
+ * translation, with no fault and no time bound -- a store landing in a page
+ * that now belongs to someone else.  There is no remote invalidate, so the
+ * other CPUs have to be asked to do it themselves.
  *
- * invlpg is a local instruction.  It empties one entry out of the TLB of the
- * processor that executes it and says nothing to any other, and every other
- * processor's TLB is a private cache of the SAME page tables -- so a mapping
- * this CPU has just removed or changed can go on being used elsewhere, with
- * no fault, no message and no bound on how long.  That is not a race that
- * shows up as a crash; it is a stale translation, which is a store landing in
- * a page that now belongs to somebody else.
+ * Asking by interrupt alone deadlocks, because every spinlock here disables
+ * interrupts: CPU A holds a pmap's lock and waits for B's acknowledgement
+ * while B spins for that lock with interrupts off.  So a request is
+ * published as a serial number (tlb_gen), and every loop that spins with
+ * interrupts off calls pmap_tlb_poll -- kern/spinlock.c's acquire above all.
+ * The IPI only speeds up CPUs that are not spinning.  A CPU may see one
+ * request twice, once each way, so it acknowledges by storing the number,
+ * which is idempotent, not by decrementing a counter.
  *
- * The architecture provides no way to invalidate another processor's TLB.
- * The only way is to ask it to do so itself, which means an interrupt, which
- * means the far processor has to be in a state where it can take one --
- * AND EVERY SPINLOCK IN THIS KERNEL NOW TURNS INTERRUPTS OFF.  That is the
- * whole difficulty of this rung, and it is a deadlock, not a delay:
- *
- *	CPU A takes a pmap's lock, changes a mapping, sends the request and
- *	waits for an acknowledgement.  CPU B is spinning for that same pmap's
- *	lock with interrupts off.  A waits for B to answer; B waits for A to
- *	let go.  Neither is doing anything wrong.
- *
- * So the request is not delivered ONLY by interrupt.  It is published as a
- * serial number, and every loop in this kernel that spins with interrupts off
- * calls pmap_tlb_poll -- kern/spinlock.c's acquire above all.  The interrupt
- * is then an optimisation for processors that are not spinning, and the
- * correctness comes from the poll.  A processor may notice the same request
- * twice, once each way, which is why the answer is a NUMBER IT STORES rather
- * than a counter it decrements: storing the same value twice is nothing, and
- * a second decrement would let the sender leave while a CPU still held the
- * stale entry.
- *
- * One request at a time, under one lock.  A per-CPU queue of pending
- * invalidations would let several proceed at once and would need each entry
- * to be acknowledged separately; with a handful of processors and a shootdown
- * measured in microseconds, the queue is not yet worth the state it takes to
- * be wrong about.
- *
- * ⚠ WHAT IS NOT DONE HERE: narrowing the audience.  Every online processor is
- * asked, including ones that have never had this pmap in CR3 and cannot
- * possibly be holding a translation from it.  Doing better means tracking
- * which CPUs have a pmap active, which is a bitmask maintained by
- * pmap_activate and by the scheduler's switch -- worth doing when the
- * measurement below says it is, and dishonest to claim before then.
+ * One request at a time, under tlb_lock; a per-CPU queue is not worth its
+ * state at this CPU count.  Every online CPU is asked, including ones that
+ * never had the pmap loaded.  Narrowing that needs a mask of CPUs with the
+ * pmap active, kept by pmap_activate and the switch -- worth it only if
+ * pmap_stats says so.
  */
 #define	TLB_WAIT_US		100000	/* absent, not merely slow          */
 #define	TLB_LATE_MAX_LINES	8	/* say so, but do not flood         */
@@ -197,12 +173,9 @@ pmap_bootstrap(void)
 	kernel_pmap->pm_leafs         = 0;
 
 	/*
-	 * boot.S sets CR0.WP, and everything this file promises about a
-	 * read-only mapping depends on it: with WP clear the read-only bit
-	 * binds ring 3 only, and a kernel store through the same VA goes
-	 * through without a fault.  Assert it here rather than trust the
-	 * assembly, because the failure mode is not a crash -- it is a write
-	 * that quietly lands in a page somebody else is also using.
+	 * boot.S sets CR0.WP.  With it clear, read-only binds ring 3 only and
+	 * a kernel store through a read-only mapping succeeds silently, so
+	 * assert it rather than trust the assembly.
 	 */
 	__asm__ __volatile__ ("mov %%cr0, %0" : "=r"(cr0));
 	KASSERT((cr0 & CR0_WP) != 0,
@@ -218,19 +191,16 @@ pmap_bootstrap(void)
 /*
  * pmap_create: build a fresh per-task PML4.
  *
- * Memory layout we end up with:
- *	new_pml4[i]      for i in 1..511		= kernel_pmap->pm_pml4[i]
- *	new_pml4[0]      = pa(new_pdpt0) | P|RW|US
- *	new_pdpt0[0]     = kernel_pdpt0[0] (boot identity 0..1 GiB)
- *	new_pdpt0[i]     for i in 1..511		= 0  (filled lazily)
+ *	new_pml4[1..511]	= kernel_pmap->pm_pml4[1..511] (shared)
+ *	new_pml4[0]		= pa(new_pdpt0) | P|RW|US
+ *	new_pdpt0[0..511]	= kernel PDPT-0 (boot identity map in slot 0,
+ *				  kernel MMIO such as the LAPIC in slot 3)
  *
- * Sharing entries 1..511 at the PML4 level means any kernel mapping
- * placed under those slots after this pmap is created automatically
- * shows up here too -- the next-level tables are the same pages.  PDPT
- * 0 is forked because that PDPT is where the per-task user-VA pages
- * live (USER_CODE_VA = 0x40000000 sits in PDPT slot 1 of PML4[0]); we
- * still want the boot identity range to remain reachable for kernel
- * code running with this pmap loaded, hence the PDPT[0]-only copy.
+ * Sharing PML4 entries 1..511 shares the next-level pages, so a kernel
+ * mapping added there later shows up in every task.  PDPT-0 is private
+ * because user VA lives under it (USER_CODE_VA = 1 GiB, PDPT slot 1); the
+ * kernel's entries are copied into it so kernel code can still reach them
+ * with this pmap loaded.
  */
 struct pmap *
 pmap_create(void)
@@ -267,13 +237,7 @@ pmap_create(void)
 		new_pdpt0[i] = 0;
 	}
 
-	/*
-	 * Snapshot kernel PML4 first, then weld the fresh PDPT into slot 0.
-	 * Copy entries 1..511 verbatim -- they point at next-level pages we
-	 * deliberately share so kernel-side mappings stay coherent across
-	 * tasks.  Entry 0 we override; the original kernel PDPT-0 contents
-	 * are folded into our new PDPT-0 below.
-	 */
+	/* Share kernel PML4 entries 1..511; entry 0 gets the private PDPT. */
 	for (i = 1; i < 512; i++)
 		new_pml4[i] = kernel_pmap->pm_pml4[i];
 
@@ -287,22 +251,13 @@ pmap_create(void)
 
 	kern_pdpt0 = (uint64_t *)pmm_kva_from_pa(e & PTE_PA_MASK);
 	/*
-	 * Copy the WHOLE kernel PDPT-0, not just slot 0.  In today's tree
-	 * only slot 0 (the boot_pd huge-page chain) is populated, but a
-	 * future caller adding e.g. a high-MMIO mapping under PML4[0] would
-	 * land in another slot; this guards against that drift.  User-VA
-	 * installs on this pmap take the same slots in our private PDPT
-	 * and overwrite whatever kernel had there -- safe because the
-	 * kernel never installs user-VA mappings under PML4[0] outside the
-	 * boot identity range itself.
+	 * All of the kernel PDPT-0, not just slot 0: the LAPIC mapping sits in
+	 * slot 3.  User VA (1-2 GiB) is slot 1, which the kernel leaves empty.
 	 */
 	for (i = 0; i < 512; i++)
 		new_pdpt0[i] = kern_pdpt0[i];
 
-	/*
-	 * PML4 entry for our PDPT-0.  US=1 so a future user leaf below
-	 * passes the ring-3 walk; the leaf itself decides accessibility.
-	 */
+	/* US=1 so the ring-3 walk gets through; each leaf decides access. */
 	new_pml4[0] = pdpt_pa | PTE_P | PTE_RW | PTE_US;
 
 	spin_init(&pm->pm_lock, "pmap");
@@ -315,32 +270,14 @@ pmap_create(void)
 }
 
 /*
- * Tear down a per-task pmap.  Walks the PRIVATE PDPT under PML4[0], frees
- * the PD/PT pages below it that BELONG TO THIS TASK, then frees the PDPT
- * and PML4 pages themselves.  Refusing to destroy kernel_pmap is a hard
- * panic; we never want to be one stray pointer away from unmapping the
- * world.
+ * Tear down a per-task pmap: free this task's PD/PT pages under the
+ * private PDPT, then the PDPT and the PML4.  Destroying kernel_pmap panics.
  *
- * ⚠ WHICH ENTRIES ARE THIS TASK'S IS NOT "ALL BUT SLOT 0".  pmap_create
- * copies the whole kernel PDPT-0 into the private one, deliberately, so a
- * kernel mapping under PML4[0] stays reachable while this pmap is loaded --
- * and every entry it copied names a page table the KERNEL allocated and is
- * still using.  This used to free everything from slot 1 up on the theory
- * that only slot 0 could be shared, which was true only while slot 0 was
- * the only kernel mapping under PML4[0].
- *
- * The local APIC ended that: mapping its registers at 0xFEE00000 puts a PD
- * and a PT under slot 3, every task copied them, and the first task to die
- * handed both back to the page allocator while the kernel was still reading
- * the APIC through them.  The SECOND task to die is what made a noise --
- * pmm's double-free assertion -- and it is worth being clear that the noise
- * was luck.  Had a frame been handed out and written before the second
- * death, the symptom would have been an interrupt controller quietly
- * answering from somebody else's memory.
- *
- * So the rule is one sentence instead of two: an entry the kernel's own
- * PDPT-0 still names is not ours to free, whatever slot it is in.  That
- * also covers slot 0 without a special case.
+ * An entry the kernel's own PDPT-0 still names is the kernel's, whatever
+ * its slot: pmap_create copied all of PDPT-0, so the copy names page
+ * tables the kernel is still using (the LAPIC's, at 0xFEE00000, under
+ * slot 3).  Freeing them would leave the kernel reaching the APIC through
+ * recycled memory.
  */
 void
 pmap_destroy(struct pmap *pm)
@@ -374,11 +311,10 @@ pmap_destroy(struct pmap *pm)
 			if ((pdpt_e & PTE_P) == 0 || (pdpt_e & PTE_PS) != 0)
 				continue;
 			/*
-			 * Still the kernel's.  Note this compares the whole
-			 * entry, not just the address: an entry the kernel has
-			 * since REPLACED would not match and would be freed,
-			 * which is only safe because intermediate tables here
-			 * are created and never swapped out.
+			 * Still the kernel's.  The whole entry is compared,
+			 * so one the kernel has since replaced would be freed;
+			 * safe only because kernel intermediate tables are
+			 * never swapped out.
 			 */
 			if (kern_pdpt0 != NULL && kern_pdpt0[i] == pdpt_e)
 				continue;
@@ -498,16 +434,12 @@ pmap_invlpg_local(uint64_t va)
 }
 
 /*
- * Carry out whatever invalidation is outstanding, if this CPU has not already.
+ * Carry out the outstanding invalidation, if this CPU has not already.
  *
- * ⚠ MUST BE CALLED WITH INTERRUPTS OFF, which every one of its callers has by
- * construction: the interrupt handler is entered through a gate that clears
- * IF, and the spin loops that call it have just disabled them to take a lock.
- * With interrupts on, curcpu() is a question whose answer can change between
- * the read and the store, and this would credit the wrong processor.
- *
- * Cheap enough to sit in a spin loop: two loads and a compare when there is
- * nothing to do, which is the case every time but the one that matters.
+ * Interrupts must be off, as they are for every caller (the IPI gate clears
+ * IF; the spin loops have just disabled them): with them on, curcpu() can
+ * change between the read and the store and credit the wrong CPU.  Two
+ * loads and a compare when there is nothing to do, so cheap in a spin loop.
  */
 static bool
 pmap_tlb_apply(void)
@@ -520,30 +452,19 @@ pmap_tlb_apply(void)
 	if (cp->cp_tlb_gen == gen)
 		return (false);
 
-	/*
-	 * The acquire above is what makes the address safe to read: the sender
-	 * wrote it before publishing the number, so a processor that can see
-	 * this number can see the address that came with it.
-	 */
+	/* The acquire above pairs with the sender's; tlb_va was set first. */
 	pmap_invlpg_local(tlb_va);
 
-	/*
-	 * Released last, and with a barrier, because the sender is spinning on
-	 * it: it means "the entry is gone from this processor", and the entry
-	 * has to actually be gone before it can mean that.
-	 */
+	/* Release: the sender spins on this, so it must follow the invlpg. */
 	__atomic_store_n(&cp->cp_tlb_gen, gen, __ATOMIC_RELEASE);
 	return (true);
 }
 
 /*
- * The two ways in, counted apart -- because which one does the work is the
- * only evidence there is that the poll is load-bearing rather than
- * decorative.  A processor sitting idle answers by interrupt; a processor
- * spinning for a lock with interrupts off can only answer from the spin, and
- * that is precisely the case that would otherwise deadlock.  If the second
- * number is zero for ever, the argument in the block comment above is a story
- * about a thing that never happens.
+ * The two ways in are counted apart.  An idle CPU answers by interrupt; one
+ * spinning for a lock with interrupts off can answer only from the spin,
+ * which is the case that would otherwise deadlock.  tlb_by_poll staying zero
+ * would mean the poll is not load-bearing.
  */
 void
 pmap_tlb_poll(void)
@@ -563,13 +484,8 @@ pmap_tlb_ipi(struct trapframe *tf)
 }
 
 /*
- * Ask every other online processor to forget `va', and wait until they all
- * say they have.
- *
- * The wait is the point.  Returning before the acknowledgements would leave
- * the caller free to hand the physical page to somebody else while a
- * processor could still reach it through the mapping being removed, which is
- * the exact corruption this whole mechanism exists to prevent.
+ * Ask every other online CPU to forget `va' and wait until all have.  The
+ * wait is the point: the caller may free the page as soon as this returns.
  */
 static void
 pmap_shootdown(uint64_t va)
@@ -588,10 +504,9 @@ pmap_shootdown(uint64_t va)
 	present = cpu_present_count();
 
 	/*
-	 * The sender counts itself as done before publishing, because it is:
-	 * pmap_invlpg has already run the instruction locally.  Doing it in
-	 * this order also keeps the invariant the poll relies on -- no CPU is
-	 * ever behind on a generation it has already carried out.
+	 * The sender marks itself done before publishing (pmap_invlpg already
+	 * ran invlpg here), keeping the invariant the poll relies on: no CPU
+	 * is ever behind on a generation it has already carried out.
 	 */
 	tlb_va = va;
 	gen = tlb_gen + 1;
@@ -614,13 +529,10 @@ pmap_shootdown(uint64_t va)
 		    __ATOMIC_ACQUIRE) != gen) {
 			if (tsc_to_us(tsc_read() - t0) > TLB_WAIT_US) {
 				/*
-				 * Giving up leaves a stale translation on that
-				 * processor, which is the very thing this is
-				 * for -- so it is counted and named rather
-				 * than absorbed.  The alternative is waiting
-				 * for ever for a CPU that is not going to
-				 * answer, which turns one wrong mapping into a
-				 * dead machine.
+				 * Give up, counted and named: that CPU may
+				 * keep the stale entry, but waiting for ever
+				 * on one that will not answer turns a wrong
+				 * mapping into a dead machine.
 				 */
 				tlb_late++;
 				if (tlb_late_lines < TLB_LATE_MAX_LINES) {
@@ -654,11 +566,7 @@ pmap_invlpg(uint64_t va)
 
 	pmap_invlpg_local(va);
 
-	/*
-	 * Nobody to tell.  True for the whole of boot up to the rung that
-	 * starts the other processors, and true for ever on a machine with one
-	 * -- so the everyday cost of having a shootdown at all is this load.
-	 */
+	/* Nobody to tell until an AP is online; on one CPU this load is all. */
 	if (cpu_online_count() < 2)
 		return;
 
@@ -669,27 +577,16 @@ void
 pmap_tlb_init(void)
 {
 
-	/*
-	 * Installed here rather than beside the other processors' bring-up,
-	 * because the vector has to be answerable before the first processor
-	 * that could be asked exists -- and because a handler installed by the
-	 * code that owns the mechanism is one fewer thing to keep in step.
-	 */
+	/* Answerable before the first CPU that could be asked is started. */
 	intr_install_local(INTR_VEC_TLB, pmap_tlb_ipi);
 }
 
 /*
- * Prove the round trip, and say what it costs.
- *
- * Every acknowledgement is evidence: it can only be stored by the far
- * processor, and only after it has run our handler or our poll, so a
- * processor that had never left the trampoline, or whose IDT was wrong, or
- * whose APIC was not accepting, would show up here as a timeout rather than
- * as a mystery three subsystems later.
- *
- * The address is a page of the kernel's own identity map.  Invalidating a
- * live translation is harmless -- the next access walks the tables and finds
- * the same entry -- and what is being tested is the message, not the mapping.
+ * Prove the round trip and time it.  Only the far CPU can store its
+ * acknowledgement, after running our handler or poll, so an AP that never
+ * left the trampoline, has a wrong IDT or a deaf APIC shows up here as a
+ * timeout.  The address is a live page of the kernel's identity map;
+ * invalidating it is harmless.
  */
 #define	TLB_TEST_ROUNDS		1000
 
@@ -757,10 +654,8 @@ pmap_stats(void)
 	    (unsigned long long)kernel_pmap->pm_pml4_pa);
 
 	/*
-	 * And what talking to the other processors has cost.  The total is the
-	 * number that decides whether narrowing the audience is worth doing:
-	 * every microsecond here is a processor standing still inside a page
-	 * table change, and this is the only place it is visible.
+	 * Shootdown cost: the total decides whether narrowing the audience is
+	 * worth doing.
 	 */
 	spin_lock(&tlb_lock);
 	kprintf("pmap: %llu shootdown(s), %llu message(s) sent, %llu ms "
@@ -809,12 +704,9 @@ ensure_table(struct pmap *pm, uint64_t *parent, size_t idx, bool user)
 		if (e & PTE_PS)
 			return (NULL);
 		/*
-		 * If a user leaf is going under an intermediate created
-		 * for kernel-only mappings, promote the US bit.  The
-		 * page-walk requires US along every level; an existing
-		 * US=0 intermediate would gate a user leaf below.  US=1
-		 * is harmless for kernel-only leaves -- the leaf US bit
-		 * is what gates ring-3 access at the page granularity.
+		 * A user leaf under a kernel-only intermediate: promote US,
+		 * which the walk needs at every level.  US=1 above kernel
+		 * leaves is harmless; the leaf's own US bit decides.
 		 */
 		if (user && (e & PTE_US) == 0) {
 			parent[idx] |= PTE_US;
@@ -832,11 +724,8 @@ ensure_table(struct pmap *pm, uint64_t *parent, size_t idx, bool user)
 		tbl[i] = 0;
 
 	/*
-	 * Intermediate entries are P + RW; the actual permission gate
-	 * lives at the leaf.  Letting RW propagate down means a writable
-	 * leaf is honoured; clearing RW here would shadow the leaf and
-	 * make every page read-only.  US is set on demand from the
-	 * caller's intent so ring-3 walks land on user leaves.
+	 * Intermediates are P|RW, plus US on demand; the leaf decides.  RW
+	 * clear here would make every leaf below read-only.
 	 */
 	parent[idx] = pa | PTE_P | PTE_RW | (user ? PTE_US : 0);
 	pm->pm_intermediates++;

@@ -4,24 +4,20 @@
  * Copyright (c) 2026 The Hobby OS Project
  * All rights reserved.
  *
- * darwinmsg -- a freestanding ring-3 program that does a real mach_msg()
- * round-trip the Darwin way (S3 of the XNU-binary ladder).  It links against
- * no libc and no crt0: _start issues genuine Apple class-encoded `syscall`s
- * by hand, and defines its OWN mach_msg_header_t -- whose 24-byte layout is
- * byte-exact with the kernel's struct mach_msg_header, which is the whole
- * point of "binary-exact".
+ * darwinmsg -- a freestanding ring-3 program that does a mach_msg()
+ * round trip the Darwin way.  No libc, no crt0: _start issues Apple
+ * class-encoded `syscall's by hand and defines its own mach_msg_header_t,
+ * whose 24-byte layout must match the kernel's struct mach_msg_header
+ * byte for byte.
  *
- * It allocates a reply port (mach_reply_port, a Mach trap), builds a tiny
- * inline message addressed to that port, and issues the classic combined
- * mach_msg_trap with MACH_SEND_MSG | MACH_RCV_MSG -- send to the port, then
- * receive from it -- so one trap drives a real trip through the kernel's
- * message queue.  Success is the kern_return_t coming back KERN_SUCCESS and
- * msgh_id surviving the queue unchanged.
+ * It allocates a reply port (the mach_reply_port trap), addresses a small
+ * inline message to it, and issues one combined mach_msg trap with
+ * MACH_SEND_MSG | MACH_RCV_MSG, a full trip through the kernel's message
+ * queue.  Success is KERN_SUCCESS with msgh_id unchanged.
  *
- * elf2macho's `macos` mode wraps this ELF as a Mach-O carrying an
- * LC_BUILD_VERSION naming PLATFORM_MACOS, so macho_load tags the task
- * TASK_PERSONALITY_DARWIN and the kernel routes mach_msg through
- * darwin_dispatch (kern/darwin.c).
+ * elf2macho's `macos' mode tags it for PLATFORM_MACOS, so the task is
+ * TASK_PERSONALITY_DARWIN and mach_msg goes through darwin_dispatch
+ * (kern/darwin.c).
  */
 
 #include <stddef.h>
@@ -43,9 +39,8 @@
 #define	MAGIC_ID		0x4D534733	/* 'M','S','G','3' round-trip tag */
 
 /*
- * Darwin mach_msg_header_t -- the binary-exact 24-byte layout the kernel's
- * struct mach_msg_header mirrors (bits@0, size@4, remote@8, local@12,
- * voucher@16, id@20).
+ * Darwin mach_msg_header_t, 24 bytes, mirrored by the kernel's struct
+ * mach_msg_header (bits@0, size@4, remote@8, local@12, voucher@16, id@20).
  */
 typedef struct {
 	uint32_t	msgh_bits;
@@ -63,7 +58,7 @@ static const char okmsg[] =
 static const char bugmsg[] =
     "darwinmsg: BUG -- mach_msg round-trip failed or msgh_id mismatch\n";
 
-/* Raw Darwin syscalls via the `syscall` instruction (SysV/Darwin convention). */
+/* Raw Darwin syscalls via the `syscall' instruction. */
 static inline long
 dsys0(unsigned long nr)
 {

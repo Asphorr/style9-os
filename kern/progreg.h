@@ -12,55 +12,44 @@
 #include <stdint.h>
 
 /*
- * Program registry.
- *
- * The kernel currently ships every ring-3 program embedded in its
- * own image (objcopy wraps each user ELF into a .rodata blob; see
- * the "_elf.o" rule in the Makefile).  progreg is the small table
- * that names those blobs so SYS_SPAWN can resolve a string name to
- * an (image, size) pair and hand them to the ELF loader.
- *
- * When a filesystem lands, progreg shrinks to a back-compat shim
- * pointing at /sbin/NAME via vnode lookups; the user-facing
- * SYS_SPAWN ABI does not move.
+ * Program registry: the ring-3 programs embedded in the kernel image
+ * (objcopy wraps each ELF or Mach-O into a .rodata blob; see the Makefile),
+ * named so SYS_SPAWN can resolve a name to (image, size) for the loader.
+ * The Darwin personality also presents it as the synthetic /bin.
  */
 
 /*
- * Room for the registered programs.  Raised from 40 the moment 40 was not
- * enough, which is the whole reason register_one panics on a full table
- * instead of dropping the last entry: a program that silently failed to
- * register would have looked like a program that failed to LOAD.
+ * Room for the registered programs.  register_one panics on a full table
+ * rather than drop an entry, which would look like a program failing to
+ * load.
  */
 #define	PROGREG_MAX		64
 #define	PROGREG_NAME_MAX	24
 
 /*
- * Command-line argument limits for the SYS_SPAWN_ARGS path.  The
- * syscall layer copies the caller's argv into a kernel-side flattened
- * block bounded by these; the launcher then materialises it onto the
- * child's initial user stack (arch/amd64/usermode.c).  Kept small: the
- * user stack is a single page, and these caps leave it comfortably
- * unspent (16 ptrs + 512 string bytes + framing << 4 KiB).
+ * Argument limits for SYS_SPAWN_ARGS and execve(2).  The syscall layer
+ * copies argv into a kernel-side flat block bounded by these, and the
+ * launcher builds it onto the child's initial stack
+ * (arch/amd64/usermode.c).  A native program's stack is one page, which
+ * 16 pointers + 512 string bytes + framing fit easily.
  */
 #define	SPAWN_ARGV_MAX		16
 #define	SPAWN_ARG_BYTES_MAX	512
 
 /*
- * The environment a Darwin execve(2) carries across, with its own caps: a
- * build tool hands its children a dozen variables, a shell everything it
- * exported.  The dyld handoff frame still lives in the TOP PAGE of the new
- * stack, so the whole of argv + envp + their pointer block must fit in 4 KiB:
- * (16 + 32 + 6) pointers = 432 bytes, plus 512 + 2048 of strings = 2992,
- * which leaves room for the alignment the frame builder takes.  The builder
- * checks the sum rather than trusting this arithmetic, and an execve whose
- * frame will not fit is refused with E2BIG, which is the errno for it.
+ * The environment a Darwin execve(2) carries, with its own caps.  The dyld
+ * handoff frame lives in the top page of the new stack, so argv, envp and
+ * the pointer block must fit in 4 KiB: (16 + 32 + 5) quadwords = 424
+ * bytes, plus 512 + 2048 of strings = 2984, leaving room for alignment.
+ * The sum is checked (darwin_frame_fits), and a frame that will not fit is
+ * refused with E2BIG.
  */
 #define	SPAWN_ENV_MAX		32
 #define	SPAWN_ENV_BYTES_MAX	2048
 
 struct progreg_entry {
 	const char	*pr_name;	/* lookup key                   */
-	const uint8_t	*pr_image;	/* objcopy'd ELF bytes start    */
+	const uint8_t	*pr_image;	/* objcopy'd image start        */
 	size_t		 pr_size;	/* image size in bytes          */
 };
 
@@ -75,48 +64,39 @@ const struct progreg_entry *progreg_find(const char *name);
 
 /*
  * Snapshot the registry into the caller's array.  Returns how many
- * entries were written; never more than `max`.  Used by the shell to
- * answer "what can I spawn?".
+ * entries were written, at most `max'.  Used to list what can be spawned
+ * (kern/cmds.c).
  */
 size_t	progreg_snapshot(struct progreg_entry *out, size_t max);
 
 /*
- * Index the registry directly: entry `idx` in registration order, or
- * NULL past the end.  Powers the Darwin personality's synthetic /bin
- * (kern/darwin.c), which enumerates the registry as a directory.
+ * Entry `idx` in registration order, or NULL past the end.  The Darwin
+ * personality's synthetic /bin (kern/darwin.c) enumerates it.
  */
 const struct progreg_entry *progreg_at(size_t idx);
 
 /*
- * Spawn the named program: build a fresh task, load its ELF image into
- * the new pmap + vm_map, attach a ring-3 thread that iretq's to the
- * entry point.  Returns the new task_id on success, or a negative
- * SYS_E_* code on failure.
+ * Spawn the named program: a fresh task, its ELF or Mach-O image loaded,
+ * and a ring-3 thread that iretqs to the entry point.  Returns the new
+ * task_id, or a negative SYS_E_* (SYS_E_INVAL for an unknown name).
  */
 long	progreg_spawn(const char *name);
 
 /*
- * Variant that also injects a SEND right into the child's port_space at
- * MACH_PORT_PARENT (well-known name 3 = next-free slot after TASK_SELF
- * and BOOTSTRAP).  The caller must have already taken one extra SEND
- * ref on `inject_port` -- that ref is transferred into the child's
- * port_space.  On any failure path the ref is dropped.  `inject_port`
- * NULL means "behave identically to progreg_spawn".
+ * Also installs a SEND right in the child at MACH_PORT_PARENT (name 3,
+ * after TASK_SELF and BOOTSTRAP).  The caller's extra SEND ref on
+ * `inject_port` moves into the child, or is dropped on failure.  NULL
+ * behaves as progreg_spawn.
  */
 struct port;
 long	progreg_spawn_with_port(const char *name, struct port *inject_port);
 
 /*
- * Variant that spawns the named program AND installs a SEND right on
- * the new task's task-self port in `caller_space`, writing the
- * resulting port name to `*out_taskport_name`.  Powers
- * SYS_SPAWN_RETURNS_TASKPORT: the shell uses the returned name as the
- * capability-handle argument to SYS_TASK_KILL when killing the child
- * (Ctrl-C, `kill <task_id>` builtin).
- *
- * Both `caller_space` and `out_taskport_name` are required (non-NULL);
- * pass NULL for both to get progreg_spawn-style behavior.  On any
- * failure the port name is left untouched.
+ * Also installs a SEND right on the child's task-self port in
+ * `caller_space`, writing its name to `*out_taskport_name`.  Backs
+ * SYS_SPAWN_RETURNS_TASKPORT; the shell passes the name to SYS_TASK_KILL
+ * (Ctrl-C, its `kill' builtin).  Both pointers are required (SYS_E_INVAL
+ * if NULL).  On failure the port name is left untouched.
  */
 struct port_space;
 #include "port.h"		/* mach_port_name_t */
@@ -125,18 +105,12 @@ long	progreg_spawn_returning_taskport(const char *name,
 	    mach_port_name_t *out_taskport_name);
 
 /*
- * Full spawn: name + a command-line argument vector + the optional
- * caller-space taskport install of progreg_spawn_returning_taskport.
- * `argc`/`argv` carry the child's arguments -- `argv` is a kernel-owned
- * flattened block (the (argc+1) leading char* slots point into the
- * trailing packed strings; element argc is NULL), or NULL when argc==0.
- * Ownership of `argv` transfers in: it is kfree'd on every failure path
- * and handed to the launcher (which frees it after building the child's
- * stack) on success -- the caller must not touch or free it afterward.
- *
- * `caller_space`/`out_taskport_name` behave exactly as in
- * progreg_spawn_returning_taskport; pass NULL/NULL to skip the install.
- * Powers SYS_SPAWN_ARGS.
+ * Full spawn, backing SYS_SPAWN_ARGS: a name, the child's arguments, and
+ * the optional taskport install (NULL/NULL to skip).  `argv` is a
+ * kernel-owned flat block -- (argc+1) char * slots, the last NULL,
+ * pointing into packed strings that follow -- or NULL when argc is 0.
+ * `argv` is consumed: freed on failure, or by the launcher once the
+ * child's stack is built; the caller must not touch it afterwards.
  */
 long	progreg_spawn_args(const char *name, int argc, char **argv,
 	    struct port_space *caller_space,

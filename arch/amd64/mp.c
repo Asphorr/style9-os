@@ -26,35 +26,23 @@
 #include "tsc.h"
 
 /*
- * The startup sequence's waits, from the multiprocessor protocol: hold after
- * INIT while the far processor resets its state, then a short pause after the
- * first startup message before repeating it.  The repeat is not superstition --
- * the protocol says to send two, because on some implementations the first can
- * be dropped if it arrives while the processor is still coming out of INIT.
- *
- * ARRIVAL is how long we are willing to wait for the processor to say it got
- * there.  It has an entire trampoline to walk, in three addressing modes, plus
- * whatever a printf costs it, and on an emulated machine under a loaded host
- * that is not instant -- but a tenth of a second is thousands of times what it
- * takes, so a processor still absent at the end of it is absent.
+ * Startup-protocol waits: after INIT, and after the first STARTUP IPI
+ * before sending the second (the protocol sends two, since the first can
+ * be lost while the processor is still leaving INIT).  ARRIVAL bounds how
+ * long a started processor gets to walk the trampoline and check in; it
+ * needs a tiny fraction of that, so one still absent after it is absent.
  */
 #define	AP_INIT_WAIT_US		10000
 #define	AP_SIPI_WAIT_US		200
 #define	AP_ARRIVAL_WAIT_US	100000
 
-/*
- * And how long to wait for a released processor to be standing in its own
- * idle thread.  Generous for the same reason as ARRIVAL: what it has to do is
- * a page of control-register writes and one kmalloc, which is nothing, so a
- * processor still absent after a tenth of a second is absent.
- */
+/* How long a released processor gets to reach its idle thread. */
 #define	AP_RELEASE_WAIT_US	100000
 
 /*
- * A stack per processor, in the same size the scheduler gives a thread, and
- * for the same reason: what runs on it is kernel code with an interrupt frame
- * possibly on top.  This one is only the BOOTSTRAP stack -- what an AP stands
- * on between long mode and having threads of its own.
+ * The stack an AP arrives on.  sched_cpu_attach later adopts it as the
+ * CPU's idle thread, so it lives for good; sized like a thread's kstack
+ * (THREAD_DEFAULT_KSTACK).
  */
 #define	AP_STACK_PAGES		4
 
@@ -71,11 +59,8 @@ static void	mp_resched_ipi(struct trapframe *tf);
 static void	mp_where_ipi(struct trapframe *tf);
 
 /*
- * Real-time wait, measured rather than counted.
- *
- * A loop of a fixed number of pauses is not a wait, it is a guess that stops
- * being true when the code is built differently or the host is busy -- and
- * every wait in this file is part of a protocol with real microseconds in it.
+ * Real-time wait, measured on the TSC rather than counted in loop
+ * iterations: the protocol's waits are in real microseconds.
  */
 static void
 mp_wait_us(uint64_t us)
@@ -88,13 +73,9 @@ mp_wait_us(uint64_t us)
 }
 
 /*
- * Does the firmware's memory map call this page ordinary RAM?
- *
- * The trampoline's address is a constant chosen to be in conventional memory,
- * and pmm marks the whole first megabyte used so it will never hand it out --
- * but both of those are today's arrangements, and copying code over something
- * the firmware still owns would be a fault with no message attached.  Cheap to
- * ask, so it is asked.
+ * Does the firmware's memory map call this page ordinary RAM?  pmm never
+ * hands out the first megabyte, but copying the trampoline over something
+ * the firmware still owns would fail with no message, and asking is cheap.
  */
 static bool
 mp_page_is_ram(uint64_t pa)
@@ -138,11 +119,9 @@ mp_install_trampoline(void)
 	}
 
 	/*
-	 * A byte loop because this kernel has no memcpy, and volatile on the
-	 * destination because what is being written is code another processor
-	 * will fetch: the compiler has no reason to believe these stores are
-	 * ever read, and every reason to think a page of them can be merged
-	 * away.
+	 * A byte loop (no memcpy here), volatile because the stores are code
+	 * another processor will fetch, which the compiler cannot see being
+	 * read.
 	 */
 	src = (const uint8_t *)ap_tramp_start;
 	dst = (volatile uint8_t *)pmm_kva_from_pa(AP_TRAMP_PA);
@@ -156,11 +135,8 @@ mp_install_trampoline(void)
 }
 
 /*
- * Ask one processor to start, and wait for it to say it did.
- *
- * Serialised on purpose: the parameter block is one, and so is the trampoline
- * page.  Starting them in parallel would need one page each and buy a few
- * milliseconds once per boot.
+ * Start one processor and wait for it to check in.  Serialised: there is
+ * one trampoline page and one parameter block.
  */
 static bool
 mp_start_one(struct cpu *cp)
@@ -177,11 +153,9 @@ mp_start_one(struct cpu *cp)
 	}
 
 	/*
-	 * The bootstrap stack is also this CPU's SYSCALL stack for now, which
-	 * is what cp_kernel_rsp means -- nothing lands on it until this CPU
-	 * runs a user thread, and by then the scheduler will have replaced it
-	 * with that thread's own.  Recording it makes `cpu' able to show where
-	 * a parked processor is standing.
+	 * cp_kernel_rsp starts as the bootstrap stack.  No SYSCALL lands on
+	 * it before this CPU runs a user thread, and switching to one
+	 * replaces it; until then it shows `cpu' where a parked CPU stands.
 	 */
 	param = (volatile uint64_t *)pmm_kva_from_pa(AP_PARAM_PA);
 	param[AP_P_CR3 / 8] = pmap_kernel_root_pa();
@@ -211,10 +185,8 @@ mp_start_one(struct cpu *cp)
 		(void)lapic_ipi_startup(cp->cp_lapic_id, AP_TRAMP_PA);
 
 	/*
-	 * Spin, holding nothing.  The arriving processor prints a line of its
-	 * own on the way in, which means it takes the console lock -- so this
-	 * wait must not be holding anything that processor could want, and it
-	 * is not.
+	 * Spin holding nothing: the arriving processor prints on its way in
+	 * and so takes the console lock.
 	 */
 	t0 = tsc_read();
 	while (cp->cp_online == 0) {
@@ -233,13 +205,10 @@ mp_start_one(struct cpu *cp)
 }
 
 /*
- * "Look at the runqueue."  The whole message is the interrupt itself: the
- * handler sets the flag the dispatcher's tail already consults, and the tail
- * does the rest -- so there is nothing here that has to agree with anything
- * in the scheduler beyond a flag it owns.
- *
- * Also what wakes a parked processor out of its hlt at release time, where
- * the flag it sets is never looked at and the interrupt IS the message.
+ * "Look at the runqueue."  The handler only sets need_resched, which the
+ * tail of intr_dispatch already acts on.  At release time the same IPI
+ * wakes a parked processor out of its hlt; there the interrupt itself is
+ * the message.
  */
 static void
 mp_resched_ipi(struct trapframe *tf)
@@ -259,20 +228,14 @@ mp_resched(struct cpu *cp)
 }
 
 /*
- * "WHERE ARE YOU?" -- THE ONE QUESTION NO OTHER PROCESSOR CAN ANSWER FOR YOU.
+ * "Where are you?"  A CPU's program counter cannot be read from another
+ * CPU, and everything else here reports the scheduler's view of it, which
+ * says nothing about a CPU looping outside the scheduler.  So the far CPU
+ * takes an interrupt and reports the trapframe it lands in: ring (cs & 3,
+ * kernel or user spin) and RIP.
  *
- * A CPU's program counter is not readable from anywhere else.  Everything
- * this kernel can say about another processor -- what thread it holds, how
- * many switches it has done -- describes the scheduler's opinion of it, and a
- * processor stuck in a loop that never reaches the scheduler is invisible to
- * all of it.  The only instrument that works is an interrupt: the far CPU
- * takes it, and the trapframe it lands in IS its answer.
- *
- * Written at the UART with no lock and no console, like the census it belongs
- * to, because the state worth asking this in is the state where the console
- * is not answering.  The ring matters as much as the address: cs & 3 says
- * whether that processor is spinning in the kernel or in a user program, and
- * those are different bugs.
+ * Written straight at the UART with no lock, like cpu_census_uart, since
+ * it is wanted when the console is not answering.
  */
 void
 mp_where(struct trapframe *tf)
@@ -321,8 +284,8 @@ mp_start_aps(void)
 		return (0);
 
 	/*
-	 * Before the first processor exists, because the message that releases
-	 * it from its parking loop is this one.
+	 * Before any AP starts: RESCHED is what later releases it from its
+	 * parking loop.
 	 */
 	intr_install_local(INTR_VEC_RESCHED, mp_resched_ipi);
 	intr_install_local(INTR_VEC_WHERE, mp_where_ipi);
@@ -368,22 +331,17 @@ mp_release_aps(void)
 			continue;
 
 		/*
-		 * The flag first and the interrupt second: the flag is what is
-		 * read, and the interrupt is only what stops the hlt.  A
-		 * message that arrived before the flag was set would wake a
-		 * processor that then looked, saw nothing, and slept again --
-		 * and the next one is not coming.
+		 * Flag first, interrupt second: the interrupt only ends the
+		 * hlt.  Sent before the flag, it could wake a processor that
+		 * sees nothing and sleeps again, with no second IPI coming.
 		 */
 		__atomic_store_n(&cp->cp_release, 1, __ATOMIC_RELEASE);
 		mp_resched(cp);
 
 		/*
-		 * Waited for one at a time, which serialises the bring-up the
-		 * same way starting them was serialised -- and for a better
-		 * reason: each of them allocates its idle thread, so letting
-		 * four into kmalloc at once would make the first exercise of
-		 * that lock a four-way race during boot, at the one moment
-		 * nothing has been tested yet.
+		 * One at a time: each allocates its idle thread, and letting
+		 * them all into kmalloc at once would make boot the first
+		 * test of that lock under contention.
 		 */
 		t0 = tsc_read();
 		while (cp->cp_curthread == NULL) {
@@ -407,30 +365,22 @@ mp_release_aps(void)
 }
 
 /*
- * WHERE AN APPLICATION PROCESSOR BECOMES ONE OF THIS KERNEL'S CPUS.
+ * An application processor becomes one of this kernel's CPUs.
  *
- * Called from the trampoline with a stack and nothing else: no per-CPU base,
- * no GDT of its own, no IDT register, no APIC.  The order below is the order
- * of what depends on what, and the first line is the one that everything else
- * is written on top of -- until the GS base is installed, every per-CPU
- * reference in this kernel reads physical page zero, and spin_lock is a
- * per-CPU reference.
+ * Called from the trampoline with a stack and nothing else: no GS base, no
+ * GDT, IDT or APIC of its own.  The order below is dependency order, and
+ * the GS base comes first: until it is set every per-CPU reference, and so
+ * every spin_lock, reads physical page zero.
  *
- * THEN IT PARKS, and then it is let go -- two states rather than one, because
- * a processor has to be STARTED early and must not RUN anything until late.
- * Early, because the trampoline needs a page of conventional memory that boot
- * would otherwise be entitled to hand out.  Late, because CR4.SMAP and the
- * SYSCALL registers are turned on near the end of boot, and a processor that
- * had already taken a thread would be running it with neither.
+ * It is started early and parked, and released late (mp_release_aps, near
+ * the end of kmain): CR4.SMAP and the SYSCALL MSRs are set only then, and
+ * a CPU already running threads would run them without either.  Parked,
+ * its timer and LINT0 are masked and no runqueue knows it; it answers only
+ * IPIs -- TLB invalidation, `where', and the RESCHED that releases it.
  *
- * Parked, it answers exactly one thing: an invalidation.  Its timer is masked,
- * its LINT0 carries nothing, no runqueue has heard of it.  It is asleep and
- * wakeable to say "yes, I forgot it".
- *
- * Released, it collects the per-CPU state it inherited none of, adopts the
- * stack it is standing on as a thread, becomes its own idle thread, arms its
- * own timer, and joins the one runqueue.  From that point everything below is
- * an ordinary CPU and nothing in this file is special about it.
+ * Released, it loads its per-CPU control state, adopts its stack as its
+ * idle thread, arms its own timer and joins the runqueue, after which it
+ * is an ordinary CPU.
  */
 void
 ap_entry(struct cpu *cp)
@@ -439,43 +389,27 @@ ap_entry(struct cpu *cp)
 	wrmsr(MSR_GS_BASE, (uint64_t)(uintptr_t)cp);
 
 	/*
-	 * Its own GDT and TSS -- the TSS above all, because that is the one
-	 * thing that cannot be shared: it carries the stack a ring transition
-	 * lands on, and two processors pointing at one would fault onto the
-	 * same stack.  gdt_init_cpu reads which CPU it is from the block the
-	 * line above installed.
+	 * Its own GDT and above all its own TSS, which holds the stack a ring
+	 * transition lands on.  gdt_init_cpu finds this CPU through the GS
+	 * base set above.
 	 */
 	gdt_init_cpu();
 
 	/*
-	 * The IDT is one table for the machine but the register that points at
-	 * it is per-processor, and this one holds zero.  Before anything that
-	 * could fault, because a fault with no IDT is a triple fault and a
-	 * silent reset.
+	 * The IDT is shared but IDTR is per-CPU and still zero.  Before
+	 * anything that can fault: a fault with no IDT is a triple fault.
 	 */
 	idt_load();
 
 	/*
-	 * Its own APIC: the registers are already mapped (the boot processor
-	 * did that, and the mapping is shared), but the enable bit, the task
-	 * priority and every LVT entry are per-processor state that comes up
-	 * out of reset masked.
+	 * The registers are already mapped (shared mapping), but the enable
+	 * bit, TPR and LVT entries are per-CPU state.
 	 */
 	(void)lapic_init();
 
 	/*
-	 * Announce BEFORE claiming to be online, which is the wrong way round
-	 * for readability and the right way round for the console.
-	 *
-	 * ⚠ The tty takes its lock per CHARACTER, deliberately -- spin_lock
-	 * panics on a same-CPU re-acquire, so a run of output cannot hold it
-	 * across the run.  On one processor that was invisible; with two, two
-	 * kprintfs interleave BYTE BY BYTE, and the first four-processor boot
-	 * printed "parkmp:ed with interrupt 3 s off".  Setting the flag last
-	 * means the processor that is spinning on it cannot print until this
-	 * line is finished, which is enough while the only concurrent output
-	 * is a bring-up message.  It is not a substitute for serialising the
-	 * console, which is owed the day these processors run anything.
+	 * Announce before cpu_mark_online, so this line is out before the
+	 * starting CPU, spinning on the flag, prints its next one.
 	 */
 	kprintf("cpu %u: online, lapic %u, stack at 0x%llx -- parked, "
 	    "answering invalidations\n", cpu_id(),
@@ -483,44 +417,31 @@ ap_entry(struct cpu *cp)
 	    (unsigned long long)cp->cp_kernel_rsp);
 
 	/*
-	 * Released with an ordering barrier: the processor that started this
-	 * one is spinning on it, and everything above must be visible before
-	 * the flag that says "everything above is done".
+	 * A release store: everything above is visible before the flag the
+	 * starting CPU spins on.
 	 */
 	cpu_mark_online();
 
 	/*
-	 * PARKED UNTIL THE MACHINE IS READY FOR THIS PROCESSOR, answering
-	 * invalidations and nothing else.  What it is waiting for is the state
-	 * it will inherit: CR4.SMAP goes on near the end of boot, the SYSCALL
-	 * registers with it, and a processor that joined the scheduler before
-	 * them would run threads with neither.
-	 *
-	 * sti and hlt in one instruction pair, and in that order: hlt with
-	 * interrupts off is a processor that never wakes again, and an
-	 * interrupt arriving between an sti and a separate hlt would be
-	 * serviced and then slept through.  The pair is the idiom because the
-	 * architecture defers the effect of sti by one instruction for exactly
-	 * this reason.  cli on the way back so the flag is read, and everything
-	 * below it done, with interrupts off.
+	 * Parked until mp_release_aps.  `sti; hlt' back to back: sti takes
+	 * effect only after the next instruction, so no interrupt can slip in
+	 * between and be slept through, and hlt with interrupts off would
+	 * never wake.  cli on the way out, so the flag is read and everything
+	 * after it runs with interrupts off.
 	 */
 	while (__atomic_load_n(&cp->cp_release, __ATOMIC_ACQUIRE) == 0)
 		__asm__ __volatile__ ("sti; hlt; cli");
 
 	/*
-	 * Every control register and MSR this kernel depends on and that a
-	 * processor owns a private copy of.  Before the scheduler, because the
-	 * first thing the scheduler will do for this CPU is an FXRSTOR, which
-	 * needs CR4.OSFXSR -- and because the first thing it may do after that
-	 * is run a user thread, which needs the other three.
+	 * The per-CPU control registers and MSRs.  Before the scheduler: its
+	 * first switch here does an FXRSTOR (needs CR4.OSFXSR), and it may
+	 * then run a user thread (needs CR0.WP, CR4.SMAP, EFER.SCE).
 	 */
 	cpu_state_init();
 
 	/*
-	 * A thread of its own, an idle thread of its own, and a timer of its
-	 * own -- in that order, because the timer's interrupt debits a slice
-	 * and a slice belongs to a thread.  Announced before the timer starts
-	 * so the line cannot land in the middle of a preemption.
+	 * A thread (which is also the idle thread), then the timer: the
+	 * timer's interrupt debits a slice, and a slice belongs to a thread.
 	 */
 	sched_cpu_attach();
 

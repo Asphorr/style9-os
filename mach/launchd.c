@@ -24,50 +24,29 @@
 #include "thread.h"
 
 /*
- * Minimal launchd: a service supervisor with three operations.
+ * Minimal launchd: a service supervisor behind the "launchd" service
+ * port, plus a keep_alive worker and a compiled-in boot catalog.
  *
- * The contract is the bare minimum to demonstrate a launchd-shaped
- * surface on top of the bootstrap port:
+ *	LIST	enumerate the registry.  Each RUNNING entry's task is
+ *		checked with task_is_alive first, and a dead one flips
+ *		to EXITED in place.
  *
- *	LIST	enumerate the current registry, re-validating every
- *		RUNNING entry's task liveness via task_is_alive at
- *		snapshot time.  Stale entries flip to EXITED in place
- *		before the reply is built so the caller sees a fresh
- *		state machine without having to re-query.
+ *	LOAD	register a label + program pair and spawn it with
+ *		progreg_spawn.  Duplicate labels are refused; a failed
+ *		spawn leaves the entry FAILED for LIST to show.
  *
- *	LOAD	register a label + program-name pair, immediately
- *		spawn the program via progreg_spawn, and stash the
- *		new task id.  Duplicate labels are rejected.  Spawn
- *		failures land the entry in FAILED so the operator can
- *		see what happened on a subsequent LIST.
+ *	UNLOAD	remove the entry and task_request_terminate its task.
+ *		The kill is asynchronous: the task dies at its next
+ *		syscall or wake.
  *
- *	UNLOAD	drop the entry from the registry AND request async
- *		termination of the underlying task via
- *		task_request_terminate (v2: was warn-and-orphan in v1
- *		when no kill primitive existed).  Termination is
- *		asynchronous: the call returns immediately and the
- *		target dies at its next syscall / wake.  A subsequent
- *		LIST shows the entry gone; a subsequent task_alive
- *		probe on the cached task_id returns false once the
- *		zombie has been reaped by idle.
+ *	STOP	kill the task but keep the entry, STOPPED.
  *
- * Internal layout: one bounded-size array (LAUNCHD_MAX_SERVICES rows)
- * under one spinlock.  No dynamic allocation per row; the limit is
- * fine for the small-system workloads this kernel targets and avoids
- * a kmem path on every load.  Per-row state:
- *	lc_used		false when the slot is free
- *	lc_name		caller-supplied label (LAUNCHD_NAME_MAX bytes)
- *	lc_program	progreg name to spawn
- *	lc_state	LAUNCHD_STATE_* -- updated on LOAD, refreshed at LIST
- *	lc_task_id	0 when not running
+ *	START	respawn a stopped, exited, failed or throttled entry.
  *
- * Locking: all of the above is `(s)` under `s9launchd_lock`.  The
- * lock is taken across the whole dispatcher body except the actual
- * mach_msg_send (the reply), which happens after dropping the lock
- * to keep IPC fan-out outside the critical section.
- *
- * No WITNESS cycle concerns: s9launchd_lock is a leaf -- the only
- * thing held inside it is the bounded loop over our own array.
+ * The registry is a fixed array of LAUNCHD_MAX_SERVICES cells, all
+ * fields under s9launchd_lock.  The lock is dropped around anything
+ * heavier -- progreg_spawn, task_request_terminate, arm_keepalive, the
+ * reply -- so it nests only over task_is_alive's tasks_lock.
  */
 
 struct launchd_cell {
@@ -83,15 +62,12 @@ struct launchd_cell {
 };
 
 /*
- * keep_alive respawn throttle.  A keep_alive job that dies in under
- * LAUNCHD_THROTTLE_MS lived "too fast"; after LAUNCHD_THROTTLE_MAX such
- * fast deaths in a row the worker stops respawning it and parks it in
- * LAUNCHD_STATE_THROTTLED (a launchctl START clears the count and
- * revives it).  Any single run lasting at least LAUNCHD_THROTTLE_MS
- * resets the counter -- the job proved it can stay up.  This is the
- * crash-loop backoff every supervisor grows; we give up rather than
- * delay-and-retry because the cooperative worker has no timer wheel to
- * schedule a deferred respawn against.
+ * keep_alive respawn throttle.  After LAUNCHD_THROTTLE_MAX deaths in a
+ * row each under LAUNCHD_THROTTLE_MS after spawn, the worker stops
+ * respawning the job and parks it THROTTLED until a launchctl START.  A
+ * run that lasts LAUNCHD_THROTTLE_MS resets the count.  It gives up
+ * rather than retry later because the worker has no timer to schedule a
+ * deferred respawn against.
  */
 #define	LAUNCHD_THROTTLE_MS	1000u
 #define	LAUNCHD_THROTTLE_MAX	3u
@@ -107,28 +83,24 @@ extern int			 port_install_send_in_kernel(struct port *,
 static struct port		*s9launchd_port;	/* (c) */
 
 /*
- * keep_alive plumbing.  The worker thread blocks on s9launchd_death_port
- * (a kernel-owned RECV+SEND port, named s9launchd_death_name in
- * kernel_space for the recv).  For every RUNNING + keep_alive cell the
- * load/start/respawn paths arm a DEAD_NAME watch on the child's
- * task-self port via port_arm_dead_name_object, tagging it with the cell
- * index; when the child dies the notification lands here and the worker
- * respawns it.  Both (c): set once at init, never reassigned.
+ * keep_alive plumbing.  The worker blocks on the death port (RECEIVE +
+ * SEND in kernel_space).  For each running keep_alive job, load, start
+ * and respawn arm a DEAD_NAME watch on the child's task-self port,
+ * tagged with the cell index; the child's death lands here and the
+ * worker respawns it.
  */
 static mach_port_name_t		 s9launchd_death_name;	/* (c) */
 static struct port		*s9launchd_death_port;	/* (c) */
 
 /*
- * The boot catalog -- the style9 answer to launchd.plist.  Where Apple
- * encodes a job as an XML property list, the s9 jobspec is line-oriented
- * + brace-free: one `job <label>' stanza, indented keys, terminated by
- * `end'.  Keys:
+ * The boot catalog, in place of launchd.plist: line-oriented stanzas,
+ * each `job <label>', indented keys, then `end'.  Keys:
  *	program <name>	progreg image to run (required)
  *	keepalive	respawn on unexpected exit
- *	runatload	spawn at boot (else registered STOPPED, started on
- *			demand via launchctl start)
- * `#' lines + blank lines are ignored.  Compiled in (no root filesystem
- * to read a catalog from yet); parsed once by the worker thread.  (c).
+ *	runatload	spawn at boot (else registered STOPPED, for
+ *			launchctl start)
+ * `#' lines and blank lines are ignored.  Compiled in; parsed once by
+ * launchd_load_catalog.  (c)
  */
 static const char	s9launchd_catalog[] =
 	"# style9 launchd boot catalog -- s9 jobspec v1\n"
@@ -144,11 +116,7 @@ static const char	s9launchd_catalog[] =
 	"    program heartbeatd\n"
 	"end\n";
 
-/*
- * String helpers.  Bounded byte-by-byte copy + compare; the wire-
- * format buffers are fixed-size + NUL-padded by the sender so the
- * loop never reads past the field.
- */
+/* Bounded copy and compare over fixed-size, NUL-padded fields. */
 static void
 copy_bounded(char *dst, const char *src, size_t cap)
 {
@@ -178,10 +146,9 @@ eq_bounded(const char *a, const char *b, size_t cap)
 }
 
 /*
- * Refresh an entry's runtime state without taking any lock other
- * than the caller's already-held s9launchd_lock.  task_is_alive does
- * its own tasks_lock dance internally; we just call it under our
- * own lock since the lock orders never cross.
+ * Mark a RUNNING entry EXITED if its task is gone.  Caller holds
+ * s9launchd_lock; task_is_alive takes tasks_lock inside it, and nothing
+ * takes the two the other way round.
  */
 static void
 refresh_state_locked(struct launchd_cell *c)
@@ -194,11 +161,9 @@ refresh_state_locked(struct launchd_cell *c)
 }
 
 /*
- * Stamp the cell's spawn time, under s9launchd_lock, right after a
- * (re)spawn records the new task id.  launchd_handle_death diffs the
- * death time against this stamp to classify the run as a fast crash or
- * a healthy run for the respawn throttle.  Leaves lc_fast_crashes alone
- * -- the death path owns that counter.
+ * Stamp the spawn time, under s9launchd_lock, when a (re)spawn records
+ * its task id; launchd_handle_death measures the run against it for the
+ * throttle.  lc_fast_crashes belongs to the death path.
  */
 static void
 note_spawn_locked(struct launchd_cell *c)
@@ -208,18 +173,13 @@ note_spawn_locked(struct launchd_cell *c)
 }
 
 /*
- * arm_keepalive: install a DEAD_NAME watch on `task_id`'s task-self port
- * so the worker is notified when the task dies, tagged with the cell
- * index so the worker knows which entry to respawn.  Best-effort: a
- * task that already died (or has no self port) just won't be watched --
- * the worst case is a missed restart of an instance that lived for less
- * than the spawn-to-arm window.  Called OUTSIDE s9launchd_lock so the
- * port/task locks never nest under our leaf lock.
+ * Watch `task_id`'s task-self port for death, tagged with the cell
+ * index.  Best-effort: a task already gone is not watched, so an
+ * instance that dies within the spawn-to-arm window is not restarted.
+ * Called without s9launchd_lock.
  *
- * task_self_port_for hands us a transient SEND ref purely to keep the
- * port pinned across the arm; port_arm_dead_name_object takes its own
- * ref on the death port (released when the one-shot fires), so we drop
- * ours immediately after.
+ * task_self_port_for's SEND ref only pins the port across the arm (the
+ * watch holds its own ref on the death port), and is dropped at once.
  */
 static void
 arm_keepalive(uint64_t task_id, int idx)
@@ -237,10 +197,8 @@ arm_keepalive(uint64_t task_id, int idx)
 }
 
 /*
- * Common reply-shaping helper, copied from services.c's pattern.
- * Builds a header in `buf`, points the inline payload bytes at `body`
- * of `body_size`, and sends back to req->msgh_local via COPY_SEND on
- * the caller's space.
+ * Reply to req->msgh_local with a bare [header | body] message, as in
+ * services.c.  At most 1024 bytes of body.
  */
 static int
 svc_reply_inline(const struct mach_msg_header *req, struct port_space *from,
@@ -333,9 +291,8 @@ op_load(const struct mach_msg_header *req, struct port_space *from)
 		((uint8_t *)&body)[i] = p[i];
 
 	/*
-	 * Reject empty labels + empty programs so the registry never
-	 * carries a zero-length name that would silently match the
-	 * first byte of any other entry's NUL padding.
+	 * No empty labels or programs: an empty name would match any
+	 * cell's NUL padding.
 	 */
 	if (body.lr_name[0] == '\0' || body.lr_program[0] == '\0')
 		return (MACH_E_INVAL);
@@ -377,11 +334,8 @@ op_load(const struct mach_msg_header *req, struct port_space *from)
 	}
 
 	/*
-	 * Claim the slot before dropping the lock so two concurrent
-	 * LOADs of the same name don't both find free_idx and race.
-	 * We hold the lock across progreg_spawn -- spawn does take
-	 * tasks_lock internally, which is finer-grained than ours;
-	 * no cycle.
+	 * Claim the slot before dropping the lock, so two concurrent LOADs
+	 * cannot both take it.  The lock is dropped around progreg_spawn.
 	 */
 	{
 		struct launchd_cell *c = &s9launchd_cells[free_idx];
@@ -416,15 +370,11 @@ op_load(const struct mach_msg_header *req, struct port_space *from)
 	spin_unlock(&s9launchd_lock);
 
 	/*
-	 * On success, hand the caller a SEND right on the child's
-	 * task-self port: take a transient ref via task_self_port_for,
-	 * install it as a fresh name in the caller's space, then drop the
-	 * transient ref (space_install took its own ref for the installed
-	 * name).  The name lets launchctl arm a DEAD_NAME notification and
-	 * learn of the child's death by notification instead of polling
-	 * task_alive.  Done outside s9launchd_lock so the port + space
-	 * locks never nest under our leaf lock.  Best-effort: a failed
-	 * install reports 0 and launchctl falls back to the poll path.
+	 * Give the caller a SEND right on the child's task-self port, so
+	 * launchctl can watch for its death instead of polling task_alive.
+	 * space_install takes its own ref; the transient one from
+	 * task_self_port_for is dropped.  Best-effort: on failure the name
+	 * is 0 and launchctl polls.
 	 */
 	reply.ls_taskport = MACH_PORT_NULL;
 	reply.ls_pad      = 0;
@@ -442,11 +392,7 @@ op_load(const struct mach_msg_header *req, struct port_space *from)
 		}
 	}
 
-	/*
-	 * keep_alive: arm launchd's own DEAD_NAME watch on the child so the
-	 * worker respawns it on unexpected exit.  Independent of the SEND
-	 * handed to the caller above (each takes its own ref).
-	 */
+	/* keep_alive: launchd's own watch, independent of the caller's. */
 	if (reply.ls_status == MACH_MSG_OK && reply.ls_task_id != 0 &&
 	    (body.lr_flags & LAUNCHD_LOAD_FLAG_KEEPALIVE) != 0)
 		arm_keepalive(reply.ls_task_id, free_idx);
@@ -514,14 +460,9 @@ op_unload(const struct mach_msg_header *req, struct port_space *from)
 	spin_unlock(&s9launchd_lock);
 
 	/*
-	 * Issue async termination AFTER dropping s9launchd_lock.
-	 * task_request_terminate takes tasks_lock + t_lock + sched_lock;
-	 * keeping the kill outside our own lock keeps the s9launchd
-	 * leaf-lock leaf-shaped and avoids a long fan-out under it.  No
-	 * cycle if we'd done it inside either, but the discipline is
-	 * cleaner.  Skips kernel_task internally + silently no-ops on
-	 * ids that have already exited (the race vs. a self-exiting
-	 * daemon is harmless).
+	 * Kill after dropping s9launchd_lock: task_request_terminate takes
+	 * tasks_lock, t_lock and sched_lock and fans out wakes.  It ignores
+	 * kernel_task and ids that have already exited.
 	 */
 	if (prev_state == LAUNCHD_STATE_RUNNING && prev_task != 0)
 		task_request_terminate(prev_task);
@@ -535,13 +476,10 @@ op_unload(const struct mach_msg_header *req, struct port_space *from)
 }
 
 /*
- * op_stop: kill the entry's task but KEEP the registry row, parking it
- * in STATE_STOPPED.  Distinct from UNLOAD (which removes the row): a
- * STOPPED entry can be revived with op_start, and -- crucially -- the
- * STOPPED state tells the keep_alive worker the death it is about to
- * observe was intentional, so it must not respawn.  The state flip is
- * published BEFORE the kill so the worker can never catch a window of
- * RUNNING + dead-task and race a spurious restart in.
+ * Kill the entry's task but keep the entry, STOPPED, for op_start to
+ * revive.  STOPPED also tells the keep_alive worker the coming death is
+ * intentional.  It is set before the kill, so the worker never sees
+ * RUNNING with a dead task and respawns it.
  */
 static int
 op_stop(const struct mach_msg_header *req, struct port_space *from)
@@ -608,12 +546,10 @@ op_stop(const struct mach_msg_header *req, struct port_space *from)
 }
 
 /*
- * op_start: (re)spawn a non-running entry, returning it to RUNNING.
- * Idempotent on an already-RUNNING entry (no-op success).  The program
- * name is snapshotted under the lock and the spawn issued after
- * dropping it, mirroring op_load -- progreg_spawn takes tasks_lock,
- * finer than ours, and never yields, so hit_idx stays valid across the
- * unlock/relock.
+ * Respawn a non-running entry; a RUNNING one is left alone and reported
+ * as success.  The program name is copied under the lock and the spawn
+ * issued after dropping it, as in op_load.  hit_idx is assumed to name
+ * the same entry after the relock; nothing re-checks it.
  */
 static int
 op_start(const struct mach_msg_header *req, struct port_space *from)
@@ -684,10 +620,7 @@ op_start(const struct mach_msg_header *req, struct port_space *from)
 		s9launchd_cells[hit_idx].lc_task_id = 0;
 		reply.ls_status  = (int32_t)child_id;
 	} else {
-		/*
-		 * A manual START is an operator override: clear the fast-crash
-		 * count so a job that had been THROTTLED gets a clean slate.
-		 */
+		/* A manual START clears the throttle's count. */
 		s9launchd_cells[hit_idx].lc_state        = LAUNCHD_STATE_RUNNING;
 		s9launchd_cells[hit_idx].lc_task_id      = (uint64_t)child_id;
 		s9launchd_cells[hit_idx].lc_fast_crashes = 0;
@@ -731,14 +664,11 @@ svc_launchd_dispatch(const struct mach_msg_header *req, struct port_space *from)
 /* ---- keep_alive worker ---------------------------------------------- */
 
 /*
- * launchd_handle_death: a DEAD_NAME notification fired for cell `idx`.
- * Respawn iff the cell is still a live keep_alive job whose recorded
- * task is genuinely gone.  The !task_is_alive guard rejects two cases
- * the bare DEAD_NAME tag cannot distinguish: an entry STOPPED or
- * UNLOADED on purpose (state no longer RUNNING / lc_used cleared), and
- * a stale notification for a since-reused cell index (whose current
- * task is alive).  Program name is snapshotted under the lock; the
- * spawn + re-arm run outside it, mirroring op_load / op_start.
+ * A DEAD_NAME notification for cell `idx`.  Respawn only if the cell is
+ * still a RUNNING keep_alive job whose task is really gone: that
+ * rejects entries stopped or unloaded on purpose, and a stale
+ * notification for a reused cell whose current task is alive.  The
+ * spawn and re-arm run outside the lock, as in op_load.
  */
 static void
 launchd_handle_death(int idx)
@@ -769,7 +699,7 @@ launchd_handle_death(int idx)
 		c->lc_task_id = 0;
 
 		if (lifetime_ms >= LAUNCHD_THROTTLE_MS) {
-			/* Ran long enough to be healthy: forgive past crashes. */
+			/* Ran long enough: forgive past crashes. */
 			c->lc_fast_crashes = 0;
 			c->lc_state        = LAUNCHD_STATE_FAILED;
 			respawn            = true;
@@ -798,9 +728,8 @@ launchd_handle_death(int idx)
 
 	spin_lock(&s9launchd_lock);
 	/*
-	 * idx still names the same job: the cooperative kernel never
-	 * preempts us here and progreg_spawn does not yield, so no
-	 * concurrent UNLOAD could have freed + reused the cell.
+	 * idx is assumed to name the same job still; nothing re-checks
+	 * that a concurrent UNLOAD did not free and reuse the cell.
 	 */
 	if (child_id < 0) {
 		s9launchd_cells[idx].lc_state   = LAUNCHD_STATE_FAILED;
@@ -826,11 +755,9 @@ static void	launchd_parse_catalog(const char *text);
 static void	launchd_worker(void *arg) __attribute__((noreturn));
 
 /*
- * The worker: block on the death port forever, dispatching each
- * DEAD_NAME notification to launchd_handle_death.  Non-DEAD_NAME
- * messages + recv errors are ignored (the death port only ever
- * receives kernel-synthesised notifications).  Runs on kernel_task,
- * structurally identical to the dev uart/kbd driver stream threads.
+ * The worker, a kernel_task thread: receive on the death port for ever
+ * and hand each DEAD_NAME notification to launchd_handle_death.
+ * Anything else, and receive errors, are ignored.
  */
 static void
 launchd_worker(void *arg)
@@ -867,10 +794,8 @@ kw_eq(const char *s, size_t n, const char *lit)
 }
 
 /*
- * Copy the whitespace-delimited argument that follows a keyword into
- * `dst' (bounded, NUL-terminated).  `after_kw' points just past the
- * keyword; leading blanks are skipped, the token ends at the next
- * blank / newline / NUL.
+ * Copy the argument after a keyword into `dst' (bounded, NUL-terminated):
+ * skip blanks from `after_kw', stop at a blank, newline or NUL.
  */
 static void
 copy_token_arg(char *dst, size_t cap, const char *after_kw)
@@ -888,11 +813,9 @@ copy_token_arg(char *dst, size_t cap, const char *after_kw)
 }
 
 /*
- * Materialise one catalog job into the registry.  runatload jobs are
- * spawned immediately (RUNNING, keep_alive armed if requested); others
- * are registered STOPPED so `launchctl start' can bring them up later.
- * Boot-time, single-threaded with respect to the registry, so the
- * free-slot scan needs no dup-check beyond a trusted catalog.
+ * Enter one catalog job.  runatload jobs are spawned now (and watched if
+ * keepalive); others are registered STOPPED for `launchctl start'.  The
+ * catalog is trusted, so there is no duplicate check.
  */
 static void
 launchd_boot_load(const char *label, const char *program, bool keepalive,
@@ -962,9 +885,8 @@ launchd_boot_load(const char *label, const char *program, bool keepalive,
 }
 
 /*
- * Parse the compiled-in catalog one line at a time, accumulating the
- * current stanza's fields and committing on `end'.  A bounded scan: no
- * allocation, every copy capped to its destination field.
+ * Parse the catalog a line at a time, committing each stanza at `end'.
+ * No allocation; every copy is bounded by its field.
  */
 static void
 launchd_parse_catalog(const char *text)
@@ -1055,12 +977,9 @@ launchd_subsystem_init(void)
 	kprintf("svc: %s -> kernel name %u\n", SVC_LAUNCHD_NAME, (unsigned)kn);
 
 	/*
-	 * keep_alive worker: a kernel thread that blocks on the death port
-	 * and respawns keep_alive jobs whose tasks die.  Mirrors the
-	 * dev uart/kbd driver kernel-thread + kernel_space recv-port pattern.  The
-	 * death port is RECV+SEND in kernel_space: the RECV name backs the
-	 * worker's mach_msg_recv_block, and the port object is the notify
-	 * target arm_keepalive registers.
+	 * The keep_alive worker and its death port, RECEIVE + SEND in
+	 * kernel_space: the worker receives on the name, and the port is
+	 * the notify target arm_keepalive registers.
 	 */
 	s9launchd_death_name = port_allocate(kernel_space,
 	    MACH_PORT_RIGHT_RECEIVE | MACH_PORT_RIGHT_SEND);
@@ -1081,38 +1000,16 @@ launchd_subsystem_init(void)
 	    (unsigned)s9launchd_death_name);
 
 	/*
-	 * The boot catalog is NOT materialised here: progreg_init has not run
-	 * yet at this point in kmain, so every job would resolve to an empty
-	 * program registry.  kmain calls launchd_load_catalog once it has.
+	 * Not the catalog: progreg_init has not run yet.  kmain calls
+	 * launchd_load_catalog once it has.
 	 */
 }
 
 /*
- * Materialise the boot catalog: parse it and start every runatload job.
- *
- * This must run after progreg_init, because the catalog names programs by
- * string and progreg_spawn resolves them through the registry that
- * progreg_init fills.  That requirement used to be met by loading the
- * catalog from launchd_worker on the theory that a freshly started kernel
- * thread would not be scheduled until kmain had moved on -- but a thread
- * being runnable and a thread not running yet are different claims, and
- * only the second one was needed.  kmain does real work between
- * services_init and progreg_init, and a preemption anywhere in there let
- * the worker win the race: progreg_find returned NULL, progreg_spawn
- * returned SYS_E_INVAL, and the boot printed
- *
- *	launchd: catalog job 'com.style9.heartbeat' (heartbeatd) spawn failed rv=-3
- *
- * with the job parked in LAUNCHD_STATE_FAILED for the rest of the boot.
- * Intermittently -- roughly one boot in three on this host, which is the
- * worst frequency a bug can have, often enough to be real and rare enough
- * to be dismissed as noise.
- *
- * So the ordering is a call site now instead of an assumption about the
- * scheduler.  The worker thread keeps only the job it can actually do
- * without help: waiting on the death port.
- *
- * Idempotent: a second call is a no-op rather than a second set of jobs.
+ * Load the boot catalog, starting every runatload job.  Must run after
+ * progreg_init, which fills the registry progreg_spawn resolves program
+ * names in; kmain calls it explicitly rather than leave it to the worker
+ * thread, which may run before progreg_init.  Idempotent.
  */
 void
 launchd_load_catalog(void)

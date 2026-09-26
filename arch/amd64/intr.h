@@ -12,15 +12,10 @@
 #include <stdint.h>
 
 /*
- * Trap frame produced by the asm stubs in isr.S (x86_64).
- *
- * Field order is contractually frozen against isr_common's push order.
- * The 15 GPRs are pushed r15-last so it lands at the lowest address
- * (the trapframe's first field).  In long mode the CPU always pushes
- * SS:RSP on trap entry, regardless of CPL change.
- *
- * Reordering this struct without updating isr.S corrupts the frame in
- * flight.
+ * Trap frame built by the stubs in isr.S.  Field order is frozen against
+ * isr_common's push order: the 15 GPRs are pushed r15 last, so it lands
+ * at the lowest address, the first field.  In long mode the CPU pushes
+ * SS:RSP on every trap, CPL change or not.
  */
 struct trapframe {
 	/* Pushed by isr_common, low addresses first (i.e. pushed last). */
@@ -57,39 +52,25 @@ typedef void (*irq_handler_t)(struct trapframe *);
 void	intr_dispatch(struct trapframe *);
 void	irq_install(unsigned int irq, irq_handler_t);
 
-/*
- * The first vector above the 8259's remapped window, and so the first that
- * belongs to the local APIC rather than to the machine's one shared
- * interrupt controller.
- */
+/* First vector above the 8259's window: the local APIC's from here up. */
 #define	INTR_LOCAL_BASE		48
 
 /*
- * The vectors one processor uses to say something to another.
- *
- * Below the timer's 0xF0, which the APIC's priority scheme makes a real
- * choice -- it serves the highest-numbered pending vector first -- and which
- * is nevertheless not an important one: both handlers are a few microseconds
- * long, so whichever loses waits for the other to finish.  What actually
- * bounds how long a shootdown can be ignored is not the vector number but
- * pmap_tlb_poll, which is called from every loop that spins with interrupts
- * off; the ordering here is written down mainly so a later measurement has
- * something to disagree with.
+ * Inter-processor interrupt vectors, below the timer's 0xF0: the APIC
+ * serves the highest pending vector first, but all these handlers are a
+ * few microseconds long.  What bounds how long a shootdown can go
+ * unanswered is pmap_tlb_poll, called from the loops that spin with
+ * interrupts off, not the vector number.
  */
 #define	INTR_VEC_TLB		0xE0	/* forget these translations       */
 #define	INTR_VEC_RESCHED	0xE1	/* look at the runqueue            */
 #define	INTR_VEC_WHERE		0xE2	/* say where you are               */
 
 /*
- * Install a handler for a vector the LOCAL APIC delivers -- its timer, an
- * inter-processor interrupt -- as opposed to irq_install's 8259 lines.  The
- * two are different in a way that matters at the end of the handler: an
- * 8259 interrupt is acknowledged to the 8259, an APIC one to the APIC, and
- * the dispatcher writes the right one because it knows which table the
- * handler came out of.
- *
- * A vector left with NO handler is ignored quietly and acknowledged to
- * NOBODY, which is exactly what the spurious vector requires.
+ * Install a handler for a local APIC vector (its timer, an IPI), as
+ * opposed to irq_install's 8259 lines; the dispatcher acknowledges each
+ * to its own chip.  A vector with no handler is ignored and acknowledged
+ * to nobody, as the spurious vector requires.
  */
 void	intr_install_local(unsigned int vec, irq_handler_t);
 
@@ -116,16 +97,13 @@ intr_disable(void)
 }
 
 /*
- * Disable interrupts and report whether they had been enabled, so that a
- * caller can put them back the way it found them rather than the way it
- * wishes they were.  The pair below is what makes a critical section nest:
- * two of them one inside the other leave interrupts off until the OUTER one
- * ends, because the inner one restores "off", which is what it saw.
+ * Disable interrupts and report whether they had been enabled, so the
+ * caller can restore them as it found them.  This is what lets critical
+ * sections nest: the inner one restores "off", and interrupts stay off
+ * until the outer one ends.
  *
- * The read and the clear are one asm block on purpose.  Between a pushfq and
- * a cli there is room for an interrupt, and a caller that took one there would
- * be told interrupts were on -- true when it asked, and no longer true by the
- * time it acts on the answer.
+ * The read and the clear are one asm block so that no interrupt can land
+ * between the pushfq and the cli.
  */
 static inline bool
 intr_save_disable(void)

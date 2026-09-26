@@ -8,12 +8,8 @@
 #include "style9.h"
 
 /*
- * Mach IPC wrappers.
- *
- * One per syscall, plus a `bootstrap_lookup` convenience that bundles
- * the well-known sequence "build BOOTSTRAP_OP_LOOKUP request -> rpc
- * to MACH_PORT_BOOTSTRAP -> decode the port_descriptor in the reply"
- * since every program that talks to a kernel service needs it.
+ * Mach IPC wrappers: one per syscall, plus RPC helpers for the bootstrap,
+ * host and task ports.
  */
 
 mach_port_name_t
@@ -124,11 +120,9 @@ mach_msg_rpc(struct mach_msg_header *req, struct mach_msg_header *reply,
 }
 
 /*
- * bootstrap_lookup: ask the well-known bootstrap port for a service
- * name and return the SEND right it hands back.  Returns
- * MACH_PORT_NULL on any error (RPC failure, service-not-found, or a
- * malformed reply).  Caller is responsible for mach_port_deallocate
- * on the returned name.
+ * bootstrap_lookup: return the SEND right the bootstrap port hands back
+ * for `service', or MACH_PORT_NULL on any error (RPC failure, not found,
+ * malformed reply).  The caller deallocates it.
  */
 mach_port_name_t
 bootstrap_lookup(const char *service)
@@ -168,11 +162,9 @@ bootstrap_lookup(const char *service)
 }
 
 /*
- * bootstrap_register_service: publish `port` under `service` in the
- * registry.  Wraps the BOOTSTRAP_OP_REGISTER request -- COMPLEX
- * message carrying one port_descriptor (COPY_SEND of `port`) plus the
- * service name in the trailing inline payload -- and decodes the
- * bsr_status word in the status reply.
+ * bootstrap_register_service: BOOTSTRAP_OP_REGISTER is a COMPLEX message
+ * carrying one port descriptor (COPY_SEND of `port') followed by the
+ * service name; the reply carries bsr_status.
  */
 int
 bootstrap_register_service(const char *service, mach_port_name_t port)
@@ -217,11 +209,7 @@ bootstrap_register_service(const char *service, mach_port_name_t port)
 	return ((int)reply.body.bsr_status);
 }
 
-/*
- * bootstrap_deregister_service: remove `service` from the registry.
- * Plain (non-complex) request with the service name in the inline
- * payload; decode status from the reply.
- */
+/* bootstrap_deregister_service: a plain request carrying the name. */
 int
 bootstrap_deregister_service(const char *service)
 {
@@ -255,10 +243,8 @@ bootstrap_deregister_service(const char *service)
 }
 
 /*
- * mach_host_self: acquire a SEND right to the kernel host port.  Native
- * tasks reach it through the bootstrap registry just like any other
- * service; the Darwin host_self_trap is the equivalent for genuine
- * binaries.  Returns MACH_PORT_NULL on any failure.
+ * mach_host_self: native tasks reach the host port through the bootstrap
+ * registry like any other service; Darwin binaries use host_self_trap.
  */
 mach_port_name_t
 mach_host_self(void)
@@ -267,11 +253,6 @@ mach_host_self(void)
 	return (bootstrap_lookup(SVC_HOST_NAME));
 }
 
-/*
- * host_page_size: RPC HOST_OP_PAGE_SIZE to the host port and write the
- * machine page size through *page_size_out.  Returns MACH_MSG_OK or a
- * MACH_E_* code.
- */
 int
 host_page_size(mach_port_name_t host, uint32_t *page_size_out)
 {
@@ -299,11 +280,6 @@ host_page_size(mach_port_name_t host, uint32_t *page_size_out)
 	return (MACH_MSG_OK);
 }
 
-/*
- * host_info: RPC HOST_OP_INFO to the host port and fill *out with the
- * machine snapshot (cpu count + type, total + free memory).  Returns
- * MACH_MSG_OK or a MACH_E_* code.
- */
 int
 host_info(mach_port_name_t host, struct svc_host_info_reply *out)
 {
@@ -332,10 +308,8 @@ host_info(mach_port_name_t host, struct svc_host_info_reply *out)
 }
 
 /*
- * task_vm_allocate: RPC TASK_OP_VM_ALLOCATE to a task port and write the
- * allocated VA through *addr_out.  `task` is MACH_PORT_TASK_SELF for the
- * caller's own task.  Returns MACH_MSG_OK, the reply's in-band MACH_E_*
- * status if the allocation itself failed, or a transport MACH_E_* code.
+ * task_vm_allocate: returns MACH_MSG_OK, the reply's in-band status if the
+ * allocation failed, or the transport's MACH_E_* code.
  */
 int
 task_vm_allocate(mach_port_name_t task, uint64_t size, uint32_t prot,
@@ -374,11 +348,6 @@ task_vm_allocate(mach_port_name_t task, uint64_t size, uint32_t prot,
 	return (MACH_MSG_OK);
 }
 
-/*
- * task_vm_deallocate: RPC TASK_OP_VM_DEALLOCATE to a task port to release a
- * range previously handed out by task_vm_allocate.  (addr, size) must
- * mirror the allocation.  Returns MACH_MSG_OK or a MACH_E_* code.
- */
 int
 task_vm_deallocate(mach_port_name_t task, uint64_t addr, uint64_t size)
 {
@@ -409,12 +378,9 @@ task_vm_deallocate(mach_port_name_t task, uint64_t addr, uint64_t size)
 }
 
 /*
- * task_get_special_port: RPC TASK_OP_GET_SPECIAL_PORT to a task port and
- * write the SEND-right name it hands back through *port_out.  `which` is a
- * TASK_SPECIAL_* index.  Success is signalled by the COMPLEX bit on the
- * reply (the port rides in a descriptor, like a bootstrap lookup); a
- * non-complex reply maps to MACH_E_INVAL.  Caller mach_port_deallocate's
- * the returned name.
+ * task_get_special_port: success is a COMPLEX reply, the port riding in a
+ * descriptor as for a bootstrap lookup; anything else is MACH_E_INVAL.
+ * The caller deallocates the returned name.
  */
 int
 task_get_special_port(mach_port_name_t task, uint32_t which,

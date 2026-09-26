@@ -29,20 +29,10 @@ static uint64_t		next_thread_id;
 static void	thread_trampoline(void);
 
 /*
- * Give the CONTEXT THAT IS ALREADY RUNNING a thread structure, and make it
- * this CPU's current thread.
- *
- * A processor cannot switch away from a thread that does not exist, so
- * whatever is executing when a CPU joins the scheduler has to be given a name
- * and a place to save its registers first.  That is true of the boot
- * processor inside kmain, and equally true of an application processor
- * standing on the stack its trampoline handed it -- one function, called
- * twice, rather than the second one written from memory of the first.
- *
- * The stack is not ours: it is the one the caller is standing on, and
- * th_kstack_base stays NULL so the reaper never frees it.  th_rsp_save is
- * meaningless until the first switch AWAY from this thread, at which point
- * the switch asm fills it in.
+ * Give the context already running a thread structure and make it this
+ * CPU's current thread (boot CPU and APs alike; see thread.h).  The stack
+ * is the caller's, so th_kstack_base stays NULL and the reaper never frees
+ * it.  th_rsp_save is filled in by the first switch away.
  */
 struct thread *
 thread_adopt_current(struct task *t, const char *name)
@@ -73,9 +63,8 @@ thread_adopt_current(struct task *t, const char *name)
 	th->th_entry           = NULL;
 	th->th_arg             = NULL;
 	/*
-	 * This thread is the context already running, which is holding no
-	 * lock at the moment it acquires a name -- unlike a created thread,
-	 * whose first act is to release one it never took (see thread_create).
+	 * Holds no lock, unlike a created thread, whose first act is to
+	 * release one it never took (see thread_create).
 	 */
 	th->th_spin_depth      = 0;
 	th->th_spin_saved_if   = false;
@@ -134,22 +123,12 @@ thread_subsystem_init(void)
 }
 
 /*
- * Stack layout the first context switch into a brand-new thread will
- * encounter (lowest address at top, which is where th_rsp_save points):
- *
- *	th_rsp_save -> [ r15 = 0     ]   popped by switch.S
- *	               [ r14 = 0     ]
- *	               [ r13 = 0     ]
- *	               [ r12 = 0     ]
- *	               [ rbx = 0     ]
- *	               [ rbp = 0     ]
- *	               [ RIP = trampoline ]   ret target
- *	               [ ...stack grows down for the trampoline's use... ]
- *
- * After the asm's 6 pops and ret, the new thread enters
- * thread_trampoline() with a freshly-zeroed register file and RSP just
- * above the saved RIP slot.  The trampoline picks up current_thread
- * (set by sched_run_next before the switch) and invokes the entry fn.
+ * Create a thread in THREAD_INIT with its own kstack, holding a fake
+ * switch frame (below) so the first switch into it "returns" into
+ * thread_trampoline with zeroed callee-saved registers.  The trampoline
+ * finds itself through current_thread, which the scheduler sets before
+ * the switch, and calls the entry function.  thread_start makes it
+ * runnable.
  */
 struct thread *
 thread_create(struct task *t, void (*entry)(void *), void *arg,
@@ -189,17 +168,11 @@ thread_create(struct task *t, void (*entry)(void *), void *arg,
 	th->th_arg               = arg;
 
 	/*
-	 * ⚠ PRE-LOADED AS THOUGH IT ALREADY HELD ONE LOCK, because it does --
-	 * or rather, it will release one it never took.  The switch into a
-	 * brand-new thread happens with sched_lock held by the thread doing
-	 * the switching, and thread_trampoline's first act is to release it.
-	 * A count that started at zero would go negative there, which is the
-	 * asymmetry that makes per-thread lock accounting look impossible
-	 * until this line.
-	 *
-	 * And the state that release will restore is interrupts ON, which is
-	 * how a thread has to start: it must be preemptible from its first
-	 * instruction, since nothing else will turn them on for it.
+	 * Pre-loaded as though holding one lock: the switch into a new thread
+	 * happens with sched_lock held by the thread switching away, and
+	 * thread_trampoline's first act is to release it.  A count starting
+	 * at zero would go negative there.  The release restores interrupts
+	 * on, so the thread is preemptible from its first instruction.
 	 */
 	th->th_spin_depth        = 1;
 	th->th_spin_saved_if     = true;
@@ -282,10 +255,10 @@ thread_wait_note(struct thread *th, struct thread **qhead,
 {
 
 	/*
-	 * A second note before the first was paid is the same defect that
-	 * cycled the port's waiter list: a thread linked into two places
-	 * through one field.  Catching it here names the enqueuer that
-	 * forgot its detach, instead of wedging whoever parks next.
+	 * A second note before the first is cleared means a thread linked
+	 * into two lists through one field.  Catching it here names the
+	 * enqueuer that forgot its detach, instead of wedging whoever parks
+	 * next.
 	 */
 	KASSERT(th->th_wait_qlock == NULL,
 	    "thread_wait_note: still noted on another list");
@@ -304,17 +277,10 @@ thread_wait_forget(struct thread *th)
 }
 
 /*
- * The waker's claim against reap -- see th_wake_hold in thread.h for the
- * window it closes and the liveness rule for taking it.  Atomic because the
- * claims come from anywhere: thread context under an object's lock, the PIT
- * walk under timed_lock, a device ISR that just exchanged its waiter slot.
- */
-/*
- * The slot note -- the waiter-list note's little sibling, for the drivers
- * whose "list" is one cell an ISR exchanges (th_wait_slot in thread.h).
- * note: taken around the whole wait loop, not per install, because the
- * cell may name this thread at any point inside it.  forget: before every
- * return from the loop, by which time the loop's own discipline has
+ * The slot note (th_wait_slot in thread.h), for drivers whose waiter list
+ * is one cell an ISR exchanges.  note: around the whole wait loop, not per
+ * install, because the cell may name this thread at any point inside it.
+ * forget: before every return from the loop, by which time the loop has
  * emptied the cell.
  */
 void
@@ -333,6 +299,12 @@ thread_slot_forget(struct thread *th)
 	th->th_wait_slot = NULL;
 }
 
+/*
+ * The waker's claim against reap (th_wake_hold in thread.h says when it
+ * may be taken).  Atomic because claims come from anywhere: thread context
+ * under an object's lock, the deadline walk under timed_lock, a device ISR
+ * that just exchanged its waiter slot.
+ */
 void
 thread_hold(struct thread *th)
 {
@@ -376,13 +348,10 @@ thread_wait_unbind_locked(struct thread *th)
  * Settle the note from an exiting thread's own context: take the noted
  * lock, take the thread off the noted list if it is still there, forget.
  *
- * Finding the thread already gone is legitimate -- an extractor popped it
- * and its wake is what brought the thread here.  The window that used to
- * be written down at this spot rather than fixed -- an extractor that has
- * popped this thread and NOT YET woken it races the reap -- is paid now:
- * every extractor takes a hold on what it pops, under the same lock this
- * function will have to take, and the reaper leaves a held body alone
- * until the wake has landed (th_wake_hold, thread_hold/thread_unhold).
+ * Finding it already gone is legitimate: an extractor popped it, and its
+ * wake is what brought the thread here.  An extractor that has popped it
+ * but not yet woken it is covered by the hold it took under the same lock
+ * (th_wake_hold); the reaper leaves a held body alone.
  */
 static void
 thread_wait_unbind(struct thread *th)
@@ -406,29 +375,21 @@ thread_exit(void)
 	KASSERT(me != NULL, "thread_exit: no current thread");
 
 	/*
-	 * No exit may carry a mutex out of the world: there is no unlock by
-	 * proxy, so a lock held here stays held for ever and everything that
-	 * ever wants it parks behind a corpse.  The kill checks decline to
-	 * retire a thread whose th_mutex_depth is up (kern/sched.c), and the
-	 * syscall boundary asserts the count is zero -- this is the last
-	 * tripwire, the one every exit path passes through.
+	 * No exit may carry a mutex out: there is no unlock by proxy, so it
+	 * would stay held for good.  The kill checks decline while
+	 * th_mutex_depth is up and the syscall boundary asserts zero; this
+	 * is the last tripwire, on every exit path.
 	 */
 	KASSERT(me->th_mutex_depth == 0,
 	    "thread_exit: dying with a mutex still held");
 
 	/*
-	 * A DARWIN TASK'S FILES ARE CLOSED BY ITS OWN LAST THREAD, here, and
-	 * not by whoever reaps the body.  Closing a file can BLOCK: the
-	 * filesystem's lock is a mutex, and an orphan's blocks are given back
-	 * on the last close.  The reaper runs on the idle thread, which
-	 * cannot block, and the assertion saying so is what found this.  It
-	 * never mattered while nothing closed files concurrently; two
-	 * recipes of a parallel make writing at once put the mutex in one
-	 * child's hand at the moment the idle thread reaped the other.
-	 * Unix closes a process's files in exit(2), in process context, for
-	 * exactly this reason.  The reaper's own call stays as the fallback
-	 * and finds nothing to do -- the teardown is idempotent.  Darwin
-	 * tasks are single-threaded, and the count says so.
+	 * A Darwin task's files are closed by its own last thread, here, not
+	 * by the reaper: closing can block (fs_lock is a mutex, and an
+	 * orphan's blocks are freed on last close), and the reaper may run on
+	 * the idle thread, which cannot.  Unix closes files in exit(2) for the
+	 * same reason.  The reaper's call remains as an idempotent fallback.
+	 * Darwin tasks are single-threaded; the count checks it.
 	 */
 	if (me->th_task != NULL &&
 	    me->th_task->t_personality == TASK_PERSONALITY_DARWIN &&
@@ -436,48 +397,25 @@ thread_exit(void)
 		darwin_files_teardown(me->th_task);
 
 	/*
-	 * OFF THE DEADLINE LIST BEFORE GOING ANYWHERE ELSE.
+	 * Off every list that may still name this thread, before it becomes
+	 * reapable.  A thread killed mid-park is retired from inside
+	 * thread_block_release, so the caller that linked it in never runs its
+	 * own removal.
 	 *
-	 * A timed wait is put on that list by its caller before the park and
-	 * taken off by the same caller after it.  A thread killed mid-park
-	 * never comes back to do the second half: thread_block_release retires
-	 * it from inside the block, above the layer that registered it.  What
-	 * is left behind is a pointer to a thread about to be reaped, on the
-	 * one list the timer walks on every tick.
-	 *
-	 * ⚠ AND IT TRUNCATES RATHER THAN CRASHING, which is why it was so hard
-	 * to see.  sched_add_timed_waiter pushes at the head without asking
-	 * whether the thread is already there -- so when the corpse's memory is
-	 * handed to a NEW thread and that thread registers a deadline, the push
-	 * overwrites a forward pointer the list was still using, and every
-	 * waiter behind it stops having a deadline at all.  Nothing fails,
-	 * nothing is reported: they simply never wake, and the machine goes
-	 * quiet with every processor idle and every thread blocked.
+	 * First the deadline list, which the timer walks every tick.
 	 */
 	sched_remove_timed_waiter(me);
 
-	/*
-	 * AND OFF THE OBJECT'S WAITER LIST, which is the same debt one layer
-	 * up.  A port's recv loop, a port set's, a blocked sender's, a
-	 * mutex's -- each links this thread into an object's queue before
-	 * parking and unlinks it after, and a kill-mid-park exit ran neither
-	 * the "after" nor could this function do it for them, because
-	 * th_wait_link does not say whose list it is threading.  Now the
-	 * thread notes where it parks (th_wait_qhead and friends), and this
-	 * settles whatever the note still owes -- so the port teardown drain
-	 * no longer wakes a thread that was reaped out from under the list.
-	 */
+	/* Then the object's waiter list, found through the note. */
 	thread_wait_unbind(me);
 
 	/*
-	 * AND OUT OF THE DRIVER'S SLOT, the third and last place a name can
-	 * outlive its thread.  The cell has no lock to settle under -- the
-	 * ISR takes it with a bare exchange -- so this is settled the same
-	 * way: one compare-and-swap of our own name for NULL.  Exactly one
-	 * side gets the pointer.  If the exit wins, the interrupt finds the
-	 * cell empty and wakes nobody; if the interrupt wins, the wake it
-	 * posts went through sched_post_irq_wake, whose hold keeps this
-	 * body on the zombie list until that wake has landed.
+	 * Then the driver's slot.  The ISR takes the cell with a bare
+	 * exchange, so this is one CAS of our own name for NULL, and exactly
+	 * one side gets the pointer: if the exit wins the interrupt finds the
+	 * cell empty; if the interrupt wins, its wake went through
+	 * sched_post_irq_wake, whose hold keeps this body unreaped until the
+	 * wake has landed.
 	 */
 	if (me->th_wait_slot != NULL) {
 		struct thread	*expect;
@@ -512,10 +450,9 @@ thread_set_exception_ports(struct thread *th, uint32_t types_mask,
 		return (MACH_MSG_OK);
 
 	/*
-	 * Mirror task_set_exception_ports' ref ordering:
-	 * take popcount(types_mask) refs on the new port BEFORE the
-	 * swap so any concurrent user_fault_die snapshot reads a live
-	 * ref between the unlock and the prev-drop.
+	 * Mirror task_set_exception_ports' ref ordering: take
+	 * popcount(types_mask) refs on the new port before the swap, so a
+	 * concurrent user_fault_die snapshot always reads a live ref.
 	 */
 	if (port != NULL) {
 		for (i = 0; i < EXC_TYPE_COUNT; i++) {
@@ -581,11 +518,9 @@ thread_print(struct thread *th)
 }
 
 /*
- * First instructions every brand-new thread executes after the very
- * first switch into it.  Lives at the top of the fake call frame.
- * Picks up the entry function and argument from the thread struct;
- * if entry returns we call thread_exit() so a misbehaving worker
- * doesn't run off the end of its stack.
+ * Where every new thread starts, via the fake frame's return address.
+ * Calls the entry function; if it returns, thread_exit() rather than
+ * running off the end of the stack.
  */
 static void
 thread_trampoline(void)
@@ -593,10 +528,9 @@ thread_trampoline(void)
 	struct thread	*me;
 
 	/*
-	 * The switch into us happened with sched_lock held by the
-	 * previous thread.  We are responsible for releasing it before
-	 * running anything else; otherwise the next thread_yield would
-	 * try to acquire it recursively and panic.
+	 * The switch into us happened with sched_lock held by the previous
+	 * thread; release it before anything else, or the next thread_yield
+	 * would acquire it recursively and panic.
 	 */
 	sched_post_switch_unlock();
 

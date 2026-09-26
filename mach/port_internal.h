@@ -16,13 +16,11 @@
 #include "spinlock.h"
 
 /*
- * Internal layout for the Mach IPC subsystem.  This header is private
- * to mach-tree .c files; carries the struct definitions the three
- * sibling .c files (port_object, port_space, port_msg) share plus the
- * cross-file static helper declarations.
+ * Private to mach/: the structures and helpers port_object.c,
+ * port_space.c and port_msg.c share.  The public API is port.h.
  *
- * Public API stays in port.h; nothing outside mach/ should include
- * this file.
+ * Field annotations: (c) constant after creation, (p) the object's own
+ * lock (p_lock, or ps_lock for a set or space).
  */
 
 /* ---- types ----------------------------------------------------------- */
@@ -52,35 +50,25 @@ struct port {
 	void		*p_special_arg;		/* (c) SERVICE fn / TASK_SELF id */
 
 	/*
-	 * Inline-reply stash (see mach_msg_rpc + the send fast path in
-	 * port_msg.c).  All three under p_lock.
+	 * Inline-reply stash (mach_msg_rpc and the send fast path in
+	 * port_msg.c), under p_lock.
 	 */
 	struct mach_msg_header *p_stash_buf;
 	size_t		 p_stash_size;
 	int		 p_stash_rv;
 
 	/*
-	 * Notification slots.
+	 * Notification registrations, under p_lock.
 	 *
-	 *	NO_SENDERS	registered by the receiver of THIS port; fires
-	 *			when the last send-bearing right drops while
-	 *			RECEIVE is still held.  Single-slot (one
-	 *			receiver per port): a second registration
-	 *			replaces the first.
-	 *	DEAD_NAME	registered by SEND holders of THIS port; fires
-	 *			when RECEIVE is dropped and the port goes dead
-	 *			(each watcher's SEND name in their own space
-	 *			becomes a dead name).  Multi-registrant: a
-	 *			singly-linked list of p_notify_dead_name nodes,
-	 *			one per distinct notify target, so every holder
-	 *			that armed a watch is notified -- not just the
-	 *			last to register.
+	 *	NO_SENDERS	set by this port's receiver; fires when the
+	 *			last SEND / SEND_ONCE right drops while RECEIVE
+	 *			is held.  One slot: registering again replaces.
+	 *	DEAD_NAME	set by SEND holders; fires when RECEIVE is
+	 *			dropped.  A list with one node per notify
+	 *			target, so every watcher is told.
 	 *
-	 * The kernel holds a SEND ref on each notify port to keep it
-	 * alive until the notification fires or the source's RECV
-	 * drops (whichever first); the NO_SENDERS ref is released through
-	 * port_deref's notify-cleanup branch, the DEAD_NAME refs as the
-	 * list is walked on death.  All under p_lock.
+	 * Each registration holds a SEND ref on its notify port until it
+	 * fires or RECEIVE drops, released by port_deref.
 	 */
 	struct port		*p_notify_no_senders;
 	uint32_t		 p_notify_no_senders_id;
@@ -99,11 +87,9 @@ struct port_set {
 };
 
 /*
- * One armed DEAD_NAME watch.  Linked off port->p_notify_dead_name; the
- * list is built as SEND holders register and walked (fired + freed) when
- * the port dies.  nn_port carries one kernel-held SEND ref on the notify
- * target, released as the node is freed.  Deduped on nn_port so re-arming
- * the same target updates its tag rather than queueing a second message.
+ * One armed DEAD_NAME watch on port->p_notify_dead_name, fired and freed
+ * when the port dies.  nn_port holds one SEND ref, released with the
+ * node.  One node per nn_port: re-arming a target updates its tag.
  */
 struct port_notify_node {
 	struct port_notify_node	*nn_next;
@@ -113,25 +99,19 @@ struct port_notify_node {
 };
 
 /*
- * Per-descriptor kernel state while a message is in flight.  Tagged
- * union: pd_type selects which fields are live.
+ * Kernel state of one descriptor in flight; pd_type says which fields
+ * are live.
  *
- *	MACH_MSG_PORT_DESCRIPTOR	pd_port + pd_disposition carry the
- *					kernel ref taken at send time.
- *	MACH_MSG_OOL_DESCRIPTOR		pd_ool_pages + pd_ool_npages carry
- *					the payload's FRAMES, owned by the
- *					message until it is delivered or
- *					destroyed.
+ *	MACH_MSG_PORT_DESCRIPTOR	pd_port + pd_disposition: the right
+ *					(a ref, or RECEIVE itself) taken at
+ *					send time.
+ *	MACH_MSG_OOL_DESCRIPTOR		pd_ool_pages + pd_ool_npages: the
+ *					payload's frames, captured at send
+ *					(shared with the sender or copied,
+ *					vm/vm.h).
  *
- * An in-flight OOL payload used to be a kmalloc'd copy of the sender's bytes,
- * which meant every transfer paid for two: once into the staging buffer on
- * send, once out of it into the receiver's fresh frames on recv.  It is now
- * the frames themselves, captured at send time -- shared with the sender
- * where that is legal, copied where it is not (vm/vm.h) -- so delivery is a
- * page-table operation and the second copy is gone along with the buffer.
- *
- * Whoever holds the array owns the frames.  Delivery hands them to the
- * receiver; every other exit releases them.
+ * Whoever holds the array owns the frames: delivery maps them into the
+ * receiver, every other exit releases them.
  */
 struct port_pending_desc {
 	uint8_t		 pd_type;
@@ -190,13 +170,12 @@ void		 port_ref(struct port *, uint8_t rights);
 void		 port_deref(struct port *, uint8_t rights);
 
 /*
- * Link a DEAD_NAME watcher onto `watched`.  Caller hands in a port that
- * already carries one fresh SEND ref (`notify`) and a pre-allocated node
- * (so no kmalloc happens under p_lock).  On a fresh registration the node
- * and ref are consumed; if a node for the same target already exists its
- * tag is updated and *was_dup is set true so the caller frees the spare
- * node and drops the spare ref.  Returns MACH_E_DEAD if `watched` has
- * already died (the event can no longer be observed).
+ * Link a DEAD_NAME watch onto `watched`.  The caller passes `notify`
+ * with a fresh SEND ref and a pre-allocated node (no kmalloc under
+ * p_lock).  A new watch consumes both.  If `notify` is already watching,
+ * its tag is updated and *was_dup set: the caller frees the node and
+ * drops the ref.  MACH_E_DEAD if `watched` has already died; the caller
+ * then releases both too.
  */
 int		 port_dead_name_link(struct port *watched, struct port *notify,
 		    struct port_notify_node *node, uint32_t tag,
@@ -222,11 +201,9 @@ int		 space_unbind_no_deref(struct port_space *,
 		    mach_port_name_t name, uint8_t right);
 
 /*
- * port_msg.c -- synthesise + enqueue a kernel-originated notification
- * message on `notify_port`.  Caller passes in the opcode (msgh_id) and
- * the user tag the receiver gets in nh_msgid.  Best-effort: dropped if
- * the queue is full or the port is dead.  Caller still owns the SEND
- * ref it held -- this routine does not deref.
+ * port_msg.c: queue a kernel notification on `notify_port`, msgh_id
+ * `notify_id` and nh_msgid `user_tag`.  Best-effort: dropped if the
+ * queue is full or the port dead.  The caller keeps the ref it holds.
  */
 int		 port_notify_enqueue(struct port *notify_port,
 		    uint32_t notify_id, uint32_t user_tag);

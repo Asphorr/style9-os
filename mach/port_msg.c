@@ -26,26 +26,16 @@
 #include "vm.h"
 
 /*
- * Message-passing layer for the Mach IPC subsystem.
+ * Mach IPC message passing: the port FIFOs and pending-descriptor
+ * housekeeping, mach_msg_send (with the special-port and inline-reply
+ * fast paths), mach_msg_recv / recv_block / recv_timed, and mach_msg_rpc,
+ * which arms the reply port's stash so a synchronous reply needs no
+ * kmalloc.
  *
- * Owns:
- *	- the FIFO and pending-descriptor housekeeping for in-flight
- *	  messages,
- *	- mach_msg_send (with the special-port and inline-reply fast
- *	  paths),
- *	- mach_msg_recv / recv_block / recv_timed,
- *	- mach_msg_rpc (which arms the stash on the reply port so the
- *	  fast path inside mach_msg_send can deliver the reply with
- *	  zero kmalloc).
- *
- * Object and name-table operations are in sibling files; their shared
- * helpers (port_create, space_lookup, ...) come in through
- * port_internal.h.
- *
- * Synchronous dispatcher hooks (task_self_dispatch in task.c,
- * bootstrap_dispatch in bootstrap.c) are picked up via the regular
- * public headers; mach_msg_send's special-port intercept calls them
- * in the sender's context.
+ * Object and name-table operations live in port_object.c and
+ * port_space.c, shared through port_internal.h.  The special-port
+ * dispatchers (task_self_dispatch in task.c, bootstrap_dispatch in
+ * bootstrap.c) run in the sender's context from mach_msg_send.
  */
 
 /* ---- message-queue helpers ----------------------------------------- */
@@ -63,13 +53,9 @@ msg_validate(const struct mach_msg_header *h)
 	if (h->msgh_size > MAX_MSG_BYTES)
 		return (MACH_E_INVAL);
 	/*
-	 * Forward-compat strictness: reject senders that scribble on
-	 * msgh_bits reserved bits or on msgh_voucher (reserved for the
-	 * unimplemented voucher capability).  A future revision will
-	 * extend MACH_MSGH_BITS_USED_MASK + define voucher semantics;
-	 * callers compiled against an older spec will fail fast with
-	 * MACH_E_INVAL the moment they cross the boundary, rather than
-	 * having their stray bits silently reinterpreted.
+	 * Reserved msgh_bits and msgh_voucher (vouchers are unimplemented)
+	 * must be zero, so a later meaning for them cannot silently
+	 * reinterpret an old caller's stray bits.
 	 */
 	if ((h->msgh_bits & ~MACH_MSGH_BITS_USED_MASK) != 0)
 		return (MACH_E_INVAL);
@@ -79,20 +65,16 @@ msg_validate(const struct mach_msg_header *h)
 }
 
 /*
- * Append a message; if anyone is waiting in recv_block on this port
- * OR on the port set this port is a member of, hand one waiter out
- * via *waiter_out so the caller can wake it AFTER dropping our
- * locks (thread_wake takes sched_lock; lock order is port -> sched).
+ * Append a message.  If a thread is parked on this port or on its port
+ * set, hand one out through *waiter_out for the caller to wake after our
+ * locks are dropped (thread_wake takes sched_lock; lock order is port ->
+ * sched).  Set waiters go first: the usual shape is one server parked on
+ * a set of many ports.
  *
- * Set-waiters take precedence: the canonical pattern is one server
- * thread parked on a set serving many member ports, so we'd rather
- * wake the server than a stray port-direct waiter.
- *
- * The waiter handed out is HELD (thread_hold, taken under the list's
- * lock where it is provably alive): between our unlock and the
- * caller's wake it can be woken by a kill, retire and be reaped, and
- * the hold is what makes the reaper wait.  The caller owes a
- * thread_unhold after its thread_wake.
+ * The waiter comes out held (thread_hold, taken under the list's lock
+ * while it is provably alive): before the caller's wake it can be killed,
+ * retire and be reaped, and the hold makes the reaper wait.  The caller
+ * owes a thread_unhold after its thread_wake.
  */
 static int
 msg_enqueue(struct port *p, struct port_msg *m, struct thread **waiter_out)
@@ -154,12 +136,10 @@ msg_enqueue(struct port *p, struct port_msg *m, struct thread **waiter_out)
 }
 
 /*
- * Pop one thread off the port's send-waiter FIFO, if any.  Caller
- * holds p_lock; caller wakes the returned thread (if non-NULL) *after*
- * dropping the lock (thread_wake takes sched_lock, and our lock order
- * is port -> sched), and owes a thread_unhold after the wake -- the
- * thread comes out of here held, for the same reap window msg_enqueue
- * describes.
+ * Pop one thread off the port's send-waiter FIFO, if any.  Caller holds
+ * p_lock, wakes the returned thread after dropping it (port -> sched),
+ * and then owes a thread_unhold: the thread comes out held, as in
+ * msg_enqueue.
  */
 static struct thread *
 port_extract_send_waiter_locked(struct port *p)
@@ -178,20 +158,14 @@ port_extract_send_waiter_locked(struct port *p)
 }
 
 /*
- * Take a specific thread off the port's recv-waiter list if it is still on
- * it.  Every thread that puts itself on this list calls this on the way out,
- * whatever woke it -- see the recv loop for why that has to be unconditional.
- * Caller holds p_lock.  Idempotent if the thread is already gone, because the
- * sender wake path may have extracted it first.
+ * Take a specific thread off the port's recv-waiter list if it is still
+ * on it.  Every thread that links itself here calls this on the way out,
+ * whatever woke it (see the recv loop).  Caller holds p_lock.  A no-op if
+ * a sender already extracted the thread.
  *
- * ⚠ THE TAIL IS THE PREDECESSOR, NOT NULL.  This used to say "if the link I
- * just wrote is NULL then the list is empty", which is true only when the
- * thread being removed was also the head.  Remove the tail of a two-deep list
- * and the head is still there, but the tail pointer said NULL -- so the next
- * thread to park took the "empty list" branch and wrote itself over the head,
- * and the thread that was already waiting there was never woken by anybody
- * again.  One waiter is the common case, which is why this survived: it needs
- * two threads on one port and the second one to time out.
+ * Removing the tail makes its predecessor the new tail, not NULL: a NULL
+ * tail over a non-empty list sends the next parker down the empty-list
+ * path, overwriting the head and stranding its waiter.
  */
 static void
 port_unbind_waiter_locked(struct port *p, struct thread *th)
@@ -236,9 +210,8 @@ port_set_unbind_waiter_locked(struct port_set *set, struct thread *th)
 }
 
 /*
- * And the same for the list a BLOCKED SENDER parks on when the destination
- * queue is full.  That list had no way off it at all except being extracted
- * by a receiver, which was fine while a park could not end any other way.
+ * The same for the list a sender parks on when the destination queue is
+ * full.  Caller holds p_lock.
  */
 static void
 port_unbind_send_waiter_locked(struct port *p, struct thread *th)
@@ -281,10 +254,9 @@ msg_dequeue(struct port *p, struct thread **send_waiter_out)
 }
 
 /*
- * Release the per-port refs each pending descriptor in `descs` holds,
- * then free the array.  Used by the failure path of mach_msg_send (to
- * unwind partial descriptor work) and by port_free in port_object.c
- * to drain unconsumed queued messages.
+ * Release what each pending descriptor in `descs` holds (a port ref or
+ * an OOL payload), then free the array.  Used by the send failure paths
+ * and by port_object.c to drain messages that were never received.
  */
 void
 free_pending_descs(struct port_pending_desc *descs, size_t n)
@@ -307,15 +279,11 @@ free_pending_descs(struct port_pending_desc *descs, size_t n)
 }
 
 /*
- * Give up an in-flight OOL payload.  Every exit that is not delivery ends
- * here: a message destroyed on a full queue, a send that fails after some of
- * its descriptors were captured, a port torn down with mail still in it.
- *
- * The frames are the message's while it is in flight, so releasing them is
- * releasing a reference -- a page shared with its sender goes on existing,
- * a page copied for the message does not.  Delivery is the one path that
- * must NOT come here: it hands the same frames to the receiver instead, and
- * dropping them as well would take back what was just given.
+ * Give up an in-flight OOL payload: every exit but delivery ends here (a
+ * send that fails after capturing, a port torn down with mail queued).
+ * The message holds one reference per frame, so a page shared with the
+ * sender survives and a page copied for the message is freed.  Delivery
+ * must not come here: it hands the same frames to the receiver instead.
  */
 static void
 pd_ool_drop(struct port_pending_desc *pd)
@@ -334,15 +302,13 @@ pd_ool_drop(struct port_pending_desc *pd)
 
 /*
  * Synthesise a notification message and enqueue it on `notify_port`.
- * Called from port_deref's no-senders detection (and, eventually, the
- * dead-name path) with a local SEND-ref already held on notify_port so
- * the receiver does not race the firing against the destination's
- * teardown.  Caller owns that ref -- this routine does not drop it.
+ * Called from port_deref (no-senders, dead-name) and from port_space.c
+ * (send-once destroyed unused), with a ref on notify_port held so the
+ * port cannot be torn down under the send.  The caller owns that ref;
+ * this does not drop it.
  *
- * Best-effort: a dead notify port (receiver gone) or a full queue
- * silently drops the notification.  v1 has no return-to-source backstop;
- * a future revision can stash the notification on a kernel-side dead
- * letter queue if real Mach semantics become important.
+ * Best-effort: a dead notify port or a full queue drops the notification.
+ * There is no dead-letter backstop.
  */
 int
 port_notify_enqueue(struct port *notify_port, uint32_t notify_id,
@@ -409,18 +375,14 @@ port_exception_post(struct port *port, uint32_t trapno, uint32_t err,
 		return (MACH_E_NOMEM);
 
 	/*
-	 * When the watcher opted into the reply protocol the caller
-	 * hands us a kernel-owned reply port; attach it as an implicit
-	 * msgh_local descriptor with MAKE_SEND disposition so the
-	 * watcher's deliver_msg installs a SEND name in their space.
-	 * The receiver replies through that name; the kernel-side
-	 * recv on `reply_port` (from the caller) wakes on the verdict.
+	 * A watcher that opted into the reply protocol gets a kernel-owned
+	 * reply port as an implicit msgh_local descriptor (MAKE_SEND), so
+	 * delivery installs a SEND name in its space; its reply wakes the
+	 * caller's kernel-side recv on `reply_port`.
 	 *
-	 * Ref accounting: take one SEND ref here for the message
-	 * in-flight; deliver_msg drops it after installing the
-	 * receiver's name, so refs balance whether or not delivery
-	 * succeeds (the free_pending_descs failure path also drops
-	 * via port_deref).
+	 * One SEND ref is taken for the message in flight.  deliver_msg
+	 * drops it after installing the name, and free_pending_descs drops
+	 * it if the message dies undelivered.
 	 */
 	if (reply_port != NULL) {
 		descs = (struct port_pending_desc *)kcalloc(1,
@@ -476,15 +438,12 @@ port_exception_post(struct port *port, uint32_t trapno, uint32_t err,
 /* ---- mach_msg_send --------------------------------------------------- */
 
 /*
- * Resolve a port descriptor on send: translate the sender's name to
- * a port pointer, apply the disposition semantics (move/copy/make),
- * and stash {port, disposition} in the pending-descriptor slot.
+ * Resolve a port descriptor on send: translate the sender's name, apply
+ * the move/copy/make disposition, and record {port, right} in `pd`.
  *
- * The pd_disposition we record here is what the RECEIVER will be
- * granted: SEND for the *_SEND family, SEND_ONCE for the *_SEND_ONCE
- * family.  We normalise away the move/copy/make distinction since
- * delivery semantics don't care -- the receiver always sees a fresh
- * name in their space carrying the right.
+ * pd_disposition is the right the receiver will be granted -- RECEIVE,
+ * SEND or SEND_ONCE.  Move/copy/make only matters to the sender; the
+ * receiver always gets a fresh name carrying the right.
  */
 static int
 send_xlate_desc(struct port_space *from, mach_port_name_t name,
@@ -505,12 +464,9 @@ send_xlate_desc(struct port_space *from, mach_port_name_t name,
 		if (p == NULL)
 			return (MACH_E_RIGHT);
 		/*
-		 * Refuse if the port is currently a set member or has
-		 * recv-blocked threads parked on it: moving the receive
-		 * right out would either silently detach the set member
-		 * or strand a thread on a right it no longer owns.  The
-		 * sender must withdraw from the set / unblock the
-		 * waiter first.
+		 * Refuse while the port is in a set or has receivers
+		 * parked on it: moving the right would silently detach the
+		 * member or strand a thread on a right it no longer owns.
 		 */
 		spin_lock(&p->p_lock);
 		if (p->p_set != NULL || p->p_waiters_head != NULL) {
@@ -593,11 +549,10 @@ send_xlate_desc(struct port_space *from, mach_port_name_t name,
 /* ---- OOL helpers --------------------------------------------------- */
 
 /*
- * desc_step: one iteration of the variable-stride descriptor walker.
- * Reads the type tag at buf[off] and returns the descriptor's stride
- * (8 for port, 16 for OOL); writes the tag to *type_out.  Returns 0
- * if the type is unknown or the full descriptor would run past `cap`,
- * signalling MACH_E_INVAL to the caller without touching the buffer.
+ * One step of the variable-stride descriptor walk: return the stride of
+ * the descriptor at buf[off] (8 for port, 16 for OOL) and its tag in
+ * *type_out, or 0 -- MACH_E_INVAL to the caller -- if the tag is unknown
+ * or the descriptor would run past `cap`.
  */
 static size_t
 desc_step(const uint8_t *buf, size_t off, size_t cap, uint8_t *type_out)
@@ -621,35 +576,22 @@ desc_step(const uint8_t *buf, size_t off, size_t cap, uint8_t *type_out)
 }
 
 /*
- * send_capture_ool: on send, validate the OOL descriptor's sender VA
- * range and take the payload's FRAMES away with it.  The sender's pmap is
- * current (sender is the calling task), so vm_pages_capture_user can read
- * its page tables directly and share what it can rather than copying.
+ * On send, validate the OOL descriptor's sender range and capture the
+ * payload's frames.  The sender is the calling task, so its page tables
+ * are current and vm_pages_capture_user shares what it can instead of
+ * copying; there is no staging buffer, and a page that must be copied is
+ * copied once.  Which pages are shared is vm/vm.h's decision.  A shared
+ * page is write-protected in the sender before this returns, so the
+ * receiver gets the bytes as they were at the send.
  *
- * There is no staging buffer any more.  There used to be, and it made every
- * transfer cost two copies of the payload -- into a kmalloc'd buffer here,
- * out of it into the receiver's fresh frames on the other side -- for a
- * middle step neither party ever looked at.  Delivery is now a page-table
- * operation, and even a payload that must be copied is copied once.
+ * `deallocate` is honoured for ring-3 senders: the sender's page-rounded
+ * range is released with vm_map_release after the capture.  Best-effort:
+ * vm_map_release refuses a range with a hole or a non-anonymous entry in
+ * it, and the sender's map is then left alone.  Kernel and trusted
+ * senders skip it; their addresses are kernel VA.
  *
- * Which pages get shared and which get copied is vm/vm.h's decision, not
- * this file's.  What matters here is the consequence: a shared page is
- * write-protected in the sender before this returns, so the receiver is
- * promised the bytes as they were at the instant of the send even if the
- * sender scribbles on its buffer immediately afterwards.
- *
- * Per-descriptor `deallocate` IS honoured for ring-3 senders:
- * post-copy, if the sender set deallocate=1 AND the source range
- * mirrors a vm_allocate'd anonymous entry exactly, the kernel calls
- * vm_map_release on the sender's range so the user does not have to
- * race the send + manual vm_deallocate.  Non-matching ranges (stack,
- * static data, partial slices of a larger allocation) leave the
- * sender's VM untouched -- the flag is best-effort, not mandatory.
- * Kernel and trusted-send senders skip the hook (their addresses
- * are kernel-VA; nothing to vm_map_release).
- *
- * On success the pd owns the payload's frames; the receive path takes them
- * over, and every other exit hands them back through pd_ool_drop.
+ * On success `pd` owns the frames: delivery takes them over, every other
+ * exit gives them back through pd_ool_drop.
  */
 static int
 send_capture_ool(struct port_space *from,
@@ -677,8 +619,7 @@ send_capture_ool(struct port_space *from,
 	addr = od->address;
 
 	if (size == 0) {
-		/* Zero-byte OOL: legal, just an empty buffer.  Receiver
-		   will see address=0, size=0; no VM install needed. */
+		/* Legal and empty: the receiver sees address 0, size 0. */
 		return (MACH_MSG_OK);
 	}
 	if (size > MACH_MSG_OOL_MAX_BYTES)
@@ -688,26 +629,15 @@ send_capture_ool(struct port_space *from,
 		return (MACH_E_INVAL);
 
 	/*
-	 * Validate the sender's address range is plausibly inside the
-	 * task's user VA window.  This is a coarse check -- a perfect
-	 * one would walk t_map for full coverage, but the subsequent
-	 * memcpy will already fault on any unmapped page within the
-	 * window, so the obvious wraparound + out-of-window cases are
-	 * all that need explicit guarding here.
+	 * Coarse check that the range lies in the task's user VA window:
+	 * wraparound and out-of-window are refused here, and an unmapped
+	 * page inside the window faults when it is copied.
 	 *
-	 * Two exemptions, both for kernel-internal senders that ship
-	 * blobs out of kmalloc'd / .rodata kernel addresses:
-	 *
-	 *	- kernel_task itself (kernel threads sending OOL)
-	 *	- a thread with th_trusted_send set, toggled by
-	 *	  mach_msg_send_trusted around a single send call
-	 *	  (used by special-service dispatchers replying out of
-	 *	  kernel rodata; see kern/thread.h)
-	 *
-	 * The kernel is trusted not to point at unmapped memory; if it
-	 * ever does the subsequent memcpy triple-faults, which is a
-	 * louder bug than the silent E_INVAL appropriate for ring-3
-	 * senders.
+	 * Kernel senders are exempt -- kernel_task, and a thread with
+	 * th_trusted_send set by mach_msg_send_trusted around one send
+	 * (service dispatchers replying out of kernel .rodata).  They are
+	 * trusted not to name unmapped memory; if one does, the copy
+	 * faults in the kernel, which is louder than MACH_E_INVAL.
 	 */
 	sender = current_thread != NULL ? current_thread->th_task : NULL;
 	from_kernel = (sender == NULL || sender == kernel_task ||
@@ -728,10 +658,9 @@ send_capture_ool(struct port_space *from,
 		return (MACH_E_NOMEM);
 
 	/*
-	 * A kernel sender's `addr` is a kernel VA in no task's map, so there
-	 * are no page tables to consult and nothing to write-protect: those
-	 * payloads are copied, which is also what keeps a service's .rodata
-	 * from turning into a receiver's writable page.
+	 * A kernel sender's `addr` is in no task's map, so its payload is
+	 * copied -- which also keeps a service's .rodata from becoming a
+	 * receiver's writable page.
 	 */
 	if (from_kernel)
 		got = vm_pages_capture_kernel((const void *)(uintptr_t)addr,
@@ -749,17 +678,9 @@ send_capture_ool(struct port_space *from,
 	pd->pd_ool_size   = size;
 
 	/*
-	 * Honour the deallocate-on-send flag for ring-3 senders.  Skip
-	 * for kernel-internal senders (kernel_task / trusted-send) since
-	 * their `addr` is a kernel VA, not a managed user range.  Page-
-	 * round the size: what the sender gives up is the pages its payload
-	 * occupies, and a 100-byte payload still costs it the page holding
-	 * those bytes.
-	 *
-	 * The range released is the one named, not the allocation it came
-	 * from -- vm_map cuts the entry when the payload is part of a larger
-	 * range, so a sender that hands over one page of eight keeps seven.
-	 * Until the map could cut, this quietly did nothing in that case.
+	 * Deallocate-on-send, ring-3 senders only.  The sender gives up the
+	 * whole pages its payload occupies, and only those: vm_map cuts a
+	 * larger entry, so handing over one page of eight keeps seven.
 	 */
 	if (od->deallocate != 0 && !from_kernel) {
 		uint64_t aligned = ((uint64_t)size + 0xFFFull) & ~0xFFFull;
@@ -770,22 +691,13 @@ send_capture_ool(struct port_space *from,
 }
 
 /*
- * apply_ool_deallocate: post-dispatch dealloc hook for the special-
- * port short-circuit path.
+ * Deallocate-on-send for the special-port path.  The queue path honours
+ * the flag in send_capture_ool, once the frames are captured.  A special
+ * port's dispatcher instead reads OOL bytes straight out of the sender's
+ * address space, so the source can only be released after the dispatch.
  *
- * The normal queue path runs through send_capture_ool, which honours
- * deallocate-on-send inline because it has already copied the bytes
- * into a kernel-side staging buffer.  Special-port destinations bypass
- * send_capture_ool: the dispatcher reads OOL bytes straight out of
- * the sender's pmap.  Releasing the source range BEFORE the dispatch
- * would yank the bytes out from under the dispatcher; releasing it
- * AFTER lets the dispatcher consume the bytes first.
- *
- * Caller (mach_msg_send's special-port branch) passes a kernel-VA
- * `msg` -- the upfront copyin already mirrored the user message into
- * m->m_buf, so this walk is pure kernel-VA bookkeeping.  Only the
- * vm_map_release calls touch user state, and they take the user-VA
- * `od->address` as data.
+ * `msg` is the kernel copy in m->m_buf; only the vm_map_release calls
+ * touch user state, taking `od->address` as data.
  */
 static void
 apply_ool_deallocate(const struct mach_msg_header *msg,
@@ -852,14 +764,9 @@ apply_ool_deallocate(const struct mach_msg_header *msg,
 }
 
 /*
- * recv_rollback_ool: on recv-path failure, tear down a partially-
- * installed OOL range in the receiver: walk the per-page mappings,
- * remove from pmap, free the underlying frames, and drop the vm_map
- * entry that recorded the range.
- *
- * `installed_pages` is the page count actually installed before the
- * failure; the caller passes whatever it got through before erroring
- * so we don't unmap-then-free pages that were never inserted.
+ * Undo an OOL range installed in the receiver: unmap each of the first
+ * `installed_pages` pages, release its frame, and drop the vm_map entry
+ * covering `total_aligned` bytes.
  */
 static void
 recv_rollback_ool(struct task *to, uint64_t landing_va,
@@ -881,19 +788,15 @@ recv_rollback_ool(struct task *to, uint64_t landing_va,
 }
 
 /*
- * recv_install_ool: on recv, land the payload's frames in the receiver's
- * address space and tell it where they went.
+ * On recv, map the payload's frames into the receiver and write the
+ * landing address into the descriptor.  vm_pages_install maps them
+ * read-only under a writable copy-on-write entry, so a receiver that only
+ * reads goes on sharing and one that writes takes a fault; nothing is
+ * copied here.
  *
- * All the work is vm_pages_install's: it finds a free range, records it, and
- * maps the frames read-only under an entry that says writable, so a receiver
- * that only reads keeps sharing whatever the sender shared and one that
- * writes takes a copy-on-write fault.  Nothing is copied here at all.
- *
- * The ownership handover is the delicate part.  On success the frames belong
- * to the receiver's map and the descriptor must forget them without
- * releasing them -- dropping a reference here would take back the pages just
- * handed over.  On failure nothing was installed, the descriptor still owns
- * them, and the caller's cleanup path does the releasing.
+ * On success the frames belong to the receiver's map and `pd` forgets
+ * them without releasing them.  On failure nothing was installed, `pd`
+ * still owns them, and the caller's cleanup releases them.
  */
 static int
 recv_install_ool(struct port_space *to_space,
@@ -974,21 +877,12 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 		return (MACH_E_INVAL);
 
 	/*
-	 * Single-pass copyin pattern: read the user header under one
-	 * SMAP bracket, validate the kernel-side copy, then allocate
-	 * the queue buffer m sized to fit the whole message and
-	 * copyin the entire body straight into m->m_buf.  After this
-	 * block, `msg` aliases m->m_buf (kernel VA) and every
-	 * subsequent header / body / descriptor read in this function
-	 * (and in the dispatchers / OOL walker we call out to) is a
-	 * plain kernel-VA dereference -- no further brackets needed.
-	 *
-	 * The destination buffer for the copyin is the queue buffer
-	 * itself, so the message bytes are copied exactly once.  The
-	 * special-port short-circuit pays for this kmalloc + kfree
-	 * even though it does not enqueue m; that cost is one heap
-	 * round-trip per dispatch, well below the wire-format walk
-	 * we are already doing.
+	 * Copy in the header, validate the copy, then copy the whole
+	 * message straight into the queue buffer m->m_buf.  From there on
+	 * `msg` aliases m->m_buf, and every read here, in the dispatchers
+	 * and in the OOL walker, is a plain kernel-VA access.  The bytes
+	 * are copied once; the special-port path pays a kmalloc/kfree for
+	 * a buffer it never queues.
 	 */
 	smap_user_access_begin();
 	hdr_copy = *umsg;
@@ -999,14 +893,11 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 		return (rv);
 
 	/*
-	 * No body-bound check here: kernel-spawned worker tasks (stress
-	 * harness, future kernel servers) send with kernel-VA `umsg`
-	 * pointers even though sender != kernel_task, and a sender vs.
-	 * t_map check would wrongly reject them.  Ring-3 entry points
-	 * (sys_msg_send / sys_msg_rpc) bound umsg + msgh_size against
-	 * the user-VA window before reaching here, so the body copyin
-	 * below is safe for the syscall caller; kernel callers are
-	 * trusted not to point at unmapped memory.
+	 * No bounds check on the body: kernel-spawned worker tasks send
+	 * with kernel-VA `umsg` although they are not kernel_task.  The
+	 * syscalls (sys_msg_send / sys_msg_rpc) bound umsg + msgh_size
+	 * against the user window before calling here; kernel callers are
+	 * trusted.
 	 */
 
 	remote_disp = MACH_MSGH_BITS_REMOTE(hdr_copy.msgh_bits);
@@ -1062,16 +953,13 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 	}
 
 	/*
-	 * Inline-reply fast path.  If the destination has an armed stash
-	 * AND the message is bare (no descriptors, no implicit reply
-	 * port), write the bytes straight into the stash buffer and set
-	 * p_stash_rv = OK.  This is the synchronous-RPC rendezvous: the
-	 * armed thread is mid-mach_msg_rpc inside the same call stack,
-	 * not parked, so no wake is needed -- it reads p_stash_rv after
-	 * its mach_msg_send returns.  Zero kmalloc, zero enqueue.
-	 *
-	 * MOVE_* dispositions still drop the sender's right so the
-	 * post-send sender's space is identical to the slow-path case.
+	 * Inline-reply fast path.  A bare message (no descriptors, no
+	 * reply port) to a port with an armed stash is written straight
+	 * into the stash buffer and p_stash_rv set to OK: no enqueue, no
+	 * wake.  This is the synchronous-RPC rendezvous -- the armer is
+	 * inside mach_msg_rpc on this same call stack and reads
+	 * p_stash_rv when its send returns.  MOVE_* still drops the
+	 * sender's right, as on the queue path.
 	 */
 	if (!complex && !has_local) {
 		size_t	want_size;
@@ -1089,23 +977,17 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 			dst  = (uint8_t *)dest->p_stash_buf;	/* user VA */
 			src2 = (const uint8_t *)msg;		/* kernel VA */
 			/*
-			 * dest->p_stash_buf was armed by mach_msg_rpc and
-			 * points into the receiver's caller-supplied user
-			 * buffer.  Single SMAP bracket on the copy + the
-			 * msgh_local zero so the inline-reply fast path
-			 * touches user memory the same way deliver_msg
-			 * does on the slow path.
+			 * p_stash_buf is the RPC caller's user buffer: one
+			 * SMAP bracket over the copy and the msgh_local
+			 * fixup, as in deliver_msg.
 			 */
 			smap_user_access_begin();
 			for (i = 0; i < want_size; i++)
 				dst[i] = src2[i];
 			/*
-			 * Sender filled msgh_local with their own name; the
-			 * stash receiver has no use for it (the reply port
-			 * name belongs to the receiver's space, but the
-			 * sender's view doesn't translate).  Zero it so the
-			 * receiver doesn't accidentally space_drop a name it
-			 * never owned.
+			 * msgh_local is a name in the sender's space, not the
+			 * receiver's; zero it so the receiver cannot drop a
+			 * name it never owned.
 			 */
 			sh = (struct mach_msg_header *)dst;
 			sh->msgh_local = MACH_PORT_NULL;
@@ -1126,11 +1008,10 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 	}
 
 	/*
-	 * Special-port intercept.  When the destination is a kernel
-	 * object (task_self_port etc.) we never queue: the dispatcher
-	 * synthesises any reply directly and returns.  Honour MOVE_*
-	 * by dropping the sender's right first so the dispatcher
-	 * cannot observe a stale name in the sender's space.
+	 * Special-port intercept: a kernel-object destination (task self,
+	 * bootstrap, a service) is never queued; its dispatcher runs here
+	 * and sends any reply itself.  MOVE_* drops the sender's right
+	 * first, so the dispatcher never sees a stale name.
 	 */
 	if (dest->p_special != PORT_SPECIAL_NONE) {
 		int	special_rv;
@@ -1146,11 +1027,9 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 			uint64_t	 tid;
 
 			/*
-			 * p_special_arg holds the target's task id, not a
-			 * raw pointer (the port can outlive the task).
-			 * Resolve it to a ref'd task so dispatch operates on
-			 * live memory; a stale port (task already reaped)
-			 * resolves to NULL and fails safe with MACH_E_DEAD.
+			 * p_special_arg is the target's task id, not a
+			 * pointer: the port can outlive the task.  A reaped
+			 * task resolves to NULL and gives MACH_E_DEAD.
 			 */
 			tid = (uint64_t)(uintptr_t)dest->p_special_arg;
 			t = task_lookup_ref(tid);
@@ -1175,30 +1054,21 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 			special_rv = MACH_E_INVAL;
 			break;
 		}
-		/*
-		 * Dispatchers read msg (== m->m_buf) directly -- it is
-		 * kernel VA, so any further OOL-source touches happen
-		 * with the OOL descriptor's `address` already validated
-		 * in the kernel copy.  apply_ool_deallocate honours
-		 * deallocate-on-send for any OOL with the flag set; it
-		 * walks m->m_buf, so no SMAP brackets are needed there
-		 * either.
-		 */
+		/* Now that the dispatcher has read them, deallocate-on-send. */
 		apply_ool_deallocate(msg, from);
 		kfree(m);
 		return (special_rv);
 	}
 
 	/*
-	 * Take an extra ref on dest of the same kind as the sender's
-	 * right.  Released after enqueue regardless of MOVE/COPY.
+	 * A ref on dest of the sender's right's kind, held across the
+	 * enqueue whether the right is moved or copied.
 	 */
 	port_ref(dest, remote_right);
 
 	/*
-	 * For MOVE_* the sender relinquishes their right.  Any other
-	 * rights under the same name (e.g. RECEIVE held simultaneously
-	 * with SEND) survive the drop.
+	 * MOVE_* gives up the sender's right; other rights under the same
+	 * name (RECEIVE alongside SEND) survive.
 	 */
 	if (remote_disp == MACH_MSG_TYPE_MOVE_SEND ||
 	    remote_disp == MACH_MSG_TYPE_MOVE_SEND_ONCE) {
@@ -1206,11 +1076,6 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 		    remote_right);
 	}
 
-	/*
-	 * m is already allocated and m->m_buf already populated from
-	 * the upfront copyin -- nothing to do here beyond setting the
-	 * hdrs offset that the descriptor walker uses.
-	 */
 	hdrs_off = sizeof(struct mach_msg_header);
 
 	if (complex) {
@@ -1228,9 +1093,8 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 		ndescs = body->msgh_descriptor_count;
 		if (ndescs > 0) {
 			/*
-			 * Variable-stride walk: confirm every descriptor's
-			 * type tag is known and the full descriptor fits
-			 * within msgh_size before we commit to processing.
+			 * Check every tag and bound before processing any
+			 * descriptor.
 			 */
 			walk_off = hdrs_off + sizeof(struct mach_msg_body);
 			for (walk_i = 0; walk_i < ndescs; walk_i++) {
@@ -1254,9 +1118,9 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 	}
 
 	/*
-	 * Implicit msgh_local descriptor: when sender supplies a reply
-	 * port, treat it as a stealth port-descriptor with the local
-	 * disposition.
+	 * A reply port in msgh_local travels as an implicit port
+	 * descriptor with the local disposition, in the last slot of
+	 * m_descs.
 	 */
 	if (has_local) {
 		struct port_pending_desc local_pd;
@@ -1264,11 +1128,7 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 		    &local_pd);
 		if (rv != MACH_MSG_OK)
 			goto fail;
-		/*
-		 * Stash on the queued msg's m_descs[ndescs] slot --
-		 * grow the array by 1 so recv code path doesn't
-		 * special-case the header descriptor.
-		 */
+		/* Grow the array by one for it. */
 		struct port_pending_desc *bigger;
 		bigger = (struct port_pending_desc *)kcalloc(ndescs + 1,
 		    sizeof(struct port_pending_desc));
@@ -1284,10 +1144,7 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 		if (descs != NULL)
 			kfree(descs);
 		descs = bigger;
-		/*
-		 * Zero out msgh_local in the buffered copy; recv will
-		 * fill in the receiver-side name.
-		 */
+		/* Delivery writes the receiver's name here. */
 		struct mach_msg_header *hdr =
 		    (struct mach_msg_header *)m->m_buf;
 		hdr->msgh_local = MACH_PORT_NULL;
@@ -1340,14 +1197,11 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 		struct thread	*self;
 
 		/*
-		 * Enqueue with backpressure: if the destination queue is
-		 * full, park self on dest->p_send_waiters and wait for a
-		 * recv to free a slot, then retry.  Wakes propagate via
-		 * port_extract_send_waiter_locked in the recv paths.
-		 *
-		 * If the port dies while we are parked, port_deref's
-		 * RECV-drop path drains p_send_waiters and the retry
-		 * sees p_dead -> returns MACH_E_DEAD.
+		 * Enqueue with backpressure: on a full queue, park on
+		 * p_send_waiters until a receive frees a slot
+		 * (port_extract_send_waiter_locked), then retry.  If the
+		 * port dies meanwhile, port_deref's RECEIVE-drop path wakes
+		 * the list and the retry sees p_dead: MACH_E_DEAD.
 		 */
 		for (;;) {
 			rv = msg_enqueue(dest, m, &waiter);
@@ -1384,11 +1238,8 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 			thread_block_release(THREAD_BLOCK_PORT, dest,
 			    &dest->p_lock);
 			/*
-			 * And off the list before going round again, for the
-			 * same reason and with the same failure if it is left
-			 * out -- see the recv loop below.  A receiver that
-			 * extracted us already did it; a park that declined to
-			 * park did not.
+			 * Off the list before going round again,
+			 * unconditionally, as in the recv loop below.
 			 */
 			spin_lock(&dest->p_lock);
 			port_unbind_send_waiter_locked(dest, self);
@@ -1402,16 +1253,12 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 		}
 	}
 
-	/*
-	 * Drop the extra ref we took right after lookup.  The kind
-	 * matches the sender's right: SEND for COPY/MOVE_SEND,
-	 * SEND_ONCE for MOVE_SEND_ONCE.
-	 */
+	/* The ref taken after lookup, of the sender's right's kind. */
 	port_deref(dest, remote_right);
 	return (MACH_MSG_OK);
 
 fail:
-	/* Releases port refs AND frees OOL staging buffers as appropriate. */
+	/* Releases the descriptors' port refs and OOL frames. */
 	free_pending_descs(descs, ndescs);
 	if (m != NULL)
 		kfree(m);
@@ -1423,21 +1270,16 @@ fail:
 /* ---- mach_msg_recv --------------------------------------------------- */
 
 /*
- * recv_rollback_installed: undo the first `up_to` descriptors of an
- * in-flight delivery -- caller has already noticed an error on
- * descriptor `up_to` and needs to back out everything that succeeded
- * up to (but not including) it.
+ * Delivery failed at descriptor `up_to`: undo the ones before it and
+ * release the rest.
  *
- * For each previously-installed descriptor:
- *	PORT	  -- pds[k].name was just rewritten to a receiver-space
- *		     name; drop that right back out of the receiver.
- *	OOL	  -- od[k].address was just rewritten to a receiver VA;
- *		     unmap the range, free the frames, drop the vm_map
- *		     entry.
+ *	PORT	-- the name now in the descriptor is the receiver's; drop
+ *		   that right from the receiver.
+ *	OOL	-- the address is a receiver VA; unmap the range, release
+ *		   the frames, drop the vm_map entry.
  *
- * After undoing the install side, walk the remaining descs[] to release
- * ports we never delivered and give back OOL payloads still owned by their
- * descriptors.
+ * Descriptors from `up_to` on were never installed: their port refs are
+ * dropped and their OOL payloads given back.
  */
 static void
 recv_rollback_installed(struct port_space *to, struct port_msg *m,
@@ -1481,7 +1323,7 @@ recv_rollback_installed(struct port_space *to, struct port_msg *m,
 		}
 	}
 
-	/* The descs[] entries past `up_to` never installed; free them. */
+	/* From `up_to` on, nothing was installed. */
 	for (i = up_to; i < m->m_ndescs; i++) {
 		if (m->m_descs[i].pd_type == MACH_MSG_PORT_DESCRIPTOR &&
 		    m->m_descs[i].pd_port != NULL) {
@@ -1541,10 +1383,9 @@ deliver_msg(struct port_space *to, struct port *p, struct port_msg *m,
 
 			kind = m->m_descs[i].pd_disposition;
 			/*
-			 * RECEIVE descriptors carry the right itself rather
-			 * than a pending ref -- install without a fresh
-			 * port_ref, and skip the matching port_deref below.
-			 * See send_xlate_desc MOVE_RECEIVE for the symmetry.
+			 * A RECEIVE descriptor carries the right itself, not
+			 * a ref (see MOVE_RECEIVE in send_xlate_desc): install
+			 * it without a port_ref and skip the port_deref.
 			 */
 			if (kind == MACH_PORT_RIGHT_RECEIVE)
 				rv = space_install_no_ref(to,
@@ -1612,11 +1453,8 @@ deliver_msg(struct port_space *to, struct port *p, struct port_msg *m,
 	}
 
 	/*
-	 * Copyout the queued kernel-VA message into the caller's user
-	 * buffer.  Single SMAP bracket on the write side -- m->m_buf
-	 * has been built up entirely in the kernel (post-receive
-	 * descriptor translation lives in there), so this is the only
-	 * user touch on the deliver path.
+	 * Copy out the translated message: the only user access on the
+	 * delivery path.
 	 */
 	{
 		uint8_t *dst = (uint8_t *)buf;
@@ -1685,10 +1523,8 @@ mach_msg_recv_timed(struct port_space *to, mach_port_name_t recv_name,
 		return (MACH_E_INVAL);
 
 	/*
-	 * Resolve the deadline once.  For FOREVER and NONE the actual
-	 * value is unused -- those flags drive different control paths
-	 * (skip the timed-waiters dance vs. return E_NOMSG on empty
-	 * without ever blocking).
+	 * The deadline, once.  Unused for FOREVER (never timed) and NONE
+	 * (MACH_E_NOMSG on empty, never blocks).
 	 */
 	deadline = 0;
 	if (timeout_ms != MACH_TIMEOUT_FOREVER &&
@@ -1696,9 +1532,8 @@ mach_msg_recv_timed(struct port_space *to, mach_port_name_t recv_name,
 		deadline = clock_uptime_ms() + timeout_ms;
 
 	/*
-	 * Two flavours: name refers to a port (RECEIVE right) -> wait
-	 * on that port; OR name refers to a port_set -> wait on the
-	 * set and serve whichever member has the next message.
+	 * The name is a port (RECEIVE right) or a port set; a set serves
+	 * whichever member has a message first.
 	 */
 	set = space_lookup_set(to, recv_name);
 	if (set == NULL) {
@@ -1765,32 +1600,15 @@ mach_msg_recv_timed(struct port_space *to, mach_port_name_t recv_name,
 			    &p->p_lock);
 
 			/*
-			 * OFF BOTH LISTS, WHATEVER IT WAS THAT ENDED THE PARK.
-			 *
-			 * A sender that woke us took us off the port's list on
-			 * its way past; a deadline that woke us did not; and a
-			 * park that DECLINED TO PARK -- because a wake had
-			 * already been posted against this thread and
-			 * thread_block_release read the note and returned
-			 * without ever blocking -- did not either, and does not
-			 * say so.  Three ways out and only one of them tidied
-			 * up, so the other two left this thread on the list and
-			 * the loop above put it there a SECOND time.
-			 *
-			 * The second link is written through the tail, so the
-			 * tail's forward pointer is made to point at the tail:
-			 * a one-element cycle.  From then on the port has a
-			 * waiter that can never be removed by being extracted,
-			 * and every wake the port hands out goes to that
-			 * phantom instead of to whoever is actually asleep --
-			 * so the thread that IS waiting waits for ever, and so
-			 * does everything waiting on it.
-			 *
-			 * So the detach is unconditional, which is also the
-			 * only version of this that does not have to be
-			 * re-reasoned every time a new way out of a park is
-			 * invented.  It costs a walk of a list that is nearly
-			 * always empty.
+			 * Off both lists, whatever ended the park.  A sender
+			 * that woke us has already unlinked us; a deadline has
+			 * not, nor has a park that declined to park because
+			 * th_wake_pending was set.  Left linked, the next trip
+			 * round links this thread again through the tail,
+			 * making a one-element cycle that swallows every
+			 * later wake on the port.  Detaching unconditionally
+			 * covers every way out of a park, for a walk of a list
+			 * that is nearly always empty.
 			 */
 			sched_remove_timed_waiter(self);
 
@@ -1801,9 +1619,8 @@ mach_msg_recv_timed(struct port_space *to, mach_port_name_t recv_name,
 			if (self->th_timed_out) {
 				self->th_timed_out = 0;
 				/*
-				 * The deadline woke us, not a sender -- but
-				 * look at the queue once more before giving
-				 * up, in case one landed in the window.
+				 * The deadline woke us; look at the queue once
+				 * more in case a message landed meanwhile.
 				 */
 				if (p->p_qhead != NULL) {
 					m = p->p_qhead;
@@ -1907,14 +1724,9 @@ mach_msg_recv_timed(struct port_space *to, mach_port_name_t recv_name,
 		if (self->th_timed_out) {
 			self->th_timed_out = 0;
 			/*
-			 * Loop back: a sender may have placed a message
-			 * on one of the members in the race window.  The
-			 * scan at the top of the loop will pick it up; if
-			 * the queues are still empty, we'll either re-park
-			 * (still within the original deadline, which has
-			 * elapsed -> immediately re-time-out) or return
-			 * E_TIMEOUT through the recomputed deadline path.
-			 * Simpler: just check elapsed time and return.
+			 * Unlike the port case there is no last look: a
+			 * message that landed meanwhile stays queued for the
+			 * next receive.
 			 */
 			return (MACH_E_TIMEOUT);
 		}
@@ -1922,36 +1734,21 @@ mach_msg_recv_timed(struct port_space *to, mach_port_name_t recv_name,
 }
 
 /*
- * mach_msg_rpc: send-then-recv with an autogenerated reply port.
+ * mach_msg_rpc: send, then receive on a fresh reply port.
  *
- * The reply port is created in `space` carrying RECEIVE + SEND.  We
- * splice it into req->msgh_local with disposition MAKE_SEND so the
- * receiver receives a SEND right under their own name; they reply by
- * msgh_remote = (that name) and the message lands back in our recv on
- * the same reply port.  On any error -- send failure, recv failure,
- * timeout -- the reply port is deallocated before return.
+ * The reply port is allocated in `space` with RECEIVE + SEND and spliced
+ * into req->msgh_local as MAKE_SEND, so the server gets a SEND right
+ * under its own name and replies to it.  req->msgh_bits gets the local
+ * disposition; the caller's remote disposition and COMPLEX bit are kept.
+ * The reply port is deallocated on every return.
  *
- * `req->msgh_bits` is updated to encode the local disposition; the
- * caller's remote disposition (COPY_SEND, MOVE_SEND_ONCE, ...) is
- * preserved as-is.
- *
- * Inline-reply optimisation:
- *
- *	Before issuing the send, we arm the reply port's "stash": pointer
- *	to the caller's reply_buf and its size, with rv=NOMSG.  If the
- *	send's downstream dispatcher (PORT_SPECIAL_*) runs synchronously
- *	in this thread and replies via mach_msg_send to the reply port,
- *	the send-side fast path writes the bytes straight into reply_buf
- *	and sets the stash rv to OK.  No port_msg ever allocated.  We
- *	then disarm and check the rv -- if filled, return without ever
- *	calling mach_msg_recv_timed.
- *
- *	Async senders (a parked server thread that will reply later) take
- *	the slow path: the send-side fast path test fails (stash is still
- *	armed when the dispatcher returns, but the dispatcher itself
- *	enqueues -- no, dispatcher only fast-paths the bare reply case;
- *	queued sends still queue).  So disarm before recv, then recv runs
- *	normally against the FIFO.
+ * Inline reply: before the send the reply port's stash is armed with
+ * reply_buf, its size and rv = MACH_E_NOMSG.  If a special-port
+ * dispatcher replies synchronously, in this thread, with a bare message,
+ * mach_msg_send's fast path writes it straight into reply_buf and sets
+ * the rv to OK -- no port_msg at all -- and the recv is skipped.  Any
+ * other reply is queued as usual: the stash is disarmed when the send
+ * returns and the recv reads the FIFO.
  */
 int
 mach_msg_rpc(struct port_space *space, struct mach_msg_header *req,
@@ -1984,10 +1781,8 @@ mach_msg_rpc(struct port_space *space, struct mach_msg_header *req,
 	}
 
 	/*
-	 * Arm the stash.  mach_msg_send's fast path will overwrite
-	 * p_stash_rv to MACH_MSG_OK on synchronous bare-reply delivery;
-	 * if the dispatcher chose to enqueue (or replied with a complex
-	 * message), p_stash_rv stays NOMSG and we fall through to recv.
+	 * Arm the stash.  A complex or queued reply leaves p_stash_rv at
+	 * MACH_E_NOMSG, and we fall through to the recv.
 	 */
 	spin_lock(&reply_port->p_lock);
 	reply_port->p_stash_buf  = reply_buf;
@@ -1996,13 +1791,9 @@ mach_msg_rpc(struct port_space *space, struct mach_msg_header *req,
 	spin_unlock(&reply_port->p_lock);
 
 	/*
-	 * Read the caller's bits, then patch msgh_bits / msgh_local in
-	 * place to splice in MAKE_SEND and the freshly-allocated reply
-	 * name.  Both touch the user's req struct, so they happen under
-	 * a SMAP bracket.  The COMPLEX flag is preserved so an RPC that
-	 * carries body descriptors does not lose its descriptor area to
-	 * a MACH_MSGH_BITS() recompute that would only encode the
-	 * disposition bytes.
+	 * Splice MAKE_SEND and the reply name into the caller's req (user
+	 * memory, hence the SMAP brackets).  COMPLEX is carried over by
+	 * hand: MACH_MSGH_BITS() encodes only the dispositions.
 	 */
 	{
 		uint32_t bits_local;
@@ -2024,9 +1815,8 @@ mach_msg_rpc(struct port_space *space, struct mach_msg_header *req,
 	rv = mach_msg_send(space, req);
 
 	/*
-	 * Disarm regardless of how the send went; if the fast path fired
-	 * stash_rv is MACH_MSG_OK and the reply bytes are already in
-	 * reply_buf.
+	 * Disarm whatever the send did; stash_rv == MACH_MSG_OK means the
+	 * reply is already in reply_buf.
 	 */
 	spin_lock(&reply_port->p_lock);
 	stash_rv = reply_port->p_stash_rv;
@@ -2055,19 +1845,13 @@ mach_msg_rpc(struct port_space *space, struct mach_msg_header *req,
 /* ---- selftest -------------------------------------------------------- */
 
 /*
- * WHAT A PORT'S WAITER LIST LOOKS LIKE AFTER EVERYBODY HAS LEFT IT.
+ * Selftest: a port's waiter list must be empty once every waiter has left
+ * it, however each one left.  A thread that leaves the CPU but stays on
+ * the list hangs the port silently, so the test looks at the list itself.
  *
- * The bug this exists for cost four processors a whole boot roughly one time
- * in four, and left nothing to look at: three CPUs halted, no lock waited on,
- * no failure printed, the log simply stopping.  It is a leak of ONE POINTER --
- * a thread that took itself off the CPU without taking itself off the list --
- * and the only honest way to test for it is to look at the list.
- *
- * Both scenes are arranged, not waited for.  The race that produced it needs a
- * wake to arrive against a thread that has decided to sleep and not yet
- * committed, which is a window of a few instructions on another processor; the
- * note that wake leaves (th_wake_pending) is a value this can simply set, so
- * the test is deterministic on one processor and on four.
+ * Every scene is arranged, not raced for: the wake-before-sleep window is
+ * reproduced by setting th_wake_pending directly, so the test is
+ * deterministic on one CPU or many.
  */
 #define	PW_TIMEOUT_MS	20u	/* long enough to be a real park */
 #define	PW_HELPER_MS	3000u	/* the helper always leaves, pass or fail */
@@ -2103,9 +1887,8 @@ pw_helper_entry(void *arg)
 
 /*
  * Scene 3's helper: link onto the port's waiter list exactly as the recv
- * loop does -- including the note the recv loop now takes -- then die with
- * the link still in place.  thread_exit owes the list an unbind; the
- * scene's assert is that it paid.
+ * loop does, thread_wait_note included, then die still linked.  The scene
+ * checks that thread_exit unlinked it.
  */
 static void
 pw_corpse_entry(void *arg)
@@ -2132,10 +1915,9 @@ pw_corpse_entry(void *arg)
 }
 
 /*
- * Scene 4's victim: park in the REAL recv path, for ever.  Only a kill
- * ends this wait, and the kill retires the thread inside
- * thread_block_release -- so reaching the lines after the recv at all is
- * itself a failure, which is what ph_got reports.
+ * Scene 4's victim: park in the real recv path with no timeout.  Only a
+ * kill ends it, retiring the thread inside thread_block_release, so
+ * returning from the recv at all is a failure (ph_got).
  */
 static void
 pw_victim_entry(void *arg)
@@ -2176,13 +1958,9 @@ port_wait_selftest(void)
 	}
 
 	/*
-	 * 1. A PARK THAT DECLINED TO PARK.  The note says a wake has already
-	 *    been posted against this thread, so thread_block_release reads it
-	 *    and returns without ever blocking -- and the recv loop, told
-	 *    nothing, goes round and puts itself on the port's list a second
-	 *    time.  The second link is written through the tail, so the tail's
-	 *    forward pointer is made to point at the tail: a one-element cycle
-	 *    that nothing can ever be extracted from again.
+	 * 1. A park that declines to park: with th_wake_pending set,
+	 *    thread_block_release returns without blocking, and the recv
+	 *    loop must still unlink before it links itself again.
 	 */
 	current_thread->th_wake_pending = 1;
 	rv = mach_msg_recv_timed(kernel_space, name, &buf, sizeof(buf),
@@ -2199,13 +1977,9 @@ port_wait_selftest(void)
 	}
 
 	/*
-	 * 2. AND A SECOND WAITER, which is what makes the tail matter.  The
-	 *    helper parks first and stays; this thread parks behind it and
-	 *    times out.  Taking the tail off a list whose head is somebody
-	 *    else used to set the tail to NULL rather than to the head -- and
-	 *    the next thread to park then took the "nobody is waiting" branch
-	 *    and wrote itself over the head, so the helper was off the list
-	 *    without ever being told and no message could reach it again.
+	 * 2. A second waiter, which makes the tail matter.  The helper parks
+	 *    first and stays; this thread parks behind it and times out, and
+	 *    removing it must leave the tail naming the helper.
 	 */
 	pw.ph_name   = name;
 	pw.ph_got    = 0;
@@ -2243,9 +2017,8 @@ port_wait_selftest(void)
 	}
 
 	/*
-	 *    Park and leave once more.  With the tail wrong this is the trip
-	 *    that overwrites the head, so the damage is done here and shows up
-	 *    at the send below rather than at either park.
+	 *    Park and leave once more.  With a wrong tail this trip would
+	 *    overwrite the head, which shows at the final send.
 	 */
 	rv = mach_msg_recv_timed(kernel_space, name, &buf, sizeof(buf),
 	    PW_TIMEOUT_MS);
@@ -2256,16 +2029,11 @@ port_wait_selftest(void)
 	}
 
 	/*
-	 * 3. A THREAD THAT DIES ON THE LIST.  A kill retires its target from
-	 *    inside thread_block_release, above the recv loop that linked it
-	 *    onto the port -- so the loop's unconditional detach never runs,
-	 *    and the port used to keep naming a thread the reaper had
-	 *    already freed; the teardown drain then woke poisoned memory.
-	 *    Arranged like everything here: the helper links itself in
-	 *    exactly as the recv loop does, notes the list as the recv loop
-	 *    now does, and dies with the link in place.  thread_exit owes
-	 *    the list an unbind, and it parks BEHIND the scene-2 helper, so
-	 *    paying also has to fix the tail.
+	 * 3. A thread that dies on the list.  A kill retires its target
+	 *    inside thread_block_release, so the recv loop's detach never
+	 *    runs; thread_exit must unlink it through its thread_wait_note,
+	 *    or the port names freed memory.  The corpse is linked behind
+	 *    the scene-2 helper, so the unlink must also fix the tail.
 	 */
 	pw_corpse.ph_port   = p;
 	pw_corpse.ph_done   = 0;
@@ -2289,11 +2057,10 @@ port_wait_selftest(void)
 	}
 
 	/*
-	 * 4. AND THE REAL THING: a task killed while its thread is parked in
-	 *    the real recv path.  The kill's wake fan-out breaks the thread
-	 *    out of the park, the post-wake check retires it inside
-	 *    thread_block_release, and the note the recv loop took when it
-	 *    linked the thread in is what lets thread_exit take it back off.
+	 * 4. The real thing: a task killed while its thread is parked in the
+	 *    recv path.  The kill's wake breaks the park, the post-wake check
+	 *    retires the thread, and the recv loop's thread_wait_note lets
+	 *    thread_exit unlink it.
 	 */
 	victim_task = task_create("port-victim");
 	if (victim_task == NULL) {

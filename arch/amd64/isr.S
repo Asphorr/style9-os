@@ -8,17 +8,11 @@
 /*
  * IDT stub bodies (x86_64).
  *
- * One stub per architectural vector 0..47.  Each stub normalises the
- * trap frame -- pushing a dummy err code on vectors that the CPU does
- * not push one for -- then falls through to isr_common, which saves
- * the 15 GPRs and calls intr_dispatch in C.
- *
- * isr_table at the bottom is a flat array of stub addresses indexed by
- * vector number; the C side reads it to populate the IDT.
- *
- * Calling convention reminder: SysV AMD64 places arg 0 in %rdi; we
- * leave %rsp pointing at the trapframe and move it into %rdi before
- * calling intr_dispatch.
+ * One stub per vector 0..255.  Each stub normalises the trap frame --
+ * pushing a dummy err code where the CPU pushes none -- and jumps to
+ * isr_common, which saves the 15 GPRs and calls intr_dispatch with the
+ * trapframe in %rdi.  isr_table, at the bottom, maps vector to stub for
+ * idt_init.
  */
 
 	.section .text
@@ -97,14 +91,10 @@ ISR_NOERR 47
 
 /*
  * Vectors 48-255: everything the local APIC delivers -- its timer, its
- * spurious vector, and the inter-processor interrupts that will start and
- * steer other CPUs.  None push an error code.
- *
- * Generated rather than written out, unlike the 48 above, because two
- * hundred and eight identical lines say nothing the loop does not.  The
- * .altmacro directive is what lets %vecno be substituted into the macro
- * argument; it is turned off again immediately, since it also changes how
- * the assembler reads strings for the rest of the file.
+ * spurious vector, the IPIs.  None push an error code.  .altmacro lets
+ * %vecno be substituted into the macro argument; it is switched off at
+ * once because it also changes how strings are read for the rest of the
+ * file.
  */
 	.altmacro
 	.set	vecno, 48
@@ -126,11 +116,9 @@ ISR_NOERR 47
  *	[rsp+40]saved RSP	(CPU pushes always in long mode)
  *	[rsp+48]saved SS
  *
- * We push the 15 GPRs (no pusha in 64-bit) so %rsp ends up pointing at
- * a populated struct trapframe.  The trap frame's low offsets are r15
- * first (lowest address) through rax (just below the dwords pushed
- * earlier).  Calling intr_dispatch with the trapframe in %rdi follows
- * SysV-AMD64 arg passing.
+ * Pushing the 15 GPRs (no pusha in 64-bit mode) leaves %rsp pointing at
+ * a struct trapframe: r15 at the lowest address, rax just below the
+ * vector.  struct trapframe in intr.h must match this push order.
  */
 	.globl	isr_common
 	.type	isr_common, @function
@@ -156,9 +144,8 @@ isr_common:
 	call	intr_dispatch
 
 	/*
-	 * Restore-and-resume tail.  Exposed as a symbol so trapframe_iretq
-	 * (below) can enter it with a trapframe the caller built by hand,
-	 * rather than duplicating the pop order that intr.h freezes.
+	 * Restore-and-resume tail, global so trapframe_iretq can enter it
+	 * with a hand-built trapframe instead of duplicating the pop order.
 	 */
 	.globl	isr_return
 	.type	isr_return, @function
@@ -185,22 +172,16 @@ isr_return:
 
 /*
  * trapframe_iretq(struct trapframe *tf) -- resume through a trapframe the
- * caller assembled itself, instead of the one an IDT stub pushed.
+ * caller assembled itself.
  *
- * Signal return needs this.  A sigreturn(2) arrives as a SYSCALL, and the
- * SYSRET path can only hand back the registers the syscall ABI already
- * declares volatile -- %rcx and %r11 are architecturally destroyed by the
- * SYSCALL instruction itself.  That is fine for a signal taken at a syscall
- * boundary, where the ABI had written those registers off anyway, but a
- * signal taken asynchronously (from the IRQ path, mid-computation) must be
- * resumed EXACTLY: %rcx may be a `rep movs` counter, %r11 a live temporary.
- * So the asynchronous flavour of sigreturn rebuilds the interrupted machine
- * state as a trapframe and leaves through IRETQ, which restores all 15 GPRs
- * plus RFLAGS with no register reserved by the calling convention.
+ * For the asynchronous sigreturn (darwin_sigreturn_full).  SYSRET cannot
+ * restore %rcx and %r11, which SYSCALL destroys; a signal taken at a
+ * syscall boundary does not care, but one taken from the IRQ path must
+ * be resumed exactly, and IRETQ restores all 15 GPRs and RFLAGS.
  *
- * Switching %rsp to the caller's frame abandons the current kernel stack --
- * deliberately: this never returns, and both entry paths (syscall_entry and
- * an IDT stub) reload the stack from a known top on the next entry.
+ * Moving %rsp onto the frame abandons the current kernel stack.  That is
+ * fine: this never returns, and both entry paths (syscall_entry, an IDT
+ * stub) start from the top of the stack on the next entry.
  */
 	.globl	trapframe_iretq
 	.type	trapframe_iretq, @function
@@ -210,12 +191,9 @@ trapframe_iretq:
 	.size	trapframe_iretq, . - trapframe_iretq
 
 /*
- * Vector-number -> stub-address table.  idt_init() reads this when
- * populating the IDT so each gate calls the right normalising stub.  All
- * 256 entries, so every vector the APIC can be told to use lands somewhere
- * deliberate; a vector with nothing installed behind it is ignored by
- * intr_dispatch, which is a different thing from a vector with no gate at
- * all -- that one is a #GP.
+ * Vector -> stub table, read by idt_init.  All 256 entries, so every
+ * vector lands on a gate: one with no handler installed is ignored by
+ * intr_dispatch, whereas a vector with no gate at all would #GP.
  */
 	.macro ISR_TABLE_ENTRY n
 	.quad	isr_\n

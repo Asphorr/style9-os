@@ -4,13 +4,12 @@
  * Copyright (c) 2026 The Hobby OS Project
  * All rights reserved.
  *
- * heartbeatd -- a minimal persistent daemon for the s9 launchd boot
- * catalog.  Unlike loopchild (a syscall-free CPU spinner used to stress
- * the IRQ-return kill path), heartbeatd PARKS on a Mach recv: zero CPU
- * when idle, the way a real daemon behaves.  The boot catalog declares
- * it runatload + keep_alive, so it is up from boot and the launchd
- * worker respawns it if it ever dies.  It registers no bootstrap name
- * (it serves no clients), so multiple instances never collide.
+ * heartbeatd -- a minimal persistent daemon for the launchd boot catalog.
+ * Unlike loopchild (a syscall-free spinner for the IRQ-return kill path)
+ * it parks on a Mach receive and uses no CPU when idle.  The catalog
+ * declares it runatload + keepalive, so it is up from boot and respawned
+ * if it dies.  It registers no bootstrap name, so several instances
+ * never collide.
  */
 
 #include "style9.h"
@@ -32,11 +31,10 @@ main(void)
 	    (unsigned)park);
 
 	/*
-	 * Block forever.  We hold SEND on `park' ourselves so NO_SENDERS
-	 * never fires and the recv never returns on its own; the only way
-	 * out is task_request_terminate, which wakes the parked recv with
-	 * t_killed set so thread_block_release's post-wake check retires
-	 * us.  No CPU is consumed while parked.
+	 * Block forever.  We hold a send right on `park' ourselves, so
+	 * NO_SENDERS never fires; the only way out is
+	 * task_request_terminate, whose wake with t_killed set retires the
+	 * thread in thread_block_release.
 	 */
 	for (;;) {
 		rv = mach_msg_recv(park, &msg, sizeof(msg));

@@ -14,33 +14,21 @@
 #include "spinlock.h"
 
 /*
- * Where a mapping's bytes come from.
+ * Where a mapping's bytes come from: what a page should hold the first
+ * time it is touched.  A range with no object is zero-fill; a range with
+ * a file object gets the file's bytes at the matching offset, and zeroes
+ * past end-of-file, as mmap(2) promises for the last page.
  *
- * vm_map answers "which virtual ranges are live".  This answers the other
- * half of the question -- what should be in a page the first time someone
- * touches it.  A range with no object is zero-fill, which is all anonymous
- * memory ever needs; a range with a file object gets that file's bytes at
- * the matching offset, and zeroes past the end of the file, which is
- * exactly what mmap(2) promises for the tail of the last page.
+ * No page list and no sharing: every frame a fault installs belongs to
+ * the map entry that faulted it, so an object is a source of initial
+ * content, not a page cache.  Two tasks mapping one file get their own
+ * frames -- MAP_PRIVATE -- and the repeated reads are absorbed by the
+ * block cache (fs/bio.c).  A writable shared mapping would need a page
+ * list here.
  *
- * There is deliberately no page list here and no sharing.  Every frame a
- * fault installs belongs to the single map entry that faulted it, so an
- * object is a *source of initial content*, not a cache of pages: two tasks
- * mapping the same file get their own frames with the same bytes in them.
- * That is MAP_PRIVATE, which is the only thing a read-only filesystem can
- * meaningfully offer anyway, and it keeps the whole layer clear of the
- * aliasing questions a shared page cache would raise.  The repeated reads
- * that a private-per-task rule implies are absorbed one level down, by the
- * block cache (fs/bio.c) -- which is the layer that should be absorbing
- * them.  When a writable shared mapping is wanted, this is the struct that
- * grows a page list.
- *
- * A file object holds the file RESOLVED (a struct fs_handle), not its path.
- * That distinction was measured, not assumed: resolving "/var/db/big.txt"
- * costs a tree walk per component plus one for the inode, and a pager that
- * re-resolved per fault spent 936 us on each 4 KiB page, nearly all of it
- * re-answering a question it had already answered.  The path is kept beside
- * the handle, but only so diagnostics can say which file a mapping is.
+ * The object holds the file resolved (a struct fs_handle), not its path:
+ * a pager that re-resolved the path on every fault spent 936 us per page.
+ * The path is kept only for diagnostics.
  */
 
 #define	VM_OBJ_PATH_MAX		256
@@ -54,10 +42,9 @@
 struct vm_object {
 	struct spinlock	 vo_lock;
 	/*
-	 * (f) the file, resolved.  Not (c): its identity is fixed, but the
-	 * filesystem refreshes the cached length in place when the volume has
-	 * changed under it, so the struct is handed to fs_pread mutable.  Only
-	 * fs/ writes it, and only while holding the volume lock.
+	 * (f) the file, resolved.  Not (c): the filesystem refreshes its
+	 * cached length in place when the volume changes, so fs_pread gets
+	 * it mutable.  Only fs/ writes it, under the volume lock.
 	 */
 	struct fs_handle vo_handle;
 	uint64_t	 vo_size;	/* (c) bytes of real content     */
@@ -67,10 +54,10 @@ struct vm_object {
 };
 
 /*
- * Create a file-backed object over an already-resolved file, remembering
- * `path` for diagnostics.  Returns it with one reference, which the caller
- * hands to the vm_map_entry it is about to create.  NULL on allocation
- * failure.
+ * Create a file-backed object over a resolved file, keeping `path` for
+ * diagnostics, and take a hold on the file (fs_hold) that the last
+ * vm_object_deref gives back.  Returns it with one reference, for the
+ * vm_map_entry the caller is about to create; NULL on failure.
  */
 struct vm_object	*vm_object_file(const struct fs_handle *h,
 			    const char *path);
@@ -79,15 +66,13 @@ void			 vm_object_ref(struct vm_object *);
 void			 vm_object_deref(struct vm_object *);
 
 /*
- * Fill one 4 KiB page of `obj` at byte offset `off` into `page`, which is a
- * kernel-VA alias of the frame and must already be zeroed -- everything this
- * does not write (the tail past end-of-file, a hole) stays zero, which is
- * what both mmap(2) and a sparse file require.
+ * Fill the 4 KiB page of `obj` at byte offset `off` into `page`, a kernel
+ * alias of the frame that must already be zeroed: whatever this does not
+ * write (past end-of-file, a hole) stays zero, as mmap(2) and sparse
+ * files require.
  *
- * MUST NOT be called with any spinlock held.  It reads the disk, the disk
- * read sleeps waiting for the drive's interrupt, and a thread that blocks
- * while holding a spinlock in this kernel is never woken again (the preempt
- * count is global; see fs/bio.c for the full account of that rule).
+ * Must not be called with a spinlock held: it reads the disk, which
+ * sleeps (fs/bio.c).
  *
  * Returns 0 on success, -1 if the file could not be read.
  */

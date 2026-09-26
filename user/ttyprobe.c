@@ -6,56 +6,41 @@
  */
 
 /*
- * ttyprobe -- a self-authored Darwin-ABI probe for the rung where the terminal
- * can be TOLD something.
+ * ttyprobe -- a self-authored Darwin-ABI probe for terminal control:
+ * turning echo off, asking the window size, reading one keystroke without
+ * Return.  As with dirlist, pipefork and filewrite, a program we wrote
+ * proves the syscalls from ring 3 before one we did not (coreutils' stty)
+ * depends on them.
  *
- * The console has been a terminal for a while in the sense that mattered so
- * far: it echoes, it edits a line, Ctrl-C signals, and a real Apple shell runs
- * interactively on it.  All of that was fixed at compile time.  A program
- * could not turn the echo off, could not ask how wide the screen is, and could
- * not read a single keystroke without waiting for Return -- and those three
- * are the entire admission price for full-screen software.  tcgetattr answered
- * ENOTTY, on purpose and in writing, because there was nothing behind it.
+ *	1. A fresh terminal is canonical with echo on, the state a session
+ *	   must start in.
+ *	2. The window size is the screen's, not a made-up 80x24.
+ *	3. A file and a pipe both answer ENOTTY.  isatty(3) rests on this,
+ *	   and gls picks columns by it: a pipe answering would put columns
+ *	   in a file.
+ *	4. An unknown ioctl answers ENOTTY, and TIOCSWINSZ EINVAL, instead
+ *	   of succeeding quietly.
+ *	5. A setting reads back: raw mode is set by one call and confirmed
+ *	   by another, so a tcsetattr that libSystem only pretends to do
+ *	   fails.
+ *	6. With VMIN=0 a read returns 0; canonical mode would block until
+ *	   Return.
+ *	7. A byte arrives with no newline behind it.  The driver feeds one
+ *	   character and no line ending, which a canonical line buffer
+ *	   would hold forever.
+ *	8. The restore takes, so the next shell has its terminal back.
  *
- * This is the de-risking step, in the same tradition as dirlist for
- * directories, pipefork for processes and filewrite for the volume: prove the
- * syscalls from ring 3 with a program we wrote, BEFORE a binary we did not
- * write depends on them.  The one that follows is coreutils' stty, which does
- * nothing else for a living.
+ * Readiness (for make) is checked here too, since this probe already
+ * makes pipes:
  *
- * WHAT IT CHECKS, and why each is here rather than assumed:
- *
- *	1. A fresh terminal reports canonical mode with echo on.  That is the
- *	   state a session must start in, and the state a previous program
- *	   leaving raw mode behind would have broken.
- *	2. The window size is the screen's real size, not a fabricated 80x24.
- *	3. A FILE and a PIPE both answer ENOTTY.  This is the check that keeps
- *	   isatty(3) honest, and gls decides whether to print in columns by it:
- *	   a kernel that answered for a pipe would put columns in a file.
- *	4. An unknown request answers ENOTTY rather than succeeding quietly.
- *	5. A setting READS BACK.  The whole rung is worthless if tcsetattr is
- *	   a no-op that libSystem pretends worked, so the raw mode is asked
- *	   for through one call and confirmed through another.
- *	6. With VMIN=0 a read returns 0 instead of waiting.  In canonical mode
- *	   this same read would have blocked until Return.
- *	7. AND THEN A BYTE ARRIVES WITH NO NEWLINE BEHIND IT.  The driver feeds
- *	   this program a single character and no line ending; canonical mode
- *	   would hold it in the line buffer forever, so receiving it at all is
- *	   the proof -- from out here, through read(2) -- that the kernel's
- *	   discipline really did stop being line-based.
- *	8. The restore takes, so the shell that runs next has its terminal back.
- *
- * And, from the rung after -- readiness, which arrived for make and is
- * checked here because this is the probe that already owns a pipe:
- *
- *	9. select(2) asked once (a zero timeout) sees a pipe's read end go from
- *	   not ready to ready when a byte is written, and its write end ready
+ *	9. select(2) with a zero timeout sees a pipe's read end go from not
+ *	   ready to ready when a byte is written; the write end is ready
  *	   throughout.
- *	10. A 40 ms select on an empty pipe returns 0 AFTER 40 ms: the wait
- *	    parked and the clock ended it, which is the path nothing in make's
- *	    own use of pselect exercises.
+ *	10. A 40 ms select on an empty pipe returns 0 after 40 ms: the wait
+ *	    parked and the clock ended it, a path make's own pselect use
+ *	    does not exercise.
  *	11. poll(2) reports POLLIN and POLLHUP together on a read end whose
- *	    writer has closed with a byte still in the pipe.
+ *	    writer closed with a byte still in the pipe.
  *	12. A closed descriptor is EBADF to select and POLLNVAL to poll.
  *
  * Freestanding: no SDK headers, prototypes declared as <termios.h> would alias
@@ -91,10 +76,9 @@ typedef __SIZE_TYPE__	size_t;
 #define	TIOCJUNK	0x4004745AUL	/* _IOR('t', 90, int) -- nothing */
 
 /*
- * Apple's struct termios, which is also the kernel's and also stty's.  Written
- * out here rather than shared through a header on purpose: this program exists
- * to check the ABI, and a probe that got the layout from the same place as the
- * thing it is probing would agree with it by construction.
+ * Apple's struct termios, also the kernel's and stty's.  Written out rather
+ * than shared through a header: a probe taking the layout from the thing
+ * it probes would agree with it by construction.
  */
 struct termios {
 	uint64_t	c_iflag;
@@ -200,9 +184,8 @@ now_ms(void)
 }
 
 /*
- * 9-12: readiness on a pipe, the object this probe already knows how to make.
- * Kept after the terminal is restored so that a failure here leaves the shell
- * its terminal all the same.
+ * 9-12: readiness on a pipe.  Run after the terminal is restored, so a
+ * failure here still leaves the shell its terminal.
  */
 static void
 readiness_checks(void)
@@ -339,7 +322,7 @@ entry(void)
 		    "%u by %u pixels\n", ws.ws_row, ws.ws_col, ws.ws_xpixel,
 		    ws.ws_ypixel);
 
-	/* 3. what is NOT a terminal, which is the more useful answer. */
+	/* 3. what is not a terminal. */
 	fd = open(AFILE, O_RDONLY);
 	if (fd < 0)
 		printf("ttyprobe: %s is not on this volume, so the file half "
@@ -375,10 +358,8 @@ entry(void)
 		    "both refused, each in its own way\n");
 
 	/*
-	 * 5. RAW.  Asked for through tcsetattr and confirmed through a fresh
-	 * tcgetattr, so what is being checked is that the KERNEL kept it --
-	 * a libSystem that remembered the struct and handed it back would
-	 * pass any check made against the copy we sent.
+	 * 5. Raw.  Set with tcsetattr and confirmed with a fresh tcgetattr,
+	 * so it is the kernel that must have kept it, not a copy we sent.
 	 */
 	tio = saved;
 	tio.c_lflag &= ~(ICANON | ECHO | ISIG);
@@ -399,11 +380,7 @@ entry(void)
 		printf("ttyprobe: PASS the terminal is raw, and says so when "
 		    "asked again\n");
 
-	/*
-	 * 6. VMIN=0: a read that finds nothing says so instead of waiting.
-	 * In the canonical mode this program started in, this same call would
-	 * have blocked until somebody pressed Return.
-	 */
+	/* 6. VMIN=0: a read that finds nothing returns instead of waiting. */
 	got = read(0, &c, 1);
 	if (got != 0)
 		fail("a VMIN=0 read did not come back empty");
@@ -412,10 +389,8 @@ entry(void)
 		    "rather than waiting\n");
 
 	/*
-	 * 7. One character, with no line ending anywhere behind it.  The
-	 * driver fed exactly one byte before spawning this program; a
-	 * canonical terminal would still be holding it in the line buffer,
-	 * waiting for a Return that is never coming.
+	 * 7. The driver fed exactly one byte, no line ending, before
+	 * spawning us; a canonical terminal would still be holding it.
 	 */
 	tio.c_cc[VMIN] = 1;
 	if (tcsetattr(0, TCSANOW, &tio) != 0)
@@ -428,10 +403,7 @@ entry(void)
 		    "newline behind it -- canonical mode would still be "
 		    "waiting\n", c);
 
-	/*
-	 * 8. And the terminal goes back, because the next program to run here
-	 * is a shell and it expects the terminal a shell was given.
-	 */
+	/* 8. Restore: the next program here is a shell. */
 	if (tcsetattr(0, TCSAFLUSH, &saved) != 0)
 		fail("tcsetattr would not restore the terminal");
 	else if (tcgetattr(0, &tio) != 0)

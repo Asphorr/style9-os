@@ -12,28 +12,19 @@
 #include <stdint.h>
 
 /*
- * Plain test-and-set spinlock with debug instrumentation.
+ * Test-and-set spinlock with debug instrumentation.  A hold disables
+ * interrupts (saved and restored, so sections nest) and preemption, and
+ * spins answer TLB shootdowns; see spinlock.c.
  *
  * Lock key on the struct itself:
  *	(a)	atomic; written via __atomic_exchange / __atomic_store
+ *	(c)	const after init
  *	(s)	written only while the lock is held -- safe to read
  *		without a lock once you have observed sl_state == 1
  *
- * The holder fields are purely diagnostic; spin_lock records the call
- * site so that a hang or a SPINLOCK_ASSERT_HELD failure can pinpoint
- * which routine last touched it.  sl_holder_cpu is a real CPU id
- * (machine/cpu.h) rather than the constant zero it used to be, which is
- * what makes the recursive-acquire check and "unlock by non-owner CPU"
- * mean what they say.  The WITNESS-style lock-order check itself has
- * already landed in kern/witness.h.
- *
- * ⚠ STILL NOT AN SMP LOCK.  Acquire spins without disabling interrupts, so
- * on a machine with more than one CPU running there is a lock this CPU's
- * interrupt handler must not take while this CPU's mainline holds it -- the
- * handler would spin for a lock only the interrupted code can release.  The
- * kernel dodges that today by never taking sched_lock from an IRQ (see
- * sched_post_irq_wake) rather than by making the lock safe; the fix, when
- * APs actually run, is to save-and-disable IF across the hold.
+ * The holder fields record the call site and CPU (machine/cpu.h) for
+ * diagnostics, the recursive-acquire check and the non-owner-unlock
+ * check.  Lock-order checking is kern/witness.h.
  *
  * Static initialiser:  static struct spinlock x = SPINLOCK_INIT("x");
  * Dynamic init:        spin_init(&lock, "name");
@@ -58,9 +49,9 @@ bool	spin_held(const struct spinlock *);
 /*
  * Non-blocking acquire.  Returns true on success (lock now held), false
  * if the lock is busy.  Caller must spin_unlock on success; on failure
- * it leaves preempt counts and lock state untouched.  Useful from IRQ
- * context where a normal spin would deadlock against a non-IRQ holder
- * on the same CPU.
+ * the interrupt state, preempt count and lock are as they were.  For
+ * callers that would rather skip the work than wait, e.g. an interrupt
+ * handler.
  */
 bool	spin_trylock(struct spinlock *);
 

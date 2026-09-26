@@ -67,13 +67,11 @@
  * consumer (mouse_getpkt, and so mouse_getpkt_block: the mouse-drv
  * thread).
  *
- * head and tail are free-running counters -- unsigned wrap is what keeps
- * head - tail the fill level -- and each has one writer.  The producer
- * fills a slot, THEN releases head past it; the consumer reads a slot out,
- * THEN releases tail past it; each acquires the other's index before
- * touching a slot.  That pairing is what orders the packet bytes against
- * the index that publishes them.  volatile never did: it orders volatile
- * accesses among themselves, and the slots are not volatile.
+ * head and tail are free-running counters (unsigned wrap keeps head - tail
+ * the fill level), each with one writer.  The producer fills a slot, then
+ * releases head past it; the consumer reads a slot, then releases tail
+ * past it; each acquires the other's index first.  That pairing, not
+ * volatile, orders the packet bytes against the index that publishes them.
  */
 #define	MOUSE_RING_SIZE		32
 #define	MOUSE_RING_MASK		(MOUSE_RING_SIZE - 1)
@@ -99,14 +97,12 @@ static uint8_t			mouse_pkt[MOUSE_PKT_BYTES];
 static uint8_t			mouse_phase;
 
 /*
- * Single-consumer block-on-read support, the protocol kbd.c's is (its
- * kbd_getc_block has the reasoning): the consumer names itself in
- * mouse_waiter BY EXCHANGE and re-checks the ring; the IRQ, having
- * published a packet, exchanges the slot empty and posts a deferred wake
- * to whoever it found.  Two exchanges on one slot, so one sees the other.
- * wake_pending lets a consumer harvested between its re-check and its
- * block skip the block; a wake that reaches it after that is kept by
- * thread_wake as th_wake_pending, which thread_block honours.
+ * Blocking read for the single consumer, kbd.c's protocol (reasoning at
+ * kbd_getc_block): the consumer installs itself in mouse_waiter by
+ * exchange and rechecks the ring; the IRQ, having published a packet,
+ * exchanges the slot empty and posts a deferred wake to whoever it found.
+ * mouse_wake_pending lets a consumer taken between recheck and block skip
+ * the block; a wake after that is kept as th_wake_pending by thread_wake.
  */
 static struct thread *volatile	mouse_waiter;
 static volatile int		mouse_wake_pending;
@@ -122,10 +118,9 @@ static int	mouse_probe(const char **stepp, int *gotp);
 static void	mouse_ring_push(const uint8_t *pkt);
 
 /*
- * Spin until the controller's input buffer is clear (safe to write) or
- * the bounded budget elapses.  Returns 0 if writable, -1 on timeout --
- * the caller gives up on the mouse rather than hanging boot on a machine
- * with no PS/2 controller.
+ * Spin until the controller's input buffer is clear.  Returns 0, or -1
+ * after I8042_SPIN polls, so a machine with no PS/2 controller loses the
+ * mouse rather than hangs boot.
  */
 static int
 i8042_wait_write(void)
@@ -151,12 +146,11 @@ i8042_command(uint8_t cmd)
 
 /*
  * Spin until a byte from the wanted side is readable and return it, or -1
- * on timeout.  The controller has ONE output buffer for the keyboard, the
- * mouse and its own replies, so a byte being there is not the byte asked
- * for: STS_AUX says whether it came from the mouse, and one from the
- * other side is dropped.  mouse_init holds the keyboard port for the
- * exchange, so there should be none to drop -- but a reply read from the
- * wrong device is how an init goes quietly wrong.
+ * on timeout.  The controller has one output buffer for keyboard, mouse
+ * and its own replies; STS_AUX says whether a byte is the mouse's, and a
+ * byte from the other side is dropped.  mouse_init holds the keyboard
+ * port, so there should be none, but a reply taken from the wrong device
+ * would derail the init silently.
  */
 static int
 i8042_read_from(bool aux)
@@ -221,9 +215,8 @@ aux_command(uint8_t cmd)
  * and the controller raising IRQ12 for it; or -1, with *stepp naming the
  * step that failed and *gotp what came back instead (-1: nothing did).
  *
- * It stops at the first answer it does not like.  Every step after a
- * failed one would be built on a guess about the controller's state, and
- * the controller is the keyboard's as much as the mouse's.
+ * It stops at the first bad answer: later steps would build on a guess
+ * about a controller the keyboard shares.
  */
 static int
 mouse_probe(const char **stepp, int *gotp)
@@ -240,12 +233,10 @@ mouse_probe(const char **stepp, int *gotp)
 		goto fail;
 
 	/*
-	 * Read-modify-write the controller config byte: turn on "raise
-	 * IRQ12" and re-enable the aux clock, preserving every other bit --
-	 * notably bit 0, the keyboard's own IRQ1 enable that kbd_init
-	 * relies on.  Nothing is written unless the read came back: a
-	 * default standing in for the real byte would overwrite exactly
-	 * the bits this is careful to keep.
+	 * Read-modify-write the config byte: raise IRQ12 and enable the aux
+	 * clock, keeping every other bit (notably bit 0, the keyboard's IRQ1
+	 * enable).  Nothing is written unless the read succeeded, since a
+	 * guessed byte would clobber the bits being kept.
 	 */
 	*stepp = "read config";
 	if (i8042_command(CTL_READ_CONFIG) != 0)
@@ -281,12 +272,10 @@ mouse_probe(const char **stepp, int *gotp)
 	id = reply;
 
 	/*
-	 * Id 0 is the plain three-byte mouse this driver reads.  A wheel
-	 * mouse (3) or a five-button one (4) that something has already
-	 * switched into that mode sends FOUR bytes a packet -- set-defaults
-	 * does not switch it back, only a reset does -- and a three-byte
-	 * assembler would read that stream a packet and a third at a time.
-	 * Declined rather than misread.
+	 * Only id 0, the three-byte mouse, is read.  A wheel (3) or
+	 * five-button (4) mouse already switched into that mode sends four
+	 * bytes a packet, and set-defaults does not undo it (only a reset
+	 * does); declined rather than misread.
 	 */
 	*stepp = "device id (not a 3-byte mouse)";
 	if (id != AUX_ID_STANDARD)
@@ -316,18 +305,16 @@ mouse_init(void)
 	bool		 was_on;
 
 	/*
-	 * Brought up in Phase 2 (after clock_init), interrupts already on.
-	 * Held off for the duration and put back as found: the polled i8042
-	 * exchange must be atomic against kbd_irq, which drains the same
-	 * 0x60 data port, and IRQ12 must not be delivered until pit_hz() is
-	 * calibrated (the intr_dispatch -> sched_check_timeouts ->
-	 * clock_uptime_ms path divides by it).
+	 * Called in Phase 2 (after clock_init) with interrupts on; they are
+	 * held off for the duration and restored as found.  The polled
+	 * exchange must be atomic against kbd_irq, which reads the same data
+	 * port, and IRQ12 must not arrive before pit_hz() is calibrated
+	 * (intr_dispatch -> sched_check_timeouts -> clock_uptime_ms divides
+	 * by it).
 	 *
-	 * And the keyboard port is held at the controller: disabling
-	 * interrupts stops kbd_irq, not the keyboard.  A key pressed during
-	 * the exchange would put its byte in the one output buffer, ahead of
-	 * the reply being waited for.  Held, the keyboard keeps the key and
-	 * sends it once the port is let go.
+	 * The keyboard port is held too: disabling interrupts stops kbd_irq,
+	 * not the keyboard, and a key pressed now would land in the output
+	 * buffer ahead of the reply.  Held, the keyboard sends it later.
 	 */
 	was_on = intr_save_disable();
 	kbd_held = (i8042_command(CTL_DISABLE_KBD) == 0);
@@ -336,19 +323,16 @@ mouse_init(void)
 	id = mouse_probe(&step, &got);
 
 	/*
-	 * A device left half-configured, with nothing unmasked at IRQ12 to
-	 * read it, could put a byte in the shared output buffer that nobody
-	 * ever takes -- and every key after it would wait behind that byte.
-	 * So a failed probe takes the aux port back down.
+	 * A failed probe takes the aux port back down: a half-configured
+	 * device with IRQ12 masked could leave a byte in the shared output
+	 * buffer that nobody takes, and every key would wait behind it.
 	 */
 	if (id < 0)
 		(void)i8042_command(CTL_DISABLE_AUX);
 
 	/*
-	 * Enabling streaming can make the device immediately queue an
-	 * initial data packet; drain it (still IRQ12-masked) so the line is
-	 * quiescent when we unmask and the consumer's ring starts empty.
-	 * Real motion arms IRQ12 from here on.
+	 * Enabling streaming can queue an initial packet at once; drain it
+	 * while IRQ12 is still masked, so the ring starts empty.
 	 */
 	i8042_drain();
 
@@ -396,12 +380,9 @@ mouse_getpkt(uint8_t *out)
 }
 
 /*
- * IRQ12 handler.  Drain every aux byte the controller has queued; the
- * status port's AUX bit tells a mouse byte from a keyboard byte on the
- * shared i8042, so a byte without it is left in place for kbd_irq.  No
- * EOI here -- intr_dispatch issues it (slave then master) after we
- * return; no scheduler call either -- the deferred wake is posted via
- * sched_post_irq_wake and drained at a safe preempt point.
+ * IRQ12 handler.  Drain every aux byte queued; a byte without STS_AUX is
+ * the keyboard's and is left for kbd_irq.  intr_dispatch sends the EOI
+ * (slave, then master); the wake is deferred via sched_post_irq_wake.
  */
 static void
 mouse_irq(struct trapframe *tf)
@@ -421,17 +402,14 @@ mouse_irq(struct trapframe *tf)
 }
 
 /*
- * Assemble one streaming data byte into the current packet, pushing a
- * completed 3-byte packet onto the ring.  Shared by mouse_irq and the
- * boot self-test, mirroring how kbd.c shares kbd_decode_scancode between
- * its IRQ and polled paths.
+ * Add one streaming byte to the current packet, pushing each complete
+ * 3-byte packet onto the ring.  Shared by mouse_irq and the boot self-test.
  *
- * Resync, such as it is: byte 0 of a PS/2 packet always has bit 3 set, so
- * at phase 0 a byte lacking it cannot be a byte 0 -- drop it and wait for
- * one that could be.  A heuristic, not a guarantee: a delta byte can have
- * bit 3 set too, and after a lost byte the stream may settle on the wrong
- * boundary until one of those checks fails.  Nothing stricter is
- * available -- any value, 0xFA included, is a legal delta.
+ * Resync: byte 0 always has bit 3 set, so at phase 0 a byte without it is
+ * dropped.  Only a heuristic -- a delta byte can have bit 3 set too, so
+ * after a lost byte the stream can stay misaligned until the check fails;
+ * nothing stricter exists, since any value, 0xFA included, is a legal
+ * delta.
  */
 static void
 mouse_feed_byte(uint8_t b)
@@ -470,10 +448,8 @@ mouse_ring_push(const uint8_t *pkt)
 	__atomic_store_n(&mouse_ring_head, head + 1, __ATOMIC_RELEASE);
 
 	/*
-	 * Harvest a parked consumer atomically against one installing
-	 * itself concurrently, then defer the wake (sched_post_irq_wake
-	 * must not take sched_lock from IRQ context); wake_pending covers
-	 * the recheck-and-block race.  Acquire-release: the release half
+	 * Take a parked consumer and defer its wake; mouse_wake_pending
+	 * covers the recheck-to-block window.  The exchange's release half
 	 * carries the head store above to a consumer whose exchange reads
 	 * this one.
 	 */
@@ -500,11 +476,9 @@ mouse_getpkt_block(uint8_t *out)
 		}
 
 		/*
-		 * Empty: clear pending, install the waiter, recheck.  Mirror
-		 * of the IRQ-side store order (push, exchange waiter, set
-		 * pending) run in reverse, the way kbd_getc_block does it.
-		 * The install is an exchange so that the recheck cannot be
-		 * satisfied from before it -- kbd_getc_block says why.
+		 * Empty: clear pending, install the waiter (by exchange),
+		 * recheck -- the IRQ's order in reverse, as in kbd_getc_block,
+		 * which says why.
 		 */
 		__atomic_store_n(&mouse_wake_pending, 0, __ATOMIC_RELAXED);
 		(void)__atomic_exchange_n(&mouse_waiter, self,
@@ -530,13 +504,12 @@ mouse_getpkt_block(uint8_t *out)
 }
 
 /*
- * The self-test is a second producer into the assembler the IRQ owns, so
- * it borrows the IRQ's own exclusion: interrupts off on this CPU, which is
- * the one IRQ12 is delivered to (the 8259 reaches the boot processor only,
- * and the self-test runs there, before the others are released).  And it
- * feeds only at a packet boundary: three bytes appended to a half-built
- * live packet would complete THAT packet and leave two of the test's own
- * behind.
+ * The self-test is a second producer into the IRQ's assembler, so it
+ * borrows the IRQ's exclusion: interrupts off on this CPU, the one IRQ12
+ * reaches (the 8259 delivers to the boot CPU only, and the self-test runs
+ * there before the others are released).  It feeds only at a packet
+ * boundary; three bytes added to a half-built live packet would complete
+ * that one and leave two of its own behind.
  */
 int
 mouse_selftest_feed(uint8_t b0, uint8_t b1, uint8_t b2)

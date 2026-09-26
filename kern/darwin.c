@@ -34,62 +34,46 @@
 #include "vm_object.h"
 
 /*
- * Darwin (XNU) syscall personality dispatcher -- S2 of the Mach-O ladder.
- * syscall_dispatch routes a TASK_PERSONALITY_DARWIN task here; we decode the
- * Apple class/number out of %rax and translate each onto the style9 primitive
- * that already implements it.  The interesting part is not the translation
- * but the ABI boundary: how the caller passes arguments (already aligned with
- * style9 -- rdi/rsi/rdx/r10/r8/r9) and how it reads results.
+ * Darwin (XNU) syscall personality.  syscall_dispatch routes a
+ * TASK_PERSONALITY_DARWIN task here; we decode the Apple class/number from
+ * %rax and map each call onto the style9 primitive that implements it.
+ * Arguments arrive as on style9 (rdi/rsi/rdx/r10/r8/r9); results differ:
+ *	- Unix/BSD (class 2): CF clear means %rax is the result; CF set means
+ *	  %rax is a positive Darwin errno, mapped from the internal failure.
+ *	- Mach (class 1): a port name or kern_return_t in %rax, no carry
+ *	  convention; we clear carry.
  *
- * Return convention, the crux of S2:
- *	- Unix/BSD (class 2): libSystem reads the carry flag.  CF clear means
- *	  %rax is the result; CF set means %rax is a positive errno.  style9
- *	  has no errno (it speaks MACH_E_* and ELF_E_* codes), so the error path
- *	  maps an internal failure onto a Darwin errno and sets carry.
- *	- Mach (class 1): the trap returns a port name or kern_return_t in %rax
- *	  with no carry convention; we clear carry and return the value.
- *
- * The carry flag lives in the saved user RFLAGS the entry stub sysrets with
- * (syscall_entry.S restores %r11 from sf_user_rflags), so every return funnels
- * through darwin_ok()/darwin_err() to set it deterministically -- a Darwin
- * syscall never inherits stale carry from the thread's last user instruction.
+ * The carry flag lives in the saved user RFLAGS (syscall_entry.S sysrets
+ * with %r11 = sf_user_rflags), so every return goes through darwin_ok() or
+ * darwin_err() and never inherits stale carry from user code.
  */
 
 #define	RFLAGS_CF	(1u << 0)
 
 /*
  * The synthetic /bin: where darwin_bin_lookup (below) presents the program
- * registry as a directory.  Inode numbers are synthesized well clear of
- * the FAT volume's cluster-derived ones.
+ * registry as a directory.  Its inode numbers start at DARWIN_BIN_INO_BASE,
+ * meant to be well clear of any the volume hands out.
  */
 #define	DARWIN_BIN_DIR		"/bin"
 #define	DARWIN_BIN_INO_BASE	0xB1000000u
 
 /*
- * Darwin console input -- a terminal, not a mailbox.
+ * Darwin console input.  The DARWIN_OF_CONSOLE / implicit-stdin read path
+ * drains this ring; producers push one character at a time through
+ * darwin_cons_input(), the line discipline: echo, erase, Ctrl-C to a
+ * signal, Ctrl-D to end-of-file, and only completed lines to the reader.
+ * Editing and signals happen when a key arrives, whether or not anyone is
+ * reading, which is why they live on the producer side.
  *
- * The DARWIN_OF_CONSOLE / implicit-stdin read path drains this; producers
- * push into it one character at a time through darwin_cons_input(), which is
- * the LINE DISCIPLINE: it echoes, it lets a typo be erased, it turns Ctrl-C
- * into a signal and Ctrl-D into end-of-file, and it hands the reader only
- * completed lines.  That division is the point.  A terminal in canonical
- * mode is not a byte pipe with a read() on the end; the editing and the
- * signals happen at the moment a key ARRIVES, whether or not anybody is
- * currently reading, and a reader that tried to do them would echo a
- * character only once it got round to consuming it.
+ * Two producers: the keyboard driver thread, while a Darwin task has
+ * claimed the console (darwin_cons_sink), and the SYS_CONS_FEED native
+ * syscall, which loads a canned script for the boot demo.  Both go through
+ * the same discipline.
  *
- * There are two producers and they are not alike.  The keyboard driver
- * thread routes live keystrokes here whenever a Darwin task has claimed the
- * console (see darwin_cons_sink), which is what makes an interactive shell
- * interactive.  The SYS_CONS_FEED native syscall pushes a canned script and
- * then declares end-of-input, which is what makes the boot demo
- * reproducible.  Both go through the same discipline, so the scripted path
- * exercises the code the live path uses rather than a parallel one.
- *
- * The ring is deliberately ISOLATED from the kbd/uart Mach ports the native
- * shell consumes: nothing a Darwin binary leaves behind can leak into the
- * native surface, and the two never race for the same keystroke -- the
- * claim decides who gets it, once, at the driver.
+ * The ring is separate from the kbd/uart Mach ports the native shell
+ * reads: nothing leaks between the two, and the claim decides at the
+ * driver who gets each keystroke.
  */
 #define	DARWIN_CONS_BUF		512u
 #define	DARWIN_CONS_MASK	(DARWIN_CONS_BUF - 1u)
@@ -139,11 +123,8 @@ static long	darwin_cons_read(struct syscall_frame *f, void *ubuf,
  *	(c) darwin_cons_lock
  *	(a) atomic / single-writer, read without the lock
  *
- * The lock exists because the two producers run in different threads (the
- * keyboard driver thread and whichever task calls SYS_CONS_FEED) and the
- * consumer is a third.  Nothing under it sleeps -- the wake is posted after
- * the lock is dropped, because a thread that blocks holding a spinlock in
- * this kernel is never woken again.
+ * The two producers and the consumer run in different threads.  Nothing
+ * sleeps under the lock; wakes are posted after it is dropped.
  */
 static struct spinlock	darwin_cons_lock = SPINLOCK_INIT("darwin-cons");
 
@@ -156,50 +137,30 @@ static char	darwin_cons_line[DARWIN_CONS_LINE];	/* (c) being typed */
 static uint32_t	darwin_cons_line_len;			/* (c) */
 
 /*
- * A scripted session waiting to be "typed".  SYS_CONS_FEED leaves the whole
- * script here rather than pushing it into the ring, and the reader releases
- * one line of it whenever it would otherwise have to wait.
- *
- * That indirection is what keeps the demo honest.  Pushing the script in one
- * go would echo every command before the program had started, and a
- * transcript where the commands all appear above their output proves less
- * than one that interleaves -- while a script that did not echo at all would
- * exercise a different path from the keyboard's.  Releasing a line at a time,
- * on demand, through the same discipline a keystroke uses, is the model that
- * matches what it claims to be: something typing on your behalf, at the speed
- * the program is willing to read.
+ * A scripted session waiting to be "typed".  SYS_CONS_FEED leaves the
+ * script here, and the reader releases one line of it through the line
+ * discipline whenever it would otherwise wait.  Pushing it all at once
+ * would echo every command before the program had started; a line at a
+ * time interleaves the echo with the output, as typing would.
  */
 static char	darwin_cons_script[DARWIN_CONS_BUF];	/* (c) */
 static uint32_t	darwin_cons_script_len;			/* (c) */
 static uint32_t	darwin_cons_script_off;			/* (c) */
 
 /*
- * WHAT THE TERMINAL HAS BEEN TOLD.
- *
- * Until this, the discipline above was canonical because it was written that
- * way -- the comment on it said as much: the only mode worth having before
- * there is a tcsetattr to leave it with.  This is that tcsetattr's other end.
- * The flags are not decoration: a full-screen program's first act is to turn
- * ICANON and ECHO off, and until it can, every one of them is locked out.
- *
- * One terminal, one setting, no per-descriptor copy.  That is not a
- * simplification of Unix -- it is Unix: the state belongs to the DEVICE, which
- * is why two shells sharing a terminal fight over it, and why `stty` run from
- * one of them changes what the other sees.
- *
- * Guarded by darwin_cons_lock: the discipline reads these on the producer's
- * thread while an ioctl may be writing them on the consumer's.
+ * The terminal settings (tcgetattr/tcsetattr).  A full-screen program
+ * starts by turning ICANON and ECHO off, and the discipline honours these
+ * flags.  One setting for the device, not per descriptor, as on Unix.
+ * Under darwin_cons_lock: the discipline reads them on the producer's
+ * thread while an ioctl may write them on the consumer's.
  */
 static struct darwin_termios	darwin_cons_tio;	/* (c) */
 
 /*
- * A terminal nobody has configured, which is the state a session starts in and
- * the state one that ends must be put back into.  Real Unix does NOT do the
- * putting back -- that is why a program killed in raw mode leaves a shell
- * typing blind and why `reset` exists -- but here the console has exactly one
- * claimant at a time, and a wedged terminal would need a REBOOT to clear.  So
- * darwin_cons_release restores this, and that is a deliberate difference,
- * written down rather than discovered.
+ * Default settings: the state a session starts in and, unlike Unix, the
+ * state darwin_cons_release restores when it ends.  The console has one
+ * claimant at a time and no `reset', so a program killed in raw mode would
+ * otherwise leave it wedged until reboot.
  */
 static void
 darwin_cons_tio_default(struct darwin_termios *t)
@@ -233,10 +194,8 @@ darwin_cons_tio_default(struct darwin_termios *t)
 static bool	darwin_cons_tio_ready;			/* (c) */
 
 /*
- * The settings, made real on first use.  A boot-time init hook would do the
- * same job and would be one more thing a future caller could arrive before;
- * asking for the settings is the only way to reach them, so the question is
- * the safest place to answer it.  Caller holds darwin_cons_lock.
+ * The settings, defaulted on first use rather than by an init hook that a
+ * caller could arrive before.  Caller holds darwin_cons_lock.
  */
 static struct darwin_termios *
 darwin_cons_tio_locked(void)
@@ -250,12 +209,9 @@ darwin_cons_tio_locked(void)
 }
 
 /*
- * What the terminal did.  vo_n_wait is the one that earns its keep: it counts
- * trips round the wait loop that produced nothing, which is the same number
- * in either implementation and therefore the honest way to compare them.  A
- * reader that sleeps takes one trip per wake; a reader that spun on
- * thread_yield took one per timeslice it was handed, for as long as the
- * prompt sat there.
+ * Console counters.  darwin_cons_n_wait counts trips round the read wait
+ * loop that found nothing: one per wake for a sleeping reader, one per
+ * timeslice for a spinning one.
  */
 static uint64_t	darwin_cons_n_read;	/* (c) read(2) calls served      */
 static uint64_t	darwin_cons_n_wait;	/* (c) fruitless trips round it  */
@@ -263,35 +219,29 @@ static uint64_t	darwin_cons_n_key;	/* (c) characters typed          */
 static uint64_t	darwin_cons_n_script;	/* (c) characters scripted       */
 
 /*
- * The clean-room libSystem.B.dylib (user/libsystem.c), embedded as a Mach-O
- * blob.  The dyld backchannel maps it by path on demand -- it is the only
- * dependency the S4 programs name.  objcopy derives these symbols from the
- * input file name "libSystem.B.dylib" (every non-alphanumeric byte -> '_').
- * As Tier-1 grows, add a row to darwin_dylibs[] and embed the matching dylib;
- * dyld + this service already resolve an arbitrary canonical path against the
- * table, so no linker rewrite is needed -- only more dylibs and more symbols.
+ * Embedded dylibs, mapped by path on demand through the dyld backchannel
+ * (darwin_s9_map_image).  objcopy derives the symbols from the input file
+ * name (every non-alphanumeric byte -> '_').  A new dylib is a row in
+ * darwin_dylibs[] plus the embedded blob.
+ *
+ * libSystem.B.dylib: the clean-room one, user/libsystem.c.
  */
 extern uint8_t	_binary_libSystem_B_dylib_start[];
 extern uint8_t	_binary_libSystem_B_dylib_end[];
 
 /*
- * libgmp (GMP 6.3.0, a real Homebrew x86-64 bottle).  gfactor's second
- * dependency, and the first dylib registered here beyond libSystem -- the proof
- * that the dyld resolves a multi-dylib closure.  It is keyed on its LITERAL
- * install name: a Homebrew bottle leaves the @@HOMEBREW_PREFIX@@ placeholder
- * unrelocated, and that is exactly the byte string gfactor's LC_LOAD_DYLIB
- * names, so map_image matches it verbatim (no path rewriting in the kernel).
+ * libgmp (GMP 6.3.0, a real Homebrew x86-64 bottle), gfactor's second
+ * dependency.  Keyed on its literal install name: a bottle leaves the
+ * @@HOMEBREW_PREFIX@@ placeholder unrelocated, and that is the string
+ * gfactor's LC_LOAD_DYLIB names, so it matches verbatim.
  */
 extern uint8_t	_binary_libgmp_10_dylib_start[];
 extern uint8_t	_binary_libgmp_10_dylib_end[];
 
 /*
- * libedit (clean-room stub, user/libedit_stub.c).  dash names Apple's
- * /usr/lib/libedit.3.dylib for its interactive line editor and only ever
- * calls into it when stdin is a tty; this stub answers the bind with
- * el_init returning NULL, which dash's own guards treat as "no editor".
- * Like libSystem it is OUR code -- the third dylib in the registry and the
- * second clean-room one.
+ * libedit (clean-room stub, user/libedit_stub.c).  dash links Apple's
+ * /usr/lib/libedit.3.dylib and calls it only when stdin is a tty; the
+ * stub's el_init returns NULL, which dash treats as "no editor".
  */
 extern uint8_t	_binary_libedit_3_dylib_start[];
 extern uint8_t	_binary_libedit_3_dylib_end[];
@@ -360,19 +310,16 @@ darwin_dispatch(struct syscall_frame *f)
 /* ---- pipes --------------------------------------------------------------- */
 
 /*
- * A kernel pipe: one fixed ring shared by every fd cloned from either
- * end (dup2 within a task, fork across tasks).  p_readers/p_writers
- * count the live fds per end; the object frees itself when both hit
- * zero, and the counts ARE the protocol -- a read on an empty ring with
- * p_writers == 0 is EOF, a write with p_readers == 0 is EPIPE.  All
- * fields under p_lock; the lock is only ever held for ring arithmetic
- * (user copies stage through a bounce buffer outside it).
+ * A kernel pipe: one fixed ring shared by every fd cloned from either end
+ * (dup2 within a task, fork across tasks).  p_readers/p_writers count the
+ * live fds per end; the pipe frees itself when both reach zero.  A read of
+ * an empty ring with no writers is EOF, a write with no readers is EPIPE.
+ * All fields under p_lock, held only for ring arithmetic (user copies go
+ * through a bounce buffer outside it).
  *
- * Blocking is a yield-spin: the reader (or a writer facing a full ring)
- * re-checks after thread_yield, bailing to EINTR when its task has a
- * kill pending.  A wait-queue wake is the obvious upgrade once a real
- * blocking primitive grows a timeout story; the spin is correct and
- * storm-proof for the pipeline lengths this serves.
+ * A reader sleeps on &p_count, a writer facing a full ring on &p_rpos;
+ * either returns EINTR when its task has a kill or an unblocked signal
+ * pending.
  */
 #define	DARWIN_PIPE_BUF		4096u
 #define	DARWIN_PIPE_CHUNK	512u	/* bounce-buffer granularity */
@@ -424,18 +371,10 @@ darwin_pipe_drop(struct darwin_pipe *p, bool writer)
 		return;
 	}
 	/*
-	 * An end going away is news to whoever is parked on the other one, and
-	 * it is the news they can never learn by waiting longer: a reader with
-	 * no writers left has reached EOF, a writer with no readers left has
-	 * an EPIPE coming.  Missing this wake is the shape of hang that looks
-	 * like a deadlock and is really nobody having said the last word --
-	 * a shell reading a pipeline whose producer has exited would sit there
-	 * for ever with the answer already decided.
-	 *
-	 * Both channels are woken rather than only the one that changed: which
-	 * count reached zero is known here, but each side re-tests everything
-	 * anyway, and one extra trip round a loop is cheaper than the reasoning
-	 * needed to be sure the narrower wake is right.
+	 * An end going away must wake the other side: a reader with no
+	 * writers left is at EOF, a writer with no readers faces EPIPE, and
+	 * neither learns it by waiting.  Both channels are woken; each side
+	 * re-tests everything anyway.
 	 */
 	(void)sched_wakeup(&p->p_count);
 	(void)sched_wakeup(&p->p_rpos);
@@ -443,14 +382,8 @@ darwin_pipe_drop(struct darwin_pipe *p, bool writer)
 }
 
 /*
- * What waiting costs, counted the way the console's counters are counted and
- * for the same reason: a trip round a wait loop that produced nothing is the
- * one number that means the same thing in either implementation, so it is the
- * honest way to compare a reader that sleeps against a reader that spins.
- *
- * A parked waiter takes one trip per wake.  A spinning one takes one per
- * timeslice it is handed, for as long as it has to wait -- which is to say
- * the counter measures the machine the wait is stealing.
+ * Pipe and wait4 counters.  As on the console, a "fruitless trip" is a pass
+ * round a wait loop that found nothing: one per wake for a parked waiter.
  */
 static uint64_t	darwin_pipe_n_read;	/* pipe read(2) calls served    */
 static uint64_t	darwin_pipe_n_rwait;	/* fruitless trips, empty ring  */
@@ -464,19 +397,12 @@ static uint64_t	darwin_wait_n_told;	/* child-news calls that woke   */
 static uint64_t	darwin_wait_n_woke;	/* ...and threads they woke     */
 
 /*
- * How long a parked wait4 lets pass before looking again of its own accord.
+ * How long a parked wait4 sleeps before re-checking on its own.  The wakes
+ * for this wait come from every route out of a Darwin task, not all in this
+ * file; if one is ever missed, the net keeps the parent from hanging.
  *
- * The net exists because the wakes for this one wait are not all in this file:
- * every route out of a Darwin task is supposed to say so, and if one ever
- * forgets, the price without a net is a shell that never returns -- the least
- * diagnosable failure a kernel has.
- *
- * IT FIRING IS NOT A BUG, and the first version of this said it was.  A child
- * that takes longer than the interval trips it while doing nothing wrong;
- * there is simply no news yet, which is the correct answer to have been given.
- * What distinguishes a lost wake is not the net firing but what the re-check
- * FINDS: if the answer was already sitting there, nobody had told the parent,
- * and only the deadline did.  That is the counter worth reading.
+ * The net firing is normal for a slow child.  A lost wake is when the
+ * re-check finds a zombie already there (darwin_wait_n_lost).
  */
 #define	DARWIN_WAIT_NET_MS	500
 
@@ -517,30 +443,17 @@ darwin_pipe_read(struct syscall_frame *f, struct darwin_pipe *p,
 			return (darwin_ok(f, 0));	/* EOF */
 		}
 		/*
-		 * Two different reasons to stop waiting, and for a long time
-		 * only the first was asked about: the task has been killed, or
-		 * it has a signal posted that it is not blocking.  Without the
-		 * second, a reader blocked on a pipe nobody is writing to
-		 * ignores SIGINT and SIGTERM entirely -- the signal sits
-		 * pending, delivered only if the read happens to finish.
-		 *
-		 * Asked with p_lock still held, because the park below needs
-		 * it: a signal that arrives after this test but before the
-		 * park is not missed, since posting one wakes the thread.
+		 * Stop waiting if the task is being killed or has an unblocked
+		 * signal pending (else SIGINT would sit until the read ends).
+		 * Tested under p_lock, which the park below releases: a signal
+		 * posted in between wakes the thread, so it is not missed.
 		 */
 		if (task_kill_pending(current_thread->th_task) ||
 		    darwin_signal_pending(current_thread->th_task)) {
 			spin_unlock(&p->p_lock);
 			return (darwin_err(f, DARWIN_EINTR));
 		}
-		/*
-		 * Sleep until a writer says there are bytes.  This used to
-		 * spin on thread_yield, which is correct and costs the
-		 * machine: a reader waiting on a slow producer took every
-		 * timeslice it was offered to discover the ring was still
-		 * empty, and on one CPU the only thread it could take them
-		 * from was the producer it was waiting for.
-		 */
+		/* Sleep until a writer says there are bytes. */
 		darwin_pipe_n_rwait++;
 		thread_block_release(THREAD_BLOCK_SLEEP, &p->p_count,
 		    &p->p_lock);
@@ -548,10 +461,10 @@ darwin_pipe_read(struct syscall_frame *f, struct darwin_pipe *p,
 }
 
 /*
- * Write the whole buffer, blocking on a full ring -- full-length
- * completion is what a libc that does not retry short writes needs.
- * A reader-less pipe returns the bytes already moved, or EPIPE if
- * nothing was (signal-free EPIPE; SIGPIPE does not exist here yet).
+ * Write the whole buffer, blocking on a full ring: a libc that does not
+ * retry short writes needs full-length completion.  A reader-less pipe
+ * returns the bytes already moved, or posts SIGPIPE and fails with EPIPE
+ * if nothing was.
  */
 static long
 darwin_pipe_write(struct syscall_frame *f, struct darwin_pipe *p,
@@ -586,11 +499,9 @@ darwin_pipe_write(struct syscall_frame *f, struct darwin_pipe *p,
 				if (done > 0)
 					return (darwin_ok(f, (long)done));
 				/*
-				 * Reader-less pipe: post SIGPIPE to the writer.
-				 * Ignored or caught, the write just fails with
-				 * EPIPE (POSIX); otherwise the default-terminate
-				 * signal retires the writer when this syscall
-				 * returns and the EPIPE is never observed.
+				 * Ignored or caught, SIGPIPE leaves the write
+				 * failing with EPIPE; by default it terminates
+				 * the writer as this syscall returns.
 				 */
 				darwin_signal_post(current_thread->th_task,
 				    DARWIN_SIGPIPE);
@@ -607,11 +518,9 @@ darwin_pipe_write(struct syscall_frame *f, struct darwin_pipe *p,
 					return (darwin_err(f, DARWIN_EINTR));
 				}
 				/*
-				 * Sleep until a reader makes room, on the
-				 * read position rather than the byte count:
-				 * two waits on one pipe want opposite things
-				 * and a shared channel would wake each side
-				 * for the other's news.
+				 * Sleep until a reader makes room, on &p_rpos
+				 * so readers and writers do not wake each
+				 * other for nothing.
 				 */
 				darwin_pipe_n_wwait++;
 				thread_block_release(THREAD_BLOCK_SLEEP,
@@ -638,15 +547,13 @@ darwin_pipe_write(struct syscall_frame *f, struct darwin_pipe *p,
 	return (darwin_ok(f, (long)n));
 }
 
-/* ---- open-file table ------------------------------------------------------ */
+/* ---- open-file table ----------------------------------------------------- */
 
 /*
- * darwin_fd_alloc_from returns the lowest FREE slot at `min` or above;
- * darwin_fd_alloc is the common floor-3 form (0..2 keep their implicit
- * std-stream meaning until dup2 explicitly retargets them).  The floored
- * variant serves fcntl(F_DUPFD): a shell saves its std fds at 10+ before
- * a redirection and restores them after.  Returns -1 when the table is
- * full above the floor.
+ * darwin_fd_alloc_from returns the lowest FREE slot at `min` or above, or
+ * -1 when the table is full above it; fcntl(F_DUPFD) uses the floor (a
+ * shell saves its std fds at 10+).  darwin_fd_alloc is the floor-3 form:
+ * 0..2 keep their implicit std-stream meaning until dup2 retargets them.
  */
 static int
 darwin_fd_alloc_from(struct task *t, int min)
@@ -670,11 +577,10 @@ darwin_fd_alloc(struct task *t)
 }
 
 /*
- * Keep a copy of what a file was opened as.  An fd holds the file's bytes,
- * but mmap needs its *name*: the pager reads pages one at a time, long after
- * the open, and with no vnode layer here a path is the only durable handle a
- * file has.  Returns NULL on allocation failure, which is not fatal -- the fd
- * still works, it just cannot be mapped.
+ * Keep a copy of the path a file was opened by.  mmap's pager reads pages
+ * long after the open, and with no vnode layer the path is the only durable
+ * handle.  NULL on allocation failure is not fatal: the fd still works, it
+ * just cannot be mapped.
  */
 static char *
 darwin_path_dup(const char *path)
@@ -696,15 +602,11 @@ darwin_path_dup(const char *path)
 }
 
 /*
- * read(2) from a disk-backed fd: fetch through the filesystem into a bounce
- * buffer, then hand it to the caller.
- *
- * The bounce exists because fs_pread writes into kernel memory and the user
- * buffer must be crossed under an SMAP bracket; reading straight into ring-3
- * memory would also mean holding a user page while the disk read sleeps.  It
- * is capped rather than sized to the request so that one enormous read cannot
- * ask the heap for an enormous allocation -- the loop delivers the whole
- * length regardless, one chunk at a time.
+ * read(2) from a disk-backed fd, through a kernel bounce buffer: fs_pread
+ * writes kernel memory, the user copy needs an SMAP bracket, and no user
+ * page should be held while the disk read sleeps.  The bounce is capped at
+ * DARWIN_READ_CHUNK so a huge read cannot ask for a huge allocation; the
+ * loop still delivers the whole length.
  */
 #define	DARWIN_READ_CHUNK	(64u * 1024u)
 
@@ -732,10 +634,8 @@ darwin_file_read(struct syscall_frame *f, struct darwin_ofile *of, void *ubuf,
 		if (rv != FS_E_OK) {
 			kfree(bounce);
 			/*
-			 * A read that fails mid-file is the disk's failing,
-			 * EIO -- except the one failure a descriptor onto
-			 * /.xid can have, which is its checkpoint sliding
-			 * out of the window, and that has its own word.
+			 * EIO, except for a /.xid descriptor whose checkpoint
+			 * has left the window: ESTALE.
 			 */
 			return (darwin_err(f, rv == FS_E_GONE ?
 			    DARWIN_ESTALE : DARWIN_EIO));
@@ -758,15 +658,10 @@ darwin_file_read(struct syscall_frame *f, struct darwin_ofile *of, void *ubuf,
 }
 
 /*
- * What a filesystem refusal is called in Darwin's numbering.
- *
- * FS_E_SPREAD is the interesting one and it is a judgement call: the writer
- * moves a file's records in one copy of one node and refuses when they have
- * been split across two, which is a documented edge of the truncate rung and
- * not a full disk.  ENOSPC is the closest true thing a program can be told --
- * room could not be found -- and EIO would say the volume was damaged, which
- * it is not.  A shell prints "No space left on device" and stops, which is the
- * right behaviour for a request this kernel cannot yet carry out.
+ * Map an FS_E_* code to a Darwin errno.  FS_E_SPREAD (a file's records
+ * split across two nodes, which the writer refuses to move) is not a full
+ * disk, but ENOSPC -- room could not be found -- is the nearest true
+ * answer; EIO would claim the volume is damaged.
  */
 static int
 darwin_fs_errno(int rv)
@@ -786,30 +681,17 @@ darwin_fs_errno(int rv)
 	case FS_E_NOALLOC:	return (DARWIN_ENOSPC);
 	case FS_E_SPREAD:	return (DARWIN_ENOSPC);
 	case FS_E_INVAL:	return (DARWIN_EINVAL);
-	/*
-	 * A checkpoint read through /.xid that the free queue has since let
-	 * go of.  NFS's word for a handle whose object is no longer there,
-	 * and the nearest thing errno has to "this was true a moment ago".
-	 */
+	/* A /.xid checkpoint the free queue has since let go of. */
 	case FS_E_GONE:		return (DARWIN_ESTALE);
 	default:		return (DARWIN_EIO);
 	}
 }
 
 /*
- * write(2) to a disk-backed fd: bounce through the kernel, then hand it to the
- * filesystem, the mirror image of darwin_file_read and for the same reasons --
- * fs_pwrite reads out of kernel memory, and a user page must not be held while
- * the disk write sleeps.
- *
- * O_APPEND is resolved HERE, per call, against the length the volume has now
- * rather than the one this fd was opened with.  That is the whole content of
- * the flag: two shells appending to the same log must not overwrite each
- * other, and a cursor remembered from open time is exactly how they would.
- *
- * The write is not reported as short unless the filesystem shortened it.  A
- * partial write that returned success would be indistinguishable to the caller
- * from a full one, and a shell writing a line would silently produce half of it.
+ * write(2) to a disk-backed fd, through a bounce buffer as in
+ * darwin_file_read.  O_APPEND is resolved per call against the handle's
+ * current length, not the open-time one, so two appenders do not overwrite
+ * each other.  A write is short only if the filesystem shortened it.
  */
 #define	DARWIN_WRITE_CHUNK	(64u * 1024u)
 
@@ -862,11 +744,7 @@ darwin_file_write(struct syscall_frame *f, struct darwin_ofile *of,
 	}
 	kfree(bounce);
 
-	/*
-	 * The cursor follows the bytes, and the fd's idea of the length
-	 * follows the handle's -- which fs_pwrite has already moved if the
-	 * write ran off the end.
-	 */
+	/* fs_pwrite has already grown fh_size if the write ran off the end. */
 	of->of_off  = (uint32_t)(at + done);
 	of->of_size = (uint32_t)of->of_handle.fh_size;
 	return (darwin_ok(f, (long)done));
@@ -881,12 +759,10 @@ darwin_ofile_clear(struct darwin_ofile *of)
 	case DARWIN_OF_DIR:
 	case DARWIN_OF_FILE:
 		/*
-		 * THE ONE PLACE A DESCRIPTOR STOPS EXISTING, which is why the
-		 * file is given back here and not in close(2): dup2 over a live
-		 * slot, a task being torn down and an exec all end a descriptor
-		 * without going near that syscall, and each of them would
-		 * otherwise have to remember.  Harmless on a directory, whose
-		 * handle was never filled in and reads as FS_HANDLE_NONE.
+		 * The one place a descriptor stops existing, so the file is
+		 * closed here rather than in close(2): dup2 over a live slot,
+		 * task teardown and exec end descriptors too.  A directory's
+		 * handle is FS_HANDLE_NONE, which fs_close ignores.
 		 */
 		(void)fs_close(&of->of_handle);
 		if (of->of_buf != NULL)
@@ -917,14 +793,10 @@ darwin_ofile_clear(struct darwin_ofile *of)
 
 /*
  * Foreground task for console input: the id of the Darwin task that last
- * read(2) the console.  It is also the CLAIM -- while it names a live task,
- * the keyboard driver routes keystrokes here instead of to the Mach input
- * port the native shell reads, so exactly one of the two surfaces receives
- * any given key.  A stand-in for process groups, and enough for the case
- * this system actually has: one interactive shell draining the console.
- *
- * Read without the lock, which is safe because a stale id is harmless: the
- * lookup that follows it either finds a live task or does not.
+ * read(2) the console.  It is also the claim: while it names a live task,
+ * the keyboard driver routes keys here instead of to the native shell's
+ * Mach input port.  A stand-in for process groups.  Read without the lock;
+ * a stale id only makes the following lookup fail.
  */
 static uint64_t	darwin_cons_fg_id;		/* (a) */
 
@@ -960,32 +832,14 @@ darwin_cons_deliver_locked(void)
 }
 
 /*
- * One character arriving at the terminal: the line discipline.
+ * One character arriving at the terminal: the line discipline.  Echo
+ * happens here, as the key arrives, so a busy shell still shows what is
+ * typed.  Editing (ICANON), echo (ECHO) and signals (ISIG) are governed
+ * separately by their own flags; programs use every combination.
  *
- * Echo happens HERE, as the key arrives, not where the line is consumed --
- * that is the difference between a terminal and a queue, and it is why a
- * shell that is busy running a command still shows what you type at it.
- *
- * WHICH OF THESE THINGS HAPPEN IS NOW ASKED, not assumed.  This used to be
- * canonical mode because it was written that way; every branch below that
- * edits, echoes or signals is now conditional on the flag that governs it, so
- * a program that turns ICANON and ECHO off gets what it asked for: raw bytes,
- * one at a time, nothing printed.  The three questions are separate on purpose
- * -- programs use all four combinations, and a "raw mode" boolean would have
- * tied echo to editing to signals and served none of them exactly.
- *
- * Returns whether a wake is owed, and leaves it to the caller: a reader is
- * woken outside the lock, never under it.
- *
- * WHETHER, not WHOM.  This used to hand back the parked thread out of a slot
- * that held exactly one -- which was true of the console and false of the
- * kernel around it.  A second reader overwrote the first, and the first was
- * then never woken by anything; task teardown needed a hook of its own to
- * clear the slot, or a keystroke after the reader's task died would have
- * called thread_wake on freed memory.  Both problems were the object holding
- * a thread pointer.  It holds a CHANNEL now -- see sched_wakeup -- and the
- * scheduler keeps the list, so there is no count to be wrong about and
- * nothing for a dying task to clean up.
+ * Returns whether a wake is owed; the caller wakes the reader channel
+ * (&darwin_cons_head) outside the lock.  The console keeps no thread
+ * pointer, so a dying reader leaves nothing to clean up.
  */
 static bool
 darwin_cons_input_locked(char c, bool *intr_out)
@@ -996,15 +850,9 @@ darwin_cons_input_locked(char c, bool *intr_out)
 	tio = darwin_cons_tio_locked();
 
 	/*
-	 * Not canonical: the byte is the message.  No editing, no line to
-	 * accumulate, and the reader is owed a wake for every single character
-	 * rather than for every line -- which is the whole point, since a
-	 * program in this mode is waiting on one keystroke.
-	 *
-	 * ISIG survives ICANON going away; they are independent flags and a
-	 * pager that wants raw keys usually still wants Ctrl-C to work.  So the
-	 * signal characters are tested first, out of c_cc rather than from the
-	 * constants, because a program is allowed to move them.
+	 * Non-canonical: no editing, and a wake per character.  ISIG is
+	 * independent of ICANON (a pager wants raw keys and a working Ctrl-C),
+	 * so VINTR is tested first, from c_cc since a program may move it.
 	 */
 	if ((tio->c_lflag & DARWIN_ICANON) == 0) {
 		if ((tio->c_lflag & DARWIN_ISIG) != 0 &&
@@ -1023,16 +871,10 @@ darwin_cons_input_locked(char c, bool *intr_out)
 	}
 
 	/*
-	 * Canonical mode.  What follows was a switch on constants; it is a
-	 * chain of comparisons against c_cc because those are VARIABLES now --
-	 * a program may move its interrupt character, and one that does would
-	 * be answered by a switch that still knew only 0x03.
-	 *
-	 * Input mapping comes first: with ICRNL set -- the default, and what
-	 * every one of these programs is built for -- the Return key's carriage
-	 * return IS a newline by the time anything else looks at it.  With it
-	 * cleared, a bare CR is an ordinary byte and only LF ends a line, which
-	 * is what a program that cleared it asked for.
+	 * Canonical mode.  An if-chain rather than a switch because the
+	 * special characters come from c_cc and may be moved.  ICRNL (the
+	 * default) maps CR to newline first; with it clear, only LF ends a
+	 * line.
 	 */
 	if (c == '\r' && (tio->c_iflag & DARWIN_ICRNL) != 0)
 		c = '\n';
@@ -1040,19 +882,11 @@ darwin_cons_input_locked(char c, bool *intr_out)
 	if ((tio->c_lflag & DARWIN_ISIG) != 0 &&
 	    (uint8_t)c == tio->c_cc[DARWIN_VINTR]) {
 		/*
-		 * Ctrl-C discards what was typed and signals.  Discarding is
-		 * the part that is easy to leave out and wrong to: the line
-		 * you abandoned must not arrive at the next prompt.
-		 *
-		 * It also WAKES the reader, which is not decoration.  Posting
-		 * a signal in this kernel only sets a bit -- it does not
-		 * disturb a thread already asleep in a syscall -- so a reader
-		 * parked at a prompt would sleep through its own interrupt
-		 * and collect it at the exit of whatever syscall woke it
-		 * next.  Measured, not reasoned: the first version of this
-		 * printed ^C, discarded the line correctly, and then ate the
-		 * NEXT command the user typed, because that command's read(2)
-		 * was the one that carried the stale SIGINT out to dash.
+		 * Ctrl-C discards the typed line, so it cannot reach the next
+		 * prompt, and signals.  It also returns true to wake the
+		 * reader: posting a signal only sets a bit, and a reader
+		 * parked at a prompt would otherwise carry the SIGINT out
+		 * with the next command's read(2) and lose that command.
 		 */
 		darwin_cons_line_len = 0;
 		tty_putc('^');
@@ -1061,10 +895,8 @@ darwin_cons_input_locked(char c, bool *intr_out)
 		*intr_out = true;
 	} else if ((uint8_t)c == tio->c_cc[DARWIN_VEOF]) {
 		/*
-		 * Ctrl-D delivers what is typed so far WITHOUT a newline; on
-		 * an empty line that is a zero-byte read, which is exactly
-		 * how a Unix terminal spells end-of-file.  A shell exits on
-		 * it, which is how the console gets handed back.
+		 * Ctrl-D delivers the line so far without a newline; on an
+		 * empty line that is a zero-byte read, i.e. end-of-file.
 		 */
 		if (darwin_cons_line_len == 0)
 			darwin_cons_eof = true;
@@ -1073,11 +905,8 @@ darwin_cons_input_locked(char c, bool *intr_out)
 	} else if ((uint8_t)c == tio->c_cc[DARWIN_VERASE] ||
 	    c == DARWIN_CONS_ERASE) {
 		/*
-		 * Two keys, one meaning.  VERASE is one character and it is
-		 * DEL by default, but this keyboard driver sends backspace for
-		 * the key labelled backspace, and a terminal that rubbed out
-		 * on only one of them would be wrong for half the hardware
-		 * that reaches it.
+		 * VERASE is DEL by default, but the keyboard driver sends
+		 * backspace for the Backspace key; both erase.
 		 */
 		if (darwin_cons_line_len == 0)
 			return (false);		/* nothing to rub out */
@@ -1109,12 +938,7 @@ darwin_cons_input_locked(char c, bool *intr_out)
 		if (c < 0x20 && c != '\t')
 			return (false);		/* not a key we render */
 		if (darwin_cons_line_len >= DARWIN_CONS_LINE) {
-			/*
-			 * A line longer than the buffer is delivered rather
-			 * than truncated: losing the tail silently would be
-			 * worse than handing the reader a line it did not
-			 * ask to be split.
-			 */
+			/* Deliver an overlong line in pieces, not truncated. */
 			darwin_cons_deliver_locked();
 		}
 		darwin_cons_line[darwin_cons_line_len++] = c;
@@ -1128,7 +952,7 @@ darwin_cons_input_locked(char c, bool *intr_out)
 
 /*
  * Push one character in from a producer.  Returns true if the console took
- * it -- which is also the answer to "does a Darwin task want this key".
+ * it (currently always).
  */
 bool
 darwin_cons_input(char c)
@@ -1152,10 +976,9 @@ darwin_cons_input(char c)
 }
 
 /*
- * The keyboard driver's sink.  Answers "is a Darwin task holding the
- * console" and, if so, swallows the key; otherwise the driver sends it to
- * the Mach input port and the native shell gets it as before.  One decision,
- * one place: nothing else in the system arbitrates the keyboard.
+ * The keyboard driver's sink: if a Darwin task holds the console, take the
+ * key; otherwise return false and the driver sends it to the Mach input
+ * port.  Nothing else arbitrates the keyboard.
  */
 bool
 darwin_cons_sink(char c)
@@ -1167,9 +990,8 @@ darwin_cons_sink(char c)
 	fg = task_lookup_ref(darwin_cons_fg_id);
 	if (fg == NULL) {
 		/*
-		 * The claimant died without releasing -- teardown normally
-		 * clears this, but a claim that outlives its task would wedge
-		 * the keyboard, so drop it here too rather than trust one path.
+		 * The claimant died unreleased.  Teardown normally clears the
+		 * claim; dropping it here too keeps the keyboard from wedging.
 		 */
 		darwin_cons_fg_id = 0;
 		return (false);
@@ -1179,10 +1001,9 @@ darwin_cons_sink(char c)
 }
 
 /*
- * Release the console if `t` was holding it.  Called when a task dies: a
- * claim that outlived its owner would route every keystroke into a ring
- * nobody drains, which from the keyboard's end is indistinguishable from a
- * dead machine.
+ * Release the console if `t` was holding it.  Called when a task dies; a
+ * claim that outlived its owner would route every key into a ring nobody
+ * drains.
  */
 void
 darwin_cons_release(struct task *t)
@@ -1192,33 +1013,18 @@ darwin_cons_release(struct task *t)
 		return;
 	darwin_cons_fg_id = 0;
 	spin_lock(&darwin_cons_lock);
-	/*
-	 * A parked reader of a dying task used to need forgetting here, or a
-	 * later keystroke would have called thread_wake on freed memory.  It
-	 * needs nothing now: the console keeps no thread pointer, and a thread
-	 * leaves the scheduler's sleep queue as part of being woken, which
-	 * every route out of a task goes through.
-	 */
 	darwin_cons_line_len   = 0;
 	darwin_cons_tail       = darwin_cons_head;  /* discard unread input */
 	darwin_cons_eof        = false;	/* the next claimant starts fresh */
 	darwin_cons_script_len = 0;	/* a script belongs to its session */
 	darwin_cons_script_off = 0;
-	/*
-	 * And the SETTINGS go back with everything else.  A program that dies
-	 * holding the terminal in raw mode is not an unlikely case -- it is the
-	 * ordinary way a full-screen program ends when it crashes -- and on a
-	 * machine whose console has one claimant and no `reset` to run, leaving
-	 * it that way costs a reboot.  See darwin_cons_tio_default.
-	 */
+	/* Settings too: see darwin_cons_tio_default. */
 	darwin_cons_tio_default(darwin_cons_tio_locked());
 	spin_unlock(&darwin_cons_lock);
 
 	/*
-	 * A session ending is the natural moment to say what the terminal
-	 * cost, and the only one available while the machine is still up: the
-	 * boot-time stats block has long since printed by the time anybody
-	 * types.  The waits figure is the interesting one -- see the counters.
+	 * Session end is the moment to print what the session cost; the
+	 * boot-time stats block printed long before anyone typed.
 	 */
 	darwin_cons_stats();
 	darwin_wait_stats();
@@ -1228,11 +1034,9 @@ darwin_cons_release(struct task *t)
 }
 
 /*
- * Load a scripted session, driven by the SYS_CONS_FEED native syscall.  The
- * bytes are not delivered here -- they are held until a reader asks, and then
- * released one line at a time through the same discipline a keystroke uses
- * (see darwin_cons_script_locked).  Running out of script is end-of-input,
- * which is what lets a scripted shell exit without anybody typing Ctrl-D.
+ * Load a scripted session (SYS_CONS_FEED).  The bytes are held until a
+ * reader asks, then released a line at a time (darwin_cons_script_locked).
+ * Running out of script is end-of-input, so a scripted shell exits.
  */
 void
 darwin_cons_feed(const char *buf, size_t n)
@@ -1252,11 +1056,10 @@ darwin_cons_feed(const char *buf, size_t n)
 }
 
 /*
- * Release the next scripted line into the discipline, or declare end-of-input
- * once the script is spent.  Returns false when there was nothing left to
- * type and the caller should wait for a real key instead; *intr_out reports a
- * Ctrl-C in the script, which the caller signals after dropping the lock
- * exactly as it would for a typed one.
+ * Release the next scripted line into the discipline, or declare
+ * end-of-input once the script is spent.  Returns false when there was
+ * nothing to type and the caller should wait for a real key.  *intr_out
+ * reports a scripted Ctrl-C, which the caller signals after unlocking.
  */
 static bool
 darwin_cons_script_locked(bool *intr_out)
@@ -1274,9 +1077,8 @@ darwin_cons_script_locked(bool *intr_out)
 		c = darwin_cons_script[darwin_cons_script_off++];
 		darwin_cons_n_script++;
 		/*
-		 * The wake this returns is discarded on purpose: the only
-		 * thread that could be parked here is the one running this,
-		 * and it is about to loop round and find the line itself.
+		 * The owed wake is dropped: the reader is the thread running
+		 * this, and it will find the line itself.
 		 */
 		(void)darwin_cons_input_locked(c, &intr);
 		if (intr)
@@ -1286,15 +1088,9 @@ darwin_cons_script_locked(bool *intr_out)
 }
 
 /*
- * read(2) on a console fd (implicit stdin or an explicit CONSOLE slot):
- * serve one line of console input.  The discipline above has already echoed
- * it and already decided where the line ends, so this only moves bytes and
- * waits.
- *
- * It waits by SLEEPING.  This used to spin on thread_yield(), which works and
- * costs the whole machine: an interactive shell sitting at a prompt would
- * take every timeslice offered to it, forever, to discover the ring was
- * still empty.  Now the reader parks on the ring and the producer wakes it.
+ * read(2) on a console fd (implicit stdin or a CONSOLE slot).  The
+ * discipline has already echoed and split lines, so this only moves bytes
+ * and waits, parked on &darwin_cons_head until a producer wakes it.
  */
 static long
 darwin_cons_read(struct syscall_frame *f, void *ubuf, size_t n)
@@ -1316,18 +1112,10 @@ darwin_cons_read(struct syscall_frame *f, void *ubuf, size_t n)
 		spin_lock(&darwin_cons_lock);
 		tio = darwin_cons_tio_locked();
 		/*
-		 * HOW LITTLE WILL DO.  In canonical mode the ring only ever
-		 * holds whole lines, so anything in it is a complete answer
-		 * and one byte is enough to return on.  Out of it, VMIN is the
-		 * program's own statement of how little it will settle for --
-		 * a pager waiting on a keystroke sets 1 and means it, and a
-		 * program setting 0 is asking not to be made to wait at all.
-		 *
-		 * VTIME is stored and reported back faithfully and is NOT
-		 * honoured: a timed wait wants a timer per reader, and there
-		 * is nothing here that needs one yet.  Said out loud rather
-		 * than left for someone to discover, since a program setting
-		 * VMIN=0 VTIME=5 would get a poll instead of a half-second.
+		 * How little will do.  In canonical mode the ring holds only
+		 * whole lines, so one byte is enough; otherwise VMIN says (0
+		 * means do not wait).  VTIME is stored and reported but not
+		 * honoured: VMIN=0 VTIME=5 polls instead of waiting 0.5 s.
 		 */
 		least = 1;
 		if ((tio->c_lflag & DARWIN_ICANON) == 0)
@@ -1345,12 +1133,7 @@ darwin_cons_read(struct syscall_frame *f, void *ubuf, size_t n)
 			break;
 		}
 
-		/*
-		 * Nothing queued.  If a script is loaded, this is the moment
-		 * it gets to type its next line -- the reader asking is what
-		 * paces it, so the transcript interleaves commands with their
-		 * output instead of listing them all up front.
-		 */
+		/* Nothing queued: a loaded script types its next line now. */
 		if (darwin_cons_script_locked(&intr)) {
 			spin_unlock(&darwin_cons_lock);
 			if (intr)
@@ -1359,12 +1142,9 @@ darwin_cons_read(struct syscall_frame *f, void *ubuf, size_t n)
 		}
 
 		/*
-		 * A pending, unblocked signal (e.g. SIGINT from Ctrl-C) breaks
-		 * the blocking read with EINTR; the syscall-exit path then
-		 * delivers it -- a caught handler runs, an uncaught SIGINT
-		 * terminates.  Mirrors the pipe read's interrupt check, and
-		 * has to be tested before parking or a signal that arrived
-		 * while we were awake would be slept through.
+		 * A pending, unblocked signal breaks the read with EINTR and
+		 * the syscall-exit path delivers it.  Tested before parking, or
+		 * a signal that arrived while awake would be slept through.
 		 */
 		if (darwin_signal_pending(current_thread->th_task)) {
 			spin_unlock(&darwin_cons_lock);
@@ -1372,17 +1152,9 @@ darwin_cons_read(struct syscall_frame *f, void *ubuf, size_t n)
 		}
 
 		/*
-		 * Register, then park with the lock dropped ATOMICALLY with
-		 * respect to a producer: thread_block_release does the drop
-		 * under the scheduler lock, so a wake fired between the two
-		 * cannot be lost.  Doing it by hand -- unlock, then block --
-		 * is the classic missed-wakeup, and here it would hang a
-		 * shell at its prompt until the next keystroke.
-		 *
-		 * The registration is the block target itself now: the ring's
-		 * head is the CHANNEL, and the scheduler holds the list of who
-		 * is on it.  There is nowhere left to put a second reader
-		 * wrongly, which is what the console's own slot did.
+		 * Park on the ring's head.  thread_block_release drops the
+		 * lock under the scheduler lock, so a producer's wake cannot
+		 * fall between the unlock and the block.
 		 */
 		darwin_cons_n_wait++;
 		thread_block_release(THREAD_BLOCK_SLEEP,
@@ -1398,18 +1170,9 @@ darwin_cons_read(struct syscall_frame *f, void *ubuf, size_t n)
 }
 
 /*
- * What a create actually gets: what was asked for, less what this task's umask
- * takes away.
- *
- * Every program asks for the most it could possibly want -- 0666 for a file,
- * 0777 for a directory -- and every Unix hands back less.  That is not a
- * courtesy, it is where the number in `ls -l` comes from, and a system without
- * it has to either ignore the argument (which this did, out loud) or produce
- * world-writable files nobody asked for.
- *
- * The argument arrives as a long because that is how a syscall carries one;
- * only the low twelve bits mean anything, and the type bits a caller may have
- * folded in are the filesystem's business rather than the caller's.
+ * The mode a create actually gets: the requested permission bits (low
+ * twelve; any type bits are the filesystem's business) less this task's
+ * umask.
  */
 static uint16_t
 darwin_mode_arg(long raw)
@@ -1421,17 +1184,10 @@ darwin_mode_arg(long raw)
 }
 
 /*
- * ioctl(2) on a terminal, which is the only kind of device a program here can
- * be holding: everything else it can open is a file, a pipe, or nothing.
- *
- * The refusals matter as much as the answers.  ENOTTY on a file and on a pipe
- * is not a failure to implement something -- it is the answer, and it is the
- * one isatty(3) is built out of.  gls asks TIOCGWINSZ before deciding whether
- * to print in columns, and a kernel that answered it for a pipe would have gls
- * writing columns into a file.
- *
- * `arg` is a pointer for every request here; a caller that passes a bad one
- * gets EFAULT from the copy rather than a fault in the kernel.
+ * ioctl(2) on the terminal, the only device a program here can hold.
+ * ENOTTY on a file or pipe is the answer isatty(3) is built on (gls asks
+ * TIOCGWINSZ to decide whether to print in columns).  `arg` is a user
+ * pointer for every request; a bad one gets EFAULT from the copy.
  */
 static long
 darwin_cons_ioctl(struct syscall_frame *f, struct darwin_ofile *of,
@@ -1464,13 +1220,9 @@ darwin_cons_ioctl(struct syscall_frame *f, struct darwin_ofile *of,
 		spin_lock(&darwin_cons_lock);
 		*darwin_cons_tio_locked() = tio;
 		/*
-		 * The three spellings differ only in what happens to input
-		 * that has already arrived.  SETA takes effect now and leaves
-		 * it; SETAW would wait for output to drain, and there is
-		 * nothing here that buffers output to drain; SETAF discards
-		 * what is queued, which is what a program changing modes
-		 * between two of its own reads is asking for -- keystrokes
-		 * typed under the OLD rules must not arrive under the new.
+		 * SETA applies now; SETAW would first drain output, of which
+		 * none is buffered; SETAF also discards queued input, typed
+		 * under the old rules.
 		 */
 		if (req == DARWIN_TIOCSETAF) {
 			darwin_cons_tail     = darwin_cons_head;
@@ -1486,10 +1238,8 @@ darwin_cons_ioctl(struct syscall_frame *f, struct darwin_ofile *of,
 
 	case DARWIN_TIOCGWINSZ:
 		/*
-		 * The console's real size, not a fabricated 80x24: this is a
-		 * text-mode display and TTY_COLS x TTY_ROWS is the hardware.
-		 * The pixel fields are zero, which is what every terminal that
-		 * is not a graphics window reports.
+		 * The text-mode console's real size, TTY_COLS x TTY_ROWS;
+		 * pixel fields zero, as for any non-graphical terminal.
 		 */
 		ws.ws_row    = TTY_ROWS;
 		ws.ws_col    = TTY_COLS;
@@ -1501,12 +1251,8 @@ darwin_cons_ioctl(struct syscall_frame *f, struct darwin_ofile *of,
 
 	case DARWIN_TIOCSWINSZ:
 		/*
-		 * Refused, and refused honestly.  On a pty the size is a
-		 * property of the window and the program that owns it says
-		 * what it is; here it is a property of the CRT controller, and
-		 * accepting a number we would then keep contradicting -- every
-		 * TIOCGWINSZ after it would answer 25x80 again -- is worse
-		 * than saying no.
+		 * Refused: the size is the CRT controller's, and every later
+		 * TIOCGWINSZ would contradict an accepted value.
 		 */
 		return (darwin_err(f, DARWIN_EINVAL));
 
@@ -1520,13 +1266,7 @@ darwin_cons_ioctl(struct syscall_frame *f, struct darwin_ofile *of,
 		return (darwin_ok(f, 0));
 
 	default:
-		/*
-		 * ENOTTY for a request this terminal does not know, which is
-		 * what Unix answers and what the callers are written for --
-		 * "inappropriate ioctl for device" is about the REQUEST, not
-		 * about the device, however much the wording suggests
-		 * otherwise.
-		 */
+		/* ENOTTY for an unknown request, as Unix answers. */
 		kprintf("darwin: ioctl(%#lx) on the terminal is not one we "
 		    "answer\n", req);
 		return (darwin_err(f, DARWIN_ENOTTY));
@@ -1534,10 +1274,8 @@ darwin_cons_ioctl(struct syscall_frame *f, struct darwin_ofile *of,
 }
 
 /*
- * One line about the terminal, printed beside the other subsystem counters.
- * The waits-per-read ratio is the whole point: at one wait per read the
- * reader sleeps until something happens, which is what a terminal should
- * cost when nobody is typing.
+ * One line of terminal counters.  About one wait per read means the reader
+ * sleeps until something happens.
  */
 void
 darwin_cons_stats(void)
@@ -1554,11 +1292,8 @@ darwin_cons_stats(void)
 }
 
 /*
- * The same line for the other two things a Darwin task waits on.  Read it the
- * same way: the waits column against the calls column is what waiting costs.
- * A pipe reader or a shell in wait4 that shows thousands of waits against a
- * handful of calls is not waiting, it is spinning, and every one of those
- * trips is a timeslice taken from the process it is waiting FOR.
+ * The same for select, pipes and wait4.  Waits far above calls means a
+ * waiter is spinning, not sleeping.
  */
 void
 darwin_wait_stats(void)
@@ -1584,11 +1319,8 @@ darwin_wait_stats(void)
 	    (unsigned long long)darwin_wait_n_told,
 	    (unsigned long long)darwin_wait_n_woke);
 	/*
-	 * Said as a FAIL rather than reported, because it is exact now and it
-	 * does not depend on how busy the machine was -- which is what an
-	 * assertion has to be.  Non-zero means some path out of a Darwin task
-	 * does not call darwin_child_news, and a shell waiting on that path
-	 * would sit there until the deadline underneath it fired.
+	 * A FAIL, since the count is exact and load-independent: some path
+	 * out of a Darwin task does not call darwin_child_news.
 	 */
 	if (darwin_wait_n_lost != 0)
 		kprintf("wait: FAIL %llu answer(s) reached a parent only "
@@ -1599,43 +1331,26 @@ darwin_wait_stats(void)
 /* ---- readiness: select(2), pselect, poll(2) ------------------------------ */
 
 /*
- * READINESS IS A QUESTION, NOT A COPY OF THE ANSWER
+ * Readiness for select(2), pselect and poll(2).  Rather than a wait queue
+ * per file (BSD's selrecord), there is one channel, darwin_select_gen:
+ * every producer rings it after its own wake, and a selector that finds
+ * nothing ready parks there and rescans.  A spurious wake costs one scan
+ * of at most DARWIN_NOFILE slots.
  *
- * Every wait in this file so far has been a wait for ONE thing: a pipe with
- * bytes, a console with a line, a child with news.  select(2) asks about
- * several at once and wants the first, and the obvious design gives each
- * kind of file its own wait queue and registers the asking thread on all of
- * them, which is what BSD's selrecord does.  This kernel does the simpler
- * thing that is right at its size: there is ONE channel for "something a
- * selector might care about changed", every producer rings it after the
- * wake it already does, and a selector that finds nothing ready parks there
- * and looks again.  A spurious wake costs one scan of at most sixteen slots.
+ * The generation count makes it race-free.  A producer bumps it under
+ * darwin_select_lock; a selector reads it, scans without the lock (the
+ * scan takes pipe and console locks, which must not nest under it), then
+ * locks and compares.  A bump means rescan; otherwise it parks with the
+ * lock held and thread_block_release drops it under the scheduler lock,
+ * so no bump-and-wake can fall in the gap.
  *
- * What makes that correct rather than merely usually right is the
- * generation count.  A producer bumps it under darwin_select_lock; a
- * selector reads it, scans WITHOUT the lock (the scan takes the pipe and
- * console locks, and nothing may hold those under this one), then takes the
- * lock and compares.  A bump in between means a rescan; none means the park
- * is made with the lock still held, and thread_block_release drops it under
- * the scheduler lock, so a producer cannot bump and wake in the gap.  This is
- * the console's own missed-wakeup argument with one extra word in it.
- *
- * WHAT EACH KIND OF FILE ANSWERS.  A disk file, a directory and /dev/null
- * are always ready both ways: nothing about them waits.  A pipe's read end
- * is readable with bytes in the ring or with no writer left (the read would
- * return 0, which is an answer); its write end is writable with room or
- * with no reader left (the write would fail at once, which is also an
- * answer).  The console is readable when the discipline holds a line -- or
- * a byte, out of canonical mode -- or has reached end-of-input, or has a
- * scripted session it has not finished releasing; a reader asking is what
- * releases the next line, so an unspent script IS input waiting.  The
- * console is always writable.  Exceptional conditions do not exist here and
- * are never reported.
- *
- * A raw-mode VMIN above one is answered as "readable" from the first byte,
- * which is what BSD's ttnread answers too; the read that follows may still
- * wait for the rest.  Said here because it is the one place select's answer
- * and read's behaviour part company.
+ * Answers: a disk file, directory or /dev/null is always ready both ways.
+ * A pipe's read end is readable with bytes or no writers left; its write
+ * end writable with room or no readers left.  The console is always
+ * writable, and readable with input queued, at end-of-input, or with a
+ * script loaded (a read releases its next line).  No exceptional
+ * conditions are ever reported.  A raw-mode VMIN above one reads as ready
+ * from the first byte, as BSD's ttnread does; the read may still wait.
  */
 #define	DARWIN_RD	0x1u		/* would not block reading   */
 #define	DARWIN_WR	0x2u		/* would not block writing   */
@@ -1651,7 +1366,7 @@ static uint64_t		darwin_select_n_wait;	  /* parks                  */
 static uint64_t		darwin_select_n_timeout;  /* parks the clock ended  */
 static uint64_t		darwin_select_n_intr;	  /* waits a signal ended   */
 
-/* A producer's one duty: say that something changed, then wake whoever asks. */
+/* A producer's duty: bump the generation, then wake any selector. */
 static void
 darwin_select_news(void)
 {
@@ -1679,9 +1394,9 @@ darwin_select_stats(void)
 /*
  * What one descriptor would answer now.  `want` is DARWIN_RD/WR; the return
  * is the subset that would not block, plus DARWIN_HUP/ERR for a pipe end
- * whose other side is gone (poll(2) reports those on their own, select(2)
- * folds them into readable/writable).  A slot nothing is open in is EBADF's
- * business: *bad says so and the answer is empty.
+ * whose other side is gone (poll(2) reports those; select(2) folds them
+ * into readable/writable).  A slot with nothing open sets *bad (EBADF) and
+ * returns 0.
  */
 static uint32_t
 darwin_fd_ready(struct task *t, int fd, uint32_t want, bool *bad)
@@ -1752,19 +1467,13 @@ darwin_fd_ready(struct task *t, int fd, uint32_t want, bool *bad)
 
 /*
  * An absolute deadline `ms` from now, in the tick clock the timed waiter is
- * checked against, plus ONE TICK.  The tick clock advances in whole ticks,
- * so "now" read from it is up to a tick stale, and a deadline made from it
- * alone comes up short by that much -- a 40 ms wait came back after 33 --
- * and coming back early is the one thing a timeout must not do.  This is
- * Unix's tvtohz rule, one tick added for the fraction already gone.
+ * checked against, plus one tick (Unix's tvtohz rule): "now" in whole
+ * ticks is up to a tick stale, and a timeout must never return early.
  *
- * NOT computed from the microsecond clock, which was the first fix and
- * turned a 40 ms wait into 1763.  That clock is the tick count plus a TSC
- * delta since calibration, and under a hypervisor the tick count falls
- * behind real time as ticks are lost, so the two clocks drift apart by the
- * seconds of ticks the host has swallowed since boot.  A deadline has to be
- * spelled in the clock that will judge it.  Never 0, which callers use for
- * "no deadline".
+ * Not from the microsecond clock: that is ticks plus a TSC delta, and
+ * under a hypervisor lost ticks make it drift from the tick clock by
+ * seconds.  A deadline must be in the clock that judges it.  Never 0,
+ * which callers use for "no deadline".
  */
 static uint64_t
 darwin_deadline_ms(uint64_t ms)
@@ -1787,10 +1496,9 @@ darwin_deadline_ms(uint64_t ms)
  * zero timeout -- one scan, no park.  Returns the scan's count, 0 on the
  * deadline, or -EINTR.
  *
- * The signal test sits between the scan and the park with nothing held,
- * and that is safe for the reason every other wait here relies on: posting
- * a signal wakes the target's sleeper, and a wake that finds nobody asleep
- * leaves a note the next park consumes (kern/sched.c).
+ * The signal test runs with nothing held; that is safe because posting a
+ * signal wakes the target, and a wake that finds nobody asleep leaves
+ * th_wake_pending for the next park (kern/sched.c).
  */
 static long
 darwin_readiness_wait(long (*scan)(void *), void *arg, uint64_t deadline_ms,
@@ -1907,21 +1615,17 @@ darwin_select_scan(void *arg)
 }
 
 /*
- * The shared body of select(2) and pselect: (nfds, in, out, except, timeout
- * [, sigmask]) in arg0..5.  `by_spec` says the timeout is a timespec (and
- * arg5 a mask) rather than a timeval.  A NULL timeout waits for ever; a zero
- * one asks once.  On return each set holds the ready subset (all clear on a
- * timeout), which is what POSIX says and what BSD does; the timeout is not
- * written back.
+ * The shared body of select(2) and pselect: (nfds, in, out, except,
+ * timeout [, sigmask]) in arg0..5.  `by_spec` means a timespec timeout and
+ * an arg5 mask rather than a timeval.  A NULL timeout waits for ever, a
+ * zero one scans once.  On return each set holds its ready subset (all
+ * clear on timeout); the timeout is not written back.
  *
- * THE MASK IS THE POINT OF PSELECT.  A caller that blocks SIGCHLD, looks at
- * whether a child has died, and then waits for a token with SIGCHLD
- * unblocked has no window in which a death goes unnoticed -- provided the
- * unblocking and the wait are one operation.  Swapped in before the wait
- * and, on the ordinary exits, swapped back after.  The exit that IS the
- * signal keeps the temporary mask installed and arms the restore for the
- * delivery path to make (task.h, t_sig_mask_restore): put back here, it
- * would block the signal the caller unblocked to receive.
+ * pselect's mask makes unblocking and waiting one operation, so a caller
+ * that blocks SIGCHLD, checks its children and waits cannot miss a death.
+ * On an EINTR exit the temporary mask stays installed and the delivery
+ * path restores it (t_sig_mask_restore); restoring here would block the
+ * very signal being delivered.
  */
 static long
 darwin_select_common(struct syscall_frame *f, bool by_spec)
@@ -2081,8 +1785,8 @@ darwin_poll_scan(void *arg)
 
 /*
  * poll(2): (fds, nfds, timeout-in-ms) in arg0..2; a negative timeout waits
- * for ever, zero asks once.  Returns how many entries have a non-zero
- * revents, the array written back whatever the outcome.
+ * for ever, zero scans once.  Returns how many entries have a non-zero
+ * revents, and writes the array back unless the wait failed.
  */
 static long
 darwin_sys_poll(struct syscall_frame *f)
@@ -2117,11 +1821,10 @@ darwin_sys_poll(struct syscall_frame *f)
 }
 
 /*
- * Will argv + envp fit the dyld handoff page?  The same arithmetic as
- * build_dyld_arg_stack (arch/amd64/usermode.c), asked BEFORE execve lets go
- * of the old image -- past that point a refusal has nowhere to return to
- * and the task exits 127.  The builder checks again on its own; this is the
- * copy that can still say E2BIG.
+ * Will argv + envp fit the dyld handoff page?  The arithmetic of
+ * build_dyld_arg_stack (arch/amd64/usermode.c), asked before execve drops
+ * the old image, while E2BIG can still be returned; past that point the
+ * builder's own check can only exit the task with 127.
  */
 static bool
 darwin_frame_fits(int argc, char **argv, int envc, char **envp)
@@ -2147,19 +1850,14 @@ darwin_frame_fits(int argc, char **argv, int envc, char **envp)
 /* ---- the working directory ----------------------------------------------- */
 
 /*
- * Resolve a user-supplied path against the calling task's working directory,
- * producing an absolute, normalised path in `out`.
+ * Resolve a user path against the task's working directory into an
+ * absolute, normalised path in `out`.  The filesystem resolves components
+ * literally and has no parent links, so `..' is handled here: "." is
+ * dropped, ".." pops a component (a no-op at the root), and repeated
+ * slashes collapse.
  *
- * Normalisation is not decoration.  A cwd that only ever gets longer is not a
- * working directory -- `cd ..` has to work, and the only place that can
- * happen is here, because the filesystem below resolves components literally
- * and has no notion of a parent link.  So "." is dropped, ".." pops the last
- * component (and does nothing at the root, exactly as a real Unix root
- * behaves), and repeated slashes collapse.
- *
- * Returns 0, or a negative errno-ish for a path that will not fit.  Writing
- * into `out` only on success would be tidier but costs a second buffer; every
- * caller treats a failure as fatal to the syscall and never looks at `out`.
+ * Returns 0, or -1 if the path does not fit; `out` is then garbage, and
+ * every caller fails the syscall without reading it.
  */
 static int
 darwin_path_resolve(const struct task *t, const char *in, char *out,
@@ -2220,11 +1918,7 @@ darwin_path_resolve(const struct task *t, const char *in, char *out,
 			out[n++] = in[start];
 	}
 
-	/*
-	 * A trailing separator is stripped so the result can be pasted onto
-	 * unconditionally, but the root is only a separator and keeping it is
-	 * the difference between "/" and the empty string.
-	 */
+	/* Strip a trailing separator, except the one that is the root. */
 	if (n > 1 && out[n - 1] == '/')
 		n--;
 	out[n] = '\0';
@@ -2240,11 +1934,6 @@ darwin_files_teardown(struct task *t)
 		if (t->t_darwin_files[i].of_type != DARWIN_OF_FREE)
 			darwin_ofile_clear(&t->t_darwin_files[i]);
 	}
-	/*
-	 * The console is a file this task may have been holding too, and the
-	 * one whose loss is not local: a claim outliving its owner would send
-	 * every keystroke into a ring nobody drains.
-	 */
 	darwin_cons_release(t);
 }
 
@@ -2269,10 +1958,7 @@ darwin_files_fork_copy(struct task *parent, struct task *child)
 		case DARWIN_OF_FILE:
 			/*
 			 * Private cursor.  POSIX shares the offset through the
-			 * open-file description; for the read-only files this
-			 * serves, cursor divergence after fork is unobservable.
-			 * A disk-backed fd copies its handle -- three words --
-			 * where it used to copy the file's entire contents.
+			 * open-file description; this does not.
 			 */
 			buf = NULL;
 			if (src->of_buf != NULL) {
@@ -2283,10 +1969,7 @@ darwin_files_fork_copy(struct task *parent, struct task *child)
 				for (k = 0; k < src->of_size; k++)
 					buf[k] = src->of_buf[k];
 			}
-			/*
-			 * The child holds every file its parent held: a fork
-			 * doubles the descriptors, so it doubles the claims.
-			 */
+			/* Each duplicated descriptor is another fs hold. */
 			if (fs_hold(&src->of_handle) != FS_E_OK) {
 				if (buf != NULL)
 					kfree(buf);
@@ -2298,14 +1981,7 @@ darwin_files_fork_copy(struct task *parent, struct task *child)
 			dst->of_size   = src->of_size;
 			dst->of_off    = src->of_off;
 			dst->of_flags  = src->of_flags;
-			/*
-			 * The SOURCE's type, not a constant: a directory
-			 * descriptor copies exactly like a file one -- a
-			 * duplicated name and nothing else, since it has no
-			 * buffer and no handle -- but it must stay a
-			 * directory on the other side, and a line that said
-			 * FILE here would have quietly turned it into one.
-			 */
+			/* The source's type: a directory must stay one. */
 			dst->of_type   = src->of_type;
 			break;
 		case DARWIN_OF_PIPE_R:
@@ -2372,9 +2048,8 @@ darwin_dup_install(struct task *t, int oldfd, int newfd)
 				buf[k] = src->of_buf[k];
 		}
 		/*
-		 * A duplicate is a second holder, and the claim is made BEFORE
-		 * the copy: a refusal here must leave the target slot free
-		 * rather than holding a handle the filesystem is not counting.
+		 * Take the hold before filling the slot, so a refusal leaves it
+		 * free rather than holding an uncounted handle.
 		 */
 		if (fs_hold(&src->of_handle) != FS_E_OK) {
 			if (buf != NULL)
@@ -2408,16 +2083,12 @@ darwin_dup_install(struct task *t, int oldfd, int newfd)
 	}
 }
 
-/* ---- zombies (exit status for wait4) -------------------------------------- */
+/* ---- zombies (exit status for wait4) ------------------------------------- */
 
 /*
- * The wait4 channel: a dying Darwin task's {pid, ppid, status} parked
- * until the parent reaps it.  Deliberately a flat table, not a proc
- * tree -- style9 has no struct proc, and 32 unreaped children is
- * already a pathological pipeline.  A task that dies by exception
- * (not exit/kill) records nothing; wait4 then reports ECHILD once the
- * child leaves the live task list, which a shell treats as "died
- * weirdly" rather than hanging.
+ * A dying Darwin task's {pid, ppid, status}, kept until the parent reaps
+ * it with wait4.  A flat table, since style9 has no struct proc; 32
+ * unreaped children is already pathological.
  */
 #define	DARWIN_NZOMBIE	32
 
@@ -2432,7 +2103,7 @@ static struct darwin_zombie	darwin_zombies[DARWIN_NZOMBIE];	/* (z) */
 static struct spinlock		darwin_zombie_lock =
     SPINLOCK_INIT("dzombie");					/* (z) */
 
-/* ---- signals -------------------------------------------------------------- */
+/* ---- signals ------------------------------------------------------------- */
 
 /*
  * Bit for signal `signo` in the pending / mask words.  Valid signals are
@@ -2449,9 +2120,8 @@ darwin_sigbit(int signo)
 }
 
 /*
- * Default action for a SIG_DFL signal.  Only SIGCHLD defaults to ignore;
- * every other signal we can post (SIGINT, SIGPIPE, SIGTERM, SIGKILL)
- * defaults to terminating the task.
+ * Default action for a SIG_DFL signal: only SIGCHLD is ignored; every
+ * other signal terminates the task.
  */
 static bool
 darwin_sig_default_is_ignore(int signo)
@@ -2461,10 +2131,10 @@ darwin_sig_default_is_ignore(int signo)
 }
 
 /*
- * The mask a signal frame records for sigreturn to put back: the mask in
- * force -- or, after a pselect(2) that ended in this very signal, the mask
- * pselect was asked to put back (task.h, t_sig_mask_restore).  Reading it
- * disarms the request: the frame now carries the restore.
+ * The mask a signal frame records for sigreturn: the one in force or,
+ * after a pselect(2) ended by this signal, the one pselect must restore
+ * (t_sig_mask_restore).  Reading it disarms the request; the frame now
+ * carries the restore.
  */
 static uint32_t
 darwin_sig_mask_for_frame(struct task *t)
@@ -2479,7 +2149,7 @@ darwin_sig_mask_for_frame(struct task *t)
 	return (t->t_sig_mask);
 }
 
-/* Nothing was delivered after all: put the mask back now, by hand. */
+/* Nothing was delivered after all: restore the mask now. */
 static void
 darwin_sig_mask_unarm(struct task *t)
 {
@@ -2500,14 +2170,10 @@ darwin_signal_post(struct task *t, int signo)
 		return;
 	__atomic_fetch_or(&t->t_sig_pending, bit, __ATOMIC_RELEASE);
 	/*
-	 * And WAKE anything of the target's that is asleep on a channel, or the
-	 * bit just set will not be looked at until whatever that thread was
-	 * waiting for happens on its own -- which for a read on a pipe nobody
-	 * is writing to means never.  Woken unconditionally rather than only
-	 * for signals that will be delivered: whether this one is deliverable
-	 * depends on a mask that only the target's own thread may read without
-	 * racing, and a sleeper that wakes to find nothing for it simply parks
-	 * again, which every sleep here is written to do.
+	 * Wake the target's sleepers, or the bit is not seen until their wait
+	 * ends on its own (never, for an idle pipe).  Unconditionally: whether
+	 * the signal is deliverable depends on a mask only the target's thread
+	 * may read, and a sleeper woken for nothing parks again.
 	 */
 	(void)sched_wake_sleepers_of(t);
 }
@@ -2521,11 +2187,9 @@ darwin_signal_pending(struct task *t)
 	if (t == NULL)
 		return (false);
 	/*
-	 * One load of the pending set, not one per use: it is written from
-	 * another task's thread, and reading it twice could see two different
-	 * answers inside a single decision.  t_sig_mask is written only by the
-	 * owning task on its own thread, so a plain read of it is right here --
-	 * this is that thread.
+	 * One atomic load of t_sig_pending, which other tasks write.
+	 * t_sig_mask is written only by the owning task's thread, which is
+	 * this one, so a plain read is right.
 	 */
 	deliverable = __atomic_load_n(&t->t_sig_pending, __ATOMIC_ACQUIRE) &
 	    ~t->t_sig_mask;
@@ -2533,17 +2197,10 @@ darwin_signal_pending(struct task *t)
 		return (false);
 
 	/*
-	 * Posted and unblocked is not enough.  A signal whose disposition is
-	 * to do NOTHING must not end a wait: it will be consumed on the way
-	 * back to ring 3 and the caller would have returned EINTR for an event
-	 * that left no trace.
-	 *
-	 * SIGCHLD is the whole reason this matters and it is not a corner
-	 * case.  It is default-ignore, and it arrives precisely when a parent
-	 * is sitting in wait4 -- so a predicate that counted it made wait4
-	 * return EINTR the instant its child died, every time, instead of
-	 * reaping it.  That is not a hypothetical: it is what the first
-	 * version of this did, and pipefork caught it on the first boot.
+	 * An ignored signal must not end a wait: it is consumed on the way to
+	 * ring 3 and the EINTR would be for nothing.  SIGCHLD is the case that
+	 * matters -- default-ignore, and it arrives exactly while the parent
+	 * sits in wait4, which would otherwise return EINTR instead of reaping.
 	 */
 	for (signo = 1; signo < DARWIN_NSIG; signo++) {
 		if ((deliverable & darwin_sigbit(signo)) == 0)
@@ -2559,10 +2216,9 @@ darwin_signal_pending(struct task *t)
 }
 
 /*
- * Notify a Darwin parent that a child changed state: post SIGCHLD to the
- * task whose id is `ppid`.  Best-effort -- a parent that already exited is a
- * silent no-op.  Kept out of darwin_zombie_lock: task_lookup_ref takes
- * tasks_lock, and no path holds a task lock under darwin_zombie_lock.
+ * Post SIGCHLD to the task whose id is `ppid`; a no-op if it has exited.
+ * Called outside darwin_zombie_lock: task_lookup_ref takes tasks_lock, and
+ * no path nests a task lock under darwin_zombie_lock.
  */
 static void
 darwin_signal_notify_parent(uint64_t ppid)
@@ -2579,14 +2235,12 @@ darwin_signal_notify_parent(uint64_t ppid)
 }
 
 /*
- * Pick the next signal to act on out of `t`'s deliverable set
- * (pending & ~mask), lowest number first, reporting its disposition through
- * *disp_out.  IGN and default-ignore signals are consumed here and skipped;
- * a SIG_DFL-terminate signal is consumed and returned; a caught signal
- * (handler VA) is left pending -- returned so phase 2 can deliver it
- * on-stack -- which also stops the scan, so a terminate queued behind a
- * caught signal waits until the handler is serviced.  Returns 0 when
- * nothing remains deliverable.
+ * Pick the next signal to act on from `t`'s deliverable set (pending &
+ * ~mask), lowest first, with its disposition in *disp_out.  Ignored
+ * signals are consumed and skipped; a default-terminate one is consumed
+ * and returned; a caught one (handler VA) is returned still pending for
+ * on-stack delivery, which ends the scan, so a terminate queued behind it
+ * waits.  Returns 0 when nothing is deliverable.
  */
 static int
 darwin_signal_next(struct task *t, uint64_t *disp_out)
@@ -2633,9 +2287,8 @@ darwin_signal_deliver(struct task *t)
 	if (disp != DARWIN_SIG_DFL)
 		return;		/* caught: phase 2 delivers on-stack */
 	/*
-	 * SIG_DFL, terminate.  A signalled task never reaches its own exit(2),
-	 * so this is the sole writer of its wait4 status (termsig in the low 7
-	 * bits -- WIFSIGNALED for the parent's wait4).
+	 * Default terminate.  The task never reaches exit(2), so record its
+	 * wait4 status here: termsig in the low 7 bits (WIFSIGNALED).
 	 */
 	darwin_zombie_record(t->t_id, t->t_darwin_ppid, signo & 0x7F);
 	thread_exit();
@@ -2643,11 +2296,9 @@ darwin_signal_deliver(struct task *t)
 }
 
 /*
- * RFLAGS to resume ring 3 with: the arithmetic flags and DF as the sigframe
- * left them, IF and the must-be-set bit 1 forced on, everything else dropped.
- * The frame lives on the user's own stack, so sf_rflags is attacker-writable
- * in the limit -- unmasked, a forged frame could hand ring 3 IOPL 3 (raw I/O
- * ports plus CLI/STI) through either resume path.
+ * RFLAGS to resume ring 3 with: the arithmetic flags and DF from the
+ * sigframe, IF and reserved bit 1 forced on, everything else dropped.  The
+ * frame is on the user stack, so unmasked a forged one could grant IOPL 3.
  */
 static uint64_t
 darwin_signal_rflags(uint64_t saved)
@@ -2723,9 +2374,8 @@ darwin_signal_deliver_syscall(struct syscall_frame *f, long rv)
 	}
 	if (disp != DARWIN_SIG_DFL) {
 		/*
-		 * Caught: consume the pending bit and deliver to the ring-3
-		 * handler on the user stack.  If the frame cannot be built
-		 * (no trampoline / bad stack) fall through to terminate.
+		 * Caught: consume the bit and deliver on the user stack; if the
+		 * frame cannot be built, terminate instead.
 		 */
 		__atomic_fetch_and(&t->t_sig_pending,
 		    ~((uint32_t)1 << signo), __ATOMIC_RELEASE);
@@ -2738,17 +2388,12 @@ darwin_signal_deliver_syscall(struct syscall_frame *f, long rv)
 }
 
 /*
- * The asynchronous twin of darwin_signal_setup_frame.  Same stack layout and
- * the same trampoline entry protocol; what differs is how much has to be
- * saved.  A signal taken at a syscall boundary can rely on the ABI -- the
- * argument and scratch registers were already dead, and the FPU file is
- * caller-saved across a call.  A signal taken from the IRQ path interrupted
- * an arbitrary instruction, so every GPR and the x87/SSE file are live and
- * all of it goes in the frame.
- *
- * The handler VA travels in %r10 here too, even though nothing forces it on
- * this path -- matching the syscall flavour (where SYSCALL owns %rcx) lets
- * one _sigtramp serve both.
+ * The asynchronous twin of darwin_signal_setup_frame: same stack layout and
+ * trampoline protocol, but it interrupted an arbitrary instruction, so
+ * every GPR and the x87/SSE file are live and go in the frame.  (At a
+ * syscall boundary the ABI already made scratch registers and the FPU
+ * dead.)  The handler still travels in %r10, as on the syscall path where
+ * SYSCALL owns %rcx, so one _sigtramp serves both.
  */
 static int
 darwin_signal_setup_frame_trap(struct trapframe *tf, int signo,
@@ -2786,10 +2431,9 @@ darwin_signal_setup_frame_trap(struct trapframe *tf, int signo,
 	frame.sf_rflags = tf->tf_rflags;
 
 	/*
-	 * The interrupted thread's x87/SSE file is still live in the register
-	 * file -- the trap did not switch threads, and thread_switch_asm is
-	 * the only thing that spills th_fpu -- so FXSAVE here captures exactly
-	 * the state the handler is about to clobber.
+	 * The interrupted thread's x87/SSE state is still in the registers
+	 * (only thread_switch_asm spills th_fpu), so FXSAVE here captures what
+	 * the handler is about to clobber.
 	 */
 	__asm__ __volatile__ ("fxsave (%0)" : : "r"(frame.sf_fpu) : "memory");
 
@@ -2832,13 +2476,10 @@ darwin_signal_deliver_trap(struct trapframe *tf)
 }
 
 /*
- * Resume from an SGFR2 frame.  Rebuilds the interrupted machine state as a
- * trapframe and leaves through IRETQ, the one exit that can restore %rcx and
- * %r11 -- SYSRET architecturally destroys both, which is why the async path
- * cannot ride the ordinary syscall return the way the SGFR1 path does.
- *
- * Never returns: on a good frame it lands back in ring 3 where the signal
- * struck, on a corrupt one it retires the task.
+ * Resume from an SGFR2 frame: rebuild the interrupted state as a trapframe
+ * and leave through IRETQ, since SYSRET destroys %rcx and %r11 (the SGFR1
+ * path can use the ordinary syscall return).  Never returns: back to ring
+ * 3 where the signal struck, or, on a corrupt frame, the task retires.
  */
 static void
 darwin_sigreturn_full(uint64_t uctx)
@@ -2884,10 +2525,8 @@ darwin_sigreturn_full(uint64_t uctx)
 	tf.tf_ss     = GDT_UDATA | GDT_RPL3;
 
 	/*
-	 * Reload the interrupted FPU file last: the kernel is built -mno-sse
-	 * and touches neither x87 nor XMM between here and the IRETQ, and a
-	 * context switch in that window would spill and reload the restored
-	 * state intact.
+	 * FPU state last: the kernel (-mno-sse) touches no x87/XMM before the
+	 * IRETQ, and a context switch in between preserves it.
 	 */
 	__asm__ __volatile__ ("fxrstor (%0)" : : "r"(frame.sf_fpu) : "memory");
 
@@ -2895,41 +2534,22 @@ darwin_sigreturn_full(uint64_t uctx)
 	/* NOTREACHED */
 }
 
-/* ---- zombies -------------------------------------------------------------- */
+/* ---- zombies ------------------------------------------------------------- */
 
 /*
- * The channels a parent in wait4(2) parks on, hashed by its own pid.
- *
- * A parent waits for news about ITS children, so the channel has to be
- * something the child's side can name without holding a pointer to the
- * parent -- a pointer would mean a lookup and a reference on every task
- * death, and dropping that reference can itself be the death that starts
- * another one, which is a recursion no wake needs to be inside.  An address
- * derived from the pid needs neither.
- *
- * Collisions are not a correctness problem and that is the point of naming
- * the table small: two parents that hash together wake each other's waits,
- * each re-tests, finds nothing of its own and parks again.  Every sleeper in
- * this kernel is in a re-testing loop already, because a wake has never been
- * a promise that the thing waited for happened.
+ * The channels a parent in wait4(2) parks on, hashed by its own pid, so a
+ * dying child can name one without a lookup and reference on the parent
+ * (dropping that reference could itself start another teardown).
+ * Collisions only cause spurious wakes, which every sleeper re-tests.
  */
 #define	DARWIN_WAIT_CHANS	16
 static char	darwin_wait_chan[DARWIN_WAIT_CHANS];
 
 /*
- * One counter per channel, bumped every time a parent on it is told something.
- *
- * This is what makes "a wake went missing" an exact statement rather than a
- * guess.  The deadline under a parked wait4 fires on a slow child, which is
- * ordinary; the interesting case is a deadline that fires and finds the answer
- * ALREADY THERE, because that means nobody said so.  But those two can happen
- * at the same instant -- a child that takes just over the interval records its
- * zombie exactly as the timer goes off -- and a test that reported the pair as
- * a fault did exactly that, once in four boots.
- *
- * So the parent reads this counter before parking and again after a deadline
- * wake.  Changed means somebody told it, however the wake and the timer raced;
- * unchanged, with an answer waiting, means the news never came at all.
+ * One counter per channel, bumped whenever a parent on it is told
+ * something.  A parent reads it before parking and after a deadline wake:
+ * changed means it was told, however wake and timer raced; unchanged with
+ * a zombie waiting means the news never came (a lost wake).
  */
 static uint32_t	darwin_wait_gen[DARWIN_WAIT_CHANS];
 
@@ -2949,18 +2569,10 @@ darwin_wait_channel(unsigned long long pid)
 }
 
 /*
- * Tell a parent that something happened to one of its children.  Called both
- * where a zombie is recorded -- the news a wait4 is hoping for -- and from
- * task teardown, where the news is that a child has left the live list and a
- * wait for it can now only ever answer ECHILD.
- *
- * Both, rather than only the first, and the reason is worth stating: while
- * wait4 spun, it re-counted the caller's live children on every trip, so a
- * child that disappeared by ANY route eventually produced an answer.  A
- * parked parent has no such second chance -- it wakes when it is told to and
- * not otherwise -- so the teardown call is what keeps the sleeping version as
- * forgiving as the spinning one was.  Missing it would turn an exotic exit
- * path into a shell that never returns.
+ * Tell a parent that something happened to one of its children.  Called
+ * where a zombie is recorded, and from task teardown, when a child leaves
+ * the live list and a wait for it can only answer ECHILD.  The teardown
+ * call covers every exit route, recorded or not.
  */
 void
 darwin_child_news(unsigned long long ppid)
@@ -2969,10 +2581,7 @@ darwin_child_news(unsigned long long ppid)
 	if (ppid == 0)
 		return;			/* no Darwin parent to tell */
 	darwin_wait_n_told++;
-	/*
-	 * Bumped BEFORE the wake, so a parent that is woken by this call and
-	 * one that was already awake both see the new value.
-	 */
+	/* Bumped before the wake, so woken and awake parents both see it. */
 	(void)__atomic_fetch_add(&darwin_wait_gen[ppid % DARWIN_WAIT_CHANS], 1,
 	    __ATOMIC_RELEASE);
 	darwin_wait_n_woke += sched_wakeup(darwin_wait_channel(ppid));
@@ -3024,11 +2633,8 @@ darwin_zombie_record(unsigned long long pid, unsigned long long ppid,
 	spin_unlock(&darwin_zombie_lock);
 	darwin_signal_notify_parent(ppid);
 	/*
-	 * Woken with the zombie lock DROPPED, which is safe because a waiter
-	 * registers itself on the channel while holding that same lock: by the
-	 * time this thread could take it, anyone waiting is already findable.
-	 * The wake cannot arrive too late, only too early -- and too early is
-	 * a re-test.
+	 * Woken with the zombie lock dropped: a waiter parks on the channel
+	 * while holding that lock, so it is already findable by now.
 	 */
 	darwin_child_news(ppid);
 }
@@ -3063,15 +2669,9 @@ darwin_zombie_reap(uint64_t ppid, uint64_t pid, int *status_out,
 }
 
 /*
- * Is there a zombie here for `ppid` (optionally a particular `pid`)?  Asks
- * without taking one, and REQUIRES the zombie lock already held.
- *
- * This exists so wait4 can make its last look and its decision to sleep under
- * one lock.  Looking with the reaper above, letting the lock go and then
- * parking is the lost wakeup in its textbook form: a child that dies in the
- * gap records its zombie, finds nobody on the channel, and the parent parks
- * afterwards with the answer already sitting in the table.  Nothing wakes it
- * again -- that child has only one death to report.
+ * Is there a zombie for `ppid` (optionally a particular `pid`)?  Does not
+ * reap; caller holds darwin_zombie_lock.  Lets wait4 make its last look and
+ * its park under one lock, so a child dying in between cannot be missed.
  */
 static bool
 darwin_zombie_present_locked(uint64_t ppid, uint64_t pid)
@@ -3139,10 +2739,8 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		int64_t			us;
 
 		/*
-		 * The only wall-clock source a program has.  A machine with no
-		 * usable RTC reports EPERM rather than handing back 1970: a
-		 * program that knows the time is unavailable can say so, while
-		 * one told it is the epoch will print a date and be believed.
+		 * With no usable RTC, EPERM rather than 1970: a program told
+		 * the time is unavailable can say so.
 		 */
 		if (!clock_walltime_valid())
 			return (darwin_err(f, DARWIN_EPERM));
@@ -3175,13 +2773,8 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			return (darwin_err(f, DARWIN_ENAMETOOLONG));
 
 		/*
-		 * Checked before it is adopted, and checked for being a
-		 * DIRECTORY rather than merely existing.  A cwd that names a
-		 * regular file would make every later relative path resolve
-		 * under it and fail one component deeper, where the error has
-		 * nothing to do with the mistake that caused it.  The root is
-		 * accepted without asking the volume, since it is the one
-		 * directory that exists by construction.
+		 * Must be a directory, not merely exist, or later relative
+		 * paths fail one component deeper.  The root always is.
 		 */
 		if (!(want[0] == '/' && want[1] == '\0')) {
 			if (fs_stat(want, &sb) != FS_E_OK)
@@ -3206,11 +2799,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		for (n = 0; t->t_darwin_cwd[n] != '\0'; n++)
 			continue;
 		n++;				/* the NUL is part of it */
-		/*
-		 * ERANGE, not a truncated answer.  A caller handed a partial
-		 * path would open the wrong thing rather than fail, which is
-		 * exactly what getcwd(3) exists to prevent.
-		 */
+		/* ERANGE, never a truncated path. */
 		if (f->sf_arg1 < n)
 			return (darwin_err(f, DARWIN_ERANGE));
 		if (syscall_copyout((void *)f->sf_arg0, t->t_darwin_cwd,
@@ -3267,13 +2856,10 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			return (darwin_err(f, DARWIN_ENAMETOOLONG));
 
 		/*
-		 * /dev, such as it is: three names and no directory.  The
-		 * console answers to /dev/console and /dev/tty -- the name
-		 * ttyname(3) hands out has to open the thing it names, or it
-		 * is not a name -- and /dev/null is the sink every shell
-		 * redirection reaches for.  Answered before the volume is
-		 * asked, because a volume that HAD a /dev would otherwise
-		 * be handed a create and make a plain file called null.
+		 * /dev: three names, no directory.  /dev/console and /dev/tty
+		 * (what ttyname(3) returns) open the console; /dev/null is the
+		 * sink.  Answered before the volume, which might otherwise
+		 * create a plain file called null.
 		 */
 		if (darwin_streq(path, "/dev/null") ||
 		    darwin_streq(path, "/dev/console") ||
@@ -3289,45 +2875,27 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		}
 
 		/*
-		 * WHAT AN OPEN FOR WRITING NOW MEANS
-		 *
-		 * This used to answer EROFS to every write mode, because the
-		 * volume underneath could only be read and an fd that accepted
-		 * writes would have swallowed them.  The volume can be written
-		 * now, so the flags are honoured -- and the three that MAKE or
-		 * UNMAKE bytes are answered here rather than at the first
-		 * write, because that is what open(2) promises: after it
-		 * returns, the file exists and is the length the flags say.
+		 * O_CREAT, O_EXCL and O_TRUNC take effect here, not at the
+		 * first write: when open(2) returns, the file exists and has
+		 * the length the flags say.
 		 */
 		flags   = (uint32_t)f->sf_arg1;
 		writing = (flags & DARWIN_O_ACCMODE) != DARWIN_O_RDONLY;
 
 		/*
-		 * The published past (fs.h, /.xid) is refused to a writer at
-		 * the open, which is where open(2) says a read-only
-		 * filesystem refuses: a descriptor that accepted the mode and
-		 * then failed every write would be the same lie EROFS exists
-		 * to prevent.  Creating and truncating are writes too.
+		 * A read-only tree (fs.h, /.xid) refuses writers at the open,
+		 * as open(2) specifies; creating and truncating are writes.
 		 */
 		if (fs_readonly(path) && (writing ||
 		    (flags & (DARWIN_O_CREAT | DARWIN_O_TRUNC)) != 0))
 			return (darwin_err(f, DARWIN_EROFS));
 
 		/*
-		 * A DIRECTORY CAN BE OPENED, and that is not a technicality.
-		 *
-		 * fs_open answers about bytes, so it says "not found" for a
-		 * directory -- which is what a program asking for one got, and
-		 * the reason GNU mkdir reported that the directory it had just
-		 * successfully created did not exist: it opens what it makes.
-		 * Measured, not guessed; the kernel said so in one line once
-		 * the failing open was made to print.
-		 *
-		 * What comes back is a descriptor that names a PLACE.  There
-		 * is nothing to read through it -- read(2) answers EISDIR --
-		 * and writing to one is refused before it starts.  It carries
-		 * the path, which is what every call that takes a directory fd
-		 * actually wants.
+		 * A directory can be opened (GNU mkdir opens what it makes);
+		 * fs_open would say "not found" for one.  The descriptor
+		 * carries only the path, which is what every call taking a
+		 * directory fd wants; read(2) on it is EISDIR, and opening it
+		 * for writing is refused.
 		 */
 		{
 			struct fs_statbuf	dst;
@@ -3358,13 +2926,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		if (rv == FS_E_NOTFOUND && (flags & DARWIN_O_CREAT) != 0) {
 			uint64_t	ino;
 
-			/*
-			 * open(2)'s third argument, at last taken seriously.
-			 * It is a REQUEST, not the answer: what a file is
-			 * created with is the request less this task's umask,
-			 * which is why every program asks for 0666 and every
-			 * Unix produces 0644.
-			 */
+			/* The requested mode, less the umask. */
 			rv = fs_create(path, darwin_mode_arg(f->sf_arg2), &ino);
 			if (rv == FS_E_OK)
 				rv = fs_open(path, &handle);
@@ -3377,12 +2939,8 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			return (darwin_err(f, DARWIN_EEXIST));
 		}
 		/*
-		 * Resolve, do not read.  What an fd needs is the answer to
-		 * "which file"; the bytes come later and only the ones asked
-		 * for.  This used to slurp the whole file into the kernel
-		 * heap on every open, which cost the file's length per open
-		 * and put a ceiling on how large a file could be opened at
-		 * all.
+		 * A disk file is only resolved to a handle; bytes are read on
+		 * demand.  Built-ins are copied into of_buf.
 		 */
 		if (rv == FS_E_NOTFOUND || rv == FS_E_NOMOUNT) {
 			/* Not on the disk: try the synthetic /bin (progreg). */
@@ -3392,11 +2950,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 				    "name on the volume or in /bin\n", path);
 				return (darwin_err(f, DARWIN_ENOENT));
 			}
-			/*
-			 * A built-in is an image in the kernel's own text.
-			 * There is nowhere for a write to it to go, and
-			 * saying so is the whole of what EROFS is for.
-			 */
+			/* A built-in lives in kernel text: EROFS to writers. */
 			if (writing || (flags & DARWIN_O_TRUNC) != 0)
 				return (darwin_err(f, DARWIN_EROFS));
 			if (pe->pr_size > 0x7FFFFFFF)
@@ -3418,11 +2972,8 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			return (darwin_err(f, DARWIN_EIO));
 		} else {
 			/*
-			 * O_TRUNC means the file is empty when open returns,
-			 * not when something first writes: a shell that
-			 * redirects into a file and then produces no output
-			 * has still emptied it, and that is the difference
-			 * between `> f` and nothing at all.
+			 * Truncate now, so `> f' empties f even if nothing is
+			 * ever written.
 			 */
 			if ((flags & DARWIN_O_TRUNC) != 0 &&
 			    handle.fh_size != 0) {
@@ -3431,14 +2982,9 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 					kprintf("darwin: open('%s'): O_TRUNC "
 					    "refused (rv=%d)\n", path, rv);
 					/*
-					 * EVERY EXIT PAST fs_open GIVES THE
-					 * FILE BACK.  A resolved handle is a
-					 * claim on the file now, and one
-					 * dropped on the floor is permanent:
-					 * the row is never freed, so the
-					 * kernel's count of open files creeps
-					 * up until opens start failing, at a
-					 * point unrelated to the cause.
+					 * Every exit past fs_open must close
+					 * the handle, or its open-file row
+					 * leaks for good.
 					 */
 					(void)fs_close(&handle);
 					return (darwin_err(f,
@@ -3462,7 +3008,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		}
 		t->t_darwin_files[fd].of_buf    = buf;
 		t->t_darwin_files[fd].of_handle = handle;
-		/* Kept for diagnostics; the handle is what gets read. */
+		/* For mmap, fstat and fdpath; reads use the handle. */
 		t->t_darwin_files[fd].of_path =
 		    on_disk ? darwin_path_dup(path) : NULL;
 		t->t_darwin_files[fd].of_size  = size;
@@ -3499,18 +3045,14 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			return (darwin_cons_read(f, (void *)f->sf_arg1, n));
 		case DARWIN_OF_DIR:
 			/*
-			 * A directory is not a stream of bytes to anything
-			 * above this kernel: a walker calls readdir(3), which
-			 * goes down the fs_readdir backchannel and never
-			 * touches this path.  EISDIR is what a modern Unix
-			 * answers and what makes the difference visible.
+			 * readdir(3) uses the fs_readdir backchannel, not
+			 * read(2); EISDIR, as a modern Unix answers.
 			 */
 			return (darwin_err(f, DARWIN_EISDIR));
 		case DARWIN_OF_FILE:
 			/*
-			 * A cursor past the end reads as EOF, not as a very
-			 * large number: ftruncate(2) leaves the offset where
-			 * it was, and the difference below would wrap.
+			 * A cursor past the end (ftruncate(2) leaves it) is
+			 * EOF; the subtraction would otherwise wrap.
 			 */
 			avail = of->of_off < of->of_size ?
 			    of->of_size - of->of_off : 0;
@@ -3552,19 +3094,11 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			return (darwin_err(f, DARWIN_ENAMETOOLONG));
 
 		/*
-		 * AN OPEN DESCRIPTOR NOW KEEPS THE FILE ALIVE.  Unix says a
-		 * file lives until its last name and its last descriptor are
-		 * both gone; this used to keep only the first half and said so
-		 * out loud, because the second needs the filesystem to know
-		 * what is open and nothing told it.  Something does now (see
-		 * fs_open), so the choice is made one layer down: if anything
-		 * still holds this file, the name goes and the bytes wait in
-		 * the volume's private directory until the last close.
-		 *
-		 * Which happened is not reported here.  From ring 3 the two are
-		 * the same event -- the name is gone either way -- and a kernel
-		 * that announced the difference would be inviting programs to
-		 * depend on it.
+		 * A file lives until its last name and last descriptor are
+		 * gone.  fs_unlink decides: if the file is still open, the
+		 * name goes and the bytes wait in the volume's private
+		 * directory until the last close.  Ring 3 sees the same
+		 * result either way.
 		 */
 		rv = fs_unlink(path);
 		if (rv != FS_E_OK) {
@@ -3578,25 +3112,16 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		return (darwin_ok(f, 0));
 	}
 	/*
-	 * rename(2).  Two paths in, one transaction out.
+	 * rename(2): resolve both names and hand them to one fs_rename, whose
+	 * edit changes every leaf in memory before writing any, so the rename
+	 * is atomic.
 	 *
-	 * The reason a program reaches for this rather than unlink-then-create
-	 * is that it must not be interruptible half way, and none of that is
-	 * this function's doing: it resolves two names against the caller's
-	 * working directory and hands both to a single filesystem call, and the
-	 * atomicity is kept by the edit underneath, which changes every leaf it
-	 * touches in memory before writing any of them.
-	 *
-	 * AN OPEN DESCRIPTOR STILL ANSWERS WITH THE OLD PATH.  A descriptor
-	 * here remembers the name it was opened with for the calls that ask
-	 * about names -- fchdir, fchmod, F_GETPATH -- and this is the call
-	 * that makes that shortcut visible, exactly as the comment where it is
-	 * made predicted.  The BYTES do not take that shortcut: reads and
-	 * writes go through the handle, which is why a descriptor held on a
-	 * file this call replaces goes on reading the file it opened -- now
-	 * nameless, waiting in the volume's private directory for the close
-	 * that finishes it -- while every open of the name gets the newcomer.
-	 * filewrite holds one across exactly that takeover and checks both.
+	 * An open descriptor still answers with the old path for the calls
+	 * that ask about names (fchmod, the fdpath backchannel), since it
+	 * keeps the name it was opened by.  Its bytes go through the handle,
+	 * so a descriptor on a replaced file keeps reading that file, now
+	 * nameless until its last close, while new opens get the newcomer.
+	 * user/filewrite.c checks both.
 	 */
 	case DARWIN_SYS_rename: {
 		char	opath[DARWIN_PATH_MAX];
@@ -3629,15 +3154,8 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		return (darwin_ok(f, 0));
 	}
 	/*
-	 * mkdir(2) and rmdir(2), which share everything with unlink above
-	 * except which call they end in.
-	 *
-	 * THE MODE IS HONOURED NOW.  It used to be taken and dropped, said out
-	 * loud right here: the writer stamped 0755 on every directory because
-	 * there was no umask to subtract and no chmod to correct it with
-	 * afterwards.  There are both, so `mkdir foo` -- which asks for 0777,
-	 * as every program does -- comes out 0755 the way it does on a Mac, and
-	 * `mkdir -m 700` comes out 0700 because it was asked for.
+	 * mkdir(2) and rmdir(2), shaped like unlink above.  mkdir's mode is
+	 * the request less the umask: `mkdir foo' asks 0777 and gets 0755.
 	 */
 	case DARWIN_SYS_mkdir:
 	case DARWIN_SYS_rmdir: {
@@ -3661,12 +3179,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		rv = make ? fs_mkdir(path, darwin_mode_arg(f->sf_arg1), NULL) :
 		    fs_rmdir(path);
 		if (rv != FS_E_OK) {
-			/*
-			 * "Already there" is to a mkdir what "not there" is
-			 * to an unlink: the ordinary answer to a program that
-			 * asked rather than looked first, and not worth a
-			 * line.  Everything else is.
-			 */
+			/* ENOENT, and EEXIST for mkdir, are routine: no log. */
 			if (rv != FS_E_NOTFOUND &&
 			    !(make && rv == FS_E_EXIST))
 				kprintf("darwin: %s('%s') refused (rv=%d)\n",
@@ -3719,12 +3232,10 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			break;		/* a file or a directory: the volume */
 		}
 		/*
-		 * One volume, one open transaction: publishing this file and
-		 * publishing everything are the same checkpoint, so fsync is
-		 * sync.  The promise is the point -- write(2) stopped
-		 * carrying it when mutations began to batch (see the policy
-		 * essay in fs/fs.c), and a 0 from here is where it moved to:
-		 * the write is on the platter, not parked in the batch.
+		 * One volume, one open transaction: publishing this file means
+		 * publishing everything, so fsync is sync.  write(2) only
+		 * batches (ckpt_policy in fs/fs.c); a 0 here means the data is
+		 * on disk.
 		 */
 		if (fs_sync() != FS_E_OK)
 			return (darwin_err(f, DARWIN_EIO));
@@ -3776,11 +3287,9 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		int			rv;
 
 		/*
-		 * There is one user and it is root, so the only permission
-		 * question with a real answer is "can this be written":
-		 * the synthetic /bin and the published past cannot.  The
-		 * rest is existence, which is what most callers ask (a
-		 * PATH search asks X_OK and means "is it there").
+		 * One user, root, so the only real permission question is
+		 * W_OK: the synthetic /bin and read-only trees refuse it.
+		 * The rest is existence (a PATH search's X_OK means that).
 		 */
 		len = syscall_copyin_str((const char *)f->sf_arg0, raw,
 		    sizeof(raw));
@@ -3838,7 +3347,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		rv = fs_truncate(&of->of_handle, (uint64_t)len);
 		if (rv != FS_E_OK)
 			return (darwin_err(f, darwin_fs_errno(rv)));
-		/* The cursor stays where it was: read(2) knows about that. */
+		/* The cursor stays put; read(2) handles one past the end. */
 		of->of_size = (uint32_t)of->of_handle.fh_size;
 		return (darwin_ok(f, 0));
 	}
@@ -3847,12 +3356,9 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		long	len;
 
 		/*
-		 * No FIFOs.  A named pipe is a pipe reachable by a path, and
-		 * this kernel keeps its pipes in descriptor tables and its
-		 * names on a volume that has no node type for one yet.  EPERM
-		 * is what a filesystem that cannot hold one answers, and the
-		 * one caller so far (make's jobserver) hears it, says so, and
-		 * uses a pipe(2) instead.
+		 * No FIFOs: the volume has no node type for one.  EPERM, as a
+		 * filesystem that cannot hold one answers; make's jobserver
+		 * then falls back to pipe(2).
 		 */
 		len = syscall_copyin_str((const char *)f->sf_arg0, raw,
 		    sizeof(raw));
@@ -3900,11 +3406,8 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 				    (unsigned)status);
 				darwin_wait_n_call++;
 				/*
-				 * The answer was already here when the deadline
-				 * woke us, so nobody had said so: a wake went
-				 * missing.  Named out loud with the pid, since
-				 * the fix is always a darwin_child_news that
-				 * some exit path does not make.
+				 * Found only because the deadline woke us: some
+				 * exit path lacks a darwin_child_news.
 				 */
 				if (by_net) {
 					darwin_wait_n_lost++;
@@ -3916,12 +3419,10 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 				return (darwin_ok(f, (long)got));
 			}
 			/*
-			 * No zombie.  If no live child could still make
-			 * one, the wait can never succeed.  The zombie is
-			 * recorded before the child leaves the live list,
-			 * so re-checking the table first means a child
-			 * that exits between these two samples is caught
-			 * next iteration, never lost.
+			 * No zombie, and no live child left to make one:
+			 * ECHILD.  A zombie is recorded before its task
+			 * leaves the live list, so a child exiting between
+			 * the two samples is caught next iteration.
 			 */
 			if (task_count_darwin_children(t->t_id,
 			    pid > 0 ? (uint64_t)pid : 0) == 0) {
@@ -3938,22 +3439,17 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			if (options & DARWIN_WNOHANG)
 				return (darwin_ok(f, 0));
 			/*
-			 * A parent waiting on a child that will not exit is
-			 * the wait most worth interrupting -- it is where a
-			 * shell spends its time, and where Ctrl-C has to
-			 * land.  SIGCHLD is in the deliverable set too, so a
-			 * caught SIGCHLD breaks the wait and the handler runs
-			 * before the loop is re-entered.
+			 * Interruptible: this is where a shell sits when
+			 * Ctrl-C arrives.  A caught SIGCHLD also breaks the
+			 * wait, so its handler runs first.
 			 */
 			if (task_kill_pending(t) || darwin_signal_pending(t))
 				return (darwin_err(f, DARWIN_EINTR));
 
 			/*
-			 * Sleep until a child has news.  The look above used
-			 * the reaper, which lets the lock go; this one is made
-			 * with the lock we are about to park with still held,
-			 * so a child that dies between the two cannot report
-			 * to an empty channel.
+			 * Sleep until a child has news.  Look once more under
+			 * the lock we park with, so a child dying since the
+			 * reap above cannot report to an empty channel.
 			 */
 			spin_lock(&darwin_zombie_lock);
 			if (darwin_zombie_present_locked(t->t_id,
@@ -3962,12 +3458,9 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 				continue;
 			}
 			/*
-			 * Park with a deadline -- see DARWIN_WAIT_NET_MS for
-			 * why this one wait has a net under it and the others
-			 * do not.  Waking on it is ordinary; the loop simply
-			 * looks again.  Whether anything was WRONG is decided
-			 * at the top, by whether the answer turns out to have
-			 * been waiting there all along.
+			 * Park with a deadline (DARWIN_WAIT_NET_MS).  Waking
+			 * on it is ordinary; the top of the loop decides
+			 * whether a wake was lost.
 			 */
 			current_thread->th_wake_deadline_ms =
 			    clock_uptime_ms() + DARWIN_WAIT_NET_MS;
@@ -3980,10 +3473,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			sched_remove_timed_waiter(current_thread);
 			if (current_thread->th_timed_out != 0) {
 				darwin_wait_n_net++;
-				/*
-				 * Only blame a lost wake if nothing was said
-				 * while we slept.  See darwin_wait_gen.
-				 */
+				/* Lost only if nothing was said: darwin_wait_gen. */
 				by_net = darwin_wait_generation(t->t_id) == gen;
 			} else
 				by_net = false;
@@ -4019,10 +3509,9 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		t->t_darwin_files[wfd].of_type = DARWIN_OF_PIPE_W;
 		kprintf("darwin: UNIX pipe() -> r=%d w=%d\n", rfd, wfd);
 		/*
-		 * Both fds in one %rax: read end low, write end high.
-		 * Darwin's native convention is %rax/%rdx; our clean-room
-		 * libSystem is the only caller of this number and unpacks
-		 * the packed form (the entry stub hands back one register).
+		 * Both fds in one %rax: read end low, write end high.  XNU
+		 * returns %rax/%rdx, but the entry stub returns one register
+		 * and our libSystem, the only caller, unpacks this form.
 		 */
 		return (darwin_ok(f,
 		    (long)(((uint64_t)(uint32_t)wfd << 32) |
@@ -4066,11 +3555,8 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		return (darwin_ok(f, newfd));
 	}
 	/*
-	 * umask(2): the bits a create may not grant, and the OLD value back.
-	 *
-	 * Returning the previous mask is not a nicety -- it is the only way to
-	 * read the thing, since there is no getumask, and a program that wants
-	 * to know sets it twice.
+	 * umask(2): set the bits a create may not grant; return the old value
+	 * (the only way to read it).
 	 */
 	case DARWIN_SYS_umask: {
 		struct task	*t;
@@ -4082,13 +3568,8 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		return (darwin_ok(f, (long)was));
 	}
 	/*
-	 * chmod(2) and fchmod(2): the permission bits of something that is
-	 * already there.
-	 *
-	 * There is no ownership check because there are no owners -- one user,
-	 * root, and a volume whose inodes all say uid 0.  What a real kernel
-	 * would refuse here it would refuse on grounds this system does not
-	 * have, so the check is absent rather than faked.
+	 * chmod(2) and fchmod(2).  No ownership check: one user, root, and
+	 * every inode is uid 0.
 	 */
 	case DARWIN_SYS_chmod:
 	case DARWIN_SYS_fchmod: {
@@ -4104,11 +3585,9 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		t = current_thread->th_task;
 		if (nr == DARWIN_SYS_fchmod) {
 			/*
-			 * An fd is a path here, because this kernel has no
-			 * vnodes: what it remembers about an open file is the
-			 * name it was opened by.  A descriptor onto something
-			 * with no name -- a pipe, the console, a built-in
-			 * image -- has nothing to chmod, and says so.
+			 * No vnodes: an fd is chmod'ed by the path it was
+			 * opened by.  A pipe, the console or a built-in has
+			 * none: EINVAL.
 			 */
 			fd = (int)f->sf_arg0;
 			if (fd < 0 || fd >= DARWIN_NOFILE)
@@ -4174,9 +3653,8 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		case DARWIN_F_DUPFD:
 		case DARWIN_F_DUPFD_CLOEXEC:
 			/*
-			 * Close-on-exec is moot here (exec preserves fds by
-			 * design and the table has no flag bits), so the
-			 * CLOEXEC flavor degenerates to plain F_DUPFD.
+			 * No close-on-exec flag bits in the table, so this is
+			 * plain F_DUPFD.
 			 */
 			newfd = darwin_fd_alloc_from(t, (int)f->sf_arg2);
 			if (newfd < 0)
@@ -4215,9 +3693,8 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			return (darwin_err(f, DARWIN_EFAULT));
 
 		/*
-		 * The program registry is flat: resolve by final path
-		 * component, so "/bin/gfactor" and "gfactor" both land on
-		 * the registered image.
+		 * The program registry is flat: resolve by the final path
+		 * component, so "/bin/gfactor" and "gfactor" are the same.
 		 */
 		base = path;
 		for (i = 0; path[i] != '\0'; i++) {
@@ -4245,15 +3722,10 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			    DARWIN_ENOMEM : DARWIN_EFAULT));
 
 		/*
-		 * THE ENVIRONMENT CROSSES AN EXEC.  It did not, for a long
-		 * time: the kernel passed an empty envp and libSystem made
-		 * one up (PATH=/bin), which every program so far survived
-		 * because none of them told a child anything.  A build tool
-		 * is nothing but that -- MAKEFLAGS, MAKELEVEL, the jobserver's
-		 * descriptors -- and a shell exporting a variable expects the
-		 * program it runs to see it.  Copied under its own caps; a
-		 * vector that will not fit the handoff page is refused here,
-		 * with the errno for it, before the old image is let go of.
+		 * The environment crosses the exec (make's MAKEFLAGS, a
+		 * shell's exports).  Copied under its own caps; vectors that
+		 * will not fit the handoff page get E2BIG here, before the old
+		 * image is dropped.
 		 */
 		kenvp = NULL;
 		envc  = 0;
@@ -4301,11 +3773,9 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		if (target == NULL)
 			return (darwin_err(f, DARWIN_ESRCH));
 		/*
-		 * The target's disposition decides the mechanism.  Reading it
-		 * unlocked is exact on this uniprocessor: sigaction(2) is the
-		 * only writer, it only ever writes its OWN task, and no thread
-		 * runs between our read and the post below (syscalls execute
-		 * with IF clear).
+		 * The target's disposition decides the mechanism.  Read
+		 * without a lock: sigaction(2), the only writer, writes only
+		 * its own task, so a concurrent change can be missed.
 		 */
 		disp = (sig > 0 && sig < DARWIN_NSIG)
 		    ? target->t_sig_handler[sig] : DARWIN_SIG_DFL;
@@ -4313,24 +3783,18 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		    darwin_sig_default_is_ignore(sig) ||
 		    target == current_thread->th_task)) {
 			/*
-			 * Post and let return-to-user delivery decide.  That
-			 * covers every signal the target does not simply die
-			 * from: one it catches (its handler runs at its next
-			 * return to ring 3 -- a timer IRQ is enough, it need
-			 * never syscall), one it ignores, a default-ignore
-			 * signal (SIGCHLD), and ANY self-signal, which is
-			 * applied at THIS kill syscall's own exit.
+			 * Post and let return-to-user delivery decide: a
+			 * caught signal (the handler runs at the next return
+			 * to ring 3, a timer IRQ being enough), an ignored or
+			 * default-ignore one, and any self-signal, applied at
+			 * this syscall's exit.
 			 */
 			darwin_signal_post(target, sig);
 		} else if (sig != 0) {
 			/*
-			 * Cross-task default-terminate.  The target may be
-			 * blocked in a syscall and there is no signal-wake to
-			 * pull it out yet, so termination stays synchronous
-			 * here.  Record the wait4 status (termsig in the low
-			 * bits -- a terminated task never reaches its own
-			 * exit(2), so this is the only writer) and request the
-			 * async kill.
+			 * Cross-task default-terminate: record the wait4
+			 * status (termsig in the low bits; the target never
+			 * reaches exit(2)) and request the kill directly.
 			 */
 			kprintf("darwin: UNIX kill(%ld, %d) -> terminate\n",
 			    pid, sig);
@@ -4346,25 +3810,19 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		int		signo;
 
 		/*
-		 * libSystem's sigaction/signal marshal (signo, handler) into
-		 * arg0/arg1: arg1 is the ring-3 handler VA -- DARWIN_SIG_DFL
-		 * (0), DARWIN_SIG_IGN (1), or a function pointer.  We record the
-		 * disposition here; on-stack invocation of a caught handler is
-		 * phase 2 (until then a caught signal simply stays pending and
-		 * never terminates).  SIGKILL is uncatchable.
+		 * libSystem's sigaction/signal pass (signo, handler) in
+		 * arg0/arg1: DARWIN_SIG_DFL (0), DARWIN_SIG_IGN (1) or a
+		 * ring-3 handler VA, invoked on-stack at delivery.  SIGKILL is
+		 * uncatchable.
 		 */
 		signo = (int)f->sf_arg0;
 		if (signo <= 0 || signo >= DARWIN_NSIG ||
 		    signo == DARWIN_SIGKILL)
 			return (darwin_err(f, DARWIN_EINVAL));
 		/*
-		 * The disposition being replaced comes back in %rax.  It is
-		 * not decoration: a program that sets a handler only where
-		 * the signal was not already ignored -- which is what a
-		 * command run in the background under a shell expects, and
-		 * what make does for every fatal signal -- needs the old
-		 * value, and a libc that always said SIG_DFL made it install
-		 * handlers it had promised not to.
+		 * The old disposition comes back in %rax: make and background
+		 * commands install a handler only where the signal was not
+		 * already ignored.
 		 */
 		old = current_thread->th_task->t_sig_handler[signo];
 		current_thread->th_task->t_sig_handler[signo] = f->sf_arg1;
@@ -4412,18 +3870,13 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 
 		/*
 		 * Restore the context saved at delivery.  _sigtramp passes the
-		 * ucontext in arg0; the magic at offset 0 says which flavour it
-		 * is.  An SGFR2 (asynchronous) frame carries a whole machine
-		 * state and can only be resumed by IRETQ, so it leaves through
-		 * darwin_sigreturn_full and never comes back here.  An SGFR1
-		 * frame reshapes THIS syscall frame so the sysret lands back at
-		 * the interrupted rip/rsp/rflags with the original %rax --
-		 * sigreturn does not "return" normally.  A bad pointer or an
-		 * unknown magic means a corrupt/forged frame; kill the task
-		 * rather than resume into nonsense.
-		 *
-		 * Reading 64 bytes is safe for either flavour: SGFR2 is the
-		 * larger struct and shares the magic's placement.
+		 * ucontext in arg0; the magic at offset 0 gives the flavour.
+		 * SGFR2 (asynchronous) resumes by IRETQ in
+		 * darwin_sigreturn_full.  SGFR1 reshapes this syscall frame so
+		 * the sysret lands at the saved rip/rsp/rflags with the saved
+		 * %rax.  A bad pointer or magic kills the task.  Reading the
+		 * 64-byte SGFR1 size is safe for both: SGFR2 is larger and
+		 * keeps the magic at offset 0.
 		 */
 		t    = current_thread->th_task;
 		uctx = f->sf_arg0;
@@ -4470,12 +3923,8 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		if (size == 0)
 			return (darwin_err(f, DARWIN_EINVAL));
 		/*
-		 * The address argument is a hint and this takes it as one: the
-		 * map picks the range.  MAP_FIXED is the case where the caller
-		 * is not asking but telling, and honouring it means splitting
-		 * or replacing whatever already lives there -- say no rather
-		 * than quietly place the mapping somewhere else, which is the
-		 * one answer a MAP_FIXED caller cannot cope with.
+		 * The address is only a hint; the map picks the range.
+		 * MAP_FIXED is refused rather than silently placed elsewhere.
 		 */
 		if ((flags & DARWIN_MAP_FIXED) != 0)
 			return (darwin_err(f, DARWIN_EINVAL));
@@ -4504,11 +3953,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			of = &t->t_darwin_files[fd];
 			if (of->of_type != DARWIN_OF_FILE)
 				return (darwin_err(f, DARWIN_EBADF));
-			/*
-			 * Only a file that lives on the volume can be paged
-			 * in.  The synthetic /bin entries are built into the
-			 * kernel image and have no handle to read through.
-			 */
+			/* A /bin built-in has no handle to page through. */
 			if (of->of_handle.fh_kind == FS_HANDLE_NONE)
 				return (darwin_err(f, DARWIN_ENODEV));
 			if ((off & 0xFFFull) != 0)
@@ -4523,11 +3968,8 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			return (darwin_err(f, DARWIN_ENOMEM));
 		}
 		/*
-		 * No frames are allocated here and no page tables are touched:
-		 * the entry is the whole mapping until something reads or
-		 * writes it.  That is the difference between this and
-		 * vm_allocate, and it is why mapping a 4 MiB file costs a
-		 * kmalloc rather than 4 MiB.
+		 * Lazy: no frames or page tables until first touch, unlike
+		 * vm_allocate, so mapping a 4 MiB file costs one kmalloc.
 		 */
 		if (!vm_map_enter_backed(t->t_map, va, size, prot,
 		    VME_F_ANON | VME_F_LAZY, obj, off)) {
@@ -4555,11 +3997,9 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		if (size == 0)
 			return (darwin_err(f, DARWIN_EINVAL));
 		/*
-		 * Any sub-range of a mapping, including its middle: vm_map
-		 * cuts the entries at the edges of the request.  What is still
-		 * refused is a range with a hole in it, which POSIX would let
-		 * pass but which here means the caller has lost track of what
-		 * it owns.
+		 * Any sub-range, middle included; vm_map splits entries at the
+		 * edges.  A range with a hole is refused, though POSIX allows
+		 * it.
 		 */
 		if (!vm_map_release(t->t_map, t->t_pmap, va, size))
 			return (darwin_err(f, DARWIN_EINVAL));
@@ -4596,10 +4036,8 @@ darwin_mach(struct syscall_frame *f, uint32_t trap)
 		mach_port_name_t	n;
 
 		/*
-		 * Install a fresh SEND right to the kernel's host port in the
-		 * caller's space and hand back the name.  MACH_PORT_NULL on
-		 * failure (host_init has not run / table full), matching the
-		 * port-returning-trap convention task_self_trap uses.
+		 * A fresh SEND right to the host port in the caller's space;
+		 * MACH_PORT_NULL on failure (no host_init yet, table full).
 		 */
 		n = MACH_PORT_NULL;
 		(void)host_self_acquire(current_thread->th_task->t_port_space,
@@ -4655,14 +4093,11 @@ darwin_mach_msg_err(long rv, bool sending)
 
 /*
  * mach_msg_trap (Mach class 1, trap 31): the classic combined send/receive.
- * Darwin's mach_msg(3) packs its arguments into the syscall registers in the
- * usual order; we read msg/option/rcv_size/rcv_name/timeout.  The 7th arg
- * (notify) is unsupported -- a classic mach_msg passes MACH_PORT_NULL there.
- * send_size (arg2) is implicit: the kernel honours msg->msgh_size.  A combined
- * SEND|RCV sends then receives into the same buffer, exactly as mach_msg(3)
- * does; the shared syscall_msg_* helpers do the user-range check + SMAP
- * bracket + drive the kernel's existing message path.  Returns a
- * mach_msg_return_t in %rax with carry clear (Mach convention).
+ * Arguments (msg, option, send_size, rcv_size, rcv_name, timeout) in the
+ * usual registers; send_size is ignored in favour of msgh_size, and the
+ * 7th (notify) is unsupported.  SEND|RCV sends, then receives into the same
+ * buffer, through the syscall_msg_* helpers (range check, SMAP bracket).
+ * Returns a mach_msg_return_t in %rax, carry clear.
  */
 static long
 darwin_mach_msg(struct syscall_frame *f)
@@ -4705,8 +4140,9 @@ darwin_mach_msg(struct syscall_frame *f)
 }
 
 /*
- * style9-private call gate (class DARWIN_SYSCALL_CLASS_STYLE9), reached only
- * from our own dyld -- never from a genuine Apple binary.  See darwin.h.
+ * style9-private call gate (class DARWIN_SYSCALL_CLASS_STYLE9), reached
+ * only from our own dyld and libSystem, never from Apple code.  See
+ * darwin.h.
  */
 static long
 darwin_style9(struct syscall_frame *f, uint32_t num)
@@ -4735,12 +4171,11 @@ darwin_style9(struct syscall_frame *f, uint32_t num)
 }
 
 /*
- * map_image(const char *path): map the embedded dylib registered under `path`
- * into the calling task at its next dylib base, and return that base in %rax.
- * dyld reads the dependency name out of the main image's LC_LOAD_DYLIB and
- * hands it here; the kernel owns the actual mapping (it holds the blob + the
- * VM machinery), which keeps the user/kernel SMAP boundary clean.  Carry set
- * with 0 in %rax on any failure (unknown path, fault, OOM) so dyld can branch.
+ * map_image(const char *path): map the embedded dylib registered under
+ * `path` at the task's next dylib base and return that base.  dyld passes
+ * the name from an LC_LOAD_DYLIB; the kernel, which holds the blob, does
+ * the mapping.  Carry set with a Darwin errno on failure (unknown path,
+ * fault, map error).
  */
 static long
 darwin_s9_map_image(struct syscall_frame *f)
@@ -4786,20 +4221,10 @@ darwin_s9_map_image(struct syscall_frame *f)
 }
 
 /*
- * Metadata for something in the program registry, which is not on any volume:
- * these files are part of the kernel image, so no filesystem has an opinion
- * about when they were written or who owns them.
- *
- * The timestamp is the one true thing available -- the moment this kernel
- * started running, which is when these files came into existence as far as
- * anything can observe.  It is computed rather than sampled (wall time minus
- * uptime is exactly the anchor clock_init took from the RTC), so repeated
- * stats of /bin/hello agree with each other instead of drifting a second per
- * second the way reporting "now" would.  A machine with no usable RTC reports
- * zero, which is the same "unrecorded" a volume without timestamps reports.
- *
- * The mode says read-only and executable because that is precisely what a
- * program baked into the kernel image is.
+ * Metadata for a program-registry entry, which lives in the kernel image.
+ * Every timestamp is boot time, computed as wall time minus uptime (the
+ * RTC anchor clock_init took) so repeated stats agree; 0 with no usable
+ * RTC.  The mode is read-only and executable.
  */
 static void
 darwin_bin_statbuf(struct fs_statbuf *sb, int is_dir)
@@ -4827,12 +4252,10 @@ darwin_bin_statbuf(struct fs_statbuf *sb, int is_dir)
 }
 
 /*
- * fs_stat(const char *path, struct fs_statbuf *out): existence + size + type +
- * inode probe behind libSystem's stat$INODE64.  Copies the small fs_statbuf
- * out to the caller and returns 0 (carry clear) if the file is present, carry
- * set otherwise.  The kernel reports only this neutral struct; libSystem turns
- * it into Apple's struct stat, so the macOS ABI layout stays out of the kernel
- * -- and which filesystem answered stays out of libSystem.
+ * fs_stat(const char *path, struct fs_statbuf *out): the probe behind
+ * libSystem's stat$INODE64.  Copies out the neutral fs_statbuf and returns
+ * 0, or carry set (ENOENT, EFAULT, ENAMETOOLONG).  libSystem converts it to
+ * Apple's struct stat, keeping the macOS layout out of the kernel.
  */
 static long
 darwin_s9_fs_stat(struct syscall_frame *f)
@@ -4852,10 +4275,9 @@ darwin_s9_fs_stat(struct syscall_frame *f)
 		return (darwin_err(f, DARWIN_ENAMETOOLONG));
 
 	/*
-	 * /bin answers as the overlay it is (see fs_readdir below): the
-	 * directory itself is neither the volume's nor the registry's alone,
-	 * so it keeps a stable synthetic inode even when the volume has a
-	 * /bin.  Everything under it resolves normally, registry first.
+	 * /bin is an overlay (see fs_readdir below), so the directory keeps
+	 * a synthetic inode even when the volume has a /bin.  Names under it
+	 * resolve registry first.
 	 */
 	if (darwin_streq(path, DARWIN_BIN_DIR)) {
 		darwin_bin_statbuf(&sb, 1);
@@ -4878,10 +4300,9 @@ darwin_s9_fs_stat(struct syscall_frame *f)
 /*
  * fs_readdir(const char *path, uint32_t index, struct fs_dirent *out):
  * fill *out with the index-th entry of the directory at `path`, behind
- * libSystem's opendir/readdir.  Returns 1 in %rax when an entry was written, 0
- * at end-of-directory (carry clear either way), carry set on error.  The
- * kernel keeps no per-fd cursor: each call re-resolves and re-scans to
- * `index`, which is cheap for the small read-only directories this serves.
+ * libSystem's opendir/readdir.  Returns 1 when an entry was written, 0 at
+ * end-of-directory (carry clear either way), carry set on error.  No
+ * cursor is kept: each call re-resolves and re-scans to `index`.
  */
 static long
 darwin_s9_fs_readdir(struct syscall_frame *f)
@@ -4907,19 +4328,13 @@ darwin_s9_fs_readdir(struct syscall_frame *f)
 
 	if (darwin_streq(path, DARWIN_BIN_DIR)) {
 		/*
-		 * /bin is an OVERLAY: whatever the volume has there, with the
-		 * program registry appended.  open() and stat() already see
-		 * both -- they try the disk and fall back to the registry --
-		 * so a listing that showed only the registry was the one
-		 * operation disagreeing with the other two, and a file you can
-		 * open but cannot see is worse than either answer alone.
+		 * /bin is an overlay: the volume's entries, then the program
+		 * registry, so the listing agrees with open() and stat().
 		 */
 		if (fs_readdir(path, index, &de) != 1) {
 			/*
-			 * Past the volume's own entries.  How many there were
-			 * has to be counted, because the registry's numbering
-			 * starts where the disk's stops and neither side knows
-			 * about the other.
+			 * Past the volume's entries; count them, since the
+			 * registry's numbering starts where the disk's stops.
 			 */
 			for (nreal = 0; fs_readdir(path, nreal, &de) == 1;
 			    nreal++)
@@ -4942,23 +4357,17 @@ darwin_s9_fs_readdir(struct syscall_frame *f)
 			return (darwin_err(f, DARWIN_ENOENT));
 		if (rv == 0) {
 			/*
-			 * End of the on-disk listing.  The root grows one
-			 * synthetic entry -- "bin" -- at exactly the first
-			 * end index (a probe at index-1 still yielding an
-			 * entry proves this is that index), so a directory
-			 * walker discovers the program registry.
+			 * End of the on-disk listing.  The root gets one
+			 * synthetic "bin" at exactly the first end index (the
+			 * probe at index-1 proves it), so a walker finds the
+			 * program registry.
 			 */
 			if (!darwin_streq(path, "/"))
 				return (darwin_ok(f, 0));
 			if (index > 0 &&
 			    fs_readdir(path, index - 1, &de) != 1)
 				return (darwin_ok(f, 0));
-			/*
-			 * Unless the volume already has a /bin of its own, in
-			 * which case the overlay above has merged the registry
-			 * into it and naming it again here would list one
-			 * directory twice.
-			 */
+			/* Unless the volume has its own /bin, already listed. */
 			if (fs_stat(DARWIN_BIN_DIR, &sb) == FS_E_OK)
 				return (darwin_ok(f, 0));
 			de.fde_ino    = DARWIN_BIN_INO_BASE;
@@ -4977,9 +4386,9 @@ darwin_s9_fs_readdir(struct syscall_frame *f)
 
 /*
  * fs_fstat(int fd, struct darwin_fdstat *out): classify what an open fd
- * holds for libSystem's fstat64.  The neutral kinds map onto S_IFREG /
- * S_IFCHR / S_IFIFO in the clean-room library; the implicit std streams
- * (FREE at 0..2) classify as the console they reach.
+ * holds for libSystem's fstat64, which maps the kinds onto S_IFREG /
+ * S_IFCHR / S_IFIFO / S_IFDIR; the implicit std streams (FREE at 0..2)
+ * classify as the console they reach.
  */
 static long
 darwin_s9_fs_fstat(struct syscall_frame *f)
@@ -5032,23 +4441,13 @@ darwin_s9_fs_fstat(struct syscall_frame *f)
 }
 
 /*
- * fs_fdpath(int fd, char *buf, size_t cap): what path an fd was opened by.
+ * fs_fdpath(int fd, char *buf, size_t cap): the path an fd was opened by.
+ * With no vnodes, this is what libSystem builds the *at family,
+ * fdopendir, fchdir and fchmod on.  A file renamed since the open answers
+ * with its old name; the fix is an inode-keyed answer, not a patch.
  *
- * ONE CALL, FIVE SYMBOLS.  The *at family, fdopendir, fchdir and fchmod all
- * ask the same question in different words -- "the thing this descriptor is
- * on, by name" -- and a kernel with vnodes would answer none of them this way.
- * This one has no vnodes: what it keeps about an open file is the path it was
- * opened by, which was being kept for diagnostics and turns out to be exactly
- * what libSystem needs to build the rest of the family on top of the calls
- * that already work.
- *
- * The limit of that honesty is worth stating: a file RENAMED after it was
- * opened would answer with the name it no longer has.  Nothing here can rename
- * yet -- that is a later rung -- and when it can, this becomes a lie that has
- * to be replaced by an inode-keyed answer rather than patched.
- *
- * Returns the length, or fails: EBADF for a descriptor that is not open,
- * EINVAL for one with no name at all (a pipe, the console, a built-in image).
+ * Returns the length; EBADF if not open, EINVAL if it has no name (pipe,
+ * console, built-in), ERANGE if `cap' is too small.
  */
 static long
 darwin_s9_fs_fdpath(struct syscall_frame *f)
@@ -5080,12 +4479,10 @@ darwin_s9_fs_fdpath(struct syscall_frame *f)
 }
 
 /*
- * The fabricated Darwin identity this kernel reports through uname().  None of
- * it is "real" -- style9 is not XNU -- but a libSystem-only CLI tool cannot
- * tell: it calls uname(2) and prints whatever comes back, never validating it.
- * The release (23.x == macOS 14 Sonoma) and machine name a plausible x86-64
- * Mac; the version banner is branded style9 so the lie is at least honest about
- * its provenance.  The hostname matches libSystem's gethostname() ("style9").
+ * The Darwin identity reported through uname(): release 23.x (macOS 14
+ * Sonoma) on x86_64, a plausible Mac for tools that print it, with a
+ * version banner that says style9.  The hostname matches libSystem's
+ * gethostname() ("style9").
  */
 static const struct darwin_uname	darwin_uname_id = {
 	"Darwin",
@@ -5097,9 +4494,8 @@ static const struct darwin_uname	darwin_uname_id = {
 };
 
 /*
- * uname(struct darwin_uname *out): copy the identity card out to the caller.
- * libSystem reshapes it into Apple's struct utsname.  Returns 0 (carry clear);
- * carry set only if the destination pointer faults.
+ * uname(struct darwin_uname *out): copy the identity out; libSystem
+ * reshapes it into Apple's struct utsname.  Returns 0, or EFAULT.
  */
 static long
 darwin_s9_uname(struct syscall_frame *f)
@@ -5111,7 +4507,7 @@ darwin_s9_uname(struct syscall_frame *f)
 	return (darwin_ok(f, 0));
 }
 
-/* Tiny NUL-terminated string compare for the dylib registry lookup. */
+/* NUL-terminated string equality. */
 static bool
 darwin_streq(const char *a, const char *b)
 {
@@ -5126,16 +4522,11 @@ darwin_streq(const char *a, const char *b)
 }
 
 /*
- * A name in the Darwin view of /bin.  One alias: "sh" is dash.
- *
- * Every program built for a Unix that needs a shell asks for /bin/sh --
- * make's default SHELL is that string, compiled in -- and the registry's
- * "sh" is this kernel's own native shell, an ELF the Darwin loader rightly
- * refuses with ENOEXEC.  Debian answers the same question with a symlink;
- * this answers it here, at the one point every Darwin-side lookup of a
- * program passes through, so stat, open and execve agree on what the name
- * means.  The native side never asks through this function and is not
- * affected: `sh` typed at the style9 prompt is still sh.elf.
+ * A name in the Darwin view of /bin.  One alias: "sh" is dash.  Programs
+ * (make's default SHELL) ask for /bin/sh, but the registry's "sh" is the
+ * native ELF shell, which the Darwin loader refuses.  Every Darwin-side
+ * program lookup passes here, so stat, open and execve agree; the native
+ * side does not, and `sh' there is still sh.elf.
  */
 static const struct progreg_entry *
 darwin_bin_find(const char *name)
@@ -5147,13 +4538,11 @@ darwin_bin_find(const char *name)
 }
 
 /*
- * The synthetic /bin: the program registry presented as a directory.  A
- * shell's PATH machinery stat(2)s each candidate before committing to an
- * execve, so the registry the execve resolves against must also be visible
- * to the path calls -- otherwise every registered program is runnable yet
- * "not found".  This helper answers "/bin/<name>" lookups for the FS-shaped
- * services (open / fs_stat / fs_readdir above); execve keeps its own
- * basename resolution, and the FAT volume keeps every other path.
+ * The synthetic /bin: the program registry as a directory.  A shell's PATH
+ * search stat(2)s before it execve's, so the path calls must see what
+ * execve runs.  Answers "/bin/<name>" for open, access and fs_stat
+ * (fs_readdir walks the registry directly); execve resolves by basename
+ * itself, and every other path goes to the volume.
  */
 static const struct progreg_entry *
 darwin_bin_lookup(const char *path)

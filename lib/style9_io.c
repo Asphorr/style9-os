@@ -10,13 +10,9 @@
 #include <stdarg.h>
 
 /*
- * I/O routines.
- *
- * Every output path ultimately funnels through write(), which is the
- * SYS_PRINT syscall.  putchar/puts/printf are thin wrappers; printf
- * formats into a 256-byte stack buffer one segment at a time so the
- * kernel only sees `write` calls (no need for a streaming putchar
- * fast path until profiling says otherwise).
+ * I/O routines.  All output goes through write(), the SYS_PRINT syscall;
+ * printf formats into a 256-byte stack buffer, flushed when full and at
+ * the end.
  *
  * Supported printf conversions:
  *	%s	NUL-terminated string ("(null)" on NULL)
@@ -30,10 +26,9 @@
  *
  * Flags supported:
  *	'0'	zero-pad numeric conversions
- *	'-'	left-align (default is right-align) for %s and numbers
- * Width is honoured for %d/%i/%u/%x/%X/%s.  Long modifier `l` is
- * accepted (%ld / %lu / %lx) and read as long; `ll` is also accepted
- * for long long.  No floats -- we have no FPU saved on syscall yet.
+ *	'-'	left-align %s (numbers are always right-aligned)
+ * Width is honoured for %d/%i/%u/%x/%X/%s.  `l' reads a long, `ll' a
+ * long long.  No floats.
  */
 
 ssize_t
@@ -114,10 +109,9 @@ sb_puts(struct sbuf *sb, const char *s, unsigned width, int left_align)
 }
 
 /*
- * Numeric emit with optional field width.  Build the digit string into
- * a 24-byte stack buffer (max length of any 64-bit value in any base
- * >= 2), then emit (width - digits) pad chars followed by the digits.
- * width <= digit count is a no-op pad-wise; the digits still emit.
+ * Unsigned emit, right-aligned in `width'.  tmp holds the digits in
+ * reverse; 24 bytes covers 64 bits in base 10 or 16, the only bases
+ * printf passes (base 2 would need 64).
  */
 static void
 sb_putu(struct sbuf *sb, unsigned long long v, unsigned int base, int upper,
@@ -148,10 +142,9 @@ sb_putu(struct sbuf *sb, unsigned long long v, unsigned int base, int upper,
 }
 
 /*
- * Signed counterpart: emit '-' before the field for negatives and let
- * sb_putu handle the rest, with the width reduced by one so the sign
- * is counted as part of the field.  Matches glibc behaviour for
- * %05d/-42 == "-0042"; for unsigned %5d we left-pad with spaces.
+ * Signed emit: the '-' goes out first and counts toward the width.
+ * Right for zero padding (%05d of -42 is "-0042"), but space padding
+ * gives "-  42" where C gives "  -42".
  */
 static void
 sb_putd(struct sbuf *sb, long long v, unsigned width, char pad)
@@ -198,10 +191,8 @@ printf(const char *fmt, ...)
 		i++;
 
 		/*
-		 * Optional flag '0' means pad numeric conversions with '0'
-		 * instead of spaces.  We don't honour '-', '+', ' ', '#' yet;
-		 * skip them silently so a format that uses them still does
-		 * the right thing for the conversion letter at least.
+		 * Flags: '0' zero-pads numbers, '-' left-aligns %s; '+', ' '
+		 * and '#' are skipped so the conversion itself still works.
 		 */
 		zero_pad = 0;
 		left_align = 0;
@@ -232,7 +223,7 @@ printf(const char *fmt, ...)
 
 			switch (fmt[i]) {
 			case '\0':
-				/* trailing '%' with no conversion -- emit it raw */
+				/* a trailing '%' goes out as is */
 				sb_putc(&sb, '%');
 				goto done;
 			case '%':

@@ -6,25 +6,20 @@
  */
 
 /*
- * libSystem.B.dylib -- a clean-room, minimal libSystem for the S4 Darwin
- * binary-compatibility rung.  This is NOT Apple's libSystem: it exports the
- * same symbol NAMES an Apple-ABI binary imports (an interface, not
- * copyrightable code) and implements each on top of style9's class-encoded
- * Darwin syscalls (kern/darwin.c).  Built by the real Darwin toolchain
- * (clang -target x86_64-apple-macos + ld64.lld -dylib) and bound at runtime
- * by our own dyld (user/dyld.c) -- no Apple bits anywhere in the chain.
+ * libSystem.B.dylib -- a clean-room, minimal libSystem for Darwin binaries.
+ * Not Apple's: it exports the symbol names an Apple-ABI binary imports (an
+ * interface, not code) and implements each over style9's class-encoded
+ * Darwin syscalls (kern/darwin.c).  Built by clang -target
+ * x86_64-apple-macos + ld64.lld -dylib and bound at runtime by our dyld
+ * (user/dyld.c); no Apple bits anywhere in the chain.
  *
- * The export set was grown to satisfy a real Apple CLI binary (figlet, a
- * Homebrew x86-64 macOS bottle): the 43 symbols it imports from
- * /usr/lib/libSystem.B.dylib -- stdio, malloc, string/mem, ctype/locale,
- * getopt, the stack protector, and one stat variant.  Everything that needs a
- * filesystem (fopen, stat) fails cleanly (NULL / -1) since style9 exposes no
- * VFS to ring 3 yet; everything else is a complete, self-contained
- * implementation over write(2)/exit(2).
+ * The export set is what the hosted binaries (figlet, tree, coreutils,
+ * gmake, dash, ...) import: stdio, malloc, string/mem, ctype/locale,
+ * getopt, files and directories, processes, signals, terminals, time.
  *
- * Compiled -fno-builtin so the compiler cannot lower a body into a libc call
- * (memcpy/memset) the no-libc link could not resolve, and cannot turn our own
- * memcpy/memset into self-recursion.
+ * Compiled -fno-builtin so the compiler cannot lower a body into a libc
+ * call the link cannot resolve, or turn our memcpy/memset into
+ * self-recursion.
  */
 
 #pragma clang diagnostic ignored "-Wmissing-field-initializers"
@@ -45,11 +40,10 @@ typedef __WCHAR_TYPE__		wchar_t;
 /* ---- raw Darwin syscalls ------------------------------------------------ */
 
 /*
- * One class-encoded Darwin syscall.  The class is the high byte of `nr`
- * (0x2000000 = BSD/Unix).  This 3-arg helper places args in rdi/rsi/rdx; the
- * full Darwin x86-64 convention continues r10/r8/r9 (NOT rcx, which `syscall`
- * clobbers).  The kernel's result, with Apple's carry-flag error convention,
- * comes back in rax.
+ * One class-encoded Darwin syscall; the class is the high byte of `nr'
+ * (0x2000000 = BSD).  Args in rdi/rsi/rdx (the convention continues
+ * r10/r8/r9, not rcx, which `syscall' clobbers).  The result comes back in
+ * rax; this helper ignores the carry flag.
  */
 static long
 dsys(long nr, long a, long b, long c)
@@ -70,24 +64,18 @@ write(int fd, const void *buf, unsigned long n)
 }
 
 /*
- * atexit handlers, run by exit(3) in LIFO order.  guname registers gnulib's
- * close_stdout here to flush stdout at teardown; our stdio writes are already
- * unbuffered, so it is belt-and-braces, but running the handlers keeps exit(3)
- * faithful.  _exit(2) (below) deliberately skips them.  Programs that register
- * none (figlet, tree -- neither imports atexit) see identical behaviour, so
- * this is a no-op for them.
+ * atexit handlers, run by exit(3) in LIFO order; _exit(2) skips them.
+ * coreutils registers gnulib's close_stdout here.
  */
 #define	ATEXIT_MAX	32
 static void	(*atexit_fns[ATEXIT_MAX])(void);
 static int	atexit_n;
 
 /*
- * errno's storage.  Apple's <errno.h> defines errno as (*__error()), so a
- * binary reads it through the accessor below rather than as a symbol; one
- * shared cell is enough for a system with one thread per process.  It lives
- * this far up the file because the calls that SET it -- mmap, fstatat --
- * are scattered through it, and a variable used in six places should be
- * declared once at the top rather than forward-declared into the middle.
+ * errno's storage.  Apple's <errno.h> defines errno as (*__error()), so
+ * binaries read it through that accessor; one cell suffices with one thread
+ * per process.  Declared up here because setters are spread through the
+ * file.
  */
 static int	g_errno;
 
@@ -110,19 +98,10 @@ getpid(void)
 }
 
 /*
- * A BSD-class syscall that honours Apple's carry-flag error convention: on
- * error the kernel sets CF and returns a positive errno, otherwise CF is clear
- * and %rax is the result.  Capture CF right after `syscall` (exactly as
- * libSystem reads a BSD error) and fold a failure into the -1 the fd routines
- * below expect.  write/exit/getpid above ignore errors, so they use the
- * lighter dsys; the file calls need the error bit.
- *
- * The errno store is not decoration.  This used to throw the code away and
- * return only -1, which is enough for a caller that wants to know THAT
- * something failed and useless to one that must know WHAT: a read interrupted
- * by a signal and a read on a closed descriptor were the same answer, so
- * nothing could retry the first and give up on the second.  It surfaced the
- * day a test asserted EINTR and got 0.
+ * A BSD-class syscall with Apple's carry-flag convention: on error the
+ * kernel sets CF and returns a positive errno in %rax.  CF is captured right
+ * after `syscall' and a failure becomes errno plus -1, so a caller can tell
+ * EINTR from EBADF.  write/exit/getpid above ignore errors and use dsys.
  */
 static long
 bsd_call(long nr, long a, long b, long c)
@@ -273,9 +252,8 @@ __bzero(void *b, size_t n)
 }
 
 /*
- * memset_pattern16: fill [b, b+len) with the 16-byte pattern at `pat`,
- * repeating it and truncating the final partial copy.  An Apple libc
- * extension figlet pulls in via its optimised string paths.
+ * memset_pattern16 (an Apple extension): fill [b, b+len) with the 16-byte
+ * pattern at `pat', truncating the last copy.
  */
 void
 memset_pattern16(void *b, const void *pat, size_t len)
@@ -293,27 +271,15 @@ memset_pattern16(void *b, const void *pat, size_t len)
 /* ---- malloc: a bump allocator over mmap'd chunks ------------------------ */
 
 /*
- * The heap is asked for, not declared.
+ * malloc bumps a cursor through chunks from mmap(MAP_ANON), so pages cost
+ * frames only once touched (a BSS heap would be allocated, zeroed and
+ * copied on fork in full).
  *
- * This used to be a 4 MiB array in BSS, because ring 3 had no way to ask the
- * kernel for memory.  That array was not free: the Mach-O loader allocates and
- * zeroes every page of a segment's bss tail when the image loads, so every
- * program here paid 4 MiB of real frames up front and a fork copied all of
- * them, whether it ever called malloc or not.
- *
- * Now malloc requests chunks with mmap(MAP_ANON) and bumps a cursor through
- * them.  The kernel hands back only the promise; each page becomes a frame
- * when it is first touched, so a program that allocates a kilobyte holds a
- * page, and one that allocates nothing holds nothing.
- *
- * Everything else is as it was.  Each block carries a 16-byte header holding
- * its usable size, so realloc() can copy the old contents forward; free() is
- * a no-op, since the programs hosted here allocate near-monotonically and
- * never depend on reclamation.  Chunks are page-aligned and every size is
- * rounded to 16, so returned pointers meet the alignment the SSE string paths
- * assume.  A request that does not fit the current chunk abandons its tail and
- * maps a new one -- the same bargain free() already makes, bounded by the
- * chunk size rather than by the whole heap.
+ * Each block has a 16-byte header holding its usable size, for realloc().
+ * free() is a no-op: the hosted programs allocate near-monotonically.
+ * Chunks are page-aligned and sizes round to 16, the alignment the SSE
+ * string paths assume.  A request that does not fit abandons the rest of
+ * the chunk and maps a new one.
  */
 #define	CHUNK_BYTES	(256u * 1024u)
 
@@ -393,9 +359,8 @@ realloc(void *p, size_t n)
 }
 
 /*
- * The page size ring 3 sees.  A constant rather than a syscall: the kernel's
- * host port reports the same 4096 (mach/host.c), and a program asking this
- * wants a number to size a buffer with, not a fact about the machine.
+ * The page size, as a constant: the host port reports the same 4096
+ * (mach/host.c).
  */
 int
 getpagesize(void)
@@ -405,13 +370,11 @@ getpagesize(void)
 }
 
 /*
- * posix_memalign: over-allocate and round up.  The subtlety is that realloc()
- * above reads a block's usable size from the 16 bytes IN FRONT of the pointer
- * it was given, so the header has to be re-stamped in front of the ALIGNED
- * pointer, not left in front of the raw one -- otherwise a realloc of an
- * aligned block would copy whatever happened to sit there.  Since a chunk is
- * page-aligned and every size rounds to 16, any gap it opens is a multiple of
- * 16, so the restamped header never reaches back into another block.
+ * posix_memalign: over-allocate and round up.  realloc() reads the size
+ * from the 16 bytes in front of the pointer, so the header is re-stamped in
+ * front of the aligned pointer.  Chunks are page-aligned and sizes round to
+ * 16, so the gap is a multiple of 16 and the new header stays inside this
+ * block.
  */
 int
 posix_memalign(void **out, size_t align, size_t size)
@@ -456,10 +419,7 @@ atoi(const char *s)
 	return (neg ? -v : v);
 }
 
-/*
- * getenv scans the exported environ (defined with _NSGetEnviron below) --
- * a forward declaration here since the storage lives with its accessor.
- */
+/* environ is defined with _NSGetEnviron below. */
 extern char	**environ;
 
 char *
@@ -483,14 +443,13 @@ getenv(const char *name)
 /* ---- ctype / locale ----------------------------------------------------- */
 
 /*
- * Apple's <ctype.h> inlines isspace()/isdigit()/... to read
- * _DefaultRuneLocale.__runetype[c] for ASCII (c < 128) and to call __maskrune()
- * otherwise; toupper()/tolower() call __toupper()/__tolower().  We must export
- * _DefaultRuneLocale with __runetype at the SAME offset Apple's header placed it
- * (60: magic[8]+encoding[32]+2 ptrs+invalid_rune) and fill it with the C-locale
- * classification, plus implement the three extern helpers.  __runetype is built
- * entirely at compile time (a macro fan-out over 0..255) since our dyld runs no
- * library initialisers.  The _CTYPE_* bit values are Apple's published ABI.
+ * Apple's <ctype.h> inlines isspace()/isdigit()/... as a read of
+ * _DefaultRuneLocale.__runetype[c] for c < 128 and a call to __maskrune()
+ * otherwise; toupper()/tolower() call __toupper()/__tolower().  So
+ * __runetype must sit at Apple's offset, 60 (magic[8] + encoding[32] + two
+ * pointers + invalid_rune), holding the C-locale classes.  It is built at
+ * compile time (a macro fan-out over 0..255) because our dyld runs no
+ * initialisers.  The _CTYPE_* bit values are Apple's ABI.
  */
 #define	_CT_A	0x00000100u		/* alpha   */
 #define	_CT_C	0x00000200u		/* control */
@@ -565,11 +524,9 @@ _RuneLocale _DefaultRuneLocale = {
 };
 
 /*
- * __maskrune: the slow path of the ctype macros (c >= 128, or a non-inlined
- * call site).  Return the rune's classification masked by `f`.  Non-ASCII
- * runes carry no class in the C locale, so they mask to zero.  Returns
- * unsigned long so the full %rax is defined regardless of how the caller's
- * header prototyped it.
+ * __maskrune: the ctype macros' slow path.  The rune's class masked by
+ * `f'; non-ASCII has no class in the C locale.  unsigned long so all of
+ * %rax is defined whatever the caller's prototype.
  */
 unsigned long
 __maskrune(int c, unsigned long f)
@@ -634,21 +591,21 @@ wcscat(wchar_t *dst, const wchar_t *src)
 /* ---- stdio -------------------------------------------------------------- */
 
 /*
- * FILE is NOT entirely opaque to an Apple binary: Apple's <stdio.h> inlines
- * getc() as __sgetc() -- `(--fp->_r < 0 ? __srget(fp) : (int)(*fp->_p++))`
- * -- and feof()/fileno() the same way, so compiled-in macro expansions
- * dereference Apple's struct __sFILE field OFFSETS directly (gfactor's
- * stdin reader does exactly this; it imports __srget, the macro's refill
- * hook).  The head of our FILE therefore mirrors Apple's layout where the
- * macros look: _r at offset 8 is pinned <= 0 so EVERY inlined getc takes
- * the __srget path (which re-pins it) and our unbuffered read logic stays
- * the single point of truth; _w at 12 is pinned 0 (the __sputc inline would
- * call __swbuf, which nothing here imports -- the preflight would catch a
- * binary that does); _flags at 16 carries the real __SEOF bit for the
- * feof() inline; _file at 18 carries the fd for the fileno() inline.  The
- * buffer pointer _p (offset 0) is never dereferenced while _r/_w are kept
- * non-positive, so it doubles as our fd + eof storage.  Everything past
- * Apple's first 20 bytes is ours (the ungetc pushback).
+ * FILE is not opaque to an Apple binary: <stdio.h> inlines getc() as
+ * `(--fp->_r < 0 ? __srget(fp) : (int)(*fp->_p++))', and feof()/fileno()
+ * likewise, reading struct __sFILE offsets directly (gfactor's stdin
+ * reader does, and imports __srget).  So our FILE's head mirrors Apple's
+ * where the macros look:
+ *
+ *	_r (8)		pinned <= 0, so every inlined getc calls __srget (which
+ *			re-pins it) and our unbuffered read stays the one path
+ *	_w (12)		pinned 0 (the __sputc inline would call __swbuf, which
+ *			nothing here imports)
+ *	_flags (16)	the real __SEOF bit, for feof()
+ *	_file (18)	the fd, for fileno()
+ *
+ * _p (0) is never dereferenced while _r/_w stay non-positive, so it holds
+ * our fd and eof.  Past Apple's first 20 bytes the struct is ours.
  */
 typedef struct __sFILE {
 	int	fd;		/* offset 0: Apple's _p, never deref'd  */
@@ -739,10 +696,10 @@ fread(void *ptr, size_t size, size_t nmemb, FILE *fp)
 }
 
 /*
- * fopen(3)'s mode string, as open(2) flags.  "r" reads, "w" makes and
- * empties, "a" makes and appends; a "+" opens both ways, an "x" (C11)
- * refuses a file that exists, and "b", "e" and "t" mean nothing here.
- * Anything else is EINVAL, which is the standard's answer.
+ * fopen(3)'s mode string as open(2) flags.  "r" reads, "w" creates and
+ * truncates, "a" creates and appends; "+" opens both ways, "x" (C11)
+ * refuses an existing file, "b", "e" and "t" are ignored.  Anything else
+ * is EINVAL.
  */
 int	open(const char *path, int flags, ...);
 
@@ -843,11 +800,10 @@ ftell(FILE *fp)
 /* ---- formatted output (printf / fprintf / sprintf family) --------------- */
 
 /*
- * A tiny emitter that targets EITHER an fd (printf/fprintf: buffered, flushed
- * when full, so long output costs few write(2)s) OR a caller buffer
- * (sprintf/snprintf: bounded, NUL-terminated).  `total` counts every char the
- * format produced -- the value the snprintf family returns -- regardless of
- * truncation; `n` is bytes pending in buf (fd) or already stored in dst.
+ * An emitter targeting either an fd (printf/fprintf: buffered, flushed when
+ * full) or a caller buffer (sprintf/snprintf: bounded, NUL-terminated).
+ * `total' counts every char produced, truncated or not (the snprintf
+ * return value); `n' is bytes pending in buf or stored in dst.
  */
 struct ob {
 	int		fd;	/* >= 0: flush to fd; < 0: write into dst */
@@ -1105,11 +1061,9 @@ fprintf(FILE *fp, const char *fmt, ...)
 }
 
 /*
- * The sprintf family routes through the same formatter with an fd of -1, so
- * the output lands in the caller's buffer (NUL-terminated, capped to `cap`).
- * vsnprintf is the common core; __sprintf_chk is clang's _FORTIFY_SOURCE
- * sprintf, whose object-size arg we treat as a snprintf cap so it cannot
- * overrun.  All return the length the format produced, snprintf-style.
+ * The sprintf family: the same formatter with fd -1, into the caller's
+ * buffer.  __sprintf_chk is _FORTIFY_SOURCE's sprintf; its object size is
+ * used as the snprintf cap.  All return the full formatted length.
  */
 int
 vsnprintf(char *dst, size_t cap, const char *fmt, __builtin_va_list ap)
@@ -1158,9 +1112,9 @@ __sprintf_chk(char *dst, int flag, size_t slen, const char *fmt, ...)
 /* ---- minimal sscanf ----------------------------------------------------- */
 
 /*
- * A small sscanf: enough to parse a figlet font header (a run of decimal
- * integers) plus %c/%s/%x.  Honours leading whitespace skipping, `*`
- * suppression, and an optional field width.  Returns the assigned-field count.
+ * A small sscanf: enough for a figlet font header (decimal integers) plus
+ * %c/%s/%x, with whitespace skipping, `*' suppression and field widths.
+ * Returns the number of fields assigned.
  */
 static int
 isspc(int c)
@@ -1285,12 +1239,10 @@ sscanf(const char *str, const char *fmt, ...)
 /* ---- getopt ------------------------------------------------------------- */
 
 /*
- * The classic BSD getopt.  optind/optarg/opterr/optopt are exported globals --
- * figlet binds to optind/optarg and reads them between calls, while getopt (in
- * this library) writes the same storage.  `g_place` is our private scan cursor.
- * optreset is the BSD re-scan protocol: a shell's getopts builtin sets it (with
- * optind) to parse a fresh vector, and getopt clears it after dropping the
- * stale cursor.
+ * BSD getopt.  optind/optarg/opterr/optopt are exported globals that
+ * binaries read between calls.  `g_place' is our scan cursor.  optreset is
+ * the BSD re-scan protocol: a shell's getopts sets it (with optind) for a
+ * fresh vector, and getopt clears it after dropping the cursor.
  */
 int	 opterr = 1;
 int	 optind = 1;
@@ -1360,23 +1312,16 @@ getopt(int argc, char *const argv[], const char *optstring)
 /* ---- filesystem metadata: stat / readdir over the private backchannel --- */
 
 /*
- * There used to be a path_abs() here, rewriting "." and "./x" into absolute
- * paths before the syscall, and its own comment admitted why: the kernel had
- * no working directory to consult, so "this is the only place that knows the
- * cwd is a fiction."  It is gone because the fiction is.  The kernel resolves
- * relative paths against the calling task's real working directory now, which
- * is the only place that CAN resolve them correctly -- "../x" needs to know
- * where you actually are, and this side never did.
+ * Relative paths go to the kernel as they are: it resolves them against
+ * the task's working directory.
  */
 
 /*
- * The kernel reports filesystem metadata in these small neutral structs (the
- * style9-private class-0x2A calls fill them); this file then shapes them into
- * the macOS ABI the binary expects.  The layouts mirror kern/fs.h exactly -- a
- * private kernel<->libSystem wire format, never seen by an Apple binary, and
- * deliberately saying nothing about WHICH filesystem answered.  The asserts
- * are the same ones the kernel header carries: two hand-written copies of a
- * layout drift, and a drifted copyout would be silent.
+ * The kernel reports file metadata in these neutral structs (filled by the
+ * style9-private class-0x2A calls), which this file shapes into the macOS
+ * ABI.  They mirror fs/fs.h: a private kernel<->libSystem wire format that
+ * says nothing about which filesystem answered.  The asserts repeat the
+ * kernel's, since a drifted copy would fail silently.
  */
 #define	FS_NAME_MAX	256
 
@@ -1413,7 +1358,7 @@ s9_fs_stat(const char *path, struct fs_statbuf *sb)
 	return (bsd_call(0x2A000002, (long)path, (long)sb, 0));
 }
 
-/* fs_readdir backchannel: fills *out; returns 1 (entry), 0 (end), -1 (error). */
+/* fs_readdir backchannel: fills *out; 1 (entry), 0 (end), -1 (error). */
 static long
 s9_fs_readdir(const char *path, uint32_t index, struct fs_dirent *out)
 {
@@ -1422,10 +1367,9 @@ s9_fs_readdir(const char *path, uint32_t index, struct fs_dirent *out)
 }
 
 /*
- * uname backchannel: the kernel reports its (fabricated) identity card in this
- * neutral struct -- layout mirrors kern/darwin.h's struct darwin_uname exactly.
- * uname(3) below reshapes it into Apple's struct utsname.  Returns 0, or -1
- * (carry set) only if the pointer faults.
+ * uname backchannel: the kernel's Darwin identity, in kern/darwin.h's
+ * struct darwin_uname layout; uname(3) reshapes it into struct utsname.
+ * Fails (-1) only if the pointer faults.
  */
 #define	DARWIN_UNAME_FIELD	128
 
@@ -1444,22 +1388,15 @@ s9_uname(struct darwin_uname *out)
 }
 
 /*
- * stat$INODE64 / lstat$INODE64: a binary stat()s a path and reads st_mode (is
- * it a directory?), st_size, and st_ino (a path walker keys cycle detection on
- * st_ino).  We fill the macOS INODE64 struct stat layout here -- st_mode@4,
- * st_ino@8, st_size@96, ... -- so the ABI knowledge lives in libSystem while
- * the kernel reports only the neutral fs_statbuf.  The import names hold a
- * '$' no C identifier can spell, so ordinary functions are aliased onto them;
- * the read-only FS has no symlinks, so lstat is just stat.
+ * stat$INODE64 / lstat$INODE64 fill the macOS INODE64 struct stat
+ * (st_mode@4, st_ino@8, st_size@96, ...) from the neutral fs_statbuf, so
+ * the ABI knowledge lives here.  Path walkers key cycle detection on
+ * st_ino.  The names contain a '$' no C identifier can spell, hence the
+ * asm aliases.  There are no symlinks, so lstat is stat.
  *
- * The permission bits, owner, link count and four timestamps used to be
- * invented here -- every file 0644, every directory 0755, every date the
- * epoch -- because the kernel reported only size, inode and a directory flag.
- * It now reports what the volume actually records, so this stops guessing;
- * `ls -l` prints the mode APFS stored and the day the file was written.
- * Where a filesystem genuinely has nothing to say (FAT has no owner) the
- * invention happens in the kernel, at the layer that knows which volume
- * answered, rather than here where it would apply to both.
+ * Mode, owner, link count and timestamps are what the volume records;
+ * where a filesystem has none (FAT has no owner) the kernel, which knows
+ * the volume, supplies a default.
  */
 #define	STAT_BUF_SIZE	144		/* the $INODE64 struct stat */
 
@@ -1483,9 +1420,8 @@ stat_shape(const struct fs_statbuf *sb, void *buf)
 	*(uint32_t *)(p + 16)  = sb->fs_uid;
 	*(uint32_t *)(p + 20)  = sb->fs_gid;
 	/*
-	 * The four timespecs.  The kernel reports one nanosecond count per
-	 * time; splitting it into (seconds, nanoseconds) is this layer's job
-	 * because the split is Apple's struct, not the filesystem's fact.
+	 * The four timespecs: the kernel reports nanoseconds; the (sec,
+	 * nsec) split is Apple's struct, so it is done here.
 	 */
 	*(int64_t *)(p + 32)   = (int64_t)(sb->fs_atime_ns / 1000000000ULL);
 	*(int64_t *)(p + 40)   = (int64_t)(sb->fs_atime_ns % 1000000000ULL);
@@ -1520,14 +1456,12 @@ lstat_inode64(const char *path, void *buf)
 }
 
 /*
- * stat64/lstat64/fstat64: the pre-INODE64 symbol names.  Same struct
- * layout as the $INODE64 variants (both are the 144-byte 64-bit-inode
- * form), just the older exported spelling -- a binary built against a
- * lower deployment target (dash) binds these.  fstat64 classifies an OPEN
- * fd via the fs_fstat backchannel: the kernel says reg/chr/fifo in a
- * neutral struct and the S_IF* spelling happens here.
+ * stat64/lstat64/fstat64: the older names for the same 144-byte
+ * 64-bit-inode struct, bound by binaries built for a lower deployment
+ * target (dash).  fstat64 asks the fs_fstat backchannel what kind of thing
+ * an open fd is and spells it as S_IF* here.
  */
-struct s9_fdstat {			/* mirrors kern/darwin.h */
+struct s9_fdstat {			/* kern/darwin.h's darwin_fdstat */
 	uint64_t	fds_ino;
 	uint32_t	fds_size;
 	uint8_t		fds_kind;	/* 0 reg / 1 chr / 2 fifo / 3 dir */
@@ -1582,9 +1516,8 @@ fstat64(int fd, void *buf)
 }
 
 /*
- * fstat$INODE64: the same call under the name a binary built against a modern
- * deployment target imports.  Both spellings describe the identical 144-byte
- * struct -- INODE64 was about widening ino_t, which this layout already is.
+ * fstat$INODE64: the modern deployment target's name for the same call and
+ * the same 144-byte struct.
  */
 int	fstat_inode64(int fd, void *buf) __asm__("_fstat$INODE64");
 
@@ -1596,10 +1529,9 @@ fstat_inode64(int fd, void *buf)
 }
 
 /*
- * faccessat: existence (and on this FS, any-permission) probe.  dash tests
- * X_OK on PATH candidates; present == executable on a volume where
- * everything readable is runnable-or-openable.  Only AT_FDCWD-relative
- * absolute paths exist here, so dirfd is moot.
+ * faccessat: an existence probe; any file present passes any mode (dash
+ * tests X_OK on PATH candidates).  dirfd is ignored: the path is resolved
+ * as given, absolute or against the working directory.
  */
 int
 faccessat(int dirfd, const char *path, int mode, int flags)
@@ -1617,12 +1549,11 @@ faccessat(int dirfd, const char *path, int mode, int flags)
 /* ---- directory streams (opendir / readdir / closedir) ------------------- */
 
 /*
- * opendir/readdir/closedir over the fs_readdir backchannel.  An Apple binary
- * (tree(1)) imports the $INODE64 variants and treats DIR as opaque, so the
- * layout is ours: just the directory path and the next index.  The kernel side
- * is stateless -- we pass (path, index) and bump index -- and readdir returns a
- * pointer to a single embedded struct dirent it refills each call, exactly as
- * readdir(3) returns a pointer to internal storage.
+ * opendir/readdir/closedir over the fs_readdir backchannel.  Binaries
+ * import the $INODE64 variants and treat DIR as opaque, so its layout is
+ * ours: a path and the next index.  The kernel side is stateless; readdir
+ * refills one embedded struct dirent per call, as readdir(3) returns
+ * internal storage.
  */
 #define	DT_DIR	4
 #define	DT_REG	8
@@ -1689,15 +1620,11 @@ readdir_inode64(DIR *dp)
 }
 
 /*
- * THE FD-RELATIVE FAMILY, all of it built on one question to the kernel:
- * WHAT PATH IS THIS DESCRIPTOR ON.
- *
- * openat, fdopendir, fchdir and fchmod are the same request in four
- * vocabularies, and a kernel with vnodes would answer none of them by name.
- * This one has no vnodes and remembers the path an fd was opened by, so the
- * whole family reduces to "ask, then call the plain version" -- which is
- * honest as long as nothing can rename a file out from under an open
- * descriptor, and nothing here can yet.
+ * The fd-relative family (openat, fdopendir, fchdir, fchmod) rests on one
+ * kernel question: what path was this descriptor opened by?  With no
+ * vnodes, each asks and then calls the plain version.  A file renamed
+ * since the open still answers with its old name (see darwin_s9_fs_fdpath
+ * in kern/darwin.c).
  *
  * s9_fs_fdpath returns the length or -1 with errno set.
  */
@@ -1714,9 +1641,8 @@ s9_fs_fdpath(int fd, char *buf, size_t cap)
 }
 
 /*
- * Join a directory fd and a relative name into one path.  AT_FDCWD and an
- * absolute name both mean "the fd is not part of the answer", which is the
- * case almost every caller actually takes.
+ * Join a directory fd and a relative name into one path.  With AT_FDCWD
+ * or an absolute name the fd plays no part.
  */
 #define	AT_FDCWD	(-2)
 
@@ -1771,11 +1697,9 @@ openat(int fd, const char *path, int flags, ...)
 DIR	*fdopendir_inode64(int fd) __asm__("_fdopendir$INODE64");
 
 /*
- * fdopendir: a directory stream from a descriptor.  The fd is CLOSED here
- * rather than remembered, because our DIR is a path and an index and has
- * nothing to do with a descriptor afterwards -- and because closedir(3) is
- * documented to close what fdopendir was given, so a caller that goes on to
- * use the fd is relying on something no system promises.
+ * fdopendir: a directory stream from a descriptor.  Our DIR is a path and
+ * an index, so the fd is closed now rather than at closedir(3), which owns
+ * it by contract anyway.
  */
 DIR *
 fdopendir_inode64(int fd)
@@ -1802,21 +1726,11 @@ fchdir(int fd)
 }
 
 /*
- * dirfd / fstatat: how a directory walker asks about an entry it just read.
- *
- * ls(1) does not stat "path/name" -- it opens the directory once and then
- * calls fstatat(dirfd(dirp), name, ...) per entry, which is the *at family's
- * whole point: the directory is named by an open descriptor rather than by a
- * path that could be replaced underneath the walk.
- *
- * This kernel has no *at syscalls and no descriptor for a directory: our
- * opendir is a path plus an index, and the DIR already remembers the path.
- * So a dirfd here is a token that finds the DIR again, and fstatat joins its
- * remembered path to the name.  That gives up exactly what *at was invented
- * to provide -- atomicity against a directory being moved mid-walk -- which
- * costs nothing on a read-only volume where no directory can move.  It is
- * worth naming the trade rather than letting the table look like an
- * implementation detail.
+ * dirfd / fstatat: ls(1) opens a directory once and calls
+ * fstatat(dirfd(dirp), name, ...) per entry.  Our DIR is not a descriptor,
+ * so a dirfd is a token that finds the DIR again, and fstatat joins the
+ * DIR's path to the name.  That gives up what *at exists for: a directory
+ * renamed mid-walk is not followed.
  */
 #define	DIRFD_BASE	0x7D00		/* far above any real fd number */
 #define	DIRFD_SLOTS	16
@@ -1847,11 +1761,9 @@ dirfd(DIR *dp)
 }
 
 /*
- * Joining a directory descriptor's path to a relative name is this side's
- * job and stays here: a dirfd is a libSystem construct (dirfd_tab above), so
- * the kernel has never heard of it.  Distinct from the working directory,
- * which the kernel now owns -- AT_FDCWD below just hands the name straight
- * through and lets it resolve there.
+ * A dirfd is a libSystem construct (dirfd_tab), unknown to the kernel, so
+ * the join happens here.  AT_FDCWD passes the name through for the kernel
+ * to resolve against the working directory.
  */
 #define	AT_PATH_MAX	1024
 
@@ -2055,9 +1967,8 @@ strtoul(const char *s, char **end, int base)
 }
 
 /*
- * strtol: the signed sibling of strtoul.  Consume an optional sign, convert the
- * magnitude with strtoul, then apply it.  gmp uses this to parse small decimal
- * fields; the LONG_MIN/MAX saturation a full libc does is unneeded here.
+ * strtol: sign, then strtoul for the magnitude.  No LONG_MIN/MAX
+ * saturation; gmp only parses small decimal fields with it.
  */
 long
 strtol(const char *s, char **end, int base)
@@ -2078,7 +1989,7 @@ strtol(const char *s, char **end, int base)
 	return (neg ? -(long)v : (long)v);
 }
 
-/* __strcpy_chk: clang's _FORTIFY_SOURCE strcpy.  Bounded so it cannot overrun. */
+/* __strcpy_chk: _FORTIFY_SOURCE strcpy, bounded so it cannot overrun. */
 char *
 __strcpy_chk(char *dst, const char *src, size_t dstlen)
 {
@@ -2107,11 +2018,8 @@ mbstowcs(wchar_t *pwcs, const char *s, size_t n)
 }
 
 /*
- * wcrtomb: one wide character back into bytes.  Single-byte locale, so the
- * answer is one byte or it is an error -- and the error is the honest one:
- * a program asking for U+00FF+ in the C locale is asking for something this
- * encoding cannot say.  The NULL form is the standard's way of asking how
- * many bytes a shift sequence back to the initial state costs; here, none.
+ * wcrtomb: single-byte locale, so one byte or EILSEQ for anything above
+ * 0xFF.  With s == NULL it returns 1: a NUL and no shift sequence.
  */
 size_t
 wcrtomb(char *s, wchar_t wc, void *ps)
@@ -2129,17 +2037,10 @@ wcrtomb(char *s, wchar_t wc, void *ps)
 }
 
 /*
- * frexp/ldexp, and their long-double spellings.
- *
- * gnulib's printf pulls these in to lay out a floating-point conversion; stty
- * imports all four and, printing no floats, calls none of them -- but an
- * import must RESOLVE whether or not it is ever called, so they are real
- * rather than stubs that abort.
- *
- * Done by multiplication rather than by taking the exponent field apart.
- * Every step is a power of two, so nothing is rounded away and the answer is
- * exact; the cost is a loop proportional to the exponent, which for any value
- * a printf is handed is a handful of turns.
+ * frexp/ldexp and the long-double versions, imported via gnulib's printf
+ * (stty binds all four).  An import must resolve even if never called, so
+ * they are real.  Scaling by powers of two is exact; the loop is linear in
+ * the exponent.
  */
 double
 frexp(double x, int *e)
@@ -2303,10 +2204,8 @@ fgets(char *s, int size, FILE *fp)
 }
 
 /*
- * Read side of stdio.  Our streams are unbuffered, so getc/__srget reduce to a
- * single-byte read; a one-slot pushback backs ungetc.  factor invoked with
- * command-line operands never reads a stream, but gmp imports these, so they
- * must bind -- and behave if some other input path reaches them.
+ * Read side of stdio.  Streams are unbuffered, so getc/__srget are a
+ * one-byte read; a one-slot pushback backs ungetc.
  */
 int
 fgetc(FILE *fp)
@@ -2337,10 +2236,9 @@ getc(FILE *fp)
 }
 
 /*
- * __srget: the refill hook of Apple's inlined getc() macro, which has just
- * decremented _r below zero to get here.  Re-pin _r at 0 FIRST -- that is
- * what keeps the next inlined getc funneling back into this function
- * instead of dereferencing the fake buffer pointer -- then read.
+ * __srget: the refill hook of Apple's inlined getc(), which decremented _r
+ * below zero to get here.  Re-pin _r at 0 first, so the next inlined getc
+ * comes back here instead of dereferencing the fake buffer pointer.
  */
 int
 __srget(FILE *fp)
@@ -2374,9 +2272,8 @@ ferror(FILE *fp)
 }
 
 /*
- * fscanf: gmp links it for formatted input, but factor on the command line
- * never reaches a scan.  With no scan engine we report input failure (EOF) so a
- * caller sees "nothing matched" rather than undefined behaviour.
+ * fscanf: gmp imports it; factor with operands never calls it.  No scan
+ * engine: always EOF (input failure).
  */
 int
 fscanf(FILE *fp, const char *fmt, ...)
@@ -2390,20 +2287,16 @@ fscanf(FILE *fp, const char *fmt, ...)
 /* ---- POSIX / locale stubs (present so the bind resolves) ---------------- */
 
 /*
- * Minimal answers for a read-only, single-user, C-locale system: no passwd or
- * group database, no symlinks, no real-time clock, one charset.  Each returns
- * the neutral value that makes a CLI tool fall back to its numeric / ASCII /
- * epoch path -- enough for the bind to resolve and the tool to run.
+ * Minimal answers for a single-user, C-locale system with no passwd or group
+ * database and no symlinks.  Each returns the neutral value that sends a
+ * tool down its numeric / ASCII path.
  */
 int	__mb_cur_max = 1;		/* C locale: single-byte encoding */
 
 /*
- * isatty: classify an open fd via the fs_fstat backchannel.  The kernel
- * reports a console fd (implicit stdin/out/err, or an explicit CONSOLE
- * slot) as DARWIN_FDSTAT_CHR; a character device is a tty as far as a CLI
- * binary cares (interactive prompts, line-buffered output).  Files, pipes,
- * and bad fds are not ttys -- ENOTTY / EBADF.  An honest answer here is
- * what flips a no-argument dash into its interactive REPL.
+ * isatty: the fs_fstat backchannel reports a console fd as
+ * DARWIN_FDSTAT_CHR, which counts as a tty; files, pipes and bad fds do
+ * not.  This is what puts a no-argument dash into interactive mode.
  */
 int
 isatty(int fd)
@@ -2425,17 +2318,12 @@ setlocale(int category, const char *locale)
 }
 
 /*
- * nl_langinfo(3): the locale's names for things.
+ * nl_langinfo(3): the C locale's names.  gnulib's strftime, which coreutils
+ * formats dates with, takes %b from ABMON_1 + tm_mon, so `ls -l' needs them.
  *
- * This returned "" for everything but the codeset until gls asked, and the
- * consequence was visible rather than theoretical: gnulib's strftime -- which
- * is what coreutils formats dates with -- gets the month abbreviation for %b
- * from ABMON_1 + tm_mon, so `ls -l` printed a blank where every month should
- * have been.  The C locale HAS these names; not returning them was the bug.
- *
- * The item numbers are Apple's <langinfo.h>, which is BSD's: CODESET 0, then
- * the date and time formats, AM/PM, seven day names, seven abbreviations,
- * twelve month names, twelve abbreviations.
+ * Item numbers are Apple's <langinfo.h> (BSD's): CODESET 0, the date and
+ * time formats, AM/PM, seven day names, seven abbreviations, twelve month
+ * names, twelve abbreviations.
  */
 #define	NL_CODESET	0
 #define	NL_D_T_FMT	1
@@ -2531,7 +2419,7 @@ readlink(const char *path, char *buf, size_t bufsize)
 	(void)path;
 	(void)buf;
 	(void)bufsize;
-	return (-1);			/* no symlinks on the read-only FS */
+	return (-1);			/* no symlinks */
 }
 
 char	*realpath_extsn(const char *path, char *resolved)
@@ -2543,7 +2431,7 @@ realpath_extsn(const char *path, char *resolved)
 	char	*out;
 	size_t	 i;
 
-	/* Identity: our paths are already canonical (no symlinks, no ".."). */
+	/* Identity: no symlinks; "." and ".." are not resolved. */
 	out = resolved != NULL ? resolved : (char *)malloc(1024);
 	if (out == NULL)
 		return (NULL);
@@ -2554,12 +2442,11 @@ realpath_extsn(const char *path, char *resolved)
 }
 
 /*
- * Wall clock.  The kernel reads the CMOS RTC once at boot and reports the
- * anchor plus elapsed uptime, so these are cheap and monotonic.  UTC only --
- * no timezone database exists on this system, and gettimeofday's second
- * argument has been ignored by real systems for decades.
+ * Wall clock: the kernel's boot-time RTC anchor plus uptime, so cheap and
+ * monotonic; EPERM if there was no usable RTC.  UTC only, no timezone
+ * database; gettimeofday's second argument is ignored, as everywhere.
  */
-struct s9_timeval {			/* mirrors kern/darwin.h exactly */
+struct s9_timeval {			/* kern/darwin.h's darwin_timeval */
 	long		tv_sec;
 	int		tv_usec;
 	int		tv_pad;
@@ -2582,21 +2469,16 @@ time(long *t)
 	struct s9_timeval	tv;
 
 	if (gettimeofday(&tv, (void *)0) != 0)
-		tv.tv_sec = 0;		/* no clock: (time_t)-1 is the C answer,
-					   but 0 is what our callers can print */
+		tv.tv_sec = 0;		/* no clock: 0, not C's (time_t)-1 */
 	if (t != NULL)
 		*t = tv.tv_sec;
 	return (tv.tv_sec);
 }
 
 /*
- * clock_gettime.  Every clock id gets the same answer here, and that is a
- * fact about this system rather than a shortcut: the kernel's wall time IS
- * uptime plus a boot-time anchor that nothing can change afterwards, so it
- * already has the property MONOTONIC exists to promise -- it cannot be
- * stepped, slewed, or set backwards.  The only difference from a textbook
- * MONOTONIC clock is which instant counts as zero, and a program measuring an
- * interval subtracts two readings and never notices.
+ * clock_gettime: every clock id gets the same answer.  Wall time is uptime
+ * plus a boot-time anchor nothing can change, so it cannot be stepped or
+ * set back -- what MONOTONIC promises; only its zero differs.
  */
 struct s9_timespec {
 	long	tv_sec;
@@ -2629,17 +2511,13 @@ strftime(char *s, size_t max, const char *fmt, const void *tm)
 	return (0);
 }
 
-/* ---- guname rung: the machine-identity trick + the libc it pulls in ------ */
+/* ---- uname, and the libc guname pulls in -------------------------------- */
 
 /*
- * guname (GNU coreutils' uname, a real Apple x86-64 bottle) asks the system
- * what it is and prints the answer.  The whole illusion rides on uname(3): we
- * fetch the kernel's fabricated identity card and reshape it into Apple's
- * struct utsname.  guname does not validate a single field -- it cannot tell it
- * is not on a Mac, because it never asks anything but uname().  The remaining
- * symbols below are the small, ordinary libc guname drags in (the bind needs
- * every name present); each is a complete implementation, not a stub, except
- * where a read-only single-user C-locale system has nothing real to return.
+ * uname(3) reshapes the kernel's Darwin identity into Apple's struct
+ * utsname; guname prints it unchecked.  The symbols after it are the
+ * ordinary libc guname imports, each a real implementation unless there is
+ * nothing real to return.
  */
 
 #define	_SYS_NAMELEN	256
@@ -2690,15 +2568,12 @@ __error(void)
 }
 
 /*
- * mmap(2) / munmap(2).
+ * mmap(2) / munmap(2), through the six-argument wrapper (also used by
+ * select and pselect).  SYSCALL clobbers %rcx, so the fourth argument
+ * (flags) travels in %r10, and fd and offset in %r8 and %r9, as Apple's
+ * stubs load them.
  *
- * The only six-argument syscall in this file, and the argument that makes it
- * six is the one the SYSCALL instruction cannot carry in %rcx -- so arg3
- * (flags) travels in %r10, and args 4 and 5 (fd, offset) in %r8 and %r9,
- * exactly as Apple's stubs load them.
- *
- * Failure is MAP_FAILED, not NULL: address zero is a legal mapping in
- * principle, so mmap has never been allowed to use it as the error value.
+ * Failure is MAP_FAILED, not NULL: address zero is a legal mapping.
  */
 static long
 bsd_call6_e(long nr, long a, long b, long c, long d, long e, long f)
@@ -2745,18 +2620,9 @@ munmap(void *addr, size_t len)
 }
 
 /*
- * ioctl: the terminal requests, handed to the kernel.
- *
- * This used to refuse everything with ENOTTY, on the grounds that nothing here
- * was a terminal in the sense a device ioctl means.  The console is one now --
- * it has a termios the kernel keeps and a size it can be asked for -- so the
- * call goes through, and the refusals come from the kernel, which is the only
- * place that knows whether a given descriptor is a terminal at all.  A file
- * and a pipe still get ENOTTY, and that is what gcat and gls are written for:
- * both ask, and both take the non-terminal path when told no.
- *
- * The third argument is a pointer for every request that reaches here; taking
- * it as one is what the variadic declaration is hiding.
+ * ioctl: passed to the kernel, which knows whether the fd is a terminal (a
+ * file or pipe gets ENOTTY, and gcat and gls take their non-terminal paths).
+ * The variadic third argument is a pointer for every request used here.
  */
 int
 ioctl(int fd, unsigned long request, ...)
@@ -2771,9 +2637,8 @@ ioctl(int fd, unsigned long request, ...)
 }
 
 /*
- * MB_CUR_MAX on modern macOS expands to (___mb_cur_max()) -- a CALL, not the
- * legacy `int __mb_cur_max` data symbol we also export above.  C/US-ASCII
- * locale: one byte per character.
+ * MB_CUR_MAX on modern macOS is a call to ___mb_cur_max(), not the legacy
+ * `int __mb_cur_max' also exported above.  One byte per character.
  */
 int
 ___mb_cur_max(void)
@@ -2825,9 +2690,9 @@ __assert_rtn(const char *func, const char *file, int line, const char *expr)
 }
 
 /*
- * raise: we deliver no signals.  raise(SIGABRT) must still terminate -- it is
- * how abort(3) is specified to act -- so route it to abort; any other signal is
- * a no-op success (there is no handler to run).
+ * raise: SIGABRT must terminate, as abort(3) is specified to, so it goes to
+ * abort.  Any other signal is not sent: raise returns 0 without running a
+ * handler, although kill(2) below does deliver signals.
  */
 int
 raise(int sig)
@@ -2879,11 +2744,7 @@ memcmp(const void *a, const void *b, size_t n)
 	return (0);
 }
 
-/*
- * memmove: copy n bytes, correct even when the regions overlap.  gmp's mpn
- * shifting and gfactor both pull it in; memcpy alone is not enough because the
- * source and destination can alias.
- */
+/* memmove: copy n bytes; the regions may overlap (gmp's mpn shifts do). */
 void *
 memmove(void *dst, const void *src, size_t n)
 {
@@ -2906,9 +2767,8 @@ memmove(void *dst, const void *src, size_t n)
 }
 
 /*
- * __memmove_chk / __memset_chk: clang's _FORTIFY_SOURCE wrappers.  When the
- * compiler cannot size the destination it passes (size_t)-1, so the check is a
- * no-op; a genuine overflow (n > dstlen) aborts, as real Darwin does.
+ * __memmove_chk / __memset_chk: _FORTIFY_SOURCE wrappers.  An unsized
+ * destination comes as (size_t)-1; n > dstlen aborts, as on Darwin.
  */
 void *
 __memmove_chk(void *dst, const void *src, size_t n, size_t dstlen)
@@ -2944,7 +2804,7 @@ strspn(const char *s, const char *set)
 	return (i);
 }
 
-/* Length of the leading run of *s consisting of bytes NOT in `set`. */
+/* Length of the leading run of *s consisting of bytes not in `set'. */
 size_t
 strcspn(const char *s, const char *set)
 {
@@ -2987,12 +2847,9 @@ lseek(int fd, long off, int whence)
 }
 
 /*
- * Public read(2)/close(2)/open(2): until the process rung, every consumer
- * went through stdio and only the s_* internals existed.  pipefork reads
- * its pipe end raw, shell-shaped tools close fds they dup2'd away, and a
- * shell open(2)s its script file directly -- through the errno-recording
- * trap wrapper (defined with the process-control section below) so its
- * "cannot open x" diagnostics name the real reason.
+ * Public read(2)/close(2)/open(2).  open goes through the errno-recording
+ * wrapper (defined with process control below), so a shell's "cannot open"
+ * names the real reason.
  */
 static long	bsd_call_e(long nr, long a, long b, long c);
 
@@ -3011,12 +2868,9 @@ close(int fd)
 }
 
 /*
- * open(2).  The third argument exists only when O_CREAT (0x200) is in the
- * flags, and then it is the mode the file is made with, less the umask --
- * which the kernel subtracts.  It used to be dropped here and 0 sent in its
- * place, so every file a shell made with `>` came out mode 0000: readable
- * by root, which is everyone, and invisible as a defect for exactly that
- * reason.
+ * open(2).  The third argument exists only with O_CREAT (0x200): the
+ * creation mode, from which the kernel subtracts the umask.  It must be
+ * passed on, or `>' makes files mode 0000.
  */
 int
 open(const char *path, int flags, ...)
@@ -3034,9 +2888,8 @@ open(const char *path, int flags, ...)
 }
 
 /*
- * fsync (Darwin #95): the promise write(2) does not carry.  The kernel
- * batches mutations and publishes them by policy; a 0 from here means the
- * policy was made to pay up and this descriptor's writes are on the platter.
+ * fsync (Darwin #95).  The kernel batches mutations and publishes them by
+ * policy; 0 from here means this descriptor's writes are on disk.
  */
 int
 fsync(int fd)
@@ -3046,11 +2899,10 @@ fsync(int fd)
 }
 
 /*
- * fcntl: F_DUPFD (cmd 0) has real semantics -- a shell parks its saved std
- * fds at 10+ with it around redirections -- so it travels to the kernel
- * (Darwin #92), which duplicates the slot at the lowest free fd >= arg.
- * The flag commands stay accepted-and-ignored: there is nothing to set on
- * this fd table.
+ * fcntl (Darwin #92).  Every command goes to the kernel, which implements
+ * F_DUPFD and F_DUPFD_CLOEXEC (lowest free fd >= arg; a shell parks its
+ * saved std fds at 10+ this way) and answers the flag commands itself.
+ * Answering here would hand back a fake 0, and 0 is a valid fd.
  */
 int
 fcntl(int fd, int cmd, ...)
@@ -3061,13 +2913,6 @@ fcntl(int fd, int cmd, ...)
 	__builtin_va_start(ap, cmd);
 	arg = __builtin_va_arg(ap, long);
 	__builtin_va_end(ap);
-	/*
-	 * Every command travels to the kernel -- it knows which ones carry
-	 * semantics (F_DUPFD and its CLOEXEC twin) and answers the flag
-	 * commands itself.  Swallowing a command here would hand the caller
-	 * a fake 0, and 0 is a valid fd: dash once "moved" its script to
-	 * stdin that way.
-	 */
 	return ((int)bsd_call_e(0x200005C, fd, cmd, arg));
 }
 
@@ -3148,9 +2993,8 @@ vfprintf(FILE *fp, const char *fmt, __builtin_va_list ap)
 }
 
 /*
- * vsprintf: unbounded formatted write into `dst`.  We have no way to know the
- * buffer size, so the cap is SIZE_MAX -- gmp's callers size dst from the value
- * being printed, the same trust the real vsprintf extends.
+ * vsprintf: unbounded, as everywhere; gmp's callers size dst from the
+ * value being printed.
  */
 int
 vsprintf(char *dst, const char *fmt, __builtin_va_list ap)
@@ -3160,12 +3004,10 @@ vsprintf(char *dst, const char *fmt, __builtin_va_list ap)
 }
 
 /*
- * set/getprogname(): the program's short name, the one every coreutils
- * diagnostic prefixes itself with.  Our dyld calls setprogname with argv[0]
- * before entering LC_MAIN, which is where a real system does it too -- Darwin
- * has no crt0 doing this either; libSystem's own init takes it off the handoff
- * stack.  Until then the name is a placeholder rather than a lie about which
- * program is speaking.
+ * set/getprogname(): the short name coreutils prefixes diagnostics with.
+ * Our dyld calls setprogname with argv[0] before LC_MAIN (on Darwin,
+ * libSystem's initialiser takes it off the handoff stack); until then it
+ * is a placeholder.
  */
 static const char	*g_progname = "darwin";
 
@@ -3190,11 +3032,7 @@ getprogname(void)
 	return (g_progname);
 }
 
-/*
- * XSI strerror_r.  There is a real errno table further down this file; this
- * used to answer "Unknown error" to everything, which turned a program's
- * perfectly good diagnostic into a shrug.
- */
+/* XSI strerror_r, over the errno table further down. */
 char	*strerror(int errnum);
 
 int
@@ -3215,9 +3053,9 @@ strerror_r(int errnum, char *buf, size_t buflen)
 /* ---- stack protector ---------------------------------------------------- */
 
 /*
- * The canary: figlet's prologues load ___stack_chk_guard and its epilogues
- * compare.  Any consistent value works since both sides read this one global;
- * a real system randomises it at startup, which we have no entropy source for.
+ * The canary that protected prologues load and epilogues compare.  Any
+ * constant works; a real system randomises it, and we have no entropy
+ * source.
  */
 void	*__stack_chk_guard = (void *)0x595e9fbd94fda766ULL;
 
@@ -3230,13 +3068,11 @@ __stack_chk_fail(void)
 }
 
 /*
- * ____chkstk_darwin: the stack-probe thunk clang emits ahead of a large or
- * variable-length frame.  Its contract is to probe (touch) the requested span
- * -- passed in %rax -- below %rsp, preserving every register including %rax (the
- * caller subtracts it from %rsp afterward) and never touching %rsp itself.  Our
- * ring-3 stack is fully pre-mapped (no demand-paged guard region to fault in),
- * so probing is unnecessary: a bare `ret` is a correct, register-clean thunk as
- * long as the frame fits the mapped stack -- which the launcher sizes for.
+ * ____chkstk_darwin: the stack probe clang emits before a large or
+ * variable-length frame.  It must touch the span in %rax below %rsp and
+ * preserve every register, %rax and %rsp included.  Our ring-3 stack is
+ * fully pre-mapped with no guard region, so a bare `ret' is correct as
+ * long as the frame fits the stack the launcher maps.
  */
 __asm__(
 	".text\n"
@@ -3246,11 +3082,9 @@ __asm__(
 );
 
 /*
- * dyld_stub_binder lives in libdyld inside Apple's libSystem umbrella and is
- * the target of classic lazy-binding stubs.  We bind with chained fixups,
- * which need no stub binder, so this is vestigial -- but exporting it keeps
- * the link working regardless of fixup mode, and our dyld binds eagerly, so
- * it is never actually entered.
+ * dyld_stub_binder (libdyld, in Apple's libSystem umbrella) is the target
+ * of classic lazy-binding stubs.  Exported so such binaries bind; our dyld
+ * resolves lazy binds eagerly, so it is never entered.
  */
 __asm__(
 	".globl dyld_stub_binder\n"
@@ -3263,12 +3097,10 @@ __asm__(
 /* ---- process control (fork / exec / wait / pipes) ------------------------ */
 
 /*
- * Carry-capturing BSD syscalls that also set errno.  The process-control
- * wrappers below report failure through the errno protocol -- coreutils'
- * gnulib branches on ENOENT vs EACCES after a failed exec, on ECHILD
- * after wait -- unlike the early fd routines (bsd_call) that predate
- * g_errno.  The 4-argument form loads %r10, the SYSCALL slot for arg3
- * (wait4's rusage pointer).
+ * Carry-capturing BSD syscalls that set errno (gnulib branches on ENOENT
+ * vs EACCES after exec, on ECHILD after wait).  bsd_call_e is the same as
+ * bsd_call above.  The 4-argument form loads %r10, the SYSCALL slot for
+ * the fourth argument (wait4's rusage pointer).
  */
 static long
 bsd_call_e(long nr, long a, long b, long c)
@@ -3311,14 +3143,12 @@ bsd_call4_e(long nr, long a, long b, long c, long d)
 }
 
 /*
- * fork(2).  The kernel rebuilds the child's register file from almost
- * nothing: the child re-enters userspace at the instruction after this
- * `syscall` with only %rax (= 0), %rsp, and %rip guaranteed.  That is
- * exactly the C ABI's caller-save set gone -- so the wrapper parks the
- * six callee-saved registers on the stack first.  The address-space copy
- * duplicates that stack, and parent and child alike restore from their
- * own copy on the way out.  Carry set means no child: errno in %rax,
- * fold to -1 via fork_fail (kept out-of-line so the hot path is pop+ret).
+ * fork(2).  The child re-enters ring 3 after this `syscall' with only
+ * %rax (= 0), %rsp and %rip guaranteed, so the wrapper saves the six
+ * callee-saved registers on the stack first; the address-space copy
+ * duplicates them and each side restores its own.  Carry set means no
+ * child: errno in %rax, folded to -1 by fork_fail (out of line so the
+ * normal path is pop+ret).
  */
 long
 fork_fail(long err)
@@ -3356,10 +3186,8 @@ __asm__(
 extern int	fork(void);
 
 /*
- * vfork: with a full-copy fork underneath, fork semantics are a strict
- * superset of what a vfork caller may rely on (child and parent own
- * private stacks, so the child's "until it execs" window cannot scribble
- * on the parent).
+ * vfork: fork gives more than a vfork caller may rely on (the child has
+ * its own copy of the address space and cannot scribble on the parent).
  */
 int
 vfork(void)
@@ -3385,9 +3213,9 @@ execv(const char *path, char *const argv[])
 }
 
 /*
- * execvp: PATH search collapses to a single try -- the kernel resolves
- * the final path component against its program registry, so a bare name
- * and any absolute spelling land on the same image.
+ * execvp: no PATH search needed: the kernel resolves the final path
+ * component in its program registry, so a bare name and any absolute
+ * spelling reach the same image.
  */
 int
 execvp(const char *file, char *const argv[])
@@ -3419,10 +3247,9 @@ wait(int *status)
 }
 
 /*
- * pipe(2): the kernel hands both ends back packed in %rax (read end in
- * the low half, write end in the high half) -- see kern/darwin.c for why
- * the native %rax/%rdx convention is not used.  This wrapper is the only
- * caller, so the packing is private ABI between it and the kernel.
+ * pipe(2): both ends come back packed in %rax, read end low, write end
+ * high (kern/darwin.c says why not %rax/%rdx).  A private ABI between this
+ * wrapper and the kernel.
  */
 int
 pipe(int fds[2])
@@ -3466,36 +3293,21 @@ getppid(void)
 }
 
 /*
- * Signal management.  The kernel delivers signals now: sigaction/signal
- * record a ring-3 handler (or SIG_DFL/SIG_IGN) and hand the kernel the
- * address of the trampoline below (arg2, like Apple's sa_tramp) so it knows
- * where to enter ring 3 on a caught signal.  Apple's sigset_t is a 32-bit
- * mask; struct sigaction leads with the handler at offset 0.
+ * Signals.  sigaction/signal register a handler (or SIG_DFL/SIG_IGN) and
+ * pass the kernel the trampoline below (arg2, like Apple's sa_tramp) to
+ * enter ring 3 through.  Apple's sigset_t is a 32-bit mask; struct
+ * sigaction starts with the handler.
  *
- * _sig_tramp is where the kernel resumes ring 3 on a caught signal.  It is
- * entered with rdi=signo, rsi=siginfo, rdx=ucontext, r10=handler and rsp
- * 16-aligned-plus-8 (as if called).  It calls the handler, then issues
- * sigreturn(ucontext) (SYS_sigreturn = 0x20000B8), which never returns.
+ * _sig_tramp is entered with rdi=signo, rsi=siginfo, rdx=ucontext,
+ * r10=handler and rsp 16-aligned-plus-8 (as if called).  It calls the
+ * handler, then sigreturn(ucontext) (0x20000B8), which does not return.
  *
- * THE UCONTEXT IS CARRIED ON THE STACK, NOT IN A CALLEE-SAVED REGISTER, and
- * that is not a style choice.  A synchronous frame -- one built at a syscall's
- * exit -- saves only rip, rsp, rflags and rax, because everything else is
- * guaranteed by the calling convention: the interrupted point is a syscall
- * return, and callee-saved registers hold what they held before the call.
- * That guarantee is the trampoline's to keep.
- *
- * The earlier version kept the ucontext in rbx, having pushed the old value
- * first.  The pop never happened: sigreturn does not return, so the push was
- * a promise nothing could keep, and ring 3 resumed with the ucontext ADDRESS
- * where its own variable used to be.  The symptom was a local turning into a
- * plausible-looking stack pointer, and it took a test that let a signal
- * interrupt a blocking read to see it -- every earlier signal test either
- * kept nothing live across the call or came in on the asynchronous path,
- * which saves the whole machine state and restores it through IRETQ.
- *
- * A push and a pop, on the other hand, cost the same and are kept by the
- * ordinary rules: the value lives below the frame the kernel just wrote, the
- * handler cannot see it, and no register the interrupted code owns is touched.
+ * The ucontext is kept on the stack, not in a callee-saved register.  A
+ * frame built at a syscall's exit saves only rip, rsp, rflags and rax,
+ * relying on the calling convention for the rest, so the trampoline must
+ * not change any callee-saved register: sigreturn never returns to restore
+ * one.  A value pushed below the kernel's frame touches nothing the
+ * interrupted code owns.
  */
 extern void	sig_tramp(void);
 
@@ -3512,13 +3324,10 @@ __asm__(
 );
 
 /*
- * The kernel hands the disposition being replaced back in %rax, and both
- * entry points pass it on: sigaction into oact's leading handler word,
- * signal as its return.  A caller that only installs a handler where the
- * signal was not already ignored -- make does this for every fatal signal,
- * the way a job run in the background is meant to -- needs that word to
- * be true.  A NULL act asks without changing: the kernel is told the
- * current disposition back, which is what "no change" spells here.
+ * The kernel returns the replaced disposition in %rax: sigaction puts it
+ * in oact's handler word, signal returns it.  make installs handlers only
+ * where a signal is not already ignored, so it must be right.  A NULL act
+ * queries, then sets the same disposition back.
  */
 int
 sigaction(int sig, const void *act, void *oact)
@@ -3562,9 +3371,8 @@ sigprocmask(int how, const void *set, void *oset)
 	long		old;
 
 	/*
-	 * Apple's sigset_t is a 32-bit mask.  A NULL set means "query only":
-	 * pass how == 0 so the kernel leaves the mask untouched and hands back
-	 * the current one in %rax (SYS_sigprocmask = 0x2000030) for *oset.
+	 * A NULL set only queries: how == 0 leaves the mask alone and the
+	 * kernel returns the current one in %rax for *oset.
 	 */
 	newmask = (set != NULL) ? *(const unsigned int *)set : 0u;
 	if (set == NULL)
@@ -3585,11 +3393,9 @@ sigemptyset(void *set)
 }
 
 /*
- * These two used to do nothing, and a mask built out of them was always
- * empty.  That is a lie with a shape: a program blocks SIGCHLD, checks for
- * a dead child, and waits with pselect -- and with an empty mask the check
- * and the wait have a window between them that the block was meant to
- * close.  Apple's sigset_t is a 32-bit word, signals 1..31.
+ * Real set operations on Apple's 32-bit sigset_t (signals 1..31): a
+ * program that blocks SIGCHLD, checks for a dead child and then pselects
+ * relies on the mask to close the window between the two.
  */
 int
 sigaddset(void *set, int sig)
@@ -3630,20 +3436,16 @@ alarm(unsigned int secs)
 	return (0);
 }
 
-/* ---- the genv / gtimeout gap ---------------------------------------------- */
+/* ---- environment and working directory ---------------------------------- */
 
 /*
- * The process environment.  The kernel passes no envp, so this library IS
- * the environment's source of truth: a single PATH entry pointing at the
- * synthetic /bin (the program registry presented as a directory by
- * kern/darwin.c), which is where every runnable thing on this system
- * lives.  A shell imports it and its PATH search then stats and execs
- * straight out of /bin; env(1) prints it.
+ * The environment.  The default, used when the kernel hands over none, is
+ * a single PATH entry for the synthetic /bin (the program registry as a
+ * directory, kern/darwin.c), where everything runnable lives.
  *
- * Both Apple access routes land on the same storage: older binaries bind
- * the `environ` data symbol directly, newer ones call _NSGetEnviron()
- * (crt does not vend `environ` from a dylib, but our dyld binds data
- * symbols fine, so we can simply export it).
+ * Older binaries bind the `environ' data symbol, newer ones call
+ * _NSGetEnviron(); both reach the same storage (our dyld binds data
+ * symbols, so `environ' is simply exported).
  */
 static char	*environ_default[] = { (char *)"PATH=/bin", 0 };
 
@@ -3657,11 +3459,9 @@ _NSGetEnviron(void)
 }
 
 /*
- * The environment the kernel handed over, if any: our dyld calls this
- * before main, from the same handoff stack it reads argv off, the way it
- * calls setprogname.  An empty vector means the kernel had nothing to say
- * -- a task spawned from the native shell -- and the default above stands,
- * so a program started by hand still finds its PATH.
+ * Adopt the envp from the handoff stack; our dyld calls this before main,
+ * like setprogname.  An empty vector (a task spawned from the native
+ * shell) keeps the default, so PATH is still set.
  */
 void
 s9_environ_init(char **envp)
@@ -3671,16 +3471,7 @@ s9_environ_init(char **envp)
 		environ = envp;
 }
 
-/*
- * The kernel has a working directory now, so these stop pretending.
- *
- * What they used to be is worth recording, because the shape of the lie is
- * instructive: chdir(2) returned success without doing anything, getcwd(3)
- * answered "/" whatever had happened, and a helper on this side of the
- * syscall rewrote relative paths against that imaginary root.  Nothing ever
- * reported an error, so a program that changed directory and then opened a
- * relative name simply got a different file than it asked for.
- */
+/* The working directory belongs to the kernel. */
 int
 chdir(const char *path)
 {
@@ -3689,13 +3480,10 @@ chdir(const char *path)
 }
 
 /*
- * THE ENVIRONMENT CAN BE EDITED, which it could not: setenv and unsetenv
- * returned success and changed nothing, a lie nothing noticed while no
- * program here told a child anything.  A build tool is made of telling
- * children things.  The vector is taken over on the first edit -- a copy
- * of the pointers, malloc'd, so the handoff-stack vector the kernel wrote
- * is never written to -- and grown as needed.  putenv keeps the caller's
- * string, as POSIX says it must; setenv makes its own.
+ * Editing the environment.  The first edit copies the pointer vector into
+ * malloc'd memory (the kernel's handoff-stack vector is never written),
+ * grown as needed.  putenv keeps the caller's string, as POSIX requires;
+ * setenv makes its own.
  */
 static char	**environ_owned;		/* the vector, once ours   */
 static size_t	  environ_cap;			/* slots in it, NULL incl. */
@@ -3724,7 +3512,7 @@ environ_find(const char *name, size_t namelen)
 	return (i);
 }
 
-/* Make environ ours to edit, with room for `extra` more entries. */
+/* Make environ ours to edit, with room for `extra' more entries. */
 static int
 environ_own(size_t extra)
 {
@@ -3826,7 +3614,7 @@ unsetenv(const char *name)
 	}
 }
 
-/* Process groups and resource limits do not exist yet: report success. */
+/* No process groups or resource limits: report success. */
 int
 setpgid(int pid, int pgid)
 {
@@ -3845,7 +3633,7 @@ setrlimit(int which, const void *rlp)
 	return (0);
 }
 
-/* Apple sigset_t is a 32-bit mask; these two complete the sigset family. */
+/* The rest of the sigset family, on Apple's 32-bit sigset_t. */
 int
 sigfillset(void *set)
 {
@@ -3865,11 +3653,9 @@ sigdelset(void *set, int sig)
 }
 
 /*
- * sigsuspend: POSIX blocks here until a signal fires; no signal will ever
- * fire, so return the mandated -1/EINTR immediately.  gtimeout's wait loop
- * is `while (waitpid(pid, .., WNOHANG) == 0) sigsuspend(..)` -- with an
- * immediate EINTR that degrades to polling, and the loop still terminates
- * the moment the child exits.
+ * sigsuspend: returns -1/EINTR at once instead of waiting for a signal.
+ * gtimeout's `while (waitpid(pid, .., WNOHANG) == 0) sigsuspend(..)' then
+ * polls, and still ends when the child exits.
  */
 int
 sigsuspend(const void *mask)
@@ -3907,10 +3693,9 @@ strpbrk(const char *s, const char *set)
 }
 
 /*
- * strtod: decimal + optional fraction + optional e-notation -- what
- * gtimeout's duration parser ("10", "1.5", "2e1") consumes.  No hex
- * floats, no INF/NAN spellings; SSE2 double arithmetic is the Penryn
- * baseline, so plain multiply-accumulate is fine.
+ * strtod: decimal, optional fraction, optional exponent -- what gtimeout's
+ * duration parser ("10", "1.5", "2e1") needs.  No hex floats, no INF/NAN;
+ * plain multiply-accumulate, not correctly rounded.
  */
 double
 strtod(const char *s, char **endp)
@@ -3973,26 +3758,20 @@ strtod_l(const char *s, char **endp, void *loc)
 	return (strtod(s, endp));
 }
 
-/* ---- the shell rung (dash) ----------------------------------------------- */
+/* ---- what dash binds ---------------------------------------------------- */
 
 /*
- * Everything below exists because a real POSIX shell (Homebrew dash) binds
- * it.  A shell is the most demanding libc consumer yet: it longjmps out of
+ * Everything below is imported by dash (Homebrew): it longjmps out of
  * errors, saves fds around redirections, walks PATH with stat, asks who it
- * is, and parses with the wide-char and string family.  The answers stay
- * true to this system: single user (root), one process group, no ttys on
- * the serial console, a read-only volume.
+ * is.  The answers fit this system: one user (root), one process group.
  */
 
 /*
- * setjmp/longjmp -- the real thing, in asm; dash's error handling (exraise)
- * longjmps across arbitrary call depth, so no stub survives contact.  Both
- * jumpers are OUR code (this library is the only setjmp provider in the
- * closure), so the jmp_buf layout is private: the six callee-saved
- * registers + rsp + rip = 64 bytes, comfortably inside Apple's 148-byte
- * jmp_buf.  C `setjmp` does not save the signal mask on Darwin (`sigsetjmp`
- * does); our masks are no-ops anyway, so the register file is the entire
- * context.  longjmp(env, 0) must deliver 1, per POSIX.
+ * setjmp/longjmp in asm; dash's error handling longjmps across any call
+ * depth.  This library is the only setjmp in the closure, so the jmp_buf
+ * layout is private: six callee-saved registers + rsp + rip = 64 bytes,
+ * inside Apple's 148-byte jmp_buf.  Unlike Darwin's setjmp, this one does
+ * not save the signal mask.  longjmp(env, 0) delivers 1, per POSIX.
  */
 __asm__(
 	".text\n"
@@ -4027,9 +3806,8 @@ __asm__(
 );
 
 /*
- * Identity: one user, root, one group, one process group (its leader being
- * whoever asks).  dash compares uid==euid to decide privileged mode --
- * equal answers keep it in normal mode.
+ * Identity: root, one group, one process group led by whoever asks.  dash
+ * enters privileged mode if uid != euid, so they are equal.
  */
 int
 getuid(void)
@@ -4076,9 +3854,8 @@ getpwnam(const char *name)
 }
 
 /*
- * getcwd(3) over __getcwd(2), which is how Darwin's own libc does it: the
- * syscall fills a caller-supplied buffer or fails with ERANGE, and the
- * allocating form is a courtesy this side adds.
+ * getcwd(3) over __getcwd(2), as in Darwin's libc: the syscall fills the
+ * caller's buffer or fails with ERANGE; the allocating form is ours.
  */
 #define	GETCWD_MAX	256		/* matches DARWIN_PATH_MAX */
 
@@ -4090,10 +3867,8 @@ getcwd(char *buf, size_t size)
 
 	if (buf == NULL) {
 		/*
-		 * The POSIX extension: allocate one that fits.  Asking the
-		 * kernel into a local first means the allocation is sized to
-		 * the answer rather than to the maximum, and that a failure
-		 * costs no malloc at all.
+		 * The extension: allocate one that fits.  Asking into a local
+		 * first sizes it to the answer, and a failure mallocs nothing.
 		 */
 		if (bsd_call_e(0x2000000 | 326, (long)tmp,
 		    (long)sizeof(tmp), 0) < 0)
@@ -4119,14 +3894,7 @@ getcwd(char *buf, size_t size)
 	return (buf);
 }
 
-/*
- * umask: the kernel's now, and it means something.
- *
- * This used to answer 022 without keeping it -- true of a read-only volume,
- * where no create could be affected by a mask.  The volume is writable, the
- * kernel subtracts this from every mkdir and every O_CREAT, and a program
- * that sets it expects the next file it makes to show the difference.
- */
+/* umask: kept by the kernel, which applies it to every mkdir and O_CREAT. */
 int
 umask(int mask)
 {
@@ -4135,13 +3903,8 @@ umask(int mask)
 }
 
 /*
- * chmod, fchmod, lchmod.
- *
- * lchmod is chmod because NOTHING IN THIS SYSTEM IS A SYMLINK -- neither
- * filesystem here can make one and neither can name one -- so "do not follow
- * the link" is a distinction without a case.  That is why it forwards rather
- * than failing: an lchmod that refused would be refusing on a ground that does
- * not exist here.
+ * chmod, fchmod, lchmod.  Neither filesystem can make or name a symlink,
+ * so lchmod is chmod.
  */
 int
 chmod(const char *path, unsigned short mode)
@@ -4165,16 +3928,10 @@ lchmod(const char *path, unsigned short mode)
 }
 
 /*
- * chown, fchown, lchown -- and this family CANNOT be honoured, so it says so
- * rather than pretending.
- *
- * There are no users here.  No uid table, no login, no credentials on a task;
- * every inode on the volume says owner 0, group 0, and that is not a default
- * this system could change -- it is the only value it has a meaning for.  So a
- * request to leave the owner alone (-1, -1) or to set it to root succeeds
- * because it is already true, and anything else answers EPERM, which is
- * exactly what a real kernel tells an unprivileged caller and exactly what
- * every caller of chown is written to handle.
+ * chown, fchown, lchown.  There are no users: no uid table, no credentials
+ * on a task.  Leaving owner and group alone (-1) or naming root succeeds
+ * without a call; anything else is EPERM, as for an unprivileged caller,
+ * which every chown caller handles.
  */
 static int
 chown_common(long owner, long group)
@@ -4210,14 +3967,7 @@ lchown(const char *path, unsigned int owner, unsigned int group)
 	return (chown_common((long)(int)owner, (long)(int)group));
 }
 
-/*
- * unlink(2), which reaches the kernel now that the volume can be written.
- *
- * It used to answer EROFS from here without asking anybody, which was true of
- * every volume this system could mount at the time.  It is not true any more,
- * and a libc that keeps saying so is a libc that makes the kernel look
- * broken.
- */
+/* unlink(2), mkdir(2), rmdir(2): straight to the kernel. */
 int
 unlink(const char *path)
 {
@@ -4225,15 +3975,7 @@ unlink(const char *path)
 	return ((int)bsd_call_e(0x200000A, (long)path, 0, 0));
 }
 
-/*
- * mkdir(2) and rmdir(2).  Straight through, for the same reason unlink is:
- * the volume can be written now, and the answer is the kernel's to give.
- *
- * mode_t is sixteen bits on Darwin and is passed as declared.  It used to say
- * here that the kernel stamped 0755 regardless and the argument was carried
- * only so that the fact stayed visible; the kernel has a chmod and a umask
- * now, and the mode is honoured, so the note went the way the behaviour did.
- */
+/* mode_t is 16 bits on Darwin; the kernel applies the umask. */
 int
 mkdir(const char *path, unsigned short mode)
 {
@@ -4249,9 +3991,8 @@ rmdir(const char *path)
 }
 
 /*
- * rename(2).  Two paths, one call, and nothing done here between them --
- * a libc that "helpfully" unlinked the destination first would break the one
- * promise programs use this call for.
+ * rename(2): one call.  Unlinking the destination first here would break
+ * the atomic replace programs rely on.
  */
 int
 rename(const char *from, const char *to)
@@ -4278,8 +4019,8 @@ getrlimit(int which, void *rlp)
 }
 
 /*
- * sysconf: dash asks for the clock tick to scale its times builtin.
- * struct tms below answers in those (fictional) ticks.
+ * sysconf: dash asks for the clock tick to scale its times builtin, which
+ * times() below answers (always zero).
  */
 long
 sysconf(int name)
@@ -4311,9 +4052,8 @@ times(void *buf)
 }
 
 /*
- * killpg: with one process group per session, the group IS the process --
- * forward to kill(2).  Only dash's interactive job control sends group
- * signals, so this is bind-resolution insurance more than a hot path.
+ * killpg: the process group is the process (see getpgrp), so kill(2).
+ * Only dash's interactive job control sends group signals.
  */
 int
 killpg(int pgrp, int sig)
@@ -4322,7 +4062,7 @@ killpg(int pgrp, int sig)
 	return (kill(pgrp, sig));
 }
 
-/* The pre-sigprocmask mask call: masks are no-ops here (see sigprocmask). */
+/* The pre-sigprocmask mask call: a no-op here; use sigprocmask. */
 int
 sigsetmask(int mask)
 {
@@ -4340,18 +4080,13 @@ wait3(int *status, int options, void *rusage)
 }
 
 /*
- * TERMINAL CONTROL.
+ * Terminal control.  The settings belong to the device, not the
+ * descriptor, so they live in the kernel and two programs sharing the
+ * console see each other's changes: nothing is cached here, every call is
+ * an ioctl on the caller's struct, in Apple's layout.
  *
- * This family used to answer ENOTTY to everything, on the grounds that there
- * was no terminal to control.  There is one now, and the settings live in the
- * kernel, where they belong: the state is the DEVICE's, not the descriptor's,
- * and two programs sharing a console must see each other's changes.  So none
- * of this keeps a copy -- every call is an ioctl, and the struct these hand
- * about is the caller's own storage, in Apple's layout.
- *
- * The layout is asserted rather than trusted, for the same reason the kernel
- * asserts it: the size is encoded in the ioctl number (0x48 in TIOCGETA), so
- * getting it wrong would be a silent disagreement about where c_lflag is.
+ * The size is asserted, as in the kernel: it is encoded in the ioctl
+ * number (0x48 in TIOCGETA), and a mismatch would silently move c_lflag.
  */
 #define	TCSANOW		0
 #define	TCSADRAIN	1
@@ -4383,9 +4118,8 @@ tcgetattr(int fd, void *termios_p)
 }
 
 /*
- * tcsetattr: the action is not a flag on the setting, it is WHICH of three
- * requests to send -- Darwin spells the difference in the ioctl number, and
- * the kernel is where "discard what is already typed" happens.
+ * tcsetattr: the action picks which of three ioctls to send; the kernel
+ * does the draining and flushing.
  */
 int
 tcsetattr(int fd, int action, const void *termios_p)
@@ -4410,9 +4144,8 @@ tcsetattr(int fd, int action, const void *termios_p)
 }
 
 /*
- * The speed accessors are pure struct access -- no call, no terminal.  BSD
- * keeps the baud rate itself rather than an index into a table, which is why
- * these are one field read each and why B38400 is the number 38400.
+ * The speed accessors only touch the struct.  BSD stores the baud rate
+ * itself, not a table index, so B38400 is 38400.
  */
 unsigned long
 cfgetispeed(const void *termios_p)
@@ -4464,9 +4197,8 @@ tcsetpgrp(int fd, int pgrp)
 }
 
 /*
- * fdopen (Apple exports it as fdopen$DARWIN_EXTSN under unix2003
- * versioning): wrap an existing fd in a fresh FILE.  Our FILE is just
- * {fd, eof, unget}, so the mode string only needs to exist.
+ * fdopen (exported as fdopen$DARWIN_EXTSN under unix2003 versioning):
+ * wrap an fd in a fresh FILE.  The mode string is ignored.
  */
 FILE	*fdopen_extsn(int fd, const char *mode) __asm__("_fdopen$DARWIN_EXTSN");
 
@@ -4574,9 +4306,8 @@ strtoumax(const char *s, char **end, int base)
 }
 
 /*
- * strerror/strsignal: name the errnos this system can actually produce
- * (kern/darwin.h's set); anything else formats numerically into a static
- * buffer, which is all the POSIX lifetime contract requires.
+ * strerror/strsignal: names for the errnos kern/darwin.h can produce;
+ * anything else is formatted into a static buffer, which POSIX allows.
  */
 static char	strerror_buf[32];
 
@@ -4704,26 +4435,18 @@ wctype(const char *property)
 	return (0);
 }
 
-/* ---- gls rung: the calendar, the mode string, and the rest of ls(1) ------ */
+/* ---- what gls binds: the calendar, the mode string, the rest of ls(1) --- */
 
 /*
- * gls (GNU coreutils 9.11's ls) is the ninth real Apple binary, and the first
- * one that asks the system what it REMEMBERS rather than what it is: a mode
- * word, an owner, a link count and a date, per file.  Every one of those was
- * being invented in this file until the kernel learned to carry them out of
- * the inode -- so most of what follows is presentation for facts that now
- * arrive from the disk, not substitutes for them.
- *
- * The exceptions are named where they occur: this volume has no ACLs, no
- * group database and no timezone, and saying so plainly beats approximating
- * any of the three.
+ * gls (coreutils ls) formats per-file facts that come from the inode (mode,
+ * owner, link count, dates).  What is missing -- ACLs, a group database, a
+ * timezone -- is said where it occurs.
  */
 
 /*
- * struct tm, Apple's layout: nine ints, then the two BSD extensions.  The
- * date formatting ls(1) actually uses is gnulib's own strftime replacement,
- * compiled into the binary; it reads tm_gmtoff and tm_zone, so both are here
- * and both say UTC.
+ * struct tm, Apple's layout: nine ints, then the two BSD extensions.
+ * ls(1) formats dates with gnulib's own strftime, which reads tm_gmtoff
+ * and tm_zone; both say UTC.
  */
 struct tm {
 	int	 tm_sec;
@@ -4740,12 +4463,11 @@ struct tm {
 };
 
 /*
- * The calendar, in both directions, by the same trick: shift the year to
- * begin in March so that February's length stops being a special case, count
- * whole 400-year eras, and let one linear formula carry the month lengths.
- * Leap years and century rules fall out of the era arithmetic instead of
- * being tested for.  (Howard Hinnant's days_from_civil / civil_from_days; the
- * kernel has the forward half in fs/fat/fat.c for the same reason.)
+ * The calendar both ways (Howard Hinnant's days_from_civil /
+ * civil_from_days): start the year in March so February is not special,
+ * count 400-year eras, and one linear formula gives the month lengths;
+ * leap and century rules fall out of the era arithmetic.  fs/fat/fat.c has
+ * the forward half.
  */
 static int64_t
 days_from_civil(int32_t y, uint32_t m, uint32_t d)
@@ -4786,13 +4508,9 @@ civil_from_days(int64_t z, int *y_out, unsigned *m_out, unsigned *d_out)
 }
 
 /*
- * gmtime_r: seconds since the epoch to a broken-down UTC time.
- *
- * localtime_r is the same function.  That is not laziness: this system reads
- * one clock, the CMOS RTC, and has no timezone database, no TZ handling and
- * nothing that could tell it what offset the machine sits at.  Choosing one
- * would mean printing every timestamp wrong by it.  UTC is what the hardware
- * said, and tm_zone says so.
+ * gmtime_r: seconds since the epoch to broken-down UTC.  localtime_r is the
+ * same function: with no timezone database or TZ handling, any other
+ * offset would be a guess, and tm_zone says UTC.
  */
 struct tm *
 gmtime_r(const int64_t *t, struct tm *tm)
@@ -4809,11 +4527,8 @@ gmtime_r(const int64_t *t, struct tm *tm)
 	secs = *t;
 
 	/*
-	 * Floor division, not truncation: a pre-1970 timestamp divided the C
-	 * way rounds toward zero and lands a day late with a negative
-	 * remainder.  Nothing on this volume is that old, but a date routine
-	 * that is right for only half the number line is a trap for whoever
-	 * reaches for it next.
+	 * Floor division, not C's truncation, so pre-1970 times land on the
+	 * right day with a non-negative remainder.
 	 */
 	days = secs / 86400;
 	rem  = secs % 86400;
@@ -4845,21 +4560,16 @@ localtime_r(const int64_t *t, struct tm *tm)
 	return (gmtime_r(t, tm));
 }
 
-/*
- * tzset(3): read the timezone from the environment.  There is no timezone to
- * read and no database to read it from, so this is a genuine no-op rather
- * than an unimplemented stub -- the state it would set is already correct.
- */
+/* tzset(3): no timezone to read; the state is already UTC. */
 void
 tzset(void)
 {
 }
 
 /*
- * strmode(3): the "drwxr-xr-x " a long listing opens with, BSD's spelling,
- * including the trailing space.  That space is where macOS puts the '+' or
- * '@' marking an ACL or an extended attribute; this volume has neither, so
- * it stays blank rather than being dropped -- the column belongs there.
+ * strmode(3): "drwxr-xr-x ", BSD's spelling with the trailing space where
+ * macOS puts '+' or '@' for an ACL or extended attribute.  There are
+ * neither here, but the column stays.
  */
 void
 strmode(int mode, char *p)
@@ -4901,7 +4611,7 @@ strmode(int mode, char *p)
 	*p = '\0';
 }
 
-/* ---- the small libc gls drags in with it -------------------------------- */
+/* ---- the small libc gls pulls in ---------------------------------------- */
 
 size_t
 strnlen(const char *s, size_t maxlen)
@@ -4914,10 +4624,8 @@ strnlen(const char *s, size_t maxlen)
 }
 
 /*
- * __memcpy_chk: what _FORTIFY_SOURCE compiles a memcpy into when the
- * destination's size is known.  A copy larger than that size is a detected
- * overflow, and the contract is to abort rather than to truncate: truncating
- * would hide the bug the check exists to find.
+ * __memcpy_chk: _FORTIFY_SOURCE's memcpy with a known destination size.
+ * An oversized copy aborts; truncating would hide the bug.
  */
 void *
 __memcpy_chk(void *dst, const void *src, size_t len, size_t dstlen)
@@ -4929,10 +4637,9 @@ __memcpy_chk(void *dst, const void *src, size_t len, size_t dstlen)
 }
 
 /*
- * Wide characters in the C locale, where every byte is its own character.
- * wcwidth is how ls(1) aligns columns: one column for a printable character,
- * zero for the null, and -1 for a control character, whose effect on the
- * cursor a column counter cannot predict.
+ * Wide characters in the C locale.  wcwidth, which ls(1) aligns columns
+ * by: 1 for a printable character, 0 for the null, -1 for a control
+ * character.
  */
 int
 wcwidth(wchar_t wc)
@@ -4975,11 +4682,9 @@ wmemcpy(wchar_t *dst, const wchar_t *src, size_t n)
 }
 
 /*
- * The locale, in the two shapes a program asks for it.  setlocale(3) above
- * already answers "C"; these are the query paths.  localeconv's answer is the
- * C locale's by definition -- "." for the decimal point, empty strings for
- * everything monetary, and CHAR_MAX for every numeric field, which is how the
- * standard spells "this locale does not specify one".
+ * Locale queries (setlocale(3) above answers "C").  localeconv gives the C
+ * locale's values: "." as decimal point, empty strings, and CHAR_MAX
+ * ("unspecified") for every numeric field.
  */
 struct lconv {
 	char	*decimal_point;
@@ -5031,10 +4736,8 @@ localeconv(void)
 }
 
 /*
- * uselocale(3): install a thread's locale and return the previous one.  There
- * is one locale and it is C, so the previous one is always the global locale
- * -- returned as a non-null token because NULL is uselocale's ERROR return,
- * and a caller that checks would otherwise see a failure that did not happen.
+ * uselocale(3): the previous locale is always the global C one, returned
+ * as a non-null token because NULL means failure.
  */
 void *
 uselocale(void *loc)
@@ -5045,7 +4748,7 @@ uselocale(void *loc)
 	return (&global_locale);
 }
 
-/* MB_CUR_MAX for an explicitly named locale.  Whichever it is, it is C. */
+/* MB_CUR_MAX for a named locale, which is always C. */
 int
 ___mb_cur_max_l(void *loc)
 {
@@ -5055,10 +4758,8 @@ ___mb_cur_max_l(void *loc)
 }
 
 /*
- * The group database, which does not exist.  getgrgid above answers NULL to
- * the same question asked by number.  ls(1) falls back to printing the
- * numeric gid, which is the honest rendering of a system where group 0 has
- * no name to print.
+ * No group database (getgrgid above is the same); ls(1) prints the
+ * numeric gid.
  */
 void *
 getgrnam(const char *name)
@@ -5069,17 +4770,11 @@ getgrnam(const char *name)
 }
 
 /*
- * POSIX.1e ACLs, which this filesystem does not have.  ls(1) calls
- * acl_get_file (or acl_get_link_np) on every entry to decide whether to print
- * the '+' that marks an extended ACL, and acl_get_entry to see whether what
- * came back holds anything.
- *
- * NULL alone is not the answer, and getting that wrong was visible: gnulib
- * reads a NULL return as an ERROR unless errno says the system does not do
- * ACLs, so `ls -l` printed a bare "gls: /usr" line -- an error report with an
- * empty message, because errno happened to be 0 -- before every single entry
- * it then listed correctly.  ENOTSUP is both the truthful answer and the one
- * gnulib's ACL_NOT_WELL_SUPPORTED() accepts as "no ACLs here, carry on".
+ * POSIX.1e ACLs, which these filesystems lack.  ls(1) calls acl_get_file
+ * (or acl_get_link_np) per entry to decide on the '+', and acl_get_entry
+ * to look inside.  NULL must come with errno ENOTSUP: gnulib treats any
+ * other NULL as an error to report, while ACL_NOT_WELL_SUPPORTED() takes
+ * ENOTSUP as "no ACLs here".
  */
 #define	DARWIN_ENOTSUP	45
 
@@ -5132,12 +4827,9 @@ acl_free(void *obj)
 }
 
 /*
- * pthread mutexes.  Every process here has exactly one thread, so a lock is
- * uncontended by construction: these are not stubs standing in for missing
- * synchronisation, they are what correct synchronisation degenerates to when
- * there is nobody to race against.  The day this system grows threads inside
- * a Darwin process, these become real and the compiler will not remind us --
- * which is why it is written down here.
+ * pthread mutexes.  Every Darwin process here has one thread, so a lock is
+ * uncontended and these are correct as no-ops.  They must become real if
+ * Darwin processes ever get threads; nothing else will flag it.
  */
 int
 pthread_mutex_lock(void *m)
@@ -5155,34 +4847,24 @@ pthread_mutex_unlock(void *m)
 	return (0);
 }
 
-/* ---- the gmake rung: readiness, spawning, and what a build tool asks ----- */
+/* ---- what gmake binds: readiness, spawning, a build tool's libc --------- */
 
 /*
- * GNU make is the first program here that is nothing but a way of running
- * OTHER programs, and the thirty-three symbols it needed sort into three
- * kinds.  A kernel kind, which is where the rung earned its keep: select(2)
- * and pselect -- readiness, asked rather than assumed, the first wait in
- * this system that is about more than one thing -- plus access(2),
- * ftruncate(2) and an environment that survives an exec.  A spawning kind:
- * posix_spawn, which on Darwin is THE way a process is started and which
- * this library builds out of fork and execve, because a fork here is a
- * copy-on-write map share and costs what a spawn would.  And the ordinary
- * kind -- strndup, perror, setvbuf -- which is what most of any libc is.
+ * GNU make needs three kinds of thing: kernel calls (select/pselect,
+ * access, ftruncate), posix_spawn -- built here from fork and execve,
+ * since a copy-on-write fork costs what a spawn would -- and ordinary libc
+ * (strndup, perror, setvbuf).
  *
- * Each of the honest edges is said where it lives: mkfifo is refused by the
- * kernel, dlopen by this library, getloadavg has nothing to report, and
- * posix_spawn learns that a program does not exist before it forks, which is
- * how it can answer ENOENT as a return value the way the real one does.
+ * The limits are noted where they live: the kernel refuses mkfifo, this
+ * library refuses dlopen, getloadavg has nothing to report.
  */
 
 /*
  * select(2), Darwin #93, and pselect through the style9-private class (the
- * kernel says why, next to DARWIN_SYS_select).  The two-level namespace
- * hands out several spellings of each -- $1050 for a binary built against
- * the 10.5 SDK's FD_SETSIZE semantics, $DARWIN_EXTSN for one built with the
- * extended-size fd_set -- and every one of them is the same call here: an
- * fd_set is 1024 bits in both, and the kernel reads only the words nfds
- * reaches.
+ * kernel says why, next to DARWIN_SYS_select).  Binaries import several
+ * spellings -- $1050 (10.5 SDK FD_SETSIZE semantics), $DARWIN_EXTSN
+ * (extended-size fd_set) -- and all are the same call here: fd_set is 1024
+ * bits either way and the kernel reads only the words nfds reaches.
  */
 int
 select(int nfds, void *rfds, void *wfds, void *efds, const void *tv)
@@ -5250,9 +4932,9 @@ poll(void *fds, unsigned int nfds, int timeout)
 }
 
 /*
- * Apple's <sys/select.h> guards every FD_SET/FD_ISSET with this when
- * _FORTIFY_SOURCE is on: a 1 means the fd is inside the set, a 0 aborts
- * the caller.  FD_SETSIZE is 1024 here as there.
+ * Apple's <sys/select.h> guards FD_SET/FD_ISSET with this under
+ * _FORTIFY_SOURCE: 1 means the fd fits, 0 aborts the caller.  FD_SETSIZE
+ * is 1024.
  */
 int
 __darwin_check_fd_set_overflow(int n, const void *set, int unlimited)
@@ -5320,11 +5002,9 @@ remove(const char *path)
 /* ---- posix_spawn --------------------------------------------------------- */
 
 /*
- * Apple's posix_spawnattr_t and posix_spawn_file_actions_t are both `void *`:
- * the caller holds a pointer and the library owns what it points at, so the
- * shapes below are this library's business alone.  File actions are kept in
- * order, as POSIX requires -- a dup2 after a close of the same fd means
- * something different from the reverse.
+ * Apple's posix_spawnattr_t and posix_spawn_file_actions_t are `void *`,
+ * so what they point at is ours.  File actions run in order, as POSIX
+ * requires (dup2 then close is not close then dup2).
  */
 #define	SPAWN_FA_MAX		16
 #define	SPAWN_FA_DUP2		1
@@ -5462,14 +5142,11 @@ posix_spawnattr_setsigdefault(void **attrp, const unsigned int *set)
 }
 
 /*
- * posix_spawn(3): fork, arrange the child, exec.  Errors come back as the
- * RETURN VALUE, not through errno, which is the one way this differs from
- * every other call in the file and the reason the existence check comes
- * first: a program that is not there is reported to the caller as ENOENT
- * before any child exists, exactly as the real one reports it, instead of
- * as a child that exited 127.  What is left for the child to fail at after
- * that -- a dup2 onto a closed fd, an image the loader refuses -- it reports
- * the shell's way, by exiting 127.
+ * posix_spawn(3): fork, arrange the child, exec.  Errors are the return
+ * value, not errno, so the existence check comes first: a missing program
+ * is ENOENT before any child exists, as with the real one.  Later failures
+ * in the child (a bad dup2, an image the loader refuses) exit 127, the
+ * shell's way.
  */
 int
 posix_spawn(int *pidp, const char *path, void *const *fap, void *const *attrp,
@@ -5526,11 +5203,11 @@ posix_spawnp(int *pidp, const char *file, void *const *fap,
 	return (posix_spawn(pidp, file, fap, attrp, argv, envp));
 }
 
-/* ---- the ordinary kind --------------------------------------------------- */
+/* ---- ordinary libc ------------------------------------------------------ */
 
 /*
- * bsd_signal(3): signal(3) with BSD semantics, which is what signal(3) here
- * has always had -- the handler stays installed after it runs.
+ * bsd_signal(3): signal(3) with BSD semantics (the handler stays
+ * installed), which is what signal(3) here has.
  */
 void *
 bsd_signal(int sig, void *handler)
@@ -5561,10 +5238,8 @@ feof(FILE *fp)
 }
 
 /*
- * setvbuf(3): this stdio is unbuffered, which satisfies every mode a caller
- * can ask for -- an unbuffered stream never holds back what a line-buffered
- * or fully-buffered one would have flushed by now.  Accepted, and nothing
- * changes.
+ * setvbuf(3): accepted and ignored.  An unbuffered stream never holds back
+ * what a buffered one would have flushed, so every mode is satisfied.
  */
 int
 setvbuf(FILE *fp, char *buf, int mode, size_t size)
@@ -5603,7 +5278,7 @@ strndup(const char *s, size_t n)
 	return (d);
 }
 
-/* long long IS long on this ABI: strtoll is strtol under another name. */
+/* long long is long on this ABI, so strtoll is strtol. */
 long long
 strtoll(const char *s, char **end, int base)
 {
@@ -5619,9 +5294,8 @@ atof(const char *s)
 }
 
 /*
- * __strncpy_chk: the _FORTIFY_SOURCE form.  The compiler passes the
- * destination's known size; a copy that would overrun it is a bug in the
- * caller and aborts, as Apple's does.
+ * __strncpy_chk: _FORTIFY_SOURCE strncpy.  A copy that would overrun the
+ * known destination size aborts, as Apple's does.
  */
 char *
 __strncpy_chk(char *dst, const char *src, size_t n, size_t dstlen)
@@ -5705,9 +5379,8 @@ localtime(const long *t)
 }
 
 /*
- * getloadavg(3): there is no load average to report.  The kernel keeps no
- * such number, and inventing one would be the wrong kind of compatible.
- * -1, and make says once that it cannot enforce load limits here.
+ * getloadavg(3): the kernel keeps no load average, so -1/ENOSYS; make then
+ * says once that it cannot enforce load limits.
  */
 int
 getloadavg(double *avg, int n)
@@ -5728,10 +5401,9 @@ getlogin(void)
 }
 
 /*
- * confstr(3): _CS_PATH (1) is the only name with an answer, and it is the
- * same one the default environment gives -- everything runnable lives in
- * the synthetic /bin.  Returns the length the answer needs, NUL included;
- * copies as much as fits.
+ * confstr(3): only _CS_PATH (1) is answered, with the default
+ * environment's /bin.  Returns the length needed, NUL included, and copies
+ * what fits.
  */
 size_t
 confstr(int name, char *buf, size_t len)
@@ -5755,9 +5427,8 @@ confstr(int name, char *buf, size_t len)
 }
 
 /*
- * ttyname(3): the console's name, and only for a descriptor that IS the
- * console.  The name is one the kernel opens -- a name that could not be
- * opened would be a label, not a name.
+ * ttyname(3): "/dev/console", which the kernel can open, for a descriptor
+ * that is the console; ENOTTY otherwise.
  */
 char *
 ttyname(int fd)
@@ -5787,12 +5458,9 @@ ttyname_r(int fd, char *buf, size_t len)
 }
 
 /*
- * dlopen(3) and its family: there is no dynamic loading after the dyld has
- * handed off.  dlopen answers NULL and dlerror says why in words, once,
- * which is the contract; dlsym on any handle finds nothing.  A program that
- * only loads a plugin when asked to -- make's $(load), a shell's `enable
- * -f` -- runs, and reports the refusal where it would have reported a
- * missing plugin.
+ * dlopen(3) and family: no dynamic loading after dyld hands off.  dlopen
+ * returns NULL and dlerror says why, once; dlsym finds nothing.  Programs
+ * that load plugins only on request (make's $(load)) still run.
  */
 static const char	*dl_error_pending;
 
@@ -5835,11 +5503,9 @@ dlclose(void *handle)
 }
 
 /*
- * mkstemps(3) and mkstemp(3): the XXXXXX before `suffixlen` trailing bytes
- * is replaced until a name is new, which O_EXCL is the judge of.  The
- * candidates are made from the pid and a counter rather than a random
- * source -- there is one user and no adversary, and a name that is new is
- * all the contract asks for.
+ * mkstemps(3) and mkstemp(3): replace the XXXXXX before `suffixlen'
+ * trailing bytes until O_EXCL accepts the name.  Candidates come from the
+ * pid and a counter, not randomness: one user, no adversary.
  */
 int
 mkstemps(char *tmpl, int suffixlen)
@@ -5888,8 +5554,8 @@ mkstemp(char *tmpl)
 }
 
 /*
- * tmpfile(3): a file with no name from the moment it is open -- the orphan
- * the volume keeps for exactly this, unlinked while a descriptor holds it.
+ * tmpfile(3): create, then unlink while open; the volume keeps the orphan
+ * until the last close.
  */
 FILE *
 tmpfile(void)

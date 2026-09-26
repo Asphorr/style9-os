@@ -5,17 +5,12 @@
  * All rights reserved.
  *
  * Reply-protocol child.  Installs the parent-injected port at the
- * BAD_INSTRUCTION slot WITH the EXC_FLAG_RESUMABLE flag, opting into
- * the kernel's reply protocol.  Then executes UD2; user_fault_die
- * posts the exception to the watcher AND parks this thread waiting
- * for a verdict.  When the watcher replies EXC_VERDICT_RESUME with
- * rip_advance=2, the kernel skips past the UD2 and resumes execution
- * here.  We confirm the resume worked by sending a tagged "I survived"
- * message back to the watcher via MACH_PORT_PARENT.
- *
- * Without the RESUMABLE flag the kernel would retire the thread
- * after delivering the exception (A v1 / per-type / thread-level
- * behavior); the flag is the explicit opt-in.
+ * BAD_INSTRUCTION slot with EXC_FLAG_RESUMABLE, then executes UD2:
+ * user_fault_die posts the exception and parks this thread for a verdict.
+ * The watcher replies EXC_VERDICT_RESUME with rip_advance=2, the kernel
+ * skips the UD2, and we send a tagged "survived" message back through
+ * MACH_PORT_PARENT.  Without the flag the thread would be retired after
+ * delivery.
  */
 
 #include "style9.h"
@@ -38,9 +33,8 @@ main(void)
 	__asm __volatile("ud2");
 
 	/*
-	 * Post-resume: tell the watcher we made it.  Uses the same
-	 * MACH_PORT_PARENT SEND right (still in our name table; the
-	 * exception port took its own ref, didn't consume ours).
+	 * Resumed: tell the watcher.  MACH_PORT_PARENT is still ours; the
+	 * exception port took its own reference.
 	 */
 	ping.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
 	ping.msgh_size    = sizeof(ping);

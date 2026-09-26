@@ -15,10 +15,10 @@
  *
  * The `macos` mode additionally stamps an LC_BUILD_VERSION naming
  * PLATFORM_MACOS, which flips the loaded task to the kernel's Darwin syscall
- * personality (S2).  It is used by the freestanding user/darwinhello stub,
- * which issues genuine class-encoded Apple syscalls (write, getpid,
- * task_self_trap, exit) rather than style9 ones.  Binary-exact mach_msg /
- * MIG / a real libSystem remain later steps.
+ * personality (S2).  It is used by the freestanding user/darwinhello and
+ * darwinmsg stubs, which issue genuine class-encoded Apple syscalls rather
+ * than style9 ones.  Real dynamic Mach-O binaries (S4) are linked by clang
+ * and ld64.lld instead, not by this tool.
  *
  *	elf2macho       <in.elf> <out.macho>	thin x86-64 Mach-O
  *	elf2macho fat   <in.elf> <out.macho>	fat archive, one x86-64 slice
@@ -50,8 +50,8 @@
  * Initial user %rsp recorded in LC_UNIXTHREAD.  Advisory only: style9's
  * launcher (arch/amd64/usermode.c build_user_arg_stack) lays down the
  * real argc/argv frame and passes its own %rsp to usermode_enter, so the
- * loader ignores this field.  Kept equal to USER_STACK_TOP for a sane,
- * spec-shaped thread state.  Mirror of arch/amd64/usermode.h.
+ * loader ignores this field.  It no longer matches USER_STACK_TOP in
+ * arch/amd64/usermode.h.
  */
 #define	USER_STACK_TOP	0x40010000ULL
 

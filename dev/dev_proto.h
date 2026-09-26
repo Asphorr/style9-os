@@ -13,22 +13,19 @@
 /*
  * Generic device-driver protocol.
  *
- * A driver registers itself in the bootstrap port under the name
- * "dev/<NAME>" (e.g. "dev/kbd").  The registered port is its CONTROL
- * port -- a PORT_SPECIAL_SERVICE port whose dispatcher handles the
- * DEV_OP_* opcodes below.  The protocol is small and intentionally
- * subsetted by class: a stream input driver implements INFO + OPEN_STREAM,
- * an output driver implements INFO + WRITE, a block device would
- * implement INFO + READ + WRITE + IOCTL.  INFO is always supported.
+ * A driver registers in the bootstrap port as "dev/<NAME>" (e.g.
+ * "dev/kbd").  The registered port is its control port, a
+ * PORT_SPECIAL_SERVICE port whose dispatcher handles the DEV_OP_* codes
+ * below, subsetted by class: stream input implements INFO + OPEN_STREAM,
+ * output INFO + WRITE, a block device INFO + GEOM + READ_BLOCK +
+ * WRITE_BLOCK + SYNC.  INFO is always supported.
  *
- * Wire structs below are ABI-stable: existing fields keep their offsets,
- * new fields append, and the size is pinned by _Static_assert.  Reordering
- * an existing field breaks any consumer compiled against an older layout.
- * Each struct is preceded by a WIRE FORMAT banner for grep-ability.
+ * The wire structs are ABI-stable: fields keep their offsets, new ones
+ * append, and each size is pinned by _Static_assert.  Each struct carries
+ * a WIRE FORMAT banner for grep.
  *
- * All replies COPY_SEND back through req->msgh_local; the inline-reply
- * fast path applies to bare replies (INFO, WRITE) and skips the kmalloc
- * + enqueue + wake of the queue path entirely.
+ * Replies go to req->msgh_local.  Bare replies (INFO, WRITE) take the
+ * inline-reply fast path, skipping the queue's kmalloc, enqueue and wake.
  */
 
 #define	DEV_OP_INFO		1	/* request: header.  reply: dev_info_reply  */
@@ -42,10 +39,8 @@
  *	WRITE_BLOCK writes up to DEV_BLOCK_MAX_SECTORS at a given LBA
  *	SYNC        flush write cache so previous writes hit the medium
  *
- * Sector size is fixed at 512 for the protocol.  Drives reporting
- * something else are rejected at probe time -- the wire shape would
- * have to change to accommodate them, and 512 is universal on the
- * supported hardware.
+ * The protocol's sector size is fixed at 512; ata_drv assumes 512-byte
+ * sectors without checking.
  */
 #define	DEV_OP_GEOM		4	/* request: header.  reply: dev_geom_reply  */
 #define	DEV_OP_READ_BLOCK	5	/* request: dev_block_io_req.  reply: dev_block_read_reply */
@@ -54,12 +49,12 @@
 
 /*
  * Device classes.  The kind tells a consumer how to talk to the device:
- *	STREAM_RX	push-style input (kbd, uart-rx, mouse).  OPEN_STREAM
- *			hands the consumer a SEND right to the underlying
- *			Mach port; the consumer recvs from it to get bytes.
- *	STREAM_TX	accepts WRITE bytes (uart-tx, future tty).
- *	CHAR		random-access byte device (future: rtc, random).
- *	BLOCK		fixed-size sector device (future: nvme, ramdisk).
+ *	STREAM_RX	push-style input (kbd, uart, mouse).  OPEN_STREAM
+ *			moves the stream port's RECEIVE right to the
+ *			consumer, which receives the events from it.
+ *	STREAM_TX	accepts WRITE bytes.
+ *	CHAR		random-access byte device (none yet).
+ *	BLOCK		fixed-size sector device (ATA disks).
  */
 #define	DEV_KIND_NONE		0
 #define	DEV_KIND_STREAM_RX	1
@@ -67,27 +62,24 @@
 #define	DEV_KIND_CHAR		3
 #define	DEV_KIND_BLOCK		4
 
-#define	DEV_F_READABLE		0x01	/* DEV_OP_OPEN_STREAM works  */
-#define	DEV_F_WRITABLE		0x02	/* DEV_OP_WRITE works        */
+#define	DEV_F_READABLE		0x01	/* OPEN_STREAM or READ_BLOCK */
+#define	DEV_F_WRITABLE		0x02	/* WRITE or WRITE_BLOCK      */
 #define	DEV_F_STREAM		0x04	/* events arrive unsolicited */
 
 #define	DEV_NAME_MAX		16	/* short name, post-"dev/" prefix */
 #define	DEV_WRITE_MAX		256	/* per-call write payload cap */
 
 /*
- * Block-IO sizing.  At 512 B/sector, 4 sectors is the largest run that
- * fits in MAX_MSG_BYTES (4096) with room for header + descriptor.  A
- * higher-level layer (future FS) chains calls if it wants more.
+ * Block-IO sizing: 4 sectors (2 KiB) per call keeps a request or reply,
+ * header included, inside MAX_MSG_BYTES (4096).  Larger transfers take
+ * several calls.
  */
 #define	DEV_BLOCK_SECTOR_BYTES	512
 #define	DEV_BLOCK_MAX_SECTORS	4
 #define	DEV_BLOCK_MAX_BYTES	\
 	(DEV_BLOCK_SECTOR_BYTES * DEV_BLOCK_MAX_SECTORS)
 
-/*
- * Reply for DEV_OP_INFO.  Sits right after the mach_msg_header in the
- * reply message.  24 bytes; the fast path treats this as a bare reply.
- */
+/* Reply body for DEV_OP_INFO, after the header; a bare reply. */
 /* WIRE FORMAT.  ABI-stable. */
 struct dev_info_reply {
 	char		dir_name[DEV_NAME_MAX];	/* NUL-terminated         */
@@ -99,9 +91,8 @@ _Static_assert(sizeof(struct dev_info_reply) == DEV_NAME_MAX + 8,
     "dev_info_reply must be 24 bytes (wire format)");
 
 /*
- * Request for DEV_OP_WRITE.  dwr_len is the number of valid bytes in
- * dwr_data; the driver writes those out and returns dwr_written in the
- * reply (may be less than dwr_len if a short write occurred).
+ * Request for DEV_OP_WRITE: dwr_len valid bytes in dwr_data.  The reply's
+ * dwr_written may be less on a short write.
  */
 /* WIRE FORMAT.  ABI-stable. */
 struct dev_write_request {
@@ -125,16 +116,16 @@ _Static_assert(sizeof(struct dev_write_reply) == 8,
 /* ---- block-device wire formats ---- */
 
 /*
- * Reply to DEV_OP_GEOM.  dgr_model is the device-reported model string
- * (NUL-padded).  dgr_total_sectors is in dgr_sector_bytes units; a
- * 1 GiB QEMU disk reports total=0x200000, bytes=512.
+ * Reply to DEV_OP_GEOM.  dgr_model is the device's model string,
+ * NUL-padded; dgr_total_sectors counts dgr_sector_bytes units (a 1 GiB
+ * disk: 0x200000 of 512).
  */
 /* WIRE FORMAT.  ABI-stable. */
 struct dev_geom_reply {
 	int32_t		dgr_rv;
 	uint32_t	dgr_sector_bytes;
 	uint64_t	dgr_total_sectors;
-	uint32_t	dgr_flags;	/* reserved (LBA48-supported etc.) */
+	uint32_t	dgr_flags;	/* bit 0: LBA48 supported */
 	uint32_t	dgr_pad;
 	char		dgr_model[40];
 };
@@ -143,9 +134,9 @@ _Static_assert(sizeof(struct dev_geom_reply) == 64,
     "dev_geom_reply must be 64 bytes (wire format)");
 
 /*
- * Request for DEV_OP_READ_BLOCK.  Asks for `dbr_count` sectors starting
- * at LBA `dbr_lba`.  Caller's reply buffer must hold a dev_block_read_reply
- * (header + status + count * 512 bytes).
+ * Request for DEV_OP_READ_BLOCK: `dbr_count' sectors at LBA `dbr_lba'.
+ * The caller's reply buffer must hold a header plus a
+ * dev_block_read_reply.
  */
 /* WIRE FORMAT.  ABI-stable. */
 struct dev_block_io_req {
@@ -158,11 +149,9 @@ _Static_assert(sizeof(struct dev_block_io_req) == 16,
     "dev_block_io_req must be 16 bytes (wire format)");
 
 /*
- * Reply for DEV_OP_READ_BLOCK on success.  dbr_count is the actual
- * sector count delivered (== request count on success, 0 on error).
- * dbr_data carries (dbr_count * 512) bytes of payload, padded out to
- * the full DEV_BLOCK_MAX_BYTES so the buffer size is fixed and the
- * receiver doesn't need to special-case partial messages.
+ * Reply for DEV_OP_READ_BLOCK.  dbr_count is the request's count on
+ * success, 0 on error.  dbr_data holds dbr_count * 512 bytes, padded to
+ * DEV_BLOCK_MAX_BYTES so the reply size is fixed.
  */
 /* WIRE FORMAT.  ABI-stable. */
 struct dev_block_read_reply {
@@ -174,10 +163,7 @@ struct dev_block_read_reply {
 _Static_assert(sizeof(struct dev_block_read_reply) == 8 + DEV_BLOCK_MAX_BYTES,
     "dev_block_read_reply must be 2056 bytes (wire format)");
 
-/*
- * Request for DEV_OP_WRITE_BLOCK.  Carries the (lba, count) tuple plus
- * the inline data payload.  Symmetric to the read reply.
- */
+/* Request for DEV_OP_WRITE_BLOCK: (lba, count) and the data inline. */
 /* WIRE FORMAT.  ABI-stable. */
 struct dev_block_write_req {
 	uint64_t	dbw_lba;
@@ -189,10 +175,7 @@ struct dev_block_write_req {
 _Static_assert(sizeof(struct dev_block_write_req) == 16 + DEV_BLOCK_MAX_BYTES,
     "dev_block_write_req must be 2064 bytes (wire format)");
 
-/*
- * Reply for DEV_OP_WRITE_BLOCK and DEV_OP_SYNC.  Same shape as
- * dev_write_reply but field names track the block semantics.
- */
+/* Reply for DEV_OP_WRITE_BLOCK and DEV_OP_SYNC. */
 /* WIRE FORMAT.  ABI-stable. */
 struct dev_block_io_reply {
 	int32_t		dbr_rv;

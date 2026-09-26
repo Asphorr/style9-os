@@ -17,10 +17,10 @@
 #include "vm.h"
 
 /*
- * Where a main image whose linked __TEXT lies outside the user window gets
- * relocated to (see load_thin).  In [VM_USER_VA_LO, VM_USER_VA_HI) and clear
- * of dyld (0x60000000), the dylib region (0x70000000+), and the user stack
- * (0x4000F000); leaves ~256 MiB of headroom below dyld for a large image.
+ * Where a main image whose linked __TEXT lies outside the user window is
+ * relocated to (see load_thin).  In [VM_USER_VA_LO, VM_USER_VA_HI), below
+ * dyld (0x60000000, leaving ~256 MiB) and the dylibs (0x70000000+); the
+ * Darwin stack grows down from here (DARWIN_STACK_TOP).
  */
 #define	MACHO_IMAGE_BASE	0x50000000ULL
 
@@ -35,12 +35,10 @@ static int		load_segment(struct task *target, const uint8_t *image,
 static uint32_t		be32(uint32_t v);
 
 /*
- * Load a Mach-O image already resident in kernel memory into `target`.
- * A fat/universal archive is dispatched to the slice picker; a thin
- * image goes straight to the segment mapper.  Returns the entry RIP in
- * `*entry_out` and MACHO_E_OK, or a negative MACHO_E_* on failure --
- * the same contract as elf_load(), so usermode_elf_launcher can treat
- * the two formats interchangeably behind a 4-byte magic sniff.
+ * Load a Mach-O image resident in kernel memory into `target`: a fat
+ * archive goes to the slice picker, a thin image to load_thin.  Fills
+ * `*out' and returns MACHO_E_OK, or a negative MACHO_E_*; the launcher
+ * picks this or elf_load() by the 4-byte magic.
  */
 int
 macho_load(struct task *target, const void *image, size_t image_size,
@@ -67,12 +65,10 @@ macho_load(struct task *target, const void *image, size_t image_size,
 }
 
 /*
- * Pick the CPU_TYPE_X86_64 slice out of a fat/universal archive and load
- * it as a thin image.  Fat headers are BIG-ENDIAN on disk regardless of
- * the slices they carry, so every field is read through be32().  The
- * selected slice is loaded by load_thin directly (not via macho_load),
- * so a pathologically nested fat-in-fat archive is simply rejected as a
- * bad thin magic rather than recursing.
+ * Pick the CPU_TYPE_X86_64 slice of a fat archive and load it thin.  Fat
+ * headers are big-endian, so every field goes through be32().  The slice
+ * goes to load_thin, not macho_load, so fat-in-fat is rejected as a bad
+ * magic rather than recursed into.
  */
 static int
 load_fat(struct task *target, const uint8_t *image, size_t image_size,
@@ -93,9 +89,8 @@ load_fat(struct task *target, const uint8_t *image, size_t image_size,
 	narch = be32(fh->nfat_arch);
 
 	/*
-	 * Cap the arch count: a real universal binary carries a handful of
-	 * slices, and an absurd value almost certainly means we mis-sniffed
-	 * a non-fat image as fat.  Bound the scan rather than trust it.
+	 * A real universal binary has a handful of slices; an absurd count
+	 * means a mis-sniffed non-fat image.
 	 */
 	if (narch == 0 || narch > 64)
 		return (MACHO_E_BADCMD);
@@ -127,18 +122,15 @@ load_fat(struct task *target, const uint8_t *image, size_t image_size,
 }
 
 /*
- * Load a thin (single-architecture) 64-bit Mach-O.  Validates the header,
- * walks the load commands bounded by sizeofcmds, maps every LC_SEGMENT_64
- * into the target address space, and resolves the entry point from
- * LC_UNIXTHREAD (rip taken verbatim) or LC_MAIN (entryoff added to the
- * mach-header base, which is how dyld computes it).  LC_UNIXTHREAD wins if
- * both are present.
+ * Load a thin 64-bit Mach-O: validate the header, walk the load commands
+ * within sizeofcmds, map every LC_SEGMENT_64, and take the entry from
+ * LC_UNIXTHREAD (rip verbatim) or LC_MAIN (entryoff from the mach-header
+ * base, as dyld computes it); LC_UNIXTHREAD wins if both are present.
  *
- * An image whose __TEXT is linked outside the user window [VM_USER_VA_LO,
- * VM_USER_VA_HI) -- e.g. a real Apple binary at 0x100000000, which we cannot
- * relink at the source -- is relocated wholesale to MACHO_IMAGE_BASE by a load
- * bias added to every segment vmaddr and to the entry.  Our own
- * -pagezero_size'd binaries already sit in the window and take a zero bias.
+ * An image whose __TEXT is linked outside [VM_USER_VA_LO, VM_USER_VA_HI)
+ * (a real Apple binary at 0x100000000) is slid to MACHO_IMAGE_BASE by a
+ * bias added to every vmaddr and the entry.  Our own -pagezero_size'd
+ * binaries sit in the window and take a zero bias.
  */
 static int
 load_thin(struct task *target, const uint8_t *image, size_t image_size,
@@ -205,16 +197,12 @@ load_thin(struct task *target, const uint8_t *image, size_t image_size,
 			sg = (const struct mach_segment_command_64 *)
 			    (image + off);
 			/*
-			 * The first file-offset-0, non-empty segment is __TEXT
-			 * -- the image base.  If its linked vmaddr is outside
-			 * the user window (a real Apple binary lives at
-			 * 0x100000000), relocate the whole image down to
-			 * MACHO_IMAGE_BASE: choose the bias here, before
-			 * mapping __TEXT, so every segment lands biased.  Only
-			 * __PAGEZERO precedes __TEXT and it is never mapped
+			 * The first non-empty fileoff-0 segment is __TEXT, the
+			 * image base; choose the bias here, before mapping it.
+			 * Only __PAGEZERO precedes it and is never mapped
 			 * (initprot 0), so its zero bias is harmless.  dyld
-			 * re-derives the slide from the biased mach-header we
-			 * report, keeping its chained-fixup walk correct.
+			 * derives the slide from the biased mach-header we
+			 * report, which keeps its chained-fixup walk right.
 			 */
 			if (sg->fileoff == 0 && sg->filesize > 0 && !have_base) {
 				if (sg->vmaddr < VM_USER_VA_LO ||
@@ -281,12 +269,8 @@ load_thin(struct task *target, const uint8_t *image, size_t image_size,
 	}
 
 	/*
-	 * Stamp the task's syscall personality from the platform the image
-	 * declared.  A PLATFORM_MACOS LC_BUILD_VERSION opts the task into the
-	 * Darwin ABI -- class-encoded syscalls routed through darwin_dispatch;
-	 * anything else (including no LC_BUILD_VERSION) leaves it native
-	 * style9.  Set before the entry resolves so the tag holds regardless
-	 * of which entry command the binary carries.
+	 * Stamp the syscall personality from the declared platform, before
+	 * the entry is resolved, whichever entry command the image carries.
 	 */
 	target->t_personality = darwin_platform ?
 	    TASK_PERSONALITY_DARWIN : TASK_PERSONALITY_STYLE9;
@@ -305,24 +289,13 @@ load_thin(struct task *target, const uint8_t *image, size_t image_size,
 }
 
 /*
- * Bring one LC_SEGMENT_64 into the target task's address space.  A
- * structural twin of elf.c's load_segment().  `bias` is added to the
- * segment's vmaddr before mapping: 0 for an MH_EXECUTE loaded at its linked
- * address, the load base for a relocatable MH_DYLIB (see macho_map_dylib):
- *	- skip no-access guard segments (__PAGEZERO has initprot 0 and a
- *	  4 GiB vmsize -- mapping it would be both pointless and ruinous),
- *	- round [bias+vmaddr, bias+vmaddr+vmsize) out to whole pages,
- *	- allocate + map each page U=1 with R/W/X from initprot,
- *	- zero the freshly-allocated frame (covers the bss tail where
- *	  vmsize > filesize),
- *	- hand the range to vm_map_image, which fills it from `image +
- *	  fileoff` -- borrowing the kernel's own frames where it can rather
- *	  than allocating and copying (vm/vm.h has the doctrine).
- *
- * What stays here is what Mach-O says and ELF does not: the guard-segment
- * rule, the load bias, and the initprot translation.  The mapping itself is
- * shared with kern/elf.c, because the two formats disagree about how a
- * segment is described and agree entirely about what one is.
+ * Map one LC_SEGMENT_64 into the target at bias + vmaddr (bias is 0 for an
+ * executable at its linked address, or the slide or dylib base; see
+ * load_thin and macho_map_dylib).  No-access guard segments are skipped
+ * (__PAGEZERO: initprot 0, 4 GiB vmsize).  The rest is the Mach-O part --
+ * bias and initprot translation; vm_map_image, shared with kern/elf.c,
+ * does the mapping, zero-fills the bss tail and borrows the kernel's own
+ * frames where it can (vm/vm.h).
  */
 static int
 load_segment(struct task *target, const uint8_t *image, size_t image_size,
@@ -342,10 +315,9 @@ load_segment(struct task *target, const uint8_t *image, size_t image_size,
 		return (MACHO_E_BADCMD);
 
 	/*
-	 * initprot, not maxprot: it is what the segment is mapped with, and
-	 * therefore what decides whether its pages can be shared.  That keeps
-	 * __DATA_CONST out of the borrowed set on its own -- dyld writes its
-	 * fixups there, so it is mapped writable and stays copied.
+	 * initprot, not maxprot, decides the mapping and so whether pages can
+	 * be borrowed.  __DATA_CONST, where dyld writes fixups, is writable
+	 * and stays copied.
 	 */
 	prot = VM_PROT_USER;
 	if (sg->initprot & MACHO_VM_PROT_READ)
@@ -367,13 +339,10 @@ load_segment(struct task *target, const uint8_t *image, size_t image_size,
 }
 
 /*
- * Map a relocatable MH_DYLIB into `target` at `bias`.  Validates the header,
- * walks the load commands, and drops every LC_SEGMENT_64 at bias+vmaddr via
- * the shared load_segment (so __LINKEDIT -- carrying the export trie + chained
- * fixups our dyld reads back -- is mapped just like __TEXT).  No entry point,
- * no LC_MAIN, no personality stamp: a dylib is data to be bound into an
- * already-running task, not a program to enter.  *out_span gets the page-
- * rounded VA span consumed from `bias` so the caller can place the next dylib.
+ * Map a relocatable MH_DYLIB into `target` at `bias`: every LC_SEGMENT_64
+ * via load_segment, __LINKEDIT included (dyld reads the export trie and
+ * chained fixups from it).  No entry point or personality stamp.
+ * *out_span gets the page-rounded span used, to place the next dylib.
  */
 int
 macho_map_dylib(struct task *target, const void *image, size_t image_size,
@@ -444,9 +413,8 @@ macho_map_dylib(struct task *target, const void *image, size_t image_size,
 }
 
 /*
- * Read a big-endian uint32 from a fat header field.  The kernel runs
- * little-endian on x86-64, so every fat/universal field needs the swap;
- * thin Mach-O bodies are native little-endian and are read directly.
+ * Byte-swap a big-endian fat header field; thin Mach-O is little-endian
+ * and read directly.
  */
 static uint32_t
 be32(uint32_t v)

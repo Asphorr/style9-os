@@ -70,12 +70,9 @@ elf_load(struct task *target, const void *image, size_t image_size,
 }
 
 /*
- * Bring one PT_LOAD into the target task's address space.  Validation and
- * the p_flags -> VM_PROT_* translation happen here, because they are what
- * this container format says; the mapping itself is vm_map_image, which is
- * the same code kern/macho.c reaches for an LC_SEGMENT_64.  The two formats
- * disagree about how a segment is described and agree completely about what
- * one is, so that is where the line is drawn.
+ * Map one PT_LOAD into the target.  Validation and the p_flags ->
+ * VM_PROT_* translation are ELF's; the mapping is vm_map_image, shared
+ * with kern/macho.c.
  */
 static int
 load_segment(struct task *target, const uint8_t *image, size_t image_size,
@@ -91,9 +88,8 @@ load_segment(struct task *target, const uint8_t *image, size_t image_size,
 		return (ELF_E_BADSEG);
 
 	/*
-	 * vme_prot carries pmap-style bits (R/W/X plus USER); vme_flags only
-	 * tracks backing semantics (ANON, COW), since "user accessibility" is
-	 * already in the prot byte and a second flag would just drift.
+	 * Always readable and USER; W and X from p_flags.  User access lives
+	 * in the prot bits, not in a vme_flags flag.
 	 */
 	prot = VM_PROT_READ | VM_PROT_USER;
 	if (ph->p_flags & PF_W)

@@ -6,28 +6,22 @@
  *
  * vmmap -- dump the calling task's VM regions.
  *
- * Userspace counterpart to Darwin's `vmmap(1)`: prints one line per
- * live entry in the task's vm_map showing VA range, size, protection
- * bits, backing kind, and a guessed "region type" label.  The kernel
- * surface is the SYS_TASK_GET_VM_REGIONS syscall, which copies an
- * array of mach_vm_region_entry records back to the caller.
- *
- * Like lsmp(1), v1 only introspects self.  Useful as a debugger probe
- * + a demo of the layered (vm_map -> per-page pmap) memory model: the
- * tool shows the higher-level intent (region kinds, protections)
- * without having to walk the per-task PML4.
+ * Counterpart to Darwin's vmmap(1): one line per vm_map entry with VA
+ * range, size, protection, backing kind and a guessed region label, from
+ * SYS_TASK_GET_VM_REGIONS (an array of mach_vm_region_entry).  Like
+ * lsmp(1) it can only inspect itself.  It shows the vm_map layer's intent
+ * without walking the task's page tables.
  */
 
 #include "style9.h"
 
 /*
- * Map a VA range to a coarse region label by checking against the
- * well-known layout the loader + launcher build for a fresh task:
- *	USER_VA_LO    = 0x40000000  -- ELF .text starts here
- *	USER_STACK_VA = 0x4000F000  -- single-page user stack the launcher maps
- *	heap / vm_allocate-anon lands in vm_map_find_space holes above
- * The classifier is heuristic (no formal section tagging in the
- * vm_map entry yet), so labels are guidance, not authoritative.
+ * Coarse region label from the layout the loader and launcher build:
+ * image text at the bottom of the user window, a single-page stack, and
+ * vm_allocate memory in vm_map_find_space holes.  vm_map entries carry no
+ * section tag, so the labels are guesses.  The kernel's USER_STACK_VA is
+ * 0x40FFF000 (arch/amd64/usermode.h); the stack hint below does not
+ * match it.
  */
 #define	USER_VA_LO_HINT		0x40000000ULL
 #define	USER_STACK_VA_HINT	0x4000F000ULL
@@ -39,16 +33,13 @@ region_label(const struct mach_vm_region_entry *e)
 
 	size = e->mvr_end - e->mvr_start;
 
-	/*
-	 * Single-page mapping at the well-known stack VA.
-	 */
+	/* Single-page mapping at the stack VA. */
 	if (e->mvr_start == USER_STACK_VA_HINT && size == 0x1000ULL)
 		return ("STACK");
 
 	/*
-	 * Image: starts at USER_VA_LO, executable, anonymous in our
-	 * loader (elf_load currently copies segments into freshly
-	 * pmm_alloc'd frames marked VME_F_ANON).
+	 * Image: executable at USER_VA_LO.  elf_load copies segments into
+	 * fresh frames (vm_map_image), so they show as anonymous.
 	 */
 	if (e->mvr_start == USER_VA_LO_HINT &&
 	    (e->mvr_prot & VM_PROT_EXEC) != 0)
@@ -114,10 +105,9 @@ print_row(const struct mach_vm_region_entry *e)
 }
 
 /*
- * Stand up a couple of extra anonymous regions before the snapshot so
- * the table demonstrates more than just the fixed TEXT + STACK pair
- * every task gets at launch.  Failures are non-fatal: snapshot still
- * shows whatever state was actually reached.
+ * Add two anonymous regions so the table shows more than the image and
+ * stack every task starts with.  Failure is harmless: the snapshot shows
+ * whatever exists.
  */
 static void
 seed_demo_state(void)

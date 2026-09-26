@@ -44,11 +44,8 @@ kvprintf(const char *fmt, va_list ap)
 	written = 0;
 
 	/*
-	 * One line of kernel output is one write as far as the console is
-	 * concerned, so the hardware cursor is programmed once when this
-	 * returns rather than once per character emitted along the way.
-	 * There is a single exit below, which is what makes the closing
-	 * bracket safe to place there.
+	 * One call is one console write: the console is held and the
+	 * hardware cursor programmed once, at the single exit below.
 	 */
 	tty_batch_begin();
 
@@ -124,12 +121,7 @@ kvprintf(const char *fmt, va_list ap)
 				    (uint64_t)va_arg(ap, unsigned int),
 				    10, false, width, zeropad, left_align);
 			break;
-		/*
-		 * Octal, which exists here for exactly one reason: a mode
-		 * word.  0755 is a number nobody reads in decimal, and a
-		 * diagnostic that printed 493 would be technically correct
-		 * and useless.
-		 */
+		/* Octal, for mode words: 0755, not 493. */
 		case 'o':
 			if (length >= 1)
 				written += emit_uint(va_arg(ap, unsigned long),

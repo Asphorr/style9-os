@@ -1,79 +1,55 @@
 /*
- * THE POWER FAILS ON PURPOSE, AT EVERY POSSIBLE MOMENT
+ * Power failure on purpose, at every possible moment.
  *
  *	make torncheck
  *	obj/hosttorn obj/style9.apfs [workload] [-k N [-s S]]
  *
- * Every rung of the writer has leaned on one sentence: the checkpoint is the
- * only atom this volume has.  The clobbering rename leaned on it hardest --
- * "the takeover and the reap reach the platter as one published state" -- and
- * the sentence has been enforced by construction and never once measured.
- * This stand measures it, the way the sabotage ladder measured apfsck: not by
- * trusting the design but by doing the harm and watching the answer.
+ * Measures the claim the writer rests on: the checkpoint is the volume's
+ * only atom.
  *
- * THE HARM.  A workload runs against the image and the harness kills the
- * process INSIDE bio_write: after the Kth write of the measured edit has
- * landed, the (K+1)th either never starts (a clean cut) or lands its first S
- * sectors and no more (a torn write -- the disk's own failure mode, since a
- * platter has no obligation to finish a 4 KiB block it was half way through).
- * Then a fresh process mounts what is left and answers three questions: does
- * it mount at all, is the volume WHOLLY the old state or WHOLLY the new one,
- * and does apfsck agree.  K sweeps every write the edit makes, so every
- * moment the power could fail is a moment it does.  A mount that answers
- * NEW is asked one more: through a view of the checkpoint before (apfs.h,
- * "the published past"), is the old state still there to the byte -- the
- * free queue's retention, measured at every failure that let a checkpoint
- * land.
+ * The harm.  A workload runs against the image and the harness kills the
+ * process inside bio_write: after the Kth write of the measured edit lands,
+ * the (K+1)th either never starts (a clean cut) or lands its first S sectors
+ * only (a torn write; a disk need not finish a block it started).  A fresh
+ * process then mounts what is left: does it mount, is the volume wholly the
+ * old state or wholly the new one, and does apfsck agree?  K sweeps every
+ * write of the edit.  A mount that answers new is also asked, through a view
+ * of the checkpoint before (apfs.h), whether the old state is still there to
+ * the byte: the free queue's retention, at every failure that let a
+ * checkpoint land.
  *
- * WHAT MUST BE TRUE.  There is exactly one write that changes the answer --
- * the container superblock landing in the descriptor ring -- and the sweep
- * asserts it: old state at every cut before that write, new state at it and
- * after, never a third state, never an unmountable disk.  A torn write must
- * never flip the answer ON ITS OWN, because a torn block fails its
- * Fletcher-64 and a reader that adopts a block it cannot checksum has no
- * business calling itself a reader.  A tear CAN instead complete a write:
- * when every byte that differs sits inside the sectors that landed -- a
- * superblock's tail is padding, and padding does not change between
- * checkpoints -- the block on the platter is whole, and the sweep judges
- * the moment as the write having finished, because that is what it is.
+ * What must be true.  Exactly one write changes the answer -- the container
+ * superblock landing in the descriptor ring: old state at every cut before
+ * it, new at it and after, never a third state or an unmountable disk.  A
+ * torn write must never flip the answer on its own, since a torn block fails
+ * its Fletcher-64.  A tear can complete a write, though: when every differing
+ * byte is in the sectors that landed (a superblock's tail is padding, the
+ * same in every checkpoint), the block is whole and is judged as written.
  *
- * THE ONE-WRITE CRASH WINDOW, measured first and then proved irreducible.
- * A checkpoint ends with two copies of the same superblock: the ring slot,
- * which is the commit, and block zero, which is a courtesy for readers that
- * start there.  Two fixed locations cannot both change in one block write,
- * so between those two writes EVERY volume of this design is a volume whose
- * anchor lags its ring -- and apfsck says exactly that ("Block zero: the
- * filesystem was not unmounted cleanly", which after a power cut is a true
- * statement) and withholds its clean bill.  The order is still the right
- * order; committing the anchor first would advertise a checkpoint the ring
- * does not hold.  So the window's grid points answer to a two-tier oracle:
- * strict apfsck must refuse, and apfsck -u -- uncleanliness tolerated,
- * everything else still checked, which was verified by breaking one byte of
- * a catalog node and watching -u catch it -- must call the volume whole.
- * Everywhere else, strict apfsck must simply be happy.
+ * The one-write crash window.  A checkpoint ends with two copies of its
+ * superblock: the ring slot, which is the commit, and block zero.  Two fixed
+ * locations cannot change in one write, so between them the anchor lags the
+ * ring, and apfsck says so ("Block zero: the filesystem was not unmounted
+ * cleanly", true after a power cut).  Writing the anchor first would
+ * advertise a checkpoint the ring does not hold.  So in the window strict
+ * apfsck must refuse and apfsck -u (uncleanliness tolerated, all else
+ * checked -- it catches one broken byte in a catalog node) must call the
+ * volume whole; everywhere else strict apfsck must pass.
  *
- * WHAT THE MODEL IS, honestly.  Writes land in the order they were issued
- * and a cut keeps a prefix.  A real disk with a write cache can reorder
- * across that prefix unless someone tells it not to, and nothing in this
- * stack issues a flush yet -- so what is proved here is that the LOGICAL
- * order is crash-consistent, which is the property a flush discipline would
- * then pin to the platter.  Reorder-under-cache is that later rung's
- * question, and pretending this sweep answers it would be the lie the essay
- * above the acceptance script warns about.
+ * The model.  Writes land in issue order and a cut keeps a prefix; the
+ * kernel's ATA path makes that so by ending every write with FLUSH CACHE.
+ * A disk reordering across the prefix is not modelled.
  *
- * HOW THE IMAGE COMES BACK.  Every write is journaled with its pre-image
- * before it lands (one pread, one append), and between grid points the
- * parent replays the journal BACKWARDS.  That restores exactly what the
- * dying child touched, with no assumption that two runs of the workload
- * write the same blocks -- the undo log is per-run truth, not a bet on
- * determinism.  The determinism that IS relied on -- the same start state
- * driving the same write COUNT, so K means the same moment every time -- is
- * asserted rather than assumed: a child that survives a cut below W, or
- * refuses an operation the dry run completed, fails the stand out loud.
+ * Restoring the image.  Every write is journaled with its pre-image before
+ * it lands, and between grid points the parent replays the journal
+ * backwards, restoring exactly what the dying child touched without
+ * assuming two runs write the same blocks.  What is relied on -- the same
+ * start state giving the same write count, so K means the same moment -- is
+ * asserted: a child that survives a cut below W, or refuses an operation the
+ * dry run completed, fails the stand.
  *
- * The single-point form (-k, and -s for the torn variant) runs one grid
- * point, does NOT restore, and leaves the corpse for apfspoke and apfsck:
- * the autopsy mode, for when the sweep names a K and a human wants to look.
+ * With -k (and -s for a tear) one grid point runs and the image is not
+ * restored, left for apfspoke and apfsck to examine.
  */
 #define	_POSIX_C_SOURCE	200809L
 
@@ -98,10 +74,8 @@
 #define	BUG_EXIT	99	/* a workload op refused on an honest disk */
 
 /*
- * One wall-clock value for every run of every child.  Fixed rather than read,
- * because the sweep's whole vocabulary -- "the Kth write" -- depends on two
- * runs of the same workload issuing the same sequence, and a timestamp is the
- * one input that would differ.
+ * One fixed wall-clock value for every run: "the Kth write" needs two runs
+ * of a workload to issue the same writes, and a real timestamp would differ.
  */
 #define	NOW		1756000000000000000ULL
 
@@ -118,7 +92,7 @@ static int		 tear;		/* sectors of the fatal write to land */
 static int		 wpipe = -1;	/* dry run reports W through this */
 static long		 odd_writes;	/* writes that were not one block */
 
-/* ---- the five ----------------------------------------------------------- */
+/* ---- what fs/apfs needs from the kernel --------------------------------- */
 
 void *
 kmalloc(size_t size)
@@ -157,9 +131,8 @@ bio_read(unsigned drive, uint64_t lba, uint32_t nsec, void *buf)
 }
 
 /*
- * The block autopsy's appetite, fed the same way hostapfs feeds it (see the
- * essay there): no driver and no platter on a host, so the counters are zero
- * and the straight-off-the-device read is the same pread as every other.
+ * For the block autopsy, as in hostapfs: no driver on a host, so the
+ * counters are zero and the direct device read is the same pread.
  */
 uint32_t
 ata_lost_intrs(void)
@@ -183,11 +156,9 @@ ata_kread(unsigned drive_idx, uint64_t lba, uint32_t count, void *buf)
 }
 
 /*
- * The seam the whole stand hangs on.  Journal the pre-image, then either
- * land the write whole, or land S sectors of it and die on the spot --
- * _exit, not exit, because a power failure does not run atexit handlers
- * either.  The journal entry goes down BEFORE the torn sectors do, so even
- * the block this child mutilates on its way out is restorable.
+ * Journal the pre-image, then land the write whole, or land S sectors of it
+ * and die on the spot (_exit: a power failure runs no atexit handlers).  The
+ * journal entry goes down first, so even the torn block is restorable.
  */
 int
 bio_write(unsigned drive, uint64_t lba, uint32_t nsec, const void *buf)
@@ -248,18 +219,16 @@ bio_write(unsigned drive, uint64_t lba, uint32_t nsec, const void *buf)
 
 /*
  * Five edits, chosen for what they make the checkpoint carry: a creation
- * (records and fresh extents), the clobbering rename (the takeover, the
- * orphan machinery and a reap in one edit -- the sentence this stand exists
- * to test), an unlink (records leaving, blocks to the free queue), a growth
- * (the extent reference tree's new two-level paths under power loss), and a
- * BATCH -- four different edits published by a single checkpoint, which is
- * the shape the kernel's sync policy produces once mutations stop
- * checkpointing themselves.  The batch is the policy's acceptance: before
- * the flip none of its edits exists, from the flip all of them do, and no
- * cut or tear may ever show a volume carrying some.
- * Each workload is a setup phase that completes -- its own checkpoint and
- * all -- and a measured phase that ends in exactly one fs_apfs_checkpoint();
- * only the measured phase's writes are counted and cut.
+ * (records and fresh extents), the clobbering rename (takeover, orphan and
+ * reap in one edit), an unlink (records leaving, blocks to the free queue),
+ * a growth (the extent reference tree's two-level paths), and a batch of
+ * four edits published by one checkpoint, as the kernel's sync policy does.
+ * Before the flip none of the batch exists, from it all of it does, and no
+ * cut or tear may show a volume carrying some.
+ *
+ * Each workload is a setup phase, completed with its own checkpoint, and a
+ * measured phase ending in exactly one fs_apfs_checkpoint(); only the
+ * measured phase's writes are counted and cut.
  */
 
 static void
@@ -308,9 +277,8 @@ make_file(uint64_t dir, const char *name, uint32_t blocks, uint8_t fill)
 
 /*
  * Classifiers answer with the verify child's exit code.  OLD and NEW are
- * checked to the byte: a state that merely LOOKS old is exactly the kind of
- * half-published edit the sweep exists to catch, so "the name is there" is
- * never enough -- the size and every byte have to be the state's own.
+ * checked to the byte, size and contents: a state that merely looks old is
+ * the half-published edit the sweep exists to catch.
  */
 #define	CLS_OLD		10
 #define	CLS_NEW		11
@@ -522,12 +490,11 @@ w_batch_setup(void)
 }
 
 /*
- * A create, an unlink, a rename and a growth, then ONE checkpoint -- the
- * kernel's deferred policy seen from below.  The unlink-then-create pair is
- * in here on purpose: the blocks the unlink releases are queued at the OPEN
- * transaction's xid and stay marked in use, so nothing later in the batch
- * can be handed a block the published checkpoint still reaches.  That claim
- * is exactly what a cut anywhere in this edit puts to the proof.
+ * A create, an unlink, a rename and a growth, then one checkpoint.  The
+ * unlink is followed by allocations on purpose: the blocks it releases are
+ * queued at the open transaction's xid and stay marked in use, so nothing
+ * later in the batch may be handed a block the published checkpoint still
+ * reaches -- which a cut anywhere in this edit puts to the test.
  */
 static void
 w_batch_measured(void)
@@ -603,11 +570,10 @@ static char	logpath[512];
 static char	undopath[512];
 
 /*
- * Run the workload in a child that will die mid-write (or complete, when K
- * is at or past W -- the dry run is exactly that with K = -1).  The child's
- * chatter goes to the iteration log; a completed run reports its measured
- * write count back through the pipe, which is how the parent learns W
- * without parsing prose.
+ * Run the workload in a child that dies mid-write, or completes when K is
+ * at or past W (the dry run is K = -1).  Its output goes to the iteration
+ * log; a completed run reports its measured write count, W, through the
+ * pipe.
  */
 static int
 run_cut(const struct workload *wl, long k, int s, bool to_stdout)
@@ -657,14 +623,11 @@ run_cut(const struct workload *wl, long k, int s, bool to_stdout)
 }
 
 /*
- * THE PAST BEHIND THE NEW STATE.  When the measured checkpoint landed, the
- * checkpoint before it is the old state by definition -- setup's own, or the
- * image's -- and the free queue promises its blocks are untouched for
- * APFS_FQ_KEEP more checkpoints.  So a mount that classifies as NEW is asked
- * a second question through a view of the checkpoint before: is THAT wholly
- * the old state, to the byte?  It is the retention promise measured at every
- * power failure that let the new state land, including the tears: a torn
- * checkpoint that completed still had its predecessor's blocks to keep.
+ * The past behind the new state.  Once the measured checkpoint landed, the
+ * one before it is the old state (setup's, or the image's), and the free
+ * queue keeps its blocks for APFS_FQ_KEEP more checkpoints.  So a NEW mount
+ * is asked, through a view of that checkpoint, whether it is wholly the old
+ * state -- including after tears that completed the checkpoint.
  */
 static int
 past_is_old(const struct workload *wl)
@@ -732,10 +695,9 @@ run_apfsck(const char *flag, bool to_stdout)
 }
 
 /*
- * The checker's three possible words about an image, in the two-tier scheme
- * the header essay lays out: strict (-c) happy; strict refusing while -u
- * calls the volume whole (a crash, honestly reported); or damage that even
- * uncleanliness-tolerance will not excuse.
+ * The two-tier verdict (see the top of the file): strict (-c) passes;
+ * strict refuses while -u passes (a crash, reported as one); or damage that
+ * -u refuses too.
  */
 #define	FSCK_CLEAN	0
 #define	FSCK_UNCLEAN	1
@@ -769,10 +731,9 @@ fsck_name(int verdict)
 }
 
 /*
- * Put every block back, newest change first.  Replaying the journal
- * backwards undoes overlapping writes correctly by construction: the last
- * entry to touch a block is undone first, and the first entry -- whose
- * pre-image is the pristine content -- is undone last and therefore wins.
+ * Put every block back, newest change first, so overlapping writes undo
+ * correctly: the first entry for a block, holding the pristine content, is
+ * undone last and wins.
  */
 static void
 restore(void)
@@ -875,8 +836,7 @@ show_log(void)
 
 /*
  * One grid point: cut at K (torn at S sectors, 0 = clean), verify, apfsck,
- * restore.  Everything the parent decides comes back in one struct so the
- * sweep below reads as the model it asserts.
+ * restore.
  */
 struct point {
 	int	p_cut;		/* -1 died as told, W completed, -2 forbidden */
@@ -910,18 +870,14 @@ grid_point(const struct workload *wl, long k, int s, bool keep)
 }
 
 /*
- * The measured model, position by position.  Writes are numbered 1..W; a
- * point (k, s) holds k whole writes and s sectors of write k+1.  The ring
- * superblock is write W-1 and the anchor is write W -- asserted rather than
- * assumed, because the flip discovered on the clean row must land exactly
- * there.  The crash window of the header essay is the set of states where
- * the ring superblock's content is whole and the anchor's is not: reached
- * by cutting after W-1, or by a tear of W-1 that completed it.  A torn
- * anchor completes on this superblock layout (every differing byte is in
- * the first sector); if a future layout moves a differing byte past the
- * torn prefix, the point stops matching and the sweep says so out loud --
- * which is the moment to decide what a mount without a readable block zero
- * should do, not before.
+ * The model, position by position.  Writes are numbered 1..W; a point
+ * (k, s) holds k whole writes and s sectors of write k+1.  The ring
+ * superblock is write W-1 and the anchor write W (sweep asserts the flip
+ * lands there).  The crash window is where the ring superblock is whole and
+ * the anchor is not: a cut after W-1, or a tear of W-1 that completed it.
+ * A torn anchor completes with this superblock layout (every differing byte
+ * is in the first sector); a layout that broke that would show up here as a
+ * deviation.
  */
 static bool
 point_allowed(long k, int s, long w, const struct point *pt)
@@ -947,13 +903,11 @@ static const int	tears[] = { 0, 1, 4, 7 };
 
 /*
  * Three tear positions, not seven: any partial landing breaks a sealed
- * block's Fletcher-64 the same way, so early, middle and late probe the
- * distinct outcomes (an unsealed DATA block has no checksum to break, and
- * for those what matters is only that no committed state references the
- * block -- which the state assertion already answers).  What earns clean
- * cuts AND tears at every K is that they fail differently: a clean cut
- * tests the ORDER of writes, a torn write tests the reader's refusal to
- * believe a half-written block.
+ * block's Fletcher-64 alike, so early, middle and late cover the outcomes
+ * (an unsealed data block has no checksum, and the state check already asks
+ * that nothing committed references it).  Clean cuts and tears both run at
+ * every K because they fail differently: a cut tests write order, a tear
+ * the reader's refusal of a half-written block.
  */
 static int
 sweep(const struct workload *wl)
@@ -968,11 +922,9 @@ sweep(const struct workload *wl)
 	int		fsck0;
 
 	/*
-	 * No pristine pre-check: a workload's OLD state exists only after its
-	 * setup phase has run, so the pristine image classifies as nothing at
-	 * all (or, for an unlink, accidentally as NEW).  The k=0 grid point
-	 * carries that duty properly -- setup complete, not one measured
-	 * write landed, and the verdict must be OLD.
+	 * No pristine pre-check: the old state exists only after setup, so the
+	 * pristine image classifies as nothing (an unlink's, as NEW).  The k=0
+	 * grid point does the job: setup complete, no measured write, OLD.
 	 */
 
 	/* the dry run: complete the workload once, learn W, prove NEW */
@@ -1004,11 +956,9 @@ sweep(const struct workload *wl)
 	restore();
 
 	/*
-	 * The grid.  The flip is still DISCOVERED -- the first clean cut
-	 * that answers NEW -- and then asserted to sit exactly at write W-1,
-	 * the ring superblock, one before the anchor.  Every point is judged
-	 * by position against the measured model in point_allowed, and the
-	 * crash-window points are counted rather than excused silently.
+	 * The grid.  The flip is discovered (the first clean cut answering
+	 * NEW) and asserted to be write W-1, the ring superblock.  Every point
+	 * is judged by point_allowed; crash-window points are counted.
 	 */
 	devs = 0;
 	window = 0;
@@ -1115,9 +1065,8 @@ main(int argc, char **argv)
 	}
 
 	/*
-	 * The autopsy mode: one grid point, chatter to the terminal, and NO
-	 * restore -- the image is left exactly as the power failure left it,
-	 * for apfsck and apfspoke to examine at leisure.
+	 * One grid point, output to the terminal, and no restore: the image is
+	 * left as the power failure left it, for apfsck and apfspoke.
 	 */
 	if (k >= 0) {
 		struct point	pt;

@@ -11,9 +11,8 @@
  * clock.elf -- ring-3 wrapper around the kernel's "clock" Mach service.
  *
  * Looks the service up via bootstrap_lookup, RPCs a CLOCK_OP_GET, and
- * prints the uptime in milliseconds + microseconds + raw tick count.
- * No arguments; demonstrates the bootstrap-lookup + service-call
- * idiom in twenty lines.
+ * prints the uptime in milliseconds, microseconds and ticks: the
+ * bootstrap-lookup + service-call idiom at its smallest.
  */
 
 int

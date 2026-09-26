@@ -11,40 +11,25 @@
 #include <stdint.h>
 
 /*
- * Read-only APFS -- the filesystem a Darwin personality ought to be reading.
+ * APFS, the Darwin personality's filesystem: a reader and a copy-on-write
+ * writer (see "writing" below) for Apple's published on-disk format.
  *
- * Everything else on this rung is already Apple-shaped (Mach-O images, a
- * clean-room dyld, libSystem, launchd, Mach IPC), and FAT was only ever the
- * placeholder that let a binary find a data file at all.  APFS is the real
- * thing, and unlike the rest of the Apple surface here it does not have to be
- * reverse engineered: Apple published the on-disk format.
+ * Three ideas carry the format:
  *
- * Three ideas carry the whole format, and the code below is organised around
- * them:
+ *	1. Every metadata block starts with an obj_phys header: a Fletcher-64
+ *	   of the rest of the block, the object's id (oid) and the transaction
+ *	   that wrote it (xid).  Nothing is trusted unchecked -- a half-written
+ *	   block is what a copy-on-write filesystem expects after a crash.
  *
- *	1. EVERY metadata block starts with an obj_phys header carrying a
- *	   Fletcher-64 checksum of the rest of the block, plus the object's id
- *	   (oid) and the transaction that wrote it (xid).  Nothing is trusted
- *	   without checking that checksum -- a half-written block is exactly
- *	   what a copy-on-write filesystem expects to find after a crash.
+ *	2. There is no fixed superblock.  Block 0 is only an anchor; the live
+ *	   container superblock is the newest copy in the checkpoint
+ *	   descriptor ring that still checksums.  A commit writes the new
+ *	   state elsewhere and then lands one superblock, so an interrupted
+ *	   write is a no-op rather than corruption.
  *
- *	2. There is no single fixed superblock.  Block 0 is only an anchor;
- *	   the live container superblock is whichever copy in the CHECKPOINT
- *	   DESCRIPTOR ring carries the highest xid and still checksums.  That
- *	   ring is how APFS commits atomically: write the new state elsewhere,
- *	   then land one new superblock.  Mounting means finding the newest
- *	   valid one, which is what makes an interrupted write a no-op rather
- *	   than corruption.
- *
- *	3. Objects are addressed indirectly.  A PHYSICAL oid is a block
- *	   number, but a VIRTUAL oid has to be translated through an object
- *	   map (omap) B-tree first, because copy-on-write moves objects
- *	   without changing their identity.
- *
- * Read-only, and that is the whole of it: no allocator, no checkpoint writer,
- * no space manager.  Mounting a copy-on-write filesystem for reading is a much
- * smaller claim than writing one, and it is the claim a Darwin personality
- * needs -- a binary opens its data files, it does not reformat the disk.
+ *	3. Objects are addressed indirectly.  A physical oid is a block
+ *	   number; a virtual oid is translated through an object map (omap)
+ *	   B-tree, because copy-on-write moves objects without renaming them.
  */
 
 /* 'NXSB' as it appears little-endian at offset 32 of the container block. */
@@ -140,20 +125,13 @@ _Static_assert(__builtin_offsetof(struct apfs_nx_superblock, nx_spaceman_oid)
     == 152, "nx_spaceman_oid sits at +152");
 
 /*
- * THE EPHEMERAL OBJECTS, AND WHY THEY NEED A MAP OF THEIR OWN
- *
- * A physical oid is a block number and a virtual one is a question for the
- * object map, but an EPHEMERAL oid is neither.  Those objects live in memory
- * while the container is mounted and are written to the checkpoint data area
- * only when a checkpoint commits, so their block number is a property of the
- * checkpoint rather than of the object.  The checkpoint says where they went
- * in checkpoint-map blocks, which sit in the descriptor ring immediately
- * before the superblock that closes the same checkpoint.
- *
- * That is why a reader that only wants files can skip them -- nothing an open
- * or a read ever touches is ephemeral -- and why anything that wants to know
- * about SPACE cannot.  The space manager is ephemeral, and it is the only
- * thing that knows which blocks are free.
+ * Ephemeral objects.  An ephemeral oid is neither a block number nor an
+ * omap key: the object lives in memory while mounted and is written to the
+ * checkpoint data area when a checkpoint commits, so its block belongs to
+ * the checkpoint.  Checkpoint-map blocks, just before the checkpoint's
+ * superblock in the descriptor ring, say where each one went.  Nothing a
+ * file read touches is ephemeral; the space manager is, and it alone knows
+ * which blocks are free.
  */
 struct apfs_checkpoint_mapping {
 	uint32_t	cpm_type;
@@ -185,18 +163,13 @@ _Static_assert(__builtin_offsetof(struct apfs_checkpoint_map_phys, cpm_map)
 #define	APFS_CPM_MAX_PER_BLOCK	((APFS_BLOCK_SIZE - 40) / 40)
 
 /*
- * THE SPACE MANAGER
+ * The space manager.  Two devices (main and tier2; only main is non-empty
+ * here), each divided into chunks of sm_blocks_per_chunk blocks, so that a
+ * chunk's allocation bitmap is exactly one block: 32768 bits, 32768 blocks.
  *
- * Two devices (main and tier2; only main is ever non-empty here), each divided
- * into chunks of sm_blocks_per_chunk blocks.  One chunk's allocation bitmap is
- * exactly one block -- 32768 bits for 32768 blocks -- which is the arithmetic
- * the whole layout is built around.
- *
- * The free queues are the asymmetry that makes this filesystem harder to write
- * than to read.  Allocating is an edit to a bitmap; freeing is an INSERT into
- * one of these B-trees, keyed by the transaction that did the freeing, and the
- * blocks do not become available again until that transaction is old enough.
- * A writer that does not maintain xid has nothing honest to put in that key.
+ * Allocating is a bitmap edit; freeing is an insert into a free-queue
+ * B-tree keyed by the freeing transaction, and the blocks become available
+ * again only once that transaction is old enough.
  */
 struct apfs_spaceman_device {
 	uint64_t	sm_block_count;
@@ -235,9 +208,8 @@ _Static_assert(sizeof(struct apfs_spaceman_free_queue) == 40,
 #define	APFS_SFQ_COUNT		3
 
 /*
- * Only as far as the free queues -- everything past them is internal-pool
- * ring bookkeeping this kernel has no use for yet.  The struct is read out of
- * a block, so a short definition reads a prefix; it must never be written.
+ * Only as far as the internal pool's bitmap ring; the rest of the block is
+ * not used here.  A prefix overlaid on the block, never written by itself.
  */
 struct apfs_spaceman {
 	struct apfs_obj_phys		sm_o;
@@ -258,25 +230,19 @@ struct apfs_spaceman {
 	struct apfs_spaceman_free_queue	sm_fq[APFS_SFQ_COUNT];
 
 	/*
-	 * THE INTERNAL POOL'S OWN BOOKKEEPING
+	 * The internal pool (sm_ip_base) holds the chunk bitmaps and
+	 * chunk-info blocks, which cannot live in the space they account
+	 * for.  The pool's own usage bitmap is copied, never overwritten, so
+	 * it lives in a ring of sm_ip_bm_block_count slots at sm_ip_bm_base.
+	 * One slot is live; the free ones are a list threaded through the u16
+	 * table at sm_ip_bm_free_next_offset, from sm_ip_bm_free_head to
+	 * sm_ip_bm_free_tail, 0xFFFF ending it.  A checkpoint writes its
+	 * bitmap into the head slot and returns the one it replaced to the
+	 * tail, so earlier checkpoints' bitmaps survive as long as the ring
+	 * is deep.
 	 *
-	 * The pool at sm_ip_base holds the blocks that describe allocation --
-	 * the chunk bitmaps and the chunk-info blocks -- because those cannot
-	 * live in the space they themselves account for.  Which pool blocks
-	 * are in use is a bitmap like any other, except that it must be
-	 * copied rather than overwritten for the same reason everything else
-	 * must: a checkpoint that has not committed yet is still readable.
-	 *
-	 * So there is a RING of them, sm_ip_bm_block_count slots long, at
-	 * sm_ip_bm_base.  One slot is live; the free ones are a linked list
-	 * threaded through the u16 table at sm_ip_bm_free_next_offset, from
-	 * sm_ip_bm_free_head to sm_ip_bm_free_tail, with 0xFFFF for the end.
-	 * A checkpoint takes the head, writes its bitmap there, and returns
-	 * the slot it replaced to the tail -- so the ring is a FIFO and the
-	 * previous checkpoints' bitmaps survive for as long as it is deep.
-	 *
-	 * The two small tables say which slot is live and which xid it
-	 * belongs to.  All three offsets are byte offsets into this block.
+	 * The xid and bitmap tables say which slot is live and for which xid.
+	 * All three offsets are byte offsets into this block.
 	 */
 	uint16_t			sm_ip_bm_free_head;
 	uint16_t			sm_ip_bm_free_tail;
@@ -286,11 +252,9 @@ struct apfs_spaceman {
 };
 
 /*
- * Pinned against a real container rather than against the published layout:
- * every one of these was read out of obj/style9.apfs before it was written
- * here, and the two free-queue tree oids the struct reports are the same two
- * oids the checkpoint map lists as free-queue B-trees, which is the check
- * that the offsets are right rather than merely plausible.
+ * Offsets read off obj/style9.apfs.  The check that they are right, not
+ * just plausible: the two free-queue tree oids read through them are the
+ * ones the checkpoint map lists as free-queue B-trees.
  */
 _Static_assert(__builtin_offsetof(struct apfs_spaceman, sm_dev) == 48,
     "sm_dev[] starts at +48");
@@ -307,29 +271,20 @@ _Static_assert(__builtin_offsetof(struct apfs_spaceman, sm_fq) == 200,
     "sm_fq[] starts at +200");
 
 /*
- * WHERE THE BITMAPS ACTUALLY ARE
+ * Where the bitmaps are.  sm_dev[].sm_addr_offset is a byte offset into the
+ * space manager's own block, of an array of block numbers: the chunk-info
+ * blocks themselves, or, with chunk-info address blocks, one more level of
+ * indirection (never reached at this container size).  Each chunk-info
+ * block describes up to sm_chunks_per_cib chunks, and each chunk names the
+ * one block holding its bitmap, one bit per block.  Both live in the
+ * internal pool.
  *
- * sm_dev[].sm_addr_offset is an offset INTO THE SPACE MANAGER'S OWN BLOCK, at
- * an array of block numbers.  With no chunk-info address blocks those are the
- * chunk-info blocks themselves; with them there is one more level of
- * indirection, which a container this size never reaches.
+ * Measured rather than assumed:
  *
- * Each chunk-info block describes up to sm_chunks_per_cib chunks, and each
- * chunk names the single block holding its allocation bitmap -- one bit per
- * block, and with 32768 blocks to a chunk that bitmap is exactly one 4 KiB
- * block, which is what the whole geometry is arranged to make true.
- *
- * Two conventions here are measured rather than assumed, because both are the
- * kind of thing that is equally plausible either way round:
- *
- *	A CLEAR bit means the block is free; a set bit means it is in use.
+ *	A clear bit means the block is free; a set bit means it is in use.
  *
  *	ci_bitmap_addr == 0 means the chunk has no bitmap because every block
  *	  in it is free.  A fresh container is mostly these.
- *
- * The bitmaps and the chunk-info blocks live in the space manager's internal
- * pool (sm_ip_base), and they have to: the blocks that record what is
- * allocated cannot themselves be tracked by the records they hold.
  */
 struct apfs_chunk_info {
 	uint64_t	ci_xid;		/* transaction that last changed it */
@@ -356,11 +311,9 @@ _Static_assert(__builtin_offsetof(struct apfs_chunk_info_block,
 #define	APFS_CI_MAX_PER_CIB	((APFS_BLOCK_SIZE - 40) / 32)
 
 /*
- * Object map.  A PHYSICAL oid is already a block number, but a VIRTUAL one
- * is not: copy-on-write moves an object without changing its identity, so
- * the mapping oid -> block lives in this B-tree and is looked up by
- * (oid, xid).  Keying on the transaction too is what lets several versions
- * of the same object coexist -- that is how snapshots work.
+ * Object map: virtual oid -> block, a B-tree looked up by (oid, xid).
+ * Keying on the transaction lets several versions of one object coexist,
+ * which is how snapshots work.
  */
 struct apfs_omap_phys {
 	struct apfs_obj_phys	om_o;
@@ -408,35 +361,21 @@ struct apfs_omap_val {
 #define	APFS_BTREE_INFO_SIZE		40
 
 /*
- * Inside that trailing btree_info: flags, node size, key size, value size,
- * longest key, longest value, then the two counts.  Two of those are written
- * here, by offset rather than through a struct, because they are the fields a
- * writer has to keep true and the rest are the tree's shape.
- *
- * Which of the two moves says what happened.  An INSERT adds a record, so the
- * key count moves and the node count does not; a SPLIT adds a node holding
- * records that were already counted, so the node count moves and the key
- * count does not.  Getting that backwards is not a rounding error -- apfsck
- * answers "Catalog: wrong key count in info footer" either way.
+ * The trailing btree_info holds flags, node size, key size, value size,
+ * longest key, longest value, then the key and node counts.  The writer
+ * keeps the counts true, by offset: an insert moves the key count only, a
+ * split moves the node count only (its records were already counted).
+ * Either one wrong draws "Catalog: wrong key count in info footer".
  */
 #define	APFS_BTREE_INFO_KEYCOUNT	24
 #define	APFS_BTREE_INFO_NODECOUNT	32
 
 /*
- * And two more that a writer has to keep true, which nothing here touched
- * until a rename put a name longer than any on the image into the tree:
- *
- *	Catalog: wrong maximum key size in info footer.
- *
- * They are HIGH-WATER MARKS rather than measurements.  A footer claiming MORE
- * than any record needs is accepted and one claiming less is refused, which
- * was measured with tools/apfspoke.py on a copy of this container rather than
- * assumed -- so they are raised when a record exceeds them and never lowered.
- * Lowering would mean walking the whole tree after every delete to find the
- * new maximum, to tighten a bound no reader needs tight.
- *
- * A create could always have produced this and never did: every name the tests
- * made was shorter than "standard.flf", which the image came with.
+ * The longest key and value are high-water marks: apfsck accepts a footer
+ * claiming more than any record needs and refuses one claiming less
+ * ("Catalog: wrong maximum key size in info footer"; measured with
+ * tools/apfspoke.py).  So they are raised when a record exceeds them and
+ * never lowered, which would take a whole-tree walk after every delete.
  */
 #define	APFS_BTREE_INFO_LONGKEY		16
 #define	APFS_BTREE_INFO_LONGVAL		20
@@ -596,31 +535,20 @@ _Static_assert(__builtin_offsetof(struct apfs_superblock, apfs_volname) == 704,
 #define	APFS_ROOT_DIR_INO	2
 
 /*
- * And so is the private directory's, which is what makes a Unix unlink
- * possible on this volume at all.
+ * So is the private directory's.  No path reaches it; it holds files whose
+ * last name was taken while a descriptor still had them open (apfsck calls
+ * them orphans), until the last close.  What an orphan must look like, found
+ * one apfsck refusal at a time:
  *
- * A file whose last name is taken away while a descriptor is still open on it
- * must keep its bytes until that descriptor closes.  Somewhere it has to live
- * in the meantime, and the format says where: this directory, which every
- * volume is formatted with and which no path ever reaches, holds the files
- * that have no name left.  A checker knows what it is looking at in there and
- * calls them ORPHANS.
+ *	- its entry here is named "0x%llx-dead", the object id in lower-case
+ *	  hex, or "Orphan inode: wrong name";
+ *	- the inode's ai_parent_id is not this directory, or "Inode record:
+ *	  parent is private directory".  It names the root, the one parent
+ *	  that cannot be removed while it waits (a dangling one reads as
+ *	  "Inode record: free inode number in use" once rmdir'd);
+ *	- the link count is zero, or "Orphan inode: has a link count".
  *
- * What one has to look like was measured with apfsck rather than read off a
- * layout, one refusal at a time:
- *
- *	- the ENTRY under this directory is named "0x%llx-dead", the object id
- *	  in lower-case hex, or the answer is "Orphan inode: wrong name";
- *	- the inode record's ai_parent_id must NOT be this directory, or the
- *	  answer is "Inode record: parent is private directory".  It names the
- *	  root here, which is the only parent that cannot be removed out from
- *	  under it while it waits -- a dangling one reads as "Inode record:
- *	  free inode number in use" the moment the old directory is rmdir'd;
- *	- the link count must be ZERO, or the answer is "Orphan inode: has a
- *	  link count".  Which is the truth: the entry in here is not a name,
- *	  it is a place to wait, and nothing can open it by walking a path.
- *
- * No flag in ai_internal_flags is wanted, which was measured too.
+ * No ai_internal_flags bit is wanted.
  */
 #define	APFS_PRIV_DIR_INO	3
 
@@ -628,28 +556,21 @@ _Static_assert(__builtin_offsetof(struct apfs_superblock, apfs_volname) == 704,
 #define	APFS_ORPHAN_NAME_MAX	24
 
 /*
- * Directory-entry keys come in two shapes and the volume's incompatible
- * feature flags pick which.  A case- or normalization-insensitive volume
- * stores a 22-bit hash of the name alongside its length, and orders entries
- * within a directory BY THAT HASH; a plain volume stores just the length and
- * orders by name.
- *
- * Computing that hash means reproducing Apple's case folding, which is why
- * this reader once refused to and read every record in the tree instead.  It
- * no longer does: the hash is recovered and computed (see fs/apfs/apfs.c), and a
- * name is found by descending on its key like anything else.  The old way is
- * still the fallback for a name this kernel cannot fold -- anything outside
- * ASCII -- and it is still exact, just costlier.
+ * Directory-entry keys come in two shapes, picked by the volume's
+ * incompatible feature flags.  A case- or normalization-insensitive volume
+ * stores a 22-bit hash of the name with its length and orders a directory's
+ * entries by that hash; a plain volume stores the length and orders by name.
+ * fs/apfs/apfs.c computes the hash and descends on the key; a name it cannot
+ * fold (anything outside ASCII) is found by reading every record instead,
+ * which is exact but costlier.
  */
 #define	APFS_INCOMPAT_CASE_INSENSITIVE		0x00000001ULL
 #define	APFS_INCOMPAT_NORM_INSENSITIVE		0x00000008ULL
 #define	APFS_DREC_LEN_MASK			0x000003FFU
 
 /*
- * ...and what a writer needs that a reader did not: the hash occupies the rest
- * of that word, twenty-two bits above the ten the length uses.  Which hash it
- * is, and how it was recovered, is in fs/apfs/apfs.c beside the code that
- * computes it -- the answer was not in any specification.
+ * The hash takes the 22 bits above the 10-bit length.  Which hash, and how
+ * it was recovered (no specification says), is beside the code in apfs.c.
  */
 #define	APFS_DREC_HASH_SHIFT			10
 #define	APFS_DREC_HASH_BITS			0x003FFFFFU
@@ -659,10 +580,8 @@ _Static_assert(__builtin_offsetof(struct apfs_superblock, apfs_volname) == 704,
 #define	APFS_DT_REG		8
 
 /*
- * Packed, and it matters: the on-disk record is 18 bytes, but the natural
- * alignment of a struct ending in a uint16 after two uint64s would round
- * sizeof up to 24 -- and a length check against that silently rejects every
- * real directory entry.
+ * Packed: the on-disk record is 18 bytes, natural alignment would make it
+ * 24, and a length check against 24 would reject every real entry.
  */
 struct apfs_drec_val {
 	uint64_t	dv_file_id;
@@ -674,11 +593,9 @@ _Static_assert(sizeof(struct apfs_drec_val) == 18,
     "a directory-entry record is 18 bytes before its extended fields");
 
 /*
- * Inode record.  Note what is NOT here: the file's size.  That lives in a
- * dstream extended field appended after this struct, because a plain
- * directory has no need of one -- so the fixed part stops at 92 bytes and
- * the extended fields follow.  The struct is packed: uncompressed_size sits
- * at offset 84, which is not 8-byte aligned.
+ * Inode record.  The file's size is not here but in a dstream extended
+ * field after the 92-byte fixed part, since a directory needs none.
+ * Packed: ai_uncompressed_size sits at +84, not 8-byte aligned.
  */
 struct apfs_inode_val {
 	uint64_t	ai_parent_id;
@@ -700,20 +617,17 @@ struct apfs_inode_val {
 } __attribute__((packed));
 
 /*
- * ai_mode is an ordinary POSIX mode_t written straight to disk, so its type
- * field is spelled the way POSIX froze it.  The reader needs exactly one of
- * these bits: ai_nchildren_or_nlink means CHILDREN on a directory and LINKS
- * on anything else, and the mode is what tells the two apart.
+ * ai_mode is a POSIX mode_t as stored.  Its type also says what
+ * ai_nchildren_or_nlink counts: children on a directory, links otherwise.
  */
 #define	APFS_S_IFMT	0170000
 #define	APFS_S_IFDIR	0040000
 #define	APFS_S_IFREG	0100000
 
 /*
- * ai_internal_flags, of which a writer needs exactly one.  Every file and
- * directory in this container carries NO_RSRC_FORK, which is what a volume
- * made by anything other than a Mac says; a created inode that did not would be
- * claiming a resource fork it has no record for.
+ * Every inode in this container carries NO_RSRC_FORK, as on any volume not
+ * made by a Mac; a created inode without it would claim a resource fork it
+ * has no record for.
  */
 #define	APFS_INODE_NO_RSRC_FORK		0x0000000000008000ULL
 
@@ -723,21 +637,18 @@ _Static_assert(__builtin_offsetof(struct apfs_inode_val, ai_mode) == 80,
     "ai_mode sits at +80");
 
 /*
- * Extended fields.  A record that needs more than its fixed part appends a
- * small blob of them: a count, then that many descriptors, then the data they
- * describe, each datum padded up to a multiple of 8.  This is how APFS keeps a
- * directory's inode from carrying a file's worth of empty fields -- and it is
- * why a file's LENGTH is not where one would look for it.  Length lives in the
- * DSTREAM field, so an inode without one names something with no bytes.
+ * Extended fields: a record that needs more than its fixed part appends a
+ * count, that many descriptors, then their data, each padded to a multiple
+ * of 8.  A file's length lives in the DSTREAM field, so an inode without
+ * one names something with no bytes.
  */
 #define	APFS_INO_EXT_TYPE_NAME		4
 #define	APFS_INO_EXT_TYPE_DSTREAM	8
 
 /*
- * And the two flag values those two carry, read off the inodes already in this
- * container rather than chosen: a name is not copied when a file is cloned, a
- * dstream belongs to the system.  The fields are descriptive, not enforced --
- * which is why they had to be measured rather than reasoned about.
+ * The flags those two carry, copied from the inodes already in this
+ * container: a name is not copied when a file is cloned, a dstream is a
+ * system field.  Nothing enforces them, so they were read, not reasoned.
  */
 #define	APFS_XF_DO_NOT_COPY		0x02
 #define	APFS_XF_SYSTEM_FIELD		0x20
@@ -766,15 +677,11 @@ _Static_assert(sizeof(struct apfs_x_field) == 4, "an x_field is 4 bytes");
 _Static_assert(sizeof(struct apfs_dstream) == 40, "a dstream is 40 bytes");
 
 /*
- * File extent.  The key is the record header followed by the byte offset
- * within the file; the value gives that run's length and the block it starts
- * at.  Two things a reader has to respect: the run is ALLOCATED length and may
- * overshoot the file's real size (the tail of the last block is garbage), and
- * a physical block of zero means a HOLE -- a sparse region that was never
- * written and reads back as zeroes rather than as anything on disk.
- *
- * Packed for the same reason the records above are: these sit at whatever
- * offset the node's value area put them, which is not 8-byte aligned.
+ * File extent.  The key is the record header plus the byte offset in the
+ * file; the value gives the run's length and first block.  The length is
+ * allocated length and may overshoot the file's size (the tail of the last
+ * block is garbage), and a physical block of zero is a hole, which reads as
+ * zeroes.  Packed: values sit wherever the node's value area puts them.
  */
 #define	APFS_FILE_EXTENT_LEN_MASK	0x00FFFFFFFFFFFFFFULL
 
@@ -788,20 +695,16 @@ _Static_assert(sizeof(struct apfs_file_extent_val) == 24,
     "a file-extent record is 24 bytes");
 
 /*
- * Physical extent, in the volume's EXTENT REFERENCE tree -- the other tree
- * that names a file's blocks, and the reason moving a file's bytes is not a
- * one-tree edit.  The file-system tree answers "where are this file's bytes";
- * this one answers the reverse, "who owns this run and how many references
- * does it have", which is what makes a block shared between clones countable.
+ * Physical extent, in the volume's extent reference tree: the reverse of a
+ * file extent, saying who owns a run and how many references it has, which
+ * is what makes blocks shared between clones countable.  Moving a file's
+ * bytes therefore edits both trees.
  *
- * The KEY is the run's first block, so relocating a run changes the key and
- * therefore where the record sorts -- unlike a file extent, whose key is the
- * offset within the file and does not move at all.
+ * The key is the run's first block, so relocating a run moves its record
+ * within the tree; a file extent's key (the file offset) stays put.
  *
- * pe_len_and_kind packs the length in blocks into the low 60 bits and the kind
- * into the top 4.  Note "in BLOCKS": the file extent above counts BYTES, and
- * the two describing the same run in different units is exactly the sort of
- * thing that reads as correct and is not.
+ * pe_len_and_kind: length in BLOCKS in the low 60 bits, kind in the top 4.
+ * The file extent for the same run counts BYTES.
  */
 #define	APFS_PEXT_LEN_MASK	0x0FFFFFFFFFFFFFFFULL
 #define	APFS_PEXT_KIND_SHIFT	60
@@ -823,9 +726,8 @@ _Static_assert(sizeof(struct apfs_phys_ext_val) == 20,
 #define	FS_APFS_MAX_FILE	(4u * 1024u * 1024u)
 
 /*
- * One directory entry as fs_apfs_readdir reports it.  Deliberately the same
- * shape fs_fat_dirent has, so the Darwin readdir path can be pointed at
- * either filesystem without changing its wire format.
+ * One directory entry as fs_apfs_readdir reports it: the fields of
+ * fs_fat_dirent, with APFS's 64-bit inode number and size.
  */
 struct fs_apfs_dirent {
 	uint64_t	ade_ino;
@@ -835,17 +737,12 @@ struct fs_apfs_dirent {
 };
 
 /*
- * A file's metadata, as fs_apfs_stat reports it.  Sizes are 64-bit because
- * APFS's are; the Darwin syscall layer narrows them where its own wire format
- * is 32-bit, which is the right place for that decision to be visible.
- *
- * Everything below afs_mode comes out of the inode record's FIXED part, which
- * the tree walk was already reading and this struct was already throwing away
- * -- the timestamps are APFS's own nanoseconds since the Unix epoch, and the
- * link count is nchildren for a directory (Apple stores both in one field and
- * tells them apart by the mode).  afs_alloced is the dstream's allocated size,
- * which is what st_blocks means: what the volume spent, not what the file
- * says it is.
+ * A file's metadata, as fs_apfs_stat reports it.  Sizes are 64-bit as in
+ * APFS; the Darwin syscall layer narrows them where its wire format is
+ * 32-bit.  Timestamps are APFS nanoseconds since the Unix epoch.  afs_nlink
+ * is the file's link count (at least 1), and 1 for a directory, whose field
+ * counts children instead.  afs_alloced is the dstream's allocated size,
+ * what st_blocks means: what the volume spent, not the file's length.
  */
 struct fs_apfs_statbuf {
 	uint64_t	afs_size;	/* byte length (0 for a directory) */
@@ -870,7 +767,7 @@ struct fs_apfs_statbuf {
 #define	FS_APFS_E_CKSUM		(-5)	/* Fletcher-64 mismatch         */
 #define	FS_APFS_E_NOTFOUND	(-6)	/* name absent / not a dir      */
 #define	FS_APFS_E_TOOBIG	(-7)	/* file exceeds FS_APFS_MAX_FILE */
-#define	FS_APFS_E_NOALLOC	(-8)	/* would need a block allocator  */
+#define	FS_APFS_E_NOALLOC	(-8)	/* beyond what this writer does  */
 #define	FS_APFS_E_EXIST		(-9)	/* the name is already taken     */
 #define	FS_APFS_E_ISDIR		(-10)	/* ...and it is a directory      */
 #define	FS_APFS_E_SPREAD	(-11)	/* records span more leaves than
@@ -883,9 +780,9 @@ struct fs_apfs_statbuf {
 
 /*
  * Probe the first ATA drive for an APFS container and adopt the newest valid
- * checkpoint superblock.  Called once at boot, after ata_drv_init and
- * kmem_init.  Logs the container geometry on success and a one-line reason on
- * failure; a failed probe simply leaves APFS unavailable.
+ * checkpoint superblock.  Called once at boot, after ata_drv_init, bio_init
+ * and kmem_init.  Logs the container geometry on success and a one-line
+ * reason on failure; a failed probe leaves APFS unavailable.
  */
 void	fs_apfs_init(void);
 
@@ -893,370 +790,288 @@ void	fs_apfs_init(void);
 int	fs_apfs_ready(void);
 
 /*
- * What reading the file-system tree has cost so far: reads started and how
- * many of them descended on a key rather than visiting every record, B-tree
- * nodes read, records handed to a callback, keys compared.  The two kinds are
- * counted apart because the difference between them is the whole point -- a
- * read that descends costs the depth of the tree and a read that does not
- * costs the size of the volume.
+ * Print the mount's counters: tree reads (keyed descents counted apart from
+ * whole-tree walks, since one costs the tree's depth and the other the
+ * volume's size), nodes, records and key compares; then space, free queues,
+ * checkpoints, views, the internal pool and the tree's shape.
  */
 void	fs_apfs_stats(void);
 
 /*
  * Take a run of free blocks, confirm the disk agrees, and give it back.
- *
- * Stops one step short of a real allocation on purpose, and the step it stops
- * at was found by trying: a container holding a block marked in use that
- * nothing references is not valid, and apfsck rejects it outright.  An
- * allocation in this format is half an operation; the other half is whatever
- * points at the block, and neither half is valid alone.  What this proves is
- * the half that exists -- the search, the bitmap edit, both counters, the
- * sealing, and that all of it survives a round trip through the drive.
+ * The run is never kept: a block marked in use that nothing references is
+ * invalid to apfsck.  Proves the live checkpoint does not see the take until
+ * a checkpoint publishes it, that a released run stays held for
+ * APFS_FQ_KEEP checkpoints and then comes free, that the free queue's node
+ * reuses its own holes, and that a second chunk can be used.
  */
 void	fs_apfs_alloc_selftest(void);
 
 /*
- * Close the container's current transaction: write a checkpoint.
+ * Close the open transaction: write a checkpoint.
  *
- * Re-emits the checkpoint's ephemeral objects into the next free slots of the
- * data ring, writes a checkpoint map naming where they landed, and closes the
- * whole thing with a superblock carrying the next transaction id.  The
- * superblock's landing is the commit: before it the container is the previous
- * checkpoint entire, after it the new one entire.  Block zero is then made a
- * copy of that superblock, which is what makes the difference between a
- * container fsck calls clean and one it calls interrupted.
+ * Releases what the free queue has held long enough, flushes the allocation
+ * metadata, re-emits the ephemeral objects into the next free slots of the
+ * data ring, writes a checkpoint map naming where they landed, and closes it
+ * with a superblock carrying the next xid.  The superblock's landing is the
+ * commit: before it the container is the previous checkpoint entire, after
+ * it the new one, edits of the open transaction included.  Block zero is
+ * then made a copy of that superblock, without which fsck calls the
+ * container interrupted rather than clean.
  *
- * What it does NOT do yet is change any object tree, so the checkpoint it
- * writes says what the previous one said, one xid later.  That is the whole
- * scope for now: the mechanism has to be provable on its own before
- * copy-on-write can hang the top of its chain off it.
- *
- * Returns FS_APFS_E_OK, or a negative FS_APFS_E_* with nothing written -- the
- * one exception being a failure to update block zero, which is reported and
- * not propagated, because by then the checkpoint has happened.
+ * Returns FS_APFS_E_OK, or a negative FS_APFS_E_* with nothing committed --
+ * except a failure to update block zero, which is reported and not
+ * propagated, because by then the checkpoint has happened.
  *
  * The caller must hold the volume lock: this moves state the readers use.
  */
 int	fs_apfs_checkpoint(void);
 
 /*
- * The two questions a checkpoint POLICY asks, so that one need not live here.
+ * The two questions a checkpoint policy asks; the policy lives elsewhere.
  *
- * fs_apfs_dirty says whether there is an open transaction at all -- edits made
- * since the last checkpoint, readable through the writer's own view and
- * reachable from no superblock yet.  A sync of a clean container is a no-op
- * the caller can skip without asking the disk anything.
+ * fs_apfs_dirty: is there an open transaction -- edits since the last
+ * checkpoint, readable through the writer's own view but reachable from no
+ * superblock yet?  A sync of a clean container can skip the disk.
  *
- * fs_apfs_ckpt_due says the open transaction is as large as the container can
- * safely absorb and the next edit might not fit -- the bound is the free
- * queue's single node, and the essay at the definition says why.  A policy
- * that checkpoints when this fires, and otherwise whenever ITS reasons say to
- * (a sync, a timer), never runs the queue into its own overflow fallback.
+ * fs_apfs_ckpt_due: is the open transaction as large as the container can
+ * safely absorb?  The bound is the free queue's single node (see the
+ * definition).  A policy that checkpoints when this fires, and otherwise
+ * for its own reasons, never runs the queue into its overflow fallback.
  *
- * Both are reads of mount state; callers hold the volume lock like every
- * other caller here.
+ * Both read mount state under the volume lock.
  */
 int	fs_apfs_dirty(void);
 int	fs_apfs_ckpt_due(void);
 
 /*
- * Write two checkpoints and interrogate the disk after each: block zero moved,
- * the ring's newest superblock is the one just written, the checkpoint it
- * replaced still reads and still says its own xid, and every object the new
- * map names is where it says at the new xid.  Two, because a writer that
- * commits correctly but forgets to advance its own cursors passes the first
- * and overwrites it with the second.
+ * Write two checkpoints and interrogate the disk after each: block zero
+ * moved, the ring's newest superblock is the one just written, the one it
+ * replaced still reads with its own xid, and every object the new map names
+ * is where it says.  Two, because a writer that forgets to advance its
+ * cursors passes the first and overwrites it with the second.
  */
 void	fs_apfs_ckpt_selftest(void);
 
 /*
- * Write to a file and prove the bytes MOVED: the run the live checkpoint still
- * names has to read exactly as it did, while the new run carries the write.
- * Restores what it found.  The path is passed in so that the one file the
- * write tests use is named in one place.
+ * Write to a file and prove the bytes moved: the run the previous checkpoint
+ * names reads exactly as it did, the new run carries the write.
+ * Restores what it found.  The path is passed in so the one file the write
+ * tests use is named in one place.
  */
 void	fs_apfs_data_selftest(const char *path);
 
 /*
  * Make a file longer: `ino` names the inode record carrying its length, `id`
  * the dstream its extents are keyed on.  A file with slack in its last block
- * grows into it and nothing but the length changes; otherwise a run is taken,
- * zeroed, and handed to both trees that name a file's blocks.  Refuses when
- * the leaf it would insert into has no room -- splitting a node is not done
- * here.  Returns FS_APFS_E_OK or a negative FS_APFS_E_*.
+ * grows into it and only the length changes; otherwise a run is taken,
+ * zeroed, and entered in both trees that name a file's blocks (lengthening
+ * the last run when the new one touches it).  A full leaf is split once and
+ * the grow retried.  Returns FS_APFS_E_OK or a negative FS_APFS_E_*.
  */
 int	fs_apfs_grow(uint64_t ino, uint64_t id, uint64_t new_size);
 
 /*
- * And make one shorter, with the same two names for the same two things.  A
- * run that reaches past the new end is shortened; a run entirely past it loses
- * its record in both trees that name a file's blocks; the blocks go to the
- * free queue, because checkpoints still on the platter name them.  Cutting
- * inside a block moves the length and nothing else.  Refuses, out loud, a file
- * whose runs are spread over more leaves than its inode's own.
+ * Make a file shorter; `ino` and `id` as for fs_apfs_grow.  A run reaching
+ * past the new end is shortened, a run entirely past it loses its record in
+ * both trees, and the blocks go to the free queue, because checkpoints still
+ * on the platter name them.  Cutting inside a block moves only the length.
+ * Refuses, out loud, more runs past the new end than one call cuts
+ * (FS_APFS_E_NOALLOC) and records spread over more leaves than one edit
+ * holds (FS_APFS_E_SPREAD).
  */
 int	fs_apfs_truncate(uint64_t ino, uint64_t id, uint64_t new_size);
 
 /*
- * How many B-tree nodes this kernel has split since it booted.  Exposed so a
- * test can insist that a node really did run out of room and grow rather than
- * the insert quietly having had space all along.
+ * B-tree nodes split since boot, so a test can insist a node really ran out
+ * of room rather than the insert having had space all along.
  */
 uint64_t fs_apfs_splits(void);
 
 /*
- * And how many appends lengthened a run that was already there instead of
- * giving the file another one.  Two runs that touch are one run; a test that
- * cannot see the difference cannot tell a filesystem that coalesces from one
- * that is quietly spending a record per block.
+ * Appends that lengthened an existing run instead of adding one, so a test
+ * can tell coalescing from quietly spending a record per block.
  */
 uint64_t fs_apfs_merges(void);
 
 /*
- * And how many checkpoints have been written since boot.  A checkpoint is
- * when the free queue lets go, and what it lets go of becomes holes a
- * first-fit allocator may prefer -- so a test claiming appends MERGE can
- * only decide the claim over a window no checkpoint landed in, and this is
- * how it finds out whether one did.  With checkpoints written by policy
- * rather than by every mutation, that landing is no longer the test's to
- * predict.
+ * Checkpoints written since boot.  A checkpoint is when the free queue lets
+ * go, making holes a first-fit allocator may prefer, so a test claiming
+ * appends merge can only judge a window no checkpoint landed in; checkpoints
+ * are written by policy, and this is how it finds out.
  */
 uint64_t fs_apfs_ckpts(void);
 
 /*
- * How many records a truncate has shortened, and how many it has taken out of
- * a tree altogether.  Two counters and not one, because they are two different
- * operations wearing the same name: shortening edits a length in place, and
- * dropping is the first thing this kernel does that makes a B-tree smaller.  A
- * test that could not tell them apart would pass on a truncate that never once
- * reached the harder half.
+ * Records a truncate shortened, and records it took out of a tree.  Apart,
+ * because shortening edits a length in place while dropping shrinks the
+ * B-tree, and a test must see the harder half happen.
  */
 uint64_t fs_apfs_shortens(void);
 uint64_t fs_apfs_drops(void);
 
 /*
  * Put a name into the directory whose object id is `dir`, with an empty file
- * under it, and report the object id it was given.  `now` is the moment to
- * stamp, in nanoseconds since the Unix epoch, passed in for the same reason
- * fs_apfs_touch takes one: this file knows the on-disk format, not the clock.
+ * under it, and report the object id it was given.  `now` is the time to
+ * stamp, in nanoseconds since the Unix epoch; this layer has no clock.
  *
- * The file is created with a dstream holding no bytes and no blocks, because an
- * inode with no dstream at all is one nothing can ever lengthen.  Returns
- * FS_APFS_E_EXIST if the name is taken, and refuses a name this kernel cannot
- * hash -- anything outside ASCII -- rather than guessing at Apple's folding.
+ * The file gets a dstream with no bytes and no blocks, since an inode with
+ * no dstream can never be lengthened.  Returns FS_APFS_E_EXIST if the name
+ * is taken, and refuses a name this kernel cannot hash (anything outside
+ * ASCII) rather than guess at Apple's folding.
  */
 int	fs_apfs_create(uint64_t dir, const char *name, uint64_t now,
 	    uint16_t perm, uint64_t *ino_out);
 
 /*
- * And take a name back out, with the file under it.
- *
- * The blocks are given back by cutting the file to nothing first, which is the
- * truncate above doing what it already does; what is left for this is the three
- * records a create made and the two counts it moved.  Refuses a directory
- * (FS_APFS_E_ISDIR) and refuses an inode with more than one link, out loud,
- * because this kernel makes neither and unlinking one of several is a different
- * operation from removing the last name a file has.
+ * Take a name back out, with the file under it.  The blocks go back by
+ * truncating to nothing first; then the three records a create made are
+ * removed and its two counts undone.  Refuses a directory (FS_APFS_E_ISDIR)
+ * and, out loud, an inode with more than one link: this kernel makes no
+ * hard links, and removing one of several names is a different operation.
  */
 int	fs_apfs_unlink(uint64_t dir, const char *name, uint64_t now);
 
 /*
- * The same two calls again for a DIRECTORY, and they are the same two calls:
- * one function each, with a question in it, rather than a pair that agrees
- * today.  What differs on disk is smaller than it looks and none of it is
- * optional -- a directory's inode carries no data stream at all (a checker
- * that finds one says so), its entry is typed a directory (as does one that
- * finds the two disagreeing), its child count starts at zero, and it is
- * counted in apfs_num_directories, which unlike apfs_num_files is checked.
+ * The same two for a directory, sharing their code with the file versions.
+ * On disk a directory's inode has no data stream (apfsck objects to one),
+ * its entry is typed a directory (apfsck checks the two agree), its child
+ * count starts at zero, and it is counted in apfs_num_directories, which
+ * unlike apfs_num_files is checked.
  *
- * fs_apfs_rmdir removes a directory that holds nothing.  "Holds nothing" is
- * asked of the TREE and not of the count in the directory's own record: the
- * count is a claim and the records are the thing.  Refuses a name that is not
- * a directory (FS_APFS_E_NOTDIR) and one that still holds a name
- * (FS_APFS_E_NOTEMPTY); the second is not politeness towards POSIX, since a
- * directory removed out from under its children leaves entries whose parent
- * is gone, and the checker says so.
+ * fs_apfs_rmdir removes a directory that holds nothing, asked of the tree,
+ * not of the child count in its record.  Refuses a name that is not a
+ * directory (FS_APFS_E_NOTDIR) and one that still holds a name
+ * (FS_APFS_E_NOTEMPTY): removing it would leave entries whose parent is gone.
  */
 int	fs_apfs_mkdir(uint64_t dir, const char *name, uint64_t now,
 	    uint16_t perm, uint64_t *ino_out);
 int	fs_apfs_rmdir(uint64_t dir, const char *name, uint64_t now);
 
 /*
- * Move a name, within one directory or between two, taking what is under it --
- * and OVER whatever stands at the destination, in the same edit, because POSIX
- * asks a rename to be atomic and the checkpoint is the only atom this volume
- * has: a state in which the name is not there at all is the one state rename
- * exists to keep readers from seeing.
+ * Move a name, within one directory or between two, taking what is under it
+ * -- and over whatever stands at the destination, in the same edit: POSIX
+ * wants rename atomic, and a state with the name absent is the one readers
+ * must not see.
  *
- * Over a free name nothing is created and nothing destroyed: the same inode
- * ends up with a different name, in a different place, and the tree holds
- * exactly as many records as it did.  What makes it a rung of its own is that
- * the inode RECORD has to follow -- it carries the name and the parent, apfsck
- * checks both against the entry that names it, and a name of a different
- * length makes the record a different length, so it is rebuilt rather than
- * amended.
+ * Over a free name, the same inode ends up with another name in another
+ * place and the tree holds as many records as before.  The inode record is
+ * rebuilt, not amended: it carries the name and the parent, apfsck checks
+ * both against the entry, and a name of another length changes its length.
  *
- * A FILE standing at the destination is orphaned into the private directory --
- * the same records the unlink-while-open path writes, and not one of its
- * extents touched -- and its object id comes back through *victim_out (NULL if
- * the caller does not care; 0 when nothing stood there).  Whether anything
- * still holds that file open is the CALLER's question: this layer knows the
- * format, the layer above knows the descriptors, so the caller either reaps it
- * at once or leaves it for the close that will.  An empty DIRECTORY standing
- * there is simply removed -- it has two records, no data stream and nothing to
- * defer -- and *victim_out stays 0, since nothing waits.
+ * A file standing at the destination is orphaned into the private directory
+ * (as fs_apfs_orphan does, no extent touched) and its object id returned
+ * through *victim_out (which may be NULL; 0 when nothing stood there).
+ * Whether it is still open is the caller's question: the caller reaps it at
+ * once or leaves it for the last close.  An empty directory standing there
+ * is simply removed, and *victim_out stays 0.
  *
  * Refuses FS_APFS_E_NOTFOUND for a name that is not there; FS_APFS_E_ISDIR
  * and FS_APFS_E_NOTDIR when the two ends are not the same kind of thing;
  * FS_APFS_E_NOTEMPTY for a directory that still holds a name, asked of the
- * tree the way rmdir asks; and FS_APFS_E_INVAL for the root, for an inode with
- * more than one link on either end, and for a directory moved into itself --
- * which would take every name inside it out of the volume.  Renaming a name to
- * itself succeeds and changes nothing; renaming one to another spelling of
- * itself is a real move, so the case a caller asks for is the case the volume
- * keeps.
+ * tree as rmdir asks; and FS_APFS_E_INVAL for the root, an inode with more
+ * than one link on either end, or a directory moved into itself.  Renaming
+ * a name to itself succeeds and changes nothing; renaming it to another
+ * spelling of itself is a real move, so the volume keeps the case asked for.
  */
 int	fs_apfs_rename(uint64_t odir, const char *oname, uint64_t ndir,
 	    const char *nname, uint64_t now, uint64_t *victim_out);
 
 /*
- * Take a name away from a file that something still holds open.
+ * Take a name away from a file that something still holds open.  The entry
+ * moves to the private directory under the name the format wants there, and
+ * the inode record is rebuilt as for a rename, with the root as parent and a
+ * link count of zero.  The bytes are not touched.  Afterwards no path
+ * reaches the file and every open descriptor still does.
  *
- * The entry leaves its directory for the private one, under the name the
- * format wants there; the inode record follows it, as it does for a rename,
- * except that what it is rebuilt with is the ROOT for a parent and ZERO for a
- * link count.  The bytes are not touched.  Afterwards no path reaches the
- * file and every open descriptor still does, which is what Unix promises and
- * what this kernel used to say out loud that it did not keep.
- *
- * Refuses FS_APFS_E_ISDIR for a directory: an open directory whose name is
- * taken away is a real case and a different one, since a directory in here
- * would still have children whose parent is unreachable.
- *
- * *ino_out gets the object id, because that is the only handle on the file
- * afterwards -- there is no name left to ask about.
+ * Refuses FS_APFS_E_ISDIR for a directory, whose children would be left
+ * under an unreachable parent.  *ino_out gets the object id, the only handle
+ * on the file afterwards.
  */
 int	fs_apfs_orphan(uint64_t dir, const char *name, uint64_t now,
 	    uint64_t *ino_out);
 
 /*
- * And let one go, when the last descriptor on it closes.
- *
- * The same work as an unlink -- the bytes, the three records, the counters --
- * asked for by object id, since the caller has no name and the one in the
- * private directory is derived rather than remembered.
+ * Let an orphan go when its last descriptor closes: the work of an unlink,
+ * asked for by object id (its private-directory name is derived from it).
  */
 int	fs_apfs_reap(uint64_t ino, uint64_t now);
 
 /*
- * Everything the private directory is still holding, let go at once.
- *
- * Called after mounting, and the case it exists for is a crash: an orphan is
- * created by a kernel that means to reap it and gets to only if it lives that
- * long.  A volume that comes up with names in here is a volume whose last boot
- * ended between the two, and the format's answer -- the reason the directory
- * exists rather than a log -- is that they can simply be finished now.
- *
- * *n_out gets how many, which is zero on every clean boot and the whole point
- * of the number on the others.
+ * Reap everything the private directory still holds.  Called after mounting:
+ * orphans left there mean the last boot ended between orphaning a file and
+ * reaping it, and they can simply be finished now.  *n_out gets how many,
+ * zero after a clean shutdown.
  */
 int	fs_apfs_reap_all(uint64_t now, uint32_t *n_out);
 
 /*
- * How many names have been taken from files still open, and how many of those
- * files have since been let go.
- *
- * They are counted apart because they are not the same event and need not
- * balance within one boot: a file orphaned by a kernel that then stopped is
- * reaped by the next one, and the pair of numbers across two boots is how a
- * test says so.
+ * Files orphaned, and orphans reaped.  They need not balance within a boot:
+ * a file orphaned by a kernel that then stopped is reaped by the next one.
  */
 uint64_t fs_apfs_orphans(void);
 uint64_t fs_apfs_reaps(void);
 
 /*
- * apfs-orphan: a file kept alive by nothing but a promise.
- *
- * Arranges it, like the rungs above: writes a file with a length, takes its
- * name away, and then asks the questions that only hold if the bytes survived
- * -- the length is what it was, the path no longer resolves, the object id
- * still does.  Then lets it go and checks the volume is back where it started,
- * because an orphan that is never reaped is a leak that apfsck calls valid.
+ * apfs-orphan: writes a file with a length, takes its name away, and checks
+ * the length is intact, the path no longer resolves and the object id still
+ * does.  Then reaps it and checks the volume is back where it started: an
+ * orphan never reaped is a leak apfsck calls valid.
  */
 void	fs_apfs_orphan_selftest(uint64_t now);
 
 /*
- * How many files have been made and unmade, and how many record ends have been
- * laid into room a delete gave back.
- *
- * The third is the one worth having.  A node's free span only ever shrinks, so
- * a create and an unlink that did not reuse the holes between them would cost a
- * record's worth of room per cycle and the volume would stop taking names after
- * about fifteen boots -- while still reporting thousands of bytes free.  A test
- * that watches this number watches for that.
+ * Files made and unmade, and record ends laid into room a delete gave back.
+ * The third matters: a node's free span only shrinks, so create and unlink
+ * without hole reuse would lose a record's worth of room per cycle, and the
+ * volume would stop taking names while reporting thousands of bytes free.
  */
 uint64_t fs_apfs_makes(void);
 uint64_t fs_apfs_kills(void);
 uint64_t fs_apfs_holes(void);
 
 /*
- * And the same two for directories, counted apart from files on purpose.  A
- * refusal is the thing worth watching here: a test that asks for a directory
- * it must not get -- one that is not empty, one that is not a directory --
- * proves nothing by being answered with an error, because an error is also
- * what a writer that half-did the work and then failed would answer.  These
- * say whether the work happened.
+ * The same two for directories.  An error alone proves nothing about a
+ * refusal -- a writer that half-did the work and then failed answers the
+ * same -- so these say whether the work happened.
  */
 uint64_t fs_apfs_dirmakes(void);
 uint64_t fs_apfs_dirkills(void);
 
 /*
- * Names moved.  Worth its own counter for the reason above and one more: a
- * rename onto a free name is the only writer here whose success moves no total
- * at all -- the same records, the same key count, the same file and directory
- * counts -- so this is the only number that says it happened.  And of those,
- * how many landed on a taken name: a refusal and a half-done replacement
- * answer a caller identically, and the counter is what tells them apart.
+ * Names moved, and of those, moves onto a taken name.  A rename onto a free
+ * name changes no other total, so this is the only number that says it
+ * happened; the second tells a replacement from a refusal.
  */
 uint64_t fs_apfs_moves(void);
 uint64_t fs_apfs_clobbers(void);
 
 /*
- * apfs-move: a name moved, within a directory and between two.
- *
- * Arranges what it checks, like the two above.  A file is given a length and
- * then moved to a longer name and a shorter one, because the length lives in
- * an extended field packed after the name and a rename that rebuilt the record
- * instead of carrying it across would leave a valid empty file behind.  A
- * directory is moved with a child in it, which nothing touches.  And the
- * refusals are asked for -- a file onto a directory's name, of a name that is
- * not there, of a directory into itself, under its own child, and into
- * something that is not a directory -- because a refusal leaves no trace on
- * the volume for a checker to find afterwards.
+ * apfs-move: a name moved within a directory and between two.  A file with a
+ * length is moved to a longer name and a shorter one: the length lives in an
+ * extended field after the name, and a rebuild that dropped it would leave a
+ * valid empty file.  A directory is moved with a child in it.  The refusals
+ * are asked for too -- a file onto a directory's name, a missing name, a
+ * directory into itself or under its own child, into a non-directory --
+ * since a refusal leaves nothing on the volume for a checker to find.
  */
 void	fs_apfs_move_selftest(uint64_t now);
 
 /*
- * apfs-clobber: a name taken over, and what stood there accounted for.
- *
- * Two files with different bytes, and one moved onto the other: the name
- * answers with the newcomer's bytes, the occupant waits in the private
- * directory with its own still intact -- the halves only a reader can tell
- * apart, since both endings leave a valid volume -- and the reap returns its
- * blocks.  Then the directory cases: an empty one replaced outright, a full
- * one refused NOTEMPTY, a file onto a directory ISDIR and a directory onto a
- * file NOTDIR, each refusal leaving no mark.  Takes the wall clock because
- * this file has no clock of its own.
+ * apfs-clobber: two files with different bytes, one moved onto the other.
+ * The name answers with the newcomer's bytes and the occupant waits in the
+ * private directory with its own intact (only a reader can tell, since
+ * either outcome is a valid volume); the reap returns its blocks.  Then an
+ * empty directory replaced outright, a full one refused NOTEMPTY, a file
+ * onto a directory ISDIR, a directory onto a file NOTDIR, each refusal
+ * leaving no mark.  `now` is the wall clock, which this layer lacks.
  */
 void	fs_apfs_clobber_selftest(uint64_t now);
 
 /*
- * The extent reference tree's growth, counted: index levels gained (it was
- * born a single node that was its own root), leaves split under that index,
- * and emptied leaves taken back out.  The counters exist because the volume's
- * steady state ran within one record of the old sixteen-record ceiling and
- * the first boot to touch it refused ordinary writes -- so whether the tree
- * ever actually grew is a fact worth being able to ask for.
+ * The extent reference tree's growth: index levels gained (it starts as a
+ * single root node), leaves split under that index, and emptied leaves
+ * taken back out.
  */
 uint64_t fs_apfs_extref_grows(void);
 uint64_t fs_apfs_extref_splits(void);
@@ -1265,10 +1080,9 @@ uint64_t fs_apfs_extref_drops(void);
 /*
  * apfs-extref: the extent reference tree outgrows its root and keeps
  * answering.  Two files grow a block at a time in alternation, so no append
- * can merge with the run before it and every one is a fresh record; the tree
- * divides down, a leaf splits, and every record still resolves.  Then both
- * files are cut to nothing, which walks the deletions back across the leaves
- * it made.  Takes the wall clock because this file has no clock of its own.
+ * merges and each is a fresh record; the tree gains a level, a leaf splits,
+ * and every record still resolves.  Then both files are cut to nothing,
+ * deleting back across the leaves it made.  `now` is the wall clock.
  */
 void	fs_apfs_extref_selftest(uint64_t now);
 
@@ -1281,52 +1095,44 @@ void	fs_apfs_split_selftest(void);
 
 /*
  * Make a node stop starting where its parent says it does, and prove the
- * writer notices.  Arranged rather than waited for, out of two files that take
- * turns: the leaf holding one's inode record is split AT that record so it
- * becomes the key the index files that half under, the file is unlinked, and
- * the other is what keeps that half from emptying -- so it stays on the volume
- * and is the next boot's victim.  Takes the wall clock in nanoseconds, because
- * this file has no clock of its own.
+ * writer notices.  The leaf holding one file's inode record is split at that
+ * record, so it becomes that half's index key; the file is unlinked while a
+ * second file keeps the half from emptying.  Both files are removed again.
+ * `now` is the wall clock in nanoseconds.
  */
 void	fs_apfs_index_selftest(uint64_t now);
 
 /*
  * Make a node lose its last record, and prove it leaves the tree rather than
- * staying in it holding nothing -- which apfsck calls "B-tree: keys are out of
- * order", since the index above still files it under a key it no longer has.
- * A freshly made file has the highest key on the volume, so splitting the leaf
- * that holds its inode record AT that record puts it alone in a node; unlinking
- * it is then the whole of the arrangement.  Takes the wall clock in
- * nanoseconds, for the same reason as the test above.
+ * staying empty ("B-tree: keys are out of order" from apfsck, since the index
+ * still files it under a key it no longer has).  A new file has the highest
+ * key on the volume, so splitting its leaf at its inode record leaves that
+ * record alone in a node; unlinking the file does the rest.  `now` as above.
  */
 void	fs_apfs_drop_selftest(uint64_t now);
 
 /*
- * Put a file's inode record and its data stream record in DIFFERENT nodes on
- * purpose -- by splitting the leaf that holds both between them -- and prove
- * that unlinking it takes both.  Checked by asking the tree for the stream
- * record afterwards, because the unlink that left one behind reported success.
- * Takes the wall clock in nanoseconds.
+ * Put a file's inode record and data stream record in different nodes, by
+ * splitting the leaf between them, and prove unlinking takes both: the tree
+ * is asked for the stream record afterwards, since an unlink that leaves it
+ * behind still reports success.  `now` as above.
  */
 void	fs_apfs_stream_selftest(uint64_t now);
 
 /*
- * Fill a leaf on purpose and prove a create makes its own room.  Names go into
- * a directory one at a time until the writer has had to split, and a couple
- * more afterwards; then every one of them has to still resolve to the inode it
- * was made as, and every node has to still start where its parent says it does.
- * All of them are removed again.  Takes the wall clock in nanoseconds, for the
- * same reason the two tests above do.
+ * Fill a leaf and prove a create makes its own room: names go into a
+ * directory until the writer has split, plus a couple more; every one must
+ * still resolve to its inode and every node start where its parent says.
+ * All are removed again.  `now` as above.
  */
 void	fs_apfs_room_selftest(uint64_t now);
 
 /*
- * Prove that descending on a key finds what reading every record finds.  Every
- * record on the volume is sought by its own key and has to come back out of
- * the leaf it lives in with the rest of the tree behind it, in order; keys
- * that are not on the volume have to land on the record after them; and the
- * leaf an insert would use has to be the one the old whole-tree answer names.
- * Reads only, so it can run at any point and changes nothing.
+ * Prove that descending on a key finds what reading every record finds.
+ * Every record is sought by its own key and must come back from its leaf
+ * with the rest of the tree after it, in order; absent keys must land on the
+ * record after them; and the leaf an insert would use must be the one a
+ * whole-tree walk names.  Reads only.
  */
 void	fs_apfs_seek_selftest(void);
 
@@ -1411,26 +1217,18 @@ int	fs_apfs_read_block(uint64_t bno, void *buf);
 uint64_t	fs_apfs_fletcher64(const void *p, uint32_t len);
 
 /*
- * Write a METADATA block back, sealing it first: the Fletcher-64 is computed
- * over the block from offset 8 and stored in the header, so the result cannot
- * be part of its own input.  Exposed because fs/fs_txn.c writes the blocks a
- * transaction collected and sealing is not knowledge worth having twice.
- *
- * Not for file data, which carries no header and needs no seal -- writing
- * data through here would overwrite its first eight bytes with a checksum.
+ * Write a metadata block, sealing it first: the Fletcher-64 over the block
+ * from offset 8 is stored in the header.  Exported for fs/fs_txn.c, which
+ * writes the blocks a transaction collected.  Not for file data, which has
+ * no header: its first eight bytes would become a checksum.
  */
 int	fs_apfs_write_block(uint64_t bno, void *buf);
 
 /*
- * Read and write a block that has NO obj_phys header, so there is no checksum
- * to verify on the way in and none to seal on the way out.
- *
- * File data is the obvious such block, but it is not the interesting one: an
- * allocation bitmap is also nothing but bytes, and the eight where a metadata
- * block keeps its Fletcher-64 are the allocation state of the chunk's first
- * sixty-four blocks.  Reading one through the checked path rejects it and
- * writing one through the sealed path destroys it, which is why the
- * distinction is exported rather than kept private to the reader.
+ * Read and write a block with no obj_phys header: no checksum verified or
+ * sealed.  File data is one such block; an allocation bitmap is another, and
+ * its first eight bytes are the state of the chunk's first 64 blocks, which
+ * the checked path would reject and the sealed path destroy.
  */
 int	fs_apfs_read_block_raw(uint64_t bno, void *buf);
 int	fs_apfs_write_block_raw(uint64_t bno, const void *buf);
@@ -1438,119 +1236,81 @@ int	fs_apfs_write_block_raw(uint64_t bno, const void *buf);
 /* ---- writing ------------------------------------------------------- */
 
 /*
- * WHAT THIS WRITER IS, AND WHAT IT DELIBERATELY IS NOT.
+ * The writer is copy-on-write, like Apple's: a changed block, metadata or
+ * file data, is written to a newly allocated block, the object map is
+ * pointed at the copy, and the old block goes to the free queue.  Edits of
+ * the open transaction are readable at once and become durable when
+ * fs_apfs_checkpoint lands a superblock naming them; until then a crash
+ * mounts the previous checkpoint intact.
  *
- * APFS is a copy-on-write filesystem: Apple's implementation writes a changed
- * metadata block to a NEW location, updates the object map to point at it,
- * and publishes the result by writing a fresh checkpoint superblock with a
- * higher transaction id.  Nothing is overwritten, so an interrupted write
- * leaves the previous checkpoint intact and the volume mounts as it was.
- *
- * This writer does none of that.  It mutates IN PLACE: a changed block is
- * written back where it already lived.  That forfeits exactly one property --
- * crash safety, since a power loss mid-write leaves a block half-updated with
- * no older version to fall back to -- and buys the absence of the two hardest
- * pieces of APFS, the space manager (allocation bitmap chunks plus free-queue
- * B-trees keyed by xid) and the recursive object-map rewrite that copy-on-
- * write forces.  A volume this writer has touched is still a VALID APFS
- * volume at rest: checksums are recomputed, the tree shape is untouched, and
- * an independent implementation reads it back.  It is simply not a volume
- * that was written the way Apple writes one.
- *
- * The consequence is a hard boundary, and the API states it rather than
- * papering over it: nothing here can allocate a block.  A write may only land
- * on blocks the file already owns.  Growing a file, filling a hole, creating
- * a file, and adding a directory entry all need an allocator and all return
- * FS_APFS_E_NOALLOC.  Overwriting bytes that are already there is the whole
- * of what works, and it works completely.
+ * FS_APFS_E_NOALLOC marks a change this writer does not make: on a container
+ * it cannot allocate in, a hole filled or a file extended by a write, or an
+ * edit wider than its fixed bounds.
  */
 
 /*
- * Overwrite `len` bytes of the resolved file (`id`, `size`) at file offset
- * `off`, reporting the count written through *out_put.
+ * Write `len` bytes of the resolved file (`id`, `size`) at file offset `off`,
+ * reporting the count written through *out_put.  Each run touched moves to
+ * new blocks; partial blocks are read-modify-written, so the bytes around
+ * the request survive.
  *
- * Refuses rather than truncates: a write that would extend the file past
- * `size`, or that lands anywhere the file has no block (a hole, or a range no
- * extent record covers), returns FS_APFS_E_NOALLOC having written nothing it
- * cannot account for.  Coverage is verified by counting bytes actually
- * written and comparing against the request -- an absent extent record is
- * silence, not an error, and silence must not read as success.
- *
- * Partial blocks are read-modify-written, so the bytes around the request
- * survive it.
+ * Refuses rather than shortens: a write past `size` returns
+ * FS_APFS_E_NOALLOC before anything is written, and so does one reaching a
+ * hole or a range no extent record covers -- an absent record is silence,
+ * not an error, so coverage is checked run by run.
  */
 int	fs_apfs_pwrite(uint64_t id, uint64_t size, uint64_t off,
 	    const uint8_t *buf, uint32_t len, uint32_t *out_put);
 
 /*
  * Stamp an inode's modification and change times, in nanoseconds since the
- * Unix epoch, which is how APFS stores them.
- *
- * This is the first thing here to rewrite METADATA, and therefore the first
- * to recompute a Fletcher-64 rather than merely check one: the B-tree leaf
- * holding the record is re-read, patched, re-sealed and written back.  Note
- * the transaction id is left alone -- bumping it would oblige us to publish a
- * new checkpoint, which is the next rung and not this one.
+ * Unix epoch, as APFS stores them.  The leaf holding the record is copied,
+ * patched and sealed into a new block of the open transaction.
  */
 int	fs_apfs_touch(uint64_t oid, uint64_t mtime_ns);
 
 /*
- * fs_apfs_chmod: the permission bits of an inode that already exists, and the
- * change time that any Unix moves with them.  Only the low twelve bits are
- * the caller's to set -- the type nibble belongs to the format, and the
- * checker tests it against the type in the directory entry.
+ * Set an inode's permission bits, and its change time with them.  Only the
+ * low twelve bits are the caller's: the type bits must match the directory
+ * entry's type, which apfsck checks.
  */
 int	fs_apfs_chmod(uint64_t oid, uint16_t perm, uint64_t now_ns);
 
 /*
  * The current length of the file whose inode object id is `ino`, without
- * resolving a path.  One tree walk instead of one per path component, which
- * is what makes refreshing a stale handle affordable enough to do on demand
- * rather than caching a length and hoping.
+ * resolving a path: one descent, cheap enough to refresh a stale handle on
+ * demand.
  */
 int	fs_apfs_size(uint64_t ino, uint64_t *size_out);
 
 /*
- * THE PUBLISHED PAST, READ BACK
+ * Views: the published past, read back.
  *
- * A checkpoint is written and then left alone.  Its superblock stays in the
- * descriptor ring until the ring comes round, and every object it names is a
- * block that copy-on-write never touched again: the blocks a later transaction
- * stopped using went to the free queue, and the queue holds them for
- * APFS_FQ_KEEP checkpoints before the bitmap may hand them out.  So for that
- * long a checkpoint is not merely a fallback for a crash -- it is a complete
- * volume, older than the live one, sitting on the platter with nothing
- * pointing at it.
+ * A checkpoint's superblock stays in the descriptor ring until the ring
+ * comes round, and the blocks a later transaction stopped using are held by
+ * the free queue for APFS_FQ_KEEP checkpoints.  For that long a checkpoint is
+ * a complete, older volume on the platter that nothing points at.
  *
- * A VIEW points at it.  fs_apfs_view_open walks that checkpoint's own spine
- * -- its superblock, its container object map, its volume superblock, its
- * volume object map, its file-system root -- and records the two numbers a
- * reader descends from: the volume object map's tree and the root's block,
- * both as of that xid.  fs_apfs_view_enter makes every reader in this file
- * ask THOSE instead of the mount's, until fs_apfs_view_leave; between the two
- * a lookup, a stat, a readdir, a slurp or a ranged read answers with the
- * volume as that checkpoint left it, byte for byte, out of blocks the live
- * volume no longer names.  The retention is what makes the answer honest:
- * the free queue's promise had been kept since the queue existed and never
- * once called in, and this is what calls it in.
+ * A view points at it.  fs_apfs_view_open walks the checkpoint's spine
+ * (superblock, container object map, volume superblock, volume object map,
+ * file-system root) and records what a reader descends from: the volume
+ * object map's tree and the root's block, as of that xid.  Between
+ * fs_apfs_view_enter and fs_apfs_view_leave every reader here -- lookup,
+ * stat, readdir, slurp, pread -- answers with the volume as that checkpoint
+ * left it.
  *
- * WHAT A VIEW IS NOT.  It is not a snapshot.  A snapshot holds its blocks --
- * the object map keeps a version per snapshot and the free queue waits on
- * the oldest of them -- and this object map replaces rather than keeps
- * (omap_replace_cow says why).  A view merely BORROWS the blocks for as long
- * as the free queue would have held them anyway, so it is a window that
- * slides: the live volume goes on publishing, and each checkpoint written
- * lets go of the oldest one behind it.  A view of a checkpoint the queue has
- * let go of is refused with FS_APFS_E_GONE rather than served, because the
- * blocks may already belong to something else and file data carries no
- * header to say so.  The floor of the window is not computed from the
- * arithmetic but recorded from what the queue actually released, and the
- * essay at fq_floor in apfs.c says why the two can differ.
+ * A view is not a snapshot: a snapshot holds its blocks, while this object
+ * map replaces rather than keeps versions (see omap_replace_cow).  A view
+ * borrows blocks for as long as the free queue holds them anyway, a window
+ * that slides as the live volume publishes.  A checkpoint the queue has let
+ * go of is refused with FS_APFS_E_GONE, since its blocks may belong to
+ * something else and file data has no header to say so.  The window's floor
+ * is recorded from what the queue actually released, not computed (see
+ * fq_floor in apfs.c for why the two can differ).
  *
- * A view is read-only by construction rather than by policy: while one is
- * entered this file writes no block, allocates none and releases none, and
- * says so out loud if asked to.  Views do not nest, and are entered and left
- * within one holding of the volume lock -- the writer never sees one.
+ * While a view is entered this file writes, allocates and releases nothing,
+ * and says so if asked to.  Views do not nest, and are entered and left
+ * within one holding of the volume lock, so the writer never sees one.
  */
 struct fs_apfs_view {
 	uint64_t	av_xid;		/* the checkpoint it reads          */

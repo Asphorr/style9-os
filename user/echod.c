@@ -4,24 +4,17 @@
  * Copyright (c) 2026 The Hobby OS Project
  * All rights reserved.
  *
- * echod -- persistent daemon that the launchd/launchctl arc brings
- * up and tears down.
+ * echod -- persistent daemon that launchd/launchctl bring up and tear
+ * down.
  *
- * Lifecycle:
- *	1. Register an "echo" service under the bootstrap port so
- *	   clients can find us by name.
- *	2. Loop forever: mach_msg_recv_block() on the service port; for
- *	   each incoming message, echo back a reply on msgh_local
- *	   carrying the same msgh_id (mirrors Mach RPC semantics).
- *	3. There is no self-exit -- termination happens via
- *	   task_request_terminate when launchctl UNLOAD asks the kernel
- *	   to kill us.  v2: the s9launchd UNLOAD path fires the async
- *	   kill, our parked mach_msg_recv gets woken with t_killed set,
- *	   and thread_block_release's post-wake check retires us before
- *	   we'd ever read another message.  No cleanup code below the
- *	   recv loop runs in that path (the thread retires inside the
- *	   kernel); that is fine because the kernel reclaims the
- *	   port_space + vm_map on task teardown.
+ *	1. Register an "echo" service under the bootstrap port.
+ *	2. Loop: mach_msg_recv on the service port and reply on msgh_local
+ *	   with the same msgh_id.
+ *	3. No self-exit.  launchctl UNLOAD makes launchd request an async
+ *	   kill (task_request_terminate); the parked receive wakes with
+ *	   t_killed set and the thread retires inside the kernel, so the
+ *	   cleanup after the loop does not run.  Task teardown reclaims
+ *	   the port space and vm_map.
  */
 
 #include "style9.h"

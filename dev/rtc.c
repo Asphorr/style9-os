@@ -12,22 +12,18 @@
 #include "rtc.h"
 
 /*
- * MC146818 CMOS RTC.  See rtc.h for why this exists and why it is read once.
+ * MC146818 CMOS RTC (see rtc.h).  Two hazards make a naive read wrong:
  *
- * Two hazards make a naive read wrong, and neither is rare:
+ *	1. The chip updates its registers once a second, and a read
+ *	   mid-update can see a half-carried time (01:00 when it is 02:00).
+ *	   Status A's UIP bit flags an update, but it can start right after
+ *	   the check, so the whole time is read twice with UIP clear and
+ *	   accepted only when both reads agree.
  *
- *	1. The chip updates its registers once a second, and a read that lands
- *	   mid-update can see a half-carried time -- 01:59:60, or worse, 01:00
- *	   when it is 02:00.  Status register A's top bit (UIP) says an update
- *	   is in progress, but checking it once is not enough: the update can
- *	   start right after the check.  The reliable move is to read the whole
- *	   time twice with UIP clear and accept it only when both agree.
- *
- *	2. The register format is not fixed.  Status register B says whether
- *	   values are BCD or binary and whether hours are 12- or 24-hour, and
- *	   real machines ship both ways.  In 12-hour mode the top bit of the
- *	   hour register means PM -- and it survives BCD decoding, so it has to
- *	   be stripped before decoding and applied after.
+ *	2. Status B says whether values are BCD or binary and hours 12- or
+ *	   24-hour; machines ship both ways.  In 12-hour mode the hour's top
+ *	   bit means PM and survives BCD decoding, so it is stripped before
+ *	   decoding and applied after.
  */
 
 #define	CMOS_ADDR	0x70
@@ -49,9 +45,9 @@
 #define	HOUR_PM		0x80
 
 /*
- * Bit 7 of the address port is the NMI-disable line on most chipsets, so a
- * read leaves it as it found it: the top bit of whatever we select is 0 here,
- * which is the "NMI enabled" state every other part of the system assumes.
+ * Bit 7 of the address port is the NMI-disable line on most chipsets; every
+ * register selected here has it clear, the NMI-enabled state the rest of
+ * the system assumes.
  */
 static uint8_t
 cmos_read(uint8_t reg)
@@ -107,9 +103,8 @@ rtc_read(struct rtc_time *out)
 	int		 tries;
 
 	/*
-	 * Read until two consecutive snapshots agree.  Bounded: a chip that
-	 * never settles is broken, and hanging the boot on it would be worse
-	 * than booting without wall time.
+	 * Read until two consecutive snapshots agree, at most 16 times: a
+	 * chip that never settles costs wall time, not the boot.
 	 */
 	read_raw(&a, &ca);
 	for (tries = 0; tries < 16; tries++) {
@@ -147,9 +142,8 @@ rtc_read(struct rtc_time *out)
 		b.rt_hour = 0;			/* 12 AM is hour 0 */
 
 	/*
-	 * The century register is optional and reads as 0 (or 0xFF) where it
-	 * is absent.  Fall back to the usual two-digit convention rather than
-	 * reporting year 26.
+	 * The century register is optional and reads 0 (or 0xFF) where
+	 * absent; then fall back to the two-digit convention.
 	 */
 	if (cb >= 19 && cb <= 25)
 		b.rt_year = (uint16_t)(cb * 100 + b.rt_year);
@@ -178,11 +172,10 @@ rtc_to_epoch(const struct rtc_time *t)
 	int64_t	m;
 
 	/*
-	 * Howard Hinnant's days_from_civil.  The trick is to shift the year so
-	 * it starts in March: then the leap day is the LAST day of the year
-	 * instead of being wedged into the middle, and the month-length series
-	 * becomes a single linear formula with no table and no special cases.
-	 * Eras are 400 years, the span over which the Gregorian rule repeats.
+	 * Howard Hinnant's days_from_civil.  The year is shifted to start in
+	 * March, so the leap day is the last day of the year and month
+	 * lengths follow one linear formula.  An era is 400 years, the
+	 * Gregorian cycle.
 	 */
 	y = (int64_t)t->rt_year;
 	m = (int64_t)t->rt_month;

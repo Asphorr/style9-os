@@ -41,18 +41,15 @@ static volatile uint64_t	pit_tick_count;		/* (a) */
 static unsigned int		pit_actual_hz;		/* (c) */
 
 /*
- * True until a per-CPU timer takes the job over (pit_release_preempt), and
- * true forever on a machine that has no local APIC.  Written once, before
- * that timer is unmasked, so the ISR reading it cannot race the writer.
+ * True until the APIC timer takes the slice debit over
+ * (pit_release_preempt); forever without a local APIC.  Written once,
+ * before that timer is unmasked.
  */
 static bool			pit_debits_slice = true;
 
 static void	pit_isr(struct trapframe *tf);
 
-/*
- * How often to print the census, in ticks; zero for never.  Set from the
- * shell (`cpu census N') or from a boot that is being chased.
- */
+/* Census period in ticks, zero for never; set by `cpu census N'. */
 uint64_t	pit_census_ticks;
 
 void
@@ -111,16 +108,9 @@ pit_isr(struct trapframe *tf)
 	__atomic_add_fetch(&pit_tick_count, 1, __ATOMIC_RELEASE);
 
 	/*
-	 * A CENSUS OF THE PROCESSORS, WRITTEN STRAIGHT AT THE SERIAL PORT.
-	 *
-	 * The tool of last resort, and the one that was missing.  A machine
-	 * whose processors are all busy and whose log has stopped is telling
-	 * you nothing at all, and every instrument this kernel has for saying
-	 * what a CPU is doing goes through the console -- which is exactly
-	 * what a wedge takes away.  So this one goes nowhere near it: no lock,
-	 * no formatting, no tty, one byte at a time at the UART.
-	 *
-	 * It is not free and it is not pretty, so it is off unless asked for.
+	 * Census of the CPUs, written straight at the UART: no lock, no
+	 * formatting, no tty, so it still works when a wedge has taken the
+	 * console away.  Off unless asked for.
 	 */
 	if (pit_census_ticks != 0 &&
 	    (pit_tick_count % pit_census_ticks) == 0) {
@@ -130,31 +120,21 @@ pit_isr(struct trapframe *tf)
 	}
 
 	/*
-	 * Track quantum usage for whatever is running on THIS CPU -- the
-	 * tick is charged to the CPU that took it, which is the CPU whose
-	 * slice is being spent.  When the quantum is exhausted, ask for a
-	 * reschedule; intr_dispatch (or the next spin_unlock-to-zero)
-	 * honours it.  We do NOT
-	 * gate on preempt_is_enabled here: the gate lives at the
-	 * actual schedule point, not at the flag-set point, so that
-	 * a critical section ending later still has the resched
-	 * pending.
+	 * Debit the slice of whatever runs on this (the boot) CPU and ask
+	 * for a reschedule when it is spent; intr_dispatch or the next
+	 * spin_unlock to zero honours it.  Not gated on preempt_is_enabled:
+	 * the gate is at the schedule point, so a critical section ending
+	 * later still owes the reschedule.
 	 *
-	 * ONLY while this is still the machine's only timer.  There is one
-	 * PIT and it interrupts one CPU, so the slice it can debit is that
-	 * one CPU's; a local APIC timer takes the job per-processor and this
-	 * gate is how it is handed over.  Both debiting would halve every
-	 * quantum, which no test asserts and no message reports.
+	 * Only until the APIC timer takes the job over; both debiting would
+	 * silently halve every quantum.
 	 */
 	if (pit_debits_slice && preempt_quantum_tick())
 		preempt_resched_request();
 
 	/*
-	 * Deadline-driven wakes (sched_check_timeouts) do NOT belong
-	 * here -- spin_trylock inside that routine drops preempt_count
-	 * via spin_unlock, and a preempt_count transition to zero from
-	 * inside the ISR would yield BEFORE pic_eoi runs, leaving the
-	 * 8259 holding the IRQ and starving future PIT ticks.  The
-	 * check runs from intr_dispatch's tail instead, after pic_eoi.
+	 * No sched_check_timeouts here: its spin_unlock can drop the preempt
+	 * count to zero and yield before pic_eoi, leaving the 8259 holding
+	 * the IRQ.  intr_dispatch runs it after the EOI.
 	 */
 }

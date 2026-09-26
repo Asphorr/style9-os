@@ -52,11 +52,8 @@
 #define	COM1_IRQ		4
 
 /*
- * RX ring buffer.  Single-producer (COM1 IRQ) / single-consumer
- * (uart_getc_block, called by the uart_drv thread).  The keyboard ring's
- * discipline, dev/kbd.c: one writer per index, the byte stored before
- * head is released past it and read before tail is, each side acquiring
- * the other's index first.
+ * RX ring: single producer (COM1 IRQ), single consumer (uart_getc_block,
+ * from the uart-drv thread), with the keyboard ring's discipline (kbd.c).
  */
 #define	UART_BUF_SIZE		256
 #define	UART_BUF_MASK		(UART_BUF_SIZE - 1)
@@ -82,7 +79,7 @@ void
 uart_init(void)
 {
 
-	/* Mask all UART interrupts; we only do polled output for now. */
+	/* All UART interrupts masked until uart_enable_rx; output polls. */
 	outb(COM_IER(uart_base), 0x00);
 
 	/* Programme baud rate: enable DLAB, set divisor=1 (115200 baud). */
@@ -104,11 +101,7 @@ void
 uart_putc(char ch)
 {
 
-	/*
-	 * Translate '\n' to CR-LF on the wire so any terminal program
-	 * pointed at the serial line displays cleanly; the kernel proper
-	 * still emits a single '\n' at the API boundary.
-	 */
+	/* '\n' goes out as CR-LF, for terminal programs on the line. */
 	if (ch == '\n')
 		uart_send_raw('\r');
 	uart_send_raw(ch);
@@ -209,10 +202,8 @@ uart_getc_block(void)
 }
 
 /*
- * COM1 IRQ handler.  Drains every byte currently in the receiver
- * (the 16550 fires one IRQ per FIFO-trigger-threshold but the line
- * may have several bytes queued), pushes into the ring, then hands
- * the parked consumer over via sched_post_irq_wake.
+ * COM1 IRQ handler.  Drains every byte in the receiver (one interrupt can
+ * cover several) into the ring; the push wakes the consumer.
  */
 static void
 uart_irq(struct trapframe *tf)
@@ -223,12 +214,7 @@ uart_irq(struct trapframe *tf)
 
 	while ((inb(COM_LSR(uart_base)) & LSR_DATA_READY) != 0) {
 		b = inb(COM_DR(uart_base));
-		/*
-		 * Convert CR (the terminal "Enter" byte on most TTY
-		 * line disciplines) to LF so the shell's line-mode
-		 * '\n' check matches without us replicating cooked-tty
-		 * logic here.
-		 */
+		/* CR, a terminal's Enter, becomes the '\n' readers expect. */
 		if (b == '\r')
 			b = '\n';
 		uart_buf_push((char)b);

@@ -1,49 +1,30 @@
 /*
- * THE APFS WRITER, ON THE HOST
+ * The APFS writer, on the host.
  *
  *	make hostapfs
  *	obj/hostapfs obj/style9.apfs [test ...]
  *
- * fs/apfs is ordinary C over a block device.  It reaches outside itself for
- * exactly five things -- bio_read, bio_write, kmalloc, kfree, kprintf -- which
- * was measured with nm rather than assumed, and every one of them has a
- * one-line answer on a host.  So the whole subsystem, self-tests and all, runs
- * against an image file with no kernel, no QEMU and no boot.
+ * fs/apfs is ordinary C over a block device.  What it needs from the kernel
+ * (bio_read, bio_write, kmalloc, kfree, kprintf, and three ATA hooks for the
+ * block autopsy) is stubbed here in a line or two each, so the subsystem and
+ * its self-tests run against an image file with no kernel, QEMU or boot: a
+ * second, not the four minutes of a boot, and apfsck right after.
  *
- * WHY THIS EXISTS.  Until now the only way to learn whether a change to the
- * writer was right was to build a kernel, boot QEMU, run every self-test the
- * system has, and then apfsck the image: about four minutes for one bit of
- * information, which is longer than writing the change usually takes.  A loop
- * that slow does not get run per-edit, so it gets run per-BATCH, and a batch
- * that fails tells you less than four separate runs would have.  Here the same
- * tests take under a second and apfsck can be called in the same breath.
+ * It does not replace the QEMU pass: ring 3, interrupts, the ATA driver and
+ * the cache under bio are absent.  This is for the arithmetic -- paddings,
+ * key order, node splits, footer counts.
  *
- * WHAT IT DOES NOT REPLACE.  Ring 3, interrupts, a real ATA driver and the
- * page cache under bio are all absent, so the QEMU pass stays exactly as
- * necessary as it was for anything above the filesystem.  This is for the
- * arithmetic: paddings, key order, node splits, footer counts.
- *
- * AND WHAT IT CANNOT SEE, measured rather than guessed by putting a bug back
- * and watching this miss it.  Every test here leaves the volume as it found
- * it, so a defect that exists only WHILE the tests run is gone before apfsck
- * is called: the footer bug this rung fixed -- a key longer than the tree had
- * ever held, which nothing raised the high-water mark for -- was reintroduced
- * on purpose and this reported a clean run, correctly, because by the end the
- * long key had been taken back out and a footer of 25 was honest again.  An
- * end-state checker cannot answer a mid-run question.  What would catch that
- * class is an invariant asserted after each test rather than at the end, which
- * is a self-test to be written and not a property of this harness.
- *
- * What it DOES catch was measured the same way: emptying the data stream in
- * inode_renamed -- exactly the mistake a rename that rebuilt the record like a
- * create would make -- fails apfs-move here in seconds, twice, with a non-zero
- * exit for a script to act on.
+ * Every test leaves the volume as it found it, so a defect that exists only
+ * while the tests run is gone before apfsck looks; a footer high-water mark
+ * left unraised was reintroduced on purpose and went unseen here.  Catching
+ * that class needs an invariant checked after each test.  A defect that
+ * survives does fail here: emptying the data stream in inode_renamed fails
+ * apfs-move, with a nonzero exit.
  */
 /*
- * pread and pwrite are POSIX, not ISO C, and -std=c11 alone hides them --
- * which matters rather than being tidiness: implicitly declared they would
- * return int, and a truncated ssize_t is a short read this code would then
- * report as success.
+ * pread and pwrite are POSIX, not ISO C, and -std=c11 hides them; implicitly
+ * declared they would return int, and a truncated ssize_t could make a short
+ * read look like success.
  */
 #define	_POSIX_C_SOURCE	200809L
 
@@ -68,7 +49,7 @@ static long	 alloc_live;		/* kmalloc that has not been freed */
 static long	 alloc_total;
 static int	 fails;			/* lines a test called a failure */
 
-/* ---- the five ----------------------------------------------------------- */
+/* ---- what fs/apfs needs from the kernel --------------------------------- */
 
 void *
 kmalloc(size_t size)
@@ -93,10 +74,8 @@ kfree(void *p)
 }
 
 /*
- * Every line the writer prints, and a tally of the ones that say a test
- * failed.  Counted HERE rather than by grepping afterwards, so that the exit
- * status of this program is the answer and a script does not have to parse
- * prose to find out whether anything went wrong.
+ * Every line the writer prints, counting the ones that say a test failed,
+ * so the exit status is the answer and no script has to parse the output.
  */
 int
 kprintf(const char *fmt, ...)
@@ -129,14 +108,11 @@ bio_read(unsigned drive, uint64_t lba, uint32_t nsec, void *buf)
 }
 
 /*
- * The block autopsy (block_autopsy in apfs.c) grew an appetite the original
- * five stubs did not cover: on a checksum failure it asks the ATA driver for
- * its interrupt counters and for a read straight off the platter, to say
- * whether the cache or the device is the liar.  On the host there is no
- * driver and no platter -- the image IS the device -- so the counters are
- * zero and the "straight off the device" read is the same pread every other
- * read is.  Which is honest: on the host the two answers cannot differ, and
- * an autopsy that runs here is reporting a corrupt image, not a caching bug.
+ * For block_autopsy in apfs.c: on a checksum failure it asks the ATA driver
+ * for its interrupt counters and a read straight off the device, to tell a
+ * cache fault from a device fault.  Here the image is the device, so the
+ * counters are zero, the direct read is the same pread, and an autopsy
+ * reports a corrupt image.
  */
 uint32_t
 ata_lost_intrs(void)
@@ -188,10 +164,10 @@ static void	run_seek(uint64_t now)  { (void)now; fs_apfs_seek_selftest(); }
 static void	run_ckpt(uint64_t now)  { (void)now; fs_apfs_ckpt_selftest(); }
 
 /*
- * In the order kmain runs them, because the order is load-bearing: the index
- * and drop tests leave a deeper tree than the pristine volume has, apfs-room
- * fills a leaf in it, and apfs-seek goes last on purpose so that the descent
- * it checks has had to choose.
+ * In kmain's order, except that ckpt runs last here.  The order matters: the
+ * index and drop tests leave a deeper tree than the pristine volume's,
+ * apfs-room fills a leaf in it, and apfs-seek comes after them so that the
+ * descent it checks has had to choose.
  */
 static const struct hosttest	tests[] = {
 	{ "alloc",  run_alloc,		     false },
@@ -252,24 +228,18 @@ main(int argc, char **argv)
 	}
 
 	/*
-	 * One wall-clock reading for the whole run, in nanoseconds, exactly as
-	 * the kernel passes one down from fs.c.  The tests only ever write it
-	 * into records, so a single value keeps two runs of this comparable.
+	 * One wall-clock reading in nanoseconds for the whole run, as fs.c
+	 * passes one down; the tests only write it into records.
 	 */
 	now = (uint64_t)time(NULL) * 1000000000ULL;
 
 	/*
-	 * THE LIST IS RUN TWICE, and the reason is what a leak looks like here.
-	 * "Nothing still held at the end" is the wrong question: a mounted
-	 * volume legitimately keeps buffers for its space manager, its bitmap,
-	 * its chunk-info block and each free queue, and the kernel never frees
-	 * those either because it never unmounts.  What a leak DOES look like
-	 * is the same work costing more the second time, so the two passes are
-	 * compared against each other rather than against zero.
-	 *
-	 * It buys a second thing for nothing: these tests are all written to
-	 * leave the volume as they found it, and a pass that only works on a
-	 * pristine tree fails here rather than in some later boot.
+	 * The list runs twice.  A mounted volume legitimately holds buffers
+	 * (space manager, bitmaps, chunk-info block, free queues) that are
+	 * never freed, since the kernel never unmounts, so a leak shows as the
+	 * second pass holding more than the first, not as a nonzero total.
+	 * The second pass also fails any test that only works on a pristine
+	 * tree.
 	 */
 	ran = 0;
 	for (pass = 0; pass < 2; pass++) {

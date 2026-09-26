@@ -13,17 +13,14 @@
 /*
  * Small-object kernel allocator.
  *
- * Power-of-two bucket sizes from 16 to 2048 bytes; requests above
- * that fall through to direct pmm_alloc_pages().  Every chunk carries
- * a small header before the caller-visible pointer that records the
- * bucket index (or page-multiple count) plus a redzone magic, so
- * kfree() can route the freed chunk back without help from the caller
- * and double-frees / wild pointers are caught with a panic instead of
- * silent corruption.
+ * Power-of-two buckets from 16 to 2048 bytes; larger requests go straight
+ * to pmm_alloc_pages().  A header before the caller's pointer records the
+ * bucket index (or page count) and a magic, so kfree() needs no size and
+ * a double free or wild pointer panics instead of corrupting.  Red zones
+ * and free-chunk poison catch overruns and use-after-free (kmem.c).
  *
- * Not callable from interrupt context: the underlying spinlock is not
- * IRQ-safe.  BSD shape: an IRQ handler that wants memory enqueues a
- * task for a thread to run later.
+ * Not for interrupt context: BSD shape, an IRQ handler that wants memory
+ * hands the work to a thread.
  */
 
 void	 kmem_init(void);
@@ -33,11 +30,9 @@ void	 kfree(void *p);
 void	 kmem_stats(void);
 
 /*
- * Number of pmm pages currently parked in bucket freelists.  A
- * regression that leaks chunks (kfree path bug, dropped pointer) is
- * not visible from pmm alone because kmem caches its refills; this
- * number plus pmm_used gives the conserved quantity stress tests
- * need to check against the baseline.
+ * Pages the buckets have taken from pmm (in use or free; they are never
+ * given back).  Because of that caching a chunk leak is invisible to pmm
+ * alone: stress tests check that pmm_used_pages() minus this is unchanged.
  */
 size_t	 kmem_cached_pages(void);
 

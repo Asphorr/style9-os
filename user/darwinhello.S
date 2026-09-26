@@ -5,26 +5,20 @@
  * All rights reserved.
  *
  * darwinhello -- a freestanding ring-3 program that speaks the Darwin (XNU)
- * syscall ABI, NOT style9.  It links against no libc and no crt0: _start
- * issues genuine Apple class-encoded `syscall`s by hand -- the same bytes a
- * macOS x86-64 binary's libSystem stubs emit.
+ * syscall ABI, not style9.  No libc, no crt0: _start issues Apple
+ * class-encoded `syscall's by hand, the same bytes libSystem's stubs emit.
  *
- * Apple puts a CLASS in the high byte of the number in %rax: class 2 is the
- * BSD/Unix gate (write 0x2000004, getpid 0x2000014, exit 0x2000001), class 1
- * is the Mach trap gate (task_self_trap 0x100001C, mach_reply_port
- * 0x100001A).  Arguments follow the System V / Darwin syscall convention
- * (rdi, rsi, rdx, r10, r8, r9 -- the same registers style9 uses), and a BSD
- * call reports failure by setting the carry flag with a positive errno in
- * %rax.
+ * The high byte of %rax is the class: 2 is the BSD gate, 1 the Mach trap
+ * gate.  Arguments go in rdi, rsi, rdx, r10, r8, r9 (as in style9); a BSD
+ * call fails by setting the carry flag with a positive errno in %rax.
  *
- * elf2macho's `macos` mode wraps this ELF as a Mach-O carrying an
+ * elf2macho's `macos' mode wraps this ELF as a Mach-O with an
  * LC_BUILD_VERSION naming PLATFORM_MACOS, so macho_load tags the task
- * TASK_PERSONALITY_DARWIN and the kernel routes these syscalls through
- * darwin_dispatch (kern/darwin.c) -- the S2 path -- instead of the native
- * style9 table.
+ * TASK_PERSONALITY_DARWIN and its syscalls go to darwin_dispatch
+ * (kern/darwin.c) instead of the native table.
  *
- * Sequence (each step is visible in the boot transcript, via the program's
- * own write() or the kernel's darwin_dispatch trace):
+ * Sequence (each step shows in the boot transcript, through the program's
+ * own write() or the darwin_dispatch trace):
  *	write(1, banner)                    class-2 round trip, carry clear
  *	getpid()                            class-2 value return (our task id)
  *	task_self_trap(), mach_reply_port() class-1 Mach traps

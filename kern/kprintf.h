@@ -14,13 +14,15 @@
 /*
  * Minimal in-kernel printf.
  *
- * Conversions supported: %c %s %d %i %u %x %X %p %%
- * Flags supported:        0 (zero-pad)
- * Width supported:        decimal, up to two digits
- * Length modifiers:       none -- the caller casts as needed
+ * Conversions supported: %c %s %d %i %u %o %x %X %p %%
+ * Flags supported:        - (left-align), 0 (zero-pad)
+ * Width supported:        decimal
+ * Length modifiers:       l, ll, z
  *
- * Output is sent unconditionally to the VGA console via tty_putc().
- * No locking; safe to call only single-threaded.
+ * Output goes through tty_putc() (VGA, with serial and debugcon
+ * mirrors).  Each call is one console write: tty_batch_begin holds the
+ * console for this CPU until it returns, so outside a panic lines from
+ * different CPUs do not interleave.
  */
 
 int	kprintf(const char *, ...) __attribute__((format(printf, 1, 2)));

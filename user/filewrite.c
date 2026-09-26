@@ -6,50 +6,36 @@
  */
 
 /*
- * filewrite -- a self-authored Darwin-ABI probe for the rung where userspace
- * can CHANGE the volume.
+ * filewrite -- a self-authored Darwin-ABI probe for writing the volume from
+ * ring 3, run before a genuine Apple binary (dash redirecting with `>')
+ * depends on it.  Not an Apple binary, but built by the real toolchain,
+ * bound by our dyld against our libSystem and importing the same symbols,
+ * so a clean run proves the syscall path and not our own glue.
  *
- * Everything below this program has been provable for a while: the APFS writer
- * makes files, grows them, shortens them and removes them, and apfsck accepts
- * what it leaves.  None of it was reachable from ring 3 -- open(2) answered
- * EROFS to every write mode and write(2) on a file descriptor answered EBADF --
- * so the only thing that had ever written to the disk was the kernel's own
- * self-tests.  This is the probe that de-risks the syscalls before a genuine
- * Apple binary (dash, redirecting with `>`) depends on them.
- *
- * It is NOT a real Apple binary.  It is built by the same real toolchain, bound
- * by our dyld against our libSystem, and imports the same symbols a real one
- * would -- so a clean run proves the syscall path and not our own glue.
- *
- * WHAT IT CHECKS, and why each one is here rather than assumed:
- *
- *	1. O_CREAT makes a file that was not there, and the fd it returns is
- *	   usable.  A create that "succeeded" but left nothing behind would
- *	   still let the write below appear to work, against a handle pointing
- *	   at nothing.
- *	2. The bytes read back are the bytes written -- through a SECOND open,
- *	   not the write fd.  Reading back through the thing that wrote is how
- *	   a cache proves itself right.
- *	3. lseek + a write into the MIDDLE overwrites without changing the
- *	   length.  A writer that always appended would pass every other check
- *	   here.
- *	4. O_APPEND lands at the end no matter where the cursor was.
- *	5. O_TRUNC empties a file that had contents, at open time.
- *	6. unlink removes the name, and opening it afterwards fails.
- *	7. Writing to a built-in (/bin/gcat, which lives in the kernel's own
- *	   text) is still refused: the volume being writable does not make
- *	   everything writable.
- *	8. mkdir makes a DIRECTORY that was not there, and refuses to make it
- *	   twice.  Everything after this is checked through calls that know
- *	   nothing about directories, because a name that can be made INSIDE
- *	   one is the only proof from out here that what reached the disk is a
- *	   directory rather than a record that resembles one.
- *	9. rmdir will not remove it while that name is in it, does remove it
- *	   once the name is gone, and takes the path to the file with it.
- *	10. The two removals do not stand in for each other: rmdir refuses a
- *	   file, unlink refuses a directory.
- *	15. The checkpoint fsync(2) published can be read back by its number
- *	   under /.xid, and nothing under that name can be written.
+ *	1. O_CREAT makes a file that was not there, with a usable fd.
+ *	2. The bytes read back through a second open are the bytes written;
+ *	   reading through the writing fd would only check a cache.
+ *	3. A write into the middle overwrites without changing the length,
+ *	   which a writer that always appended would fail.
+ *	4. O_APPEND lands at the end wherever the cursor was.
+ *	5. O_TRUNC empties the file at open time.
+ *	6. unlink removes the name.
+ *	7. A built-in (/bin/gcat, in the kernel's own text) still refuses a
+ *	   write open.
+ *	8. mkdir makes a directory and refuses to make it twice.
+ *	9. A name can be made inside it, the only proof from out here that
+ *	   a directory reached the disk; rmdir refuses while it is there and
+ *	   succeeds once it is gone.
+ *	10. rmdir refuses a file, unlink refuses a directory.
+ *	11. rename moves a name and its bytes (the length lives in the
+ *	    record the rename rewrites).
+ *	12. rename onto a taken name: new opens get the newcomer while a
+ *	    descriptor held on the old file still reads it to the end.
+ *	13. An open file outlives its last name; afterwards the name is free
+ *	    to an O_EXCL create.
+ *	14. fsync(2) answers 0 on a written file and fails on a closed fd.
+ *	15. The checkpoint fsync published can be read back by number under
+ *	    /.xid, and nothing there can be written.
  *
  * Freestanding: no SDK headers, prototypes declared as <fcntl.h>/<unistd.h>
  * would alias them, entry at _entry (ld -e), relinked low like dyldhello.
@@ -84,9 +70,8 @@ typedef __SIZE_TYPE__	size_t;
 #define	ESTALE		70
 
 /*
- * The directory stream, as libSystem's $INODE64 flavour of it lays out the
- * entry: an Apple binary sees exactly this, so this probe sees exactly this.
- * DIR itself is opaque to the caller, as it is to Apple's.
+ * The $INODE64 dirent, as an Apple binary sees it.  DIR stays opaque, as in
+ * Apple's headers.
  */
 struct dirent {
 	uint64_t	d_ino;
@@ -155,9 +140,8 @@ fail(const char *what)
 }
 
 /*
- * Read a whole file through a fresh descriptor.  Fresh because the point of
- * every check here is that the bytes reached the FILE, and a cursor left over
- * from the write would be answering a question about this program's memory.
+ * Read a whole file through a fresh descriptor, so the check is on the
+ * file and not on the writing descriptor's state.
  */
 static long
 slurp(const char *path, char *buf, size_t cap)
@@ -213,11 +197,8 @@ entry(void)
 	(void)unlink(PATH);
 
 	/*
-	 * 1. a file that was not there.
-	 *
-	 * EROFS here is not a failure: this kernel boots from a FAT volume as
-	 * readily as from an APFS one, and only one of them has a writer.  The
-	 * answer is the volume's, so it is reported as one and the run stops.
+	 * 1. a file that was not there.  EROFS is not a failure: the kernel
+	 * also boots from FAT, which has no writer, so the run just stops.
 	 */
 	fd = open(PATH, O_WRONLY | O_CREAT | O_TRUNC, 0666);
 	if (fd < 0 && *__error() == EROFS) {
@@ -305,10 +286,7 @@ entry(void)
 	else
 		printf("filewrite: PASS unlink removed %s\n", PATH);
 
-	/*
-	 * 7. A built-in is not on the volume: it is an image in the kernel's
-	 * own text, and there is nowhere for a write to it to go.
-	 */
+	/* 7. A built-in lives in the kernel's text, not on the volume. */
 	fd = open("/bin/gcat", O_WRONLY);
 	if (fd >= 0) {
 		fail("a built-in accepted an open for writing");
@@ -317,10 +295,8 @@ entry(void)
 		printf("filewrite: PASS /bin/gcat is still read-only\n");
 
 	/*
-	 * 8. A DIRECTORY, which ring 3 could not make at all until this rung.
-	 *
-	 * Whatever an earlier run left goes first, in the order that works:
-	 * the name inside, then the directory over it.
+	 * 8. A directory.  Clear an earlier run's leftovers first: the name
+	 * inside, then the directory.
 	 */
 	(void)unlink(DIRFILE);
 	(void)rmdir(DIR);
@@ -333,10 +309,8 @@ entry(void)
 		    "again\n", DIR);
 
 		/*
-		 * 9. A name inside it -- the whole proof, from out here, that
-		 * what went on the disk is a directory: open(O_CREAT) does not
-		 * know one from the other, and it had to find this one to put
-		 * anything under it.
+		 * 9. A name inside it: open(O_CREAT) can only put one there
+		 * if what reached the disk is a directory.
 		 */
 		fd = open(DIRFILE, O_WRONLY | O_CREAT | O_TRUNC, 0666);
 		if (fd < 0) {
@@ -372,13 +346,10 @@ entry(void)
 		    "refuses a directory\n");
 
 	/*
-	 * 11. A NAME THAT MOVES, and its bytes with it.
-	 *
-	 * The bytes are what makes this worth asking from out here rather than
-	 * leaving to the kernel's own tests: a file's length lives in the same
-	 * packed record as its name, so a rename to a name of a different
-	 * length rewrites the record around it, and a program that reads the
-	 * file afterwards is the only one that can say the length survived.
+	 * 11. A name that moves, and its bytes with it.  The file's length
+	 * lives in the same packed record as its name, so a rename to a name
+	 * of another length rewrites the record; reading the file afterwards
+	 * shows the length survived.
 	 */
 	(void)unlink(MOVED);
 	fd = open(PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -406,12 +377,10 @@ entry(void)
 	}
 
 	/*
-	 * 12. AND ONTO A NAME THAT IS TAKEN, which is the rename POSIX names
-	 * first: write the new file beside the real one, rename it over.  A
-	 * descriptor is held on the occupant across the move because the
-	 * promise has two readers, and only a program out here can be both:
-	 * every open of the NAME must get the newcomer at once, while the
-	 * holder goes on reading the file it opened, to the last byte.
+	 * 12. Onto a name that is taken: write a new file beside the old one
+	 * and rename it over.  Every open of the name must then get the
+	 * newcomer, while a descriptor held on the old file across the move
+	 * still reads it to the last byte.
 	 */
 	held = open(MOVED, O_RDONLY);
 	if (held < 0)
@@ -461,19 +430,10 @@ entry(void)
 	(void)unlink(MOVED);
 
 	/*
-	 * 13. A FILE THAT OUTLIVES ITS OWN NAME.
-	 *
-	 * The oldest promise Unix makes about unlink and the one this kernel
-	 * used to say out loud it did not keep: a file lives until its last
-	 * name AND its last descriptor are gone.  It has to be asked from out
-	 * here, because the whole of it is what a HOLDER sees -- the kernel's
-	 * own test can prove the records are still on the volume, and only a
-	 * program still reading through a descriptor can prove they are still
-	 * the file it opened.
-	 *
-	 * Read AFTER the unlink and from a non-zero offset, so that a kernel
-	 * which had quietly kept the bytes in a buffer at open time could not
-	 * pass: what is checked is that the volume still answers.
+	 * 13. A file that outlives its name: it lives until its last name and
+	 * its last descriptor are gone.  Read after the unlink, from a
+	 * non-zero offset, so bytes buffered at open time cannot pass for the
+	 * volume still answering.
 	 */
 	fd = open(PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 	if (fd < 0)
@@ -507,12 +467,9 @@ entry(void)
 		}
 		(void)close(fd);
 		/*
-		 * And now it really is gone.  Asked by making the name again:
-		 * an O_EXCL create is the one question whose answer tells
-		 * "the name is free" from "the name is free and the old file is
-		 * still sitting somewhere holding its blocks", because the
-		 * second is what a missing reap leaves and neither open nor
-		 * stat can see it.
+		 * Now it is gone.  An O_EXCL create of the name is the check:
+		 * a file left unreaped after the last close could still hold
+		 * the name, which neither open nor stat would show.
 		 */
 		fd = open(PATH, O_WRONLY | O_CREAT | O_EXCL, 0644);
 		if (fd < 0)
@@ -526,14 +483,11 @@ entry(void)
 	}
 
 	/*
-	 * 14. FSYNC, which is where the durability promise moved when the
-	 * kernel began to batch its checkpoints.  write(2) returning means
-	 * the edit is complete and ordered; fsync(2) returning 0 means it is
-	 * published on the platter rather than parked in the open batch.
-	 * From out here only the syscall's answer is checkable -- the platter
-	 * half is what the kernel's own torn-write stand holds it to -- and
-	 * the refusals are checkable too: a descriptor that is not there, and
-	 * a pipe, which has no platter for the promise to be about.
+	 * 14. fsync.  The kernel batches checkpoints: write(2) returning means
+	 * the edit is complete and ordered, fsync(2) returning 0 means it is
+	 * published on disk rather than parked in the open batch.  Only the
+	 * answer is checkable from here (the kernel's torn-write stand checks
+	 * the disk), plus the refusal of a closed descriptor.
 	 */
 	fd = open(PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 	if (fd < 0)
@@ -554,19 +508,14 @@ entry(void)
 	}
 
 	/*
-	 * 15. THE PUBLISHED PAST, BY PATH.  fsync(2) publishes a checkpoint,
-	 * and the kernel lists every checkpoint it can still read under
-	 * /.xid (fs/fs.h) -- so the newest name there is the one the fsync
-	 * just made, and the file under it has to read as what was written,
-	 * out of a directory that refuses every write.  Read by a path that
-	 * names the checkpoint by NUMBER, which is a claim no cache of this
-	 * program's could satisfy: the bytes were on the platter before the
-	 * number was known out here.
+	 * 15. The published past, by path.  The kernel lists every checkpoint
+	 * it can still read under /.xid (fs/fs.h), so the newest entry is the
+	 * one fsync just made, and the file under it must read as written,
+	 * from a directory that refuses every write.
 	 *
-	 * Softened at one point, and out loud: the window slides with every
-	 * checkpoint, and the syncer may publish one between the listing and
-	 * the read.  ESTALE there is the window being honest rather than the
-	 * file being lost, and is reported as skipped, not as failed.
+	 * The window slides with every checkpoint, and the syncer may publish
+	 * one between the listing and the read: ESTALE then is reported as
+	 * skipped, not failed.
 	 */
 	fd = open(PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 	if (fd < 0)

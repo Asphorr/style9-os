@@ -6,27 +6,19 @@
  */
 
 /*
- * timeprobe -- a self-authored Darwin-ABI probe for the wall clock, in the
- * same role dirlist played for readdir and pipefork for fork/exec: prove the
- * syscall from ring 3 with a small binary built by the real toolchain, before
- * a genuine Apple binary (gdate, or ls -l's timestamps) depends on it.
+ * timeprobe -- a self-authored Darwin-ABI probe for the wall clock, as
+ * dirlist is for readdir and pipefork for fork/exec: a small binary built
+ * by the real toolchain proves the syscalls before a genuine Apple binary
+ * (gdate, ls -l) depends on them.  Three separate checks:
  *
- * It checks three things a clock has to get right, and they are not the same
- * check:
+ *	1. plausible: a year in 2020..2100.  A broken BCD decode or epoch
+ *	   conversion lands somewhere absurd.
+ *	2. advances: two readings across a busy loop differ.
+ *	3. never goes backwards over repeated samples, which every interval
+ *	   measurement relies on.
  *
- *	1. the value is PLAUSIBLE -- a date in this century, not 1970 and not
- *	   year 2600.  A broken BCD decode or a bad epoch conversion lands
- *	   somewhere absurd, and absurd is easy to see.
- *
- *	2. it ADVANCES -- two readings across some work must differ, or the
- *	   clock is a constant wearing a timestamp's clothes.
- *
- *	3. it NEVER GOES BACKWARDS -- sampled repeatedly, no reading may be
- *	   less than the one before it.  This is the property everything that
- *	   measures an interval quietly relies on.
- *
- * It also decodes the epoch into a date itself, so the printed line can be
- * eyeballed against the host that launched QEMU.
+ * The epoch is decoded to a date here so the line can be compared with
+ * the host running QEMU.
  */
 
 typedef __UINT32_TYPE__	uint32_t;

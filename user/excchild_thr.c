@@ -4,15 +4,12 @@
  * Copyright (c) 2026 The Hobby OS Project
  * All rights reserved.
  *
- * Thread-level vs task-level exception precedence test.  This child
- * installs the parent-injected port at BOTH the task-level
- * BAD_INSTRUCTION slot AND the thread-level BAD_INSTRUCTION slot, then
- * deliberately executes UD2.  user_fault_die checks thread-level
- * first; if precedence is correct the message is posted there and
- * the task-level slot is left alone -- exactly one MACH_EXC_FAULT
- * lands in the parent's queue.  The parent recv_timed for a second
- * message with a short timeout and asserts MACH_E_TIMEOUT; the
- * timeout proves the task-level slot did NOT also fire.
+ * Thread-level vs task-level exception precedence.  This child installs
+ * the parent-injected port at both the task-level and the thread-level
+ * BAD_INSTRUCTION slot, then executes UD2.  user_fault_die checks the
+ * thread level first, so exactly one MACH_EXC_FAULT should arrive; the
+ * parent's timed receive of a second one must end in MACH_E_TIMEOUT,
+ * proving the task-level slot did not also fire.
  */
 
 #include "style9.h"

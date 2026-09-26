@@ -69,39 +69,32 @@ static void	kmain_memory_smoke(void);
 static void	kmain_run_tests(void);
 
 /*
- * Top-of-kernel entry called from boot.S after the multiboot1 stub has
- * set up a stack and pushed the bootloader's magic and info pointer.
+ * Top-of-kernel entry, called from boot.S with a stack set up and the
+ * bootloader's magic and info pointer as arguments.
  *
- * Init order is deliberate: console first so subsequent stages can log,
- * then CPU tables (GDT before IDT so traps land in our handlers using
- * our selectors), then the 8259 PIC (must be remapped before sti), then
- * the keyboard (depends on IRQ1 being routable).  Only at the very end
- * do we enable interrupts globally.
+ * Init order is deliberate: per-CPU base, then console so later stages
+ * can log, then CPU tables (GDT before IDT so traps land in our handlers
+ * using our selectors), the 8259 PIC (remapped before sti), memory, the
+ * local APIC and MADT, the keyboard, and only then interrupts and the
+ * clock.
  */
 void
 kmain(uint32_t mb_magic, uint32_t mb_info)
 {
 
 	/*
-	 * FIRST, before anything at all.  Per-CPU state is reached through
-	 * the GS base and the base is zero until this runs, so any earlier
-	 * code that touched it would read and write physical page zero
-	 * instead -- and spin_lock touches it, by way of the preempt count,
-	 * which puts the boundary before the first lock rather than before
-	 * the first obviously CPU-flavoured call.  There is no console yet;
-	 * cpu_print checks the result out loud once there is one.
+	 * First of all.  Per-CPU state is reached through the GS base, which
+	 * is zero until this runs, so any earlier access would hit physical
+	 * page zero -- and spin_lock is one, via the preempt count.  There is
+	 * no console yet; cpu_print reports the result once there is.
 	 */
 	cpu_bsp_init();
 
 	uart_init();
 	tty_init();
 	/*
-	 * Before the banner, because it scribbles across the screen and
-	 * clears it: the first thing a reader should see is a boot log, not
-	 * the wreckage of the test that made the console trustworthy enough
-	 * to print one.  It runs at all because everything above this line
-	 * -- and every shell above that -- has been drawing text under a
-	 * cursor that was not following it.
+	 * Before the banner: the tests scribble on the screen and clear it,
+	 * and the first thing on screen should be the boot log.
 	 */
 	tty_selftest();
 	tty_wrap_selftest();
@@ -126,11 +119,10 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	kmain_memory(mb_magic, mb_info);
 
 	/*
-	 * After the memory system, because the APIC's registers have to be
-	 * MAPPED, and while interrupts are still off, because the interrupt
-	 * path is what is being rewired: software-enabling the APIC routes
-	 * the 8259's output through its LINT0 pin, and until that pin is
-	 * programmed the legacy controller reaches nobody at all.
+	 * After the memory system, because the APIC's registers must be
+	 * mapped, and with interrupts still off, because enabling the APIC
+	 * routes the 8259 through LINT0, and until that pin is programmed the
+	 * legacy controller reaches nobody.
 	 */
 	if (lapic_init())
 		tty_puts("  [ok] local apic (legacy pins wired through)\n");
@@ -138,10 +130,9 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 		tty_puts("  [--] local apic absent -- 8259 alone\n");
 
 	/*
-	 * After the APIC, so that the processor reading the table already
-	 * knows its own APIC id from the register and can recognise itself in
-	 * the list -- and so the address the table gives for the APIC can be
-	 * compared against the one the MSR gave.
+	 * After the APIC, so the boot CPU knows its own APIC id and can find
+	 * itself in the table, and the table's APIC address can be checked
+	 * against the MSR's.
 	 */
 	if (acpi_madt_probe())
 		tty_puts("  [ok] acpi madt (processors counted)\n");
@@ -158,18 +149,15 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	tty_puts("  [ok] clock\n");
 
 	/*
-	 * Needs the PIT ticking to be measured against, and interrupts on to
-	 * be caught arriving, so it cannot happen beside lapic_init.
+	 * Needs the PIT ticking to measure against and interrupts on to catch
+	 * its own, so it cannot happen beside lapic_init.
 	 */
 	lapic_timer_probe();
 
 	/*
-	 * And now the reason the chip was worth turning on: the slice stops
-	 * being debited by the machine's one PIT and starts being debited by
-	 * the timer belonging to the CPU whose slice it is.  At the PIT's own
-	 * rate, so that the quantum keeps the length it was measured to have.
-	 * If this declines -- no APIC, nothing measured -- the PIT keeps the
-	 * job and the kernel preempts exactly as it did before.
+	 * Hand the slice from the PIT to this CPU's APIC timer, at the PIT's
+	 * rate so the quantum keeps its length.  If this declines (no APIC,
+	 * nothing measured) the PIT keeps the job.
 	 */
 	if (lapic_timer_start())
 		tty_puts("  [ok] apic timer debits the slice\n");
@@ -177,22 +165,18 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 		tty_puts("  [--] preemption stays on the PIT\n");
 
 	/*
-	 * And the other processors, last of the machine bring-up: starting one
-	 * needs the APIC (two interrupts), the page allocator (a stack each)
-	 * and the TSC (the sequence has real microseconds in it).  They arrive
-	 * and PARK -- see ap_entry for why they are not let into the scheduler
-	 * until spinlocks are interrupt-safe.
+	 * The other processors, last of the machine bring-up: starting one
+	 * needs the APIC (INIT and startup IPIs), the page allocator (a stack
+	 * each) and the TSC (the sequence has real microsecond delays).  They
+	 * arrive and park until mp_release_aps below -- see ap_entry.
 	 */
 	if (mp_start_aps() != 0)
 		tty_puts("  [ok] application processors up (parked)\n");
 
 	/*
-	 * And the first thing the other processors are ever asked to do: forget
-	 * a page translation.  It runs here, immediately after they arrive,
-	 * because every mapping this kernel changes from now on depends on that
-	 * message getting through -- so if it does not, the boot should say so
-	 * at the point the mechanism was switched on rather than as a
-	 * corruption somewhere downstream.
+	 * Right after the APs arrive: every mapping change from now on relies
+	 * on TLB shootdown reaching them, so a failure should show here, not
+	 * as corruption later.
 	 */
 	pmap_tlb_selftest();
 
@@ -201,20 +185,17 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 
 	kbd_drv_init();
 	/*
-	 * Give the keyboard its second consumer.  Until a Darwin task claims
-	 * the console this sink declines every key and the driver behaves
-	 * exactly as it did; registering it at boot rather than at first
-	 * claim keeps the driver thread free of a "has anyone registered
-	 * yet" question it would have to ask on every keystroke.
+	 * The keyboard's second consumer.  It declines every key until a
+	 * Darwin task claims the console; registered at boot so the driver
+	 * thread never has to ask whether it exists.
 	 */
 	kbd_drv_set_sink(darwin_cons_sink);
 	/*
 	 * Mouse comes up here, not beside kbd_init: lighting IRQ12 before
 	 * clock_init would let a pending aux byte fire an IRQ whose
 	 * intr_dispatch -> sched_check_timeouts -> clock_uptime_ms path
-	 * divides by the still-zero pit_hz().  The keyboard is unmasked
-	 * early because the boot shell needs it; the mouse has no
-	 * early-boot consumer, so deferring it to here costs nothing.
+	 * divides by the still-zero pit_hz().  The mouse has no early
+	 * consumer, so deferring it costs nothing.
 	 */
 	mouse_init();
 	mouse_drv_init();
@@ -224,183 +205,129 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	fs_fat_init();
 	fs_apfs_init();
 	/*
-	 * Anything an interrupted boot left with no name is finished now, while
-	 * nothing in the system holds a file and the answer is therefore known
-	 * without asking.  Zero on every clean boot; the log says so when not.
+	 * Finish anything an interrupted boot left unnamed, now, while nothing
+	 * holds a file.  Zero on every clean boot.
 	 */
 	(void)fs_reap_orphans();
 	/*
-	 * Mounting is the block cache's worst honest workload: probing two
-	 * filesystems and walking a volume's tree asks for the same metadata
-	 * blocks over and over.  Reporting here says what that cost.
+	 * Mounting is the block cache's worst honest workload (the same
+	 * metadata blocks, over and over); report what it cost.
 	 */
 	bio_stats();
 	ata_irq_stats();
 
 	/*
-	 * After the mount numbers are reported, so the cost of mounting stays
-	 * comparable across boots and the write test's own I/O does not muddy
-	 * it.  See fs/fs.h for what the test claims and why a read-back alone
-	 * would not have been evidence.
+	 * The filesystem self-tests.  The order is load-bearing where noted.
+	 *
+	 * The write test goes after the mount numbers so its I/O does not muddy
+	 * them (fs/fs.h says what it claims).  The allocation test takes free
+	 * blocks, checks the disk agrees and gives them back (fs/apfs/apfs.h).
+	 * The checkpoint test moves the container to a new transaction id, so
+	 * it follows those two.
 	 */
 	fs_write_selftest();
-	/*
-	 * And the other half of writing: the space accounting.  Takes a run of
-	 * free blocks, checks the disk agrees, and gives it back -- see
-	 * fs/apfs/apfs.h for why it cannot honestly keep them.
-	 */
 	if (fs_apfs_ready())
 		fs_apfs_alloc_selftest();
-	/*
-	 * And the mechanism that will one day make both of those durable as a
-	 * unit: a checkpoint.  Runs last of the three because it moves the
-	 * container to a new transaction id, and the two tests above are
-	 * easier to read against the one it booted in.
-	 */
 	fs_ckpt_selftest();
 
-	/*
-	 * And what all of it is for: a write that leaves the checkpoint behind
-	 * it describing the bytes it actually had.  Last, because it is the
-	 * only one of these that moves a file's contents.
-	 */
+	/* A write whose checkpoint describes the bytes it actually wrote. */
 	fs_data_selftest();
 
 	/*
-	 * And the shape of the tree changing.  Shorter FIRST: the file it finds
-	 * is the one the boot before grew, so the tail it checks on the way in
-	 * is the proof that growth outlived the machine, and the length it
-	 * leaves behind is what gives the growth test something to do on every
-	 * boot instead of once in the life of an image.
+	 * Truncate before grow: the file truncate finds is the one the last
+	 * boot grew (so its tail proves growth survived), and the length it
+	 * leaves gives the grow test work on every boot.
 	 */
 	fs_trunc_selftest();
 	fs_grow_selftest();
 
 	/*
-	 * And a file that was not there at all.  Every test above works on
-	 * something the image already carried; this one makes its own, writes
-	 * into it, and leaves it for the next boot to find and take away again
-	 * -- so the volume ends every boot after the first exactly as it began.
+	 * A file, then a directory with a name inside it, made from nothing and
+	 * left for the next boot to remove -- so the volume ends every boot
+	 * after the first as it began.
 	 */
 	fs_make_selftest();
-
-	/*
-	 * And a DIRECTORY that was not there at all, which is the same claim
-	 * about a different record -- and one more besides: a name is made
-	 * inside it, so a directory this kernel invented an instant ago is one
-	 * the reader can descend into and the writer can key an entry under.
-	 * It is emptied again and left, for the same reason the file above is.
-	 */
 	fs_dirs_selftest();
 
 	/*
-	 * And the one test in here the kernel cannot satisfy: a file a REAL
-	 * Apple shell redirected into, during the boot before this one.  It has
-	 * to run here, before ring 3 starts, or it would be checking what was
-	 * written moments ago instead of what survived the power going off.
+	 * Checks a file a real Apple shell redirected into during the previous
+	 * boot.  Must run before ring 3 starts, or it would see this boot's
+	 * write instead of what survived power-off.
 	 */
 	fs_shell_selftest();
 
 	/*
-	 * Last of all, the three operations nothing else reaches any more.  A
-	 * node that runs out of room: appending stopped filling one once runs
-	 * that touch began to be merged, so this asks for a split outright.
-	 * A node that stops starting where the index above it says it does,
-	 * which needs a delete to land on a node's first record.  And a node
-	 * that has nothing left in it at all, which has to leave the tree.
-	 * The last two are arranged rather than waited for, because where a
-	 * delete lands is a property of where the splits fell.
+	 * B-tree operations no ordinary path reaches any more: a split, a node
+	 * whose first key changes, a node emptied out of the tree.  The last
+	 * two are arranged rather than waited for, since where a delete lands
+	 * depends on where the splits fell.
 	 */
 	fs_split_selftest();
 	fs_index_selftest();
 	fs_drop_selftest();
 
-	/*
-	 * And a file whose two records a split has put on either side of a
-	 * node boundary, which is the case an unlink used to answer success to
-	 * while leaving half of it on the volume.
-	 */
+	/* A file whose two records a split put either side of a boundary. */
 	fs_stream_selftest();
 
 	/*
-	 * And the OTHER tree -- the one that counts the volume's runs --
-	 * outgrowing its single-node root.  It runs here, before everything
-	 * below it, on purpose: once it has run the tree has an index level
-	 * for good, and every later test in this boot and every test of the
-	 * next one is exercising the two-level walk without being told.
+	 * The extent-reference tree (the one that counts the volume's runs)
+	 * outgrowing its single-node root.  Early on purpose: from then on it
+	 * has an index level for good, so every later test, this boot and
+	 * next, exercises the two-level walk.
 	 */
 	fs_extref_selftest();
 
 	/*
-	 * And the same three shapes again, this time asked for by an ordinary
-	 * caller rather than by a test: names go into a directory until a leaf
-	 * has no room, and the create that finds it full is the one that has to
-	 * split it.  Runs after the three above so that the tree it fills is
-	 * the deep one they leave behind.
+	 * The same shapes reached by an ordinary caller: names go into a
+	 * directory until the create that finds a leaf full has to split it.
+	 * After the tests above, so it fills the deep tree they leave.
 	 */
 	fs_room_selftest();
 
 	/*
-	 * And a name moved rather than made or destroyed, which is the one
-	 * writer whose success changes no count on the volume.  It runs after
-	 * the fill above for the same reason that one runs after the splits:
-	 * the leaves it moves records between are fuller here than they would
-	 * be against a pristine volume.
+	 * A rename: the one writer whose success changes no count on the
+	 * volume.  After the fill, so it moves records between fuller leaves.
 	 */
 	fs_move_selftest();
 
 	/*
-	 * And a file that outlives the name it was reached by, which is the
-	 * half of unlink(2) this kernel used to say out loud it did not keep.
-	 * After the move test because it is the same machinery pointed at the
-	 * private directory, and a failure there is worth reading first.
+	 * A file that outlives its name.  After the move test: the same
+	 * machinery, pointed at the private directory.
 	 */
 	fs_orphan_selftest();
 
 	/*
-	 * And a rename that lands on a taken name -- the move and the
-	 * orphaning as ONE edit, then the half only descriptors can prove:
-	 * the name answers with the newcomer while the replaced file goes on
-	 * answering whoever still holds it.  After both of the above, since
-	 * it is those two machineries composed.
+	 * A rename onto a taken name -- move and orphaning as one edit: the
+	 * name answers with the newcomer while the replaced file keeps
+	 * answering whoever holds it.  After both, since it composes them.
 	 */
 	fs_clobber_selftest();
 
 	/*
-	 * And the published past, by name: the checkpoints the tests above
-	 * left in the ring read back through /.xid exactly as they were
-	 * written, refuse every write, and slide out of reach on the free
-	 * queue's schedule.  After every writer above, because what it reads
-	 * is what they published.
+	 * Past checkpoints read back through /.xid as written, refuse writes,
+	 * and age out on the free queue's schedule.  After every writer,
+	 * since it reads what they published.
 	 */
 	fs_view_selftest();
 
 	/*
-	 * And that every file those tests opened was given back.  Last of the
-	 * filesystem tests on purpose: it is an assertion about all of them,
-	 * and the only moment it can be made is after the last one and before
-	 * ring 3 opens anything of its own.
+	 * Every file the tests opened was given back.  After the last test
+	 * that opens files and before ring 3 opens any.
 	 */
 	fs_open_check();
 
 	/*
-	 * And then, against the tree those three leave behind -- three levels
-	 * deep, with split halves and a node's worth of gaps in it -- that
-	 * looking a record up by its key answers what reading every record
-	 * answers.  It goes last on purpose: run against the pristine volume it
-	 * would be checking a descent through two levels that never had to
-	 * choose.
+	 * A lookup by key answers what a full walk does.  Last, against the
+	 * three-level tree the split, index and drop tests leave behind: on a
+	 * pristine volume the descent would never have to choose.
 	 */
 	fs_seek_selftest();
 
 	/*
-	 * The tests above no longer publish as they go: mutations batch, and
-	 * the checkpoint is owed until something collects it (see the policy
-	 * essay in fs/fs.c).  This is the boot's collection point -- every
-	 * cross-boot claim the tests make, from the write marker to the 0711
-	 * chmod, is durable from HERE, not from the call that made it.  Then
-	 * the syncer starts, so what ring 3 writes from now on is published
-	 * on a clock rather than only when a queue fills or an fsync asks.
+	 * Mutations batch, and the checkpoint is owed until something collects
+	 * it (policy in fs/fs.c).  This sync is the boot's collection point:
+	 * every cross-boot claim the tests make is durable from here, not from
+	 * the call that made it.  Then the syncer publishes on a clock.
 	 */
 	if (fs_ready() && fs_sync() < 0)
 		kprintf("kmain: the closing sync failed -- what the "
@@ -408,55 +335,46 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	fs_syncer_start();
 
 	/*
-	 * Register a demo service under the bootstrap port so ring-3
-	 * code has something to look up.  MACH_PORT_TASK_SELF=1 in
-	 * kernel_space resolves to kernel_task's task_self port; we
-	 * publish it as "kernel_task" so a lookup returns a fresh SEND
-	 * right under a new name in the caller's space, which then
-	 * routes through the synchronous task_self dispatcher when used.
+	 * A demo service for ring 3 to look up: kernel_task's task_self port
+	 * (MACH_PORT_TASK_SELF in kernel_space), published as "kernel_task".
+	 * A lookup gets a fresh SEND right in the caller's space, served by
+	 * the synchronous task_self dispatcher.
 	 */
 	if (bootstrap_register("kernel_task",
 	    MACH_PORT_TASK_SELF) != MACH_MSG_OK)
 		panic("kmain: bootstrap_register(kernel_task)");
 
 	/*
-	 * Bring up the kernel-side Mach services (clock, stats, tasks).
-	 * Each is a PORT_SPECIAL_SERVICE port with a synchronous
-	 * dispatcher, registered under its string name in the bootstrap
-	 * port so any task -- kernel or future ring-3 -- finds them via
-	 * the standard bootstrap_lookup path.
+	 * The kernel-side Mach services (clock, stats, tasks, echool, man,
+	 * progreg) and launchd's subsystem.  Each is a PORT_SPECIAL_SERVICE
+	 * port with a synchronous dispatcher, registered by name with the
+	 * bootstrap port so any task finds it via bootstrap_lookup.
 	 */
 	services_init();
 
 	/*
-	 * Publish the host port (machine-identity + page-size service) on the
-	 * same bootstrap registry.  Native tasks reach it via
-	 * bootstrap_lookup("host"); genuine Darwin binaries via the
-	 * mach_host_self() trap.  Runs after services_init since it shares the
-	 * bootstrap registry and the kernel_space install path.
+	 * The host port (machine identity, page size), on the same registry:
+	 * bootstrap_lookup("host") for native tasks, the mach_host_self() trap
+	 * for Darwin binaries.  After services_init, whose kernel_space
+	 * install path it shares.
 	 */
 	host_init();
 
 	/*
-	 * Publish the bootstrap port's own kernel_space SEND so a task can
-	 * fetch it via task_get_special_port(TASK_SPECIAL_BOOTSTRAP).  Runs
-	 * here (Phase 2), not in bootstrap_init: kernel_space's well-known low
-	 * names (TASK_SELF=1, BOOTSTRAP=2) must be claimed by
-	 * task_subsystem_init first.
+	 * Publish the bootstrap port's own kernel_space SEND for
+	 * task_get_special_port(TASK_SPECIAL_BOOTSTRAP).  Not in
+	 * bootstrap_init: task_subsystem_init must first claim kernel_space's
+	 * well-known low names (TASK_SELF=1, BOOTSTRAP=2).
 	 */
 	bootstrap_publish();
 
 	/*
-	 * Bring up the structured kernel log on the same machinery.
-	 * Writes here mirror to tty, which already pipes through to
-	 * COM1 + debugcon, so every klog line lands on three sinks at
-	 * once -- visible on the VGA console, captured by
-	 * `qemu -serial file:...`, and dumped by `qemu -debugcon stdio`.
+	 * The structured kernel log.  It mirrors to tty, which already copies
+	 * to COM1 and debugcon, so every klog line reaches all three.
 	 */
 	klog_service_init();
 
-	/* A couple of boot-time markers, mostly so `log tail` after
-	   the shell comes up has something to show. */
+	/* Boot markers, so `log tail' has something to show. */
 	klog(KLOG_LEVEL_INFO,  "boot", "stress pass complete");
 	klog(KLOG_LEVEL_INFO,  "boot", "drivers + services up");
 	klog(KLOG_LEVEL_DEBUG, "boot", "entering shell");
@@ -466,27 +384,24 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	(void)smap_enable_runtime();
 
 	/*
-	 * AND NOW THE OTHER PROCESSORS, which have been parked since they
-	 * arrived.  Here rather than beside mp_start_aps because the two lines
-	 * above are the last of the per-CPU state a thread depends on: CR4.SMAP
-	 * and the SYSCALL registers.  A processor released before them would
-	 * run user threads with neither, and would say nothing about it.
+	 * Now release the parked processors: CR4.SMAP and the SYSCALL
+	 * registers, set just above, are the last per-CPU state a thread
+	 * depends on, and a CPU released earlier would run user threads
+	 * without them.
 	 */
 	if (mp_release_aps() != 0)
 		sched_smp_selftest();
 
 	/*
-	 * After the processors are running, because that is the machine the
-	 * list this checks gets corrupted on -- though the corruption itself
-	 * is arranged rather than raced for, so it would show on one CPU too.
+	 * With the APs running, where this list gets corrupted -- though the
+	 * test arranges the corruption rather than racing for it.
 	 */
 	port_wait_selftest();
 
 	/*
-	 * The two kill-vs-lock scenes, here for the same reason: both spawn
-	 * a task and kill it, and one of them kills it in the middle of real
-	 * disk I/O, which wants the volume mounted and the write path
-	 * already proven by the fs battery above.
+	 * The kill-vs-lock scenes: both spawn a task and kill it, one in the
+	 * middle of disk I/O, so they need the volume mounted and the write
+	 * path proven by the fs tests above.
 	 */
 	mutex_kill_selftest();
 	fs_kill_selftest();
@@ -494,21 +409,17 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	progreg_init();
 
 	/*
-	 * Only now can launchd resolve its boot catalog: every job in it names
-	 * a program by string, and the registry that turns a string into an
-	 * image is the one progreg_init just filled.  Ordering it here rather
-	 * than leaving launchd's worker thread to guess is the whole point --
-	 * see launchd_load_catalog in mach/launchd.c.
+	 * launchd's catalog names programs by string, and progreg_init has
+	 * just filled the registry that resolves them.  See
+	 * launchd_load_catalog in mach/launchd.c.
 	 */
 	launchd_load_catalog();
 
 	/*
-	 * Run hello.elf once before handing the console to sh.elf.  Its
-	 * main() exercises the userspace surface end-to-end (port self-send,
-	 * task_self RPC, bootstrap_lookup chain, OOL round-trip via
-	 * svc/echool) and exits with rv==0 on success.  Doing it here gives
-	 * a headless boot a deterministic ring-3 smoke test without needing
-	 * a way to drive sh.elf's stdin.
+	 * Run hello.elf once before sh.elf gets the console: it exercises the
+	 * userspace surface end to end (port self-send, task_self RPC,
+	 * bootstrap_lookup, OOL round trip via svc/echool) and exits 0 on
+	 * success -- a ring-3 smoke test for a headless boot.
 	 */
 	{
 		long	hello_id;
@@ -516,14 +427,9 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 		hello_id = progreg_spawn("hello");
 		if (hello_id > 0) {
 			/*
-			 * ⚠ NAPPING RATHER THAN YIELDING, and the difference is
-			 * not politeness.  A yield here waited for hello.elf
-			 * only while hello.elf was queued behind this thread;
-			 * with the other processors in the scheduler it runs
-			 * beside it, so the yield returned at once and this
-			 * loop became 350,000 context switches a second, which
-			 * cost this CPU its timer ticks and the machine its
-			 * clock.  See sched_nap_ms.
+			 * Nap, do not yield: with APs running, hello.elf runs
+			 * beside this thread, not behind it, and a yield loop
+			 * spins (see sched_nap_ms).
 			 */
 			while (task_is_alive((uint64_t)hello_id))
 				sched_nap_ms(1);
@@ -533,20 +439,12 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 			    hello_id);
 		}
 		/*
-		 * What the demos actually cost in pages.  Reported here rather
-		 * than beside the block-cache line above because nothing has
-		 * faulted yet at mount time -- every mapping the loader makes
-		 * is populated eagerly, and only the ring-3 programs above ask
-		 * for memory they have not touched.
+		 * Page and frame counts after the demos, not at mount time:
+		 * the loader populates its mappings eagerly, so only ring-3
+		 * programs fault, and the frame-sharing counters stay zero
+		 * until something forks.
 		 */
 		vm_fault_stats();
-		/*
-		 * Frames, after the demos rather than at mount time.  The
-		 * sharing counters are the ones worth reading here: at boot
-		 * they are necessarily zero because nothing has forked yet,
-		 * so the line printed during pmm_init can only ever say the
-		 * mechanism is idle.
-		 */
 		pmm_stats();
 		vm_image_stats();
 		vm_pages_stats();
@@ -564,20 +462,13 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	}
 
 	/*
-	 * Phase 2: ring-3 shell takes over as the user-facing surface.
+	 * The ring-3 shell takes over as the user-facing surface.
 	 *
-	 * sh.elf calls dev_open_stream("kbd"), which MOVE_RECEIVEs the
-	 * single RECV right on kbd_input_port out of kernel_space and into
-	 * sh.elf's port_space.  After that the in-kernel kern/shell.c can
-	 * no longer recv on kbd_input_port, so we must NOT call shell_run()
-	 * here -- it would either panic (port_set_insert on a port we no
-	 * longer own) or steal characters in a race with sh.elf.  The file
-	 * stays in the tree as a fallback / reference; phase 3 deletes it
-	 * once the userspace surface has full parity (disk + dev listing
-	 * subcommands).
-	 *
-	 * If sh.elf ever fails to spawn we drop straight into the legacy
-	 * kernel shell so the system stays interactive.
+	 * sh.elf's dev_open_stream("kbd") moves the single RECV right on
+	 * kbd_input_port out of kernel_space, so shell_run() must not be
+	 * called alongside it: it would panic (port_set_insert on a port we
+	 * no longer own) or race sh.elf for characters.  kern/shell.c stays
+	 * only as the fallback when sh.elf fails to spawn.
 	 */
 	if (progreg_spawn("sh") < 0) {
 		kprintf("kmain: spawn(sh) failed -- falling back to kernel shell\n");
@@ -586,37 +477,18 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	}
 
 	/*
-	 * sh.elf is now the interactive surface.  This thread (the boot
-	 * thread / kernel_task's id=1) has done its job; exit so it falls
-	 * off the runq cleanly.
-	 *
-	 * Why not yield-spin: a yield-loop keeps the boot thread perpetually
-	 * READY, and pick_next_locked only returns idle_thread when the
-	 * runq is empty.  idle_loop is the only caller of
-	 * sched_reap_zombies, so a boot thread that lingers on the runq
-	 * starves the reaper -- exited user tasks stay in task_list, the
-	 * shell's yield-spin on SYS_TASK_ALIVE never sees them go away,
-	 * and the prompt never comes back after a child returns.
-	 *
-	 * thread_exit() turns this thread into a zombie and hands the CPU
-	 * to whatever pick_next finds next; idle is now reachable and
-	 * reaps both this boot thread and any later user-task zombies.
-	 * kernel_task's t_refs stay high because kbd_drv_thread,
-	 * uart_drv_thread, idle_thread, and the service threads are all
-	 * still attached to it, so the task itself is unaffected.
+	 * The boot thread's job is done: exit, rather than linger on the
+	 * runqueue, and be reaped like any zombie.  kernel_task is unaffected
+	 * -- its driver, service and idle threads still hold it.
 	 */
 	thread_exit();
 	/* NOTREACHED */
 }
 
 /*
- * Boot-time test pass.  Runs every stress harness in turn so a headless
- * `make log` boot exercises the whole stack without needing keyboard
- * input.  Once it returns the shell takes over for interactive use.
- *
- * The tests are independently fatal-tolerant: a failure in stress_mem
- * does not skip the boundary or timer test, because we want the full
- * picture in one boot rather than peeling failures back one at a time.
+ * Boot-time test pass: every stress harness in turn, so a headless
+ * `make log' boot exercises the whole stack.  A failure does not skip the
+ * tests after it -- one boot gives the full picture.
  */
 static void
 kmain_run_tests(void)
@@ -725,13 +597,13 @@ kmain_run_tests(void)
  *		low 1 MiB, the kernel image, and the bitmap's own pages.
  *		After this, pmm_alloc_page works.
  *
- *	pmap	probe the live CR3 (the boot identity map) and prep the
- *		machine-dependent VM API.  Does not touch any mappings;
- *		it just records where the root table lives so later
- *		callers can extend the tree.
+ *	pmap	record the live CR3 (the boot identity map) as
+ *		kernel_pmap's root; no mappings are touched.
  *
  *	kmem	initialise empty buckets; first kmalloc() will pull a
  *		page from pmm on demand.
+ *
+ * then the VM, IPC, task, thread and scheduler layers that sit on them.
  */
 static void
 kmain_memory(uint32_t mb_magic, uint32_t mb_info)
@@ -750,10 +622,9 @@ kmain_memory(uint32_t mb_magic, uint32_t mb_info)
 	bootstrap_init();
 	task_subsystem_init();
 	/*
-	 * Enable SSE/x87 for ring 3 and capture the clean FXSAVE template
-	 * BEFORE any thread exists: thread_subsystem_init's boot thread and
-	 * every thread_create seed th_fpu from it, and the first context
-	 * switch FXRSTORs it.
+	 * Enable SSE/x87 and capture the clean FXSAVE template before any
+	 * thread exists: the boot thread and every thread_create seed th_fpu
+	 * from it.
 	 */
 	fpu_init();
 	thread_subsystem_init();
@@ -763,10 +634,8 @@ kmain_memory(uint32_t mb_magic, uint32_t mb_info)
 }
 
 /*
- * Touch every layer with a representative workload, so a regression
- * in any of pmm / pmap / kmem shows up as a visible panic / wrong
- * stat in the boot log rather than a latent bug surfacing weeks later
- * from some unrelated code path.
+ * Touch every layer with a representative workload, so a regression in
+ * pmm / pmap / kmem shows up in the boot log as a panic or a wrong stat.
  */
 static void
 kmain_memory_smoke(void)

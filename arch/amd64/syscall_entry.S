@@ -14,22 +14,12 @@
  *	  interrupts disabled)
  *	- NOT switched the stack -- %rsp still points at user space
  *
- * There is no register to spare on entry -- %rsp still points into ring 3
- * and every GPR holds either an argument or something the ABI promises to
- * give back -- so the kernel stack has to come out of memory, and the
- * address of that memory has to come from somewhere that needs no register
- * to find.  That is what the GS base is for: %gs:CPU_KERNEL_RSP is this
- * CPU's kernel stack top, installed by the scheduler on every dispatch into
- * a user thread, and %gs:CPU_USER_RSP is this CPU's one-slot parking space
- * for the ring-3 %rsp we are about to overwrite.
+ * No register is free on entry, so the kernel stack is found through the
+ * GS base: %gs:CPU_KERNEL_RSP is this CPU's kernel stack top, re-armed by
+ * the scheduler on every switch, and %gs:CPU_USER_RSP is a per-CPU slot
+ * for the ring-3 %rsp while it is replaced.
  *
- * BOTH USED TO BE GLOBALS, which was correct for exactly as long as there
- * was one CPU: two CPUs entering a syscall at once would each stash their
- * user stack in the same word, and the second one home would return the
- * first one's ring-3 %rsp to both.  The structure of the entry is unchanged
- * -- only where the two words live.
- *
- * Argument convention follows real Mach / Linux:
+ * Argument convention follows Linux:
  *	%rax	syscall number
  *	%rdi	arg0   %rsi  arg1   %rdx  arg2
  *	%r10	arg3 (NOT %rcx -- SYSCALL clobbered it)
@@ -48,11 +38,7 @@ syscall_entry:
 	movq	%rsp, %gs:CPU_USER_RSP
 	movq	%gs:CPU_KERNEL_RSP, %rsp
 
-	/*
-	 * Build a struct syscall_frame on the kernel stack, in field
-	 * order.  Matches the layout in kern/syscall.h exactly so the
-	 * C dispatcher can use ->arg0 / ->nr / ->user_rip naming.
-	 */
+	/* Build a struct syscall_frame (kern/syscall.h), in field order. */
 	pushq	%gs:CPU_USER_RSP		/* +72 user_rsp     */
 	pushq	%rcx				/* +64 user_rip     */
 	pushq	%r11				/* +56 user_rflags  */
@@ -69,17 +55,14 @@ syscall_entry:
 	/* %rax holds the syscall's return value */
 
 	/*
-	 * Restore caller-save state.  The Linux x86_64 SYSCALL ABI
-	 * (which our libc-style user wrappers expect) says the
-	 * kernel preserves everything except %rax (return), %rcx
-	 * (saved RIP), and %r11 (saved RFLAGS).  GCC emits code for
-	 * the user side assuming exactly that, so we mirror it
-	 * here: arg registers come back as the user saw them on the
-	 * way in.
+	 * As on Linux, the kernel preserves everything but %rax (return),
+	 * %rcx (RIP) and %r11 (RFLAGS), so the argument registers go back
+	 * as the user passed them.
 	 *
-	 * Order: stash user RSP in the per-CPU slot first (we cannot
-	 * park it in a register, since all the ones we could use are
-	 * either return-related or about to be restored).
+	 * The user %rsp is taken from the frame, not the per-CPU slot:
+	 * another thread's syscall may have reused the slot meanwhile.  It
+	 * is parked in the slot again because every free register is about
+	 * to be restored.
 	 */
 	movq	72(%rsp), %rdx
 	movq	%rdx, %gs:CPU_USER_RSP

@@ -4,9 +4,9 @@
  * Copyright (c) 2026 The Hobby OS Project
  * All rights reserved.
  *
- * Ring-3 demo for style9-os, now linked against libstyle9.
+ * Ring-3 demo for style9-os, linked against libstyle9.  main() runs the
+ * steps in order and stops at the first failure, returning its code.
  *
- * Steps (each demos one layer of the user/kernel IPC plumbing):
  *	1. printf banner via SYS_PRINT
  *	2. mach_port_allocate + self-send + recv round-trip
  *	3. mach_msg_recv_timed on an empty port (expect E_TIMEOUT)
@@ -19,6 +19,8 @@
  *     10. port set: insert + extract introspection + recv across two members
  *     11. DEAD_NAME notification fires when source RECV drops
  *     12. spawn_with_port: child detects MACH_PORT_PARENT and pings back
+ *     12b. OOL payload from a ring-3 child (`oolchild'), intact as of the
+ *         send and copy-on-write after it
  *     13. exception port: spawned `excchild' faults, kernel posts
  *         MACH_EXC_FAULT to the parent's port carrying trapframe state
  *     13b. per-type ports: `excchild_ud' installs only BAD_INSTRUCTION,
@@ -33,11 +35,13 @@
  *         send-recv round-trip via the registered name, deregister
  *     15. msg strictness: nonzero voucher and reserved msgh_bits are
  *         rejected with MACH_E_INVAL; clean header still round-trips
+ *     16. spawned tools and kill paths: lsmp, vmmap, launchctl, selfkill,
+ *         compute-loop kill, parent-managed kill, top, stale taskport
+ *     17. argv across spawn (argecho), a Mach-O container (machotest),
+ *         and Darwin-ABI programs
  *
- * Boot-time main() also detects whether the task was spawned via
- * SYS_SPAWN_WITH_PORT (child path: a SEND right sits at
- * MACH_PORT_PARENT).  If so, send a ping and exit -- the demos above
- * are for the original hello.elf only.
+ * A hello.elf spawned via SYS_SPAWN_WITH_PORT (a send right at
+ * MACH_PORT_PARENT) only pings its parent and exits.
  */
 
 #include "style9.h"
@@ -134,13 +138,10 @@ demo_task_self(void)
 }
 
 /*
- * OOL round-trip: build a user-VA buffer with a known pattern, send it
- * as the sole OOL descriptor in a complex message to svc/echool, expect
- * the kernel-side FNV-1a checksum to come back in msgh_id and match
- * what we computed locally.  Validates the wire format end-to-end from
- * ring 3: the body's descriptor-count, the OOL type tag at byte 0, the
- * size and address fields, and the kernel's special-port intercept all
- * have to line up for this to pass.
+ * OOL round-trip: send a patterned buffer as the one OOL descriptor of a
+ * complex message to svc/echool and expect our FNV-1a back in msgh_id.
+ * Descriptor count, type tag, size and address, and the kernel's
+ * special-port intercept must all be right.
  */
 static uint32_t
 demo_ool_fnv1a(const uint8_t *buf, uint32_t size)
@@ -250,11 +251,8 @@ demo_bootstrap_chain(void)
 }
 
 /*
- * vm_allocate: ask the kernel for a fresh page-aligned range, prove
- * the bytes start zero, write a pattern, read it back, then release
- * via vm_deallocate.  Validates SYS_VM_ALLOCATE + SYS_VM_DEALLOCATE
- * end-to-end (the syscall path, the pmap install, the vm_map entry,
- * and the symmetric teardown).
+ * vm_allocate: a fresh range reads zero, holds a written pattern, and
+ * is released by vm_deallocate.
  */
 static int
 demo_vm_allocate(void)
@@ -300,11 +298,9 @@ demo_vm_allocate(void)
 }
 
 /*
- * OOL round-trip with deallocate=1: allocate a buffer via vm_allocate,
- * fill it, ship via OOL to svc/echool with deallocate set, verify the
- * kernel-side checksum matches.  Post-send a vm_deallocate on the same
- * range MUST fail (SYS_E_INVAL) -- the kernel already freed it as part
- * of the send hook.
+ * OOL with deallocate=1: send a vm_allocate'd buffer to svc/echool and
+ * check the checksum.  The send released the range, so a vm_deallocate
+ * of it afterwards must fail.
  */
 static int
 demo_ool_deallocate(void)
@@ -363,10 +359,7 @@ demo_ool_deallocate(void)
 		return (19);
 	}
 
-	/*
-	 * The buffer is gone; a second vm_deallocate must fail.  The
-	 * kernel returns SYS_E_INVAL for any unknown range.
-	 */
+	/* Gone: vm_deallocate of an unknown range returns SYS_E_INVAL. */
 	rv = vm_deallocate(buf, 4096);
 	if (rv == 0) {
 		printf("  vm_deallocate succeeded post-send (sent buffer "
@@ -379,15 +372,10 @@ demo_ool_deallocate(void)
 }
 
 /*
- * NO_SENDERS notification.  Allocate a source port (RECV+SEND) and a
- * notify port (RECV+SEND); register a NO_SENDERS notification on the
- * source delivered to the notify port; drop the source's SEND right via
- * mach_port_mod_refs.  Now the source has RECV but no SEND, so the
- * kernel synthesises a MACH_NOTIFY_NO_SENDERS message and posts it to
- * the notify port.  Receive that, verify msgh_id and nh_msgid.
- *
- * The notify-msgid is user-chosen and round-trips verbatim so a service
- * watching many sources via one notify port can tell them apart.
+ * NO_SENDERS: request the notification on a source port, then drop its
+ * only send right with mach_port_mod_refs.  The kernel posts
+ * MACH_NOTIFY_NO_SENDERS to the notify port, carrying our nh_msgid back
+ * verbatim so one notify port can watch many sources.
  */
 #define	NO_SENDERS_TAG	0xDEADBEEFu
 
@@ -422,9 +410,8 @@ demo_no_senders(void)
 	}
 
 	/*
-	 * Drop just SEND from `source`.  RECV stays under the same name so
-	 * we keep the port alive; the no-senders condition triggers because
-	 * p_send_count goes to 0 while p_has_receive is still true.
+	 * Drop only the send right: the receive right keeps the port alive
+	 * with p_send_count at 0.
 	 */
 	rv = mach_port_mod_refs(source, MACH_PORT_RIGHT_SEND);
 	if (rv != MACH_MSG_OK) {
@@ -465,12 +452,9 @@ demo_no_senders(void)
 }
 
 /*
- * Port set.  Allocate a set + two member ports (with RECV+SEND on each
- * member).  Insert both members into the set.  Send distinct tags to
- * each member, then recv on the SET name twice -- both messages should
- * pop in send order (FIFO is per-member, but the set's scan visits
- * members head-first, so the test exercises the wiring rather than
- * ordering guarantees).
+ * Port set: two members inserted, one tagged message sent to each, two
+ * receives on the set name.  Either order is accepted: FIFO is per
+ * member, so this tests the wiring, not ordering.
  */
 #define	PSET_TAG_A	0xA1A1A1A1u
 #define	PSET_TAG_B	0xB2B2B2B2u
@@ -517,10 +501,7 @@ demo_port_set(void)
 		return (32);
 	}
 
-	/*
-	 * Read-only introspection.  Both members should report the same
-	 * set name as the one returned from port_set_allocate.
-	 */
+	/* Both members must report the set's name. */
 	if (mach_port_set_extract(port_a) != set_name) {
 		printf("  set_extract(A) returned wrong set name\n");
 		return (65);
@@ -596,13 +577,10 @@ demo_port_set(void)
 }
 
 /*
- * DEAD_NAME notification.  Mirror of demo_no_senders but from the
- * other side: we hold SEND on the source port; we want to know when
- * its RECV is dropped (the port behind our SEND name dies).  Allocate
- * source (RECV+SEND) plus a notify port; register DEAD_NAME on source
- * (kernel requires we hold SEND, which we do); drop RECV on source via
- * mod_refs; the port dies; the kernel posts MACH_NOTIFY_DEAD_NAME on
- * the notify port; recv and verify.
+ * DEAD_NAME, the mirror of demo_no_senders: holding a send right
+ * (required to register), learn when the receive right goes.  Drop the
+ * source's receive right with mod_refs; the port dies and
+ * MACH_NOTIFY_DEAD_NAME arrives on the notify port.
  */
 #define	DEAD_NAME_TAG	0xCAFE0DEAu
 
@@ -636,10 +614,7 @@ demo_dead_name(void)
 		return (40);
 	}
 
-	/*
-	 * Drop just RECV from `source`.  SEND stays under the same name
-	 * (the watcher's qualifier).  Port goes dead -> DEAD_NAME fires.
-	 */
+	/* Drop only the receive right; the send right stays as the name. */
 	rv = mach_port_mod_refs(source, MACH_PORT_RIGHT_RECEIVE);
 	if (rv != MACH_MSG_OK) {
 		printf("  mod_refs(RECV) failed (rv=%d)\n", rv);
@@ -675,11 +650,9 @@ demo_dead_name(void)
 }
 
 /*
- * spawn_with_port: allocate a work port (RECV+SEND), spawn ourselves
- * (hello.elf) with that port injected at the child's MACH_PORT_PARENT
- * slot, then recv on the work port.  The child detects its parent
- * port at startup (see main()'s child-detect block), sends a tagged
- * ping, and exits.  We verify the tag and the child task is gone.
+ * spawn_with_port: spawn hello.elf with a work port at the child's
+ * MACH_PORT_PARENT and receive the tagged ping it sends from main()
+ * before exiting.
  */
 #define	HELLO_CHILD_PING_TAG	0xCAFEC417u
 
@@ -727,28 +700,18 @@ demo_spawn_inject(void)
 }
 
 /*
- * demo_ool_from_child: receive a bulk payload sent by ANOTHER RING-3 TASK.
+ * demo_ool_from_child: receive a bulk payload from another ring-3 task.
+ * The other OOL demos talk to kernel services, which are dispatched in the
+ * sender's context and never move the bytes; only a message queued
+ * between user tasks hands the receiver the sender's frames.
  *
- * Every other OOL exercise here talks to a kernel service, and those never
- * take the path this one does: a special-port destination is dispatched in
- * the sender's own context, so the kernel never has to move the bytes at
- * all.  Only a message queued between two user tasks makes it hand the
- * receiver the sender's frames -- which is what this checks, and what
- * nothing checked before.
+ *	The payload must match the pattern computed here, not a checksum
+ *	  from the child.
+ *	It must be what the child had at send time: oolchild overwrites its
+ *	  buffer as soon as the send returns, so frames shared without
+ *	  write-protecting the child's copy read 0xA5 here.
  *
- * Two things are verified, and the second is the one worth having:
- *
- *	the payload arrived intact -- checked against the pattern computed
- *	  here, not against a checksum the child sent, so both halves must be
- *	  independently right;
- *
- *	the payload is what the child had AT SEND TIME.  oolchild overwrites
- *	  its whole buffer the instant the send returns.  If the kernel shared
- *	  those frames without taking the child's write access away, this
- *	  reads 0xA5 all through and fails.
- *
- * Then it writes to the received range, which must not be visible to anyone
- * else either -- that is the receiving half of the same mechanism.
+ * Then we write the received range, the receiving half of copy-on-write.
  */
 #define	OOLCHILD_PAGES	3
 #define	OOLCHILD_BYTES	(OOLCHILD_PAGES * 4096u)
@@ -816,9 +779,8 @@ demo_ool_from_child(void)
 	}
 
 	/*
-	 * Write into the landed range.  It is mapped writable but its page
-	 * table entries are not, so every page here takes a copy-on-write
-	 * fault and becomes ours -- the receiving half of the same trade.
+	 * The range is mapped writable but its PTEs are not, so each page
+	 * takes a copy-on-write fault and becomes ours.
 	 */
 	{
 		uint8_t	*mine = (uint8_t *)(uintptr_t)rx.ool.address;
@@ -842,12 +804,10 @@ demo_ool_from_child(void)
 }
 
 /*
- * Exception port end-to-end.  Allocate a watcher port, spawn the
- * dedicated `excchild' program with that port at MACH_PORT_PARENT.
- * `excchild' installs the parent slot as its task's exception port,
- * then NULL-derefs; the kernel synthesises a MACH_EXC_FAULT message
- * and posts it on the watcher BEFORE retiring the child thread.
- * Parent recvs the exception and checks trapno (14 = #PF) + cr2 (0).
+ * Exception port: `excchild' installs our watcher port (its
+ * MACH_PORT_PARENT) as its exception port and NULL-derefs; the kernel
+ * posts MACH_EXC_FAULT to it before retiring the thread.  Check trapno
+ * 14 (#PF), cr2 0 and the task id.
  */
 static int
 demo_exception(void)
@@ -916,16 +876,11 @@ demo_exception(void)
 }
 
 /*
- * Reply-protocol RESUME.  Spawn `excchild_resume' which opted into
- * the reply protocol (EXC_FLAG_RESUMABLE) at the BAD_INSTRUCTION
- * slot, then UD2's.  We recv the MACH_EXC_FAULT, extract the
- * implicit reply port from msgh_local, ship back a
- * mach_exception_reply with verdict=EXC_VERDICT_RESUME and
- * rip_advance=2 (the length of UD2).  The kernel advances the
- * child's RIP past the faulting instruction and returns it to user
- * mode -- the child runs its post-UD2 epilogue, which sends back
- * the agreed RESUME_SURVIVE_TAG message confirming it actually
- * resumed.  Validates the reply path end-to-end.
+ * Reply protocol.  `excchild_resume' sets EXC_FLAG_RESUMABLE on its
+ * BAD_INSTRUCTION slot and executes UD2.  We reply on the fault's
+ * msgh_local with EXC_VERDICT_RESUME and rip_advance=2 (the length of
+ * UD2); the kernel resumes the child past it, and the child sends
+ * RESUME_SURVIVE_TAG to prove it ran on.
  */
 #define	RESUME_SURVIVE_TAG	0xC0DEBA5Eu
 
@@ -971,9 +926,8 @@ demo_exception_resume(void)
 	}
 
 	/*
-	 * Verdict: skip the 2-byte UD2 and resume.  msgh_remote =
-	 * the SEND name the kernel just minted in our space for the
-	 * reply port; MOVE_SEND consumes it (one-shot reply).
+	 * msgh_remote is the send name the kernel minted in our space for
+	 * the reply port; MOVE_SEND consumes it (one-shot reply).
 	 */
 	verdict.hdr.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND, 0);
 	verdict.hdr.msgh_size    = sizeof(verdict);
@@ -991,9 +945,8 @@ demo_exception_resume(void)
 	}
 
 	/*
-	 * Child's post-UD2 epilogue runs and sends the survival tag.
-	 * If the kernel hadn't honored RESUME, the child would be
-	 * KILL'd instead and this recv would time out.
+	 * The child sends the survival tag after UD2.  Without RESUME it
+	 * would be killed and this receive would time out.
 	 */
 	rv = mach_msg_recv_timed(watch, &survive, sizeof(survive), 2000);
 	if (rv != MACH_MSG_OK) {
@@ -1017,15 +970,10 @@ demo_exception_resume(void)
 }
 
 /*
- * Thread-level exception ports + precedence.  `excchild_thr' installs
- * the parent-injected port at BOTH task-level BAD_INSTRUCTION and
- * thread-level BAD_INSTRUCTION, then UD2's.  The kernel checks the
- * thread-level slot first; if precedence is correct, only one
- * MACH_EXC_FAULT message lands in the watcher (because the
- * task-level path is short-circuited on a hit).  We confirm by
- * recv'ing the first message, then recv_timed with a 200 ms budget
- * for a second message -- it MUST time out, proving the task-level
- * slot was bypassed.
+ * Thread-level exception ports take precedence.  `excchild_thr' installs
+ * our port at both the task- and thread-level BAD_INSTRUCTION slots and
+ * executes UD2.  The thread-level hit short-circuits the task level, so
+ * after the first MACH_EXC_FAULT a 200 ms receive must time out.
  */
 static int
 demo_exception_thread_level(void)
@@ -1062,12 +1010,7 @@ demo_exception_thread_level(void)
 		return (82);
 	}
 
-	/*
-	 * Precedence assertion: only the thread-level slot fired.  Try
-	 * to recv a second message with a short timeout -- if the
-	 * task-level slot had ALSO fired we'd find a second copy in
-	 * the queue.  MACH_E_TIMEOUT confirms the queue is empty.
-	 */
+	/* A second copy would mean the task-level slot fired too. */
 	rv = mach_msg_recv_timed(watch, &extra, sizeof(extra), 200);
 	if (rv != MACH_E_TIMEOUT) {
 		printf("  precedence violated: second recv rv=%d "
@@ -1084,14 +1027,9 @@ demo_exception_thread_level(void)
 }
 
 /*
- * Per-type exception ports.  Spawn the dedicated `excchild_ud' which
- * installs the parent-injected port at EXC_MASK_BAD_INSTRUCTION only
- * (not BAD_ACCESS) and then executes UD2 to trigger #UD.  The
- * kernel's exc_type_from_trapno routes trapno 6 to BAD_INSTRUCTION;
- * the child's slot for that type is populated; user_fault_die posts
- * MACH_EXC_FAULT there before retiring the thread.  Verifies the
- * trapno arrives as 6 (not the 14 the BAD_ACCESS bucket would deliver)
- * and that the child's task_id matches the spawn return.
+ * Per-type exception ports.  `excchild_ud' installs our port for
+ * EXC_MASK_BAD_INSTRUCTION only and executes UD2; exc_type_from_trapno
+ * routes trapno 6 there.  Check trapno 6 and the child's task id.
  */
 static int
 demo_exception_per_type(void)
@@ -1153,12 +1091,9 @@ demo_exception_per_type(void)
 }
 
 /*
- * Message-header strictness.  msgh_voucher is reserved (must be zero)
- * and msgh_bits has 14 reserved bits between the two disposition lanes
- * and the COMPLEX flag at bit 31; both are rejected by mach_msg_send
- * with MACH_E_INVAL.  This demo verifies the kernel surfaces both
- * failures and then completes a clean send to prove the validator
- * does not over-reject sane headers.
+ * Header strictness: a nonzero msgh_voucher and a reserved msgh_bits bit
+ * (the 15 bits between the disposition lanes and COMPLEX at bit 31) are
+ * each refused with MACH_E_INVAL, and a clean header still goes through.
  */
 static int
 demo_msg_strictness(void)
@@ -1222,24 +1157,14 @@ demo_msg_strictness(void)
 	return (0);
 }
 
-/*
- * Bootstrap publish round-trip.  Allocate a service port (RECV+SEND),
- * register it under a user-chosen name, look the name back up from our
- * own task -- kernel hands us a fresh SEND that names the same port --
- * fire a tagged message at the looked-up name, recv on the original
- * RECV-bearing name, verify the tag.  Then deregister and confirm the
- * lookup now fails.  Validates BOOTSTRAP_OP_REGISTER + DEREGISTER
- * end-to-end: ring-3 service publish is the unlock that lets userspace
- * act as a peer of the kernel-resident services in mach/services.c.
- */
+/* Name and tag for demo_bootstrap_publish. */
 #define	PUB_DEMO_NAME	"hello.demo"
 #define	PUB_DEMO_TAG	0xFEEDFACEu
 
 /*
- * demo_launchctl_spawn: spawn the `launchctl` demo which scripts a
- * full load / poke / unload cycle against the in-kernel launchd
- * analog.  Yields generously since the child does several IPC RPCs
- * + a child-of-a-child spawn (echod).
+ * demo_launchctl_spawn: spawn the scripted `launchctl' demo against the
+ * in-kernel launchd.  Many turns: it does several RPCs and spawns
+ * grandchildren (echod and others).
  */
 static int
 demo_launchctl_spawn(void)
@@ -1260,12 +1185,9 @@ demo_launchctl_spawn(void)
 }
 
 /*
- * demo_selfkill_spawn: spawn the `selfkill` program which exercises
- * SYS_TASK_KILL on its OWN task-self port (the trivial-capability
- * case -- every task has SEND on MACH_PORT_TASK_SELF).  The
- * syscall-exit kill check (detection point #5) should retire the
- * child before its sysretq, so the BUG line in selfkill.c never
- * appears in the boot transcript.
+ * demo_selfkill_spawn: `selfkill' kills itself through
+ * MACH_PORT_TASK_SELF.  Detection point #5 (syscall exit) retires it
+ * before sysretq, so its BUG line never appears.
  */
 static int
 demo_selfkill_spawn(void)
@@ -1291,12 +1213,9 @@ demo_selfkill_spawn(void)
 }
 
 /*
- * demo_parent_managed_kill: end-to-end test of the v3 capability
- * path -- spawn_returns_taskport hands the parent BOTH task_id AND a
- * SEND right on the child's task-self port in one syscall, so the
- * parent never has to talk to bootstrap to acquire the kill
- * capability.  Mirrors the sh.c child-table pattern: every spawn
- * gives us the handle, so task_kill is one call away.
+ * demo_parent_managed_kill: spawn_returns_taskport gives the parent the
+ * task id and a send right on the child's task port in one syscall, so
+ * killing needs no bootstrap lookup (sh.c's child table works this way).
  */
 static int
 demo_parent_managed_kill(void)
@@ -1324,10 +1243,8 @@ demo_parent_managed_kill(void)
 	    child_id, (unsigned)taskport);
 
 	/*
-	 * Give loopchild a few yields to start running its compute
-	 * loop -- without that the kill races against bootstrap-register
-	 * setup and the child dies before reaching the loop body.  Not a
-	 * correctness issue but a cleaner narrative in the boot log.
+	 * Let loopchild reach its loop first; killing it earlier is
+	 * correct but makes a muddled boot log.
 	 */
 	for (i = 0; i < 16; i++)
 		(void)poll_turn();
@@ -1351,13 +1268,10 @@ demo_parent_managed_kill(void)
 }
 
 /*
- * demo_compute_kill_spawn: end-to-end demo of detection point #4
- * (IRQ-return-to-user).  loopchild publishes its own task-self port
- * under bootstrap, then enters a syscall-free spin.  Parent looks the
- * port up + calls task_kill; without the IRQ-return check the child
- * would loop forever (no syscall boundary to catch the flag).  PIT
- * IRQs hit roughly every 10 ms; the child should retire within a
- * handful of parent yields.
+ * demo_compute_kill_spawn: detection point #4 (interrupt return to ring
+ * 3).  loopchild publishes its task port under bootstrap and spins with
+ * no syscalls; we look it up and task_kill it.  Only the IRQ-return
+ * check can catch it, at the next timer tick.
  */
 static int
 demo_compute_kill_spawn(void)
@@ -1376,19 +1290,10 @@ demo_compute_kill_spawn(void)
 	}
 
 	/*
-	 * Wait for loopchild to register its task-self under bootstrap.
-	 * Polling on bootstrap_lookup is cheap (a single RPC); a handful
-	 * of turns lets the child reach the register-then-enter-loop
-	 * point.
-	 *
-	 * ⚠ TURNS, NOT YIELDS, and this loop is the one that found out why.
-	 * On one processor a yield handed the CPU to the child, so sixty-four
-	 * of them were sixty-four chances for it to get somewhere.  On four,
-	 * the child is already running elsewhere, this CPU's runqueue is empty,
-	 * and sixty-four yields are spent in microseconds -- so this printed
-	 * "lookup failed after 64 yields" on the first boot that had other
-	 * processors in the scheduler.  poll_turn waits when the yield had
-	 * nobody to yield to; see lib/style9_sys.c.
+	 * Wait for loopchild to register.  The budget is in turns, not
+	 * yields: with several CPUs a yield may find nothing to run and
+	 * return at once, while poll_turn always waits about a tick (see
+	 * lib/style9_sys.c).
 	 */
 	tport = MACH_PORT_NULL;
 	for (i = 0; i < 64 && tport == MACH_PORT_NULL; i++) {
@@ -1405,11 +1310,7 @@ demo_compute_kill_spawn(void)
 	rv = task_kill(tport);
 	printf("  task_kill(loopchild) -> %d\n", rv);
 
-	/*
-	 * loopchild has no syscall window the kill could fire on, so
-	 * termination is contingent on the IRQ-return detection point
-	 * triggering at the next PIT tick.  Bounded probe budget.
-	 */
+	/* Only the IRQ-return check can retire it; bounded wait. */
 	alive = 1;
 	for (i = 0; i < 128 && alive; i++) {
 		(void)poll_turn();
@@ -1423,11 +1324,7 @@ demo_compute_kill_spawn(void)
 	return (0);
 }
 
-/*
- * demo_vmmap_spawn: spawn the `vmmap` tool and let it print.  Same
- * shape as demo_lsmp_spawn: bounded-yield wait so the child has time
- * to dump its table before the parent moves on.
- */
+/* demo_vmmap_spawn: spawn `vmmap' and give it time to print. */
 static int
 demo_vmmap_spawn(void)
 {
@@ -1447,10 +1344,8 @@ demo_vmmap_spawn(void)
 }
 
 /*
- * demo_lsmp_spawn: spawn the `lsmp` tool and wait for it to exit.
- * lsmp seeds a varied port_space (RECV+SEND, SEND-only, port_set,
- * exception port) and then dumps its own snapshot via
- * SYS_TASK_GET_PORT_SNAPSHOT.  Boot log captures the table verbatim.
+ * demo_lsmp_spawn: spawn `lsmp', which builds a varied port space and
+ * prints its own snapshot into the boot log.
  */
 static int
 demo_lsmp_spawn(void)
@@ -1467,15 +1362,9 @@ demo_lsmp_spawn(void)
 	(void)child_id;
 
 	/*
-	 * Yield a handful of times to let the child run before we
-	 * return: lsmp does no IPC with us so we cannot block on a
-	 * port, and yield-spinning on task_alive would starve the
-	 * idle thread (only the idle-loop reaps zombie threads -- the
-	 * task stays in task_list until its last thread is reaped).
-	 * 64 yields is far more than lsmp needs to print its table
-	 * and exit; if it has not finished by then the remaining
-	 * output simply interleaves with the rest of the boot log,
-	 * which is harmless.
+	 * lsmp sends us nothing to block on, so wait a fixed number of
+	 * turns, far more than it needs.  Output still in flight after
+	 * that just interleaves with the boot log.
 	 */
 	for (i = 0; i < 64; i++)
 		(void)poll_turn();
@@ -1483,12 +1372,8 @@ demo_lsmp_spawn(void)
 }
 
 /*
- * demo_top_spawn: spawn the `top` tool and let it run its samples.
- * top RPCs the "tasks" service a few times with a yield gap between,
- * printing the per-task thread/port/region columns the service grew
- * for it.  We bounded-yield generously (160x) so all samples land in
- * the boot log before main() moves on; top does no IPC with us, so as
- * with lsmp/vmmap we cannot block on a port and just yield instead.
+ * demo_top_spawn: spawn `top' and wait enough turns for all its samples
+ * to reach the boot log; as with lsmp there is nothing to block on.
  */
 static int
 demo_top_spawn(void)
@@ -1509,23 +1394,16 @@ demo_top_spawn(void)
 }
 
 /*
- * demo_stale_taskport: regression guard for the task-self port UAF.
+ * demo_stale_taskport: a task port can outlive its task, since any
+ * outside send right (here the one spawn_returns_taskport gives us)
+ * keeps the port past task_deref's free.  Neither space_lookup nor the
+ * special-port intercept checks p_dead, so the port stores the task's
+ * id, not a pointer, and the kernel resolves it with task_lookup_ref.
  *
- * A task-self port can outlive its task -- any external SEND right (here
- * the taskport spawn_returns_taskport hands us) keeps the port object
- * alive past the task's kfree in task_deref.  port_release_task_self
- * marks the port p_dead, but neither space_lookup nor the special-port
- * intercept gates on p_dead, so before the fix both SYS_TASK_KILL and a
- * GET_INFO send reached straight through to a dangling struct task *.
- * The port now stores the task's immutable id, resolved by the kernel
- * with task_lookup_ref, so a stale port fails safe instead.
- *
- * We spawn loopchild (a syscall-free spinner), confirm a cross-task
- * GET_INFO RPC to its taskport works while it is alive, kill it via that
- * same capability, yield-spin until it leaves the live list (struct task
- * freed), then poke the now-stale taskport: the GET_INFO RPC must come
- * back MACH_E_DEAD and task_kill must no-op -- neither may touch freed
- * memory.  Pre-fix this dereferenced a dangling pointer and faulted.
+ * Spawn loopchild, check a GET_INFO RPC to its task port works, kill it
+ * through that port, wait until it leaves the live list, then use the
+ * stale port: GET_INFO must return MACH_E_DEAD and task_kill must do
+ * nothing, neither touching freed memory.
  */
 static int
 demo_stale_taskport(void)
@@ -1552,7 +1430,7 @@ demo_stale_taskport(void)
 	printf("  spawned loopchild id=%ld taskport=0x%x\n",
 	    child_id, (unsigned)tport);
 
-	/* Positive control: cross-task GET_INFO on a LIVE task-self port. */
+	/* Positive control: cross-task GET_INFO on a live task port. */
 	tx.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
 	tx.msgh_size    = sizeof(tx);
 	tx.msgh_remote  = tport;
@@ -1593,9 +1471,9 @@ demo_stale_taskport(void)
 	    (unsigned)tport);
 
 	/*
-	 * Payoff #1: GET_INFO RPC to the stale taskport.  p_special_arg
-	 * holds the dead child's id; task_lookup_ref returns NULL and the
-	 * intercept answers MACH_E_DEAD.  Pre-fix: dereferenced freed mem.
+	 * GET_INFO on the stale port: p_special_arg holds the dead child's
+	 * id, task_lookup_ref returns NULL, the intercept answers
+	 * MACH_E_DEAD.
 	 */
 	tx.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
 	tx.msgh_size    = sizeof(tx);
@@ -1613,9 +1491,8 @@ demo_stale_taskport(void)
 	printf("  stale taskport GET_INFO correctly refused: MACH_E_DEAD\n");
 
 	/*
-	 * Payoff #2: task_kill on the stale name.  space_lookup hands back
-	 * the dead port, sys_task_kill reads the (dead) id, and
-	 * task_request_terminate no-ops -- a clean return, no deref.
+	 * task_kill on the stale name: sys_task_kill reads the dead id and
+	 * task_request_terminate finds no task.
 	 */
 	rv = task_kill(tport);
 	if (rv == MACH_MSG_OK)
@@ -1628,12 +1505,9 @@ demo_stale_taskport(void)
 }
 
 /*
- * demo_spawn_argv: exercise SYS_SPAWN_ARGS end to end.  Spawn argecho
- * with a known argument vector; argecho echoes argc + each argv[i] to
- * the console (the strings appear in the boot transcript), proving the
- * kernel stack-builder + crt0 forward the command line into
- * main(argc, argv).  We hold the taskport spawn_args hands back and
- * wait for the child to retire before returning.
+ * demo_spawn_argv: SYS_SPAWN_ARGS.  argecho prints the vector it got,
+ * so the boot transcript shows the kernel's stack builder and crt0
+ * delivering it to main(argc, argv).
  */
 static int
 demo_spawn_argv(void)
@@ -1669,15 +1543,11 @@ demo_spawn_argv(void)
 }
 
 /*
- * demo_macho_spawn: exercise the Mach-O container loader (kern/macho.c).
- * machotest is an ordinary style9 program delivered as a Mach-O instead
- * of an ELF; the spawn launcher sniffs the image magic and routes it to
- * macho_load.  We spawn the thin x86-64 slice WITH a command line -- which
- * also confirms the SysV initial-stack frame reaches main(argc, argv)
- * regardless of container format -- then the single-slice fat/universal
- * archive, which drives macho_load's slice picker.  Both programs print a
- * banner the boot transcript captures; we bounded-yield between them so
- * the two outputs do not interleave.
+ * demo_macho_spawn: the Mach-O container loader (kern/macho.c).
+ * machotest is a style9 program wrapped as a Mach-O.  The thin image is
+ * spawned with arguments, showing main(argc, argv) works whatever the
+ * container; then the one-slice fat archive drives macho_load's slice
+ * picker.  Each is waited out so the outputs do not interleave.
  */
 static int
 demo_macho_spawn(void)
@@ -1716,19 +1586,13 @@ demo_macho_spawn(void)
 }
 
 /*
- * demo_darwin_spawn: exercise the Darwin syscall personality (S2,
- * kern/darwin.c).  darwinhello is NOT a style9 program -- it is a
- * freestanding stub that issues genuine Apple class-encoded syscalls
- * (write, getpid, task_self_trap, mach_reply_port, exit, plus a deliberate
- * unimplemented call to prove the carry/errno convention).  It ships as a
- * Mach-O carrying an LC_BUILD_VERSION naming PLATFORM_MACOS, so the loader
- * tags its task TASK_PERSONALITY_DARWIN and syscall_dispatch routes it
- * through darwin_dispatch.  Then darwinmsg (S3) does a real mach_msg()
- * round-trip on its own port through the same personality.  Then dyldhello
- * (S4) is a real clang/ld64 dynamic Mach-O, entered through our clean-room
- * dyld, which binds it against our libSystem.  Each program's
- * banner + the kernel's per-call trace appear in the boot transcript; we
- * bounded-yield until each retires.
+ * demo_darwin_spawn: the Darwin personality (kern/darwin.c), in order:
+ * darwinhello (raw class-encoded syscalls and the carry/errno
+ * convention), darwinmsg (a mach_msg round trip), dyldhello and dyldbig
+ * (dynamic Mach-Os through our dyld and libSystem), our own ABI probes,
+ * the host and task ports, then real Apple binaries: figlet, tree, the
+ * coreutils, gmake and dash.  Each child is waited on with a bounded
+ * number of turns; output goes to the boot transcript.
  */
 static int
 demo_darwin_spawn(void)
@@ -1776,11 +1640,8 @@ demo_darwin_spawn(void)
 	    "after %d turns\n", i);
 
 	/*
-	 * dirlist: a self-authored Darwin-ABI probe that walks the FAT volume
-	 * through our libSystem's opendir/readdir/stat (the $INODE64 imports a
-	 * real binary uses).  It de-risks the directory-enumeration syscalls --
-	 * proving the export naming and struct-dirent round-trip -- before a
-	 * genuine directory-walking binary (tree) depends on them.
+	 * dirlist: our probe walking the volume through libSystem's
+	 * $INODE64 opendir/readdir/stat, ahead of tree(1).
 	 */
 	child_id = spawn("dirlist");
 	if (child_id < 0) {
@@ -1793,12 +1654,8 @@ demo_darwin_spawn(void)
 	    "turns\n", i);
 
 	/*
-	 * The host port: the kernel object behind mach_host_self().  A pure
-	 * native exercise of the freshly-built Mach service -- look the port
-	 * up, RPC its page-size + machine-info opcodes, and print what the
-	 * kernel reports.  Drives the full IPC round-trip (bootstrap lookup
-	 * -> SEND right -> mach_msg_rpc -> synchronous dispatch -> reply)
-	 * against a brand-new PORT_SPECIAL_SERVICE port.
+	 * The host port behind mach_host_self(): RPC its page-size and
+	 * machine-info opcodes and print the answers.
 	 */
 	{
 		struct svc_host_info_reply	info;
@@ -1835,12 +1692,9 @@ demo_darwin_spawn(void)
 	}
 
 	/*
-	 * The task port (mach_task_self()): exercise the freshly-grown
-	 * resource-control surface on our OWN task port -- vm_allocate a
-	 * range as a Mach RPC (the way a Darwin binary reaches
-	 * mach_vm_allocate), prove it is real the same way demo_vm_allocate
-	 * proves the direct syscall (zero-filled + writable), then
-	 * vm_deallocate it back through the port.
+	 * VM through our own task port: allocate as a Mach RPC (as a Darwin
+	 * binary's mach_vm_allocate does), check it as demo_vm_allocate
+	 * does, and deallocate through the port.
 	 */
 	{
 		uint64_t	addr;
@@ -1891,11 +1745,9 @@ demo_darwin_spawn(void)
 	}
 
 	/*
-	 * task_get_special_port: ask our task port to hand back the HOST
-	 * port (a port riding in a descriptor, the way task_get_special_port
-	 * works on real Mach), then PROVE the handed-back port is live by
-	 * RPC'ing host_page_size on it; also confirm the BOOTSTRAP index
-	 * resolves.  Exercises the task port's COMPLEX port-carrying reply.
+	 * task_get_special_port: the host port comes back in a port
+	 * descriptor of a complex reply, as on Mach, and must answer
+	 * host_page_size; the bootstrap index must resolve too.
 	 */
 	{
 		mach_port_name_t	bs;
@@ -1933,12 +1785,9 @@ demo_darwin_spawn(void)
 	}
 
 	/*
-	 * The north star: a REAL Apple x86-64 macOS CLI binary (figlet, a
-	 * Homebrew bottle).  Not one of our builds -- a genuine Apple-toolchain
-	 * dynamic Mach-O, relocated low by macho_load, bound by our clean-room
-	 * dyld against our clean-room libSystem (43 imported symbols), running
-	 * its own LC_MAIN.  Spawned with an argument vector so it parses options
-	 * via our getopt and emits through our stdio.
+	 * figlet, a Homebrew bottle: a genuine Apple-toolchain dynamic
+	 * Mach-O, relocated low by macho_load and bound by our dyld against
+	 * our libSystem.  Its argument goes through our getopt and stdio.
 	 */
 	{
 		mach_port_name_t	figlet_tp;
@@ -1961,10 +1810,8 @@ demo_darwin_spawn(void)
 	}
 
 	/*
-	 * A SECOND real Apple binary: tree(1) (Homebrew bottle).  It descends
-	 * the FAT hierarchy through our libSystem's opendir/readdir/lstat/stat
-	 * plus the ~30 libc symbols added for it, and prints the directory tree.
-	 * Spawned with "/" so it walks the whole disk.
+	 * tree(1) (Homebrew): walks the whole volume from "/" through
+	 * libSystem's opendir/readdir/lstat/stat.
 	 */
 	{
 		mach_port_name_t	tree_tp;
@@ -1987,18 +1834,11 @@ demo_darwin_spawn(void)
 	}
 
 	/*
-	 * An EIGHTH real Apple binary: gcat (GNU coreutils' cat), placed here
-	 * because it finishes what figlet and tree started.  They read metadata
-	 * and one font; this reads a file's BYTES and puts them on the console,
-	 * so the whole chain -- extents off the disk, through the kernel, out of
-	 * an unmodified Apple binary -- is visible in one line of output.
-	 *
-	 * Both paths are passed on purpose: /etc/hello.txt exists on the APFS
-	 * image and /docs/readme.txt on the FAT one, so whichever disk is
-	 * attached, cat prints one file and reports the other missing.  That
-	 * second half is not noise -- it is cat reading our errno and choosing
-	 * its own message, which is the same interface the first half depends
-	 * on working silently.
+	 * gcat (coreutils cat): a file's bytes from the disk, out of an
+	 * unmodified Apple binary.  /etc/hello.txt is on the APFS image and
+	 * /docs/readme.txt on the FAT one, so whichever is attached, cat
+	 * prints one and reports the other missing -- its own message,
+	 * chosen from our errno.
 	 */
 	{
 		mach_port_name_t	gcat_tp;
@@ -2022,17 +1862,10 @@ demo_darwin_spawn(void)
 	}
 
 	/*
-	 * A NINTH real Apple binary: gls (GNU coreutils' ls), in the long
-	 * form, because the short form would prove only that we can list
-	 * names -- which tree(1) already did.  `-l` is the whole point: every
-	 * column but the name comes out of the inode, so a plausible line
-	 * here means the mode word, the link count, the owner, the size and
-	 * the date all survived the trip from the on-disk record through two
-	 * translation layers into a binary built for a different kernel.
-	 *
-	 * Two directories on purpose.  /bin has no volume behind it at all --
-	 * those files are inside the kernel image -- so it exercises the
-	 * synthetic side, while / is whatever the attached disk really says.
+	 * gls -l (coreutils ls): every column but the name comes from the
+	 * inode, so a plausible line means mode, link count, owner, size
+	 * and date survived from the on-disk record.  /bin is synthetic
+	 * (files in the kernel image); / is the attached disk.
 	 */
 	{
 		mach_port_name_t	gls_tp;
@@ -2057,10 +1890,8 @@ demo_darwin_spawn(void)
 	}
 
 	/*
-	 * The wall clock, from ring 3.  Uptime has been available since the
-	 * PIT came up, but the calendar needs a chip that was running before
-	 * we were; this probe is where that distinction gets tested rather
-	 * than assumed -- plausible date, advances, never runs backwards.
+	 * The wall clock from ring 3: plausible date, advances, never runs
+	 * backwards.
 	 */
 	{
 		mach_port_name_t	tprobe_tp;
@@ -2080,11 +1911,9 @@ demo_darwin_spawn(void)
 	}
 
 	/*
-	 * Demand paging, from ring 3.  Everything above this line got its
-	 * memory the moment it asked for it; mmap hands back an address and
-	 * nothing else, and the pages appear one fault at a time.  The probe
-	 * maps more than the machine has, makes the KERNEL be the first writer
-	 * of an untouched page, and holds a file mapping up against read(2).
+	 * Demand paging from ring 3: map more than the machine has, let the
+	 * kernel be first to write a page, compare a file mapping with
+	 * read(2).
 	 */
 	{
 		mach_port_name_t	mprobe_tp;
@@ -2103,14 +1932,7 @@ demo_darwin_spawn(void)
 		printf("  mmaptest retired after %d turns\n", i);
 	}
 
-	/*
-	 * filewrite: the probe for the rung where ring 3 can CHANGE the disk.
-	 * Everything under it -- an APFS writer that makes, grows, shortens and
-	 * removes files, and an outside checker that accepts what it leaves --
-	 * has been provable for a while and was reachable only from the
-	 * kernel's own self-tests, because open(2) answered EROFS to every
-	 * write mode.  This is the first program that puts bytes on the volume.
-	 */
+	/* filewrite: ring 3 creating, changing and removing files. */
 	{
 		mach_port_name_t	wprobe_tp;
 
@@ -2129,16 +1951,10 @@ demo_darwin_spawn(void)
 	}
 
 	/*
-	 * ttyprobe: the probe for the rung where the terminal can be TOLD
-	 * something.  The one keystroke fed here is the whole reason this is
-	 * driven from a program rather than run on its own: it is ONE BYTE
-	 * WITH NO NEWLINE, which a canonical terminal is obliged to hold in
-	 * its line buffer forever.  The probe reads it, and that read is the
-	 * proof from ring 3 that the discipline stopped being line-based.
-	 *
-	 * The feed goes in BEFORE the spawn because a session ending takes its
-	 * script with it, and the probe's own session is the one that must
-	 * find this.
+	 * ttyprobe: terminal control.  We feed it one byte with no newline,
+	 * which a canonical terminal would hold forever; reading it proves
+	 * raw mode.  The feed goes in before the spawn: a session's feed
+	 * ends with the session, and the probe's own session must find it.
 	 */
 	{
 		mach_port_name_t	tprobe_tp;
@@ -2159,12 +1975,9 @@ demo_darwin_spawn(void)
 	}
 
 	/*
-	 * gstty, the TENTH real Apple binary, and the oracle for the rung the
-	 * probe above just de-risked.  `stty -a` reads the entire termios and
-	 * prints every flag in the words a Mac prints them in; `stty -echo`
-	 * then CHANGES our terminal and `stty sane` puts it back, so genuine
-	 * Apple code drives both directions of tcsetattr.  Nothing was written
-	 * to make this work -- it is the same binary Homebrew ships.
+	 * gstty, the oracle for ttyprobe: `stty -a' prints every termios
+	 * flag as a Mac would, `stty -echo' changes our terminal and `stty
+	 * sane' restores it, so Apple code drives tcsetattr both ways.
 	 */
 	{
 		mach_port_name_t	 stty_tp;
@@ -2213,14 +2026,8 @@ demo_darwin_spawn(void)
 	}
 
 	/*
-	 * gmkdir and grmdir, the ELEVENTH and TWELFTH real Apple binaries, and
-	 * the pair that makes a directory usable BY HAND rather than only by
-	 * our own self-tests.
-	 *
-	 * The order is the whole demonstration: mkdir -m 700 asks for a mode
-	 * and gls is asked what arrived, which is the check that the umask is
-	 * subtracted and the bits are written rather than stamped.  Then rmdir
-	 * takes it away.  Every one of these is unmodified Homebrew code.
+	 * gmkdir and grmdir: `mkdir -m 700', then gls -ld shows the mode
+	 * that arrived (umask applied, bits written), then rmdir.
 	 */
 	{
 		mach_port_name_t	 dir_tp;
@@ -2270,13 +2077,10 @@ demo_darwin_spawn(void)
 	}
 
 	/*
-	 * gmake, the THIRTEENTH real Apple binary, and the first whose job
-	 * is running the others.  makedemo.sh (user/makedemo.sh) writes a
-	 * small project onto the volume and drives make through it: a build
-	 * that has work, a rebuild that must find none, a parallel build
-	 * over a jobserver pipe (the readiness wait this rung is about), and
-	 * a recipe that fails.  The script prints its own PASS/FAIL lines;
-	 * this side only starts it and waits.
+	 * gmake, via user/makedemo.sh: writes a small project and drives
+	 * make through a build, a rebuild that finds nothing to do, a
+	 * parallel build over a jobserver pipe (select/pselect) and a
+	 * failing recipe.  The script prints its own PASS/FAIL lines.
 	 */
 	{
 		mach_port_name_t	 mk_tp;
@@ -2300,12 +2104,8 @@ demo_darwin_spawn(void)
 	}
 
 	/*
-	 * A THIRD real Apple binary: guname (GNU coreutils' uname).  The
-	 * machine-identity trick -- it asks uname(2) what it is running on and
-	 * prints the answer, never validating it.  Our kernel hands back a
-	 * fabricated Darwin identity card, so this genuine Apple binary reports
-	 * "Darwin style9 23.6.0 ... x86_64" and cannot tell it is not on a Mac.
-	 * Spawned with "-a" for the full identity line.
+	 * guname -a (coreutils uname): prints the Darwin identity uname(2)
+	 * returns, "Darwin style9 23.6.0 ... x86_64".
 	 */
 	{
 		mach_port_name_t	guname_tp;
@@ -2328,15 +2128,11 @@ demo_darwin_spawn(void)
 	}
 
 	/*
-	 * A FOURTH real Apple binary: gfactor (GNU coreutils' factor) -- and the
-	 * first to need a SECOND dependency.  Its bind table mixes libgmp's
-	 * __gmpz_ and __gmpn_ symbols with libSystem's libc, so our dyld maps the
-	 * whole closure (gfactor -> libgmp -> libSystem) and resolves each import
-	 * against the dylib its lib_ordinal names -- the multi-dylib capability.
-	 * Run twice: a 12-digit value factored by factor's own word arithmetic
-	 * (proving the binds resolved and it runs), then 2^128, which is past the
-	 * built-in width and forces the computation INTO libgmp -- a real
-	 * cross-dylib call path exercised on the Penryn baseline.
+	 * gfactor (coreutils factor) binds libgmp's __gmpz_/__gmpn_ symbols
+	 * and libSystem's libc, so dyld maps gfactor -> libgmp -> libSystem
+	 * and resolves each import by its lib_ordinal.  Two values use
+	 * factor's own word arithmetic; 2^128 is past its width and runs
+	 * inside libgmp.
 	 */
 	{
 		const char		*gtests[3];
@@ -2369,12 +2165,9 @@ demo_darwin_spawn(void)
 	}
 
 	/*
-	 * The multi-process rung: Darwin tasks creating, replacing, and
-	 * reaping other Darwin tasks.  pipefork is our own Darwin-ABI probe
-	 * (fork + execve + wait4 + a kernel pipe carrying a real Apple
-	 * binary's stdout across a task boundary); genv and gtimeout are
-	 * REAL Apple binaries -- env exec(2)s gfactor in place, timeout
-	 * fork(2)s it, wait4(2)s it, and would kill(2) it on expiry.
+	 * Darwin tasks creating, replacing and reaping others: pipefork (our
+	 * probe), then genv, which exec(2)s gfactor in place, and gtimeout,
+	 * which fork(2)s and wait4(2)s it and would kill(2) it on expiry.
 	 */
 	{
 		mach_port_name_t	 proc_tp;
@@ -2430,13 +2223,11 @@ demo_darwin_spawn(void)
 	}
 
 	/*
-	 * The shell rung: dash, a REAL Apple POSIX shell, orchestrating
-	 * real Apple binaries.  Three escalating scenes: a builtin (pure
-	 * parser/evaluator), a pipeline (dash forks both sides, a kernel
-	 * pipe carries a builtin's output into gfactor's stdin), and a
-	 * script file (dash stat64s PATH candidates against the synthetic
-	 * /bin, open(2)s the script, saves the fd with fcntl(F_DUPFD),
-	 * and runs a command substitution).
+	 * dash, a real Apple POSIX shell: a builtin; a pipeline (dash forks
+	 * both sides, a kernel pipe feeds gfactor); a redirect to disk; a
+	 * script file (PATH lookups against the synthetic /bin, open(2),
+	 * fcntl(F_DUPFD), a command substitution); and an interactive
+	 * session over a console feed.
 	 */
 	{
 		mach_port_name_t	 sh_tp;
@@ -2474,19 +2265,11 @@ demo_darwin_spawn(void)
 		printf("  dash[pipeline] retired after %d turns\n", i);
 
 		/*
-		 * REDIRECTION, which is a shell writing to the disk.
-		 *
-		 * `>` is not a shell feature the way `|` is: dash opens the
-		 * file with O_WRONLY|O_CREAT|O_TRUNC, dup2s it onto fd 1, and
-		 * then every builtin that prints is writing to the volume
-		 * without knowing it.  Nothing in dash was changed to make
-		 * this work -- what changed is that open(2) stopped answering
-		 * EROFS.  gcat, a genuine Apple binary, reads the result back,
-		 * so both ends of this line are Apple code.
-		 *
-		 * The file is LEFT BEHIND on purpose: the boot after this one
-		 * finds it in apfs-shell, which is the only proof that the
-		 * bytes reached the platter rather than a cache.
+		 * Redirection: dash opens the file O_WRONLY|O_CREAT|O_TRUNC
+		 * and dup2s it onto fd 1, so its builtins write to the volume;
+		 * gcat reads it back.  The file is left behind on purpose: the
+		 * next boot's apfs-shell check (fs/fs.c) finds it, proving the
+		 * bytes reached the disk and not a cache.
 		 */
 		printf("  >>> dash -c 'echo ... > /etc/notes.txt' -- a REAL "
 		    "Apple shell WRITING TO THE VOLUME <<<\n");
@@ -2548,6 +2331,13 @@ demo_darwin_spawn(void)
 	return (0);
 }
 
+/*
+ * Bootstrap publish: register a port under a name, look the name up (a
+ * fresh send name for the same port), send a tag through it and receive
+ * it on the original name; then deregister and check the lookup fails.
+ * Ring-3 publish is what lets a user task serve peers the way the
+ * kernel services in mach/services.c do.
+ */
 static int
 demo_bootstrap_publish(void)
 {
@@ -2635,10 +2425,8 @@ demo_bootstrap_publish(void)
 	}
 
 	/*
-	 * Lookup must now miss.  Caller's `cli` name still resolves
-	 * locally -- mach_port_deallocate just drops the SEND -- but a
-	 * fresh bootstrap_lookup against the gone registration returns
-	 * MACH_PORT_NULL.
+	 * A fresh lookup must miss now, though our `cli' name still holds
+	 * its send right.
 	 */
 	if (bootstrap_lookup(PUB_DEMO_NAME) != MACH_PORT_NULL) {
 		printf("  '%s' still resolves after deregister\n",
@@ -2655,10 +2443,9 @@ demo_bootstrap_publish(void)
 }
 
 /*
- * Child-of-spawn-with-port detection.  Probe the well-known
- * MACH_PORT_PARENT slot with a tagged send: success means the parent
- * pre-populated slot 3 with a SEND right (we're a child); MACH_E_RIGHT
- * means an empty slot (we're the original boot-time hello.elf).
+ * Are we a spawn_with_port child?  A tagged send to MACH_PORT_PARENT
+ * (slot 3) succeeds only if the parent put a send right there;
+ * MACH_E_RIGHT means we are the boot-time hello.elf.
  */
 static int
 hello_try_parent_ping(void)
@@ -2681,11 +2468,7 @@ main(void)
 {
 	int	rv;
 
-	/*
-	 * Child path: parent injected a SEND right at MACH_PORT_PARENT.
-	 * Send the agreed ping and exit; the original boot-time hello
-	 * (which has an empty slot 3 at startup) falls through.
-	 */
+	/* A child has sent its ping and is done. */
 	if (hello_try_parent_ping())
 		return (0);
 

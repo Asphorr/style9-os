@@ -18,82 +18,58 @@ struct thread;
  * Round-robin scheduler with timer-driven preemption.  Threads also
  * yield explicitly via thread_yield, or implicitly via thread_block
  * (e.g. mach_msg_recv_block on an empty port).  A timer interrupt debits
- * the current thread's PREEMPT_QUANTUM_TICKS slice and sets
- * preempt_need_resched on expiry; the reschedule fires either inline
- * at the end of intr_dispatch, or deferred until the next
- * preempt_enable that drops the count to zero.
+ * the current thread's PREEMPT_QUANTUM_TICKS slice and requests a
+ * reschedule on expiry, honoured at the end of intr_dispatch or at the
+ * next preempt_enable that drops the count to zero.
  *
- * WHICH timer is a machine question, not a scheduler one: this CPU's local
- * APIC where there is one, and the machine's single PIT where there is not.
- * The rate is the same either way, which is what lets the quantum below stay
- * a number of ticks.
+ * The timer is this CPU's local APIC where there is one, the PIT where
+ * there is not.  Both tick at the same rate, so the quantum stays a
+ * number of ticks.
  *
- * Lock order: anywhere that takes sched_lock, take it last.
+ * Lock order: sched_lock is taken after any other lock; only th_lock
+ * nests inside it.
  */
 
 void		sched_init(void);
 
 /*
- * Bring the CALLING processor into the scheduler: adopt the context it is
- * already running as its idle thread, so it has somewhere to switch away
- * from and somewhere to stand when the queue is empty.  For application
- * processors -- the boot processor gets both from sched_init, in the other
- * order, because the context it is running has work left to do.
+ * Bring the calling application processor into the scheduler: the context
+ * it is already running becomes its idle thread.  The boot CPU gets its
+ * idle thread from sched_init instead, since its own context is the boot
+ * thread.
  */
 void		sched_cpu_attach(void);
 
-/*
- * ...and then never come back.  Runs this CPU's idle thread, which reaps,
- * yields when there is work, and sleeps when there is not.
- */
+/* Then run this CPU's idle loop: reap, yield if there is work, else hlt. */
 void		sched_cpu_idle(void) __attribute__((noreturn));
 
 /*
- * Eight threads for a tenth of a second each, and a bit set by each one out
- * of its own CPU's block.  Proof that a thread queued anywhere can run
- * anywhere, which no bookkeeping on the queueing side could fake.
+ * Eight threads of 100 ms each, each setting the bit of the CPU it runs
+ * on: proof that a thread queued anywhere can run anywhere.
  */
 void		sched_smp_selftest(void);
 void		sched_enqueue(struct thread *);
 
 /*
- * thread_yield: put current at the tail of the runqueue and switch
- * to whoever's at the head.  If the runqueue is empty the idle thread
- * runs.  Returns when the caller is rescheduled.
+ * thread_yield: put current at the tail of the runqueue and switch to the
+ * head; with the queue empty, a non-idle caller switches to this CPU's
+ * idle thread.  Returns when the caller is rescheduled: true if it
+ * switched, false if there was nothing to switch to (which, given the
+ * idle fallback, only the idle thread sees).
  *
- * ⚠ RETURNS WHETHER IT ACTUALLY SWITCHED, and that answer is the whole
- * difference between a yield on one processor and a yield on four.
- *
- * A poll loop counted in yields -- "give somebody else a turn, then look
- * again" -- was a way of waiting, because a yield with work queued behind it
- * did not come back until that work had had the CPU.  With several
- * processors the work being waited for is usually RUNNING somewhere else
- * rather than queued here, so the yield finds an empty runqueue and returns
- * at once, and a budget of sixty-four turns is spent in microseconds.  That
- * is not a hypothetical: it is what broke the first four-processor boot of
- * this kernel, in userspace, sixty-four times faster than it used to.
- *
- * So a caller that is polling can tell the two apart.  True means somebody
- * else got the CPU and something may have changed; false means there was
- * nobody to give it to, and the caller should wait in TIME instead --
- * see poll_turn in lib/style9_sys.c, which is what every such loop calls now.
+ * A yield is not a way of waiting on SMP: what a poll loop waits for is
+ * usually running on another CPU, not queued behind the caller, so the
+ * yield comes back almost at once.  Poll with sched_nap_ms (poll_turn in
+ * lib/style9_sys.c from ring 3).
  */
 bool		thread_yield(void);
 
 /*
- * Give up the CPU for about `ms' of real time.
- *
- * ⚠ WHAT EVERY `while (not yet) thread_yield()' LOOP IN THIS KERNEL MUST USE
- * once more than one processor runs threads.  A yield is a way of waiting
- * only while the thing being waited for is queued BEHIND the waiter; with
- * several processors it is running beside it, the yield returns at once, and
- * the loop becomes a spin that takes the scheduler's global lock hundreds of
- * thousands of times a second with interrupts off -- which costs the CPU its
- * timer ticks, which stops the clock, which stops every deadline in the
- * system.  See sched_nap_ms in sched.c for the boot that did exactly that.
- *
- * Resolution is one timer tick: a request for one millisecond gets one tick,
- * because a tick is when deadlines are looked at.
+ * Give up the CPU for about `ms' of real time, to the resolution of a
+ * timer tick (deadlines are checked per tick).  Every `while (not yet)'
+ * poll loop in the kernel must use this rather than thread_yield: on SMP a
+ * yield loop spins through sched_lock with interrupts off often enough to
+ * miss timer ticks, which stalls the clock and every deadline with it.
  */
 void		sched_nap_ms(uint64_t ms);
 
@@ -101,7 +77,9 @@ void		sched_nap_ms(uint64_t ms);
  * thread_block: mark current BLOCKED, record reason and target, then
  * pick the next runnable thread.  The caller is expected to be
  * embedded inside a synchronisation primitive that will arrange for
- * thread_wake() to be called later.  Returns when woken.
+ * thread_wake() to be called later.  Returns when woken, possibly
+ * spuriously: callers re-test in a loop.  A thread whose task is killed
+ * retires here instead of returning, unless it holds a mutex.
  */
 void		thread_block(int reason, void *target);
 
@@ -118,11 +96,12 @@ void		thread_block_release(int reason, void *target,
 		    struct spinlock *external);
 
 /*
- * thread_wake: transition `th` from BLOCKED to READY and enqueue it AHEAD of
- * the queue, since a thread that blocked gave its slice up unused.  Also asks
- * for a reschedule, so the wake reaches the CPU at the next tick rather than
- * when whoever is running happens to stop.  Safe to call on a not-blocked
- * thread (no-op).
+ * thread_wake: transition `th` from BLOCKED to READY and enqueue it at the
+ * head of the queue, since a thread that blocked gave its slice up unused.
+ * Also asks for a reschedule, honoured at the next safe point rather than
+ * when whoever is running happens to stop.  On a READY or RUNNING thread
+ * it leaves th_wake_pending instead, so a thread about to park does not
+ * lose the wake; on any other state it does nothing.
  */
 void		thread_wake(struct thread *);
 
@@ -132,13 +111,11 @@ void		thread_wake(struct thread *);
  * woken since.  Returns how many there were.
  *
  * A channel is just an agreed address, conventionally a field of the object
- * being waited on: the pipe's byte count for readers waiting on data, its read
- * position for writers waiting on room.  Two waits on the same object want
- * different fields, so that they are separate channels is the point.
+ * being waited on: a pipe's byte count for readers waiting on data, its read
+ * position for writers waiting on room -- two waits, two channels.
  *
- * The waiter's half of the contract is the whole difficulty.  Test the
- * condition and park under one lock, and hand that lock to
- * thread_block_release rather than dropping it first:
+ * The waiter must test the condition and park under one lock, handing that
+ * lock to thread_block_release rather than dropping it first:
  *
  *	for (;;) {
  *		spin_lock(&obj->lock);
@@ -147,17 +124,16 @@ void		thread_wake(struct thread *);
  *		    &obj->lock);
  *	}
  *
- * Unlock-then-block is the lost wakeup: an event in the gap wakes nobody and
- * the sleeper is never woken again.  A wake is also only a hint -- re-test in
- * the loop, since the bytes may be gone by the time this thread runs.
+ * Unlock-then-block is the lost wakeup: an event in the gap wakes nobody.
+ * A wake is also only a hint -- re-test in the loop, since the bytes may be
+ * gone by the time this thread runs.
  */
 uint32_t	sched_wakeup(void *chan);
 
 /*
- * sched_wake_sleepers_of: wake every thread of `task` that is asleep on a
- * channel, leaving anything blocked on a port alone.  What makes a posted
- * signal reach a thread that is already inside a blocking syscall.  See the
- * definition for why the distinction is not optional.
+ * sched_wake_sleepers_of: wake every thread of `task` asleep on a channel,
+ * leaving threads blocked on a port alone; returns how many.  This is how
+ * a posted signal reaches a thread already inside a blocking syscall.
  */
 struct task;
 uint32_t	sched_wake_sleepers_of(struct task *task);
@@ -165,53 +141,45 @@ uint32_t	sched_wake_sleepers_of(struct task *task);
 /*
  * IRQ-safe deferred wake.
  *
- * `sched_post_irq_wake` is callable from interrupt context: it appends
- * `th` to a lock-free atomic list and returns at once, without touching
- * sched_lock.  It is the primitive a hardware driver uses to signal a
- * thread blocked on kbd / serial / etc. from the IRQ that delivered the
- * event.
+ * sched_post_irq_wake is callable from interrupt context: it pushes `th'
+ * on a lock-free list and returns without touching sched_lock.  Drivers
+ * use it to wake a thread from the IRQ that delivered its event.
  *
- * `sched_drain_irq_wakes` pops the list and runs thread_wake on every
- * entry.  It is called from two safe spots in normal kernel context:
- * the tail of intr_dispatch (right before the preempt point) and the
- * tail of preempt_enable (just after the count drops to zero).  Both
- * are guaranteed to be running with no spinlock held, so taking
- * sched_lock from inside thread_wake cannot recurse onto a lock the
- * interrupted thread was holding.
+ * sched_drain_irq_wakes runs thread_wake on every entry.  It is called
+ * at the tail of intr_dispatch (before the preempt point) and of
+ * preempt_enable (when the count drops to zero), both with no spinlock
+ * held, so thread_wake's sched_lock cannot recurse onto a lock the
+ * interrupted thread held.
  */
 void		sched_post_irq_wake(struct thread *);
 void		sched_drain_irq_wakes(void);
 
 /*
- * Timed-block plumbing.  A thread that wants to be woken either by a
- * pending event OR by a deadline records its deadline in
- * th_wake_deadline_ms (absolute clock_uptime_ms()) and then calls
- * sched_add_timed_waiter before parking via thread_block_release.  On
- * wake the thread must call sched_remove_timed_waiter (idempotent) to
- * detach itself, then inspect th_timed_out to discriminate "event
- * arrived" from "deadline expired".
+ * Timed-block plumbing.  A thread to be woken by an event or a deadline,
+ * whichever comes first, sets th_wake_deadline_ms (absolute
+ * clock_uptime_ms()) and calls sched_add_timed_waiter -- at most once --
+ * before parking via thread_block_release.  On wake it must call
+ * sched_remove_timed_waiter (idempotent), then read th_timed_out to tell
+ * "event arrived" from "deadline expired".
  *
- * sched_check_timeouts is the PIT-IRQ tail that scans the list and
- * posts IRQ wakes for expired entries.
+ * sched_check_timeouts runs from intr_dispatch after each 8259 interrupt
+ * and posts IRQ wakes for expired entries.
  */
 void		sched_add_timed_waiter(struct thread *);
 void		sched_remove_timed_waiter(struct thread *);
 void		sched_check_timeouts(void);
 
 /*
- * sched_handoff_zombie: called from thread_exit().  Adds the thread
- * to the zombie list (idle thread reaps them) and switches away.
- * Never returns.
+ * sched_handoff_zombie: called from thread_exit().  Adds the thread to
+ * the zombie list and switches away.  Never returns.
  */
 void		sched_handoff_zombie(struct thread *)
 		    __attribute__((noreturn));
 
 /*
- * Reap any thread that called thread_exit() but whose struct + kstack
- * are still around.  The idle thread calls this on every iteration;
- * tests and other long-running code can call it explicitly so they
- * don't have to bounce through idle just to get a deterministic
- * cleanup point.
+ * Free the struct and kstack of every thread that has exited.  Called by
+ * the idle loop and after each thread_yield that switched; tests call it
+ * directly for a deterministic cleanup point.
  */
 void		sched_reap_zombies(void);
 
@@ -225,39 +193,29 @@ uint64_t	sched_preempts(void);
 void		sched_wake_latency_print(void);
 
 /*
- * Tally one preempt event.  Called from both the inline path
- * (intr_dispatch) and the deferred path (preempt_enable) so the
- * counter reflects every IRQ-driven schedule, not just one flavour.
+ * Tally one preempt event, from both the inline (intr_dispatch) and the
+ * deferred (preempt_enable) path.
  */
 void		sched_count_preempt(void);
 
 /*
  * Preemption primitives.
  *
- * preempt_disable / preempt_enable bracket critical sections that
- * must not be preempted -- spin_lock / spin_unlock call them
- * automatically.  The count is PER-CPU rather than per-thread, and
- * deliberately: sched_lock is held ACROSS a context switch, so the
- * thread that releases it is not the one that took it and per-thread
- * accounting underflows.  Per-CPU survives that, because a switch hands
- * over between two threads standing on the same CPU, and it answers the
- * question a timer interrupt actually has: "may I take away the CPU I am
- * on".
+ * preempt_disable / preempt_enable bracket critical sections that must not
+ * be preempted; spin_lock / spin_unlock call them.  The count is per-CPU,
+ * not per-thread: sched_lock is held across a context switch, so the
+ * thread that releases it is not the one that took it, but both are on
+ * the same CPU.
  *
- * The resched request and the quantum tally are per-CPU for the same
- * reason and reached only through the five calls below, rather than being
- * globals the PIT pokes.  A CPU owes its own reschedule; whether some
- * other CPU's slice has expired is none of its business, and while there
- * was one CPU there was no way to tell the two apart.
- *
- * preempt_quantum_tick debits one timer tick against whatever is running
- * here and returns true when the slice is spent; preempt_resched_request
- * is then the ask.  The ask is honoured elsewhere -- inline at the end of
- * intr_dispatch, or deferred to the next preempt_enable that drops the
- * count to zero -- because the gate belongs at the schedule point and not
- * at the flag-set point, so a critical section that ends later still owes
- * the reschedule.  thread_yield clears both, so a thread that gave the CPU
- * up voluntarily hands its successor a whole fresh slice.
+ * The resched request and the quantum tally are per-CPU too, reached only
+ * through the five calls below: a CPU owes its own reschedule and no
+ * other.  preempt_quantum_tick debits one timer tick against whatever is
+ * running here and returns true when the slice is spent;
+ * preempt_resched_request then asks.  The ask is honoured at the schedule
+ * point -- the end of intr_dispatch, or the next preempt_enable that drops
+ * the count to zero -- so a critical section that ends later still owes
+ * the reschedule.  thread_yield clears both, so a thread that gives the
+ * CPU up voluntarily hands its successor a fresh slice.
  */
 bool		preempt_quantum_tick(void);
 void		preempt_quantum_reset(void);
@@ -266,37 +224,24 @@ bool		preempt_resched_wanted(void);
 void		preempt_resched_clear(void);
 
 /*
- * How long a thread may hold the CPU before a timer takes it away.
- *
- * THE SLICE IS ALSO SOMEBODY ELSE'S WAITING TIME.  Whoever is behind this
- * thread in the queue waits out the whole of it, and a thread near the front
- * of the queue is often one the others are waiting FOR -- a child that has to
- * reach _exit before its parent's wait4 can return, a writer that has to reach
- * write before a reader sees a byte.  At five ticks, measured: a parent that
- * read a pipe and then waited for the child that wrote it took 104 ms to get
- * both answers, of which one whole quantum was the child queueing for the CPU
- * it needed to finish dying.
- *
- * Two ticks rather than one because the curve has a knee there and going
- * further costs the other direction.  Same measurement, same boot, all with
- * wakes going to the front of the queue:
+ * How long a thread may hold the CPU before a timer takes it away.  The
+ * slice is also the wait of whoever is queued behind, often a thread the
+ * others wait for: a child that must reach _exit before its parent's wait4
+ * returns, a writer before its reader sees a byte.  Measured, with wakes
+ * going to the head of the queue:
  *
  *	quantum   pipe-then-reap   reap alone   total wake delay per boot
  *	5 ticks       48.4 ms         3.6 ms          100 ms
  *	2 ticks       19.9 ms         5.1 ms           50 ms
  *	1 tick        18.5 ms         8.9 ms           40 ms
  *
- * One tick buys nothing on the number that motivated the change and is the
- * worst of the three at reaping, because a slice that short cannot hold a
- * task teardown: the dying child is preempted in the middle of it and has to
- * queue again to finish, so the parent waits for two turns instead of one.
+ * One tick gains almost nothing on pipe-then-reap and is worst at reaping:
+ * a task teardown does not fit in the slice, so the dying child is
+ * preempted and queues again to finish.
  *
- * The table above was measured with the PIT debiting the slice.  It still
- * describes the kernel with the APIC timer doing it, because the hand-over
- * kept the rate: the new timer is programmed at whatever the PIT was
- * programmed at, precisely so that this constant does not silently change
- * meaning.  lapic_timer_report prints the slice the delivered ticks actually
- * imply, which is where a rate that drifted would show up.
+ * Measured with the PIT debiting the slice.  The APIC timer is programmed
+ * at the PIT's rate so the constant keeps its meaning; lapic_timer_report
+ * prints the slice the delivered ticks imply.
  */
 #define	PREEMPT_QUANTUM_TICKS	2	/* ~20 ms at 100 Hz */
 

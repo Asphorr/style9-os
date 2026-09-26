@@ -16,24 +16,20 @@
 #include "spinlock.h"
 
 /*
- * Bucket sizes are 2^KMEM_MIN_LOG2 .. 2^KMEM_MAX_LOG2.  KMEM_HDR_SIZE
- * is consumed before the caller-visible pointer; bucket capacity is
- * (bucket_size - KMEM_HDR_SIZE).  Bucket 0 (16 bytes) is the smallest
- * bucket; with a 16-byte header it has zero payload room and is
- * unreachable from bucket_for().  Kept in the array so existing
- * stats / printf indexing stays stable.
+ * Bucket sizes are 2^KMEM_MIN_LOG2 .. 2^KMEM_MAX_LOG2; a bucket holds
+ * bucket_size - KMEM_HDR_SIZE bytes of payload.  Bucket 0 (16 bytes) has
+ * no payload room and bucket_for() never picks it; it stays in the array
+ * to keep stats indexing stable.
  *
- * KMEM_HDR_MAGIC sits in the header and is checked on every kfree;
- * mismatch panics (double-free or wild pointer).
+ * KMEM_HDR_MAGIC is checked on every kfree; a mismatch (double free or
+ * wild pointer) panics.
  *
- * KMEM_RZ_PATTERN fills the trailing slack between the caller's
- * payload end and the bucket's chunk end on every alloc -- on free we
- * verify it's intact, which catches buffer-overrun writes.
+ * KMEM_RZ_PATTERN fills the slack between the payload's end and the
+ * chunk's on every alloc, and is verified on free: an overrun panics.
  *
- * KMEM_POISON_PATTERN fills the entire payload AND slack on free
- * (after the red-zone check).  When the chunk gets pulled from the
- * freelist for the next alloc, the new kmalloc verifies it's still
- * intact, catching use-after-free writes during the freed lifetime.
+ * KMEM_POISON_PATTERN fills the chunk on free (after the red-zone check)
+ * and is verified when kmalloc takes the chunk again: a write through a
+ * freed pointer panics.
  */
 #define	KMEM_MIN_LOG2		4		/* 16 bytes      */
 #define	KMEM_MAX_LOG2		11		/* 2048 bytes    */
@@ -55,9 +51,7 @@ struct kmem_hdr {
 _Static_assert(KMEM_HDR_SIZE == 16, "kmem header expected to be 16 bytes");
 
 /*
- * Free chunk: when a bucket chunk is sitting on the freelist, we
- * overlay this struct on top of its payload area to thread the list.
- * The header stays valid; only the post-header bytes are reused.
+ * A free chunk, overlaid on its first bytes to thread the freelist.
  */
 struct kmem_chunk {
 	struct kmem_chunk	*kc_next;
@@ -143,12 +137,8 @@ kmalloc(size_t size)
 	spin_unlock(&kmem_lock);
 
 	/*
-	 * Verify the freed-chunk poison is still intact: if anyone
-	 * scribbled into this chunk during its dead lifetime (classic
-	 * use-after-free), the byte-by-byte poison check trips here and
-	 * we panic before handing the corrupted pointer to a new caller.
-	 * refill_bucket paints fresh chunks with poison too, so this
-	 * check is uniform across first-life and recycled paths.
+	 * Poison intact, or someone wrote through a freed pointer.
+	 * refill_bucket poisons fresh chunks too, so the check is uniform.
 	 */
 	verify_poison(c, bucket_size);
 
@@ -213,19 +203,12 @@ kfree(void *p)
 	bucket_size = bk->kb_size;
 	c  = (struct kmem_chunk *)hdr;
 
-	/*
-	 * Red-zone check: panic if the caller wrote past the end of
-	 * their allocation.  Done before any header mutation so the
-	 * autopsy sees the pristine kh_size + bucket.
-	 */
+	/* Before any header change, so a panic reports the real kh_size. */
 	verify_redzone(hdr, bucket_size);
 
 	/*
-	 * Poison the entire chunk payload so a use-after-free write
-	 * during the freed lifetime is caught at the next kmalloc that
-	 * pulls this chunk.  Then poison the magic so a double-free
-	 * trips the magic check above instead.  Order matters --
-	 * paint_poison stomps the magic if we did it first.
+	 * Poison the chunk, then clear the magic so a double free trips the
+	 * check above.
 	 */
 	paint_poison(hdr, bucket_size);
 	hdr->kh_magic = 0;
@@ -305,14 +288,9 @@ bucket_for(size_t size)
 }
 
 /*
- * Refill: allocate a fresh page from pmm, slice it into chunks of the
- * bucket's size, thread them onto the freelist.  Must be called with
+ * Slice a fresh pmm page into chunks of the bucket's size, poisoned past
+ * the kc_next slot like freed chunks, onto the freelist.  Called with
  * kmem_lock held.
- *
- * Paint the freed-state poison pattern onto every chunk before
- * linking so verify_poison in kmalloc works uniformly for first-life
- * and recycled paths.  Only the bytes past the kc_next slot are
- * painted; the link itself is set by the assignment that follows.
  */
 static void
 refill_bucket(struct kmem_bucket *bk)
@@ -342,10 +320,8 @@ refill_bucket(struct kmem_bucket *bk)
 }
 
 /*
- * Large allocations: round up to a multiple of pages, ask pmm for a
- * contiguous run, drop our header into the first KMEM_HDR_SIZE bytes.
- * Single page is the most common path -- kmalloc(8 KiB) for stacks,
- * etc.
+ * Large allocations: a contiguous pmm run of whole pages, with the header
+ * in its first KMEM_HDR_SIZE bytes.  No red zone or poison.
  */
 static void *
 kmalloc_large(size_t size)
@@ -402,12 +378,7 @@ kfree_large(struct kmem_hdr *hdr)
 
 /* ---- red-zone + freelist poison ---------------------------------- */
 
-/*
- * Fill the slack between the end of the caller's payload and the end
- * of the bucket chunk with KMEM_RZ_PATTERN.  On free we check that
- * pattern is intact; any byte that's been overwritten is a buffer
- * overflow we'd otherwise never see.
- */
+/* The red zone: payload end to chunk end, checked by verify_redzone. */
 static void
 paint_redzone(struct kmem_hdr *hdr, size_t bucket_size)
 {
@@ -450,14 +421,9 @@ verify_redzone(struct kmem_hdr *hdr, size_t bucket_size)
 }
 
 /*
- * Fill the entire chunk past the kc_next link slot with the freed-
- * state poison pattern.  Symmetric with verify_poison (which reads
- * the same range) and with refill_bucket (which paints fresh chunks
- * the same way); without that symmetry the kh_size slot at offset 8
- * leaks through verify_poison's check on the next alloc.
- *
- * Caller then overwrites bytes [0, 8) when it assigns kc_next on its
- * way to the freelist, so the freelist link survives.
+ * Poison the chunk past the kc_next slot -- exactly the range
+ * verify_poison reads and refill_bucket paints, so kh_size (offset 8)
+ * cannot leak through.  kfree then writes kc_next over bytes [0, 8).
  */
 static void
 paint_poison(struct kmem_hdr *hdr, size_t bucket_size)
@@ -472,11 +438,9 @@ paint_poison(struct kmem_hdr *hdr, size_t bucket_size)
 }
 
 /*
- * Walk the chunk that just came off the freelist and ensure every byte
- * past the kc_next slot still matches KMEM_POISON_PATTERN.  If any
- * byte differs, somebody wrote through a freed pointer between kfree
- * and this kmalloc -- panic with the offset so the corrupting writer
- * has a fingerprint to chase.
+ * Every byte past kc_next of a chunk just off the freelist must still be
+ * poison; otherwise something wrote through a freed pointer.  The panic
+ * gives the offset.
  */
 static void
 verify_poison(struct kmem_chunk *c, size_t bucket_size)

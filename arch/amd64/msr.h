@@ -11,15 +11,9 @@
 #include <stdint.h>
 
 /*
- * Model-specific registers, and the two instructions that reach them.
- *
- * Gathered here on the third copy.  rdmsr/wrmsr had been written out twice
- * -- once for SYSCALL's four registers, once for the per-CPU GS base -- and
- * the local APIC needed them a third time, which is the point at which a
- * duplicated pair of six-line inlines stops being cheaper than a header.
- * The register NUMBERS matter more than the accessors: a typo in one of
- * these is a write to a completely unrelated piece of CPU state, and having
- * them in one place means a name is spelled once.
+ * Model-specific registers and the two instructions that reach them.  The
+ * numbers are kept in one place because a typo in one is a write to
+ * unrelated CPU state.
  */
 
 #define	MSR_APIC_BASE		0x0000001Bu	/* IA32_APIC_BASE       */

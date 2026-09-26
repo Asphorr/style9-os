@@ -21,18 +21,13 @@
 #include "thread.h"
 
 /*
- * Object-lifecycle layer for the Mach IPC subsystem.
+ * Mach IPC object lifecycle: port and port_set creation, destruction and
+ * ref counting, subsystem init (kernel_space, id counters), and the
+ * special-port plumbing for kernel-implemented objects (task_self,
+ * bootstrap, kernel-owned service ports).
  *
- * Responsibilities:
- *	- port + port_set construction, destruction, and ref counting,
- *	- bootstrap of the subsystem (kernel_space + ID counters),
- *	- "special-port" plumbing for kernel-implemented Mach objects
- *	  (task_self, bootstrap, kernel-owned service ports).
- *
- * Message queueing, send/recv, and name-table operations live in
- * sibling files (port_msg.c, port_space.c).  Cross-file helpers are
- * declared in port_internal.h; everything in this file that doesn't
- * appear there stays static.
+ * Messaging is in port_msg.c, name tables in port_space.c; cross-file
+ * helpers are declared in port_internal.h.
  */
 
 struct port_space	*kernel_space;
@@ -67,11 +62,7 @@ port_subsystem_init(void)
 
 /* ---- port object ----------------------------------------------------- */
 
-/*
- * Forward decl: free_pending_descs lives in port_msg.c because it's
- * primarily a deliver/recv helper; port_free invokes it on teardown
- * to release refs left in unconsumed queued messages.
- */
+/* In port_msg.c; releases what an undelivered message still holds. */
 extern void	free_pending_descs(struct port_pending_desc *, size_t n);
 
 struct port *
@@ -130,8 +121,8 @@ port_free(struct port *p)
 	    "port_free: send waiters still parked");
 
 	/*
-	 * Drain any messages that were queued but never consumed; each
-	 * one may carry port descriptors holding refs on other ports.
+	 * Drain undelivered messages; their descriptors hold port refs and
+	 * OOL frames.
 	 */
 	m = p->p_qhead;
 	while (m != NULL) {
@@ -142,9 +133,8 @@ port_free(struct port *p)
 	}
 
 	/*
-	 * Defensive: any DEAD_NAME watch still armed here never fired (the
-	 * RECV-drop path normally detaches + fires the list before the last
-	 * ref goes).  Drop each node's SEND ref and free it so we don't leak.
+	 * Defensive: the RECEIVE drop normally fires and detaches every
+	 * DEAD_NAME watch first.  Any left never fired; release them.
 	 */
 	while (p->p_notify_dead_name != NULL) {
 		struct port_notify_node *next_n = p->p_notify_dead_name->nn_next;
@@ -229,13 +219,12 @@ port_deref(struct port *p, uint8_t rights)
 		p->p_send_waiters_head = p->p_send_waiters_tail = NULL;
 
 		/*
-		 * Hold every thread on both snapshot chains while p_lock
-		 * still proves them alive -- a thread on the list cannot
-		 * finish exiting without taking p_lock to unbind itself.
-		 * The wakes happen after the lock is dropped, and in that
-		 * gap a kill fan-out can wake a chain member, retire it and
-		 * reap it; the hold makes the reaper leave the body until
-		 * our wake has landed (th_wake_hold, kern/thread.h).
+		 * Hold every thread on both chains while p_lock still proves
+		 * them alive (a listed thread cannot finish exiting without
+		 * p_lock to unlink itself).  The wakes run after the unlock,
+		 * when a kill could retire and reap a chain member; the hold
+		 * keeps the reaper off until our wake has landed
+		 * (th_wake_hold, kern/thread.h).
 		 */
 		for (hw = wake_head; hw != NULL; hw = hw->th_wait_link)
 			thread_hold(hw);
@@ -246,10 +235,9 @@ port_deref(struct port *p, uint8_t rights)
 		p->p_set = NULL;
 
 		/*
-		 * NO_SENDERS slot: receiver going away means the
-		 * no-senders event can no longer fire on this port.
-		 * Snapshot+clear so the post-unlock cleanup releases
-		 * our SEND ref on the notify target without firing.
+		 * With the receiver gone NO_SENDERS can never fire: clear
+		 * the slot, and release its SEND ref after the unlock
+		 * without firing.
 		 */
 		if (p->p_notify_no_senders != NULL) {
 			notify_no_senders = p->p_notify_no_senders;
@@ -257,30 +245,24 @@ port_deref(struct port *p, uint8_t rights)
 			p->p_notify_no_senders_id = 0;
 		}
 		/*
-		 * DEAD_NAME list: receiver going away IS the trigger.
-		 * Detach the whole list; post-unlock we fire each watcher,
-		 * drop its SEND ref, and free the node.
+		 * The receiver going away is what DEAD_NAME waits for:
+		 * detach the list and fire it after the unlock.
 		 */
 		dead_name_list = p->p_notify_dead_name;
 		p->p_notify_dead_name = NULL;
 	}
 
 	/*
-	 * No-senders detection.  If dropping a send-bearing right took
-	 * the per-port sender count to zero while the receive end is
-	 * still held, either:
-	 *	a notification was armed -- fire it (one-shot); the port
-	 *	  stays alive so the receiver may MAKE_SEND a fresh right
-	 *	  inside the notify handler if it chooses;
-	 *	no notification -- fall back to the v0 behaviour: mark
-	 *	  the port dead and wake any recv-blocked threads with
-	 *	  MACH_E_DEAD so they aren't stranded waiting for a
-	 *	  message that can never arrive.
+	 * No senders left while RECEIVE is still held:
+	 *	a NO_SENDERS notification is armed -- fire it (one-shot);
+	 *	  the port lives on, and the receiver may MAKE_SEND again;
+	 *	none armed -- if the queue is empty and receivers are
+	 *	  parked, mark the port dead and wake them with MACH_E_DEAD
+	 *	  rather than strand them waiting for a message that cannot
+	 *	  come.
 	 *
-	 * Set-waiters are not woken in the fallback path: the set as a
-	 * whole stays alive as long as any other member still has
-	 * senders, and we have no cheap way to certify that condition
-	 * here.
+	 * Set waiters are not woken: the set lives on while any other
+	 * member has senders, which is not cheap to establish here.
 	 */
 	if ((rights & (MACH_PORT_RIGHT_SEND |
 	    MACH_PORT_RIGHT_SEND_ONCE)) != 0 &&
@@ -312,17 +294,14 @@ port_deref(struct port *p, uint8_t rights)
 	}
 	if (notify_no_senders != NULL) {
 		/*
-		 * Release the kernel-held SEND ref on the notify port.
-		 * Covers both the firing path (one-shot consumes the
-		 * registration) and the RECV-drop cleanup path (source
-		 * died with a registration still armed).
+		 * The registration's SEND ref, whether it fired or the
+		 * source died with it armed.
 		 */
 		port_deref(notify_no_senders, MACH_PORT_RIGHT_SEND);
 	}
 	/*
-	 * Fire every armed DEAD_NAME watcher (multi-registrant): post the
-	 * notification, drop the SEND ref the node held on its target, free
-	 * the node.  An empty list (the common case) is a no-op.
+	 * Fire each DEAD_NAME watch, then drop its SEND ref and free the
+	 * node.
 	 */
 	while (dead_name_list != NULL) {
 		struct port_notify_node *next = dead_name_list->nn_next;
@@ -358,10 +337,7 @@ port_deref(struct port *p, uint8_t rights)
 		send_wake_head = next;
 	}
 
-	/*
-	 * If we were a member of a set, splice ourselves out so the
-	 * set doesn't dangle a pointer at us once we're freed.
-	 */
+	/* Leave the set, so it holds no pointer to a freed port. */
 	if (member_of != NULL) {
 		spin_lock(&member_of->ps_lock);
 		struct port *cur, *prev = NULL;
@@ -447,8 +423,7 @@ port_set_deref(struct port_set *ps)
 		ps->ps_member_count = 0;
 		wake_head = ps->ps_waiters_head;
 		ps->ps_waiters_head = ps->ps_waiters_tail = NULL;
-		/* Held under ps_lock for the same reap window port_deref
-		 * describes; the wakes below run with the lock dropped. */
+		/* Held under ps_lock for the reap window, as in port_deref. */
 		for (hw = wake_head; hw != NULL; hw = hw->th_wait_link)
 			thread_hold(hw);
 	}
@@ -496,26 +471,17 @@ port_install_task_self(struct task *t)
 		return (MACH_E_NOMEM);
 
 	/*
-	 * Tag the port before any visibility: once SEND lands in the
-	 * task's space a sender could resolve it through space_lookup
-	 * and reach mach_msg_send, which gates its intercept on
-	 * p_special.  Setting the tag first means there is no window in
-	 * which a regular queue path could fire against a port that is
-	 * really meant for synchronous dispatch.
+	 * Tag before the SEND is visible: mach_msg_send picks its path
+	 * by p_special, so no send can ever queue on this port.
 	 */
 	p->p_special     = PORT_SPECIAL_TASK_SELF;
 	/*
-	 * Store the task's immutable id, NOT a raw struct task *.  A
-	 * task-self port can outlive its task: any external holder of a
-	 * SEND right (launchctl, the launchd keep_alive worker, the
-	 * shell's child registry) keeps the port object alive past the
-	 * task's kfree in task_deref.  A stored pointer would dangle and
-	 * the dispatch + SYS_TASK_KILL paths would dereference freed
-	 * memory.  The id is stable for the life of the task and resolves
-	 * via task_lookup_ref, which returns NULL once the task has been
-	 * reaped -- so a stale port fails safe.  Task ids start at 1
-	 * (next_task_id in task.c), so the value never collides with the
-	 * NULL p_special_arg of a non-special port.
+	 * The task's id, not a pointer.  Outside SEND holders (launchctl,
+	 * the launchd keep_alive worker, the shell's child registry) keep
+	 * the port alive past the task's kfree, and a pointer would dangle
+	 * in the dispatch and SYS_TASK_KILL paths.  task_lookup_ref returns
+	 * NULL once the task is reaped.  Ids start at 1 (next_task_id), so
+	 * the value is never NULL.
 	 */
 	KASSERT(t->t_id != 0, "port_install_task_self: task id 0");
 	p->p_special_arg = (void *)(uintptr_t)t->t_id;
@@ -529,11 +495,9 @@ port_install_task_self(struct task *t)
 	}
 
 	/*
-	 * The well-known name is by construction the first slot allocated
-	 * in a fresh port_space (ps_hint starts at 1).  Anything else
-	 * means a caller put something else into the space first, which
-	 * would break the ABI everyone else relies on -- panic instead of
-	 * letting a wrong name leak out.
+	 * The first slot of a fresh space (ps_hint starts at 1).  Any
+	 * other name means the space was not empty, which would break the
+	 * well-known-name ABI.
 	 */
 	if (name != MACH_PORT_TASK_SELF) {
 		panic("port_install_task_self: name %u, expected %u "
@@ -560,12 +524,11 @@ port_release_task_self(struct task *t)
 }
 
 /*
- * port_dead_name_link: link a DEAD_NAME watcher node onto `watched`.
- * Shared by the in-kernel arm (port_arm_dead_name_object) and the
- * userspace path (port_request_notification); both pre-allocate the node
- * and take the SEND ref outside p_lock so nothing allocates under it.
- * See the header comment in port_internal.h for the node/ref ownership
- * contract.  Lock-order: only watched->p_lock is taken here.
+ * Link a DEAD_NAME watch node onto `watched`, for both
+ * port_arm_dead_name_object and port_request_notification; both
+ * allocate the node and take the SEND ref beforehand, so nothing
+ * allocates under p_lock.  Ownership contract in port_internal.h.  Only
+ * watched->p_lock is taken.
  */
 int
 port_dead_name_link(struct port *watched, struct port *notify,
@@ -598,21 +561,12 @@ port_dead_name_link(struct port *watched, struct port *notify,
 }
 
 /*
- * port_arm_dead_name_object: kernel-internal DEAD_NAME arming on port
- * objects rather than names.  The userspace path
- * (port_request_notification) resolves names in a space + checks the
- * caller's rights; an in-kernel watcher (the launchd keep_alive worker)
- * already holds port pointers, so it arms directly.
- *
- * Multi-registrant: appends a watch (deduped on `notify`) so several
- * watchers can observe the same port's death.  Takes one SEND ref on
- * `notify`; that ref is dropped automatically when the notification fires
- * or when `watched`'s RECEIVE is released without firing.  Returns
- * MACH_E_DEAD if `watched` is already dead, MACH_E_NOMEM if the watch node
- * cannot be allocated.
- *
- * Lock-order: ref `notify` and allocate the node BEFORE taking
- * watched->p_lock so nothing nests under or allocates beneath it.
+ * DEAD_NAME arming on port objects rather than names, for an in-kernel
+ * watcher that already holds the pointers (the launchd keep_alive
+ * worker).  Appends a watch, one per `notify`, holding a SEND ref on it
+ * that goes when the notification fires.  MACH_E_DEAD if `watched` is
+ * already dead, MACH_E_NOMEM if no node.  The ref and the node are taken
+ * before watched->p_lock.
  */
 int
 port_arm_dead_name_object(struct port *watched, struct port *notify,
@@ -639,10 +593,9 @@ port_arm_dead_name_object(struct port *watched, struct port *notify,
 }
 
 /*
- * Mint a port object the kernel itself owns (RECEIVE held, no name in
- * any port_space) with a p_special tag pre-set.  Used to mint the
- * singleton bootstrap port; future kernel-implemented Mach objects
- * (host_self etc.) can use the same factory.
+ * Create a port the kernel itself owns (RECEIVE held, named in no
+ * space) with its p_special tag set: the bootstrap port, the host port,
+ * the service and driver control ports.
  */
 struct port *
 port_create_kernel_owned(uint8_t special_kind, void *special_arg)
@@ -660,10 +613,9 @@ port_create_kernel_owned(uint8_t special_kind, void *special_arg)
 }
 
 /*
- * Install a SEND right for `p` in kernel_space at the next-free name
- * and return that name in *name_out.  Used by services_init to wire
- * each kernel-side service port into kernel_space so bootstrap can
- * hand it out via COPY_SEND descriptors at lookup time.
+ * Install a SEND right for `p` at a new name in kernel_space, returned
+ * in *name_out, so the kernel can hand the port out by COPY_SEND.
+ * Used for the bootstrap, host and device control ports.
  */
 int
 port_install_send_in_kernel(struct port *p, mach_port_name_t *name_out)
@@ -676,10 +628,9 @@ port_install_send_in_kernel(struct port *p, mach_port_name_t *name_out)
 }
 
 /*
- * Install a SEND right to the global bootstrap port at name
- * MACH_PORT_BOOTSTRAP in t->t_port_space.  Mirrors
- * port_install_task_self in shape; differs in that the underlying
- * port object is singleton-shared rather than per-task.
+ * Install a SEND right to the global bootstrap port at
+ * MACH_PORT_BOOTSTRAP in t->t_port_space; like port_install_task_self,
+ * but the port is shared by all tasks.
  */
 int
 port_install_bootstrap(struct task *t)

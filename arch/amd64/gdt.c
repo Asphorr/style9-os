@@ -30,10 +30,8 @@
 #define	GDT_DESC_UDATA		0x00CFF2000000FFFFULL
 
 /*
- * One table, one pointer and one TSS per CPU.  See gdt.h for why the
- * tables are not shared; the arrays are indexed by the dense CPU id, which
- * is what makes tss_set_rsp0 a one-line function that cannot address
- * somebody else's TSS.
+ * One table, one pointer and one TSS per CPU (see gdt.h), indexed by the
+ * dense CPU id, so tss_set_rsp0 cannot address another CPU's TSS.
  */
 static uint64_t		gdt[MAXCPU][GDT_ENTRIES] __attribute__((aligned(16)));
 
@@ -45,12 +43,9 @@ struct gdt_ptr {
 static struct gdt_ptr	gdtr[MAXCPU];
 
 /*
- * 64-bit TSS.  Only RSP0 is consumed (the CPU loads it when an interrupt
- * or exception promotes from ring 3 to ring 0); IST stays zero until
- * per-IRQ stacks are introduced.  Layout below is imposed by Intel SDM
- * Vol 3 -- reordering desynchronises the CPU's hardware load.
+ * 64-bit TSS, wire format imposed by Intel SDM Vol 3.  Only RSP0 is used
+ * (loaded on an interrupt or exception from ring 3); IST stays zero.
  */
-/* WIRE FORMAT.  Intel SDM Vol 3 imposed. */
 struct tss {
 	uint32_t	reserved0;
 	uint64_t	rsp0;
@@ -68,9 +63,8 @@ _Static_assert(sizeof(struct tss) == 104, "tss must be 104 bytes");
 static struct tss	tss[MAXCPU] __attribute__((aligned(16)));
 
 /*
- * Fill the six flat descriptors.  Written out rather than copied from a
- * template because the kernel has no memcpy and an eight-element loop is
- * one -O2 decision away from calling for one.
+ * Fill the flat descriptors.  Written out, not copied from a template: the
+ * kernel has no memcpy, and -O2 may turn a copy loop into a call to one.
  */
 static void
 gdt_fill_flat(uint64_t *g)
@@ -120,22 +114,16 @@ gdt_init_cpu(void)
 	gdtr[me].gp_base  = (uint64_t)(uintptr_t)&gdt[me];
 
 	/*
-	 * lgdt installs the new descriptor table.  We then reload data
-	 * segments with the new data selector and reload CS with a far
-	 * return (no ljmp in 64-bit GAS for arbitrary immediates -- we
-	 * push the selector and a return-target onto the stack, lretq
-	 * loads CS and pops the target).  Finally LTR makes the CPU
-	 * use our TSS for ring-transition RSP loads.
+	 * lgdt, reload the data segments, reload CS with a far return
+	 * (push selector and target, lretq -- 64-bit GAS has no ljmp with
+	 * an arbitrary immediate), then ltr so ring transitions take RSP0
+	 * from our TSS.
 	 *
-	 * ⚠ %gs IS DELIBERATELY NOT RELOADED HERE, and %fs with it.  In
-	 * long mode those two segments' bases live only in their MSRs, and
-	 * writing the register loads the descriptor's base instead -- zero,
-	 * for every flat descriptor above.  This routine used to reload all
-	 * five, which was harmless while nothing used %gs and is now the
-	 * single instruction that would point this CPU's per-CPU block at
-	 * physical zero.  The selector value itself is dead weight in long
-	 * mode; only the base matters, and the base belongs to
-	 * cpu_bsp_init.
+	 * %gs and %fs are deliberately not reloaded.  In long mode their
+	 * bases live in MSRs, and writing the selector loads the
+	 * descriptor's base instead -- zero here -- which would point this
+	 * CPU's per-CPU block at physical zero.  The GS base is set by
+	 * cpu_bsp_init or ap_entry.
 	 */
 	__asm__ __volatile__ (
 	    "lgdt %0			\n"

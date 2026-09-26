@@ -92,9 +92,8 @@ static bool	user_range_ok(uint64_t addr, size_t len);
  *	[63:48]	user selector base -- CPU loads CS=that+16, SS=+8 on
  *		SYSRETQ (64-bit).  We set 0x18 so CS=0x28|3, SS=0x20|3.
  *
- * LSTAR is the 64-bit entry RIP.  FMASK clears IF + DF on entry so
- * the kernel side starts with interrupts disabled and a known
- * direction.
+ * LSTAR is the 64-bit entry RIP.  FMASK clears IF and DF on entry.
+ * All four registers are per-CPU; see syscall.h.
  */
 void
 syscall_init_cpu(void)
@@ -236,52 +235,34 @@ syscall_dispatch(struct syscall_frame *f)
 	long	rv;
 
 	/*
-	 * Async-kill detection point #1.  If task_request_terminate
-	 * fired while this thread was running in ring 3, t_killed is set
-	 * by the time we re-enter the kernel here.  Retire before
-	 * dispatching: the caller has been marked dead and any reply
-	 * we'd produce will never be observed (the user pages are about
-	 * to be torn down).  See kern/task.h's t_killed comment for the
-	 * full detection-site list.
+	 * Async-kill detection point #1: a kill requested while this thread
+	 * ran in ring 3.  Retire before dispatching; no reply would ever be
+	 * seen.  kern/task.h's t_killed comment lists every detection point.
 	 */
 	if (current_thread->th_task != kernel_task &&
 	    task_kill_pending(current_thread->th_task))
 		thread_exit();
 	/* NOTREACHED if killed */
 
-	/*
-	 * Darwin-personality tasks (a Mach-O that declared PLATFORM_MACOS)
-	 * dispatch through the Apple class-encoded path; every native style9
-	 * task takes the untouched table below.  See kern/darwin.c.
-	 */
+	/* Darwin-personality tasks take the Apple path (kern/darwin.c). */
 	if (current_thread->th_task->t_personality == TASK_PERSONALITY_DARWIN)
 		rv = darwin_dispatch(f);
 	else
 		rv = syscall_dispatch_body(f);
 
 	/*
-	 * Every mutex taken inside a syscall must have been given back by
-	 * here: ring 3 cannot unlock what it cannot name.  This is also
-	 * the promise that makes the kill deferral finite -- a killed
-	 * holder is allowed to run on exactly BECAUSE this boundary is
-	 * ahead of it, holding nothing (kern/sched.c, the mutex clause in
-	 * the kill checks).  A leak caught here names the syscall that
-	 * forgot, on the very return that forgot it.
+	 * Every mutex taken in a syscall is released by here.  This bounds
+	 * the kill deferral too: a killed holder may run on only because it
+	 * reaches this boundary holding nothing (the mutex clause in
+	 * kern/sched.c's kill checks).
 	 */
 	KASSERT(current_thread->th_mutex_depth == 0,
 	    "syscall returning to ring 3 with a mutex still held");
 
 	/*
-	 * Detection point #5: syscall-exit kill check.  Catches the
-	 * "syscall ITSELF caused the kill" case (e.g. SYS_TASK_KILL on
-	 * self, or a future signal-style syscall that posts a kill to
-	 * its own task).  The entry check (#1) would catch this on the
-	 * NEXT syscall, but a self-kill should retire immediately so
-	 * the user never gets a sysretq -- no half-step of returned user
-	 * code between issuing the kill and dying.  The IRQ-return
-	 * detection point (#4) and the thread_block_release pre-park /
-	 * post-wake points (#2, #3) cover the gaps if for some reason
-	 * we miss here, but this is the cleanest path.
+	 * Detection point #5: a kill caused by this syscall itself (e.g.
+	 * SYS_TASK_KILL on self).  Retire now rather than sysretq and run
+	 * user code until the next check.
 	 */
 	if (current_thread->th_task != kernel_task &&
 	    task_kill_pending(current_thread->th_task))
@@ -289,12 +270,10 @@ syscall_dispatch(struct syscall_frame *f)
 	/* NOTREACHED if killed */
 
 	/*
-	 * Signal delivery point.  Apply any signal posted to this Darwin task
-	 * during the syscall -- most notably SIGPIPE from a write to a
-	 * reader-less pipe.  A default-terminate signal retires the thread
-	 * here (so the syscall's return value is never observed); a caught
-	 * signal is left pending for phase-2 on-stack delivery.  Native tasks
-	 * carry no Darwin signal state and are skipped.
+	 * Deliver any signal pending on a Darwin task (SIGPIPE from this very
+	 * write, say): default-terminate retires the thread here, a caught
+	 * signal is delivered on-stack by reshaping `f'.  Native tasks have
+	 * no Darwin signal state.
 	 */
 	if (current_thread->th_task != kernel_task &&
 	    current_thread->th_task->t_personality == TASK_PERSONALITY_DARWIN)
@@ -304,12 +283,10 @@ syscall_dispatch(struct syscall_frame *f)
 }
 
 /*
- * syscall_console_write: copy `len` bytes from the user buffer into a kernel
- * scratch under an SMAP bracket, then push them to the tty (without holding
- * AC=1 across the tty lock + console output).  Returns bytes written, or
- * SYS_E_FAULT if the buffer escapes the user-VA window; the 4 KiB cap keeps
- * the scratch on the kernel stack.  Backs both SYS_PRINT and the Darwin
- * personality's write(2) (kern/darwin.c).
+ * syscall_console_write: copy up to 4 KiB (a kernel-stack scratch) from the
+ * user buffer under an SMAP bracket, then push it to the tty without AC=1
+ * held across the tty lock.  Returns bytes written or SYS_E_FAULT.  Backs
+ * SYS_PRINT and the Darwin console write(2).
  */
 long
 syscall_console_write(const char *buf, size_t len)
@@ -324,22 +301,12 @@ syscall_console_write(const char *buf, size_t len)
 	if (!user_range_ok((uint64_t)(uintptr_t)buf, len))
 		return (SYS_E_FAULT);
 
-	/*
-	 * Copy out of the user buffer into a kernel scratch under SMAP
-	 * bracket, then push to tty without holding AC=1 across the
-	 * tty's locking + console output path.  4 KiB cap keeps the
-	 * scratch on the kernel stack.
-	 */
 	smap_user_access_begin();
 	for (i = 0; i < len; i++)
 		scratch[i] = buf[i];
 	smap_user_access_end();
 
-	/*
-	 * One write(2) is one write to the console, cursor included: a
-	 * shell that repaints a line does not want the underline dragged
-	 * across every column on the way.
-	 */
+	/* One batch, so the cursor moves once, not across every column. */
 	tty_batch_begin();
 	for (i = 0; i < len; i++)
 		tty_putc(scratch[i]);
@@ -356,12 +323,10 @@ sys_print(const char *buf, size_t len)
 }
 
 /*
- * sys_cons_feed: copy up to 256 bytes from the user buffer into a kernel
- * scratch under an SMAP bracket, then hand them to the Darwin console-input
- * ring (darwin_cons_feed).  The userspace demo driver uses this to pre-load
- * a command script for an interactive Darwin shell, which then reads it back
- * through the personality's real read(2)/console path.  Returns bytes fed,
- * or SYS_E_FAULT if the buffer escapes the user-VA window.
+ * sys_cons_feed: copy up to 256 bytes from the user buffer and load them as
+ * the Darwin console's script (darwin_cons_feed), which a Darwin shell then
+ * reads through its real read(2) path; the boot demo uses it.  Returns
+ * bytes fed or SYS_E_FAULT.
  */
 static long
 sys_cons_feed(const char *ubuf, size_t len)
@@ -399,25 +364,19 @@ sys_yield(void)
 {
 
 	/*
-	 * 1 if somebody else got the CPU, 0 if there was nobody to give it to.
-	 * Ring 3 needs the difference for the same reason the kernel does: a
-	 * poll loop counted in yields stops being a way of waiting the moment
-	 * the thing being waited for runs on another processor instead of
-	 * queueing behind this one.  See thread_yield's comment, and poll_turn
-	 * in libstyle9, which is what the loops call.
+	 * 1 if another thread got the CPU, 0 if none was waiting.  A poll
+	 * loop counted in yields needs the difference once the awaited thread
+	 * can run on another CPU (thread_yield; poll_turn in libstyle9).
 	 */
 	return (thread_yield() ? 1 : 0);
 }
 
 /*
- * User pointer range check.
- *
- * Every task gets its own pmap; ring-3 leaves live at [0x40000000,
- * 0x80000000) by convention.  This check rejects pointers outside that
- * window (in particular anything aiming back into kernel-VA below the
- * 1 GiB identity map).  When SMAP comes online we'll also bracket the
- * deref with stac/clac so a missed range check fails closed rather
- * than just being a policy violation.
+ * User pointer range check: ring-3 mappings live in [0x40000000,
+ * 0x80000000), so anything outside, in particular kernel VA below the
+ * 1 GiB identity map, is refused.  Derefs are also bracketed with
+ * smap_user_access_begin/end, so with SMAP on a missed check faults
+ * rather than leaks.
  */
 #define	USER_VA_LO	0x40000000ULL
 #define	USER_VA_HI	0x80000000ULL
@@ -438,12 +397,11 @@ user_range_ok(uint64_t addr, size_t len)
 }
 
 /*
- * Shared copyin for a NUL-terminated user string.  Walks up to kbuf_size
- * bytes from uptr, range-checking every byte under one SMAP bracket and
- * stopping at the first NUL.  Returns the length (excluding NUL), SYS_E_FAULT
- * on a bad pointer, or SYS_E_INVAL when no NUL appears in kbuf_size bytes.
- * The textbook copyin_str the inline copies in sys_spawn et al. predate; the
- * Darwin dyld backchannel (kern/darwin.c) routes its path argument through it.
+ * Copy in a NUL-terminated user string: up to kbuf_size bytes, each
+ * range-checked, under one SMAP bracket.  Returns the length (excluding
+ * the NUL), SYS_E_FAULT on a bad pointer, or SYS_E_INVAL when no NUL
+ * appears in kbuf_size bytes.  The inline copies in sys_spawn et al.
+ * predate it.
  */
 long
 syscall_copyin_str(const char *uptr, char *kbuf, size_t kbuf_size)
@@ -475,11 +433,9 @@ syscall_copyin_str(const char *uptr, char *kbuf, size_t kbuf_size)
 }
 
 /*
- * Shared copyout for a fixed-length buffer: copy `n` bytes from kernel `kbuf`
- * to user `uptr`, range-checking the whole destination span once under one
- * SMAP bracket.  Returns 0, or SYS_E_FAULT for a NULL/wrapping/out-of-window
- * destination.  The Darwin read(2) path (kern/darwin.c) delivers file bytes
- * through it.
+ * Copy `n` bytes from kernel `kbuf` to user `uptr`: one range check of the
+ * whole span, one SMAP bracket.  Returns 0, or SYS_E_FAULT for a NULL,
+ * wrapping or out-of-window destination.
  */
 long
 syscall_copyout(void *uptr, const void *kbuf, size_t n)
@@ -509,10 +465,8 @@ syscall_copyout(void *uptr, const void *kbuf, size_t n)
 }
 
 /*
- * Shared copyin for a fixed-length buffer: the mirror of syscall_copyout.
- * Copies `n` bytes from user `uptr` into kernel `kbuf` after one range
- * check, under one SMAP bracket.  Returns 0 or SYS_E_FAULT.  The Darwin
- * pipe write path (kern/darwin.c) pulls its payload through it.
+ * The mirror of syscall_copyout: `n` bytes from user `uptr` into kernel
+ * `kbuf`.  Returns 0 or SYS_E_FAULT.
  */
 long
 syscall_copyin(void *kbuf, const void *uptr, size_t n)
@@ -542,14 +496,13 @@ syscall_copyin(void *kbuf, const void *uptr, size_t n)
 }
 
 /*
- * Copy a NUL-terminated user argument vector (execve shape: char *argv[]
- * ending in a NULL pointer) into one kernel-owned flat block, laid out
- * exactly like sys_spawn_args' block: argc+1 leading char * slots (the
- * last NULL) whose non-NULL entries point into the packed strings that
- * follow.  Caps mirror the spawn path: SPAWN_ARGV_MAX pointers,
- * SPAWN_ARG_BYTES_MAX total string bytes.  On success *blockp owns the
- * kmalloc'd block (kfree when done), *argcp the count, and 0 returns; a
- * NULL uargv is argc 0 with no block.  Negative SYS_E_* on fault/limit.
+ * Copy a NULL-terminated user vector (execve's char *argv[]) into one
+ * kernel-owned flat block laid out like sys_spawn_args': argc+1 char *
+ * slots (the last NULL) pointing into the packed strings that follow.  At
+ * most `max_ptrs' pointers and `max_bytes' string bytes (SYS_E_INVAL
+ * beyond).  On success returns 0 with the kmalloc'd block in *blockp (the
+ * caller kfrees it) and the count in *argcp; a NULL uargv is argc 0 with
+ * no block.  SYS_E_FAULT or SYS_E_NOMEM otherwise.
  */
 long
 syscall_copyin_vec(char *const *uargv, char ***blockp, int *argcp,
@@ -666,16 +619,11 @@ sys_port_dealloc(mach_port_name_t name)
 }
 
 /*
- * Mach message send/recv.  The user supplies a pointer to a Mach header;
- * we honour the user's msgh_size and read the bytes directly from the
- * caller's address space (its pmap is current for the syscall's lifetime).
- * No kmalloc round-trip on send -- the mach_msg_send path makes its own
- * copy into the queued message.
- *
- * The range-check + SMAP-bracket + mach_msg_* core lives in the non-static
- * syscall_msg_* helpers so the Darwin personality's mach_msg trap
- * (kern/darwin.c) reuses the exact same path; the sys_msg_* wrappers are
- * just the style9 syscall-table entry points.
+ * Mach message send/recv.  The user passes a Mach header pointer; its
+ * msgh_size is honoured and the body read straight from the caller's
+ * address space (its pmap is current throughout), mach_msg_send making
+ * the queued copy.  The core is in the syscall_msg_* helpers, shared with
+ * the Darwin mach_msg trap; sys_msg_* are the table entry points.
  */
 long
 syscall_msg_send(const struct mach_msg_header *umsg)
@@ -687,11 +635,8 @@ syscall_msg_send(const struct mach_msg_header *umsg)
 		return (SYS_E_FAULT);
 
 	/*
-	 * Read msgh_size under one SMAP bracket and then bound the
-	 * whole [umsg, umsg+msgh_size) range against the user-VA
-	 * window before mach_msg_send's copyin reads the body.  This
-	 * keeps the previous "body fits in user VA" guarantee without
-	 * leaving an unbracketed deref on the SMAP-enabled path.
+	 * Read msgh_size under an SMAP bracket, then bound the whole
+	 * [umsg, umsg + msgh_size) before mach_msg_send reads the body.
 	 */
 	smap_user_access_begin();
 	msgh_size = umsg->msgh_size;
@@ -784,17 +729,10 @@ sys_msg_rpc(struct mach_msg_header *ureq, struct mach_msg_header *ureply,
 }
 
 /*
- * sys_spawn: launch the named program in a fresh task.  Copies the
- * caller's name string into a small kernel-side buffer (bounded by
- * PROGREG_NAME_MAX), validates each byte lies inside the user-VA
- * window the kernel can dereference, then hands the lookup to
- * progreg_spawn.  Returns the new task's id on success or a negative
- * SYS_E_* code.
- *
- * No copy-in via copyin() yet -- we still rely on per-task PML4 being
- * loaded for the calling thread, then read the byte through its U=1
- * leaves directly.  Once SMAP/copyin land this becomes the textbook
- * copyin_str.
+ * sys_spawn: launch the named program in a fresh task.  Copies the name
+ * (at most PROGREG_NAME_MAX bytes, each range-checked) and hands it to
+ * progreg_spawn.  Returns the new task id or a negative SYS_E_*.  The
+ * inline copy is what syscall_copyin_str now does.
  */
 static long
 sys_spawn(const char *uname)
@@ -810,12 +748,7 @@ sys_spawn(const char *uname)
 	if (!user_range_ok((uint64_t)uaddr, 1))
 		return (SYS_E_FAULT);
 
-	/*
-	 * Bracket the byte-by-byte copy of the user name string.  Walks
-	 * up to PROGREG_NAME_MAX bytes, stopping at the first NUL.  The
-	 * per-byte user_range_ok already covers the address; the bracket
-	 * lets the kernel actually read once CR4.SMAP is enabled.
-	 */
+	/* The bracket lets the kernel read the user bytes with CR4.SMAP on. */
 	smap_user_access_begin();
 	for (i = 0; i < PROGREG_NAME_MAX; i++) {
 		if (!user_range_ok((uint64_t)(uaddr + (long)i), 1)) {
@@ -835,11 +768,9 @@ sys_spawn(const char *uname)
 }
 
 /*
- * sys_task_alive: 1 if a task with this id is still on the live list,
- * 0 if not.  Cheap polling primitive that lets the userspace shell
- * yield-spin until a spawned child has terminated; a real blocking
- * exit-notify port (Mach death notification) is a phase-3 conversation.
- * No fault paths -- the id is a scalar, no user-VA touched.
+ * sys_task_alive: 1 if a task with this id is still on the live list, 0
+ * if not; a polling primitive for the native shell.  Touches no user
+ * memory.
  */
 static long
 sys_task_alive(uint64_t task_id)
@@ -849,23 +780,15 @@ sys_task_alive(uint64_t task_id)
 }
 
 /*
- * syscall_vm_allocate: the task-parameterized core behind SYS_VM_ALLOCATE.
- * Allocate an anonymous, zeroed, page-rounded range in `t`'s address space
- * with the requested VM_PROT_* (VM_PROT_USER forced on -- vm_allocate is
- * always user-facing) and write the chosen VA through *va_out.  Returns 0
- * on success or a negative SYS_E_*.
+ * syscall_vm_allocate: the core of SYS_VM_ALLOCATE, also driven by the
+ * task-self port's TASK_OP_VM_ALLOCATE (kern/task.c).  Allocates an
+ * anonymous, zeroed, page-rounded range in `t` with the requested
+ * VM_PROT_* plus VM_PROT_USER, and writes its VA to *va_out.  Returns 0 or
+ * a negative SYS_E_*.
  *
- * Factored out so the task-self port's TASK_OP_VM_ALLOCATE dispatch
- * (kern/task.c) drives the identical find-space -> per-page pmap_enter ->
- * vm_map_enter path -- including the rollback below -- the way a Darwin
- * binary's mach_vm_allocate would.  `t` need not be the current task: the
- * zeroing writes through each frame's direct-map KVA and pmap_enter targets
- * t->t_pmap explicitly, so installing into a not-currently-loaded address
- * space is correct (a cross-task allocate).
- *
- * Failure paths unwind: pmm_alloc_page or pmap_enter failures, and a final
- * vm_map_enter failure, roll back every page touched so far so a partial
- * allocation never leaks frames.
+ * `t` need not be the current task: pages are zeroed through the direct
+ * map and pmap_enter targets t->t_pmap.  Any failure rolls back every page
+ * mapped so far, so no frame leaks.
  */
 long
 syscall_vm_allocate(struct task *t, uint64_t size, uint32_t prot,
@@ -929,10 +852,8 @@ unwind:
 }
 
 /*
- * sys_vm_allocate: hand back a fresh user-VA range in the calling task,
- * populated with anonymous (zeroed) pages, mapped read/write (and execute
- * if asked) with U=1.  Thin wrapper over syscall_vm_allocate; returns the
- * chosen VA on success, negative SYS_E_* on failure.
+ * sys_vm_allocate: syscall_vm_allocate on the calling task.  Returns the
+ * VA or a negative SYS_E_*.
  */
 static long
 sys_vm_allocate(uint64_t size, uint32_t prot)
@@ -948,13 +869,10 @@ sys_vm_allocate(uint64_t size, uint32_t prot)
 }
 
 /*
- * syscall_vm_deallocate: the task-parameterized core behind
- * SYS_VM_DEALLOCATE.  Release a range previously handed out by
- * syscall_vm_allocate in `t`'s map.  The pair need not mirror the allocate:
- * part of one range, or a run covering several, is served by cutting the
- * entries at the edges.  What vm_map_release still refuses is a range with a
- * hole in it or one covering memory the task only borrows.  Returns 0 on
- * success, negative SYS_E_* otherwise.
+ * syscall_vm_deallocate: the core of SYS_VM_DEALLOCATE.  Releases a range
+ * of `t`'s map; it need not match an allocation, as vm_map_release cuts
+ * entries at the edges.  A range with a hole, or covering borrowed
+ * memory, is refused.  Returns 0 or a negative SYS_E_*.
  */
 long
 syscall_vm_deallocate(struct task *t, uint64_t va, uint64_t size)
@@ -976,10 +894,7 @@ syscall_vm_deallocate(struct task *t, uint64_t va, uint64_t size)
 	return (0);
 }
 
-/*
- * sys_vm_deallocate: release a previously vm_allocate'd range in the
- * calling task.  Thin wrapper over syscall_vm_deallocate.
- */
+/* sys_vm_deallocate: syscall_vm_deallocate on the calling task. */
 static long
 sys_vm_deallocate(uint64_t va, uint64_t size)
 {
@@ -988,11 +903,9 @@ sys_vm_deallocate(uint64_t va, uint64_t size)
 }
 
 /*
- * sys_port_mod_refs: drop ONE right kind from a name in the caller's
- * port space.  Used by callers that need to split a name carrying both
- * RECV and SEND (e.g. drop only SEND while keeping RECV to receive
- * back) without tearing the whole slot down.  Returns a MACH_E_* on
- * failure -- not a SYS_E_* -- so the user sees the Mach-layer reason.
+ * sys_port_mod_refs: drop one right kind from a name in the caller's
+ * space, e.g. SEND while keeping RECV, without tearing the slot down.
+ * Fails with a MACH_E_*, not a SYS_E_*.
  */
 static long
 sys_port_mod_refs(mach_port_name_t name, uint8_t right)
@@ -1003,10 +916,9 @@ sys_port_mod_refs(mach_port_name_t name, uint8_t right)
 }
 
 /*
- * sys_port_set_alloc: create a new port set in the caller's space and
- * return its name.  A port set bundles multiple ports' receive queues
- * behind one name so a single mach_msg_recv can serve any member.  The
- * name carries MACH_PORT_RIGHT_PORT_SET; you cannot SEND to it.
+ * sys_port_set_alloc: create a port set in the caller's space and return
+ * its name (MACH_PORT_RIGHT_PORT_SET; not a SEND target).  One
+ * mach_msg_recv on it serves any member.
  */
 static long
 sys_port_set_alloc(void)
@@ -1036,12 +948,10 @@ sys_port_set_remove(mach_port_name_t set_name, mach_port_name_t port_name)
 }
 
 /*
- * sys_port_set_extract: returns the name of the port set `port_name`
- * belongs to in the calling task's space, or 0 (MACH_PORT_NULL) when
- * the port is not currently a member of any set.  Read-only; never
- * mutates the space.  Failure modes (bad name, no RECV right) collapse
- * to MACH_PORT_NULL -- same encoding as "not in a set" since the
- * caller's expected reaction is identical in both cases.
+ * sys_port_set_extract: the name of the port set `port_name` belongs to
+ * in the caller's space, or MACH_PORT_NULL if none.  Read-only.  A bad
+ * name or missing RECV right also answers MACH_PORT_NULL; the caller
+ * reacts the same way.
  */
 static long
 sys_port_set_extract(mach_port_name_t port_name)
@@ -1052,14 +962,11 @@ sys_port_set_extract(mach_port_name_t port_name)
 }
 
 /*
- * sys_port_request_notification: register a notify port to receive a
- * MACH_NOTIFY_* message when the source port reaches the matching
- * event.  v1 supports MACH_NOTIFY_NO_SENDERS only; the caller must hold
- * RECEIVE on `name` and SEND on `notify_port_name`, both in the
- * current task's port space.  The user-supplied `notify_msgid` is
- * carried back unchanged in the notification's nh_msgid field so a
- * service that watches many ports through one notify port can
- * disambiguate the source.
+ * sys_port_request_notification: register a notify port for an event on
+ * `name`: MACH_NOTIFY_NO_SENDERS (caller holds RECEIVE on `name`) or
+ * MACH_NOTIFY_DEAD_NAME (caller holds SEND).  The caller needs SEND on
+ * `notify_port_name`.  `notify_msgid` comes back in the notification's
+ * nh_msgid, so one notify port can watch many sources.
  */
 static long
 sys_port_request_notification(mach_port_name_t name, uint32_t notify_type,
@@ -1073,22 +980,12 @@ sys_port_request_notification(mach_port_name_t name, uint32_t notify_type,
 }
 
 /*
- * sys_spawn_with_port: variant of SYS_SPAWN that also hands the child
- * a SEND right at the well-known MACH_PORT_PARENT slot.
- *
- * The caller passes the program name plus a name in their own
- * port_space carrying SEND right.  This handler:
- *	1. validates + copies in the program name (same as sys_spawn),
- *	2. looks up source_name in the caller's space with SEND right,
- *	3. takes a SEND ref so the port survives the spawn race,
- *	4. hands the ref to progreg_spawn_with_port, which forwards it
- *	   into arch_spawn_user's user_spawn_arg; the launcher transfers
- *	   the ref into the child's port_space via space_install_no_ref
- *	   so the install lands at name == MACH_PORT_PARENT (== 3).
- *
- * Returns the new task's id on success, or a negative SYS_E_* on
- * failure (including MACH_E_RIGHT mapped to SYS_E_INVAL when the
- * caller does not actually hold SEND on source_name).
+ * sys_spawn_with_port: SYS_SPAWN that also gives the child a SEND right,
+ * from the caller's `source_name', at MACH_PORT_PARENT (3).  The name is
+ * copied in as in sys_spawn; a SEND ref taken here keeps the port alive
+ * through the spawn and is moved into the child by the launcher
+ * (space_install_no_ref).  Returns the new task id, or a negative
+ * SYS_E_* (SYS_E_INVAL if the caller holds no SEND on source_name).
  */
 static long
 sys_spawn_with_port(const char *uname, mach_port_name_t source_name)
@@ -1122,9 +1019,8 @@ sys_spawn_with_port(const char *uname, mach_port_name_t source_name)
 		return (SYS_E_INVAL);
 
 	/*
-	 * Look up the source name with SEND right.  Lookup does not
-	 * take a ref; bump it explicitly so the port survives the
-	 * window between this return and the launcher consuming it.
+	 * Lookup takes no ref; take one so the port survives until the
+	 * launcher consumes it.
 	 */
 	src = space_lookup(current_thread->th_task->t_port_space,
 	    source_name, MACH_PORT_RIGHT_SEND, &dummy);
@@ -1133,44 +1029,32 @@ sys_spawn_with_port(const char *uname, mach_port_name_t source_name)
 	port_ref(src, MACH_PORT_RIGHT_SEND);
 
 	/*
-	 * progreg_spawn_with_port owns the ref from here -- on success
-	 * the launcher transfers it into the child's name table, on
-	 * any failure path arch_spawn_user port_derefs it.  No further
-	 * cleanup needed in this handler.
+	 * The ref is consumed: moved into the child on success, dropped on
+	 * any failure.
 	 */
 	return (progreg_spawn_with_port(kname, src));
 }
 
 /*
- * sys_task_set_exc_port: install (or replace) the current task's
- * exception port.  Caller passes a name in their own space carrying
- * SEND right; the kernel takes a SEND ref, swaps into t_exc_port, and
- * releases any previous slot's ref.  v1 returns MACH_MSG_OK or a
- * MACH_E_* without exposing the previous slot's name (matching the
- * port_request_notification convention).
+ * sys_task_set_exc_port: the older single-port form of
+ * SYS_TASK_SET_EXC_PORTS: install `notify_port_name' (a SEND right in the
+ * caller's space) in every exception type slot, so all faults go to one
+ * watcher.  Returns MACH_MSG_OK or a MACH_E_*; the previous port's name
+ * is not returned.
  */
 static long
 sys_task_set_exc_port(mach_port_name_t notify_port_name)
 {
 
-	/*
-	 * A v1 back-compat: SYS_TASK_SET_EXC_PORT installs the same
-	 * notify port across every type slot, so a caller compiled
-	 * before A v2 still routes every fault to its single watcher.
-	 * SYS_TASK_SET_EXC_PORTS is the modern form (per-type masks).
-	 */
 	return (sys_task_set_exc_ports(EXC_MASK_ALL, notify_port_name));
 }
 
 /*
- * sys_task_set_exc_ports: install (or clear) the calling task's
- * exception ports for every type named in `types_mask` (one or more
- * of EXC_MASK_*).  `notify_port_name == MACH_PORT_NULL` clears the
- * named slots; otherwise the kernel takes popcount(types_mask) SEND
- * refs on the resolved port and writes it into each named slot,
- * replacing whatever was there (refs released via port_deref).
- *
- * Returns MACH_MSG_OK or a MACH_E_* on bad name / bad mask.
+ * sys_task_set_exc_ports: set or clear the calling task's exception ports
+ * for every EXC_MASK_* type in the low 16 bits of `arg`; the high 16 are
+ * behaviour flags (EXC_FLAGS_VALID).  MACH_PORT_NULL clears the slots;
+ * otherwise each named slot takes a SEND ref on the port, releasing what
+ * it held.  Returns MACH_MSG_OK or a MACH_E_* on a bad name or mask.
  */
 static long
 sys_task_set_exc_ports(uint32_t arg, mach_port_name_t notify_port_name)
@@ -1185,11 +1069,8 @@ sys_task_set_exc_ports(uint32_t arg, mach_port_name_t notify_port_name)
 	t = current_thread->th_task;
 
 	/*
-	 * Pack types in the low 16 bits, behavior flags in the high
-	 * 16: a single syscall covers both selection and policy.
-	 * Reject any bits outside EXC_MASK_ALL / EXC_FLAGS_VALID so
-	 * forward-incompatible callers fail fast rather than having
-	 * their stray bits silently reinterpreted by a future revision.
+	 * Unknown flag bits are refused now rather than silently given a
+	 * meaning by a later revision.
 	 */
 	types_mask = arg & EXC_MASK_ALL;
 	flags      = arg & ~EXC_MASK_ALL;
@@ -1209,10 +1090,8 @@ sys_task_set_exc_ports(uint32_t arg, mach_port_name_t notify_port_name)
 		return ((long)rv);
 
 	/*
-	 * Flags are a task-wide property, applied to whichever slot
-	 * eventually fires.  Stash whenever the syscall changes any
-	 * slot bookkeeping (including the no-types empty-mask case
-	 * with flags-only).  Last writer wins.
+	 * Flags are task-wide, applied to whichever slot fires; stored on
+	 * every successful call, even a flags-only one.  Last writer wins.
 	 */
 	spin_lock(&t->t_lock);
 	t->t_exc_flags = flags;
@@ -1221,20 +1100,12 @@ sys_task_set_exc_ports(uint32_t arg, mach_port_name_t notify_port_name)
 }
 
 /*
- * sys_task_get_port_snapshot: copy one wire-format
- * mach_port_snapshot_entry per populated slot in the named task's
- * port_space into the caller's array.  Drives the userspace `lsmp`
- * tool ("list mach ports"): a debugger-style introspection surface
- * that has no Linux equivalent because Linux has no Mach ports.
- *
- * v1 supports only task_id == 0 (snapshot self).  Cross-task
- * introspection would need either a task_for_pid-style authorization
- * primitive or a per-task ref-bumping lookup; deferred until a real
- * consumer (e.g. an external debugger task) shows up.
- *
- * Returns the number of entries written on success, or a negative
- * SYS_E_*.  `max_entries` is capped at MACH_PORT_SNAPSHOT_MAX so the
- * kernel staging buffer stays on the syscall stack.
+ * sys_task_get_port_snapshot: copy one mach_port_snapshot_entry per
+ * populated slot of the task's port space into the caller's array, for
+ * the `lsmp' tool.  Only task_id 0 (self) is accepted: another task would
+ * need an authorization primitive (task_for_pid-style).  `max_entries` is
+ * capped at MACH_PORT_SNAPSHOT_MAX so the staging buffer fits on the
+ * stack.  Returns the number written or a negative SYS_E_*.
  */
 static long
 sys_task_get_port_snapshot(uint64_t task_id,
@@ -1262,9 +1133,8 @@ sys_task_get_port_snapshot(uint64_t task_id,
 	n = port_space_snapshot(t->t_port_space, kbuf, max_entries);
 
 	/*
-	 * Copy out without holding any port_space lock: kbuf is a
-	 * private stack snapshot, so a faulting user_buf write only
-	 * tears down this syscall, never deadlocks ps_lock.
+	 * Copied out with no port_space lock held, so a faulting user write
+	 * cannot deadlock ps_lock.
 	 */
 	smap_user_access_begin();
 	for (i = 0; i < n; i++)
@@ -1274,15 +1144,9 @@ sys_task_get_port_snapshot(uint64_t task_id,
 }
 
 /*
- * sys_task_get_vm_regions: copy one wire-format mach_vm_region_entry
- * per live entry in the named task's vm_map into the caller's array.
- * Drives the userspace `vmmap` tool: dumps a process's VM layout the
- * same way Darwin's vmmap(1) does, again a question Linux only
- * answers via /proc parsing.
- *
- * v1 supports only task_id == 0 (self) for the same reason as the
- * port-snapshot syscall; cross-task introspection needs an auth
- * primitive that has not landed yet.
+ * sys_task_get_vm_regions: copy one mach_vm_region_entry per vm_map entry
+ * into the caller's array, for the `vmmap' tool (after Darwin's
+ * vmmap(1)).  Self only (task_id 0), as for the port snapshot.
  */
 static long
 sys_task_get_vm_regions(uint64_t task_id,
@@ -1317,35 +1181,18 @@ sys_task_get_vm_regions(uint64_t task_id,
 }
 
 /*
- * sys_task_kill: capability-based async terminate.
+ * sys_task_kill: capability-based asynchronous terminate.  Resolves
+ * `target_port_name` with SEND in the caller's space, requires it to be a
+ * task-self port (PORT_SPECIAL_TASK_SELF), and requests termination of
+ * the task id it stores.  You cannot kill what you hold no port to: your
+ * own (MACH_PORT_TASK_SELF, 1), or one handed over in a message, by
+ * SYS_SPAWN_WITH_PORT or SYS_SPAWN_RETURNS_TASKPORT.  kernel_task is
+ * refused, though ring 3 cannot reach its port anyway.
  *
- * `target_port_name` is a port name in the caller's space.  The kernel
- * resolves it, verifies the SEND right, checks that the port's special
- * tag is PORT_SPECIAL_TASK_SELF (i.e., the named port IS a task's
- * task-self port), reads the target task id stored in p_special_arg
- * (never a raw struct task * -- a task-self port can outlive its task),
- * and fires task_request_terminate against it.
- *
- * Caller can trivially kill itself by passing MACH_PORT_TASK_SELF (==1)
- * -- every task has its own task-self port wired into slot 1 of its
- * space at task_create time.  To kill *another* task, the caller must
- * hold SEND on the target's task-self port; today the only ways to
- * acquire that are (a) being handed it via OOL, (b) parent-inject via
- * SYS_SPAWN_WITH_PORT.  So the v1 attack surface is small and
- * Mach-shaped: you cannot kill what you do not have a port to.
- *
- * Refuses kernel_task explicitly (its task-self port is in
- * kernel_space, which is not directly reachable from ring 3 anyway,
- * but the check is cheap and documents intent).
- *
- * Returns MACH_MSG_OK on success, MACH_E_RIGHT if the SEND lookup
- * fails, MACH_E_INVAL if the port is not a task-self port or names
- * kernel_task.  Async semantics: the kill is queued; if the caller
- * killed itself, the actual retire happens on this syscall's return
- * (the dispatch-entry detection point catches it on the NEXT syscall,
- * or this very return path runs through the IRQ-return check at the
- * next PIT tick).  More commonly the caller is not the target, so the
- * syscall returns normally and the target dies asynchronously.
+ * Returns MACH_MSG_OK, MACH_E_RIGHT if the SEND lookup fails, or
+ * MACH_E_INVAL for a non-task port or kernel_task.  The kill is queued; a
+ * self-kill retires at this syscall's exit (detection point #5), another
+ * task dies asynchronously.
  */
 static long
 sys_task_kill(mach_port_name_t target_port_name)
@@ -1363,14 +1210,10 @@ sys_task_kill(mach_port_name_t target_port_name)
 		return ((long)MACH_E_INVAL);
 
 	/*
-	 * The task-self port stores the target's immutable id, never a
-	 * raw struct task * (which would dangle once the task is reaped
-	 * while this SEND right keeps the port object alive -- the very
-	 * UAF this avoids).  Hand the id to task_request_terminate, which
-	 * re-validates it under tasks_lock and silently no-ops if the
-	 * task is already gone; a stale taskport name thus kills nothing
-	 * instead of dereferencing freed memory.  kernel_task is id 1 and
-	 * is refused explicitly.
+	 * The port stores the task's id, not a struct task *, which would
+	 * dangle once the task is reaped while a SEND right keeps the port
+	 * alive.  task_request_terminate re-validates the id under
+	 * tasks_lock and does nothing if the task is gone.
 	 */
 	target_id = (uint64_t)(uintptr_t)p->p_special_arg;
 	if (target_id == 0 || target_id == kernel_task->t_id)
@@ -1379,33 +1222,20 @@ sys_task_kill(mach_port_name_t target_port_name)
 	task_request_terminate(target_id);
 
 	/*
-	 * Caller may have just killed itself.  The detection sites take
-	 * care of it on the return path (syscall_dispatch's entry check
-	 * fires on the next syscall; thread_block_release's pre-park and
-	 * the IRQ-return check cover the in-between cases).  Don't try
-	 * to short-circuit here -- returning MACH_MSG_OK gives the user
-	 * code its sysret if the kill targeted a different task, and
-	 * does no harm if it was a self-kill (the thread retires before
-	 * any user-visible side effect).
+	 * A self-kill is not short-circuited here: syscall_dispatch's exit
+	 * check retires the thread before it returns to ring 3.
 	 */
 	return ((long)MACH_MSG_OK);
 }
 
 /*
- * sys_spawn_returns_taskport: spawn variant for callers that intend
- * to manage the child (kill/signal it later).  Atomically returns
- * BOTH the new task's id (positive return value) AND a port name in
- * the caller's space holding SEND on the child's task-self port,
- * written through `out_taskport_name`.
- *
- * The capability handed back is the exact argument SYS_TASK_KILL
- * accepts: parent + future task-manager service use this to terminate
- * a child without needing any other lookup or auth.  The Mach
- * fingerprint is: "if you spawned it, you can kill it."
- *
- * Failures fan out into SYS_E_FAULT (bad pointers), SYS_E_INVAL (no
- * such program), SYS_E_NOSYS (out-of-resources during the new task's
- * setup).  On failure `*out_taskport_name` is untouched.
+ * sys_spawn_returns_taskport: spawn for a caller that will manage the
+ * child.  Returns the task id and writes to `out_taskport_name` a name in
+ * the caller's space with SEND on the child's task-self port -- exactly
+ * what SYS_TASK_KILL takes: if you spawned it, you can kill it.
+ * SYS_E_FAULT for bad pointers, SYS_E_INVAL for an unknown program, or
+ * the launcher's SYS_E_* on setup failure; `*out_taskport_name` is then
+ * untouched.
  */
 static long
 sys_spawn_returns_taskport(const char *uname,
@@ -1456,21 +1286,13 @@ sys_spawn_returns_taskport(const char *uname,
 }
 
 /*
- * sys_spawn_args: the full spawn -- a program name, a command-line
- * argument vector, AND (exactly like SYS_SPAWN_RETURNS_TASKPORT) a SEND
- * right on the new task's task-self port installed in the caller's
- * space.  The argv strings are copied into one kernel-side flattened
- * block: (argc+1) leading char* slots (the last is the NULL
- * terminator) followed by the packed, NUL-separated strings, so each
- * kargv[i] points into the same allocation and a single kfree releases
- * it.  Ownership of that block transfers to progreg_spawn_args, which
- * frees it on failure and hands it to the launcher (which materialises
- * it onto the child's stack, then frees it) on success.
- *
- * argc 0 / uargv NULL degrades to the argument-free returns-taskport
- * spawn.  Bounds: argc <= SPAWN_ARGV_MAX, total string bytes <
- * SPAWN_ARG_BYTES_MAX -- a violation is SYS_E_INVAL.  On any failure
- * *out_taskport_name is untouched.
+ * sys_spawn_args: the full spawn -- a program name, an argument vector,
+ * and the taskport of SYS_SPAWN_RETURNS_TASKPORT.  argv is copied into one
+ * flat block ((argc+1) char * slots, the last NULL, then the packed
+ * strings), freed by a single kfree, which progreg_spawn_args consumes.
+ * argc 0 or a NULL uargv spawns with no arguments.  argc beyond
+ * SPAWN_ARGV_MAX or more than SPAWN_ARG_BYTES_MAX string bytes is
+ * SYS_E_INVAL.  On failure *out_taskport_name is untouched.
  */
 static long
 sys_spawn_args(const char *uname, char *const *uargv, uint64_t argc,
@@ -1592,12 +1414,9 @@ sys_spawn_args(const char *uname, char *const *uargv, uint64_t argc,
 }
 
 /*
- * sys_thread_set_exc_ports: per-thread variant of
- * sys_task_set_exc_ports.  Operates on the calling thread (no API
- * for setting another thread's slots today); the kernel takes ref
- * accounting the same way as the task-level path.
- *
- * Returns MACH_MSG_OK or a MACH_E_*.
+ * sys_thread_set_exc_ports: sys_task_set_exc_ports for the calling thread
+ * (there is no way to name another), with the same ref accounting and no
+ * flag bits.  Returns MACH_MSG_OK or a MACH_E_*.
  */
 static long
 sys_thread_set_exc_ports(uint32_t types_mask, mach_port_name_t notify_port_name)

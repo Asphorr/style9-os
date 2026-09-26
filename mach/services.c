@@ -33,14 +33,9 @@ extern int			 port_install_send_in_kernel(struct port *,
 				    mach_port_name_t *name_out);
 
 /*
- * Common reply-shaping helper.  Builds a header in `hdr`, points the
- * inline payload bytes at `body` of `body_size`, and sends back to
- * `req->msgh_local` via COPY_SEND on the caller's space.  Returns the
- * mach_msg_send result so caller can propagate.
- *
- * Layout: [header | body].  No mach_msg_body / port_descriptor needed
- * since none of our services hand out further capabilities -- the
- * caller already has a SEND to *us* via the bootstrap lookup.
+ * Reply to `req->msgh_local` with a bare [header | body] message (at most
+ * 1024 bytes of body) and return mach_msg_send's result.  No descriptors:
+ * these services hand out no further rights.
  */
 static int
 svc_reply_inline(const struct mach_msg_header *req, struct port_space *from,
@@ -103,11 +98,8 @@ svc_stats_dispatch(const struct mach_msg_header *req, struct port_space *from)
 		return (MACH_E_INVAL);
 
 	/*
-	 * Collect a best-effort thread count by summing t_nthreads
-	 * across the live tasks.  Reads t_nthreads without taking
-	 * t_lock; the value is a monotonic counter under one writer at
-	 * a time, so a torn read yields a slightly stale total -- fine
-	 * for a stats snapshot.
+	 * A best-effort thread count: t_nthreads is summed without t_lock,
+	 * so the total may be slightly stale.
 	 */
 	ntasks  = task_snapshot(tasks, SVC_TASKS_MAX);
 	threads = 0;
@@ -153,12 +145,10 @@ svc_tasks_dispatch(const struct mach_msg_header *req, struct port_space *from)
 		spin_unlock(&t->t_lock);
 
 		/*
-		 * Per-resource counts read OUTSIDE t_lock: port_space_inuse
-		 * takes the space lock, vm_map_region_count takes vm_lock --
-		 * nesting either under t_lock would invert no existing order,
-		 * but keeping them separate keeps t_lock a short leaf.  A task
-		 * can't be reaped mid-handler (cooperative kernel, no yield
-		 * here), so the t_port_space / t_map pointers stay valid.
+		 * Read outside t_lock, which stays a short leaf:
+		 * port_space_inuse takes ps_lock, vm_map_region_count
+		 * vm_lock.  task_snapshot takes no refs, so this assumes the
+		 * task, its t_port_space and t_map are not reaped meanwhile.
 		 */
 		r.tr_entries[i].te_nports     =
 		    (uint32_t)port_space_inuse(t->t_port_space);
@@ -204,10 +194,8 @@ svc_progreg_dispatch(const struct mach_msg_header *req,
 		r.pr_total++;
 
 		/*
-		 * Stop packing when the next name plus its terminator would
-		 * not fit, but keep counting -- pr_total is the answer to
-		 * "how many are there", and it stays true even when
-		 * pr_count cannot.
+		 * Names that no longer fit are not packed but still counted:
+		 * pr_total is the true total even when pr_count falls short.
 		 */
 		for (need = 0; e->pr_name[need] != '\0'; need++)
 			continue;
@@ -219,10 +207,8 @@ svc_progreg_dispatch(const struct mach_msg_header *req,
 		r.pr_names[off++] = '\0';
 
 		/*
-		 * The image's own first four bytes decide what it is --
-		 * the same sniff usermode_setup_image makes to pick a
-		 * loader, so the shell's answer cannot drift from the
-		 * kernel's.
+		 * The image's magic decides, as in usermode_setup_image's
+		 * loader choice, so the answer matches the kernel's.
 		 */
 		if (e->pr_size >= sizeof(uint32_t) && r.pr_count < 64) {
 			uint32_t	magic;
@@ -242,13 +228,10 @@ svc_progreg_dispatch(const struct mach_msg_header *req,
 /* ---- "man" service ---------------------------------------------------- */
 
 /*
- * Symbols emitted by `objcopy -I binary` when wrapping the rendered man
- * page text.  See the Makefile MAN_OBJS section: docs/man/port.9 ->
- * obj/port.9.txt -> obj/port_man.o with symbols _binary_port_9_txt_*.
- *
- * Adding a new page: drop docs/man/<name>.9 on disk (the Makefile auto-
- * detects it), then declare the matching extern symbols here and
- * append an entry to man_pages[] below.
+ * Rendered man pages, linked in by `objcopy -I binary` (Makefile
+ * MAN_OBJS: docs/man/port.9 -> obj/port.9.txt -> obj/port_man.o, symbols
+ * _binary_port_9_txt_*).  A new docs/man/<name>.9 is built
+ * automatically; declare its symbols here and add it to man_pages[].
  */
 extern uint8_t	_binary_port_9_txt_start[];
 extern uint8_t	_binary_port_9_txt_end[];
@@ -304,16 +287,11 @@ man_find(const char *name)
 }
 
 /*
- * MAN_OP_GET dispatcher.  Reads the requested page name from the inline
- * body of the request, looks it up, and on success ships the rendered
- * text back as a single OOL descriptor.  On miss returns a bare reply
- * with msgh_id = MAN_NOT_FOUND so the caller can distinguish from a
- * generic send error.
- *
- * Uses mach_msg_send_trusted so send_capture_ool accepts the kernel
- * .rodata address in the OOL descriptor; without this exemption the
- * sender-VA range validation rejects every send from this dispatcher
- * (which runs in the ring-3 caller's thread context).
+ * MAN_OP_GET: look up the page named in the request body and send its
+ * text back as one OOL descriptor; a miss is a bare reply with msgh_id
+ * MAN_NOT_FOUND.  The reply goes through mach_msg_send_trusted: this
+ * runs in the ring-3 caller's thread, and the page's kernel .rodata
+ * address would otherwise fail the user-VA check.
  */
 static int
 svc_man_dispatch(const struct mach_msg_header *req, struct port_space *from)
@@ -396,11 +374,9 @@ svc_man_dispatch(const struct mach_msg_header *req, struct port_space *from)
 /* ---- "echool" service ------------------------------------------------- */
 
 /*
- * Walk the descriptor area of the inbound message looking for the first
- * OOL descriptor; cap the search by msgh_size and use the same type-tag
- * dispatch as port_msg.c.  Returns the OOL descriptor's address+size
- * pair, or false if there is no usable OOL descriptor.  Validates
- * everything against the wire format before touching sender memory.
+ * Find the first OOL descriptor in the request, walking the descriptors
+ * by type tag as port_msg.c does and bounded by msgh_size.  Returns its
+ * address and size, or false if there is none or the area is malformed.
  */
 static bool
 echool_find_ool(const struct mach_msg_header *req, uint64_t *addr_out,
@@ -469,17 +445,11 @@ echool_fnv1a(const uint8_t *buf, uint32_t size)
 }
 
 /*
- * Special-port dispatcher: runs synchronously in the sender's thread,
- * so the sender's pmap is current and OOL VA dereferences resolve via
- * the user's own page tables.  Bypasses recv_install_ool entirely --
- * stress_ool already covers that leg of the pipeline; this oracle's job
- * is to verify userspace can construct a wire-format-correct OOL
- * descriptor that the kernel parses cleanly.
- *
- * Cap the payload at MACH_MSG_OOL_MAX_BYTES so a misbehaving sender
- * can't park us in a multi-megabyte byte-by-byte loop.  size_t is the
- * type the loop ranges over even though `size` is uint32_t, so the
- * 1 MiB cap is the real wall.
+ * ECHOOL_OP_CHECKSUM: reply with the FNV-1a of the request's OOL payload
+ * in msgh_id.  Runs in the sender's thread, so the payload is read
+ * straight from its address space; the receive side is stress_ool's to
+ * test.  This checks that userspace builds an OOL descriptor the kernel
+ * parses.  Payloads over MACH_MSG_OOL_MAX_BYTES are refused.
  */
 static int
 svc_echool_dispatch(const struct mach_msg_header *req, struct port_space *from)
@@ -501,13 +471,7 @@ svc_echool_dispatch(const struct mach_msg_header *req, struct port_space *from)
 	if (size == 0) {
 		sum = 0u;
 	} else {
-		/*
-		 * OOL bytes live at the sender's user-VA `addr` (the
-		 * descriptor's `address` field); the special-port path
-		 * runs in the sender's pmap, so the bytes are reachable
-		 * but the kernel needs EFLAGS.AC = 1 to read them once
-		 * CR4.SMAP is set.  Bracket the single FNV-1a sweep.
-		 */
+		/* A user address: the sweep needs a SMAP bracket. */
 		payload = (const uint8_t *)(uintptr_t)addr;
 		smap_user_access_begin();
 		sum = echool_fnv1a(payload, size);
@@ -533,11 +497,8 @@ static struct port	*svc_man_port;		/* (c) */
 static struct port	*svc_progreg_port;	/* (c) */
 
 /*
- * Each service is a kernel-owned PORT_SPECIAL_SERVICE port (the
- * dispatcher function lives in p_special_arg).  We then install a
- * SEND right into kernel_space and hand the resulting name to
- * bootstrap_register so lookups can resolve it via the normal
- * descriptor-translation path.
+ * Create a kernel-owned PORT_SPECIAL_SERVICE port for `fn`, give it a
+ * SEND name in kernel_space, and register that with bootstrap.
  */
 static struct port *
 svc_register(const char *name, port_service_fn fn)

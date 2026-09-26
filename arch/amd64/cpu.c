@@ -21,24 +21,17 @@
 #include "uart.h"
 
 /*
- * The blocks themselves.
- *
- * Block 0 is initialised HERE rather than by cpu_bsp_init, so that the
- * boot CPU's block is already coherent in the image: cp_self must be right
- * before the first read through the segment base, and the first read
- * happens in the same breath as the write that makes it possible.  An
- * application processor gets its block filled by the code that starts it,
- * which knows the id it is handing out.
+ * Block 0 is initialised in the image rather than by cpu_bsp_init, so
+ * cp_self is already right when the GS base is first written and read.
+ * An AP's block is filled by cpu_register from the MADT.
  */
 struct cpu	cpus[MAXCPU] = {
 	[0] = { .cp_self = &cpus[0], .cp_id = 0 },
 };
 
 /*
- * Both start at one, and the one they start at is this processor: it is
- * present because it is here, and online because it is executing.  Everything
- * else has to be described (cpu_register) and then started (which sets
- * cp_online on the CPU that arrives) before either number moves.
+ * Both start at one: the boot CPU.  Others are counted present by
+ * cpu_register and online by cpu_mark_online once they arrive.
  */
 static unsigned int	ncpu_present = 1;	/* (c) blocks filled in */
 static unsigned int	ncpu_online = 1;	/* (a) running kernel   */
@@ -51,62 +44,39 @@ cpu_bsp_init(void)
 	uint32_t	ecx;
 	uint32_t	edx;
 
-	/*
-	 * The whole per-CPU mechanism is this one register: write a block's
-	 * address into the GS base and `%gs:0' is that block, with nothing
-	 * to index and nothing to look up.
-	 */
 	wrmsr(MSR_GS_BASE, (uint64_t)(uintptr_t)&cpus[0]);
 
 	/*
-	 * And which processor this is, from CPUID rather than from the APIC.
-	 * The APIC's ID register would say the same thing, but only once the
-	 * APIC has been found, mapped and enabled -- three subsystems away
-	 * from here.  CPUID answers now, which matters because the MADT
-	 * arrives naming processors by APIC id and has to be able to recognise
-	 * the one already running.  lapic_init writes the same value again
-	 * from the register, and the two agreeing is checked there.
+	 * The APIC id, from CPUID because that needs no mapped APIC; the
+	 * MADT walk recognises the running CPU by it.  lapic_init re-reads
+	 * it from the ID register and checks the two agree.
 	 */
 	cpuid_count(1, 0, &eax, &ebx, &ecx, &edx);
 	cpus[0].cp_lapic_id = CPUID_1_EBX_APICID(ebx);
 }
 
 /*
- * EVERYTHING A PROCESSOR HAS TO BE TOLD ABOUT ITSELF BEFORE IT CAN RUN A
- * THREAD, in one place because the list is not obvious and every item on it
- * fails silently and somewhere else.
+ * Everything a processor must be told about itself before it can run a
+ * thread.  Control registers and MSRs are per-CPU, so an AP inherits none
+ * of the boot CPU's; it does share the page tables, GDT layout and IDT, so
+ * an omission never looks like one.  It looks like:
  *
- * The boot processor got all of this from boot.S and from the bring-up in
- * kmain, and none of it from the copy in the image: a control register is per
- * CPU and an MSR is per CPU, so an application processor arriving later
- * inherits exactly nothing.  What it does inherit is the page tables, the GDT
- * layout, the IDT, and the kernel's opinions -- so the omission never looks
- * like an omission.  It looks like:
+ *	no CR0.WP	-- ring 0 writes straight through read-only pages, so
+ *			   the kernel's copy-on-write faults never happen on
+ *			   that CPU and two processes share a "private" page.
+ *	no CR4.OSFXSR	-- #UD on the first FXRSTOR, i.e. the first context
+ *			   switch.
+ *	no CR4.SMAP	-- kernel dereferences of user pointers do not fault,
+ *			   on that CPU only.
+ *	no EFER.SCE	-- #UD on the first system call made there.
  *
- *	no CR0.WP	-- ring 0 writes straight through a read-only page, so
- *			   the copy-on-write fault that the kernel arranges on
- *			   purpose simply does not happen ON THAT CPU, and two
- *			   processes quietly share a page they each believe is
- *			   private.
- *	no CR4.OSFXSR	-- #UD on the first FXRSTOR, which is the first context
- *			   switch this processor performs.
- *	no CR4.SMAP	-- kernel code dereferences user pointers without
- *			   faulting, on that CPU only.
- *	no EFER.SCE	-- #UD on the first system call made by a thread that
- *			   happened to be scheduled there.
+ * CR0.CD and CR0.NW (caches off after INIT) are cleared earlier, in
+ * aptramp.S, in the write that turns paging on.
  *
- * One more of the same shape is NOT here, because it has to be done before
- * this can be reached: CR0.CD and CR0.NW come out of reset set, and an
- * application processor that keeps them runs with its caches off.  The
- * trampoline clears them in the same write that turns paging on -- see
- * aptramp.S, which is the last place this processor executes before it has
- * anywhere to report from.
- *
- * The boot processor does not call this -- it got CR0.WP from boot.S and the
- * rest from kmain, one at a time and each with a line of log.  What keeps the
- * two from drifting is that fpu_init, smap_enable_runtime and syscall_init are
- * now split, and the halves this calls are the same functions they call: there
- * is one copy of each fact, and this is the list of which facts there are.
+ * The boot CPU does not call this: it gets CR0.WP from boot.S and the rest
+ * from kmain.  fpu_init and syscall_init call the same per-CPU halves used
+ * here, so each fact has one copy; smap_enable_runtime sets CR4.SMAP
+ * itself, and smap_init_cpu copies it only where smap_enabled says so.
  */
 void
 cpu_state_init(void)
@@ -114,10 +84,8 @@ cpu_state_init(void)
 	uint64_t	cr0;
 
 	/*
-	 * Ring 0 obeys the read-only bit.  boot.S sets this beside CR0.PG for
-	 * the boot processor; the trampoline that starts an application
-	 * processor deliberately sets nothing it does not have to, so it
-	 * arrives without it.
+	 * CR0.WP: ring 0 obeys the read-only bit.  The trampoline sets only
+	 * what it must, so an AP arrives without it.
 	 */
 	__asm__ __volatile__ ("mov %%cr0, %0" : "=r" (cr0));
 	cr0 |= ((uint64_t)1 << 16);
@@ -134,12 +102,9 @@ cpu_print(void)
 	struct cpu	*seen;
 
 	/*
-	 * The round trip is the test.  `seen' came out of the segment base
-	 * the hardware will use for every per-CPU reference from here on;
-	 * &cpus[0] is where the C side believes the block is.  If those
-	 * differ, everything works until the first per-CPU write, which
-	 * then lands somewhere nobody is looking -- so the check earns its
-	 * panic, and the panic names which of the two it distrusted.
+	 * The round trip is the test: `seen' came through the GS base,
+	 * &cpus[0] is where C believes the block is.  If they differ, the
+	 * first per-CPU write lands somewhere nobody is looking.
 	 */
 	seen = curcpu();
 	if (seen != &cpus[0])
@@ -161,11 +126,8 @@ cpu_register(uint32_t lapic_id, uint32_t acpi_id)
 	unsigned int	i;
 
 	/*
-	 * The processor doing the registering is already in block 0, and the
-	 * MADT lists it like any other.  Matching by APIC id rather than by
-	 * position is the only reliable way to recognise it: the table's order
-	 * is the firmware's business and the boot processor is not obliged to
-	 * be first in it.
+	 * The MADT lists the boot CPU, already in block 0, like any other,
+	 * and not necessarily first; recognise it by APIC id.
 	 */
 	for (i = 0; i < ncpu_present; i++) {
 		if (cpus[i].cp_lapic_id == lapic_id) {
@@ -195,14 +157,7 @@ cpu_mark_online(void)
 
 	cp = curcpu();
 
-	/*
-	 * The flag is released and the count is added to, in that order, and
-	 * both with barriers: whoever started this CPU is spinning on the flag
-	 * in its block, and whoever asks how many CPUs are up wants a number
-	 * that never counts one twice.  A CPU announces only itself, which is
-	 * why this takes no argument -- the alternative is an interface where
-	 * one CPU can declare another one running.
-	 */
+	/* Release the flag the starter spins on, then count this CPU once. */
 	__atomic_store_n(&cp->cp_online, 1, __ATOMIC_RELEASE);
 	__atomic_add_fetch(&ncpu_online, 1, __ATOMIC_ACQ_REL);
 }
@@ -222,30 +177,10 @@ cpu_online_count(void)
 }
 
 /*
- * One line per CPU that has been brought up.
- *
- * Reads the blocks by address rather than through the segment base, which
- * is the only way to see a CPU that is not this one -- and the reason the
- * fields are worth a command at all: with one CPU this says what the
- * scheduler already says, and with two it is the difference between "the
- * kernel is busy" and "that one is idle while this one queues".
- *
- * Deliberately unlocked.  Everything here is a single word being read while
- * its owner may be writing it, so a line can be a moment out of date; a
- * lock would buy consistency between fields nobody compares and cost the
- * ability to run this from a wedged CPU, which is when it is wanted most.
- */
-/*
- * WHO IS ON EACH PROCESSOR, SAID WITHOUT THE CONSOLE.
- *
- * Everything else this kernel can say goes through kprintf, and kprintf goes
- * through a lock that every processor shares -- so the one machine state
- * where you most want to be told what is happening is the one state where
- * nothing can tell you.  This writes bytes at the UART directly: no lock, no
- * formatting, no cursor, nothing that can be held by the CPU being described.
- *
- * The numbers are printed a nibble at a time for the same reason.  It is
- * ugly, it is meant to be, and it works when the pretty one cannot.
+ * Who is on each processor, said without the console.  kprintf takes the
+ * console lock every CPU shares, so it cannot report on a machine wedged
+ * on it; this writes at the UART directly, with no lock and no formatting
+ * (hence hex a nibble at a time).
  */
 void
 cpu_census_uart(void)
@@ -267,9 +202,9 @@ cpu_census_uart(void)
 		uart_puts(th != NULL && th->th_name != NULL ? th->th_name :
 		    (cp->cp_online != 0 ? "(parked)" : "(down)"));
 		/*
-		 * The task, because the name does not distinguish them: every
-		 * ring-3 thread here is called "user-elf", and "which program
-		 * is that" is the whole question when one of them is spinning.
+		 * The task id too: ring-3 threads share generic names
+		 * ("user-elf", "fork"), and which program is spinning is the
+		 * question.
 		 */
 		uart_putc('.');
 		for (sh = 12; sh >= 0; sh -= 4)
@@ -282,6 +217,11 @@ cpu_census_uart(void)
 	uart_puts("\r\n");
 }
 
+/*
+ * One line per CPU.  Reads the blocks by address, the only way to see
+ * another CPU's, and unlocked: each field is one word its owner may be
+ * writing, so a line can be a moment stale, and no lock is needed to ask.
+ */
 void
 cpu_dump(void)
 {
@@ -300,10 +240,8 @@ cpu_dump(void)
 			continue;
 		}
 		/*
-		 * Online but holding no thread is not an idle CPU, it is a
-		 * parked one -- it has never been in the scheduler and has no
-		 * idle thread to fall back on.  Printing it like an idle CPU
-		 * would invite exactly the wrong conclusion from `cpu'.
+		 * Online with no thread and no idle thread is parked, not
+		 * idle: it has never been in the scheduler.
 		 */
 		if (th == NULL && cp->cp_idle_thread == NULL) {
 			kprintf("cpu %u: lapic %u, online and PARKED, "
@@ -313,10 +251,8 @@ cpu_dump(void)
 			continue;
 		}
 		/*
-		 * The switch count is the line's reason for existing now that
-		 * there is more than one CPU: `running' is a snapshot and can
-		 * be idle on a processor that has done half the machine's
-		 * work, while this is the tally that says where the work went.
+		 * `running' is a snapshot; the switch count says where the
+		 * work actually went.
 		 */
 		kprintf("cpu %u: lapic %u, running %s, idle id=%llu, "
 		    "preempt %d%s, quantum %u/%u, %llu switches, "

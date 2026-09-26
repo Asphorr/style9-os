@@ -8,14 +8,11 @@
 #include "style9.h"
 
 /*
- * Ring-3 helper for the kernel "man" service.
- *
- * Wire protocol mirrors mach/services.c svc_man_dispatch: send a complex
- * request whose body is the NUL-terminated short page name (no extension);
- * the service replies either with a complex message carrying one OOL
- * descriptor that names the rendered text now mapped into the caller's
- * vm_map, or with a bare header whose msgh_id is MAN_NOT_FOUND when the
- * page is not registered.
+ * Ring-3 helper for the kernel "man" service (svc_man_dispatch in
+ * mach/services.c).  The request is a plain message whose body is the
+ * NUL-terminated page name, no extension.  The reply is either COMPLEX,
+ * with one OOL descriptor naming the rendered text now mapped into the
+ * caller, or a bare header with msgh_id MAN_NOT_FOUND.
  */
 
 int

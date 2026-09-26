@@ -18,9 +18,8 @@
 #include "syscall.h"
 
 /*
- * Symbols emitted by objcopy when it wraps each user.elf into its
- * %_elf.o.  The wrapper uses the FILE NAME with non-alphanumeric
- * characters mapped to underscores, so e.g. hello.elf becomes
+ * Symbols objcopy emits when it wraps each user image: the file name with
+ * non-alphanumerics mapped to '_', so hello.elf becomes
  * _binary_hello_elf_start etc.
  */
 extern uint8_t	_binary_hello_elf_start[];
@@ -81,12 +80,9 @@ extern uint8_t	_binary_crasher_elf_start[];
 extern uint8_t	_binary_crasher_elf_end[];
 
 /*
- * Mach-O-delivered programs.  Same source-and-libc as any other ring-3
- * binary, but the embedded blob is a Mach-O container (tools/elf2macho
- * rewraps the ELF) rather than an ELF -- the spawn launcher sniffs the
- * image magic and routes these to macho_load instead of elf_load.  Two
- * containers from the one program exercise both loader paths: a thin
- * x86-64 image and a single-slice fat/universal archive.
+ * A native program rewrapped as Mach-O by tools/elf2macho; the launcher
+ * sniffs the magic and uses macho_load.  One thin image, one single-slice
+ * fat archive, to cover both loader paths.
  */
 extern uint8_t	_binary_machotest_macho_start[];
 extern uint8_t	_binary_machotest_macho_end[];
@@ -95,10 +91,9 @@ extern uint8_t	_binary_machotest_fat_macho_start[];
 extern uint8_t	_binary_machotest_fat_macho_end[];
 
 /*
- * Darwin-personality program (S2).  A freestanding stub (user/darwinhello.S,
- * no libstyle9) delivered as a Mach-O that declares PLATFORM_MACOS, so
- * macho_load runs its task under the Darwin syscall ABI -- it issues genuine
- * Apple class-encoded syscalls answered by kern/darwin.c.
+ * Darwin-personality probes: Mach-Os declaring PLATFORM_MACOS that issue
+ * Apple class-encoded syscalls directly (user/darwinhello.S, a
+ * freestanding stub, and user/darwinmsg.c).
  */
 extern uint8_t	_binary_darwinhello_macho_start[];
 extern uint8_t	_binary_darwinhello_macho_end[];
@@ -107,140 +102,105 @@ extern uint8_t	_binary_darwinmsg_macho_start[];
 extern uint8_t	_binary_darwinmsg_macho_end[];
 
 /*
- * S4 dynamic-linking test program: a real clang/ld64.lld dynamic Mach-O that
- * imports from /usr/lib/libSystem.B.dylib and names /usr/lib/dyld as its
- * LC_LOAD_DYLINKER.  The launcher maps our clean-room dyld (user/dyld.c)
- * alongside it and enters through dyld, which binds it against our libSystem.
- * dyld itself is NOT registered here -- it is the linker, never spawned by name.
+ * dyldhello: a clang/ld64.lld dynamic Mach-O importing from
+ * /usr/lib/libSystem.B.dylib, with /usr/lib/dyld as LC_LOAD_DYLINKER.
+ * dyld itself is not registered: it is mapped by the launcher, never
+ * spawned by name.
  */
 extern uint8_t	_binary_dyldhello_macho_start[];
 extern uint8_t	_binary_dyldhello_macho_end[];
 
 /*
- * Load-bias proxy: dyldhello relinked at the default base (__TEXT @
- * 0x100000000, the addressing of a real Apple binary).  Exercises
- * macho_load's relocate-low path -- the prerequisite for loading an
- * arbitrary Apple binary that cannot be relinked at the source.
+ * dyldbig: dyldhello linked at Apple's default base (__TEXT at
+ * 0x100000000), exercising macho_load's relocate-low path.
  */
 extern uint8_t	_binary_dyldbig_macho_start[];
 extern uint8_t	_binary_dyldbig_macho_end[];
 
 /*
- * The S5 north star: a REAL Apple x86-64 macOS CLI binary (figlet, a Homebrew
- * bottle vendored in extern/).  Not one of our own builds -- a genuine
- * Apple-toolchain dynamic Mach-O (chained fixups, __TEXT @ 0x100000000,
- * /usr/lib/libSystem.B.dylib only).  macho_load relocates it low, our dyld
- * binds it against our libSystem, and it runs its own LC_MAIN.
+ * Real Apple x86-64 binaries (Homebrew bottles in extern/, not our
+ * builds): Apple-toolchain dynamic Mach-Os with chained fixups and __TEXT
+ * at 0x100000000, relocated low by macho_load and bound by our dyld.
+ *
+ * figlet: libSystem only.
  */
 extern uint8_t	_binary_figlet_macho_start[];
 extern uint8_t	_binary_figlet_macho_end[];
 
 /*
- * Directory-enumeration probe (dirlist): a self-authored Darwin-ABI binary
- * that walks the FAT volume through libSystem's opendir/readdir/stat -- the
- * de-risking step before a genuine directory-walking binary (tree) runs.
+ * dirlist: our Darwin-ABI probe that walks the volume through libSystem's
+ * opendir/readdir/stat, ahead of tree.
  */
 extern uint8_t	_binary_dirlist_macho_start[];
 extern uint8_t	_binary_dirlist_macho_end[];
 
-/*
- * A second REAL Apple binary: tree(1) (Homebrew bottle).  It descends a
- * directory hierarchy through libSystem's opendir/readdir/lstat -- the genuine
- * binary the FAT VFS's directory support was built to serve.
- */
+/* tree(1), real: descends directories via opendir/readdir/lstat. */
 extern uint8_t	_binary_tree_macho_start[];
 extern uint8_t	_binary_tree_macho_end[];
 
 /*
- * A third REAL Apple binary: guname (GNU coreutils' uname, a Homebrew bottle).
- * It calls uname(2) and prints the result -- the machine-identity trick: the
- * kernel feeds it a fabricated Darwin identity (kern/darwin.c) it cannot tell
- * is false, so it reports a Mac that does not exist.
+ * guname (GNU coreutils' uname), real: prints the Darwin identity the
+ * kernel reports (kern/darwin.c).
  */
 extern uint8_t	_binary_guname_macho_start[];
 extern uint8_t	_binary_guname_macho_end[];
 
 /*
- * An EIGHTH REAL Apple binary: gcat (GNU coreutils' cat, a Homebrew bottle).
- * The others read metadata or nothing at all; this one reads a file's BYTES --
- * open, fstat, a page-aligned read loop, write.  Aimed at the APFS volume it
- * is the end of the filesystem chain: extents off the disk, through the
- * kernel, out of an unmodified Apple binary that cannot tell APFS from FAT.
+ * gcat (GNU coreutils' cat), real: reads file bytes (open, fstat, a
+ * page-aligned read loop, write), end to end from APFS extents.
  */
 extern uint8_t	_binary_gcat_macho_start[];
 extern uint8_t	_binary_gcat_macho_end[];
 
 /*
- * A NINTH real Apple binary: gls (GNU coreutils' ls).  Where gcat reads a
- * file's bytes, this one reads what the filesystem REMEMBERS about it -- the
- * mode word, the owner, the link count, the date -- and prints them in a
- * column.  Every one of those was being invented in libSystem until this
- * binary asked, so it is the one that made the inode's fixed part matter.
- * It also walks a directory the way modern coreutils does, opening it once
- * and calling fstatat(dirfd(dirp), name) per entry rather than composing
- * paths.
+ * gls (GNU coreutils' ls), real: prints inode metadata (mode, owner, link
+ * count, dates) and walks directories with fstatat(dirfd(dirp), name).
  */
 extern uint8_t	_binary_gls_macho_start[];
 extern uint8_t	_binary_gls_macho_end[];
 
 /*
- * timeprobe: the self-authored Darwin-ABI probe for the wall clock -- the
- * dirlist of timekeeping.  Checks that the time is plausible, advances, and
- * never runs backwards, so the clock is proven from ring 3 before a genuine
- * binary's dates depend on it.
+ * timeprobe: our probe that the wall clock is plausible, advances and
+ * never runs backwards, as seen from ring 3.
  */
 extern uint8_t	_binary_timeprobe_macho_start[];
 extern uint8_t	_binary_timeprobe_macho_end[];
 
 /*
- * mmaptest: the same kind of self-authored probe, for mmap(2) and the demand
- * paging under it.  Maps more memory than the machine has, makes the kernel
- * write the first byte of an untouched page, and checks a file mapping's
- * bytes against read(2)'s.
+ * mmaptest: probes mmap(2) and demand paging: maps more than the machine
+ * has, has the kernel write to an untouched page, and compares a file
+ * mapping with read(2).
  */
 extern uint8_t	_binary_mmaptest_macho_start[];
 extern uint8_t	_binary_mmaptest_macho_end[];
 
 /*
- * filewrite: the same kind of probe again, for the rung where ring 3 can
- * change the volume.  Makes a file, reads it back through another descriptor,
- * overwrites part of it, appends, truncates, unlinks -- and checks that a
- * program built into this kernel's text still refuses to be written to.
- *
- * It makes a DIRECTORY too, and proves it is one through calls that know
- * nothing about directories: open(O_CREAT) had to find it to put a file under
- * it, and rmdir then refuses to take it away while that name is there.
+ * filewrite: probes volume writes: create, read back through another fd,
+ * overwrite, append, truncate, unlink, rename over an open file, and a
+ * built-in's refusal to be written.  It also makes a directory, creates a
+ * file in it, and checks rmdir refuses while it is non-empty.
  */
 extern uint8_t	_binary_filewrite_macho_start[];
 extern uint8_t	_binary_filewrite_macho_end[];
 
 /*
- * ttyprobe: the same kind of probe once more, for the terminal itself.  The
- * console echoed and edited a line from the day it existed; what it could not
- * do was be TOLD to stop -- so this checks that a raw setting reaches the
- * kernel and reads back, that a file and a pipe answer ENOTTY, that the window
- * size is the screen's, and that a keystroke with no newline behind it reaches
- * a reader at all, which canonical mode makes impossible by design.
+ * ttyprobe: probes the terminal: a raw setting reaches the kernel and
+ * reads back, a file and a pipe answer ENOTTY, the window size is the
+ * screen's, and in raw mode a key with no newline reaches the reader.
  */
 extern uint8_t	_binary_ttyprobe_macho_start[];
 extern uint8_t	_binary_ttyprobe_macho_end[];
 
 /*
- * A TENTH real Apple binary: gstty (GNU coreutils' stty).  Every other binary
- * here treats the terminal as somewhere to print; this one treats it as the
- * subject.  It reads the whole termios, names each flag, and sets them back --
- * so a rung whose oracle is usually our own printf gets an oracle that is
- * genuine Apple code, printing OUR terminal's settings in the words a Mac uses.
+ * gstty (GNU coreutils' stty), real: reads the whole termios, names each
+ * flag and sets them back, an Apple-built oracle for our terminal.
  */
 extern uint8_t	_binary_gstty_macho_start[];
 extern uint8_t	_binary_gstty_macho_end[];
 
 /*
- * The ELEVENTH and TWELFTH: gmkdir and grmdir (GNU coreutils' mkdir and
- * rmdir).  The kernel could make and remove directories before these arrived;
- * what it could not do was let a person do it BY HAND, because nothing that
- * ships in a bottle would run without the mode word being real -- chmod, a
- * umask that is subtracted, and an ownership family honest enough to refuse.
+ * gmkdir and grmdir (GNU coreutils' mkdir and rmdir), real: need real
+ * modes (chmod, an applied umask).
  */
 extern uint8_t	_binary_gmkdir_macho_start[];
 extern uint8_t	_binary_gmkdir_macho_end[];
@@ -249,13 +209,10 @@ extern uint8_t	_binary_grmdir_macho_start[];
 extern uint8_t	_binary_grmdir_macho_end[];
 
 /*
- * The THIRTEENTH: gmake (GNU make 4.4.1).  Every binary before it did one
- * thing to one file; this one's entire purpose is to run OTHER programs,
- * in the right order, only when needed.  It is the first here to ask the
- * kernel whether a descriptor is READY rather than reading it and finding
- * out, and the first to hand its children an environment it built.  The
- * project it builds at boot is written by makedemo.sh, a dash script
- * carried the way demo.sh is.
+ * gmake (GNU make 4.4.1), real: runs other programs, waits on descriptor
+ * readiness and passes its children an environment.
+ * makedemo.sh, a dash script carried like demo.sh, writes the project it
+ * builds at boot.
  */
 extern uint8_t	_binary_gmake_macho_start[];
 extern uint8_t	_binary_gmake_macho_end[];
@@ -264,23 +221,17 @@ extern uint8_t	_binary_makedemo_sh_macho_start[];
 extern uint8_t	_binary_makedemo_sh_macho_end[];
 
 /*
- * A fourth REAL Apple binary: gfactor (GNU coreutils' factor, a Homebrew
- * bottle).  Unlike the libSystem-only binaries above, it also links libgmp --
- * the first program to drive a SECOND dependency, so our dyld maps the whole
- * closure (gfactor -> libgmp -> libSystem) and binds each import against the
- * dylib its lib_ordinal names.  It factors integers, calling into libgmp for
- * values past the built-in word width: a verifiable cross-dylib computation.
+ * gfactor (GNU coreutils' factor), real: also links libgmp, so dyld maps
+ * the closure gfactor -> libgmp -> libSystem and binds each import against
+ * the dylib its lib_ordinal names; big values exercise libgmp.
  */
 extern uint8_t	_binary_gfactor_macho_start[];
 extern uint8_t	_binary_gfactor_macho_end[];
 
 /*
- * The multi-process rung.  pipefork is the self-authored Darwin-ABI probe
- * for fork/execve/wait4/pipe/dup2 (the dirlist of process control); genv and
- * gtimeout are the FIFTH and SIXTH real Apple binaries (GNU coreutils 9.11's
- * env and timeout) -- env exec(2)s its command in place, timeout fork(2)s,
- * wait4(2)s, and kill(2)s it, so genuine Apple code drives every process-
- * lifecycle syscall the Darwin personality grew.
+ * Processes.  pipefork: our probe for fork/execve/wait4/pipe/dup2.  genv
+ * and gtimeout (GNU coreutils 9.11), real: env execs its command in place;
+ * timeout forks, wait4s and kills it.
  */
 extern uint8_t	_binary_pipefork_macho_start[];
 extern uint8_t	_binary_pipefork_macho_end[];
@@ -292,13 +243,10 @@ extern uint8_t	_binary_gtimeout_macho_start[];
 extern uint8_t	_binary_gtimeout_macho_end[];
 
 /*
- * The shell rung.  dash is the SEVENTH real Apple binary -- a genuine
- * POSIX shell (Homebrew dash 0.5.13.4) that parses scripts, forks
- * pipelines, and reaps children entirely through the Darwin personality.
- * demo.sh is not a program at all: a plain-text shell script registered
- * here so the synthetic /bin (kern/darwin.c) can stat and open it for
- * dash to interpret -- execve refuses it by magic, exactly like a real
- * kernel refuses a script without a working #! interpreter.
+ * dash 0.5.13.4, real: a POSIX shell, also /bin/sh on the Darwin side
+ * (darwin_bin_find).  demo.sh is a plain-text script registered so the
+ * synthetic /bin can stat and open it for dash; execve refuses it by
+ * magic, as a kernel without #! support would.
  */
 extern uint8_t	_binary_dash_macho_start[];
 extern uint8_t	_binary_dash_macho_end[];
@@ -307,15 +255,12 @@ extern uint8_t	_binary_demo_sh_macho_start[];
 extern uint8_t	_binary_demo_sh_macho_end[];
 
 /*
- * Bridge into the arch-specific user-thread spawn path.  Lives in
- * arch/amd64/usermode.c; declared here so progreg_spawn doesn't have
- * to pull in machine headers.  Returns the new task's t_id or a
- * SYS_E_* negative.  `inject_port` is optional: when non-NULL the
- * launcher installs a SEND right on it into the child's port_space
- * at name MACH_PORT_PARENT before transitioning to ring 3.  Caller
- * must hold one SEND ref on inject_port for the duration -- that ref
- * is transferred into the child's name table on success and dropped
- * on any failure path.
+ * The arch spawn path (arch/amd64/usermode.c), declared here to avoid
+ * machine headers.  Returns the new task's t_id or a negative SYS_E_*.
+ * An optional `inject_port' is installed as a SEND right at
+ * MACH_PORT_PARENT in the child; the caller's SEND ref on it moves into
+ * the child on success and is dropped on failure.  See usermode.h for the
+ * other arguments.
  */
 struct port;
 struct port_space;
@@ -516,16 +461,11 @@ progreg_spawn_with_port(const char *name, struct port *inject_port)
 }
 
 /*
- * progreg_spawn_returning_taskport: spawn a registered program AND
- * install a SEND right on the new task's task-self port in
- * `caller_space`.  The resulting port name is written back through
- * `out_taskport_name` -- caller can then use it as the argument to
- * SYS_TASK_KILL or any other task-port-capability operation.
- *
- * Powers SYS_SPAWN_RETURNS_TASKPORT.  The shell uses this for every
- * child it tracks: storing {task_id, taskport_name} per child gives
- * sh.c the capability needed to terminate a foreground job on
- * Ctrl-C, or to implement a `kill` builtin.
+ * progreg_spawn_returning_taskport: spawn a registered program and
+ * install a SEND right on its task-self port in `caller_space`, the name
+ * written to `out_taskport_name` (usable with SYS_TASK_KILL).  Backs
+ * SYS_SPAWN_RETURNS_TASKPORT; sh.c keeps {task_id, taskport_name} per
+ * child to kill a foreground job on Ctrl-C.
  */
 long
 progreg_spawn_returning_taskport(const char *name,
@@ -544,12 +484,10 @@ progreg_spawn_returning_taskport(const char *name,
 
 /*
  * progreg_spawn_args: spawn `name` with a command line.  `argv` is a
- * kernel-owned flattened block (see progreg.h) or NULL when argc==0;
- * `caller_space`/`out_taskport_name` are the optional taskport install
- * (pass NULL/NULL to skip it).  Ownership of `argv` transfers into the
- * spawn: arch_spawn_user frees it on every failure path and the
- * launcher frees it on success.  The one path that bypasses
- * arch_spawn_user -- an unknown program name -- frees it here.
+ * kernel-owned flat block (progreg.h) or NULL when argc is 0;
+ * `caller_space'/`out_taskport_name' are the optional taskport install
+ * (NULL/NULL to skip).  `argv' is consumed: arch_spawn_user frees it on
+ * failure, the launcher on success, and an unknown name frees it here.
  */
 long
 progreg_spawn_args(const char *name, int argc, char **argv,

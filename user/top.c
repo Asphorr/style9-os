@@ -6,25 +6,21 @@
  *
  * top(1) -- periodic ring-3 process monitor.
  *
- * A close cousin of tasks(1): both RPC the kernel "tasks" Mach service
- * for a live snapshot of the task table.  Where tasks(1) prints one
- * shot and exits, top(1) samples TOP_SAMPLES times with a yield gap
- * between samples, and prints the richer per-task resource columns the
- * service grew for this tool -- thread count, port-name count, and live
- * VM-region count.  Darwin's top(1) leans on host_processor_info +
- * task_info; we get the equivalent through a single Mach RPC, no
- * per-resource syscall surface.
+ * Like tasks(1) it RPCs the kernel "tasks" Mach service for a snapshot
+ * of the task table, but samples TOP_SAMPLES times, TOP_YIELD_GAP turns
+ * apart, and prints per-task thread, port-name and VM-region counts.
+ * Darwin's top(1) uses host_processor_info + task_info; here one Mach RPC
+ * carries it all.
  *
- * No argv yet, so the sample count + cadence are compile-time.  The
- * point of multiple samples is to show the table is genuinely live:
- * spawn/exit churn between samples shows up as rows appearing and
- * disappearing and as the global task/thread totals moving.
+ * Sample count and cadence are compile-time (no argv).  Several samples
+ * show the table is live: spawn/exit churn between them moves rows and
+ * totals.
  */
 
 #include "style9.h"
 
 #define	TOP_SAMPLES	3u
-#define	TOP_YIELD_GAP	24	/* yields between consecutive samples */
+#define	TOP_YIELD_GAP	24	/* poll_turn()s between consecutive samples */
 
 static int
 top_sample(mach_port_name_t svc, uint32_t sample)

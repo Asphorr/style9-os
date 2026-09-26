@@ -22,14 +22,13 @@
  *	witness_classes[]	first-seen ordering of lock-name pointers,
  *				so a class id is just the array index.
  *
- *	witness_edges[i][j]	1 byte == 1 if "class i acquired-before
- *				class j" has been observed somewhere in
- *				the running kernel.  A new acquire of j
- *				while holding i panics if edges[j][i]
- *				is already set (would close a cycle).
+ *	witness_edges[i][j]	1 if "class i acquired before class j"
+ *				has been observed.  Acquiring j while
+ *				holding i panics if edges[j][i] is
+ *				already set (it would close a cycle).
  *
- * Both are mutated only with IRQs disabled in the calling context, so
- * the racing-IRQ-handler-also-takes-a-lock case can't tear them.
+ * Both are mutated only with interrupts disabled on the calling CPU (see
+ * witness.h).
  */
 #define	WITNESS_MAX_CLASSES	48
 
@@ -79,11 +78,7 @@ witness_acquired(struct spinlock *sl, uintptr_t ra)
 		if (held_class == new_class)
 			continue;	/* nested same-class is fine */
 
-		/*
-		 * Cycle check.  If the reverse edge (new -> held) is
-		 * already in the matrix, this acquire would close a
-		 * cycle.  Drop into the loud autopsy path.
-		 */
+		/* The reverse edge (new -> held) already seen: a cycle. */
 		if (witness_edges[new_class][held_class]) {
 			irq_restore(flags);
 			witness_panic_cycle(new_name, ra,
@@ -125,11 +120,7 @@ witness_released(struct spinlock *sl)
 		return;
 	}
 
-	/*
-	 * LIFO release is the common case; try the top first, fall
-	 * through to a search for out-of-order releases (legal, just
-	 * less common).
-	 */
+	/* LIFO release is the common case; out of order is legal too. */
 	if (me->th_held[me->th_held_count - 1].wh_name == name) {
 		me->th_held_count--;
 		irq_restore(flags);
@@ -174,14 +165,10 @@ witness_dump_held(struct thread *th)
 /* ---- internals --------------------------------------------------- */
 
 /*
- * Linear scan over witness_classes by pointer identity.  Class names
- * come from spin_init's `name` arg which is expected to be a string
- * literal -- same literal across the kernel => same pointer => same
- * class.  Auto-registers on first sight.
- *
- * Caller must hold the "IRQ disabled" invariant (the only mutator of
- * witness_nclasses + witness_classes is this routine, called only
- * from witness_acquired/released which both disable IRQ around it).
+ * Class id of `name', by pointer identity, registering it on first
+ * sight; -1 when the table is full.  Called only from witness_acquired,
+ * with interrupts disabled; it is the only writer of witness_classes and
+ * witness_nclasses.
  */
 static int
 class_of(const char *name)

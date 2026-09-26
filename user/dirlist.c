@@ -6,18 +6,16 @@
  */
 
 /*
- * dirlist -- a self-authored Darwin-ABI probe for the directory-enumeration
- * rung of the VFS.  It is NOT a real Apple binary; it is the "small probe
- * compiled with the real toolchain" that de-risks opendir/readdir/stat before
- * a genuine binary (tree(1)) depends on them.  Built by clang/ld64.lld for the
- * macOS target and bound by our dyld against our libSystem, it imports the
- * SAME $INODE64 symbol names a real binary would -- so a clean run proves the
- * export naming and the struct-dirent round-trip, not just our own glue.
+ * dirlist -- a self-authored Darwin-ABI probe for directory enumeration:
+ * not an Apple binary, but a small one built by the real toolchain to
+ * prove opendir/readdir/stat before a genuine binary (tree(1)) relies on
+ * them.  Built by clang/ld64.lld for macOS and bound by our dyld against
+ * our libSystem, it imports the same $INODE64 names a real binary would,
+ * so a clean run proves the export naming and the struct dirent layout.
  *
- * Freestanding (-fno-builtin, no SDK headers): the macOS struct dirent layout
- * and the imported prototypes are declared here exactly as <dirent.h> would
- * alias them, and resolved from /usr/lib/libSystem.B.dylib at link.  Entry is
- * _entry (ld -e), so no crt is required; relinked low like dyldhello.
+ * Freestanding (-fno-builtin, no SDK headers): the macOS struct dirent and
+ * the prototypes are declared here as <dirent.h> would alias them.  Entry
+ * is _entry (ld -e), so no crt; relinked low like dyldhello.
  */
 
 typedef __UINT8_TYPE__	uint8_t;
@@ -98,9 +96,8 @@ list(const char *path, int depth)
 
 /*
  * stat() the first real subdirectory of the root, whichever volume is
- * mounted.  Naming a fixed path here would only prove that one image was
- * attached; picking the name out of the listing proves the two calls agree
- * about the same directory.
+ * mounted.  Taking the name from the listing, not a fixed path, proves
+ * readdir and stat agree about the same directory.
  */
 static void
 stat_first_subdir(void)

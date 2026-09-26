@@ -12,22 +12,20 @@
 #include <stdint.h>
 
 /*
- * Time.  Two different questions live here and they have different answers.
+ * Time.
  *
- * UPTIME is how long since boot: the PIT counts ticks and the TSC interpolates
- * between them.  It is monotonic by construction and needs no hardware beyond
- * what boot already programmed.
+ * Uptime is time since boot: PIT ticks, with the TSC for sub-tick
+ * resolution.  Monotonic by construction.
  *
- * WALL time is what the calendar says, and no amount of counting since boot
- * can produce it -- it has to be read from a chip that was running before we
- * were.  The CMOS RTC (dev/rtc.c) is read ONCE, during clock_init, and the
- * result becomes an anchor; every reading after that is the anchor plus
- * elapsed uptime.  That keeps wall time as monotonic and as cheap as uptime,
- * and confines the slow, race-prone chip access to a single point at boot.
+ * Wall time: the CMOS RTC (dev/rtc.c) is read once, in clock_init, as an
+ * anchor, and every reading after is the anchor plus elapsed uptime.  That
+ * keeps wall time as monotonic and cheap as uptime, and confines the slow,
+ * race-prone chip access to boot.
  *
- * clock_init programmes the PIT, calibrates the TSC, and takes that anchor;
- * nothing here works until it has run, and intr_enable must have been called
- * first so the calibration loop can observe IRQ-driven tick bumps.
+ * clock_init programs the PIT, calibrates the TSC and takes the anchor.
+ * Nothing here works before it -- clock_uptime_ms divides by pit_hz() --
+ * and intr_enable must come first, since calibration counts IRQ-driven
+ * ticks.
  */
 
 void		clock_init(void);

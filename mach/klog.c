@@ -60,11 +60,10 @@ klog_copy_field(char *dst, size_t cap, const char *src)
 }
 
 /*
- * Echo the line to the kernel console.  Format:
+ * Echo the entry to the console through kprintf:
  *	[uptime_ms LVL src] text\n
- * No locking around tty here -- tty_putc itself takes tty_lock; we
- * just call it byte-by-byte.  Worst case under contention is
- * interleaving with another writer, which is harmless for a log.
+ * No lock of our own; under contention it may interleave with another
+ * writer, which is harmless for a log.
  */
 static void
 klog_emit(const struct klog_entry *e)
@@ -116,13 +115,10 @@ klog(uint8_t level, const char *src, const char *text)
 	klog_copy_field(e->ke_text, KLOG_LINE_MAX, text);
 
 	/*
-	 * Echo OUTSIDE the lock to avoid blocking other producers on
-	 * tty_lock, which is taken by tty_putc.  The snapshot we took
-	 * into `e` is private to this slot until the next producer
-	 * laps the ring -- KLOG_RING_ENTRIES entries away.  For a
-	 * 128-entry ring and the kernel's actual log rate that lap is
-	 * effectively never; for cycle-perfect safety the emit could
-	 * copy into a stack temp first.
+	 * Echo outside the lock, so other producers do not wait on the
+	 * console.  The slot stays ours to read until a producer laps the
+	 * ring, KLOG_RING_ENTRIES entries on; copying it to the stack
+	 * first would close even that window.
 	 */
 	spin_unlock(&ring_lock);
 	klog_emit(e);
@@ -138,10 +134,7 @@ klog_snapshot_tail(struct klog_entry *out, size_t max)
 
 	spin_lock(&ring_lock);
 	n = ring_count < max ? ring_count : max;
-	/*
-	 * Oldest of the last `n` lives at ring_head - n (mod cap),
-	 * because ring_head is the NEXT slot to fill.
-	 */
+	/* ring_head is the next slot to fill, so the oldest is n back. */
 	first = (ring_head + KLOG_RING_ENTRIES - n) % KLOG_RING_ENTRIES;
 	for (i = 0; i < n; i++)
 		out[i] = ring[(first + i) % KLOG_RING_ENTRIES];
@@ -201,12 +194,7 @@ svc_klog_dispatch(const struct mach_msg_header *req, struct port_space *from)
 		    sizeof(struct mach_msg_header);
 		wr = (const struct klog_write_request *)payload;
 		klog(wr->kwr_level, wr->kwr_src, wr->kwr_text);
-		/*
-		 * Acknowledge with a bare header so the client's
-		 * mach_msg_rpc can return.  No payload needed -- the
-		 * log was either accepted (we got here) or the kernel
-		 * panicked before producing a reply.
-		 */
+		/* A bare header lets the client's mach_msg_rpc return. */
 		return (svc_klog_reply_inline(req, from, NULL, 0));
 	case KLOG_OP_TAIL:
 		for (size_t i = 0; i < sizeof(tail); i++)

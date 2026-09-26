@@ -14,37 +14,27 @@
 #include "port.h"
 
 /*
- * The host port.
+ * The host port: one kernel-owned port answering questions about the
+ * machine, Mach's host special port (behind mach_host_self()).  It is
+ * PORT_SPECIAL_SERVICE, so a send goes straight to host_self_dispatch,
+ * as for the clock / stats / tasks services.
  *
- * A single kernel-owned Mach port that answers questions about the
- * machine as a whole -- the style9 analogue of Mach's host special port
- * (the object behind mach_host_self()).  It is tagged PORT_SPECIAL_SERVICE
- * so a send routes straight to host_self_dispatch with no queueing and no
- * server thread, exactly like the clock / stats / tasks services.
+ * Two ways to one object:
  *
- * Two acquisition routes, one object:
+ *	- native tasks look it up with bootstrap_lookup(SVC_HOST_NAME);
  *
- *	- native style9 tasks look it up by name, bootstrap_lookup(SVC_HOST_NAME),
- *	  like any other kernel service;
+ *	- Darwin binaries call mach_host_self(), a trap (host_self_trap in
+ *	  kern/darwin.c) into host_self_acquire, which installs a SEND
+ *	  right straight in the caller's space, as real Mach does.
  *
- *	- genuine Darwin binaries call mach_host_self(), which traps into
- *	  host_self_trap (kern/darwin.c) and lands in host_self_acquire,
- *	  installing a fresh SEND right directly in the caller's space.  This
- *	  mirrors real Mach, where mach_host_self() is a trap rather than a
- *	  string lookup.
- *
- * Either way the caller ends up with a SEND right and drives the port with
- * the HOST_OP_* opcodes below via mach_msg_rpc.
- *
- * Wire structs are ABI-stable and mirrored verbatim in lib/style9.h (the
- * ring-3 view); reordering a field silently misparses the reply.
+ * The caller then drives it with HOST_OP_* through mach_msg_rpc.  The
+ * wire structs are ABI-stable and mirrored in lib/style9.h.
  */
 
 #define	SVC_HOST_NAME		"host"
 
 /*
- * Opcodes (msgh_id) on a message sent to the host port.  Reply layouts
- * are pinned by _Static_assert below.
+ * Host port msgh_id values and their replies:
  *
  *	HOST_OP_PAGE_SIZE	-> svc_host_page_size_reply
  *	HOST_OP_INFO		-> svc_host_info_reply (HOST_BASIC_INFO shape)
@@ -53,9 +43,8 @@
 #define	HOST_OP_INFO		2
 
 /*
- * cpu_type / cpu_subtype reported by HOST_OP_INFO.  Values match Darwin's
- * <mach/machine.h> so a genuine binary reading them sees the numbers it
- * expects: CPU_TYPE_X86_64 = CPU_TYPE_X86 (7) | CPU_ARCH_ABI64 (0x01000000).
+ * HOST_OP_INFO's cpu_type / cpu_subtype, as in Darwin's <mach/machine.h>:
+ * CPU_TYPE_X86_64 = CPU_TYPE_X86 (7) | CPU_ARCH_ABI64 (0x01000000).
  */
 #define	HOST_CPU_TYPE_X86_64		0x01000007
 #define	HOST_CPU_SUBTYPE_X86_64_ALL	3
@@ -83,39 +72,29 @@ _Static_assert(sizeof(struct svc_host_info_reply) == 32,
     "svc_host_info_reply must be 32 bytes (wire format)");
 
 /*
- * Bring up the host port: mint the kernel-owned service port and publish
- * it under SVC_HOST_NAME in the bootstrap registry.  Must run after
- * bootstrap_init + services_init (it shares the bootstrap registry and the
- * kernel_space install path).  Idempotent across the call.
+ * Create the host port and register it as SVC_HOST_NAME.  After
+ * bootstrap_init and services_init.  Idempotent.
  */
 void		host_init(void);
 
-/*
- * The host port object, for the Darwin host_self_trap acquisition path.
- * NULL until host_init has run.
- */
+/* The host port object; NULL until host_init. */
 struct port	*host_get_port(void);
 
 /*
- * Persistent kernel_space SEND name for the host port (minted in host_init).
- * task_get_special_port COPY_SENDs it; MACH_PORT_NULL before host_init.
+ * The host port's kernel_space name, which task_get_special_port
+ * COPY_SENDs; MACH_PORT_NULL before host_init.
  */
 mach_port_name_t host_get_kernel_name(void);
 
 /*
- * Install a fresh SEND right to the host port in `space` and return the
- * new name through *name_out -- the mach_host_self() acquisition primitive.
- * Returns MACH_E_DEAD if host_init has not run, otherwise the space_install
- * result (MACH_MSG_OK on success).
+ * mach_host_self(): install a SEND right to the host port in `space`,
+ * returning the name in *name_out.  MACH_E_DEAD before host_init,
+ * otherwise space_install's result.
  */
 int		host_self_acquire(struct port_space *space,
 		    mach_port_name_t *name_out);
 
-/*
- * Synchronous dispatcher for messages sent to the host port.  Matches the
- * port_service_fn signature; invoked from mach_msg_send when the
- * destination's p_special is PORT_SPECIAL_SERVICE carrying this function.
- */
+/* The host port's port_service_fn. */
 int		host_self_dispatch(const struct mach_msg_header *req,
 		    struct port_space *from);
 

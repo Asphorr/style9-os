@@ -30,14 +30,9 @@ static struct idt_entry	idt[IDT_NENTRIES] __attribute__((aligned(16)));
 static struct idt_ptr	idtr;
 
 /*
- * Generated in isr.S: one stub per architectural vector, all 256 of them.
- *
- * It used to stop at 48, the end of the 8259's remapped window, and every
- * vector above that had NO GATE -- so an interrupt delivered there would not
- * be ignored, it would be a general-protection fault with an obscure error
- * code.  That was fine while the 8259 was the only thing that could deliver
- * one; the local APIC's timer, its spurious vector and its inter-processor
- * interrupts all live above 48, and want somewhere deliberate to land.
+ * Generated in isr.S: one stub per vector, all 256, so the local APIC's
+ * vectors above 48 (timer, spurious, IPIs) land on a gate rather than
+ * raising #GP.
  */
 extern uintptr_t	isr_table[];
 
@@ -82,11 +77,9 @@ idt_load(void)
 {
 
 	/*
-	 * The table is one for the machine; the REGISTER pointing at it is one
-	 * per processor and comes up holding zero.  So every CPU runs this,
-	 * and an application processor runs it before anything that could
-	 * fault -- an exception with no IDT is not a panic, it is a triple
-	 * fault and a reset, with nothing printed.
+	 * One table, but an IDTR per CPU, so every CPU runs this -- an AP
+	 * before anything that could fault: an exception with no IDT is a
+	 * silent triple fault and reset.
 	 */
 	__asm__ __volatile__ ("lidt %0" : : "m"(idtr));
 }

@@ -31,10 +31,9 @@
 static irq_handler_t	irq_handlers[16];
 
 /*
- * Handlers for the vectors the local APIC delivers, indexed by
- * vector - INTR_LOCAL_BASE.  Separate from irq_handlers because the two
- * kinds are acknowledged to different chips, and the table a handler came
- * out of is how the dispatcher knows which.
+ * Handlers for local APIC vectors, indexed by vector - INTR_LOCAL_BASE.
+ * Kept apart from irq_handlers because the two are acknowledged to
+ * different chips; the table tells the dispatcher which.
  */
 static irq_handler_t	local_handlers[IDT_NENTRIES - INTR_LOCAL_BASE];
 
@@ -83,10 +82,8 @@ static void	pf_print_err(uint64_t err);
 static void	rip_byte_dump(uint64_t rip);
 
 /*
- * Map an x86 trap vector down to one of the EXC_TYPE_* indices used
- * by t->t_exc_ports[].  Any vector not explicitly listed falls into
- * EXC_TYPE_BAD_ACCESS -- it is the catch-all bucket, matching real
- * Mach's tendency to put unknown faults under bad-access semantics.
+ * Map an x86 trap vector to an EXC_TYPE_* index into t_exc_ports[].
+ * Anything unlisted is EXC_TYPE_BAD_ACCESS, Mach's catch-all.
  */
 static unsigned
 exc_type_from_trapno(uint32_t trapno)
@@ -134,18 +131,14 @@ intr_install_local(unsigned int vec, irq_handler_t handler)
 }
 
 /*
- * Async-kill detection point #4: IRQ-return-to-user.  Catches a kill
- * issued against a task whose thread is doing a pure ring-3 compute
- * loop -- one that never voluntarily enters the kernel via syscall or
- * blocking IPC.  The timer IRQ (or any other hardware IRQ) brings the
- * thread into the kernel; the trampoline runs intr_dispatch; this
- * helper fires before the function returns and the asm iretq's back
- * to ring 3, retiring the thread instead of resuming user code.
+ * Async-kill detection point #4: return from an interrupt to ring 3.
+ * Catches a kill against a thread in a pure ring-3 compute loop that
+ * never enters the kernel on its own; any interrupt brings it in, and
+ * this retires it instead of resuming user code.
  *
- * Gated on (tf_cs & 3) == 3 so kernel-mode IRQ interrupts (e.g. PIT
- * landing while the scheduler holds sched_lock) never call thread_exit.
- * kernel_task is skipped explicitly even though t_killed cannot be set
- * on it -- belt-and-braces, and makes the early-out cheaper than the
+ * Only for frames from ring 3, so an interrupt taken in the kernel (a
+ * timer tick while sched_lock is held) never calls thread_exit.
+ * kernel_task cannot be killed; testing it first is cheaper than the
  * atomic load.
  */
 static inline void
@@ -162,12 +155,10 @@ intr_check_async_kill_on_user_return(struct trapframe *tf)
 		thread_exit();
 	/*
 	 * Signal delivery for a compute loop that never syscalls.  A
-	 * default-terminate signal (SIGINT/SIGTERM/SIGPIPE) posted while the
-	 * thread ran in ring 3 retires it here rather than resuming user
-	 * code; a CAUGHT signal is delivered to its ring-3 handler on the
-	 * user stack, with tf carrying the interrupted state into the frame
-	 * and back out of it -- which is why tf is mutable here and why this
-	 * path saves the whole register file, unlike its syscall-exit twin.
+	 * default-terminate signal retires the thread here; a caught one is
+	 * delivered to its ring-3 handler, with tf carrying the interrupted
+	 * state into the signal frame and back -- hence tf is mutable and,
+	 * unlike the syscall-exit path, the whole register file is saved.
 	 * Darwin-personality tasks only; native tasks have no signal state.
 	 */
 	if (current_thread->th_task->t_personality == TASK_PERSONALITY_DARWIN)
@@ -176,10 +167,11 @@ intr_check_async_kill_on_user_return(struct trapframe *tf)
 }
 
 /*
- * C-side trap dispatcher, called from isr_common with %rsp pointing at
- * the populated trapframe.  Vectors below 32 are CPU exceptions and
- * abort the kernel; vectors 32-47 are hardware IRQs and route through
- * the registered handler (or are simply EOI'd if none is installed).
+ * C-side trap dispatcher, called from isr_common with the trapframe
+ * built.  Vectors below 32 are CPU exceptions: demand-filled, fatal to
+ * the user thread, or a kernel panic.  32-47 are 8259 IRQs, EOI'd to the
+ * 8259 whether or not a handler is installed.  48 and up are local APIC
+ * vectors, EOI'd to the APIC only if a handler is installed.
  */
 void
 intr_dispatch(struct trapframe *tf)
@@ -187,32 +179,21 @@ intr_dispatch(struct trapframe *tf)
 	unsigned int	irq;
 
 	if (tf->tf_trapno < 32) {
-		/*
-		 * Not every fault is a mistake.  A lazily mapped page
-		 * announces itself exactly this way, and filling it is the
-		 * whole point of mmap; only if nothing claims the address
-		 * does the fault stay a fault.
-		 */
+		/* A lazily mapped page asking to be filled is not an error. */
 		if (fault_fill(tf)) {
 			intr_check_async_kill_on_user_return(tf);
 			return;
 		}
 		/*
-		 * Exceptions originating from ring 3 do not bring the
-		 * kernel down: they retire the offending user thread
-		 * instead, the way FreeBSD turns a user #PF into
-		 * SIGSEGV-then-die.  The kernel keeps running, the
-		 * shell stays interactive.
+		 * An exception from ring 3 retires the user thread, like
+		 * FreeBSD's SIGSEGV-then-die; the kernel runs on.
 		 */
 		if ((tf->tf_cs & 3) == 3) {
 			user_fault_die(tf);
 			/*
-			 * RESUME path: user_fault_die mutated tf->tf_rip
-			 * and returned.  Fall through to the IRQ-entry
-			 * tail, which iretq's back to user mode with the
-			 * new trapframe.  KILL path doesn't reach here --
-			 * user_fault_die calls thread_exit() which is
-			 * noreturn.
+			 * Only the RESUME verdict returns here, with tf_rip
+			 * advanced; the iretq goes back to user mode with it.
+			 * KILL ends in thread_exit.
 			 */
 			intr_check_async_kill_on_user_return(tf);
 			return;
@@ -228,29 +209,21 @@ intr_dispatch(struct trapframe *tf)
 		pic_eoi(irq);
 
 		/*
-		 * Wake any thread whose mach_msg_recv_timed deadline has
-		 * elapsed.  Runs here (not in pit_isr) because the
-		 * spin_unlock inside sched_check_timeouts can drop
-		 * preempt_count to zero with need_resched still set,
-		 * which would yield -- doing that BEFORE pic_eoi leaves
-		 * the 8259 holding the IRQ and blocks subsequent PIT
-		 * ticks (the busy-sleep path observed this as an outright
-		 * boot hang at stress_preempt).
+		 * Wake threads whose deadline has passed.  Here, after
+		 * pic_eoi, not in pit_isr: the spin_unlock inside can drop
+		 * the preempt count to zero and yield, and a yield before
+		 * the EOI leaves the 8259 holding the IRQ and stops the
+		 * ticks.
 		 */
 		sched_check_timeouts();
 
 		/*
-		 * Preempt point.  Two pieces of deferred work may have
-		 * been queued by the IRQ handler that just ran: any
-		 * wake requests posted via sched_post_irq_wake, and a
-		 * need_resched owed from a timer tick -- the PIT's while it
-		 * is still the chip debiting the slice, and afterwards one
-		 * the APIC timer left pending across a critical section
-		 * that ended here.  Service both only
-		 * when preempt is enabled (no caller held a spinlock
-		 * across the IRQ -- otherwise the deferred work fires
-		 * at the next spin_unlock that drops the count to
-		 * zero).
+		 * Preempt point, for work the handler left behind: wakes
+		 * posted via sched_post_irq_wake, and a need_resched owed
+		 * by a timer tick (the PIT's, or one the APIC timer left
+		 * pending across a critical section).  Only with preemption
+		 * enabled; otherwise the spin_unlock that drops the count
+		 * to zero does it.
 		 */
 		if (preempt_is_enabled()) {
 			sched_drain_irq_wakes();
@@ -265,13 +238,10 @@ intr_dispatch(struct trapframe *tf)
 	}
 
 	/*
-	 * Vector >= 48: delivered by this CPU's own local APIC.
-	 *
-	 * The EOI goes to the APIC, not the 8259, and ONLY when a handler
-	 * was installed -- a vector nobody claimed is ignored and
-	 * acknowledged to nothing, which is what the architecture requires
-	 * of the spurious vector: there is no in-service bit behind it, so
-	 * an EOI would retire some other interrupt that really is pending.
+	 * Vector >= 48: delivered by this CPU's local APIC.  EOI to the APIC,
+	 * and only when a handler is installed: an unclaimed vector is
+	 * acknowledged to nothing, as the spurious vector requires -- it has
+	 * no in-service bit, so an EOI would retire some other interrupt.
 	 */
 	if (tf->tf_trapno < IDT_NENTRIES) {
 		unsigned int	vec;
@@ -282,29 +252,18 @@ intr_dispatch(struct trapframe *tf)
 			lapic_eoi();
 
 			/*
-			 * Preempt point, and AFTER the EOI for the reason the
-			 * 8259 path learned the hard way.  An interrupt in
-			 * service blocks everything of its priority and below
-			 * on this CPU until it is acknowledged, and the timer
-			 * sits at the top -- so a yield taken before the EOI
-			 * would carry the unacknowledged interrupt away with
-			 * the outgoing thread's stack, and this CPU would get
-			 * no further timer ticks until that thread was
-			 * scheduled again by the ticks it is holding up.
+			 * Preempt point, after the EOI.  An in-service
+			 * interrupt blocks everything of its priority and
+			 * below until acknowledged, and the timer is near the
+			 * top: a yield before the EOI would carry it off with
+			 * the outgoing thread and stop this CPU's ticks.
 			 *
-			 * sched_check_timeouts is NOT repeated here.  The PIT
-			 * still ticks at the same rate it always did and the
-			 * 8259 tail above still runs it, so deadlines are
-			 * looked at exactly as often as before; doing it twice
-			 * would only add a lock acquisition to every tick.
+			 * No sched_check_timeouts here: the PIT still ticks
+			 * and the 8259 tail above runs it.
 			 *
-			 * ⚠ AND ONLY ON A CPU THAT HAS A THREAD.  This is the
-			 * one path an application processor reaches before it
-			 * is in the scheduler at all: a parked CPU answers
-			 * inter-processor interrupts and has no current
-			 * thread, no idle thread and no runqueue -- so a
-			 * reschedule owed there is a reschedule to nowhere,
-			 * and thread_yield would assert on the way in.
+			 * Only on a CPU that has a thread.  A parked AP
+			 * answers IPIs with no current thread, idle thread or
+			 * runqueue, and thread_yield would assert.
 			 */
 			if (current_thread != NULL && preempt_is_enabled()) {
 				sched_drain_irq_wakes();
@@ -379,25 +338,18 @@ intr_panic(const struct trapframe *tf)
 }
 
 /*
- * Reply-protocol helper.  Allocates a kernel-owned reply port,
- * attaches it as an implicit msgh_local SEND descriptor on the
- * exception message, posts to the watcher, and parks the calling
- * thread on the kernel-side recv queue for up to EXC_REPLY_TIMEOUT_MS.
+ * Reply protocol.  Create a kernel-owned reply port, send it with the
+ * exception message as its msgh_local SEND right, and park for up to
+ * EXC_REPLY_TIMEOUT_MS waiting for the verdict.
  *
- * Returns the verdict the watcher sent back (EXC_VERDICT_*).  Any
- * shortfall -- failed allocation, failed enqueue, timeout, malformed
- * reply -- collapses to EXC_VERDICT_KILL so the caller retires the
- * thread the same way the A v1 path would.  On EXC_VERDICT_RESUME
- * the byte count to advance past the faulting instruction lands in
- * *rip_advance_out (0 by default).
+ * Returns EXC_VERDICT_*.  Any failure -- allocation, enqueue, timeout,
+ * malformed reply -- is EXC_VERDICT_KILL, so the caller retires the
+ * thread as on the post-and-retire path.  On RESUME, *rip_advance_out is
+ * the byte count to skip past the faulting instruction (0 by default).
  *
- * The reply port lives only for the duration of this call: created
- * with RECV+SEND in kernel_space, transferred to the watcher as a
- * fresh SEND name in their space (so they can reply), then released
- * via port_deallocate(kernel_space, K) after we read the verdict.
- * The watcher's SEND keeps the port object alive a moment longer
- * (until they deallocate their name), but the kernel side never
- * touches it again.
+ * The reply port (RECV+SEND in kernel_space) lives for this call only;
+ * the watcher's SEND may keep the object alive a little longer, but the
+ * kernel never touches it again.
  */
 static uint32_t
 deliver_exception_and_wait(struct port *exc, const struct trapframe *tf,
@@ -455,43 +407,31 @@ deliver_exception_and_wait(struct port *exc, const struct trapframe *tf,
 }
 
 /*
- * The demand-paging half of the #PF handler: decide whether this fault is
- * a mapping asking to be populated, and populate it if so.  Returns true
- * when the faulting instruction should simply be re-run.
+ * The demand-paging half of the #PF handler: if this fault is a mapping
+ * asking to be populated, populate it.  Returns true when the faulting
+ * instruction should simply be re-run.
  *
- * Kernel-mode faults come here too, and they must.  A syscall that copies
- * into a buffer the program mmap'd but has not touched yet -- read(2) into a
- * fresh malloc'd block is the everyday case -- faults from ring 0 on a user
- * address, and before demand paging existed that could only ever have been a
- * bug.  Now it is a page asking to be filled like any other, so the rule is
- * about the address rather than the ring: a fault on a user VA in the current
- * task's map is serviceable, a fault on a kernel VA is still a bug and still
- * panics.
+ * Kernel-mode faults come here too: a syscall copying into a user buffer
+ * not yet touched (read(2) into fresh malloc'd memory) faults from ring 0
+ * on a user address.  So the rule is about the address, not the ring: a
+ * user VA in the current task's map is serviceable, a kernel VA is a bug
+ * and panics.
  *
- * The one condition either kind of fault has to meet is that the interrupted
- * code could have slept, because filling a page can sleep: no spinlock was
- * held.  The preempt count is global here, so that is the whole test -- a
- * thread that blocks holding a lock is never woken again (fs/bio.c has the
- * account).  The kernel's user-copy paths satisfy it by construction: they
- * bounce through a stack buffer and drop their locks before copying, which
- * they already did for other reasons.  A fault that fails the test is telling
- * us about a caller that should not have been touching user memory there, and
- * panicking is the right answer.
+ * Filling a page can sleep, so the interrupted code must have been able
+ * to: no spinlock held.  Every spinlock raises this CPU's preempt count,
+ * so that is the whole test -- a thread that blocks holding a lock is
+ * never woken again (see fs/bio.c).  The user-copy paths bounce through a
+ * stack buffer and drop their locks before copying; a fault that fails
+ * the test is a caller touching user memory where it must not, and panics.
  *
- * Note what is NOT done here: interrupts are not re-enabled.  Every IDT gate
- * is an interrupt gate and SYSCALL's FMASK clears IF too, so the entire
- * kernel side of this system runs with interrupts off and gets its wakeups by
- * switching away -- the thread that blocks on the disk hands the CPU to
- * another thread, whose restored RFLAGS turn interrupts back on, and the
- * drive's interrupt lands there.  ata_wait_intr has always worked this way
- * from the syscall path; the pager is one more caller on it.  Turning IF on
- * here would only widen the window in which this fault handler can itself be
- * interrupted, and buy nothing.
+ * Interrupts are not re-enabled.  Every IDT gate is an interrupt gate and
+ * SYSCALL's FMASK clears IF, so the kernel runs with interrupts off and
+ * gets its wakeups by switching away: the thread blocked on the disk hands
+ * the CPU to one whose restored RFLAGS turn interrupts on, and the drive's
+ * interrupt lands there (ata_wait_intr works this way).
  *
- * CR2 is read first and once.  It holds the faulting address only until the
- * next fault overwrites it, and everything below -- a nested fault, another
- * thread running while this one waits for the disk -- happens after this
- * point.
+ * CR2 is read once, before anything that can fault or sleep: a nested
+ * fault, or another thread running while this one waits, overwrites it.
  */
 static bool
 fault_fill(const struct trapframe *tf)
@@ -505,14 +445,9 @@ fault_fill(const struct trapframe *tf)
 	if (tf->tf_trapno != 14)
 		return (false);
 	/*
-	 * A protection violation means the page IS there and the access was
-	 * not allowed.  That used to be the end of it -- a real fault, never
-	 * a missing mapping -- and copy-on-write is what made the sentence
-	 * incomplete: a store to a shared page is a protection violation
-	 * deliberately arranged by the kernel, and answering it is the whole
-	 * mechanism.  So a violation is still fatal unless it was a write, in
-	 * which case vm_fault decides.  Reads and instruction fetches that
-	 * land here are as fatal as they ever were.
+	 * A protection violation means the page is there and the access was
+	 * refused.  Fatal, unless it was a write: that may be copy-on-write,
+	 * which vm_fault decides.
 	 */
 	if ((tf->tf_err & 0x1) != 0 && (tf->tf_err & 0x2) == 0)
 		return (false);
@@ -527,7 +462,7 @@ fault_fill(const struct trapframe *tf)
 	write     = (tf->tf_err & 0x2) != 0;
 	from_user = (tf->tf_cs & 3) == 3;
 
-	if (!preempt_is_enabled())		/* a lock is held: cannot sleep */
+	if (!preempt_is_enabled())		/* a lock held: cannot sleep */
 		return (false);
 	if (!from_user && (cr2 < VM_USER_VA_LO || cr2 >= VM_USER_VA_HI))
 		return (false);			/* a kernel VA: a real bug */
@@ -537,24 +472,17 @@ fault_fill(const struct trapframe *tf)
 }
 
 /*
- * BSD-style fault retirement: a #PF / #GP / #UD / etc. that originates
- * in ring 3 prints an autopsy and then kills just the offending user
- * thread.  Sibling kernel threads (shell, kbd-drv, uart-drv) keep
- * running, mirroring the SIGSEGV-then-die model.
+ * A ring-3 exception prints an autopsy and kills only the offending user
+ * thread; everything else (the shell, kbd-drv, uart-drv) keeps running.
  *
- * If the faulting task has an exception port set
- * (Xr task_set_exception_port 9 via SYS_TASK_SET_EXC_PORT), the kernel
- * posts a MACH_EXC_FAULT message onto that port carrying enough state
- * for a debugger or crash reporter in another task to do an autopsy
- * of its own.  Delivery is best-effort; a full queue or a dead port
- * silently drops the message but never blocks fault retirement.
+ * If an exception port is set (task_set_exception_port(9)), a
+ * MACH_EXC_FAULT message goes to it with enough state for a debugger or
+ * crash reporter to do its own autopsy.  Best-effort: a full queue or
+ * dead port drops it and never delays the retirement.
  *
- * When the watcher opted into the reply protocol (EXC_FLAG_RESUMABLE
- * on the owning task), the kernel parks the faulting thread on a
- * kernel-allocated reply port until the watcher's verdict comes back
- * -- EXC_VERDICT_RESUME advances tf->tf_rip and returns to user mode,
- * EXC_VERDICT_KILL retires the thread.  Without the flag, the post-
- * and-retire path of A v1 runs unchanged.
+ * If the task opted into the reply protocol (EXC_FLAG_RESUMABLE), the
+ * thread instead waits for the watcher's verdict: EXC_VERDICT_RESUME
+ * advances tf_rip and returns to user mode, EXC_VERDICT_KILL retires it.
  */
 static void
 user_fault_die(struct trapframe *tf)
@@ -597,28 +525,18 @@ user_fault_die(struct trapframe *tf)
 	rip_byte_dump((uint64_t)tf->tf_rip);
 
 	/*
-	 * Resolve the destination port + take a local SEND ref so the
-	 * port survives concurrent SYS_*_SET_EXC_PORTS replacement or
-	 * task/thread teardown between here and the post.  Drop the
-	 * local ref after delivery; the slot keeps its own ref
-	 * independently.
+	 * Resolve the port and take a local SEND ref, so it survives a
+	 * concurrent SYS_*_SET_EXC_PORTS or teardown until the post; the
+	 * slot keeps its own ref.
 	 *
-	 * Dispatch order: thread-level slot first, task-level slot
-	 * second.  The thread-level slot is the canonical "debugger
-	 * attached to one thread" hook -- if a thread has nominated a
-	 * watcher for the fault's type, the task-level slot is NOT
-	 * consulted (mirrors real Mach's thread/task precedence).
+	 * The thread-level slot wins over the task-level one, as in Mach.
 	 *
-	 * Locking note: the thread-level read is intentionally
-	 * lock-free.  th->th_exc_ports[] is only ever mutated by
-	 * SYS_THREAD_SET_EXC_PORTS, which operates on the calling
-	 * thread itself (no API today sets another thread's slots).
-	 * user_fault_die runs from a trap on that same thread, so the
-	 * writer can never run concurrently with this reader.  Taking
-	 * th_lock here would close a lock-order cycle with
-	 * thread_block_release's `external=p_lock` path (which takes
-	 * th_lock while holding p_lock) -- WITNESS would (and did)
-	 * panic.
+	 * The thread-level read takes no lock.  th_exc_ports[] is written
+	 * only by SYS_THREAD_SET_EXC_PORTS on the calling thread itself, and
+	 * this runs from a trap on that same thread, so the two cannot
+	 * overlap.  Taking th_lock here would close a lock-order cycle with
+	 * thread_block_release(external = p_lock), which takes th_lock under
+	 * p_lock; WITNESS panics on it.
 	 */
 	exc = NULL;
 	t = (current_thread != NULL) ? current_thread->th_task : NULL;
@@ -678,8 +596,7 @@ user_fault_die(struct trapframe *tf)
 }
 
 /*
- * Decode an x86_64 #PF error code into a single human-readable line.
- * The bits are:
+ * Decode a #PF error code into one line.  The bits:
  *	0  P     1 = protection violation, 0 = page not present
  *	1  W/R   1 = write,        0 = read
  *	2  U/S   1 = user mode,    0 = supervisor
@@ -699,13 +616,10 @@ pf_print_err(uint64_t err)
 }
 
 /*
- * Dump 16 bytes starting at the faulting RIP.  Reading user-VA RIPs is
- * fine -- the kernel can see them via the shared PML4 -- but if RIP
- * sits in an unmapped page we'd take a second fault.  Bound the read
- * to the same simple ranges the rest of the kernel considers
- * dereferenceable: [0, PHYSMAP) for kernel direct-mapped code, and
- * [USER_VA_LO, USER_VA_HI) for ring-3 code.  Anything else gets a "?
- * unmapped" line so a single bogus RIP doesn't double-fault us.
+ * Dump 16 bytes at the faulting RIP.  A user RIP is readable because the
+ * faulting task's pmap is the active one.  Only the range is checked;
+ * a RIP outside both known ranges is skipped rather than risk a second
+ * fault.
  */
 static void
 rip_byte_dump(uint64_t rip)
@@ -716,10 +630,9 @@ rip_byte_dump(uint64_t rip)
 	bool		 is_user;
 
 	/*
-	 * Restrict to the two ranges we know are mapped:
-	 *	[0, 1 GiB)		kernel identity map (boot.S 2 MiB pages)
-	 *	[USER_VA_LO, USER_VA_HI)	user code/data slot (pmap_kenter U=1)
-	 * Anything else, decline rather than risk a double fault.
+	 * The two ranges known to be mapped:
+	 *	[0, 1 GiB)			kernel identity map (boot.S)
+	 *	[VM_USER_VA_LO, VM_USER_VA_HI)	user window, [1 GiB, 2 GiB)
 	 */
 	if (rip >= 0x80000000ULL) {
 		kprintf("code @rip: (unmapped range, skip)\n");
@@ -727,12 +640,9 @@ rip_byte_dump(uint64_t rip)
 	}
 
 	/*
-	 * User-VA reads need SMAP-bracketing once CR4.SMAP is on; the
-	 * kernel-VA read range (< 1 GiB identity map) keeps the brackets
-	 * for uniformity -- STAC/CLAC on a kernel address are no-ops.
-	 * Copy into a kernel scratch first so the printf path stays
-	 * outside AC=1 (the tty lock + console output must not run with
-	 * the SMAP override held).
+	 * A user-VA read needs the SMAP bracket.  Copy to a kernel scratch
+	 * buffer inside it, so the tty lock and console output never run
+	 * with AC=1.
 	 */
 	p = (const uint8_t *)(uintptr_t)rip;
 	is_user = (rip >= 0x40000000ULL && rip < 0x80000000ULL);

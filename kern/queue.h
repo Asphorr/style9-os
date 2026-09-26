@@ -13,9 +13,8 @@
 #define	_SYS_QUEUE_H_
 
 /*
- * Recover the address of the containing struct given a pointer to one
- * of its members.  Used by STAILQ_LAST to walk back from stqh_last
- * (which points at the previous element's stqe_next field).
+ * The containing struct of a member pointer.  STAILQ_LAST uses it to get
+ * from stqh_last (the last element's stqe_next field) to the element.
  */
 #ifndef __containerof
 #define	__containerof(ptr, type, member)				\
@@ -23,22 +22,17 @@
 #endif
 
 /*
- * Five list flavours; each is intrusive (the link fields live inside
- * the caller's struct via a *_ENTRY field declaration), so no per-node
- * allocation is required and lists hand back pointers to whole user
- * objects rather than wrapper nodes.
+ * Four list flavours, all intrusive: the link fields live inside the
+ * caller's struct (a *_ENTRY field), so there is no per-node allocation
+ * and lists hand back whole objects.
  *
  *	SLIST	singly-linked list		head-only insert/remove
  *	LIST	doubly-linked list		O(1) remove anywhere
- *	STAILQ	singly-linked tail queue	O(1) head AND tail insert
+ *	STAILQ	singly-linked tail queue	O(1) head and tail insert
  *	TAILQ	doubly-linked tail queue	O(1) every common op
  *
- * Pick the smallest flavour whose operation set covers the call sites.
- * The cost difference is real: an SLIST entry is one pointer, a TAILQ
- * entry is two, and an unused link field in every element of a 10k-list
- * is 80 KiB of pure overhead.  The table below summarises what each
- * flavour supports in O(1); anything not listed is either O(N) or
- * absent.
+ * Pick the smallest flavour that covers the call sites; every element
+ * pays for its link fields.
  *
  *                       SLIST    LIST     STAILQ   TAILQ
  *	head size           1 ptr   1 ptr    2 ptr    2 ptr
@@ -51,18 +45,11 @@
  *	remove arbitrary    O(N)    O(1)     O(N)     O(1)
  *	reverse traversal    --      --       --      O(1) per step
  *
- * Choice guide:
- *	- Insert-head + forward iterate only (free lists, zombie reapers,
- *	  hash-bucket chains): SLIST.
- *	- Also need to delete from the middle (per-task thread lists,
- *	  hashed object tables): LIST.
- *	- Need FIFO ordering (work queues, message queues, port queues):
- *	  STAILQ if remove-arbitrary is rare, TAILQ otherwise.
- *	- Need either O(1) remove-arbitrary AND tail insert, or any
- *	  reverse traversal: TAILQ.
+ * Insert-head and forward iteration only: SLIST.  Also removal from the
+ * middle: LIST.  FIFO: STAILQ, or TAILQ if removal from the middle or
+ * reverse traversal is needed.
  *
- * Naming convention: each macro is prefixed by the flavour.  Parameters
- * are documented at the macro definition; common ones:
+ * Common macro parameters:
  *	head	address of the *_HEAD structure
  *	elm	pointer to a containing element
  *	field	the name of the *_ENTRY field embedded in the element's type
@@ -119,9 +106,8 @@ struct {								\
 } while (0)
 
 /*
- * SLIST_REMOVE: O(N) walk-from-head to find the predecessor of `elm`
- * and splice it out.  `type` is the C type of the containing struct so
- * the walker has something to cast through.
+ * SLIST_REMOVE: O(N) walk from the head to the predecessor of `elm'.
+ * `type' is the containing struct's type, for the walker.
  */
 #define	SLIST_REMOVE(head, elm, type, field) do {			\
 	if ((head)->slh_first == (elm)) {				\
@@ -145,10 +131,7 @@ struct {								\
 	    (var) && ((tvar) = SLIST_NEXT((var), field), 1);		\
 	    (var) = (tvar))
 
-/*
- * SLIST_SWAP: O(1) full-list move.  Idiom for "drain the whole list
- * under the lock, then walk it unlocked".
- */
+/* SLIST_SWAP: O(1); take the whole list under a lock, walk it unlocked. */
 #define	SLIST_SWAP(head1, head2, type) do {				\
 	struct type *_swap_first = (head1)->slh_first;			\
 	(head1)->slh_first = (head2)->slh_first;			\
@@ -157,11 +140,10 @@ struct {								\
 
 /*
  * ----------------------------------------------------------------------
- * LIST -- doubly-linked list, O(1) remove from anywhere.
+ * LIST -- doubly-linked list, O(1) remove from anywhere, no tail pointer.
  *
- * No tail pointer (use STAILQ or TAILQ if O(1) insert-tail is needed).
- * Back link is a pointer-to-pointer (le_prev) rather than a
- * pointer-to-element, so REMOVE does not have to special-case the head.
+ * The back link is a pointer to the previous next field (le_prev), so
+ * REMOVE need not special-case the head.
  * ----------------------------------------------------------------------
  */
 
@@ -238,12 +220,10 @@ struct {								\
 
 /*
  * ----------------------------------------------------------------------
- * STAILQ -- singly-linked tail queue.  O(1) head AND tail insert.
+ * STAILQ -- singly-linked tail queue.  O(1) head and tail insert.
  *
- * The head carries a pointer-to-pointer back end (stqh_last) that
- * always points at the last element's stqe_next slot, so appending is
- * a one-line splice without a chase.  Remove from the middle is still
- * O(N) (walk from head to find the predecessor); use TAILQ if that hurts.
+ * stqh_last always points at the last element's stqe_next slot, so an
+ * append is one splice.  Removal from the middle is O(N).
  * ----------------------------------------------------------------------
  */
 
@@ -337,11 +317,8 @@ struct {								\
 
 /*
  * ----------------------------------------------------------------------
- * TAILQ -- doubly-linked tail queue.  The workhorse.
- *
- * Everything is O(1): insert/remove anywhere, head insert, tail insert,
- * reverse traversal.  The cost is two pointers per element and two
- * pointers per head.  When in doubt, use this.
+ * TAILQ -- doubly-linked tail queue.  Everything O(1), including reverse
+ * traversal, for two pointers per element and per head.
  * ----------------------------------------------------------------------
  */
 

@@ -21,9 +21,8 @@
 #include "vm_object.h"
 
 /*
- * 4 KiB page constants -- duplicated locally so vm.c does not have to
- * pull arch/amd64/pmap.h.  If you ever change the kernel's page size
- * here is one of the spots to grep for.
+ * 4 KiB page constants, local so vm.c needs no arch/amd64/pmap.h.  One
+ * of the places a page-size change must touch.
  */
 #define	VM_PAGE_SHIFT		12u
 #define	VM_PAGE_SIZE		(1ull << VM_PAGE_SHIFT)
@@ -52,21 +51,15 @@ static uint64_t	vm_n_payload_shared;	/* OOL pages shared with sender */
 static uint64_t	vm_n_payload_copied;	/* ...that had to be copied     */
 
 /*
- * Cutting.  Two counters rather than one, because they answer different
- * questions and only the pair is informative: vm_n_split says the mechanism
- * ran at all, vm_n_rel_cut says it changed an outcome.  A release that needed
- * no cut is one the map could always serve; a release that needed one is a
- * request that used to come back refused.
+ * Entry cutting: vm_n_split says the mechanism ran, vm_n_rel_cut that it
+ * changed an outcome -- a release that could not be served without a cut.
  */
 static uint64_t	vm_n_split;		/* entries cut in two             */
 static uint64_t	vm_n_rel_whole;		/* released without cutting       */
 static uint64_t	vm_n_rel_cut;		/* released only because we can   */
 static uint64_t	vm_n_rel_refuse;	/* hole, stray, or not ours       */
 
-/*
- * Drop one entry.  An entry owns a reference on its object, so releasing the
- * storage has to release that too -- this is the single place that knows it.
- */
+/* Free an entry and the reference it holds on its object. */
 static void
 entry_free(struct vm_map_entry *e)
 {
@@ -81,12 +74,7 @@ void
 vm_init(void)
 {
 
-	/*
-	 * No global state to bring up yet -- per-VM maps are allocated
-	 * lazily via vm_map_create.  Keep the symbol around so a future
-	 * shared "kernel template VM" (for the per-task PML4 commit)
-	 * can plug in here without churn at the call sites.
-	 */
+	/* No global state yet; maps come from vm_map_create. */
 }
 
 struct vm_map *
@@ -119,10 +107,8 @@ vm_map_destroy(struct vm_map *map)
 		return;
 
 	/*
-	 * No lock: a map should only ever be destroyed after its owning
-	 * task has stopped running, so concurrent mutators are
-	 * impossible.  KASSERT'd via the caller (task_deref) which
-	 * holds the "task is dead" invariant.
+	 * No lock: a map is destroyed only after its task has stopped
+	 * running (task_deref), so nothing else can touch it.
 	 */
 	e = map->vm_head;
 	while (e != NULL) {
@@ -144,12 +130,11 @@ vm_map_release_anon(struct vm_map *map, struct pmap *pm)
 		return;
 
 	/*
-	 * Same single-thread invariant as vm_map_destroy -- this is the
-	 * tail of task teardown, no mutators are racing us.  Anonymous
-	 * entries own their frames -- which since fork learned to share can
-	 * mean owning one of several references, so each present leaf is
-	 * unmapped and its frame released, and pmm decides whether that was
-	 * the last claim on it.
+	 * No lock, as in vm_map_destroy: task teardown, or execve with the
+	 * task's only thread running this.  An anonymous entry may own one
+	 * of several references to a frame, so each present leaf is
+	 * unmapped and its reference dropped; pmm frees the frame with its
+	 * last one.
 	 */
 	for (e = map->vm_head; e != NULL; e = e->vme_next) {
 		if ((e->vme_flags & VME_F_ANON) == 0)
@@ -189,20 +174,12 @@ vm_map_release(struct vm_map *map, struct pmap *pm,
 	spin_lock(&map->vm_lock);
 
 	/*
-	 * Establish that the whole range is ours to take before touching any
-	 * of it.  Two separate questions, and the walk answers both:
-	 *
-	 *	Is it covered?  A hole is refused rather than skipped over.
-	 *	  POSIX would have munmap succeed on unmapped pages, but a
-	 *	  caller here naming an address it does not own has made a
-	 *	  mistake, and this kernel would rather say so.  Refusing also
-	 *	  keeps the answer to a stray munmap what it has always been.
-	 *
-	 *	Is every entry anonymous?  Checked per entry, because the flag
-	 *	  decides whether the frames beneath may be handed back.  A
-	 *	  borrowed image page belongs to the kernel and is shared by
-	 *	  every task running that program; returning one to the
-	 *	  allocator would not be merely wrong, it would be quiet.
+	 * Check the whole range before touching any of it: it must be
+	 * covered, with no hole (POSIX munmap would skip one; here it is
+	 * the caller's mistake), and every entry must be anonymous -- a
+	 * borrowed image page belongs to the kernel and every task running
+	 * that program, and handing it to the allocator would corrupt them
+	 * silently.
 	 */
 	covered = va;
 	cut     = false;
@@ -224,11 +201,10 @@ vm_map_release(struct vm_map *map, struct pmap *pm,
 	}
 
 	/*
-	 * Cut the edges, so every entry overlapping the request now lies
-	 * wholly inside it and vm_map_remove takes them all.  Failure here is
-	 * out of memory; it can leave the first cut made, and that is harmless
-	 * -- two entries describing what one described before is a different
-	 * shape for the same memory, not a wrong one.
+	 * Cut at both edges, so every overlapping entry lies wholly inside
+	 * the request and vm_map_remove takes them all.  Failure is out of
+	 * memory and may leave the first cut made, which is harmless: two
+	 * entries describing what one did.
 	 */
 	if (!vm_map_clip_locked(map, va) || !vm_map_clip_locked(map, end)) {
 		vm_n_rel_refuse++;
@@ -262,9 +238,8 @@ vm_map_reset(struct vm_map *map)
 		return;
 
 	/*
-	 * Same no-lock single-thread invariant as vm_map_destroy: the
-	 * owning task sits between images inside execve, and its only
-	 * thread is the one running this reset.
+	 * No lock: the task is between images inside execve, and its only
+	 * thread is running this.
 	 */
 	e = map->vm_head;
 	while (e != NULL) {
@@ -293,34 +268,21 @@ vm_map_fork_share(struct vm_map *src, struct pmap *src_pm,
 		return (false);
 
 	/*
-	 * No lock on src: the parent's only thread is parked in the fork
-	 * syscall, so no mutator can race the walk (the same invariant
-	 * vm_map_release_anon documents).  dst belongs to a task that has
-	 * not run yet.  That same quiescence is what lets the loop below
-	 * rewrite the parent's own flags and page tables underneath it.
+	 * No lock on src: the parent's only thread is parked in fork, and
+	 * dst's task has not run.  That quiescence also lets the loop
+	 * rewrite the parent's flags and page tables.
 	 *
-	 * Holes inside an entry (PA_INVALID) stay holes, mirroring exactly
-	 * what the parent had faulted in -- which for an eagerly loaded
-	 * segment means "everything", and for a lazy mapping means only the
-	 * pages the parent actually touched.  The child inherits the entry's
-	 * pager along with its range, so a page neither of them has touched
-	 * yet still knows where to come from.
+	 * Holes inside an entry stay holes: the child gets exactly what the
+	 * parent had faulted in, and inherits the pager for the rest.
 	 */
 	for (e = src->vm_head; e != NULL; e = e->vme_next) {
 		writable = (e->vme_prot & VM_PROT_WRITE) != 0;
 
 		/*
-		 * A writable range becomes copy-on-write in BOTH maps.  Marking
-		 * only the child would be the classic half-fix: the parent
-		 * would keep a writable page table entry over a frame the child
-		 * can see, and its next store would be delivered to both of
-		 * them without ever faulting.  Which of the two writes first is
-		 * not knowable here, so neither is allowed to.
-		 *
-		 * A read-only range needs none of this.  It is shared outright
-		 * and stays shared; a store into it was already a violation
-		 * before fork and still is, so there is nothing for a fault to
-		 * usefully do.
+		 * A writable range becomes copy-on-write in both maps: a parent
+		 * left writable would store into a frame the child sees,
+		 * without a fault.  A read-only range is simply shared; a store
+		 * to it is a violation either way.
 		 */
 		flags = e->vme_flags;
 		shared_prot = e->vme_prot;
@@ -339,12 +301,9 @@ vm_map_fork_share(struct vm_map *src, struct pmap *src_pm,
 		e->vme_flags = flags;
 
 		/*
-		 * Frames under a borrowed range -- a program image mapped
-		 * straight out of the kernel -- are not the allocator's to
-		 * count.  They were never handed out, nothing will ever hand
-		 * them back, and asking pmm to record one more owner of a
-		 * frame it does not consider allocated is a bug it will say so
-		 * about.  The child gets the same mapping and that is all.
+		 * Frames under a borrowed range (an image mapped out of the
+		 * kernel) were never allocated, and pmm must not count owners
+		 * for them; the child just gets the same mapping.
 		 */
 		owned = (e->vme_flags & VME_F_ANON) != 0;
 
@@ -353,11 +312,9 @@ vm_map_fork_share(struct vm_map *src, struct pmap *src_pm,
 			if (pa == PA_INVALID)
 				continue;
 			/*
-			 * Order matters: take the reference BEFORE installing
-			 * the second mapping.  The reverse would leave a window
-			 * where two page tables reach a frame the allocator
-			 * still believes has one owner, and any teardown inside
-			 * that window would hand a live page back.
+			 * Take the reference before the second mapping exists,
+			 * or a teardown in between could free a frame still
+			 * mapped.
 			 */
 			if (owned)
 				pmm_page_ref(pa);
@@ -378,11 +335,10 @@ vm_map_fork_share(struct vm_map *src, struct pmap *src_pm,
 /* ---- payloads of pages, carried between address spaces ------------------ */
 
 /*
- * Fill one freshly allocated frame with the slice of a payload that belongs
- * in it, zeroing whatever the payload does not reach.  `src` may be a user
- * address, which is why the caller must hold no lock: touching a page the
- * sender has not faulted in yet takes a fault, and that fault wants the map
- * lock this would otherwise be holding.
+ * Allocate a frame and fill it with the payload's page at `off`, zeroing
+ * the rest.  `src` may be a user address, so the caller must hold no
+ * lock: a page the sender has not touched yet faults, and the fault
+ * takes the map lock.
  */
 static uint64_t
 page_from_bytes(const uint8_t *src, uint64_t off, uint64_t size, bool user)
@@ -455,22 +411,19 @@ vm_pages_capture_user(struct vm_map *map, struct pmap *pm, uint64_t addr,
 		pa_out[i] = PA_INVALID;
 
 	/*
-	 * First pass, under the lock: claim every page that can be shared.
-	 * Nothing here can fault -- it reads page tables, not memory -- which
-	 * is what makes it safe to do with the map lock held, and the copies
-	 * that cannot be avoided are deliberately left to the second pass.
+	 * First pass, under the map lock: claim every page that can be
+	 * shared.  It reads page tables, not memory, so it cannot fault;
+	 * the copies are left to the second pass.
 	 */
 	taken = 0;
 	if ((addr & VM_PAGE_MASK) == 0) {
 		spin_lock(&map->vm_lock);
 		e = vm_map_lookup(map, addr);
 		/*
-		 * One anonymous entry has to cover the whole payload.  A range
-		 * that spans entries would need each one marked, and a range
-		 * over borrowed frames must not be reference-counted at all
-		 * (vm/pmm.h) -- neither is worth the code for a case that only
-		 * arises when a sender points at something other than a buffer
-		 * it allocated.  Both simply fall through to copying.
+		 * One anonymous entry must cover the whole payload.  A range
+		 * spanning entries would need each marked, and borrowed frames
+		 * must not be counted at all (vm/pmm.h); both are rare and
+		 * are copied instead.
 		 */
 		if (e != NULL && (e->vme_flags & VME_F_ANON) != 0 &&
 		    e->vme_end >= addr + (uint64_t)npages * VM_PAGE_SIZE) {
@@ -486,9 +439,8 @@ vm_pages_capture_user(struct vm_map *map, struct pmap *pm, uint64_t addr,
 					continue;	/* not faulted in yet */
 				pmm_page_ref(pa);
 				/*
-				 * The sender keeps reading it and stops being
-				 * able to write it.  A range that was already
-				 * read-only needs neither.
+				 * The sender can still read it, no longer
+				 * write it.  A read-only range needs nothing.
 				 */
 				if ((e->vme_prot & VM_PROT_WRITE) != 0 &&
 				    !pmap_enter(pm, va, pa, (uint8_t)
@@ -538,9 +490,9 @@ vm_pages_install(struct vm_map *map, struct pmap *pm, const uint64_t *pas,
 		return (false);
 
 	/*
-	 * The entry says writable, the hardware says not.  That gap is the
-	 * mechanism: a receiver that only reads goes on sharing the sender's
-	 * frames, and one that writes takes a fault and gets its own page.
+	 * The entry says writable, the page tables read-only: a receiver
+	 * that only reads goes on sharing, one that writes faults and gets
+	 * its own page.
 	 */
 	if (!vm_map_enter(map, landing, span,
 	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_USER,
@@ -552,10 +504,8 @@ vm_pages_install(struct vm_map *map, struct pmap *pm, const uint64_t *pas,
 		    pas[i], VM_PROT_READ | VM_PROT_USER))
 			continue;
 		/*
-		 * Undo the mappings but NOT the frames: they still belong to
-		 * whoever captured them, who will release them when it learns
-		 * this failed.  Freeing here as well is the double-free this
-		 * split of ownership exists to prevent.
+		 * Undo the mappings but not the frames: they still belong to
+		 * the caller, who releases them on failure.
 		 */
 		while (i-- > 0)
 			(void)pmap_remove(pm,
@@ -619,8 +569,8 @@ vm_map_image(struct vm_map *map, struct pmap *pm, uint64_t seg_va,
 	va_end   = VM_ALIGN_UP(seg_va + vmsize);
 
 	/*
-	 * The half-open range of pages that can point at the image itself.
-	 * Empty unless all three conditions in vm.h hold.
+	 * The half-open range of pages that can be borrowed from the image;
+	 * empty unless all three conditions in vm.h hold.
 	 */
 	img_pa       = pmm_pa_from_kva(src);
 	borrow_start = va_start;
@@ -636,11 +586,9 @@ vm_map_image(struct vm_map *map, struct pmap *pm, uint64_t seg_va,
 	}
 
 	/*
-	 * Entries before frames, deliberately.  A failure part-way through
-	 * the population loop below leaves the task holding frames that are
-	 * mapped but not described, and teardown walks the map -- so an entry
-	 * that already covers them is the difference between a reclaimed
-	 * partial load and a leaked one.
+	 * Entries before frames: teardown walks the map, so frames mapped by
+	 * a load that fails part-way are reclaimed only if an entry already
+	 * covers them.
 	 */
 	if (borrow_end > borrow_start) {
 		if (borrow_start > va_start &&
@@ -674,9 +622,8 @@ vm_map_image(struct vm_map *map, struct pmap *pm, uint64_t seg_va,
 			kva[i] = 0;
 
 		/*
-		 * Whatever part of this page the file covers.  Zeroes are
-		 * already right for the rest, which is the BSS tail and the
-		 * slack before a segment that does not start on a boundary.
+		 * The part of this page the file covers; the rest (BSS, slack
+		 * before an unaligned segment) stays zero.
 		 */
 		lo = (va > seg_va) ? va : seg_va;
 		hi = va + VM_PAGE_SIZE;
@@ -725,21 +672,13 @@ vm_map_stats(void)
 }
 
 /*
- * Turn a promise into memory.
- *
- * The shape of this is dictated by one rule: the pager sleeps.  Reading a
- * file-backed page goes down through the filesystem to the disk driver, which
- * blocks waiting for the drive's interrupt, and a thread that blocks while
- * holding a spinlock in this kernel never wakes up again (fs/bio.c has the
- * full account).  So the map lock is taken twice with the slow part outside
- * both windows: once to read what the entry promises, then again to install
- * the result -- and the second window has to re-examine everything the first
- * one learned, because the range can be unmapped and another thread can fault
- * the same page while this one is down at the disk.
- *
- * Both races end the same cheap way.  If the page is already present when we
- * come back, the frame we prepared is simply freed: the loser of the race
- * built a copy nobody needs, and the winner's page is just as correct.
+ * The pager sleeps -- a file-backed page is read from disk -- and no
+ * spinlock may be held across a sleep (fs/bio.c).  So the map lock is
+ * taken twice, with the slow part between: once to read what the entry
+ * promises, once to install the result.  The second window re-checks
+ * everything, since meanwhile the range can be unmapped or another
+ * thread can fault the same page in; if the page is already present, the
+ * frame prepared here is simply freed.
  */
 int
 vm_fault(struct vm_map *map, struct pmap *pm, uint64_t va, bool write)
@@ -766,14 +705,10 @@ vm_fault(struct vm_map *map, struct pmap *pm, uint64_t va, bool write)
 		return (VM_FAULT_NOMAP);
 	}
 	/*
-	 * A range mapped PROT_NONE is a reservation, not memory.  Filling it
-	 * would install a leaf the faulting thread still cannot touch, and the
-	 * same instruction would fault again forever.
-	 *
-	 * This asks vme_prot, which is what the range PERMITS.  What the page
-	 * tables currently GRANT can be less -- that is how copy-on-write is
-	 * arranged -- so the two have to be consulted for different questions,
-	 * and this one is "was the access legal at all".
+	 * Was the access legal at all?  Asked of vme_prot, what the range
+	 * permits; the page tables may grant less under copy-on-write.  A
+	 * PROT_NONE range is a reservation: filling it would install a leaf
+	 * the thread still cannot touch, and the fault would repeat forever.
 	 */
 	if ((e->vme_prot & (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXEC)) == 0 ||
 	    (write && (e->vme_prot & VM_PROT_WRITE) == 0)) {
@@ -783,15 +718,12 @@ vm_fault(struct vm_map *map, struct pmap *pm, uint64_t va, bool write)
 	}
 
 	/*
-	 * Something is already mapped here, so this was a protection fault and
-	 * not a missing page.  The legal access check above has already passed,
-	 * which leaves exactly one way to get here: a store to a page whose
-	 * write bit fork cleared.  Give the writer a page of its own.
-	 *
-	 * Note this happens BEFORE the VME_F_LAZY test below.  A lazily
-	 * populated range is not the only kind that can be shared -- the
-	 * loader populates a program's data segment eagerly, and that segment
-	 * is precisely what a forked child writes to first.
+	 * A page is present, so this is a protection fault on a legal
+	 * access: a store to a page whose write bit was cleared for
+	 * copy-on-write.  Give the writer a page of its own.  This comes
+	 * before the VME_F_LAZY test: eagerly populated ranges are shared
+	 * too -- a program's data segment is what a forked child writes
+	 * first.
 	 */
 	old = pmap_extract(pm, page);
 	if (old != PA_INVALID) {
@@ -801,21 +733,17 @@ vm_fault(struct vm_map *map, struct pmap *pm, uint64_t va, bool write)
 			return (VM_FAULT_PROT);
 		}
 		/*
-		 * Only a writable range is ever marked copy-on-write, and only
-		 * an owned range is ever writable -- a borrowed one is a
-		 * read-only window onto the kernel's own memory.  Stated here
-		 * because the two paths below would otherwise quietly hand a
-		 * kernel-image frame to pmm_free_page.
+		 * Only writable ranges are copy-on-write, and only owned ranges
+		 * are writable.  Asserted, because both paths below would
+		 * otherwise hand a kernel-image frame to pmm_free_page.
 		 */
 		KASSERT((e->vme_flags & VME_F_ANON) != 0,
 		    "copy-on-write on a range whose frames are borrowed");
 		prot = e->vme_prot;
 
 		/*
-		 * Nobody else holds this frame any more -- the other sharers
-		 * have written their own copies, or simply died.  Copying it
-		 * would produce a page identical to the one already here, so
-		 * the whole fault is just a stale write bit to hand back.
+		 * No other owner is left (the sharers copied or died): just
+		 * give the write bit back.
 		 */
 		if (pmm_page_refs(old) == 1) {
 			if (!pmap_enter(pm, page, old, prot)) {
@@ -829,11 +757,9 @@ vm_fault(struct vm_map *map, struct pmap *pm, uint64_t va, bool write)
 		}
 
 		/*
-		 * Shared for real.  Allocate and copy with the lock down, the
-		 * same discipline the pager path below follows and for a
-		 * weaker reason -- this cannot sleep -- but the window has to
-		 * be re-checked either way, because another thread of this
-		 * same task can be faulting the very same page.
+		 * Really shared.  Allocate and copy with the lock dropped, as
+		 * the pager path does; this cannot sleep, but another thread
+		 * of the task may be faulting the same page, so re-check after.
 		 */
 		spin_unlock(&map->vm_lock);
 		pa = pmm_alloc_page();
@@ -854,11 +780,8 @@ vm_fault(struct vm_map *map, struct pmap *pm, uint64_t va, bool write)
 		e = vm_map_lookup(map, page);
 		if (e == NULL || pmap_extract(pm, page) != old) {
 			/*
-			 * Somebody else resolved it while we copied, or the
-			 * range went away.  Either way the copy is worthless
-			 * and the instruction can simply be retried: it will
-			 * either succeed against the winner's page or take a
-			 * fresh fault against nothing.
+			 * Resolved by someone else meanwhile, or unmapped: drop
+			 * the copy and let the instruction retry.
 			 */
 			spin_unlock(&map->vm_lock);
 			pmm_free_page(pa);
@@ -873,9 +796,8 @@ vm_fault(struct vm_map *map, struct pmap *pm, uint64_t va, bool write)
 		}
 		spin_unlock(&map->vm_lock);
 		/*
-		 * Last: this map no longer holds the original.  Dropped after
-		 * the new leaf is installed, so there is no instant at which
-		 * this task's page table points at a frame it has released.
+		 * Drop this map's reference on the original only now, so the
+		 * page table never points at a frame it has released.
 		 */
 		pmm_free_page(old);
 		vm_n_cow_copy++;
@@ -902,7 +824,7 @@ vm_fault(struct vm_map *map, struct pmap *pm, uint64_t va, bool write)
 	for (i = 0; i < VM_PAGE_SIZE; i++)
 		kva[i] = 0;
 
-	/* The slow part, with nothing held.  Zeroes are already right for anon. */
+	/* The slow part, with nothing held; an anonymous page stays zero. */
 	if (obj != NULL) {
 		uint64_t	t0, dt;
 
@@ -972,12 +894,8 @@ vm_fault_stats(void)
 		    (unsigned long long)(vm_us_pager / vm_n_fault_file),
 		    (unsigned long long)vm_us_pager_max);
 	/*
-	 * The two numbers that say whether copy-on-write is worth having.
-	 * `shared` is what fork did not copy; `copied` is what a write made it
-	 * pay for afterwards.  The gap between them is the win, and it is only
-	 * a win because most pages a forked child inherits are never written
-	 * -- a program that touched all of its memory would simply pay the
-	 * same cost one fault at a time.
+	 * Whether copy-on-write pays: pages fork shared, against pages a
+	 * write later made it copy.
 	 */
 	kprintf("vm: fork shared %llu pages, %llu later copied on write, "
 	    "%llu reclaimed by their last owner, %llu raced\n",
@@ -987,10 +905,7 @@ vm_fault_stats(void)
 	    (unsigned long long)vm_n_cow_race);
 }
 
-/*
- * Caller holds vm_lock.  Returns true if [va, va+size) does not
- * overlap any existing entry, false otherwise.
- */
+/* Caller holds vm_lock.  Does [va, va+size) overlap no entry? */
 static bool
 vm_range_free_locked(struct vm_map *map, uint64_t va, uint64_t size)
 {
@@ -1053,9 +968,7 @@ vm_map_enter_backed(struct vm_map *map, uint64_t va, uint64_t size,
 		return (false);
 	}
 
-	/*
-	 * Insert sorted by start.  prev == NULL means new head.
-	 */
+	/* Insert sorted by start; prev == NULL means a new head. */
 	prev = NULL;
 	cur  = map->vm_head;
 	while (cur != NULL && cur->vme_start < va) {
@@ -1073,25 +986,16 @@ vm_map_enter_backed(struct vm_map *map, uint64_t va, uint64_t size,
 }
 
 /*
- * CUTTING AN ENTRY IN TWO
+ * Cut an entry in two at `at` (Mach's vm_map_clip_start / clip_end), so
+ * a request naming part of a range can treat the parts separately.
  *
- * An entry says one thing about a whole range: one protection, one set of
- * flags, one origin.  Any request that names part of a range therefore needs
- * the map to be able to describe the two parts separately, and the only way
- * to do that is with two entries where there was one.  Mach calls this
- * vm_map_clip_start/clip_end; without it every caller that named a sub-range
- * had to be refused, which is what three of them did.
+ * The delicate field is vme_offset: the second half starts further into
+ * the object by exactly as far as it starts further into the range.  Got
+ * wrong, nothing visibly breaks -- the pages just fault in holding the
+ * wrong part of the file.
  *
- * The delicate field is vme_offset.  An entry maps byte vme_offset of its
- * object at vme_start, so a half that begins further along the range begins
- * further into the object by exactly the same distance.  Getting that wrong
- * breaks nothing visible: the map stays well-formed, the pages still fault in
- * on demand, and they quietly hold the wrong part of the file.  It is the one
- * line here worth testing on purpose.
- *
- * Caller holds vm_lock, and `at` must be page-aligned and lie strictly inside
- * `e`.  Returns false only when there is no memory for the second entry, in
- * which case nothing has changed.
+ * Caller holds vm_lock; `at` is page-aligned and strictly inside `e`.
+ * Returns false, changing nothing, only when out of memory.
  */
 static bool
 vm_entry_split_locked(struct vm_map *map, struct vm_map_entry *e, uint64_t at)
@@ -1116,10 +1020,8 @@ vm_entry_split_locked(struct vm_map *map, struct vm_map_entry *e, uint64_t at)
 	ne->vme_pad    = 0;
 
 	/*
-	 * Both halves name the object now, so both hold a reference on it:
-	 * entry_free drops one per entry, and an object that gained a second
-	 * namer without gaining a second reference would be freed under the
-	 * half that outlived the other.
+	 * Both halves name the object, so both hold a reference: entry_free
+	 * drops one per entry.
 	 */
 	vm_object_ref(ne->vme_object);
 
@@ -1132,8 +1034,8 @@ vm_entry_split_locked(struct vm_map *map, struct vm_map_entry *e, uint64_t at)
 }
 
 /*
- * Make `at` an entry boundary.  A no-op when it already is one, or when it
- * falls in a hole -- there is nothing there to cut.  Caller holds vm_lock.
+ * Make `at` an entry boundary; a no-op if it is one already or falls in
+ * a hole.  Caller holds vm_lock.
  */
 static bool
 vm_map_clip_locked(struct vm_map *map, uint64_t at)
@@ -1160,20 +1062,10 @@ vm_map_remove(struct vm_map *map, uint64_t va, uint64_t size)
 	n   = 0;
 
 	/*
-	 * UNLINKED UNDER THE LOCK, FREED AFTER IT.
-	 *
-	 * Dropping an entry gives up its reference on the object, and a
-	 * file-backed object's last reference gives the FILE back -- which can
-	 * reach the volume, which sleeps on the disk, and a thread that blocks
-	 * holding a spinlock in this kernel is never woken again.  It was not
-	 * always so: an object used to own nothing that could sleep, and the
-	 * free was done in place.  The moment a mapping began holding its file
-	 * open, that became a panic on the first munmap of a mapped file --
-	 * found exactly that way, in mmaptest.
-	 *
-	 * The unlinked entries are strung together on the same vme_next they
-	 * were held by, which costs nothing: once out of the map they are
-	 * nobody's but this function's.
+	 * Unlinked under the lock, freed after it: an entry's object
+	 * reference may be a file's last, and closing the file can sleep on
+	 * the disk.  The unlinked entries are chained through their own
+	 * vme_next.
 	 */
 	gone = NULL;
 	spin_lock(&map->vm_lock);
@@ -1232,11 +1124,9 @@ vm_map_find_space(struct vm_map *map, uint64_t size, uint64_t *va_out)
 	spin_lock(&map->vm_lock);
 	va = vm_hole_locked(map, size, map->vm_hint);
 	/*
-	 * The hint only ever moves forward, so a program that maps and unmaps
-	 * in a loop would walk it to the ceiling and then fail with almost the
-	 * whole window free.  Nothing could do that before mmap existed; now
-	 * that something can, a failed search starts over from the floor
-	 * before giving up.
+	 * The hint only moves forward, so a map/unmap loop would walk it to
+	 * the ceiling and fail with the window nearly free: search again
+	 * from the floor before giving up.
 	 */
 	if (va == 0 && map->vm_hint > map->vm_lo)
 		va = vm_hole_locked(map, size, map->vm_lo);

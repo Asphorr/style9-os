@@ -29,30 +29,17 @@
 /*
  * Scheduler locking discipline.
  *
- * sched_lock is held across every context switch.  The OUTgoing
- * thread acquires it (in thread_yield / thread_block / handoff_zombie)
- * and the INcoming thread is responsible for releasing it -- either
- * by falling through to the post-switch unlock at the bottom of the
- * same function (for resumed threads), or by calling spin_unlock in
- * thread_trampoline (for brand-new threads).
+ * sched_lock is held across every context switch.  The outgoing thread
+ * acquires it (thread_yield / thread_block_release / sched_handoff_zombie)
+ * and the incoming thread releases it: at the post-switch unlock of the
+ * same function for a resumed thread, in thread_trampoline for a new one.
  *
- * This guarantees that the transition out of RUNNING and the moment
- * we leave our own stack are atomic with respect to thread_wake: a
- * waker spinning on sched_lock cannot observe us as both not-RUNNING
- * (so eligible to be woken) and still executing past our save point.
- *
- * ⚠ AND IT IS WHAT MAKES ONE RUNQUEUE SAFE FOR SEVERAL PROCESSORS, which
- * was not why it was written that way.  A yielding thread puts ITSELF back
- * on the runqueue and then switches off its own stack, so between those two
- * moments there is a thread on the queue that another CPU must not pick --
- * it is still executing.  That window is exactly the span sched_lock is
- * held for: the lock is taken before the enqueue and released only after
- * the switch, by the thread that arrives.  A second processor spinning for
- * it cannot see the queue until the stack has been left.
- *
- * The same argument covers th_rsp_save, which the switch asm writes during
- * that window and the picking CPU reads after acquiring the lock -- so the
- * release/acquire pair on sched_lock is what publishes it.
+ * So leaving RUNNING and leaving our own stack are one step as far as
+ * thread_wake and the other CPUs can tell.  A yielding thread is back on
+ * the runqueue before it has switched off its stack, and no other CPU can
+ * pick it in that window, because the window is exactly the span
+ * sched_lock is held for.  The same release/acquire pair publishes
+ * th_rsp_save, which the switch writes inside it.
  */
 
 static struct spinlock	sched_lock = SPINLOCK_INIT("sched");
@@ -67,23 +54,12 @@ static uint64_t		 ctx_switches;	/* (s) printable counter            */
 static uint64_t		 preempts;	/* (s) IRQ-driven yields            */
 
 /*
- * The idle thread, and the three words of preemption state, are PER-CPU
- * (machine/cpu.h) -- named here so the rest of this file reads as it did.
- *
- * Idle is per-CPU because it is not a policy but a place to stand: a CPU
- * with nothing runnable has to be executing something, and that something
- * has to have its own stack.  One shared idle thread would mean two CPUs
- * running one stack.
- *
- * The preempt count is per-CPU rather than per-THREAD, which is the same
- * conclusion the single-CPU kernel reached for a different reason.  It was
- * kernel-wide because sched_lock is held ACROSS a context switch: the
- * thread that releases it is not the one that took it, so a per-thread
- * count underflows.  Per-CPU keeps that property -- the acquiring and
- * releasing threads are on the same CPU by construction, since the switch
- * is what hands over -- while giving the honest answer to the question the
- * PIT actually asks, which was never "is the kernel busy" but "may I take
- * the CPU I am standing on away from what is running on it".
+ * The idle thread and the preemption state are per-CPU (machine/cpu.h),
+ * aliased here.  Idle is per-CPU because a CPU with nothing to run still
+ * needs a stack of its own to run nothing on.  The preempt count is
+ * per-CPU rather than per-thread because sched_lock is held across a
+ * switch: the thread that releases it is not the one that took it, but
+ * the two are always on the same CPU.
  */
 #define	idle_thread		(curcpu()->cp_idle_thread)
 #define	preempt_need_resched	(curcpu()->cp_need_resched)
@@ -91,83 +67,54 @@ static uint64_t		 preempts;	/* (s) IRQ-driven yields            */
 #define	preempt_count		(curcpu()->cp_preempt_count)
 
 /*
- * Lock-free LIFO of threads queued for thread_wake by an interrupt
- * handler.  Chained through a field of its own, because the thread on
- * this list is BLOCKED and somebody else is entitled to wake it before
- * the drain gets to it -- and the wake puts it on the runqueue.  While
- * this list shared th_runq_link with the runqueue, that enqueue cut the
- * LIFO in half and every wake behind it was never delivered.  Pushed
- * atomically from any context; drained in the safe windows of
- * preempt_enable / intr_dispatch.
+ * Lock-free LIFO of threads an interrupt handler wants woken: pushed from
+ * any context, drained in preempt_enable and at the tail of intr_dispatch.
+ * Chained through th_irq_link, not th_runq_link -- a thread on this list
+ * can be woken by someone else before the drain reaches it, and that wake
+ * puts it on the runqueue.
  */
 static struct thread	*irq_wake_head;		/* (a) */
 
 /*
- * Timed-waiters list: threads parked in mach_msg_recv_timed with a
- * non-FOREVER deadline.  Threaded through th_timed_link.  Maintained
- * under timed_lock from non-IRQ context; sched_check_timeouts runs
- * from the PIT IRQ and uses spin_trylock so a contended tick is just
- * skipped (deadline accuracy bound is one PIT period, ~10 ms).
+ * Threads parked with a deadline (timed Mach receives, sched_nap_ms, the
+ * ATA and Darwin waits), threaded through th_timed_link under timed_lock.
+ * sched_check_timeouts walks it from interrupt context with a trylock, so
+ * a contended walk is skipped and a deadline can be one PIT period (10 ms)
+ * late.
  */
 static struct spinlock	timed_lock = SPINLOCK_INIT("sched-timed");
 static struct thread	*timed_head;		/* (timed_lock)            */
 
 /*
- * Sleep queue: every thread currently BLOCKED on a CHANNEL, threaded through
- * th_sleep_link.  A channel is any address two pieces of code agree to name --
- * classically a field of the object being waited on -- and sched_wakeup wakes
- * whoever is parked on one.
+ * Sleep queue: every thread BLOCKED on a channel, threaded through
+ * th_sleep_link.  A channel is any agreed address, conventionally a field
+ * of the object waited on; sched_wakeup wakes whoever is parked on one.
  *
- * WHY THE SCHEDULER OWNS THIS LIST rather than each object keeping its own
- * waiter pointer: a waiter can be woken by things that know nothing about what
- * it was waiting for.  A kill fan-out wakes every thread of a task; a driver
- * IRQ wakes one by name; a thread whose task is killed while it is parked
- * retires without the object ever hearing about it.  An object holding a
- * thread pointer has to be told about all three, and the console's single
- * waiter slot -- which needed an explicit hook in task teardown to avoid
- * calling thread_wake on freed memory -- is what that costs.  Here the only
- * two moments a thread enters or leaves the list are the two the scheduler
- * already owns: committing to BLOCKED, and leaving it.  Nothing else can get
- * it wrong, because nothing else touches the list.
+ * The scheduler owns the list, rather than each object keeping a waiter
+ * pointer, because a sleeper can be woken or retired by parties that know
+ * nothing of the object -- a kill fan-out, a driver IRQ, task teardown.
+ * Only committing to BLOCKED and leaving it touch the list, and both
+ * belong to the scheduler.
  *
- * A single list, walked per wakeup, rather than a hash of queues.  The whole
- * system has a handful of threads and at most a couple of them are parked at
- * once, so a scan is cheaper than the buckets it would take to avoid it; when
- * that stops being true the fix is a hash keyed on the channel, and nothing
- * outside these three functions would have to change.
+ * One list, scanned per wakeup: few threads are ever parked at once.  If
+ * that changes, hash on the channel; nothing outside the sleepq functions
+ * would notice.
  */
 static struct thread	*sleepq_head;		/* (sched_lock)            */
 
 /*
- * How long a wake takes to become a RUN.  Making a thread READY is not making
- * it run: something else holds the CPU, and where in the queue the woken thread
- * lands decides how long it waits.  A waiter that polls is always in that queue
- * already and so is never far from its turn; one that sleeps rejoins from
- * wherever it is put, and whether that is cheaper depends on numbers rather
- * than on argument.
- *
- * Measured here rather than reasoned about because the reasoning was wrong
- * once: parking three waits made the news arrive TEN TIMES LATER, and nothing
- * short of this counter said so.
+ * Wake latency: time from being made READY to running, per wake (taken in
+ * thread_block_release).  Where a woken thread lands in the queue decides
+ * how long it waits; these say what that costs.
  */
 static uint64_t		wake_lat_n;		/* (a) wakes measured      */
 static uint64_t		wake_lat_sum_ms;	/* (a) total delay         */
 static uint64_t		wake_lat_max_ms;	/* (a) worst one           */
 
 /*
- * ...and WHY, for the ones that were slow, which the totals above cannot say.
- *
- * A mean of zero over twenty thousand wakes hides the handful that took fifty
- * milliseconds, and the handful is the interesting part: what a slow wake needs
- * naming is not its duration but what stood in front of it.  Each of these
- * lines carries the two facts that identify the cause -- how many threads were
- * queued ahead of the woken one, and who held the CPU at that moment -- and
- * printing them is what turned a whole afternoon of theories into one
- * measurement: 122 slow wakes in a boot, every single one with two to four
- * threads queued ahead, delayed by a whole quantum each.  It reads zero now.
- *
- * Bounded so a boot that goes wrong floods nothing; the counter keeps counting
- * after the printing stops, so the tally stays honest.
+ * Slow wakes, named: each printed line says how many threads were queued
+ * ahead and who held the CPU, which a mean cannot show.  Printing is
+ * capped; counting is not.
  */
 #define	WAKE_SLOW_MS		20	/* two quanta: not queueing, standing */
 #define	WAKE_SLOW_MAX_LINES	20
@@ -183,18 +130,11 @@ static void	switch_pmap_if_needed(struct thread *self, struct thread *next);
 static void	switch_user_kstack(struct thread *next);
 
 /*
- * If the incoming thread belongs to a different task than the outgoing,
- * load the new task's CR3.  Same-task switches (e.g. between kernel
- * threads, or between two threads of the same user task) skip the
- * reload; that saves the full TLB flush x86 does on every CR3 write.
- *
- * kernel_task threads (including idle) share kernel_pmap, so kernel-
- * to-kernel switches never reload either.  Called from C BEFORE
- * thread_switch_asm because the asm swap leaves us on the incoming
- * thread's stack; either order works in practice (both pmaps share
- * the boot identity map covering all kmalloc'd kstacks), but doing it
- * here keeps "active pmap == executing thread's task pmap" true at
- * every observable point.
+ * Load the incoming task's CR3 if it is not the outgoing one's.  Same-task
+ * switches -- kernel-to-kernel included, since every kernel_task thread
+ * (idle too) shares kernel_pmap -- skip the reload and the TLB flush that
+ * comes with it.  Done before thread_switch_asm so that the active pmap is
+ * the running thread's at every observable point.
  */
 static void
 switch_pmap_if_needed(struct thread *self, struct thread *next)
@@ -214,24 +154,12 @@ switch_pmap_if_needed(struct thread *self, struct thread *next)
 }
 
 /*
- * Re-arm the ring-transition kstack pointers for the incoming thread.
- *
- * Both this CPU's tss.rsp0 (used by IRQ-from-ring-3 entry) and its
- * cp_kernel_rsp (used by the SYSCALL stub) are read at the next ring-3
- * -> ring-0 transition, so they must always point at the CURRENT
- * thread's own kstack -- otherwise a syscall taken from sh.elf after
- * we just dispatched away from clock.elf would land on clock's freed
- * kstack, scribble the syscall_frame onto recycled memory, and SYSRET
- * to a garbage RIP.
- *
- * usermode_elf_launcher sets these once when a new user task starts,
- * but one CPU holds one pair of them -- without this re-arm on every
- * context switch they are stale the moment the scheduler picks a
- * different user thread.
- *
- * Threads without a kstack of their own (only the synthesised boot
- * thread) are skipped; they don't return to ring 3, so the MSRs are
- * never read from their context.
+ * Point this CPU's tss.rsp0 (interrupt from ring 3) and cp_kernel_rsp
+ * (SYSCALL) at the incoming thread's kstack.  Both are read at the next
+ * ring 3 -> 0 transition, and there is one pair per CPU, so they are stale
+ * the moment another user thread is picked: a syscall would land on the
+ * previous thread's, possibly freed, stack.  A thread with no kstack of its
+ * own (the synthesised boot thread) never returns to ring 3 and is skipped.
  */
 static void
 switch_user_kstack(struct thread *next)
@@ -246,11 +174,7 @@ switch_user_kstack(struct thread *next)
 	cpu_set_kernel_rsp(ksp);
 }
 
-/*
- * sched_lock unlock helper invoked by the trampoline that starts every
- * brand-new thread.  Lives here so trampoline doesn't need to know
- * the lock's name.
- */
+/* thread_trampoline releases sched_lock for a new thread through this. */
 void	sched_post_switch_unlock(void);
 
 void
@@ -283,26 +207,13 @@ sched_init(void)
 }
 
 /*
- * WHERE AN APPLICATION PROCESSOR JOINS THE SCHEDULER.
- *
- * Two things have to exist before a CPU can be given work, and the first is
- * the reason the second is possible: a thread of its own, because a processor
- * cannot switch AWAY from a thread that does not exist and so cannot take the
- * first one off the queue; and an idle thread, because a CPU with nothing
- * runnable still has to be executing something, on a stack that is not shared
- * with anybody.
- *
- * Both are the same thread here.  The context this processor is already
- * running -- the trampoline's stack, which is a per-CPU allocation and has
- * been since the rung that started it -- is adopted as the thread, and that
- * thread is this CPU's idler.  It is never on the runqueue; pick_next_locked
- * falls through to it whenever the queue is empty, exactly as on the boot
- * processor.
- *
- * The boot CPU does it the other way round -- its idle thread is created,
- * because the context it was already running is the boot thread and that one
- * has work to finish.  Two shapes, one invariant: every CPU owns an idle
- * thread and no CPU shares one.
+ * An application processor joins the scheduler.  It needs a thread of its
+ * own to switch away from and an idle thread to fall back to, and here
+ * they are one: the context it is already running on (the trampoline's
+ * per-CPU stack) is adopted and becomes this CPU's idler -- never on the
+ * runqueue, as on the boot CPU.  The boot CPU creates its idle thread
+ * instead, because its own context is the boot thread.  Either way, every
+ * CPU owns exactly one idle thread.
  */
 void
 sched_cpu_attach(void)
@@ -323,11 +234,7 @@ sched_cpu_attach(void)
 
 	cp->cp_idle_thread = idle;
 
-	/*
-	 * A fresh slice and no debts.  The block was zeroed in the image, so
-	 * this is saying it rather than doing it -- and saying it is what
-	 * keeps the statement true if the block ever stops being fresh.
-	 */
+	/* A fresh slice, nothing owed.  Already so in a zeroed block. */
 	preempt_resched_clear();
 	preempt_quantum_reset();
 }
@@ -341,17 +248,10 @@ sched_cpu_idle(void)
 }
 
 /*
- * Is this ANY processor's idle thread?
- *
- * The question used to be `th == idle_thread', which reads this CPU's block
- * and so answers about one of them.  A CPU asking whether some other CPU's
- * idler belongs on the runqueue would have been told yes, and an idle thread
- * on the runqueue is a thread two processors can end up standing on: its own
- * CPU falls through to it whenever the queue is empty, whether or not
- * somebody else has just picked it up.
- *
- * A scan rather than a flag on the thread, because the list is at most eight
- * long and a flag is one more field that can disagree with the truth.
+ * Is this any CPU's idle thread?  `th == idle_thread' only knows this
+ * CPU's, and another CPU's idler let onto the runqueue could end up run by
+ * two processors at once.  A scan rather than a flag: at most MAXCPU
+ * entries, and nothing to keep in sync.
  */
 static bool
 thread_is_idle(const struct thread *th)
@@ -366,31 +266,19 @@ thread_is_idle(const struct thread *th)
 }
 
 /*
- * MAKING A THREAD READY IS NOT MAKING IT RUN, and on one processor the
- * distinction was only about latency: need_resched, and this CPU gets to it
- * when it next can.  With several processors it is also about WHERE.  A CPU
- * sitting in idle's hlt has nothing to do and will not notice a new thread
- * until its own timer wakes it, which is a whole tick -- so the queue would
- * fill up in front of a busy CPU while an idle one slept through it.
+ * Tell one idle CPU there is work.  A CPU halted in idle does not look at
+ * the queue until its own next tick, so work could pile up in front of a
+ * busy CPU while another slept.  One CPU, and only a truly idle one: a busy
+ * CPU reaches the queue at its next schedule point anyway.
  *
- * So the CPU that queues the work tells one that has none.  Exactly one, and
- * only if it is genuinely idle: a busy CPU will reach the queue at its next
- * schedule point without being asked, and telling two of them about one
- * thread only buys a race for it.
+ * And only with more than one thread waiting.  The caller has just set
+ * need_resched on itself and runs a single woken thread at the spin_unlock
+ * that follows; an IPI for that one is four APIC register accesses (each a
+ * VM exit under virtualisation) under the scheduler's lock, spent to lose a
+ * race.
  *
- * ⚠ AND ONLY IF THERE IS MORE THAN ONE THREAD WAITING, which is the whole
- * difference between a hint and a tax.  The caller has just set need_resched
- * on ITSELF, and the spin_unlock that follows honours it at once -- so for a
- * single woken thread this CPU is already going to run it, and a message to
- * anybody else is work done to lose a race.  The message is four accesses to
- * the APIC's registers, every one of them a trap out of the guest on the
- * machines this is developed on, performed while holding the one lock the
- * whole scheduler serialises on.  Sending it on every wake was measurable and
- * bought nothing.
- *
- * Called with sched_lock held, which the ICR wait is bounded inside (see
- * lapic_icr_idle).  Deciding here and sending after the unlock would be
- * tidier and would act on a queue that had already moved on.
+ * Called with sched_lock held; the ICR wait is bounded (lapic_icr_idle).
+ * Sending after the unlock would act on a queue that had moved on.
  */
 static void
 poke_an_idle_cpu_locked(void)
@@ -490,26 +378,14 @@ enqueue_locked(struct thread *th)
 }
 
 /*
- * Ready, and ahead of the queue.
+ * Ready, and at the head of the queue.  A woken thread gave the CPU up
+ * before its slice was over; at the tail, the news it was woken for would
+ * wait out a quantum for every runnable thread ahead of it -- measured, that
+ * was nearly all of wake latency.
  *
- * WHAT THE TAIL COSTS A WAKE.  A thread that has just been woken is, by
- * construction, a thread that gave the CPU up before its slice was over: it
- * asked for something, it was not there, it slept.  Putting it behind the
- * threads that have been running means the news it was woken for waits for
- * their slices, and a slice here is five ticks -- so wake latency is not one
- * switch but "however many runnable threads are ahead of me" times fifty
- * milliseconds.  That was measured rather than reasoned about: in one boot,
- * 122 wakes waited 20 ms or longer, every one of them with two to four threads
- * queued ahead of it, and the delay was a whole quantum almost every time
- * (a hundred milliseconds when two of the queue wanted the CPU, not one).
- *
- * WHY THIS DOES NOT STARVE THE QUEUE.  The boost is worth exactly one slice
- * and is spent by taking it: a thread put here runs, and the moment it is
- * preempted -- or yields, or blocks and is woken having ALREADY had its turn --
- * it goes back through enqueue_locked like everybody else.  Nothing accumulates
- * priority by sleeping; sleeping only buys the CPU for the first look, which is
- * the whole point of having been woken.  A thread that wants the machine cannot
- * get it this way, because wanting the machine is not what puts a thread here.
+ * It does not starve the queue: the boost is one turn, spent by taking it.
+ * Preempted or yielding, the thread goes to the tail like any other; only
+ * the end of a new wait puts it first again, so nothing accumulates.
  */
 static void
 enqueue_first_locked(struct thread *th)
@@ -565,12 +441,8 @@ thread_yield(void)
 	next = pick_next_locked(self);
 	if (next == NULL || next == self) {
 		/*
-		 * Nobody to hand it to.  The caller asked to be put behind
-		 * whatever else wanted the CPU and there was nothing else, so
-		 * no time has passed and nothing has moved on this processor --
-		 * which is exactly what a poll loop needs to be told, and what
-		 * it could not be told while there was only one CPU to be
-		 * empty.
+		 * Nothing else to run.  Say so: a poll loop needs to know that
+		 * no time passed on this CPU.
 		 */
 		spin_unlock(&sched_lock);
 		return (false);
@@ -600,16 +472,9 @@ thread_yield(void)
 	spin_unlock(&sched_lock);
 
 	/*
-	 * Drain any zombies that have accumulated.  Historically reap was
-	 * idle-only, on the theory that "nothing else to do" was the safest
-	 * point to free thread structs.  That works when at most one user
-	 * thread is yield-spinning (idle gets the empty-runq case + reaps),
-	 * but breaks down with two or more concurrent yield-spinners: their
-	 * FIFO round-robin keeps the runq non-empty forever, idle never
-	 * runs, and zombies (e.g. an async-killed task waiting to drop its
-	 * last ref) pile up indefinitely.  Reaping from every voluntary
-	 * yield closes that hole at a one-spinlock-trylock cost in the
-	 * common (zombie-list-empty) case.
+	 * Reap here as well as in idle: two or more threads yield-spinning
+	 * keep the runqueue non-empty, idle never runs, and zombies would
+	 * pile up.  With none waiting this costs one lock round trip.
 	 */
 	sched_reap_zombies();
 
@@ -624,30 +489,12 @@ thread_block(int reason, void *target)
 }
 
 /*
- * SLEEP FOR A WHILE, BECAUSE POLLING BY YIELDING STOPPED BEING SLEEPING.
- *
- * A loop of the shape `while (something somebody else owns) thread_yield()'
- * was a way of waiting on one processor: the yield handed the CPU to that
- * somebody, so a turn round the loop cost a slice of real time.  With four
- * processors it costs nothing -- the thread being waited for is RUNNING
- * elsewhere rather than queued here -- and the loop becomes a spin at the
- * speed of the scheduler.
- *
- * ⚠ WHICH IS NOT MERELY WASTEFUL, IT IS FATAL, and this is what it looked
- * like: the boot thread's one such loop turned into 350,000 context switches
- * a second, every one of them taking the scheduler's global lock with
- * interrupts disabled.  The processor spent so much of its life with
- * interrupts off that it MISSED MOST OF ITS TIMER TICKS, so the clock stopped
- * advancing; and once the clock stops, every deadline in the system stops
- * expiring, so the timed waits that everything else was parked on never
- * returned.  Four processors at a hundred percent, a log frozen mid-line, and
- * nothing wrong with any lock -- the spinlock watchdog written to catch this
- * had nothing to say, because nobody was waiting for a lock.
- *
- * So a poll waits in TIME.  One millisecond asked for, one timer tick given,
- * because the tick is what deadlines are checked from; asking for the
- * smallest thing and being handed the resolution keeps that number in the
- * clock where it belongs.
+ * Sleep for about `ms', rounded up to a timer tick (deadlines are checked
+ * per tick).  For poll loops.  `while (busy) thread_yield()' only waits on
+ * one CPU; with several, the thread waited for runs elsewhere and the loop
+ * spins through the scheduler, taking sched_lock with interrupts off so
+ * often that the CPU misses its timer ticks -- the clock stalls, and every
+ * deadline in the system with it.  A poll waits in time instead.
  */
 void
 sched_nap_ms(uint64_t ms)
@@ -663,9 +510,8 @@ sched_nap_ms(uint64_t ms)
 	sched_add_timed_waiter(self);
 
 	/*
-	 * The channel is the thread itself, which is an address no other
-	 * piece of code names -- so nothing can wake this but the deadline,
-	 * or a kill, which is exactly the pair of things that should.
+	 * The channel is the thread itself, which nothing else names: only
+	 * the deadline or a kill can wake this.
 	 */
 	thread_block(THREAD_BLOCK_SLEEP, self);
 
@@ -686,47 +532,32 @@ thread_block_release(int reason, void *target, struct spinlock *external)
 	spin_lock(&sched_lock);
 
 	/*
-	 * Pre-park kill check.  task_request_terminate sets t_killed
-	 * BEFORE taking sched_lock for the wake fan-out, so any thread
-	 * that acquires sched_lock to commit to BLOCKED after the kill
-	 * was issued observes the flag here.  Without this, a thread
-	 * mid-transition from RUNNING to BLOCKED could miss the wake
-	 * (thread_wake bails on non-BLOCKED) and stay parked indefinitely.
+	 * Pre-park kill check.  task_request_terminate sets t_killed before
+	 * it takes sched_lock for the wake fan-out, so a thread committing
+	 * to BLOCKED after the kill sees the flag here; otherwise it would
+	 * miss the wake (thread_wake ignores non-BLOCKED threads) and stay
+	 * parked.  kernel_task threads cannot be killed and skip the check.
+	 * `external' is dropped first: it has no business surviving into
+	 * sched_handoff_zombie.
 	 *
-	 * Drop external before thread_exit -- the caller's lock has no
-	 * business surviving into sched_handoff_zombie's reacquisition
-	 * of sched_lock.  kernel_task threads cannot be killed so skip
-	 * the check for them entirely; t_killed is permanently false
-	 * there.
-	 *
-	 * ⚠ AND NOT WHILE A MUTEX IS HELD.  A thread that dies owning one
-	 * takes it to the grave locked -- mutex_unlock is owner-only, so
-	 * nobody can give it back for the corpse -- and the mutex most
-	 * often slept under is fs_lock, which every disk path holds
-	 * across its ATA waits.  Retiring here used to leave the whole
-	 * filesystem parked behind a dead owner (and the ATA channel's
-	 * ch_waiter slot naming reaped memory, which is the same defect
-	 * seen from the driver).  So a kill found while th_mutex_depth
-	 * is up DECLINES: the thread parks normally, finishes the
-	 * operation the lock was for, and retires at the first check it
-	 * reaches holding nothing -- the syscall boundary for a user
-	 * thread, the next bare park for a kernel one.  The wait it
-	 * re-enters is finite because every park under a mutex in this
-	 * kernel is: the ATA waits carry deadlines, and a mutex it is
-	 * still acquiring is released by a live owner.
+	 * Not while a mutex is held.  A thread that dies owning one leaves
+	 * it locked for good (mutex_unlock is owner-only), and the mutex
+	 * most often slept under is fs_lock, held across the ATA waits.  So
+	 * with th_mutex_depth up the kill is declined: the thread parks,
+	 * finishes the operation, and retires at the next check it reaches
+	 * holding nothing -- the syscall boundary, or the next bare park.
+	 * That park is finite: the ATA waits have deadlines, and a mutex
+	 * being acquired is released by a live owner.
 	 */
 	if (self->th_task != kernel_task &&
 	    self->th_mutex_depth == 0 &&
 	    task_kill_pending(self->th_task)) {
 		/*
-		 * Off the object's waiter list before the locks go, if the
-		 * caller linked us onto one.  The caller's own detach runs
-		 * only after this returns -- and this path does not return,
-		 * so the object would keep naming a thread about to be
-		 * reaped.  Settled HERE rather than left to thread_exit
-		 * because here the list's lock is still held: `external'
-		 * IS the lock the list lives under, so no extractor can be
-		 * mid-pop against this thread while it leaves.
+		 * Off the object's waiter list, if the caller linked us onto
+		 * one: this path never returns, so the caller's own detach
+		 * never runs.  Done here, not in thread_exit, because
+		 * `external' -- the lock that list lives under -- is still
+		 * held, so no extractor can be mid-pop against us.
 		 */
 		if (self->th_wait_qlock != NULL) {
 			KASSERT(self->th_wait_qlock == external,
@@ -742,16 +573,11 @@ thread_block_release(int reason, void *target, struct spinlock *external)
 	}
 
 	/*
-	 * A WAKE THAT ARRIVED BEFORE THIS SLEEP.  Left by thread_wake when it
-	 * found this thread still running -- which, with a second processor,
-	 * is what a wake racing a park looks like.  Reading it here is the
-	 * only place it can be read safely: under sched_lock, which is the
-	 * same lock the waker held when it wrote the note, and before the
-	 * commit to BLOCKED that the note says has already been answered.
-	 *
-	 * Declining to sleep is a spurious wakeup and nothing worse.  Every
-	 * caller of this parks inside for (;;) and re-tests, because waking
-	 * has always been a hint here rather than a promise.
+	 * A wake that arrived before this sleep: thread_wake found us still
+	 * running and left th_wake_pending.  Read under sched_lock, the lock
+	 * the waker wrote it under, and before committing to BLOCKED.
+	 * Declining to sleep is a spurious wakeup; every caller re-tests in
+	 * a loop.
 	 */
 	if (self->th_wake_pending != 0) {
 		self->th_wake_pending = 0;
@@ -768,11 +594,9 @@ thread_block_release(int reason, void *target, struct spinlock *external)
 	spin_unlock(&self->th_lock);
 
 	/*
-	 * On the sleep queue now, and only now: after the pre-park kill check
-	 * above, which is the one path out of here that does NOT go through
-	 * thread_wake and so would leave a linked thread behind to be woken
-	 * after it had been freed.  A NULL target names no channel and cannot
-	 * be woken by one, so it stays off the list.
+	 * Linked only now, after the kill check: that is the one exit that
+	 * bypasses thread_wake, and it would leave a soon-freed thread on the
+	 * list.  A NULL target names no channel and stays off it.
 	 */
 	if (target != NULL)
 		sleepq_link_locked(self);
@@ -833,16 +657,11 @@ thread_block_release(int reason, void *target, struct spinlock *external)
 	}
 
 	/*
-	 * Post-wake kill check.  If task_request_terminate ran while we
-	 * were parked, the wake it fired broke us out of the BLOCKED
-	 * state and we resumed here; t_killed is set, so retire instead
-	 * of returning to the caller (whose RPC the user will never read).
-	 *
-	 * Same mutex clause as the pre-park check: a holder returns to
-	 * its caller instead, gives the lock back in the ordinary course
-	 * of the operation, and dies at the boundary.  The kill fan-out's
-	 * wake is then just a spurious one, which every park here already
-	 * absorbs.
+	 * Post-wake kill check: a kill while we were parked is what woke
+	 * us, so retire rather than return to a caller whose result nobody
+	 * will read.  Same mutex clause as before parking -- a holder
+	 * returns, releases in the ordinary course, and dies at the
+	 * boundary; the kill's wake was then merely spurious.
 	 */
 	if (current_thread->th_task != kernel_task &&
 	    current_thread->th_mutex_depth == 0 &&
@@ -862,29 +681,13 @@ thread_wake(struct thread *th)
 	spin_lock(&th->th_lock);
 	if (th->th_state != THREAD_BLOCKED) {
 		/*
-		 * ⚠ NOT ASLEEP IS NOT THE SAME AS NOT LISTENING, and telling
-		 * the two apart is what a second processor made necessary.
-		 *
-		 * A thread that is READY or RUNNING has not missed anything --
-		 * it will look again on its own.  But a thread can also be
-		 * BETWEEN: it has decided to sleep and has not yet committed,
-		 * and on one processor that state had no duration, because
-		 * deciding and committing happen with nothing else able to run
-		 * on that CPU in between.  With four it lasts as long as
-		 * anybody likes.
-		 *
-		 * The ATA driver is where it showed.  A thread installs itself
-		 * as the channel's waiter and drops toward THREAD_BLOCKED; the
-		 * disk's interrupt lands on another processor and posts the
-		 * wake; the wake finds a RUNNING thread and, before this, did
-		 * nothing at all.  The thread then slept for ever -- one boot
-		 * in four, always inside a filesystem write, with the rest of
-		 * the machine perfectly healthy and nothing to look at.
-		 *
-		 * So the wake leaves a note instead of evaporating, and the
-		 * next attempt to sleep reads it and declines to.  The caller
-		 * re-tests its condition and finds whatever the wake was about
-		 * -- which is the contract every sleeper here already keeps.
+		 * Not blocked is not the same as not listening.  A READY or
+		 * RUNNING thread may be between deciding to sleep and
+		 * committing to it -- a window with no bound on SMP -- and a
+		 * wake that did nothing there would be lost for good.  So
+		 * leave a note: thread_block_release reads it under
+		 * sched_lock and declines to sleep, and the caller re-tests
+		 * its condition.
 		 */
 		if (th->th_state == THREAD_READY ||
 		    th->th_state == THREAD_RUNNING)
@@ -906,23 +709,13 @@ thread_wake(struct thread *th)
 	sleepq_unlink_locked(th);
 	enqueue_first_locked(th);
 	/*
-	 * ASK FOR A RESCHEDULE.  Making a thread READY is not making it run:
-	 * without this it waits in the queue until whoever holds the CPU gives
-	 * it up voluntarily or the quantum expires -- and the quantum is five
-	 * ticks, so news can arrive fifty milliseconds after it happened.
-	 *
-	 * This line is here because that was MEASURED, twice over.  Across a
-	 * whole boot, 24074 wakes spent 154 seconds between being made ready
-	 * and running, a mean of 6 ms each; with this, 530 ms, a mean of 0.
-	 * And it is what makes sleeping better than polling rather than worse:
-	 * parking three waits that used to poll made them ten times SLOWER to
-	 * notice anything, because a poller gets a fresh look every time it is
-	 * scheduled while a sleeper gets one look and must be given the CPU to
-	 * take it.
-	 *
-	 * Honoured at the next point it is safe to honour -- the tail of
-	 * intr_dispatch, or the preempt_enable that drops the count to zero,
-	 * which the spin_unlock below reaches at once.
+	 * Ask for a reschedule.  Without it the woken thread waits until the
+	 * running one yields or uses up its quantum; with it, measured over a
+	 * boot, mean wake latency went from 6 ms to 0.  It is also what lets
+	 * sleeping beat polling: a sleeper gets one look and needs the CPU to
+	 * take it.  Honoured at the next safe point -- the tail of
+	 * intr_dispatch, or the preempt_enable the spin_unlock below reaches
+	 * at once.
 	 */
 	preempt_need_resched = 1;
 	poke_an_idle_cpu_locked();
@@ -930,43 +723,12 @@ thread_wake(struct thread *th)
 }
 
 /*
- * sched_wakeup: make ready every thread parked on `chan`.
- *
- * The caller's contract is the one every sleep/wakeup pair has ever had, and
- * getting it wrong is the classic lost wakeup: the waiter must test the
- * condition and park under ONE lock, handing that lock to
- * thread_block_release so the drop happens with sched_lock held.  The waker
- * changes the condition, then calls this -- in either order with respect to
- * dropping its own lock, since a waiter is already on the queue by the time it
- * has let go of the lock the waker needs.
- *
- * Waking is a HINT and never a promise that the condition holds: a woken
- * thread must re-test in a loop.  Another thread may take the bytes first, a
- * kill may have arrived, or the channel may be shared by waiters wanting
- * different things.  Every caller in this kernel parks inside `for (;;)`.
- *
- * Returns the number woken, which is what lets a caller count its own
- * fruitless trips honestly rather than guessing.
- */
-/*
- * Wake every thread of `task` that is asleep on a CHANNEL, and no others.
- * Returns how many there were.
- *
- * For posting a signal.  A signal in this kernel sets a bit in the target and
- * returns; a thread already asleep inside a syscall never sees it, and before
- * anything here parked, that did not matter -- the waits polled, so the bit was
- * noticed on the next trip round.  Parking them made read(2) on a pipe stop
- * being interruptible, which POSIX requires it to be, and which a scene in
- * pipefork tests and duly failed.
- *
- * WHY ONLY CHANNEL SLEEPERS.  It used to be that waking a Mach-port waiter was
- * not a spurious wake but CORRUPTION: the port held it on a list threaded
- * through th_runq_link, and making it READY wrote the runqueue's link over the
- * port's and truncated both.  That is no longer true -- an object's queue has
- * a field of its own now (th_wait_link) -- so what is left is a design
- * question rather than a hazard: a Mach receive here is not interruptible, and
- * waking one would only make it re-check an empty queue and park again.  The
- * block reason is still what tells the two apart.
+ * Wake every thread of `task' asleep on a channel, and no others; returns
+ * how many.  For posting a signal: a thread parked inside a syscall would
+ * otherwise never see the pending bit, and read(2) on a pipe must be
+ * interruptible.  Threads blocked for any other reason (a Mach receive)
+ * are left alone -- a receive is not interruptible here, and would only
+ * re-check an empty queue and park again.
  */
 uint32_t
 sched_wake_sleepers_of(struct task *task)
@@ -1012,6 +774,14 @@ sched_wake_sleepers_of(struct task *task)
 	return (n);
 }
 
+/*
+ * Make ready every thread parked on `chan'; returns how many.
+ *
+ * The waiter tests its condition and parks under one lock, handing that
+ * lock to thread_block_release; the waker changes the condition and then
+ * calls this, before or after dropping its own lock.  A wake is a hint,
+ * never a promise: every caller parks inside for (;;) and re-tests.
+ */
 uint32_t
 sched_wakeup(void *chan)
 {
@@ -1023,11 +793,7 @@ sched_wakeup(void *chan)
 
 	n = 0;
 	spin_lock(&sched_lock);
-	/*
-	 * Read the link BEFORE waking: making a thread ready takes it off
-	 * this list, so walking through the entry after the fact would follow
-	 * a pointer that the unlink has already cleared.
-	 */
+	/* Read the link before waking: the unlink clears it. */
 	for (th = sleepq_head; th != NULL; th = next) {
 		next = th->th_sleep_link;
 		if (th->th_block_target != chan)
@@ -1068,28 +834,21 @@ sched_post_irq_wake(struct thread *th)
 		return;
 
 	/*
-	 * ⚠ ONCE ON THE LIST IS A WAKE; TWICE IS A KNOT.  Two parties can
-	 * name the same thread in the same instant on different CPUs -- the
-	 * PIT's deadline walk expiring an ATA waiter's slice while the
-	 * drive's own interrupt completes the command -- and the second
-	 * push would overwrite th_irq_link while the list still runs
-	 * through it.  If the thread was the head, the link is pointed at
-	 * itself and the drain spins on a one-element cycle for ever; if
-	 * not, everything queued behind it is silently never woken.  So
-	 * membership is a mark taken atomically, and the loser simply
-	 * leaves: the wake already queued carries every kind of news,
-	 * because every sleeper here re-tests its condition anyway.
+	 * Queued at most once.  Two parties can post the same thread at
+	 * once from different CPUs (a deadline expiring an ATA wait while
+	 * the drive's interrupt completes it), and a second push would
+	 * overwrite th_irq_link while the list runs through it: a self-loop
+	 * the drain spins on forever, or every wake behind it lost.  The
+	 * loser just leaves -- one queued wake carries any news, since every
+	 * sleeper re-tests.
 	 */
 	if (__atomic_exchange_n(&th->th_irq_queued, 1, __ATOMIC_ACQ_REL) != 0)
 		return;
 
 	/*
-	 * Pinned from the moment it is published.  The pointer handed in
-	 * here is alive -- the slot or list it was taken from is what the
-	 * thread's own exit must pass through -- but between this push and
-	 * the drain's thread_wake the thread can be woken by someone else,
-	 * retire and be reaped.  The hold makes the reaper leave the body
-	 * on the zombie list until the drain has delivered the wake.
+	 * Held from here until the drain's thread_wake: in between, the
+	 * thread can be woken by someone else, exit and be reaped.  The hold
+	 * keeps the reaper off the body until the wake is delivered.
 	 */
 	thread_hold(th);
 
@@ -1110,13 +869,10 @@ sched_drain_irq_wakes(void)
 		next = list->th_irq_link;
 		list->th_irq_link = NULL;
 		/*
-		 * The mark comes off BEFORE the wake, so an interrupt with
-		 * fresh news arriving mid-wake queues the thread again
-		 * instead of seeing the mark and dropping its wake on the
-		 * floor; the hold comes off only AFTER, so the thread
-		 * cannot be freed in between.  A wake delivered twice is a
-		 * spurious wakeup, which is the contract; a wake dropped is
-		 * the ATA hang of July.
+		 * Mark off before the wake, so news arriving mid-wake queues
+		 * the thread again instead of being dropped; hold off after,
+		 * so it cannot be freed in between.  A wake delivered twice is
+		 * spurious and harmless; a wake dropped is a hang.
 		 */
 		__atomic_store_n(&list->th_irq_queued, 0, __ATOMIC_RELEASE);
 		thread_wake(list);
@@ -1138,12 +894,9 @@ timed_present_locked(const struct thread *th)
 }
 
 /*
- * Add `th` to the list of timed waiters.  Caller has already filled in
- * th_wake_deadline_ms; this function inserts into a small list at the
- * head so insert is O(1).  Removal scans linearly; with only a handful
- * of timed waiters at a time (typically one or two RPC clients) the
- * extra cost is negligible compared to alternatives like a sorted
- * insert that pessimises the common case.
+ * Add `th' (th_wake_deadline_ms already set) to the timed waiters.
+ * Insert at the head, remove by scan: the list is a handful long, and a
+ * sorted insert would cost more than it saves.
  */
 void
 sched_add_timed_waiter(struct thread *th)
@@ -1154,13 +907,10 @@ sched_add_timed_waiter(struct thread *th)
 
 	spin_lock(&timed_lock);
 	/*
-	 * ⚠ TWICE ON THIS LIST IS NOT TWICE AS PATIENT, it is the end of the
-	 * list.  The push overwrites the forward pointer the thread is already
-	 * holding, and everything behind it stops having a deadline -- which
-	 * nothing reports, because a thread that is merely never woken looks
-	 * exactly like a thread that is still waiting.  The walk is over a list
-	 * that is a handful of entries long and it turns a silent wedge into a
-	 * panic that names the thread.
+	 * Twice on this list cuts it: the push overwrites the link the
+	 * thread already holds, and everyone behind it loses their deadline
+	 * -- silently, since a waiter never woken looks like one still
+	 * waiting.  The scan turns that into a panic naming the thread.
 	 */
 	KASSERT(!timed_present_locked(th),
 	    "sched_add_timed_waiter: already on the deadline list");
@@ -1193,11 +943,10 @@ sched_remove_timed_waiter(struct thread *th)
 }
 
 /*
- * Walk the timed-waiters list and post an IRQ wake for any thread
- * whose deadline has elapsed.  Called from the PIT IRQ tail; uses
- * spin_trylock so a non-IRQ holder of timed_lock never deadlocks us
- * (we'll catch the deadline on the next tick at the cost of <= one
- * PIT period of latency).
+ * Post an IRQ wake for every timed waiter whose deadline has passed.
+ * Called from intr_dispatch after each 8259 interrupt, so at least at the
+ * PIT's rate.  Trylock only: if another CPU holds timed_lock, this tick
+ * is skipped rather than spent spinning in interrupt context.
  */
 void
 sched_check_timeouts(void)
@@ -1282,13 +1031,10 @@ sched_reap_zombies(void)
 		unsigned	exi;
 
 		/*
-		 * ⚠ SOMEBODY STILL HOLDS THIS BODY.  A waker popped this
-		 * thread from a list or slot and has not delivered its
-		 * thread_wake yet (th_wake_hold, kern/thread.h); freeing it
-		 * now is exactly the freed-memory wake the hold exists to
-		 * prevent.  Put it back for a later pass -- the pin only
-		 * outlives the few lines between a pop and a wake, so the
-		 * body is never kept long.
+		 * Still held: a waker has popped this thread and not yet
+		 * delivered its thread_wake (th_wake_hold, kern/thread.h).
+		 * Freeing it now is the use-after-free the hold prevents, so
+		 * requeue it -- a hold only spans a pop and a wake.
 		 */
 		if (__atomic_load_n(&z->th_wake_hold, __ATOMIC_ACQUIRE) != 0) {
 			spin_lock(&sched_lock);
@@ -1313,13 +1059,7 @@ sched_reap_zombies(void)
 			}
 		}
 
-		/*
-		 * The comment above says thread_exit already detached us
-		 * from any waitq; this is where that claim is checked
-		 * rather than believed, because the memory below is about
-		 * to be reused and a pointer left on an object's list
-		 * outlives every other trace of the defect.
-		 */
+		/* Detached from any waiter list: checked, not assumed. */
 		KASSERT(z->th_wait_qlock == NULL,
 		    "reap: thread still noted on an object's waiter list");
 
@@ -1361,19 +1101,12 @@ idle_loop(void *arg)
 /* ---- proving the work goes to more than one processor ---------------- */
 
 /*
- * Eight threads, a tenth of a second each, and one question: did any of them
- * run anywhere but here?
- *
- * The evidence is a bit set by the thread itself out of its own CPU's block,
- * which no amount of bookkeeping on the queueing side can fake -- the bit for
- * processor three can only be set by code executing on processor three.  What
- * would pass this test on a kernel that had gone wrong is nothing: a scheduler
- * that quietly kept everything on the boot CPU sets one bit, and a processor
- * that joined and then wedged never sets its own.
- *
- * The probes measure their own life in TSC time rather than in iterations, so
- * eight of them cost a tenth of a second of wall clock between them however
- * many processors there turn out to be.
+ * Did work run anywhere but here?  Eight probes each set the bit of the
+ * CPU they are running on, read from that CPU's own block -- only code on
+ * CPU 3 can set bit 3 -- so a scheduler that kept everything on the boot
+ * CPU, or a CPU that joined and wedged, cannot pass.  Each probe lives
+ * 100 ms of TSC (wall) time, so all eight end together however many CPUs
+ * share them.
  */
 #define	SMP_TEST_THREADS	8
 #define	SMP_TEST_US		100000
@@ -1537,11 +1270,8 @@ sched_count_preempt(void)
 }
 
 /*
- * Bump the kernel-wide preempt counter.  Every spin_lock calls this
- * before the acquire spin; every spin_unlock matches it.  The counter
- * tracks how many active critical sections the kernel is currently
- * inside, summed across all threads; the PIT looks at it (not at any
- * per-thread state) when deciding whether to honour need_resched.
+ * This CPU's preempt count: every spin_lock bumps it before spinning and
+ * every spin_unlock drops it.  A reschedule is honoured only at zero.
  */
 void
 preempt_disable(void)
@@ -1562,37 +1292,21 @@ preempt_enable(void)
 		return;
 
 	/*
-	 * Just dropped to zero.  Two pieces of deferred work may have
-	 * accumulated while a critical section was held: IRQ-context
-	 * wake requests queued on the lock-free list, and a PIT
-	 * need_resched.  Drain the wakes first (so any newly readied
-	 * thread participates in the immediate yield), then honour
-	 * the resched.
-	 *
-	 * The preempts counter itself is bumped via a plain atomic
-	 * rather than spin_lock+sched_lock so this path involves no
-	 * further spin_unlock -- otherwise that unlock would re-enter
-	 * preempt_enable, see need_resched still set, and recurse
-	 * indefinitely.  thread_wake inside the drain does take
-	 * sched_lock and re-enters via spin_unlock; bounded recursion
-	 * since the second pass finds an empty wake list and a
-	 * cleared need_resched (thread_yield clears it).
+	 * Just dropped to zero: settle what was deferred meanwhile.  IRQ-
+	 * posted wakes first, so a thread they ready takes part in the
+	 * yield; then any owed reschedule.  sched_count_preempt is a plain
+	 * atomic because a spin_unlock here would re-enter this function
+	 * with need_resched still set.  thread_wake in the drain does
+	 * re-enter through its spin_unlock; that recursion ends, because
+	 * thread_yield clears the request.
 	 */
 	sched_drain_irq_wakes();
 
 	/*
-	 * ⚠ AND ONLY IF THIS CPU HAS A THREAD TO SWITCH AWAY FROM.
-	 *
-	 * There is a window, once per processor, in which a CPU is running
-	 * kernel code and is not yet in the scheduler: an application processor
-	 * released from its parking loop takes locks -- kmalloc's, on the way
-	 * to allocating its own idle thread -- before it has a current thread
-	 * at all.  The message that released it set need_resched on it, so the
-	 * very first spin_unlock of its life arrived here owing a reschedule to
-	 * nowhere, and thread_yield asserted on the way in.
-	 *
-	 * The same test guards the dispatcher's tail, for the same reason and
-	 * about the same window.
+	 * Only with a thread to switch away from.  An AP released from
+	 * parking takes locks (kmalloc, for its idle thread) before it has a
+	 * current thread, and the release IPI left need_resched set on it.
+	 * intr_dispatch's tail makes the same test for the same window.
 	 */
 	if (preempt_resched_wanted() && current_thread != NULL) {
 		sched_count_preempt();
@@ -1608,13 +1322,9 @@ preempt_is_enabled(void)
 }
 
 /*
- * The quantum and the resched request.
- *
- * Still atomic now that they are per-CPU, and for the reason they always
- * were: the PIT interrupt and the thread it interrupted are two writers on
- * ONE CPU.  Going per-CPU removes the cross-CPU race and leaves that one
- * untouched -- an interrupt lands between a load and a store just as
- * happily on a machine with one processor as on a machine with sixteen.
+ * The quantum and the resched request: per-CPU, and still atomic, because
+ * the timer interrupt and the thread it interrupted are two writers on one
+ * CPU.
  */
 bool
 preempt_quantum_tick(void)

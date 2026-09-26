@@ -17,18 +17,11 @@
 #include "spinlock.h"
 
 /*
- * Per-task name table operations.
- *
- * A port_space is the integer-name -> right mapping a task uses to
- * refer to ports.  Names are local to a space: task A's name 5 and
- * task B's name 5 are unrelated.  This file owns:
- *	- space lifecycle (new / destroy / grow),
- *	- name allocation / lookup / drop,
- *	- the public space-level operations the rest of the kernel calls
- *	  (port_allocate, port_set_*, port_space_inject_send, ...).
- *
- * Internal helpers used by mach_msg_send / recv live here as exported
- * symbols (via port_internal.h); see space_install, space_lookup, etc.
+ * Port spaces: the per-task table from integer names to rights.  Names
+ * are local to a space.  Space lifecycle, name allocation, lookup and
+ * drop, and the public space-level calls (port_allocate, port_set_*,
+ * port_space_inject_send, ...).  The space_* helpers the message path
+ * uses are exported through port_internal.h.
  */
 
 /* ---- space lifecycle ------------------------------------------------ */
@@ -118,10 +111,9 @@ space_grow_locked(struct port_space *ps, size_t new_capacity)
 }
 
 /*
- * Slot allocator shared by space_install (port) and space_install_set
- * (port_set).  Finds an empty slot, growing the table if needed.
- * Caller fills in the object pointer + rights after the slot is
- * returned.  ps->ps_lock is held on entry and released on exit.
+ * Find a free slot for space_install / space_install_set, growing the
+ * table once if needed; dead names stay occupied.  The caller holds
+ * ps_lock throughout and fills the slot in.
  */
 static int
 space_alloc_slot_locked(struct port_space *ps, mach_port_name_t *name_out)
@@ -266,9 +258,8 @@ space_lookup_set(struct port_space *ps, mach_port_name_t name)
 }
 
 /*
- * Read-only: is `name` a dead-name tombstone?  Used by the send path to
- * report MACH_E_DEAD (rather than MACH_E_NAME) when the remote name has
- * already been converted by a prior mach_port_type / observation.
+ * Is `name` a dead name?  Lets the send path answer MACH_E_DEAD rather
+ * than MACH_E_RIGHT for a name mach_port_type has already converted.
  */
 bool
 space_name_is_dead(struct port_space *ps, mach_port_name_t name)
@@ -311,11 +302,10 @@ mach_port_type(struct port_space *ps, mach_port_name_t name)
 	}
 
 	/*
-	 * A port set, or a name still holding RECEIVE, is reported by its
-	 * rights mask regardless of p_dead: the receiver defines the port's
-	 * life (style9 also marks p_dead in the no-senders fallback while
-	 * RECEIVE is still held).  Only a SEND / SEND_ONCE-only name can
-	 * become a dead name.
+	 * A set, or a name holding RECEIVE, is reported by its rights
+	 * whatever p_dead says: the receiver defines the port's life (and
+	 * the no-senders fallback sets p_dead with RECEIVE still held).
+	 * Only a SEND / SEND_ONCE name can become a dead name.
 	 */
 	if (ps->ps_table[name].pe_set != NULL ||
 	    (r & MACH_PORT_RIGHT_RECEIVE) != 0) {
@@ -324,10 +314,9 @@ mach_port_type(struct port_space *ps, mach_port_name_t name)
 	}
 
 	/*
-	 * Peek p_dead under p_lock while holding ps_lock.  The order
-	 * ps_lock (outer) -> p_lock (inner) is acyclic: no path takes a
-	 * port_space lock while holding a port lock.  ps_lock pins the
-	 * entry; the entry's own ref keeps `p` alive across the peek.
+	 * Lock order ps_lock -> p_lock: nothing takes a space lock while
+	 * holding a port lock.  ps_lock pins the entry, and the entry's
+	 * ref keeps `p` alive.
 	 */
 	spin_lock(&p->p_lock);
 	dead = p->p_dead;
@@ -339,10 +328,9 @@ mach_port_type(struct port_space *ps, mach_port_name_t name)
 	}
 
 	/*
-	 * Lazy dead-name conversion: the port died, so transmute the entry
-	 * into a tombstone and release the ref it held on the dead port
-	 * (which may free it).  The slot stays occupied until the holder
-	 * deallocates the dead name.  Done after both locks drop.
+	 * The port died: turn the entry into a dead name, which keeps the
+	 * slot until the holder deallocates it, and release the entry's
+	 * ref (possibly the last) once ps_lock is dropped.
 	 */
 	ps->ps_table[name].pe_port   = NULL;
 	ps->ps_table[name].pe_set    = NULL;
@@ -370,9 +358,8 @@ space_drop(struct port_space *ps, mach_port_name_t name)
 		return (MACH_E_NAME);
 	}
 	/*
-	 * Dead-name tombstone: the entry names no live object (the ref on the
-	 * dead port was dropped at conversion), so just reclaim the slot.
-	 * Deallocating the dead name is how a holder finally lets go of it.
+	 * A dead name holds no ref (dropped at conversion): just free the
+	 * slot.
 	 */
 	if (ps->ps_table[name].pe_dead) {
 		ps->ps_table[name].pe_dead = 0;
@@ -399,14 +386,12 @@ space_drop(struct port_space *ps, mach_port_name_t name)
 	spin_unlock(&ps->ps_lock);
 
 	/*
-	 * A send-once right destroyed without being used to send its one
-	 * message auto-fires MACH_NOTIFY_SEND_ONCE to its target port, so a
-	 * client blocked awaiting a reply that will never come is unblocked.
-	 * This is the explicit-deallocate path (teardown is handled in
-	 * port_space_destroy).  The used path -- consuming the right by
-	 * sending -- goes through space_drop_one_right and never lands here,
-	 * so a normal reply produces no spurious notification.  Fire before
-	 * port_deref, while the right's own ref still keeps `p` alive.
+	 * A send-once right destroyed unused fires MACH_NOTIFY_SEND_ONCE at
+	 * its target, unblocking a client waiting for a reply that will
+	 * never come.  This is the deallocate path; port_space_destroy does
+	 * the same at teardown.  A right consumed by sending goes through
+	 * space_drop_one_right instead, so a real reply fires nothing.
+	 * Fired before port_deref, while the right's ref keeps `p` alive.
 	 */
 	if (p != NULL && (r & MACH_PORT_RIGHT_SEND_ONCE) != 0)
 		(void)port_notify_enqueue(p, MACH_NOTIFY_SEND_ONCE, 0);
@@ -419,9 +404,9 @@ space_drop(struct port_space *ps, mach_port_name_t name)
 }
 
 /*
- * Drop ONE specific right kind from a name entry, leaving the rest in
- * place.  Used by MOVE_SEND so a name carrying both RECV and SEND
- * keeps its RECV.  If after the drop the entry is empty, remove it.
+ * Drop one right kind from a name, leaving the rest (MOVE_SEND on a
+ * name with RECEIVE and SEND keeps the RECEIVE).  An emptied entry is
+ * removed.
  */
 int
 space_drop_one_right(struct port_space *ps, mach_port_name_t name,
@@ -458,15 +443,10 @@ space_drop_one_right(struct port_space *ps, mach_port_name_t name,
 }
 
 /*
- * Remove a right from a name entry WITHOUT calling port_deref on the
- * port -- the caller is transferring the right elsewhere (the canonical
- * use is MOVE_RECEIVE, which moves the receive right into an in-flight
- * message rather than destroying it).  If the entry's rights mask
- * becomes empty the slot is freed.
- *
- * Conservation: the port object's p_has_receive / p_send_count /
- * p_send_once_count are NOT touched here; the right lives on,
- * temporarily owned by whatever the caller stuffed it into.
+ * Remove a right from a name without port_deref: the caller is moving
+ * the right elsewhere (MOVE_RECEIVE into an in-flight message).  An
+ * emptied entry is freed.  The port's p_has_receive and counts are
+ * untouched; the right lives on in whatever now holds it.
  */
 int
 space_unbind_no_deref(struct port_space *ps, mach_port_name_t name,
@@ -496,9 +476,9 @@ space_unbind_no_deref(struct port_space *ps, mach_port_name_t name,
 }
 
 /*
- * Install a port at a fresh name WITHOUT calling port_ref -- the caller
- * is delivering a right that was already "checked out" of some other
- * space (the MOVE_RECEIVE counterpart of space_unbind_no_deref).
+ * Install a port at a new name without port_ref: the caller delivers a
+ * right it already owns (the other half of space_unbind_no_deref, or a
+ * SEND ref taken for the purpose).
  */
 int
 space_install_no_ref(struct port_space *ps, struct port *p, uint8_t rights,
@@ -631,11 +611,8 @@ port_space_inject_send(struct port_space *src, mach_port_name_t src_name,
 		return (MACH_E_INVAL);
 
 	/*
-	 * Look up the source name with SEND right; space_lookup
-	 * does NOT take a ref, so the caller is implicitly relying
-	 * on `src_name` staying valid for the duration of this call.
-	 * The new entry's port_ref taken inside space_install bumps
-	 * the SEND count.
+	 * space_lookup takes no ref: the caller must keep `src_name` valid
+	 * for the call.  space_install takes the new entry's SEND ref.
 	 */
 	p = space_lookup(src, src_name, MACH_PORT_RIGHT_SEND, &rights);
 	if (p == NULL)
@@ -662,9 +639,8 @@ port_set_extract(struct port_space *ps, mach_port_name_t port_name)
 		return (MACH_PORT_NULL);
 
 	/*
-	 * Need RECEIVE to reach the port the same way port_set_insert /
-	 * port_set_remove do; SEND-only holders never see set membership
-	 * because the set bridges receive queues, not send rights.
+	 * RECEIVE required, as for insert and remove: set membership is a
+	 * receiver's business.
 	 */
 	p = space_lookup(ps, port_name, MACH_PORT_RIGHT_RECEIVE, &dummy);
 	if (p == NULL)
@@ -677,11 +653,8 @@ port_set_extract(struct port_space *ps, mach_port_name_t port_name)
 		return (MACH_PORT_NULL);
 
 	/*
-	 * Map the port_set pointer back to its name in this space.  The
-	 * set must have been installed somewhere in ps -- port_set_insert
-	 * looks up both port and set in the same space -- so a linear
-	 * scan finds it.  Stop at the first hit; sets occupy at most one
-	 * name per space.
+	 * Map the set back to its name.  port_set_insert looks both up in
+	 * one space, so the set is named in `ps`, once.
 	 */
 	result = MACH_PORT_NULL;
 	spin_lock(&ps->ps_lock);
@@ -752,15 +725,9 @@ port_request_notification(struct port_space *space, mach_port_name_t name,
 		return (MACH_E_INVAL);
 
 	/*
-	 * Each notification type names a different precondition on the
-	 * source:
-	 *	NO_SENDERS -- caller is the RECEIVER, watching for "all my
-	 *		     senders went away" while still holding RECV.
-	 *	DEAD_NAME  -- caller is a SEND HOLDER, watching for "the
-	 *		     port behind my SEND name died" so the name
-	 *		     in their own space becomes a dead name.
-	 * Other types (SEND_ONCE notification, port-deleted, ...)
-	 * reserved for future revisions.
+	 * NO_SENDERS is registered by the receiver (all senders gone),
+	 * DEAD_NAME by a SEND holder (the port died).  SEND_ONCE needs no
+	 * registration; other types are not supported.
 	 */
 	switch (notify_type) {
 	case MACH_NOTIFY_NO_SENDERS:
@@ -773,11 +740,7 @@ port_request_notification(struct port_space *space, mach_port_name_t name,
 		return (MACH_E_INVAL);
 	}
 
-	/*
-	 * Lookup itself does not take a ref; we rely on the caller's
-	 * name table entry keeping the port alive for the duration of
-	 * this call.
-	 */
+	/* No ref taken: the caller's entries keep both ports alive. */
 	source = space_lookup(space, name, required, &dummy);
 	if (source == NULL)
 		return (MACH_E_RIGHT);
@@ -788,20 +751,18 @@ port_request_notification(struct port_space *space, mach_port_name_t name,
 		return (MACH_E_RIGHT);
 
 	/*
-	 * Disallow source == notify target.  For NO_SENDERS the kernel
-	 * SEND ref on the notify port would mask the user's own "all
-	 * senders gone" event; for DEAD_NAME firing the notification
-	 * onto the same dying port is a guaranteed dead letter.
+	 * A port cannot watch itself: for NO_SENDERS the kernel's SEND ref
+	 * would keep a sender alive for ever, and a DEAD_NAME notice would
+	 * go to the port that just died.
 	 */
 	if (source == notify_port)
 		return (MACH_E_INVAL);
 
 	/*
-	 * DEAD_NAME is multi-registrant: pre-allocate a node and take a
-	 * fresh SEND ref outside source->p_lock, then hand both to
-	 * port_dead_name_link.  It appends a new watch, or -- if this target
-	 * is already armed -- updates its tag and hands the spare node + ref
-	 * back (dup) for us to release.
+	 * DEAD_NAME: allocate a node and take a SEND ref outside p_lock,
+	 * and let port_dead_name_link append the watch.  If this target is
+	 * already armed it only updates the tag, and the spare node and ref
+	 * are ours to release (dup).
 	 */
 	if (notify_type == MACH_NOTIFY_DEAD_NAME) {
 		struct port_notify_node	*node;
@@ -823,11 +784,10 @@ port_request_notification(struct port_space *space, mach_port_name_t name,
 	}
 
 	/*
-	 * NO_SENDERS is single-slot (one receiver per port).  Take a SEND
-	 * ref before swapping the field so an interleaving fire reads a live
-	 * ref; the prior registration's ref is dropped after the swap.  That
-	 * ref is released by port_deref's firing branch or the RECV-drop
-	 * cleanup branch.
+	 * NO_SENDERS has one slot.  The new SEND ref is taken before the
+	 * swap, so a concurrent fire finds a live ref; the replaced
+	 * registration's ref is dropped after it.  port_deref releases the
+	 * new one when it fires or when RECEIVE goes.
 	 */
 	port_ref(notify_port, MACH_PORT_RIGHT_SEND);
 
@@ -841,10 +801,8 @@ port_request_notification(struct port_space *space, mach_port_name_t name,
 		port_deref(prev_target, MACH_PORT_RIGHT_SEND);
 
 	/*
-	 * v1 makes no attempt to resolve prev_target back to a name in the
-	 * caller's space (would require walking ps_table or stashing the
-	 * name alongside the pointer).  Tracking the previous registration
-	 * is the application's job.
+	 * prev_target is not mapped back to a name; tracking the previous
+	 * registration is the caller's job.
 	 */
 	*prev_out = MACH_PORT_NULL;
 	return (MACH_MSG_OK);

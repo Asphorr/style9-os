@@ -33,11 +33,9 @@ _Static_assert(KBD_BUF_SIZE > 0 && (KBD_BUF_SIZE & KBD_BUF_MASK) == 0,
     "KBD_BUF_SIZE must be a power of two");
 
 /*
- * Scancode-set-1 -> ASCII translation, US layout.  Indexed by the low
- * 7 bits of the scancode (the press code); release codes are press|0x80
- * and stripped before indexing.  Zero means "no character" -- modifier
- * keys, function keys, and reserved positions all map to 0 and are
- * filtered at the producer.
+ * Scancode set 1 -> ASCII, US layout, indexed by press code (releases,
+ * press|0x80, never reach it).  Zero means no character: modifiers,
+ * function keys and unused codes, dropped by kbd_decode_scancode.
  */
 static const char	sc_table[128] = {
 	0,    27,  '1', '2', '3', '4', '5', '6',	/* 00 - 07 */
@@ -70,14 +68,12 @@ static const char	sc_table_shift[128] = {
 };
 
 /*
- * Single-producer (IRQ1 handler) / single-consumer (kbd_getc, and so
- * kbd_getc_block: the kbd-drv thread) ring buffer.  No lock: head and tail
- * are free-running counters with one writer each.  The IRQ stores a byte,
- * THEN releases head past it; the consumer takes a byte, THEN releases
- * tail past it; each acquires the other's index first.  That pairing is
- * what orders a byte against the index that publishes it -- with the
- * consumer on another processor since the APs joined the scheduler, an
- * aligned 32-bit access being atomic is not the question any more.
+ * Single-producer (IRQ1) / single-consumer (kbd_getc, from the kbd-drv
+ * thread) ring.  No lock: head and tail are free-running counters with one
+ * writer each.  The IRQ stores a byte, then releases head past it; the
+ * consumer takes a byte, then releases tail past it; each acquires the
+ * other's index first.  That pairing orders each byte against the index
+ * that publishes it, with the consumer possibly on another CPU.
  */
 static uint32_t			kbd_buf_head;	/* IRQ's      */
 static uint32_t			kbd_buf_tail;	/* consumer's */
@@ -87,33 +83,27 @@ static volatile uint8_t		kbd_shift;	/* either Shift key down */
 static volatile uint8_t		kbd_ctrl;	/* either Ctrl key down  */
 
 /*
- * Extended-scancode latch.  Scancode set 1 prefixes the cursor keys,
- * page navigation, and a handful of others with 0xE0 to disambiguate
- * them from numpad equivalents.  The IRQ handler consumes the 0xE0
- * byte, sets this flag, and treats the next byte as an extended press
- * (or release with bit 7 set, ignored).  The extended press is then
- * translated to its ANSI/VT100 escape sequence and pushed byte-by-byte
- * into the ring so a userspace pager sees the same multi-byte stream
- * it would get from a real serial terminal.
+ * Extended-scancode latch.  Set 1 prefixes the cursor and page keys (and
+ * a few others) with 0xE0 to tell them from their numpad twins.  The IRQ
+ * consumes the 0xE0, sets this, and treats the next byte as an extended
+ * press or release; a press becomes its ANSI/VT100 escape sequence, pushed
+ * byte by byte, as a serial terminal would send it.
  */
 static volatile uint8_t		kbd_extended;
 
 /*
- * Single-consumer block-on-read support.
+ * Blocking read for the single consumer.
  *
- *	kbd_waiter	The one thread currently parked in kbd_getc_block,
- *			or NULL.  Set by the consumer immediately before it
- *			rechecks the ring and blocks; cleared by the IRQ
- *			when it pushes a byte and harvests the waiter.  The
- *			exchange is atomic so a producer push that races
- *			with the consumer's set always observes one side
- *			or the other -- never both.
+ *	kbd_waiter	The thread parked in kbd_getc_block, or NULL.  Set
+ *			by the consumer just before it rechecks the ring and
+ *			blocks; taken by the IRQ when it pushes a byte.  Both
+ *			sides exchange it, so a push racing the install
+ *			either finds the waiter or is seen by the recheck.
  *
- *	kbd_wake_pending Set by the IRQ when it consumed a waiter slot.
- *			The consumer checks this flag after registering and
- *			rechecking the ring; if set, it skips the block and
- *			loops back instead, so a wake delivered between the
- *			recheck and the block is not lost.
+ *	kbd_wake_pending Set by the IRQ when it took a waiter.  Checked by
+ *			the consumer after its recheck: if set, it loops
+ *			instead of blocking, so a wake between recheck and
+ *			block is not lost.
  */
 static struct thread *volatile	kbd_waiter;
 static volatile int		kbd_wake_pending;
@@ -148,14 +138,9 @@ kbd_getc(void)
 }
 
 /*
- * Translate an extended (post-0xE0) press scancode to an ANSI/VT100
- * escape sequence and push the bytes into the ring one at a time.
- * Releases (high bit set) and unmapped scancodes are silently dropped.
- *
- * Special case: RCtrl shares scancode 0x1D with LCtrl but arrives in
- * the extended set.  Track its press / release into the same
- * kbd_ctrl flag the LCtrl path uses so either key produces the same
- * terminal-control behavior.
+ * Translate an extended (post-0xE0) press to its ANSI/VT100 escape
+ * sequence and push it into the ring.  Releases and unmapped codes are
+ * dropped.
  */
 static void
 kbd_emit_extended(uint8_t sc)
@@ -164,9 +149,9 @@ kbd_emit_extended(uint8_t sc)
 	const char	*seq;
 
 	/*
-	 * RCtrl press / release.  Done before the "release filter" below
-	 * because the release form (0x9D) carries our state-clearing
-	 * signal.
+	 * RCtrl is 0xE0 0x1D: it drives the same kbd_ctrl flag as LCtrl.
+	 * Checked before the release filter, since its release (0x9D) is
+	 * what clears the flag.
 	 */
 	if (sc == SC_LCTRL) {
 		kbd_ctrl = 1;
@@ -210,11 +195,10 @@ kbd_irq(struct trapframe *tf)
 
 	/*
 	 * Only a byte that is there, and is the keyboard's.  IRQ1 is latched
-	 * at the 8259 when the byte arrives, but the byte can be gone by the
-	 * time this runs -- mouse_init drains the controller with interrupts
-	 * off -- and a read of an empty data port hands back the last byte
-	 * again: a key pressed twice.  And the one output buffer is shared
-	 * with the mouse; a byte with STS_AUX set is mouse_irq's.
+	 * at the 8259, but the byte can be gone by the time this runs
+	 * (mouse_init drains the controller with interrupts off), and reading
+	 * an empty data port returns the last byte again.  The output buffer
+	 * is shared with the mouse; a byte with STS_AUX set is mouse_irq's.
 	 */
 	sts = inb(KBD_STATUS_PORT);
 	if ((sts & KBD_STS_OBF) == 0 || (sts & KBD_STS_AUX) != 0)
@@ -246,10 +230,9 @@ kbd_poll_getc(void)
 		return (-1);
 
 	/*
-	 * A mouse byte is taken and dropped, not decoded as a scancode.
-	 * Nor can it be left: this polls with interrupts off (ddb), so
-	 * mouse_irq will not come for it, and it would sit in the one
-	 * output buffer ahead of every key typed after it.
+	 * A mouse byte is read and dropped.  It cannot be left: this polls
+	 * with interrupts off (ddb), so mouse_irq will not take it, and it
+	 * would block the shared output buffer for every later key.
 	 */
 	if ((sts & KBD_STS_AUX) != 0) {
 		(void)inb(KBD_DATA_PORT);
@@ -273,12 +256,10 @@ kbd_poll_getc_block(void)
 }
 
 /*
- * Decode one raw scancode byte.  Updates shared shift state, returns
- * the translated character on a printable keypress, or -1 on release
- * events, modifier presses, and keys that do not map to a character.
- *
- * Used by both the IRQ handler and the polled-input path so the two
- * agree on shift state and the translation table.
+ * Decode one raw scancode byte.  Updates the shared modifier state and
+ * returns the character for a printable press, or -1 for releases,
+ * modifiers, and unmapped keys.  Shared by the IRQ and polled paths so
+ * they agree on modifier state.
  */
 static int
 kbd_decode_scancode(uint8_t sc)
@@ -309,13 +290,8 @@ kbd_decode_scancode(uint8_t sc)
 		return (-1);
 
 	/*
-	 * Ctrl folding: when Ctrl is held, translate letter keys 'A'..'Z'
-	 * / 'a'..'z' to their corresponding ASCII control codes (0x01 ..
-	 * 0x1A).  Standard VT100 / xterm convention: Ctrl-C -> 0x03,
-	 * Ctrl-D -> 0x04, Ctrl-Z -> 0x1A, and so on.  Userspace sees a
-	 * single control byte in the kbd byte stream and acts on it
-	 * (e.g. sh.c's foreground-wait peeks for 0x03 to kill the
-	 * current child).  Non-letter keys pass through unchanged.
+	 * Ctrl folds letters to control codes 0x01..0x1A (Ctrl-C = 0x03,
+	 * Ctrl-D = 0x04), the VT100 convention; other keys pass unchanged.
 	 */
 	if (kbd_ctrl != 0) {
 		if (ch >= 'a' && ch <= 'z')
@@ -342,16 +318,12 @@ kbd_buf_push(char ch)
 	__atomic_store_n(&kbd_buf_head, head + 1, __ATOMIC_RELEASE);
 
 	/*
-	 * Harvest any parked consumer and signal it.  The exchange
-	 * makes the take-the-slot operation atomic against a consumer
-	 * that's installing itself concurrently; sched_post_irq_wake
-	 * defers the actual thread_wake to the next safe point (so
-	 * we don't take sched_lock from IRQ context).  The
-	 * wake_pending flag covers the narrow race where the
-	 * consumer is between recheck-and-block and would otherwise
-	 * miss the signal.  Release as well as acquire: it is what
-	 * carries the push above to a consumer whose own exchange
-	 * reads this one (see kbd_getc_block).
+	 * Take any parked consumer and wake it.  sched_post_irq_wake defers
+	 * the thread_wake to a safe point, keeping sched_lock out of IRQ
+	 * context; kbd_wake_pending covers a consumer between recheck and
+	 * block.  The exchange releases as well as acquires: that carries
+	 * the push above to a consumer whose own exchange reads this one
+	 * (see kbd_getc_block).
 	 */
 	w = __atomic_exchange_n(&kbd_waiter, NULL, __ATOMIC_ACQ_REL);
 	if (w != NULL) {
@@ -368,13 +340,11 @@ kbd_getc_block(void)
 
 	self = current_thread;
 	/*
-	 * Noted for the length of the loop: kbd_waiter may carry our name
-	 * anywhere inside it, and an exit mid-park would leave that name
-	 * for the next keystroke's ISR to wake.  Today's only caller is
-	 * the kernel_task kbd-drv thread, which cannot be killed -- the
-	 * note is what keeps that from being a load-bearing coincidence
-	 * (thread_exit CASes the name back out; th_wait_slot in
-	 * kern/thread.h).
+	 * Noted for the length of the loop: kbd_waiter may name us anywhere
+	 * in it, and an exit mid-park would leave that name for the next
+	 * keystroke's ISR to wake.  The only caller, the kernel_task kbd-drv
+	 * thread, cannot be killed; the note makes that not matter
+	 * (thread_exit CASes the name out; th_wait_slot, kern/thread.h).
 	 */
 	thread_slot_note(self, &kbd_waiter);
 
@@ -386,24 +356,19 @@ kbd_getc_block(void)
 		}
 
 		/*
-		 * Empty: register, clear the pending flag, then recheck
-		 * the ring under the now-installed waiter slot.  Order
-		 * matters -- the IRQ-side store sequence is push, then
-		 * exchange waiter, then set pending; we mirror it in
-		 * reverse: clear pending, install waiter, recheck.
+		 * Empty: clear the pending flag, install ourselves, then
+		 * recheck the ring -- the IRQ's order (push, take waiter,
+		 * set pending) in reverse.
 		 *
-		 * ⚠ THE INSTALL IS AN EXCHANGE, NOT A STORE, and the
-		 * recheck below is only worth anything because of it.  A
-		 * store followed by a load of a DIFFERENT address is the
-		 * one reordering x86 allows: the recheck can read the head
-		 * index while our name is still in this CPU's store buffer.
-		 * With the IRQ on another processor, it can push a byte in
-		 * that window and exchange the slot empty-handed, and we
-		 * park over a ring with data in it -- woken, if ever, by
-		 * the next keystroke.  With both sides exchanging the one
-		 * slot, the two exchanges fall in a single order and the
+		 * The install is an exchange, not a store, and the recheck
+		 * depends on it.  x86 lets a load pass an earlier store to
+		 * a different address, so the recheck could read head while
+		 * our name is still in the store buffer; an IRQ on another
+		 * CPU could push a byte and find the slot empty in that
+		 * window, and we would park over a ring with data in it.
+		 * Two exchanges on one slot are totally ordered and the
 		 * second sees the first: the IRQ finds our name, or ours
-		 * reads the IRQ's and acquires the push that preceded it.
+		 * reads the IRQ's and acquires the push before it.
 		 */
 		__atomic_store_n(&kbd_wake_pending, 0, __ATOMIC_RELAXED);
 		(void)__atomic_exchange_n(&kbd_waiter, self, __ATOMIC_ACQ_REL);
@@ -417,11 +382,9 @@ kbd_getc_block(void)
 		}
 
 		/*
-		 * A wake delivered between the recheck above and the
-		 * block below would set wake_pending; if so, skip the
-		 * block and loop.  Otherwise it is safe to park -- a
-		 * later IRQ will sched_post_irq_wake us once the buffer
-		 * has data.
+		 * A wake between the recheck and the block sets
+		 * kbd_wake_pending: loop instead of parking.  Otherwise the
+		 * next push will wake us.
 		 */
 		if (__atomic_load_n(&kbd_wake_pending,
 		    __ATOMIC_ACQUIRE) != 0) {

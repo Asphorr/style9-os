@@ -11,37 +11,29 @@
 /*
  * Starting the other processors.
  *
- * An application processor comes out of reset in REAL MODE, at a physical
- * address the startup message names, with no page tables, no stack, no idea
- * which processor it is and a segment base of zero.  Everything this kernel
- * takes for granted has to be built for it in that order, by code that runs
- * in three different addressing modes before it can call a C function.  Hence
- * a trampoline: a page of position-known code in the first megabyte, because
- * the startup message carries a PAGE NUMBER in one byte and cannot name an
- * address above 0xFF000.
+ * An application processor comes out of reset in real mode at the address
+ * the STARTUP IPI names, with no page tables, no stack and no idea which
+ * CPU it is, and has to pass through three addressing modes before it can
+ * call C.  Hence a trampoline in the first megabyte: the STARTUP IPI
+ * carries a one-byte page number, so it cannot name anything above
+ * 0xFF000.
  */
 
 /*
- * Where the trampoline is assembled to run.  A compile-time constant rather
- * than an allocation, and that is what keeps the assembly honest: every
- * address inside it -- the temporary GDT's base, the far-jump targets -- is a
- * link-time constant, so there is no runtime patching of code at all.  Only
- * the parameter block below is written, and it is data.
+ * Where the trampoline is assembled to run.  A constant, so every address
+ * inside it (GDT base, far-jump targets) is a link-time constant and no
+ * code is patched at run time; only the parameter block is written.
  *
- * 0x8000 is inside the conventional memory the firmware leaves alone once it
- * has finished booting, and pmm never offers it: the whole first megabyte is
- * marked used at startup as firmware playground.  The install checks the
- * memory map anyway, because "never" is a property of today's pmm.
+ * pmm never hands out the first megabyte, and 0x8000 is conventional
+ * memory the firmware is done with; mp_install_trampoline still checks
+ * the memory map.
  */
 #define	AP_TRAMP_PA		0x8000
 
 /*
- * The parameter block, at a fixed offset in the same page so that both C and
- * assembly can name it without either one knowing how long the other's code
- * is.  Written by the processor doing the starting, read by the one being
- * started, one processor at a time -- the block is shared, so the starts are
- * serialised, which they would be anyway: each AP is waited for before the
- * next is asked.
+ * The parameter block, at a fixed offset in the same page so C and asm
+ * can both name it.  Written by the starting CPU, read by the started
+ * one; there is one block, so starts are serialised.
  */
 #define	AP_PARAM_OFF		0xF00
 #define	AP_PARAM_PA		(AP_TRAMP_PA + AP_PARAM_OFF)
@@ -51,13 +43,10 @@
 #define	AP_P_CPU		0x10	/* struct cpu * for this one     */
 
 /*
- * Selectors in the trampoline's own GDT.  The first two deliberately match the
- * kernel's (gdt.h): code64 at 0x08 and data at 0x10, so that the code segment
- * an AP is running with when it reaches C is already the selector the real GDT
- * uses for the same thing, and loading that GDT changes nothing under it.  The
- * 32-bit code segment exists only for the handful of instructions between
- * protected mode and long mode and has no counterpart in the kernel's table --
- * where 0x18 is a ring-3 descriptor that ring 0 could not jump to.
+ * Selectors in the trampoline's own GDT.  code64 and data match the
+ * kernel's (gdt.h), so loading the real GDT later changes nothing under
+ * the running CS.  code32 serves only the stretch between protected and
+ * long mode; in the kernel's table 0x18 is a ring-3 descriptor.
  */
 #define	AP_SEL_CODE64		0x08
 #define	AP_SEL_DATA		0x10
@@ -69,61 +58,39 @@
 #include <stdint.h>
 
 /*
- * Install the trampoline and start every processor the MADT described.  Each
- * one is asked, then waited for, then the next -- and each is reported, both
- * the ones that arrived and the ones that did not.  Needs the local APIC (the
- * startup sequence is two interrupts), the physical allocator (a stack per
- * processor) and the TSC (the sequence has real-time waits in it that are
- * measured in microseconds, not in loop iterations).
- *
- * Returns the number of processors that checked in, not counting the one
- * calling.
+ * Install the trampoline and start, one at a time, every processor the
+ * MADT described, reporting each that arrives or does not.  Needs the
+ * local APIC (INIT/STARTUP IPIs), pmm (a stack each) and the TSC (the
+ * protocol's waits are in microseconds).  Returns how many checked in,
+ * not counting the caller.
  */
 unsigned int	mp_start_aps(void);
 
 /*
- * Let the started processors into the scheduler.
- *
- * SEPARATE FROM STARTING THEM, and the gap is deliberate.  A processor has to
- * be started EARLY: the trampoline needs a page of conventional memory that
- * later boot-time allocation would be entitled to take, and the messages that
- * start it need the APIC, which comes up long before the rest of the machine.
- * But it must not RUN anything until the per-CPU state it will inherit is
- * settled -- CR4.SMAP is turned on near the end of boot and the SYSCALL
- * registers with it, and a processor that missed either fails silently and
- * somewhere else (see cpu_state_init).
- *
- * So they arrive, park answering invalidations, and are released here.
- * Returns how many are now in the scheduler.
+ * Let the started, parked processors into the scheduler.  Separate from
+ * starting them because they must not run anything until the per-CPU
+ * state they inherit is settled: CR4.SMAP and the SYSCALL MSRs are set
+ * near the end of kmain, and a CPU that missed either fails silently (see
+ * cpu_state_init).  Returns how many are now in the scheduler.
  */
 unsigned int	mp_release_aps(void);
 
 /*
- * Ask another processor to look at the runqueue.  Used by the scheduler when
- * it queues a thread and finds a CPU sitting in idle's hlt -- that CPU would
- * otherwise not notice until its own timer woke it a whole tick later, while
- * the queue grew in front of a busy one.
- *
- * Sends and returns.  Whether the far processor took the hint is its business
- * and costs nothing if it did not: the message only sets a flag it was going
- * to look at anyway.
+ * Ask another processor to look at the runqueue: the scheduler's nudge to
+ * a CPU halted in idle, which would otherwise not notice new work until
+ * its next tick.  Sends and returns; the IPI only sets need_resched there.
  */
 struct cpu;
 void		mp_resched(struct cpu *cp);
 
 /*
- * Ask every other processor where it is, and have each one answer for itself
- * at the UART: ring and instruction pointer, out of the trapframe the
- * question lands in.  Nothing else can answer it -- a program counter is not
- * readable from another CPU, and every other instrument here reports the
- * scheduler's opinion of a processor rather than the processor.
- *
- * For a machine that is busy and getting nothing done.  Takes no lock and
- * touches no console, since that is the state it exists for.
+ * Have every other processor report, straight at the UART, its ring and
+ * RIP from the trapframe the IPI lands in -- the only way to see where a
+ * CPU is that loops outside the scheduler.  No lock, no console.
  */
 void		mp_where_all(void);
 
-/* The same answer for the CALLING processor, out of the frame it is in. */
+/* The same report for the calling processor, from the frame it is in. */
 struct trapframe;
 void		mp_where(struct trapframe *tf);
 

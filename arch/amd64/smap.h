@@ -14,24 +14,17 @@
 /*
  * Supervisor Mode Access Prevention.
  *
- * When CR4.SMAP is set, a ring-0 access to a user-VA (U=1) page faults
- * unless EFLAGS.AC is 1.  STAC sets AC; CLAC clears it.  Any kernel
- * code that intentionally dereferences a user pointer must bracket the
- * touch with smap_user_access_begin / smap_user_access_end so an
- * accidental user-VA dereference outside the bracket fails closed.
+ * With CR4.SMAP set, a ring-0 access to a user (U=1) page faults unless
+ * EFLAGS.AC is 1; STAC sets AC, CLAC clears it.  Kernel code that means to
+ * touch a user pointer brackets it with smap_user_access_begin/end, so an
+ * accidental user dereference outside a bracket faults.
  *
- * Both calls compile to "test then jump-and-emit-instr" and are cheap;
- * STAC/CLAC themselves are 3-byte single-cycle instructions on every
- * SMAP-capable microarch.
+ * The helpers test smap_enabled and emit STAC/CLAC only when it is set,
+ * which it never is on a CPU without SMAP (CPUID.7.0:EBX bit 20) -- the
+ * Nehalem model QEMU runs has none -- so one image boots on both.
  *
- * If the boot CPU does not advertise SMAP (CPUID.7.0:EBX bit 20),
- * smap_init leaves smap_enabled false and the helpers compile down to
- * nothing.  This keeps the same kernel image bootable on pre-SMAP
- * machines (older QEMU CPU models, ancient hardware).
- *
- * Tight brackets only.  The bracket window must be short and known
- * to be free of asynchronous traps that could leak AC=1 to fault
- * handlers; in practice that means "the copy loop and nothing else".
+ * Tight brackets only: the copy loop and nothing else, so no asynchronous
+ * trap can leak AC=1 into a fault handler.
  */
 
 extern bool	smap_enabled;	/* (a) set once by smap_enable_runtime */
@@ -41,8 +34,8 @@ void		smap_init(void);
 bool		smap_enable_runtime(void);
 
 /*
- * Set CR4.SMAP on the CALLING processor, if the kernel has turned SMAP on.
- * The flag is kernel-wide; the register bit is one per CPU.
+ * Set CR4.SMAP on the calling CPU if the kernel has turned SMAP on.  The
+ * flag is kernel-wide; the register bit is per CPU.
  */
 void		smap_init_cpu(void);
 

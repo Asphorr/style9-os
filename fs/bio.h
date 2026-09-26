@@ -14,24 +14,16 @@
 /*
  * Block cache.
  *
- * Every filesystem here reads the disk the same way and none of them
- * remembers anything: walking an APFS B-tree re-reads the root node on every
- * lookup, and a directory listing re-walks the whole tree once per entry, so
- * the same handful of blocks come off the platter over and over.  The driver
- * underneath is PIO -- each transfer is a loop of `insw` with the channel
- * spinlock held -- so a re-read is not merely wasteful, it stalls the machine.
- *
- * This sits between the two.  It caches fixed 4 KiB pages of a device, keyed
- * by (drive, page), and serves arbitrary sector runs out of them: a filesystem
- * that reads 4 KiB blocks and one that reads 512-byte sectors both hit the
- * same pages.  Replacement is LRU by access stamp over a small fixed set of
- * buffers, all allocated at init -- nothing here calls the heap on the I/O
- * path, and nothing grows without bound.
+ * The filesystems re-read the same few blocks constantly (an APFS lookup
+ * starts at the root node every time), and every read is PIO.  This layer
+ * caches fixed 4 KiB pages of a device, keyed by (drive, page), and serves
+ * arbitrary sector runs from them, so 4 KiB-block and 512-byte-sector
+ * readers share pages.  Replacement is LRU by access stamp over a fixed set
+ * of buffers allocated at init: no heap use on the I/O path.
  *
  * Writes go through bio_write, which writes the device and then makes the
- * cache agree.  A cache that survives a write it did not see is a cache that
- * hands back a lie; bio_invalidate_drive remains for writers that go around
- * this layer entirely (the Mach block-device protocol does).
+ * cache agree.  bio_invalidate_drive is for writers that bypass this layer
+ * (the Mach block-device protocol).
  */
 
 /* Cached unit.  Matches the APFS block size, and 8 ATA sectors exactly. */
@@ -40,13 +32,9 @@
 #define	BIO_SECTORS_PER_PAGE	(BIO_PAGE_BYTES / BIO_SECTOR_BYTES)
 
 /*
- * How many pages to keep: 256 KiB of a 127 MiB machine.  Measured, not
- * guessed.  Mounting both filesystems and walking the APFS volume touches 82
- * distinct pages and asks for 225; at this size the surplus asks all hit and
- * the 18 evictions cost nothing, because what gets evicted is the streamed
- * file data nobody reads twice.  Raising it to 256 buffers was tried: zero
- * evictions, and the identical 143 hits and 82 disk reads.  Four times the
- * memory bought nothing, so this stays small.
+ * 256 KiB.  Measured: mounting both filesystems and walking the APFS
+ * volume touches 82 distinct pages, and 256 buffers gave exactly the same
+ * hits and disk reads as 64.
  */
 #define	BIO_NBUFS		64
 
@@ -54,32 +42,24 @@
 void	bio_init(void);
 
 /*
- * Read `nsec` 512-byte sectors starting at `lba` from `drive` into `buf`,
- * through the cache.  Returns 0 on success, or the driver's positive error.
- * Drop-in for ata_kread with the same argument order.
+ * Read `nsec' 512-byte sectors at `lba' from `drive' into `buf', through
+ * the cache; same arguments as ata_kread.  Returns 0, or non-zero on a
+ * device error (flattened to 1 when it came through the cache).
  */
 int	bio_read(unsigned drive, uint64_t lba, uint32_t nsec, void *buf);
 
 /*
- * Write `nsec` sectors at `lba`, and leave the cache telling the truth about
- * them.  Returns 0 on success, or the driver's positive error.
- *
- * Write-THROUGH, not write-back: the disk is updated first and the cache is
- * reconciled after, so a page that is resident is patched with the bytes the
- * disk now holds rather than dropped.  Dropping would be correct too, but a
- * filesystem write walks metadata to find where to write, and throwing that
- * metadata out of the cache on every write would make each one re-read the
- * tree it just walked.
- *
- * There is no dirty state and nothing to flush: when this returns 0 the bytes
- * are on the platter, because ata_kwrite issues FLUSH CACHE before it does.
+ * Write `nsec' sectors at `lba'.  Returns 0, or the driver's positive
+ * error.  Write-through: the disk first, then resident pages are patched
+ * with the new bytes rather than dropped, so the metadata a write just
+ * walked stays cached.  Nothing is dirty: on 0 the bytes are on the
+ * platter, since ata_kwrite ends with FLUSH CACHE.
  */
 int	bio_write(unsigned drive, uint64_t lba, uint32_t nsec, const void *buf);
 
 /*
- * Forget everything cached for a device.  For writers that bypass this layer
- * -- the Mach block-device protocol talks to the driver directly -- since this
- * layer cannot know which pages such a write invalidated.
+ * Forget everything cached for a device, for writers that bypass this
+ * layer (the Mach block-device protocol).
  */
 void	bio_invalidate_drive(unsigned drive);
 

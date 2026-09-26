@@ -11,11 +11,8 @@
 #include <stdint.h>
 
 /*
- * x86 port I/O primitives.
- *
- * outb / inb are unprivileged in ring 0; the assembler instructions are
- * one byte each but gcc cannot synthesise them, so the inline helpers
- * below are the canonical project-wide entry points.
+ * x86 port I/O primitives.  The compiler never emits in/out itself, so
+ * these inlines are the project-wide entry points.
  */
 
 static inline void
@@ -47,10 +44,9 @@ io_wait(void)
 }
 
 /*
- * 16-bit port I/O.  Used by drivers that transfer data words from a
- * device register (ATA PIO data port being the canonical example).
- * Block helpers below run a `rep insw / rep outsw` so a whole sector
- * (256 16-bit words) moves with one instruction.
+ * 16-bit port I/O, e.g. the ATA PIO data port.  The block helpers use
+ * `rep insw' / `rep outsw', so a whole sector (256 words) moves in one
+ * instruction.
  */
 static inline void
 outw(uint16_t port, uint16_t val)

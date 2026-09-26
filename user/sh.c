@@ -8,60 +8,33 @@
 #include "style9.h"
 
 /*
- * sh.elf -- the first real ring-3 shell for style9-os.
- *
- * Boot-time init spawns this as the user-facing surface (kern/shell.c
- * is the old in-kernel REPL; it stays in the tree as a fallback but is
- * no longer wired into kmain).  The interaction shape is:
+ * sh.elf -- the ring-3 shell style9-os boots into (kern/shell.c, the
+ * in-kernel REPL, is only a fallback in kmain).
  *
  *	1. bootstrap_lookup("dev/kbd") -> control port
  *	2. RPC DEV_OP_OPEN_STREAM       -> stream SEND right (kbd_input_port)
  *	3. for (;;) {
  *		recv one mach_msg from the stream, msgh_id == one byte;
- *		line-edit; on '\n' split argv, dispatch builtin or SYS_SPAWN,
- *		yield-spin until the spawned child drops off the live list.
+ *		line-edit; on '\n' split argv, run a builtin (sh_builtins[])
+ *		or SYS_SPAWN_ARGS, and wait for the child in wait_child.
  *	   }
  *
- * Built-ins:
- *	help		list builtins + known spawnable programs
- *	echo ARGS...	print arguments separated by spaces
- *	clear		ANSI clear-screen + repaint splash
- *	about		multi-line banner + system info
+ * Rows 1-2 are a fixed status bar (name, task count, uptime) and a rule,
+ * outside the scrolling region.  The session opens with a man-page-style
+ * splash; the prompt is '$ ', preceded by 'err N' in red when the last
+ * spawn failed.
  *
- * Anything else gets handed straight to SYS_SPAWN; the kernel's
- * progreg either resolves it (returns task_id) or returns SYS_E_INVAL.
- *
- * TUI surface
- * ---
- * Row 0 is a persistent reverse-video status bar (style9-os(9) + live
- * task count + ram + uptime), repainted on every prompt.  The shell
- * opens with a man-page-style splash -- big ASCII '9' + NAME / SYSTEM
- * / SEE ALSO blocks -- which scrolls off naturally as the user works.
- * The prompt itself is colour-coded: bright green '$' on success,
- * '[err N]' in red when the last spawn failed.
- *
- * Wait-for-child is a yield-spin against SYS_TASK_ALIVE.  Cheap and
- * adequate for a cooperative scheduler; a real exit-notification port
- * (and proper $? carry-through) is a phase-3 conversation.
+ * wait_child polls task_alive between 50 ms keyboard waits; there is no
+ * exit-notification port and no $? from the child.
  */
 
 #define	SH_LINE_MAX	256
 #define	SH_ARGC_MAX	8
 
 /*
- * What can be spawned, asked rather than remembered.
- *
- * This was a hand-written array of four names -- hello, clock, tasks,
- * sh -- with a comment promising that phase 3 would replace it with a
- * Mach "progreg" service the way "tasks" works, and a request to keep
- * the list in sync by hand until then.  Nobody did, for thirty-four
- * programs.  `help` was not merely incomplete; it was confidently
- * listing a system four programs wide.
- *
- * So it is the service now, fetched once at startup into a packed
- * NUL-separated blob and indexed in place.  Adding a program to
- * kern/progreg.c is all it takes for the shell to know about it, which
- * is what the comment always said should happen.
+ * What can be spawned, asked of the progreg service once at startup: a
+ * packed NUL-separated blob, indexed in place.  A program added to
+ * kern/progreg.c needs nothing here.
  */
 static char	sh_progs[SVC_PROGREG_BYTES];
 static uint32_t	sh_progs_n;	/* names packed into sh_progs      */
@@ -69,9 +42,8 @@ static uint32_t	sh_progs_total;	/* names the registry actually has */
 static uint64_t	sh_progs_macho;	/* bit per name: a real Darwin one */
 
 /*
- * The idx'th packed name, or NULL past the end.  Walking from the front
- * every time is O(n) per lookup and n is under forty; an index array
- * would cost more BSS than the blob it indexed.
+ * The idx'th packed name, or NULL past the end.  O(n) per lookup with n
+ * under forty; an index array would cost more than it saves.
  */
 static const char *
 prog_at(uint32_t idx)
@@ -91,29 +63,24 @@ prog_at(uint32_t idx)
 }
 
 /*
- * Cached service ports.  Looked up once at startup; the splash and
- * the per-prompt status bar both pull from them.  MACH_PORT_NULL if
- * the lookup failed -- the bar then displays "?" in place of the data.
+ * Service ports, looked up once at startup for the splash and status
+ * bar.  MACH_PORT_NULL if the lookup failed; the fetch then zeroes the
+ * reply.
  */
 static mach_port_name_t	g_kbd_stream;
 static mach_port_name_t	g_clock_port;
 static mach_port_name_t	g_stats_port;
 
 /*
- * Last-command return status.  spawn() returns task_id > 0 on success
- * or a negative SYS_E_* on failure; the prompt paints '[err N]' when
- * non-zero.  Builtins always succeed.
+ * Last command's status: 0, or the negative SYS_E_* a failed spawn
+ * returned.  The prompt shows 'err N' when non-zero.
  */
 static int	last_status;
 
 /*
- * Child registry.  Every fg/bg job the shell spawns lands here as a
- * (task_id, taskport_name) pair so the shell holds the capability
- * needed to kill the child via SYS_TASK_KILL.  Entries are written
- * once at spawn time and never explicitly evicted -- the kernel
- * recycles task_ids and port names lazily; on the next collision the
- * shell will simply overwrite the stale row.  16 slots is well in
- * excess of any plausible in-flight job count for this kernel.
+ * Child registry: a (task_id, task port) pair per spawned job, so the
+ * shell holds the right SYS_TASK_KILL needs.  Rows are never evicted;
+ * once all are used, slot 0 is overwritten (sh_child_remember).
  */
 #define	SH_CHILD_MAX	16
 struct sh_child {
@@ -123,10 +90,8 @@ struct sh_child {
 static struct sh_child	sh_children[SH_CHILD_MAX];
 
 /*
- * Foreground job state, set by dispatch() right before wait_child(),
- * cleared after the wait returns.  wait_child uses fg_taskport to
- * deliver a kill when the user hits Ctrl-C.  Single-job-at-a-time
- * model (no real job-control + & yet); the slot is enough.
+ * The foreground job, set by dispatch() around wait_child().  One job at
+ * a time: there is no job control.
  */
 static long			fg_task_id;
 static mach_port_name_t		fg_taskport;
@@ -134,11 +99,8 @@ static mach_port_name_t		fg_taskport;
 /* ---- ANSI escape constants --------------------------------------- */
 
 /*
- * Restrained palette: white-bold for emphasis, gray for body,
- * dark-gray for the chrome rules, light-red for the rare error.
- * The 'green prompt + yellow keywords' style from v1 is gone --
- * the aesthetic here is closer to a modern Terminal.app prompt
- * than to a hobby-OS splash.
+ * Palette: bold white for emphasis, gray for body, dark gray for chrome,
+ * light red for errors.
  */
 #define	ESC_RESET	"\x1b[0m"
 #define	ESC_FG_RED	"\x1b[0;91m"	/* light red, not bold */
@@ -154,29 +116,17 @@ static mach_port_name_t		fg_taskport;
 #define	ESC_SHOW_CUR	"\x1b[?25h"
 
 /*
- * The title bar's own colours: a dark-gray field with white text on it,
- * and a quieter foreground for the counters that share the row.  These
- * are the bright-background SGR codes, which did nothing at all until
- * the tty stopped spending the high background bit on blink -- a bar
- * with a background is the first thing that fix makes possible.
+ * The title bar: white on a dark-gray field, and a quieter foreground
+ * for the counters.  Bright-background SGR codes, which need the tty not
+ * to spend the high background bit on blink.
  */
 #define	ESC_BAR		"\x1b[100;97m"
 #define	ESC_BAR_DIM	"\x1b[100;37m"
 
 /*
- * The chrome, and the two rows it owns.
- *
- * Rows one and two are the status line and the rule under it; rows
- * three to twenty-five are where everything else happens.  The shell
- * says so once, with DECSTBM, and the terminal keeps the promise from
- * then on -- output that reaches the bottom of the screen scrolls the
- * region and leaves the header where it is.
- *
- * Before this, the bar was repainted at every prompt and scrolled off
- * the top by the first command that filled the screen, leaving its rule
- * behind as a stray line in the middle of the session.  Repainting more
- * often could never have fixed that: between two prompts a foreground
- * job is free to print, and the bar has to survive it.
+ * Rows 1-2 are the status line and its rule; rows 3-25 scroll.  Set once
+ * with DECSTBM, so output from a foreground job between prompts scrolls
+ * the region and cannot carry the header away.
  */
 #define	ESC_REGION_BODY	"\x1b[3;25r"
 #define	ESC_REGION_ALL	"\x1b[r"
@@ -185,11 +135,9 @@ static mach_port_name_t		fg_taskport;
 /* ---- single-byte read from the kbd stream port ------------------- */
 
 /*
- * read_byte: park in mach_msg_recv on the kbd stream port and return
- * the byte the driver thread tagged into msgh_id.  Negative on error,
- * which in normal operation cannot happen: the driver is the kernel
- * itself and the port has SEND held by the driver thread for the
- * lifetime of the system, so we treat any failure as fatal.
+ * read_byte: block on the kbd stream port and return the byte the driver
+ * put in msgh_id, or -1 on error.  The driver holds its send right for
+ * the life of the system, so an error means the stream is gone.
  */
 static int
 read_byte(void)
@@ -206,25 +154,14 @@ read_byte(void)
 /* ---- keys, not bytes ---------------------------------------------- */
 
 /*
- * A keypress, decoded.
+ * A keypress, decoded from dev/kbd.c's CSI sequences ("\x1b[A" for Up),
+ * shared by the line editor and the pager.  An unrecognised sequence
+ * comes back as SH_K_UNKNOWN, never as its bytes, so it cannot type
+ * itself into the line.
  *
- * dev/kbd.c has been turning Up into the three bytes "\x1b[A" since it
- * was written, and the pager below has had a state machine to take them
- * apart for just as long.  The line editor did not: it dropped the
- * escape as unprintable and then typed the '[' and the 'A' into the
- * command line, so pressing Up at the prompt inserted "[A".  The decoder
- * existed; it was just in the wrong place, doing it for one of the two
- * things that reads the keyboard.
- *
- * So it lives here now and both of them use it.  A key that this
- * terminal does not produce comes back as SH_K_UNKNOWN rather than as
- * its bytes -- an unrecognised sequence must not degrade into typing
- * itself, which is the whole bug.
- *
- * A lone Escape is indistinguishable from the start of a sequence
- * without a timer, so read_key blocks after one until the next byte
- * arrives, exactly as the pager's own machine used to.  Every consumer
- * here reaches Escape through a key that follows it.
+ * Without a timer a lone Escape looks like the start of a sequence, so
+ * read_key blocks for the byte after it; consumers see Escape only
+ * through the key that follows.
  */
 enum sh_key {
 	SH_K_CHAR = 0,		/* an ordinary byte, in kp_ch */
@@ -275,10 +212,8 @@ read_key(struct sh_keypress *out)
 	}
 
 	/*
-	 * Parameters, then a final byte.  Only the first parameter is
-	 * kept: every sequence this keyboard emits has at most one, and a
-	 * consumer that needed more would be parsing a terminal reply
-	 * rather than a keypress.
+	 * Parameters, then a final byte.  No key sequence has more than one
+	 * parameter; digits accumulate into it.
 	 */
 	arg = 0;
 	for (;;) {
@@ -316,10 +251,9 @@ read_key(struct sh_keypress *out)
 /* ---- service-query helpers --------------------------------------- */
 
 /*
- * fetch_clock / fetch_stats: one RPC each into the cached service
- * port.  Return 0 on success and -1 on any failure; on failure the
- * reply struct is zeroed so the caller can render "?" without an
- * explicit branch on every field.
+ * fetch_clock / fetch_stats: one RPC each on the cached port.  0 on
+ * success, -1 on failure with the reply zeroed, so callers can print it
+ * either way.
  */
 static int
 fetch_clock(struct svc_clock_reply *out)
@@ -420,17 +354,10 @@ fetch_stats(struct svc_stats_reply *out)
 /* ---- TUI surface ------------------------------------------------- */
 
 /*
- * Box drawing.
- *
- * The VGA text font has the CP437 line-drawing glyphs natively, and the
- * tty passes every byte at or above 0x20 straight through to the cell
- * grid -- so a frame costs exactly what the same number of letters
- * would.  This is the whole reason a text console can look built rather
- * than typed, and paint_hr has been quietly using one of these glyphs
- * (0xC4) since it was written without the rest ever being named.
- *
- * These are byte constants, not characters: the console is CP437 and
- * nothing in this shell is UTF-8.
+ * Box drawing.  The VGA font has the CP437 line-drawing glyphs and the tty
+ * passes every byte >= 0x20 to the cell grid, so a frame costs what the
+ * same number of letters would.  Byte constants, not characters: the
+ * console is CP437 and nothing here is UTF-8.
  */
 #define	BOX_H		'\xc4'		/* horizontal            */
 #define	BOX_V		'\xb3'		/* vertical              */
@@ -446,17 +373,13 @@ fetch_stats(struct svc_stats_reply *out)
 #define	BLOCK_FULL	'\xdb'
 
 /*
- * A panel is a frame two columns in from each margin: columns 3..78 of
- * an eighty-column screen, seventy-six wide including both borders.
- * Every row is built into one buffer and emitted with a single write,
- * which is one syscall, one tty batch and one programming of the
- * hardware cursor -- the same reason paint_hr was written that way.
- */
-/*
- * The console is eighty columns and says so in dev/tty.h; there is no
- * window-size ioctl to ask, and inventing one to tell the shell a
- * constant would be ceremony.  When a resizable terminal exists this
- * becomes a query.
+ * A panel is a frame two columns in from each margin: columns 3..78,
+ * seventy-six wide with both borders.  Each row is built in one buffer
+ * and emitted with one write: one syscall, one tty batch, one cursor
+ * update.
+ *
+ * The console is TTY_COLS (80) wide (dev/tty.h) and the native ABI has
+ * no window-size query, so the width is a constant here.
  */
 #define	SH_COLS		80
 
@@ -464,10 +387,9 @@ fetch_stats(struct svc_stats_reply *out)
 #define	PANEL_W		76
 
 /*
- * Geometry is a setting rather than a constant because the pager wants
- * the whole screen while the splash and the help list want an inset
- * card.  One panel is drawn at a time -- this shell has one thread and
- * no concurrent output -- so two variables are the whole of it.
+ * Geometry is settable because the pager wants the whole screen and the
+ * splash and help an inset card.  One panel is drawn at a time, so two
+ * variables suffice.
  */
 static size_t	panel_left = PANEL_LEFT;
 static size_t	panel_width = PANEL_W;
@@ -500,11 +422,7 @@ sh_pad(char *dst, size_t off, size_t cap, char ch, size_t n)
 	return (off);
 }
 
-/*
- * The visible width of a string, which is not its length: the panel
- * rows carry SGR sequences and a frame that counted those would come
- * out ragged by exactly the number of escape bytes in it.
- */
+/* Visible width of a string: its length less SGR escape bytes. */
 static size_t
 sh_visible(const char *s)
 {
@@ -526,9 +444,8 @@ sh_visible(const char *s)
 }
 
 /*
- * One framed row.  `body` may carry colour; the padding is computed
- * from its visible width, so the right border lands in column 78 no
- * matter how much of the row is escape bytes.
+ * One framed row.  `body' may carry colour; padding follows its visible
+ * width, so the right border lands in place.
  */
 static void
 panel_row(const char *body)
@@ -545,11 +462,9 @@ panel_row(const char *body)
 	off = sh_append(out, off, sizeof(out), ESC_RESET);
 
 	/*
-	 * Copy the body a column at a time so it can be CLIPPED at the
-	 * right border: the pager hands whole manual-page lines to this,
-	 * and a line one column too long would push the border out and
-	 * wrap the frame.  Escape sequences pass through without counting
-	 * -- they are the reason a length is not a width.
+	 * Copy a column at a time so the body is clipped at the right
+	 * border (the pager passes whole manual-page lines).  Escape
+	 * sequences pass through uncounted.
 	 */
 	vis = 0;
 	while (*body != '\0' && vis < panel_inner()) {
@@ -568,14 +483,9 @@ panel_row(const char *body)
 		}
 		if (*body == '\t') {
 			/*
-			 * Expand rather than pass through.  A tab is one
-			 * byte and up to eight columns, so a width counted
-			 * in bytes-minus-escapes is still wrong for text
-			 * that contains one -- which manual pages do, and
-			 * which pushed the pager's right border off the
-			 * end of the row and wrapped the frame.  Expanded
-			 * here, the stops are the panel's own and the tty
-			 * never sees a tab at all.
+			 * Expand tabs (one byte, up to eight columns) to the
+			 * panel's own stops, so the width stays right and
+			 * the tty never sees one.
 			 */
 			size_t	stop;
 
@@ -591,10 +501,8 @@ panel_row(const char *body)
 			continue;
 		}
 		/*
-		 * Any other control byte becomes a space.  A stray carriage
-		 * return in the text would otherwise return the cursor to
-		 * column zero and paint the rest of the line over the left
-		 * border -- a frame has to survive its contents.
+		 * Any other control byte becomes a space; a stray carriage
+		 * return would paint over the left border.
 		 */
 		if (off + 1 < sizeof(out))
 			out[off++] = (*body >= 0 && *body < 0x20) ? ' ' : *body;
@@ -613,10 +521,9 @@ panel_row(const char *body)
 }
 
 /*
- * An edge of the frame.  `title` inlays into the top edge the way a
- * grouping box does; NULL gives a plain edge.  `left` and `right` pick
- * which corners, so this one function draws the top, the bottom and
- * the separator between sections.
+ * An edge of the frame, with `title' inlaid (NULL for a plain edge).
+ * `left' and `right' pick the corners, so this draws the top, the bottom
+ * and section separators.
  */
 static void
 panel_edge(char left, char right, const char *title)
@@ -676,10 +583,8 @@ panel_bottom(void)
 }
 
 /*
- * A bottom edge with something written in it.  A pager's position and
- * key legend belong on the frame rather than on a row of their own:
- * the frame is already there, and a row spent on chrome is a row not
- * spent on the page.
+ * A bottom edge with a caption, so the pager's position and key legend
+ * cost no row of their own.
  */
 static void
 panel_bottom_captioned(const char *caption)
@@ -689,9 +594,8 @@ panel_bottom_captioned(const char *caption)
 }
 
 /*
- * A proportion, drawn.  Shaded blocks rather than a solid bar so a
- * gauge that is nearly empty still reads as a gauge and not as an
- * accident -- the light shade is the track, the dark shade is the fill.
+ * A gauge: dark shade for the fill, light shade for the track, so a
+ * nearly empty gauge still reads as one.
  */
 static size_t
 sh_gauge(char *dst, size_t off, size_t cap, uint64_t used, uint64_t total,
@@ -714,18 +618,10 @@ sh_gauge(char *dst, size_t off, size_t cap, uint64_t used, uint64_t total,
 }
 
 /*
- * paint_status_bar: the two rows above the scrolling region.
- *
- * Row one is a title bar with a background of its own rather than a
- * line of text that happens to be at the top -- which it could not be
- * until the console stopped spending the high background bit on blink,
- * since every dark background above black was a blinking one.  Row two
- * is a thin rule that separates the bar from the work below it.
- *
- * The rows never scroll, so this is a refresh of the clock rather than
- * a rescue of a bar that has been carried away.  The cursor is hidden
- * across the trip: it is programmed for real now, and without this it
- * is seen jumping to the top of the screen and back on every prompt.
+ * paint_status_bar: the two rows above the scrolling region, a title bar
+ * and a rule.  They never scroll; this refreshes the counters.  The
+ * cursor is hidden for the trip, or it is seen jumping to the top and
+ * back at every prompt.
  */
 static void
 paint_status_bar(void)
@@ -750,10 +646,8 @@ paint_status_bar(void)
 	puts(ESC_HOME);
 
 	/*
-	 * Left: the name, in white on the bar.  Right: task count and
-	 * uptime, in the bar's quieter foreground.  The padding between
-	 * them is computed from the visible width so the clock ends in
-	 * column 79 whatever the counts happen to be.
+	 * Left: the name.  Right: task count and uptime, padded by visible
+	 * width so the clock ends in column 79.
 	 */
 	off = 0;
 	off = sh_append(out, off, sizeof(out), ESC_BAR);
@@ -801,12 +695,6 @@ paint_status_bar(void)
 /*
  * paint_splash: a manpage-shaped welcome, in a frame.
  *
- * It used to be loose text with a rule under it, which read as a page
- * that had lost its edges; a box says the same thing and says where it
- * stops.  The section-9 reference lives in the frame's inlaid title
- * now, which is what a title is for.
- *
- * Colour usage:
  *	white		section labels and the frame's title
  *	gray		body text and value columns
  *	dark gray	the frame itself, and the empty half of the gauge
@@ -914,18 +802,10 @@ paint_splash(void)
 /* ---- the prompt, as bytes and as a width -------------------------- */
 
 /*
- * The prompt has to be two things at once now.
- *
- * It is a string to emit -- with the SGR sequences that colour it --
- * and it is a number of columns, because the line editor repaints the
- * whole line on every keystroke and then has to put the cursor back at
- * a column it can only work out by counting.  The escape sequences are
- * in the first and not in the second, which is exactly the distinction
- * that gets lost when a prompt is just printed.
- *
- * On success it is a plain bold-white '$ '; on failure a subdued 'err N'
- * in light red comes first (no brackets, no shouting) -- closer to how a
- * modern shell surfaces $? than to a permanent status indicator.
+ * The prompt is both bytes to emit (with SGR colour) and a width in
+ * columns, which the line editor needs to put the cursor back after
+ * repainting the line.  It is a bold white '$ ', preceded by 'err N' in
+ * light red after a failure.
  */
 #define	SH_PROMPT_MAX	64
 
@@ -1029,14 +909,7 @@ split_argv(char *line, char *argv[], int max)
 
 /* ---- builtins ----------------------------------------------------- */
 
-/*
- * The builtins, as data.
- *
- * They were a run of hand-paired puts() calls, which was fine while
- * nothing else needed to know their names.  Tab completion does: a
- * shell that completes the thirty-eight programs but not the eight
- * words it implements itself would be a strange thing to use.
- */
+/* The builtins, as data, for help and tab completion. */
 struct sh_builtin {
 	const char	*b_name;
 	const char	*b_help;
@@ -1054,12 +927,8 @@ static const struct sh_builtin sh_builtins[] = {
 };
 
 /*
- * builtin_help: the command list, framed.
- *
- * Two sections in one panel with a tee between them -- the words this
- * shell implements above, the programs it can spawn below.  The spawn
- * list is thirty-nine names now and wraps into a grid; the panel is
- * what keeps that grid from reading as spilled text.
+ * builtin_help: one panel, builtins above a separator and the spawnable
+ * programs below in a four-column grid.
  */
 static void
 builtin_help(void)
@@ -1094,13 +963,9 @@ builtin_help(void)
 	}
 
 	/*
-	 * Colour that says something.  A name in cyan is a Mach-O -- a
-	 * genuine Apple binary that comes up under the clean-room dyld --
-	 * and a name in gray is a native style9 ELF.  That split is the
-	 * most interesting fact about this list, and a grid that drew them
-	 * alike was hiding it.  The kernel decides which is which by the
-	 * image's own first four bytes, the same sniff the loader makes,
-	 * so the two cannot drift apart.
+	 * Cyan is a Mach-O run under the clean-room dyld, gray a native
+	 * ELF.  The kernel sets pr_macho from the image's magic, the same
+	 * sniff the loader makes, so the two cannot drift apart.
 	 */
 	col = 0;
 	off = 0;
@@ -1170,20 +1035,17 @@ builtin_echo(int argc, char *argv[])
 }
 
 /*
- * builtin_clear: erase the screen and redraw the splash so the freshly
- * cleared screen still has the welcome banner visible.  The status
- * bar repaint happens at the next prompt() call, so we don't need to
- * touch it here.
+ * builtin_clear: erase the screen and redraw the splash.  The status bar
+ * is repainted at the next prompt.
  */
 static void
 builtin_clear(void)
 {
 
 	/*
-	 * ED 2 homes the cursor to the top-left of the SCREEN, which is
-	 * inside the chrome.  Step back into the region explicitly rather
-	 * than trusting the erase to know about it -- the region is a
-	 * property of scrolling, not of addressing.
+	 * The clear homes the cursor to the screen's top-left, inside the
+	 * chrome; the scroll region does not affect addressing, so move
+	 * back into it explicitly.
 	 */
 	puts(ESC_CLR_SCR);
 	puts(ESC_BODY_HOME);
@@ -1191,13 +1053,10 @@ builtin_clear(void)
 }
 
 /*
- * builtin_ool: round-trip a small buffer through the kernel's echool
- * service as a single OOL descriptor, verify the kernel-computed
- * FNV-1a matches the client-computed one byte-for-byte.  Proves that
- * userspace can construct a valid OOL wire-format from its own VA
- * space, that the kernel parses the variable-stride descriptor area
- * correctly, and that the sender's pages are reachable from the
- * special-port dispatcher.
+ * builtin_ool: send a small buffer to the kernel's echool service as one
+ * OOL descriptor and compare its FNV-1a with ours.  Proves a ring-3 OOL
+ * message is well formed, the kernel parses the descriptor area, and the
+ * special-port dispatcher can reach the sender's pages.
  */
 static uint32_t
 ool_fnv1a(const uint8_t *buf, uint32_t size)
@@ -1311,29 +1170,20 @@ builtin_about(void)
 /* ---- pager + man builtin ----------------------------------------- */
 
 /*
- * Tiny in-shell pager modelled on less(1).
- *
- * Takes a flat text buffer plus a title, paints PAGER_ROWS lines at a
- * time, and lets the user scroll with:
+ * A small pager after less(1).  Paints PAGER_SCREEN_ROWS lines of a text
+ * buffer at a time:
  *
  *	Space, PgDn, Ctrl-F	page down
  *	b, PgUp, Ctrl-B		page up
  *	j, Enter, Down arrow	line down
  *	k, Up arrow		line up
- *	g			top
- *	G			bottom
- *	q, ESC ESC		quit
+ *	g, Home			top
+ *	G, End			bottom
+ *	q, Esc			quit
  *
- * Arrow keys arrive as multi-byte CSI sequences (\x1b[A etc.), so the
- * read loop runs a three-state machine (NORMAL -> ESC -> CSI) and
- * collects an optional numeric argument before the final letter.
- *
- * Line metadata is cached up front: an array of (offset, length) tuples
- * per source line.  Capped at PAGER_MAX_LINES so a runaway input never
- * scribbles past the static buffers.  The longest page in docs/man is
- * port.9 at 561 lines -- the comment here used to say ~300, which was
- * wrong and would have made the cap look roomier than it is -- so 4096
- * is a little over seven times the worst case.
+ * Keys come through read_key.  Each line's (offset, length) is indexed
+ * up front, capped at PAGER_MAX_LINES; the longest page in docs/man
+ * (port.9) is 561 lines.
  */
 
 #define	PAGER_MAX_LINES		4096
@@ -1387,10 +1237,8 @@ pager_repaint(const char *text, size_t total_lines, size_t top,
 		end = total_lines;
 
 	/*
-	 * Copy each line into a NUL-terminated buffer rather than writing
-	 * it straight out: the frame's right border has to follow it, and
-	 * panel_row is what knows where that is and how to clip a line
-	 * that would have reached it.
+	 * Copy each line into a NUL-terminated buffer for panel_row, which
+	 * clips it and draws the right border.
 	 */
 	for (i = top; i < end; i++) {
 		const char	*src;
@@ -1401,11 +1249,8 @@ pager_repaint(const char *text, size_t total_lines, size_t top,
 		lead = sizeof(ESC_FG_GRAY) - 1;
 
 		/*
-		 * A manual page's section headers are the only lines that
-		 * start in column zero with a capital -- mandoc indents
-		 * everything else -- so they can be picked out and given
-		 * the weight they have on a printed page.  Cheap, and the
-		 * difference between a page you can skim and a wall.
+		 * Section headers are the only lines starting in column zero
+		 * with a capital (mandoc indents the rest): draw them bold.
 		 */
 		if (n > 0 && src[0] >= 'A' && src[0] <= 'Z') {
 			for (off = 0; off < lead; off++)
@@ -1426,12 +1271,7 @@ pager_repaint(const char *text, size_t total_lines, size_t top,
 	for (i = end - top; i < PAGER_SCREEN_ROWS; i++)
 		panel_row("");
 
-	/*
-	 * Position and keys go IN the bottom edge.  They used to be a row
-	 * of reverse video below the text -- which never rendered, since
-	 * the tty had no case for SGR 7 -- and a row spent on chrome is a
-	 * row not spent on the page.
-	 */
+	/* Position and keys go in the bottom edge. */
 	off = 0;
 	off = sh_append_uint(caption, off, sizeof(caption),
 	    (unsigned)(top + 1));
@@ -1468,11 +1308,8 @@ pager_show(const char *text, size_t len, const char *title)
 		return;
 
 	/*
-	 * The pager owns the whole screen while it runs, so it takes the
-	 * scrolling region back and hides the cursor -- a manual page has
-	 * no use for the shell's status bar, and an underline parked
-	 * wherever the last line ended is just a distraction on a page
-	 * that is repainted whole.  Both are handed back on the way out.
+	 * The pager owns the whole screen: drop the scrolling region and
+	 * hide the cursor, restoring both on the way out.
 	 */
 	puts(ESC_REGION_ALL);
 	puts(ESC_HIDE_CUR);
@@ -1564,10 +1401,9 @@ pager_show(const char *text, size_t len, const char *title)
 }
 
 /*
- * builtin_man: bootstrap_lookup("man") + RPC for the requested page +
- * hand the OOL-installed text to the pager.  Title is "<name>(9)".
- * On not-found prints a short error to stdout and returns; on RPC
- * failure same shape but with the error code.
+ * builtin_man: fetch the page from the "man" service (man_fetch) and
+ * page the OOL-installed text, titled "<name>(9)".  Prints a short error
+ * if the page is missing or the RPC fails.
  */
 static void
 builtin_man(int argc, char *argv[])
@@ -1609,20 +1445,17 @@ builtin_man(int argc, char *argv[])
 	pager_show(text, len, title);
 
 	/*
-	 * Release the OOL-installed range so repeated `man` invocations do
-	 * not leak one anonymous mapping each.  man_release is best-effort
-	 * -- a failure (range no longer matches an entry) is harmless and
-	 * silently absorbed; the buffer stays around until task exit.
+	 * Release the OOL range so each `man' does not leak a mapping.  A
+	 * failure is harmless: the buffer stays until task exit.
 	 */
 	(void)man_release(text, len);
 }
 
-/* ---- spawn + yield-spin wait ------------------------------------- */
+/* ---- spawn + wait ------------------------------------------------ */
 
 /*
- * Drop the (task_id, taskport) pair into the first empty slot, or
- * overwrite slot 0 if every slot is full (lossy oldest-first; we
- * don't have a real LRU and don't need one for this kernel).
+ * Store the (task_id, taskport) pair in the first empty slot, or in
+ * slot 0 when all are full.
  */
 static void
 sh_child_remember(uint64_t task_id, mach_port_name_t taskport)
@@ -1641,9 +1474,8 @@ sh_child_remember(uint64_t task_id, mach_port_name_t taskport)
 }
 
 /*
- * Look up the saved taskport for a task_id.  Returns MACH_PORT_NULL
- * if no matching entry -- the user typed `kill 999` on an unknown id,
- * or the row aged out.
+ * The saved taskport for a task_id, or MACH_PORT_NULL if unknown or
+ * overwritten.
  */
 static mach_port_name_t
 sh_child_lookup(uint64_t task_id)
@@ -1658,20 +1490,13 @@ sh_child_lookup(uint64_t task_id)
 }
 
 /*
- * Foreground-wait with Ctrl-C handling.  Replaces the bare yield-spin
- * with a kbd-stream peek every 50 ms: any byte that arrives during
- * the wait is checked for ASCII 0x03 (Ctrl-C, courtesy of kbd.c's
- * Ctrl-folding).  On 0x03 we issue SYS_TASK_KILL against the fg
- * job's taskport and keep spinning until task_alive returns false --
- * the kill is async, so the task may take a yield or two to actually
- * retire (see detection-site model in kern/task.h).
+ * Foreground wait with Ctrl-C: wait up to 50 ms for a keyboard byte, then
+ * re-check task_alive.  On 0x03 (kbd.c folds Ctrl-C to it) issue
+ * SYS_TASK_KILL on the job's taskport and keep waiting: the kill is
+ * asynchronous (see t_killed in kern/task.h).
  *
- * Non-^C bytes are discarded silently.  A real shell would re-route
- * them into a type-ahead buffer the next prompt consumes; today the
- * kbd ring is the buffer of record and the user just loses those
- * bytes if they typed during a foreground job.  Cheap to fix later
- * (drain the kbd into a local scratch + flush on prompt) and not
- * worth the surface here.
+ * Other bytes typed during the job are dropped; there is no type-ahead
+ * buffer.
  */
 static void
 wait_child(long task_id, mach_port_name_t taskport)
@@ -1711,8 +1536,8 @@ streq(const char *a, const char *b)
 }
 
 /*
- * atou64: tiny stdtoul.  Returns 0 on any junk (sh `kill 0` then
- * gets the proper "task 0 not found" error from the registry lookup).
+ * atou64: leading decimal digits, 0 if none; `kill' then reports no
+ * taskport for task 0.
  */
 static uint64_t
 atou64(const char *s)
@@ -1730,12 +1555,9 @@ atou64(const char *s)
 }
 
 /*
- * `kill <task_id>` builtin: look up the saved taskport for the named
- * task_id + call SYS_TASK_KILL with it.  Capability-based, so
- * `kill 1` (init) returns MACH_E_RIGHT cleanly (sh never had the
- * taskport for kernel-side tasks).  Async: by the time `kill` returns
- * the target may not have fully retired yet; user can probe with
- * the `tasks` program if they care about the exact moment.
+ * `kill <task_id>': SYS_TASK_KILL with the saved taskport.  Capability
+ * based, so only children this shell spawned can be killed.  The kill is
+ * asynchronous; the target may not have retired when this returns.
  */
 static int
 builtin_kill(int argc, char *argv[])
@@ -1798,9 +1620,8 @@ builtin_kill(int argc, char *argv[])
 }
 
 /*
- * dispatch: route the argv to a builtin or hand to SYS_SPAWN.  Returns
- * the status to propagate into last_status: 0 for builtin / successful
- * spawn, the negative SYS_E_* code if spawn returned an error.
+ * dispatch: run a builtin or spawn the program.  Returns the new
+ * last_status: 0, or the negative SYS_E_* of a failed spawn.
  */
 static int
 dispatch(int argc, char *argv[])
@@ -1839,10 +1660,9 @@ dispatch(int argc, char *argv[])
 		return (builtin_kill(argc, argv));
 
 	/*
-	 * Not a builtin -- hand to SYS_SPAWN_ARGS so the child both
-	 * receives the full command line (argv[0..argc-1]) AND we get a
-	 * SEND right on its task-self port for Ctrl-C / the kill builtin.
-	 * argv[0] is the program name the kernel resolves in progreg.
+	 * SYS_SPAWN_ARGS: the child gets the whole command line and we get
+	 * a send right on its task port for Ctrl-C and `kill'.  argv[0] is
+	 * resolved in progreg.
 	 */
 	taskport = MACH_PORT_NULL;
 	rv = spawn_args(argv[0], argc, argv, &taskport);
@@ -1869,21 +1689,10 @@ dispatch(int argc, char *argv[])
 /* ---- line editor ------------------------------------------------- */
 
 /*
- * The line being typed, and where in it the cursor is.
- *
- * The old editor had only a length: characters went on the end,
- * backspace took one off the end, and there was nowhere else to be.
- * Every editing key the keyboard sends -- and it has been sending all
- * of them -- either did nothing or typed its own escape sequence into
- * the buffer.
- *
- * With a position, editing is ordinary insert-and-delete at a point,
- * and the only real work is drawing: the line is repainted whole on
- * every keystroke rather than patched incrementally, which is what
- * makes an insert in the middle cost the same code as an append.  One
- * write(2) per keystroke, and the terminal programs its cursor once for
- * it -- so the repaint is cheaper than the character-at-a-time echo it
- * replaces, which cost one write per byte.
+ * The line being typed and the cursor position in it.  Editing is insert
+ * and delete at the cursor; the line is repainted whole on every
+ * keystroke, one write(2) each, so a mid-line insert is no different
+ * from an append.
  */
 struct sh_line {
 	char	l_buf[SH_LINE_MAX];
@@ -1891,11 +1700,7 @@ struct sh_line {
 	size_t	l_pos;
 };
 
-/*
- * History.  A plain array, oldest first, that shifts when it fills --
- * sixteen entries is more than a session of this shell holds and the
- * shift costs a memmove of something nobody is waiting on.
- */
+/* History: a plain array, oldest first, shifted down when full. */
 #define	SH_HIST_MAX	16
 
 static char	sh_hist[SH_HIST_MAX][SH_LINE_MAX];
@@ -1923,15 +1728,10 @@ line_set(struct sh_line *ln, const char *s)
 }
 
 /*
- * Repaint the line.
- *
- * The window slides so the cursor is always on screen: a line longer
- * than the terminal scrolls sideways rather than wrapping, because a
- * wrapped line cannot be repainted from a single carriage return and
- * every edit would leave the rows below it wrong.  This is the same
- * trick every one-line editor uses, and it is why the buffer may be
- * 256 bytes on an 80-column screen without the two numbers having to
- * agree.
+ * Repaint the line.  A line wider than the screen scrolls sideways to
+ * keep the cursor visible rather than wrapping, since a wrapped line
+ * cannot be repainted from one carriage return.  So SH_LINE_MAX need not
+ * fit in SH_COLS.
  */
 static void
 line_refresh(struct sh_line *ln)
@@ -1974,10 +1774,9 @@ line_refresh(struct sh_line *ln)
 }
 
 /*
- * A fresh prompt: refresh the chrome, leave a blank row, then draw an
- * empty line.  The prompt is emitted BY line_refresh rather than
- * printed here, so there is exactly one piece of code that knows where
- * the text of a line begins.
+ * A fresh prompt: refresh the chrome, leave a blank row, draw an empty
+ * line.  line_refresh emits the prompt, so only it knows where the text
+ * of a line begins.
  */
 static void
 prompt(void)
@@ -2006,7 +1805,7 @@ line_insert(struct sh_line *ln, char c)
 	ln->l_buf[ln->l_len] = '\0';
 }
 
-/* Remove the character AT the cursor -- Delete, and Ctrl-D mid-line. */
+/* Remove the character at the cursor: Delete, and Ctrl-D. */
 static void
 line_delete(struct sh_line *ln)
 {
@@ -2019,7 +1818,7 @@ line_delete(struct sh_line *ln)
 	ln->l_len--;
 }
 
-/* Remove the character BEFORE the cursor -- Backspace. */
+/* Remove the character before the cursor: Backspace. */
 static void
 line_erase(struct sh_line *ln)
 {
@@ -2045,17 +1844,9 @@ line_erase_word(struct sh_line *ln)
 
 /*
  * Complete the first word of the line against the builtins and the
- * program registry.
- *
- * Only the first word: everything after it is an argument, and this
- * shell has no filesystem paths to complete them against yet -- when it
- * does, that is a second candidate source rather than a different
- * mechanism.  A word that is already a whole name still completes, and
- * gains its trailing space, which is what makes Tab safe to lean on.
- *
- * The rule is the usual one.  One candidate: finish it.  Several:
- * extend as far as they agree, and if that adds nothing, show them --
- * a Tab that appears to do nothing is worse than one that lists.
+ * program registry; arguments are not completed.  One candidate: finish
+ * it and add a space (a whole name still gains its space).  Several:
+ * extend as far as they agree, or list them if that adds nothing.
  */
 static const char *
 complete_candidate(uint32_t idx)
@@ -2093,10 +1884,8 @@ line_complete(struct sh_line *ln)
 	uint32_t	 nbuiltin;
 
 	/*
-	 * The word under the cursor is the first word only when nothing
-	 * before the cursor is blank.  Anywhere else, Tab has nothing to
-	 * say and does nothing -- deliberately, rather than completing a
-	 * command name into an argument position.
+	 * Only in the first word (nothing blank before the cursor); Tab in
+	 * an argument does nothing.
 	 */
 	for (pfx_len = 0; pfx_len < ln->l_pos; pfx_len++) {
 		if (is_blank(ln->l_buf[pfx_len]))
@@ -2140,9 +1929,8 @@ line_complete(struct sh_line *ln)
 	}
 
 	/*
-	 * The prefix is already as long as the candidates agree, so
-	 * extending it silently is not an option.  Show them, then let
-	 * the caller redraw the prompt beneath.
+	 * Nothing to extend: list the candidates; the caller redraws the
+	 * prompt below.
 	 */
 	puts("\n");
 	puts(ESC_FG_GRAY);
@@ -2237,9 +2025,8 @@ repl(void)
 
 		case SH_K_UP:
 			/*
-			 * Stepping off the live line saves it, so walking
-			 * back down to the bottom returns what was being
-			 * typed rather than an empty prompt.
+			 * Leaving the live line saves it in `pending', so
+			 * coming back down restores what was being typed.
 			 */
 			if (browse + 1 < sh_hist_n) {
 				if (browse < 0) {
@@ -2322,10 +2109,8 @@ repl(void)
 				continue;
 
 			/*
-			 * Ctrl-C at the prompt with no foreground job:
-			 * abandon the line and reprint.  wait_child's ^C
-			 * path cannot be reached in this window, since
-			 * dispatch has not been called yet.
+			 * Ctrl-C at the prompt (no foreground job): abandon
+			 * the line and reprint.
 			 */
 			case 0x03:
 				puts(ESC_FG_RED);
@@ -2347,10 +2132,8 @@ repl(void)
 
 		default:
 			/*
-			 * A key with no meaning here -- Insert, a page
-			 * key, an escape.  Dropped, and pointedly NOT
-			 * echoed: typing its bytes into the command line
-			 * is the bug this editor was written to fix.
+			 * A key with no meaning here (Insert, a page key,
+			 * Escape) is dropped, never typed into the line.
 			 */
 			break;
 		}
@@ -2373,11 +2156,9 @@ main(void)
 	fetch_progs();
 
 	/*
-	 * Claim the screen: erase it, hand rows three to twenty-five to
-	 * the scrolling region, and start writing inside it.  Everything
-	 * after this line -- the splash, every prompt, every program this
-	 * shell spawns -- lives in the region, and the two rows above it
-	 * belong to paint_status_bar alone.
+	 * Claim the screen: erase it, make rows 3-25 the scrolling region
+	 * and start inside it.  Everything from here on, spawned programs
+	 * included, lives in the region; rows 1-2 are paint_status_bar's.
 	 */
 	puts(ESC_CLR_SCR);
 	puts(ESC_REGION_BODY);

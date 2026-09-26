@@ -8,17 +8,10 @@
 #include "style9.h"
 
 /*
- * Raw syscall stubs.
- *
- * On x86_64 the kernel ABI takes the syscall number in %rax and
- * arguments in %rdi, %rsi, %rdx, %r10, %r8, %r9.  rcx + r11 are
- * clobbered by the `syscall` instruction itself (CPU stashes %rip
- * into %rcx and %rflags into %r11).  Returns the kernel's %rax,
- * negative for kernel error codes (SYS_E_*).
- *
- * Five variants cover everything the kernel exposes today; if a
- * future syscall needs five or six arguments we can grow syscall5 /
- * syscall6 without touching anything else.
+ * Raw syscall stubs.  Number in %rax, arguments in %rdi, %rsi, %rdx,
+ * %r10, %r8, %r9; the `syscall' instruction itself clobbers %rcx (RIP)
+ * and %r11 (RFLAGS).  Returns the kernel's %rax, negative for SYS_E_*.
+ * No syscall takes more than four arguments yet.
  */
 
 long
@@ -89,12 +82,7 @@ exit(int code)
 {
 
 	(void)syscall1(SYS_EXIT, (long)code);
-	/*
-	 * Kernel's sys_exit calls thread_exit() and never returns; the
-	 * loop is here for the compiler's benefit (we declared noreturn)
-	 * and as a defensive landing pad if a future kernel build ever
-	 * returned from the syscall by mistake.
-	 */
+	/* sys_exit never returns; the loop satisfies noreturn. */
 	for (;;)
 		;
 }
@@ -107,41 +95,18 @@ yield(void)
 }
 
 /*
- * ONE TURN OF A POLL LOOP, AND WHY yield() ALONE STOPPED BEING ONE.
+ * One turn of a poll loop: about one timer tick of real time.
  *
- * Every "wait for the child to get somewhere" in this tree was written as a
- * bounded run of yields: give somebody else a turn, look again, and give up
- * after N.  That was a way of WAITING, because a yield with work queued
- * behind it does not come back until that work has had the CPU -- so N turns
- * bought N slices of real time.
+ * A yield is not a unit of time on several CPUs.  The task being waited
+ * for runs on another processor instead of queueing behind this one, so
+ * a yield finds this runqueue empty and returns at once; and a yield that
+ * does switch, to another poll-spinner, comes straight back.  Either way
+ * a budget of N yields runs out in microseconds.  So a turn parks on a
+ * port nobody can send to until the timeout, which means the same on any
+ * number of CPUs.
  *
- * With four processors it buys nothing.  The task being waited for is not
- * queued behind this one, it is RUNNING on another processor, so the yield
- * finds an empty runqueue here and returns at once; sixty-four turns are
- * spent in microseconds and the loop reports a failure that is only the
- * budget being denominated in the wrong unit.  That is not a worry, it is the
- * first thing the first four-processor boot of this kernel got wrong:
- *
- *	loopchild.tport lookup failed after 64 yields
- *
- * ⚠ AND ASKING THE KERNEL WHETHER THE YIELD SWITCHED IS NOT ENOUGH, which
- * took a second four-processor boot to learn.  A yield that switches to
- * another poll-spinner comes straight back, so it reports "yes, somebody had
- * the CPU" and still buys almost no time -- the budgets ran out anyway, and
- * `dash /bin/demo.sh' was abandoned after 8192 turns that a single processor
- * spends in 33.
- *
- * So a turn is measured in TIME and in nothing else: park for about one tick
- * on a port nobody can send to.  That makes a turn mean the same thing on any
- * number of processors -- roughly one scheduling quantum -- which is what it
- * meant on one processor by accident, because a yield there did not come back
- * until the queue had gone round.  Every budget already written in this tree
- * keeps the meaning it was chosen with.
- *
- * The port is allocated on first use rather than at start-up, so a program
- * that never polls never spends a name on this, and the names printed by the
- * early scenes of the test programs do not shift.  A program that cannot get
- * one falls back to the bare yield, which is what it had before.
+ * The port is allocated on first use, so a program that never polls
+ * spends no name on it.  Without one, fall back to a bare yield.
  */
 #define	POLL_TURN_MS	1
 
@@ -158,13 +123,9 @@ poll_turn(void)
 	}
 
 	/*
-	 * Nobody holds a SEND right on this port, so nothing can ever arrive:
-	 * the only way out is the timeout, which is the point.  One millisecond
-	 * asked for, one timer tick given -- the kernel's deadlines are checked
-	 * from the tick, and that is the finest grain of waiting this machine
-	 * has.  Asking for the smallest thing and being handed the resolution
-	 * is more honest than naming the resolution here, where it would be a
-	 * second copy of a number that lives in the clock.
+	 * Nothing can arrive, so only the timeout returns.  Ask for 1 ms and
+	 * get one tick, the grain at which the kernel checks deadlines,
+	 * without copying the tick length here.
 	 */
 	(void)mach_msg_recv_timed(nap, &buf, sizeof(buf), POLL_TURN_MS);
 	return (0);

@@ -40,13 +40,10 @@ vm_object_file(const struct fs_handle *h, const char *path)
 		return (NULL);
 
 	/*
-	 * A MAPPING HOLDS THE FILE, and says so.  A copy of a handle is a
-	 * second claim on the bytes -- POSIX is explicit that a mapping keeps
-	 * the file alive after the descriptor it was made from has been closed
-	 * -- and the pager reads through this one long afterwards.  Without
-	 * this, mmap-then-close-then-unlink would let the filesystem take the
-	 * extents away underneath a live mapping, and the fault that noticed
-	 * would arrive nowhere near the call that caused it.
+	 * A mapping holds the file: POSIX keeps a mapped file alive after
+	 * its descriptor is closed, and the pager reads through this handle
+	 * long afterwards.  Without the hold, mmap, close, unlink would free
+	 * the extents under a live mapping.
 	 */
 	if (fs_hold(h) != FS_E_OK) {
 		kfree(obj);
@@ -86,11 +83,9 @@ vm_object_deref(struct vm_object *obj)
 	if (!last)
 		return;
 	/*
-	 * And gives it back here, OUTSIDE the lock: the last close of a file
-	 * whose name is already gone reaps it, which writes the volume and
-	 * sleeps on the disk -- and a thread that blocks holding a spinlock in
-	 * this kernel is never woken again.  Nothing else can reach the object
-	 * by now, so there is nothing left for the lock to protect.
+	 * Give the file back outside the lock: the last close of an
+	 * unlinked file reaps it, which writes the volume and sleeps.
+	 * Nothing else can reach the object now.
 	 */
 	(void)fs_close(&obj->vo_handle);
 	kfree(obj);
@@ -107,9 +102,8 @@ vm_object_page(struct vm_object *obj, uint64_t off, uint8_t *page)
 		return (-1);
 
 	/*
-	 * Wholly past end-of-file.  Not an error: a mapping is allowed to be
-	 * longer than the file it names, and those pages read as zero -- which
-	 * the caller has already put there.
+	 * Wholly past end-of-file: not an error.  A mapping may outrun its
+	 * file, and those pages read as the zeroes already there.
 	 */
 	if (off >= obj->vo_size)
 		return (0);

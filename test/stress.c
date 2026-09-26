@@ -78,15 +78,13 @@ slots_reset(void)
 }
 
 /*
- * Pick an allocation size from a distribution biased toward small --
- * realistic kernel allocators see thousands of <128B allocations per
- * KB-sized allocation, and a flat distribution would saturate the
- * large-page path far too quickly.
+ * An allocation size, biased toward small as real kernel allocations are;
+ * a flat distribution would saturate the large-page path.
  *
- *	~50%	16..128
- *	~30%	128..1024
- *	~15%	1024..2048
- *	~5%	2048..8192 (large-allocation path)
+ *	~50%	16..143
+ *	~30%	128..1151
+ *	~15%	1024..2047
+ *	~5%	2048..8191 (large-allocation path)
  */
 static size_t
 random_size(void)
@@ -130,25 +128,18 @@ verify_pattern(const uint8_t *p, size_t n, uint8_t seed)
 }
 
 /*
- * Wait for the machine to finish putting itself away.
+ * Wait for teardown to finish.
  *
- * Every test below states a CONSERVATION LAW: the pages in use, less what the
- * slab is holding in reserve, must read the same after the test as before it.
- * The law is true; sampling it is what is hard, because a thread that has
- * called thread_exit still owns its kernel stack until somebody reaps it, and
- * a task still owns its address space until its last reference goes.  Both of
- * those finish AFTER the message that told this test it was done.
+ * The tests below check a conservation law: pages in use, less what the slab
+ * holds in reserve, read the same after a test as before.  Sampling it is the
+ * hard part: an exited thread owns its kernel stack until reaped, and a task
+ * its address space until its last reference goes, both after the message
+ * that told the test it was done.  Settle before the opening sample too, or
+ * the previous test's leftovers fold into the baseline and read as a
+ * negative leak when collected.
  *
- * So a bare reap before the closing sample is not enough, and a missing one
- * before the OPENING sample is worse: it folds whatever the previous test left
- * in flight into this test's baseline, which then reads as a NEGATIVE leak
- * when this test's own reap collects it.  Both mistakes were live here and
- * both were invisible until a scheduler change altered the order things
- * happened in -- +5 pages in one test, -7 in another, neither a leak.
- *
- * Waiting for the page count to STOP MOVING is the honest way to say "there is
- * nothing still being put away".  Bounded, because a test that hangs here
- * would be worse than one that samples early.
+ * So wait until the page count stops moving; bounded, since hanging here
+ * would be worse than sampling early.
  */
 static void
 stress_settle(void)
@@ -466,10 +457,8 @@ stress_timer(unsigned int seconds)
 
 	while (pit_ticks() - start_ticks < target_ticks) {
 		/*
-		 * Load: a small + medium alloc/free pair per spin.
-		 * Cheap enough that we still complete >>10000 cycles
-		 * per second, exercising the allocator under interrupt
-		 * pressure throughout the run.
+		 * Load: a small and a medium alloc/free pair per spin,
+		 * keeping the allocator busy under interrupts all run.
 		 */
 		small  = kmalloc(48);
 		medium = kmalloc(384);
@@ -516,13 +505,10 @@ stress_timer(unsigned int seconds)
 		return (1);
 	}
 	/*
-	 * The TSC calibration window (250 ms) and the test window
-	 * (2 s) can see very different host-side SMI behaviour, so
-	 * "drift" here is dominated by calibration noise, not by any
-	 * regression in the IRQ handler.  Set the threshold high
-	 * enough that only a real broken-tick-handler shows up:
-	 * 200000 ppm == 20%, which corresponds to losing roughly one
-	 * tick in five.
+	 * The TSC calibration window (250 ms) and the test window (2 s
+	 * from the callers) see different host SMI behaviour, so drift
+	 * here is mostly calibration noise.  The threshold only catches
+	 * a broken tick handler: 200000 ppm, about one tick in five lost.
 	 */
 	if (drift_ppm > 200000) {
 		kprintf("stress_timer: FAIL drift too large\n");
@@ -536,16 +522,13 @@ stress_timer(unsigned int seconds)
 /* ---- stress_port ------------------------------------------------------ */
 
 /*
- * Round-trip every iteration: client builds a request carrying its
- * reply port as a port descriptor, server receives (gaining a SEND
- * right on the reply port), server sends a reply, client receives.
+ * A round trip per iteration: the client sends a request carrying its
+ * reply port as a port descriptor, the server receives it (gaining a SEND
+ * right), replies, and the client receives.  Each round moves one right
+ * through a descriptor; the reply has no body.
  *
- * After N rounds, every reference and every name we allocated must
- * have returned to the baseline -- a regression in disposition
- * accounting will pin pmm_used above the start.  The recv-side
- * descriptor translation is exercised twice per round (request body
- * with one descriptor; reply has no body and is the simpler path),
- * so 1000 rounds == 1000 right-transfers through the send/recv path.
+ * After N rounds every name and reference must be back at baseline; a
+ * disposition-accounting regression pins memory above the start.
  */
 struct stress_msg {
 	struct mach_msg_header		hdr;
@@ -718,14 +701,13 @@ out:
  *	done_port           --  server -> client signal on exit
  *
  * The client embeds reply_port as a port descriptor (MAKE_SEND) in
- * every request, so the server receives a fresh SEND right per round
- * and uses MOVE_SEND on the reply so its right is consumed.  At
- * round N+1 the client sends a sentinel msgh_id, the server breaks
- * out of its loop, signals via done_port, and exits.
+ * every request, so the server gets a fresh SEND right per round and
+ * consumes it with MOVE_SEND on the reply.  After N rounds the client
+ * sends a sentinel msgh_id; the server leaves its loop, signals via
+ * done_port, and exits.
  *
- * Net check: after the test, name table is back to baseline,
- * conserved memory is back to baseline, and the server thread has
- * been reaped.
+ * Afterwards the name table and conserved memory are back at baseline
+ * and the server thread has been reaped.
  */
 struct stress_thread_ctx {
 	mach_port_name_t	stc_req_port;
@@ -757,9 +739,8 @@ stress_server_thread(void *arg)
 		}
 
 		/*
-		 * Reply via the just-arrived reply-port name; MOVE_SEND
-		 * because we never want to send to it again -- a fresh
-		 * SEND right will arrive with the next request.
+		 * Reply to the name just received, with MOVE_SEND: the next
+		 * request brings a fresh SEND right.
 		 */
 		reply.msgh_bits    = MACH_MSGH_BITS(
 		    MACH_MSG_TYPE_MOVE_SEND, 0);
@@ -912,9 +893,8 @@ out:
 	port_deallocate(kernel_space, reply_port);
 
 	/*
-	 * The server thread is now ZOMBIE; reap it deterministically
-	 * before the conservation check so the kstack is returned to
-	 * the same baseline we measured at entry.
+	 * The server thread is a zombie now; settle so its kstack is freed
+	 * before the conservation check.
 	 */
 	stress_settle();
 
@@ -960,27 +940,20 @@ out:
 /* ---- stress_preempt --------------------------------------------------- */
 
 /*
- * The acid test for preemption.  Spawn N CPU-bound worker threads
- * that do nothing but increment a per-worker counter in a tight
- * loop -- they never yield, never block, never touch the scheduler
- * directly.  The main thread then sleeps for `sleep_ms` (a busy-
- * wait on pit_ticks) and tells the workers to stop.
+ * Preemption.  N CPU-bound workers increment per-worker counters in a
+ * tight loop, never yielding or blocking.  The main thread busy-waits
+ * `sleep_ms` (clock_busy_sleep_ms) and tells them to stop.  Without
+ * preemption only the first worker to run would count; with it, every
+ * counter is non-zero.
  *
- * In a cooperative scheduler, exactly one worker -- whichever ran
- * first -- would have a non-zero counter; the others would be
- * stranded in the runqueue.  Under preemption, the timer interrupt
- * forcibly rotates between them and every counter is non-zero.
+ * Passes when every counter is > 0 and at least two IRQ-driven preempts
+ * were seen.  Counter values are reported, not gated: the ratios follow
+ * host scheduling jitter.
  *
- * Pass conditions: every worker's counter > 0 AND we observed at
- * least a few IRQ-driven preempts.  Counter VALUES are reported but
- * not gated -- ratios depend heavily on host scheduling jitter.
- *
- * This is also what checks that the slice has an owner at all.  Exactly
- * one timer debits it -- the local APIC's where there is one, and the PIT
- * only until that hand-over -- so a hand-over that relieved the PIT
- * without arming the APIC would show up here as zero preempts and
- * starving workers, which is the same thing a cooperative scheduler looks
- * like.
+ * This also checks that the slice has an owner: one timer debits it (the
+ * local APIC where there is one, the PIT until the hand-over), and a
+ * hand-over that stopped the PIT without arming the APIC shows here as
+ * zero preempts and starving workers.
  */
 
 #define	STRESS_PREEMPT_MAX_WORKERS	16
@@ -1000,11 +973,8 @@ preempt_worker(void *arg)
 
 	while (!*a->pwa_stop) {
 		/*
-		 * Plain integer increment -- the compiler cannot
-		 * elide this because the counter is volatile and a
-		 * reader (the main thread) examines it later.  The
-		 * worker holds no locks, makes no syscalls, never
-		 * yields voluntarily.
+		 * Volatile, so not elided.  No locks, no calls, no
+		 * voluntary yield.
 		 */
 		(*a->pwa_counter)++;
 	}
@@ -1161,10 +1131,9 @@ out:
  *	server: reply uses MOVE_SEND_ONCE -- the right is consumed
  *	        BY the send, so the server cannot send twice
  *
- * The whole point versus plain SEND: after N rounds, the server's
- * accidentally-held SEND right would accumulate without bound; with
- * SEND_ONCE the kernel enforces the one-shot semantics.  We verify
- * by tracking inuse names in the kernel space across the run.
+ * A server holding plain SEND rights by mistake would accumulate one per
+ * round; with SEND_ONCE the kernel enforces one shot.  Checked by the
+ * kernel space's in-use name count across the run.
  */
 
 struct stress_sendonce_ctx {
@@ -1195,11 +1164,9 @@ stress_sendonce_server(void *arg)
 		}
 
 		/*
-		 * recv.reply_pd.name holds a SEND_ONCE right in our
-		 * namespace.  Reply via MOVE_SEND_ONCE: the right is
-		 * consumed by the send, and the name is removed from
-		 * our space automatically.  A second reply attempt
-		 * here would fail with MACH_E_RIGHT.
+		 * recv.reply_pd.name is a SEND_ONCE right here; the send
+		 * consumes it and removes the name.  A second reply would
+		 * fail with MACH_E_RIGHT.
 		 */
 		reply.msgh_bits    = MACH_MSGH_BITS(
 		    MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
@@ -1373,18 +1340,15 @@ out:
 /* ---- stress_sendonce_notify ------------------------------------------- */
 
 /*
- * Verify the send-once *notification* (MACH_NOTIFY_SEND_ONCE): a send-once
- * right destroyed WITHOUT being used to send its one message must auto-fire
- * the notification to its target port, so a client blocked awaiting a reply
+ * The send-once notification: a send-once right destroyed unused must fire
+ * MACH_NOTIFY_SEND_ONCE at its target port, so a client awaiting a reply
  * that will never come is unblocked.
  *
- * Single-threaded, public API only: allocate a reply port (we hold
- * RECEIVE) and a sink port, send a request to the sink carrying a
- * MAKE_SEND_ONCE right to the reply port, recv that request ourselves so
- * the send-once right lands in our space, then port_deallocate it UNUSED
- * and confirm exactly one MACH_NOTIFY_SEND_ONCE arrives on the reply port.
- * stress_sendonce above covers the used path: if a normal reply ever fired
- * a spurious notification, its reply recv would see an extra message.
+ * Single-threaded, public API only: send a request to a sink port carrying
+ * MAKE_SEND_ONCE to our reply port, receive it ourselves so the send-once
+ * right lands in our space, port_deallocate it unused, and expect one
+ * MACH_NOTIFY_SEND_ONCE on the reply port.  stress_sendonce covers the used
+ * path: a spurious notification there would show as an extra message.
  */
 int
 stress_sendonce_notify(void)
@@ -1483,11 +1447,10 @@ out:
 /* ---- stress_portset --------------------------------------------------- */
 
 /*
- * Port-set fan-in: one set, N member ports, one server thread parked
- * on the set.  The (boot) thread sends per_member messages to each
- * of the N ports in interleaved order, encoding the source port in
- * msgh_id.  The server receives via the set in whatever order the
- * scheduler / wake-policy picks, counts arrivals per source.
+ * Port-set fan-in: one set, N member ports, one server thread parked on
+ * the set.  The calling thread sends per_member messages to each port,
+ * interleaved, with the source index in msgh_id; the server counts
+ * arrivals per source in whatever order they come.
  *
  * Pass conditions:
  *	- exactly N * per_member messages delivered
@@ -1608,11 +1571,7 @@ stress_portset(unsigned int n_members, unsigned int per_member)
 	}
 	thread_start(server);
 
-	/*
-	 * Interleave sends across the members.  Encoding the source
-	 * port index in the high half of msgh_id lets the server
-	 * attribute each message back without a body descriptor.
-	 */
+	/* Interleaved; the source index rides in msgh_id's high half. */
 	for (j = 0; j < per_member; j++) {
 		for (i = 0; i < n_members; i++) {
 			struct mach_msg_header	msg;
@@ -1702,24 +1661,21 @@ out:
 /* ---- stress_intertask ------------------------------------------------- */
 
 /*
- * Two tasks, one IPC channel.  The parent (kernel_task) is the
- * client.  A second task ("worker") is created with its own
- * port_space; a server thread spawned inside it receives requests
- * and replies through send-once rights the client embeds in every
- * message.
+ * Two tasks, one IPC channel.  kernel_task is the client; a server thread
+ * in a second task ("worker", with its own port_space) replies through the
+ * send-once rights the client embeds in every request.
  *
  * Bootstrap:
  *	service port	allocated in worker_space (RECV+SEND there);
  *			port_space_inject_send copies a SEND right
- *			into kernel_space under a different name --
- *			that's how the parent learns to talk to it.
+ *			into kernel_space under another name.
  *	done port	allocated in kernel_space (RECV+SEND there);
- *			SEND right injected into worker_space so the
- *			worker can signal completion.
+ *			a SEND right is injected into worker_space for
+ *			the completion signal.
  *
- * Verification: every name in BOTH spaces returns to its pre-test
- * count, and conserved memory returns to baseline.  The new task is
- * destroyed at the end (last thread exits + task_deref).
+ * Checked: the kernel space's names and conserved memory return to
+ * baseline (the worker's counts are printed).  The worker task is
+ * destroyed at the end (last thread exits, then task_deref).
  */
 
 struct intertask_ctx {
@@ -1753,9 +1709,8 @@ intertask_server(void *arg)
 		}
 
 		/*
-		 * recv.reply_pd.name was just installed by deliver_msg
-		 * into THIS task's port_space; it carries a SEND_ONCE
-		 * right.  MOVE_SEND_ONCE consumes the right.
+		 * deliver_msg installed recv.reply_pd.name in this task's
+		 * space as a SEND_ONCE right; MOVE_SEND_ONCE consumes it.
 		 */
 		reply.msgh_bits    = MACH_MSGH_BITS(
 		    MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
@@ -1812,9 +1767,8 @@ stress_intertask(unsigned int rounds)
 	inuse_w0 = port_space_inuse(worker->t_port_space);
 
 	/*
-	 * Service port: created in the worker's namespace so the
-	 * worker holds the RECEIVE end; the parent learns the same
-	 * port under a separate name via port_space_inject_send.
+	 * Service port: the worker holds RECEIVE; the parent gets a SEND
+	 * right under its own name via port_space_inject_send.
 	 */
 	service_worker = port_allocate(worker->t_port_space,
 	    MACH_PORT_RIGHT_RECEIVE | MACH_PORT_RIGHT_SEND);
@@ -1825,11 +1779,7 @@ stress_intertask(unsigned int rounds)
 		return (2);
 	}
 
-	/*
-	 * Done port: parent allocates in kernel_space, parent holds
-	 * RECEIVE.  Worker gets a SEND right under its own name to
-	 * signal back.
-	 */
+	/* Done port: the parent holds RECEIVE, the worker a SEND right. */
 	done_kernel = port_allocate(kernel_space,
 	    MACH_PORT_RIGHT_RECEIVE | MACH_PORT_RIGHT_SEND);
 	rv = port_space_inject_send(kernel_space, done_kernel,
@@ -1969,12 +1919,9 @@ out:
  *
  *  Exercises MACH_MSG_TYPE_MOVE_RECEIVE: a port's receive right is
  *  transferred through a message to a new name, and the original name
- *  retains its surviving SEND right.
- *
- *  Single-space variant -- no worker task -- because the mechanism is
- *  about the kernel correctly re-binding the RECV right between two
- *  entries in the same name table, and we want a fast tight loop that
- *  isolates that one operation.
+ *  keeps its SEND right.  One space, no worker task: the operation is
+ *  re-binding RECV between two entries of one name table, in a tight
+ *  loop.
  *
  *  Per round:
  *    1. allocate pp = port_allocate(RECV | SEND).  pp owns RECV and SEND
@@ -2338,16 +2285,15 @@ out:
 /* ----------------------------------------------------------------------- *
  *  stress_deadname_multi
  *
- *  Exercises the dead-name machinery (Mach audit gap #4): multi-registrant
+ *  Exercises the dead-name machinery: multi-registrant
  *  MACH_NOTIFY_DEAD_NAME plus the lazy flip of a SEND name to a dead name.
  *
- *  Single-threaded, public API.  Build a target port T (we hold its
- *  RECEIVE via name `t`) and a second SEND-only name `s` to the same port
- *  -- the surviving holder we will observe.  Arm three dead-name watches
- *  on `s`, each on a distinct notify port with a distinct tag, then re-arm
- *  the first target to prove re-arm updates its tag in place (dedup)
- *  rather than queueing a second notification.  Kill T by dropping `t`,
- *  then confirm:
+ *  Single-threaded, public API.  Build a target port T (RECEIVE under
+ *  `t`) and a second, SEND-only name `s` to it -- the holder observed.
+ *  Arm three dead-name watches on `s`, each on its own notify port with
+ *  its own tag, then re-arm the first to prove a re-arm updates the tag in
+ *  place rather than queueing a second notification.  Kill T by dropping
+ *  `t`, then confirm:
  *	- each notify port carries exactly one MACH_NOTIFY_DEAD_NAME with its
  *	  expected tag (the re-armed one carries the updated tag, no second),
  *	- mach_port_type(s) read the live SEND mask before death and flips to
@@ -2434,7 +2380,7 @@ stress_deadname_multi(void)
 		goto out;
 	}
 
-	/* Kill the port: drop `t` (RECEIVE+SEND).  `s` keeps the object live. */
+	/* Kill the port: drop `t` (RECEIVE+SEND); `s` keeps the object live. */
 	rv = port_deallocate(kernel_space, t);
 	t = MACH_PORT_NULL;
 	if (rv != MACH_MSG_OK) {
@@ -2545,14 +2491,13 @@ out:
 /* ----------------------------------------------------------------------- *
  *  stress_sendblock
  *
- *  Producer thread sends `rounds` messages as fast as it can; the main
- *  thread is the slow consumer, recv'ing one message per pass.  With
- *  rounds > port qmax (currently 1024) the producer must block on a
- *  full queue and resume each time the consumer takes a slot.
+ *  A producer thread sends `rounds` messages as fast as it can; the main
+ *  thread consumes one per pass.  With rounds above the port's queue
+ *  bound (DEFAULT_QMAX, 1024) the producer must block on a full queue and
+ *  resume as the consumer frees slots.
  *
- *  Net check: every sent message is delivered in order, the producer
- *  exits cleanly, and the name table + memory budgets return to
- *  baseline.
+ *  Checked: every message arrives in order, the producer exits, and the
+ *  name table and memory return to baseline.
  * ----------------------------------------------------------------------- */
 struct stress_sendblock_ctx {
 	mach_port_name_t	ssb_name;
@@ -2715,17 +2660,15 @@ out:
  * Exercises mach_msg_rpc end-to-end and verifies mach_msg_recv_timed
  * surfaces MACH_E_TIMEOUT when no message arrives within the deadline.
  *
- * Topology: a single server thread holds RECEIVE on `srv_port` and
- * loops recv -> reply.  The main thread issues mach_msg_rpc N times.
- * mach_msg_rpc internally allocates a fresh reply port per call, encodes
- * it into msgh_local with MAKE_SEND, sends, recvs the reply on it, and
- * deallocates.  The server consumes the reply right via MOVE_SEND so
- * its name slot is reclaimed each round.
+ * A server thread holds RECEIVE on `srv_port` and loops recv -> reply;
+ * the main thread calls mach_msg_rpc N times.  mach_msg_rpc allocates a
+ * reply port per call, puts it in msgh_local as MAKE_SEND, sends, receives
+ * the reply there, and deallocates it.  The server consumes the reply
+ * right with MOVE_SEND, so its name slot is reclaimed each round.
  *
- * After the RPC loop a 50 ms recv_timed on a fresh, empty port checks
- * the new PIT-driven sched_check_timeouts path: the call must return
- * MACH_E_TIMEOUT within a loose wall-clock window (allows slack for
- * PIT-scan latency under interleaved stress passes).
+ * Then a 50 ms recv_timed on a fresh, empty port checks the timeout path
+ * (sched_check_timeouts): it must return MACH_E_TIMEOUT within a loose
+ * wall-clock window, allowing for scan latency under other stress passes.
  */
 
 #define	STRESS_RPC_SHUTDOWN_ID	0xDEAD0000u
@@ -2882,10 +2825,9 @@ stress_rpc(unsigned int rounds)
 	stress_settle();
 
 	/*
-	 * Timeout probe.  Fresh empty port, 50 ms deadline.  The PIT scan
-	 * runs at 100 Hz so the realised wait can drift by up to a tick;
-	 * 50..500 ms is a loose-enough envelope to ride out the boot-time
-	 * stress pass scheduling jitter without false alarms.
+	 * Timeout probe: fresh empty port, 50 ms deadline.  The timeout scan
+	 * runs once a tick, so the wait can be a tick late; 50..500 ms rides
+	 * out boot-time scheduling jitter without false alarms.
 	 */
 	empty = port_allocate(kernel_space,
 	    MACH_PORT_RIGHT_RECEIVE | MACH_PORT_RIGHT_SEND);
@@ -2953,22 +2895,20 @@ out:
 /* ---- stress_ool -------------------------------------------------------- */
 
 /*
- * Out-of-line memory descriptors.  Parent (kernel_task) ships kmalloc'd
- * buffers of varying sizes through an OOL descriptor; worker task recv
- * receives the bytes mapped into its own VM at a fresh USER VA, walks
- * them via a direct dereference (worker's pmap is current in the server
- * thread), checksums, and replies with the checksum.
+ * Out-of-line memory descriptors.  kernel_task ships kmalloc'd buffers of
+ * several sizes through an OOL descriptor; the worker task receives the
+ * bytes mapped at a fresh user VA, reads them directly (its pmap is
+ * current in the server thread), and replies with their checksum.
  *
  *   sizes covered    : 1, 32, 256, 4095, 4096, 8192, 16384, 65535 bytes
  *   per-size rounds  : `rounds`, deterministic seed per round
  *   pattern          : byte i = (i + round_id) ^ 0xA5
  *   verdict          : FAIL if any worker checksum disagrees with parent's
  *
- * Conservation footnote: each successful OOL recv installs new frames in
- * the worker's pmap that v1 has no vm_deallocate for.  Those frames are
- * reclaimed at the end of the test when worker_task is destroyed (last
- * thread exits + task_deref drops the pmap + vm_map).  So we record the
- * baseline pmm count BEFORE worker creation and check AFTER destruction.
+ * Each OOL receive installs frames in the worker's pmap that the server
+ * never vm_deallocates; they come back when the worker task is destroyed
+ * (task_deref drops the pmap and vm_map).  So the baseline is taken before
+ * the worker is created and checked after it is gone.
  */
 
 #define	STRESS_OOL_SENTINEL	0x070000FEu
@@ -3026,10 +2966,9 @@ stress_ool_server(void *arg)
 		}
 
 		/*
-		 * Direct dereference: the worker's pmap is current and
-		 * recv_install_ool installed the bytes at recv.ool.address
-		 * with VM_PROT_USER | R/W.  CPL=0 can read U=1 pages, so
-		 * no copyin needed.
+		 * Direct dereference, no copyin: the worker's pmap is current,
+		 * recv_install_ool mapped the bytes user R/W, and CPL 0 can
+		 * read U=1 pages.
 		 */
 		if (recv.ool.size == 0) {
 			sum = 0u;
@@ -3222,9 +3161,9 @@ stop_server:
 	stress_settle();
 
 	/*
-	 * Drop the worker task.  The server thread already exited and was
-	 * reaped above; this last ref deref destroys the per-task pmap and
-	 * vm_map, reclaiming every frame the OOL recv path installed.
+	 * The server thread has exited and been reaped; dropping the last
+	 * reference destroys the task's pmap and vm_map, and with them every
+	 * frame the OOL receives installed.
 	 */
 	task_deref(worker);
 
@@ -3262,16 +3201,11 @@ stop_server:
 /* ---- mutex: mutual exclusion, and the sleep path under contention -------- */
 
 /*
- * A lock whose waiters have never had to sleep is a lock whose sleep path has
- * never run, and kern/mutex.c is exactly that until something makes threads
- * collide.  So this makes them collide on purpose.
- *
- * The counter is incremented NON-atomically through a read, a yield and a
- * write.  Without the mutex that is a textbook lost update and the final
- * total comes out low; with it, the yield in the middle guarantees the holder
- * is descheduled while still holding the lock, which is the situation a
- * spinlock could not survive here and the only reason this primitive exists.
- * Contention is therefore not hoped for -- it is arranged.
+ * A mutex's sleep path only runs when threads collide, so this makes them
+ * collide.  The counter is incremented non-atomically -- read, yield,
+ * write -- so without the mutex updates are lost, and with it the holder is
+ * descheduled while holding the lock, the case a spinlock cannot handle and
+ * the reason this primitive exists.
  */
 static struct mutex		mtx_test_lock = MUTEX_INIT("stress-mutex");
 static volatile unsigned long	mtx_test_counter;
@@ -3291,10 +3225,10 @@ mutex_worker(void *arg)
 		mutex_lock(&mtx_test_lock);
 
 		/*
-		 * Two independent checks of the same claim.  The occupancy
-		 * count catches two threads inside at once even if the
-		 * arithmetic happens to come out right; the read-yield-write
-		 * catches a lost update even if they never overlap visibly.
+		 * Two checks of one claim: the occupancy count catches two
+		 * threads inside even if the sum comes out right, the
+		 * read-yield-write catches a lost update even if no overlap
+		 * is seen.
 		 */
 		mtx_test_inside++;
 		if (mtx_test_inside > mtx_test_maxheld)
@@ -3352,10 +3286,8 @@ stress_mutex(unsigned int n_workers, unsigned int rounds)
 	}
 
 	/*
-	 * Wait by yielding rather than by holding anything.  The bound is
-	 * generous but finite: a mutex bug here shows up as workers that never
-	 * finish, and that must be reported as a failure rather than hang the
-	 * boot.
+	 * Wait by yielding, with a generous bound: a worker that never
+	 * finishes must be reported, not hang the boot.
 	 */
 	spins = 0;
 	while (mtx_test_live != 0 && spins < 20000000u) {
@@ -3376,10 +3308,8 @@ stress_mutex(unsigned int n_workers, unsigned int rounds)
 	    mtx_test_maxheld, (unsigned long long)slept);
 
 	/*
-	 * Zero sleeps would mean the workers never actually overlapped, and a
-	 * correct-looking counter would then be saying nothing about the park
-	 * and wake paths -- which are the only parts of this lock that a
-	 * spinlock could not have provided.
+	 * Zero sleeps would mean the workers never overlapped, and a right
+	 * counter would prove nothing about the park and wake paths.
 	 */
 	if (slept == 0) {
 		kprintf("stress_mutex: FAIL never contended -- the sleep path "

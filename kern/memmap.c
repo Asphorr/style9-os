@@ -54,9 +54,8 @@ memmap_init(uint32_t mb_magic, uint32_t mb_info)
 
 	if (memmap_nentries == 0) {
 		/*
-		 * No firmware-supplied map.  Synthesise a conservative
-		 * stub: low 1 MiB reserved, then 31 MiB usable (the
-		 * absolute minimum any modern QEMU VM will hand us).
+		 * No firmware-supplied map.  Assume a conservative 32 MiB:
+		 * low 1 MiB reserved, the 31 MiB above it usable.
 		 */
 		memmap_add(0, 0x100000, MEMMAP_RESERVED);
 		memmap_add(0x100000, 0x1F00000, MEMMAP_FREE);
@@ -131,9 +130,8 @@ memmap_add(uint64_t base, uint64_t length, uint32_t type)
 }
 
 /*
- * Insertion sort: input is small (under 64 entries), the only thing
- * that matters is producing a stable ordering for pmm.  Avoid pulling
- * in a generic sort.
+ * Insertion sort by base: at most MEMMAP_MAX_ENTRIES entries, and stable,
+ * which is all pmm needs.
  */
 static void
 memmap_sort(void)
@@ -200,11 +198,7 @@ parse_mb1(uint32_t info_pa)
 			e = (const struct mb1_mmap_entry *)cur;
 			memmap_add(e->mme_base, e->mme_length,
 			    e820_to_local(e->mme_type));
-			/*
-			 * mme_size is "size of this record minus this
-			 * field"; the field itself is 4 bytes.  Step by
-			 * that to hit the next record header.
-			 */
+			/* mme_size does not count its own 4 bytes. */
 			cur += e->mme_size + sizeof(uint32_t);
 		}
 	} else if ((info->mb_flags & MB1_INFO_MEMORY) != 0) {

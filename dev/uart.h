@@ -11,18 +11,13 @@
 #include <stddef.h>
 
 /*
- * 16550 UART (PC-style 8250/16450/16550A line of chips), driven in
- * polled output mode.
+ * 16550 UART (8250/16450/16550A family): polled output, IRQ-driven
+ * receive.
  *
- * COM1 is at I/O port 0x3F8 in the legacy PC layout and is the chip
- * QEMU exposes by default; -serial file:PATH on the host side will
- * receive every byte written through uart_putc here.  Unlike dbgcon
- * (port 0xE9), this is real hardware and works on physical machines
- * as well as in emulation.
- *
- * Newlines are converted to CR-LF at the driver layer so logs read
- * correctly on any terminal program; the rest of the kernel still
- * speaks pure '\n'.
+ * COM1, at I/O port 0x3F8, is what QEMU exposes by default (-serial
+ * file:PATH captures it).  Unlike dbgcon (port 0xE9) it exists on real
+ * machines too.  '\n' is sent as CR-LF; the rest of the kernel speaks
+ * plain '\n'.
  */
 
 #define	UART_COM1_BASE	0x3F8
@@ -33,16 +28,14 @@ void	uart_puts(const char *);
 void	uart_write(const char *, size_t);
 
 /*
- * Enable IRQ-driven receive on COM1.  Must be called *after* the IDT
- * is up and interrupts are globally enabled -- the IRQ trampoline
- * routes through irq_install / pic_unmask just like every other line.
+ * Enable IRQ-driven receive on COM1 (irq_install + pic_unmask).  Call
+ * only once the IDT is up and interrupts are enabled.
  */
 void	uart_enable_rx(void);
 
 /*
- * Blocking IRQ-driven read.  Symmetric to kbd_getc_block: if the RX
- * ring is empty, the caller parks via thread_block and is woken when
- * the COM1 IRQ pushes a byte.  Single-consumer only.
+ * Blocking read, as kbd_getc_block: parks until the COM1 IRQ pushes a
+ * byte.  Single consumer only.
  */
 int	uart_getc_block(void);
 

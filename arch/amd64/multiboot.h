@@ -11,16 +11,12 @@
 #include <stdint.h>
 
 /*
- * Wire formats for the boot-info structures handed in via %ebx when
- * the bootloader transfers control.  Multiboot1 (legacy GRUB),
- * multiboot2 (modern GRUB), and PVH (QEMU -kernel for ELF64) are all
- * supported.
+ * Wire formats of the multiboot boot-info structures handed in via %ebx
+ * (PVH's are in pvh.h).  memmap parses multiboot1 and multiboot2, though
+ * boot.S carries only a multiboot2 header and the PVH note.
  *
- * Only the fields the kernel actually consumes are decoded here -- the
- * structures are larger in the standards.  Layouts are imposed by the
- * Multiboot / PVH specifications; reordering or resizing existing fields
- * desynchronises the parser from what the bootloader writes.  Each struct
- * is preceded by a WIRE FORMAT banner for grep-ability.
+ * Only the leading fields the kernel uses are declared.  Layouts are fixed
+ * by the specifications; do not reorder or resize fields.
  */
 
 /* ---- Multiboot 1 -------------------------------------------------------- */
@@ -47,7 +43,7 @@ struct mb1_info {
 
 /* WIRE FORMAT.  Multiboot1-imposed. */
 struct mb1_mmap_entry {
-	uint32_t	mme_size;		/* size of THIS record minus mme_size itself */
+	uint32_t	mme_size;		/* bytes after this field */
 	uint64_t	mme_base;
 	uint64_t	mme_length;
 	uint32_t	mme_type;

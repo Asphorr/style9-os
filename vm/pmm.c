@@ -20,11 +20,10 @@ extern char	__kernel_end[];
 
 /*
  * Lock key:
- *	(a) atomic; touch with __atomic_*  -- the bitmap words are RMWed
  *	(p) protected by pmm_lock
  *	(c) const after pmm_init
  */
-static uint64_t		*pmm_bitmap;		/* (a) bit set => used    */
+static uint64_t		*pmm_bitmap;		/* (p) bit set => used    */
 static uint64_t		 pmm_bitmap_words;	/* (c) length in u64s     */
 static uint64_t		 pmm_managed_pages;	/* (c) total managed      */
 static uint64_t		 pmm_managed_pa_end;	/* (c) exclusive end PA   */
@@ -32,11 +31,9 @@ static uint64_t		 pmm_alloc_hint;	/* (p) next-fit cursor    */
 static uint64_t		 pmm_used_count;	/* (p) currently allocated*/
 
 /*
- * (p) owners per managed frame, indexed by page number.  Sixteen bits, not
- * eight: the sharers of one frame are one per task that inherited it, and a
- * program that forks in a loop can hold far more than 255 of those alive at
- * once.  At the 1 GiB cap the array is 512 KiB, which is the price of the
- * whole mechanism.
+ * (p) owners per managed frame, by page number.  Sixteen bits: a program
+ * forking in a loop can keep far more than 255 sharers of one frame
+ * alive.  At the 1 GiB cap the array is 512 KiB.
  */
 static uint16_t		*pmm_refs;
 static uint64_t		 pmm_shared_count;	/* (p) frames with refs > 1 */
@@ -67,13 +64,11 @@ pa_from_index(uint64_t idx)
 }
 
 /*
- * Two-phase init.  Phase 1 picks a home for the bitmap from the
- * firmware map (avoiding low 1 MiB, the kernel image, and entries
- * that are not MEMMAP_FREE) and zero-clears it.  Phase 2 marks every
- * managed page as USED, then re-frees only pages that belong to a
- * MEMMAP_FREE region, then re-reserves the kernel image, the bitmap
- * itself, and any other no-go zones.  This produces a correct
- * initial state regardless of what the firmware reports.
+ * Two phases.  Phase 1 finds a home for the bitmap and owner counts in a
+ * MEMMAP_FREE region, clear of the low 1 MiB and the kernel image.
+ * Phase 2 marks every managed page used, frees the pages of MEMMAP_FREE
+ * regions, then reserves the low 1 MiB, the kernel image and the
+ * bookkeeping again -- correct whatever the firmware reports.
  */
 void
 pmm_init(void)
@@ -86,11 +81,9 @@ pmm_init(void)
 		panic("pmm_init: memmap_init was not called");
 
 	/*
-	 * Manage 0 .. min(highest_free_end, hard_cap).  Pages above the
-	 * highest FREE region either don't exist (firmware just lists
-	 * them as reserved) or live outside the boot identity map; in
-	 * either case we can't allocate them, and pretending they're
-	 * managed just inflates the "used" counter.
+	 * Manage 0 .. min(highest free end, hard cap).  Pages above the
+	 * highest FREE region are reserved or absent, and managing them
+	 * would only inflate the used count.
 	 */
 	hard_cap = PMM_HARD_CAP_BYTES;
 	max_free_end = 0;
@@ -115,10 +108,9 @@ pmm_init(void)
 	bm_bytes          = pmm_bitmap_words * sizeof(uint64_t);
 
 	/*
-	 * The bitmap and the owner counts are two views of one array of
-	 * frames, so they are carved as one block and reserved as one block.
-	 * The counts start on a page boundary past the bitmap purely so the
-	 * two are separately greppable in a memory dump.
+	 * The bitmap and owner counts are carved and reserved as one block;
+	 * the counts start on the next page boundary, so the two are easy
+	 * to tell apart in a memory dump.
 	 */
 	rc_bytes    = pmm_managed_pages * sizeof(uint16_t);
 	carve_bytes = PA_ROUND_UP(bm_bytes) + rc_bytes;
@@ -138,11 +130,9 @@ pmm_init(void)
 	pmm_used_count = pmm_managed_pages;
 
 	/*
-	 * Zero owners everywhere.  Pages that stay used from here on are the
-	 * ones nobody ever allocated -- firmware holes, the kernel image, this
-	 * very array -- and leaving them at zero is what makes the assertion
-	 * in pmm_free_page able to say "that frame was never handed out"
-	 * instead of silently wrapping a count around.
+	 * Zero owners everywhere.  Pages that stay used were never
+	 * allocated (firmware holes, the kernel image, this array), and a
+	 * zero count lets pmm_free_page assert as much instead of wrapping.
 	 */
 	for (i = 0; i < pmm_managed_pages; i++)
 		pmm_refs[i] = 0;
@@ -170,9 +160,8 @@ pmm_init(void)
 	}
 
 	/*
-	 * Low 1 MiB is firmware playground (BIOS data area, EBDA, video
-	 * memory, etc.).  Even when the firmware claims it as RAM we
-	 * refuse to hand it out; the cost is 256 pages we'll never need.
+	 * The low 1 MiB (BIOS data area, EBDA, video memory) is never handed
+	 * out, even when the firmware calls it RAM: 256 pages.
 	 */
 	mark_range_used(0, 0x100000);
 
@@ -288,10 +277,8 @@ pmm_alloc_pages(size_t npages)
 }
 
 /*
- * "I am done with this frame."  Which is the same sentence it always was --
- * what changed is that it is no longer a synonym for "and so is everyone
- * else".  A frame with other owners loses one of them here and stays exactly
- * where it is; only the last owner out returns it to the bitmap.
+ * "I am done with this frame": drop one owner.  Only the last owner out
+ * returns the frame to the bitmap.
  */
 void
 pmm_free_page(uint64_t pa)
@@ -306,11 +293,9 @@ pmm_free_page(uint64_t pa)
 	spin_lock(&pmm_lock);
 	KASSERT(is_used(idx), "pmm_free_page: double-free");
 	/*
-	 * Used, but never handed out by the allocator: the kernel image, the
-	 * firmware's low memory, this bookkeeping itself.  Those have no
-	 * owners to subtract, and a caller that reaches one has confused a
-	 * reserved frame for an allocated one -- worth saying so precisely
-	 * rather than letting the count wrap to 65535.
+	 * Used but never allocated (kernel image, low memory, this
+	 * bookkeeping): a caller freeing one has mistaken a reserved frame
+	 * for an allocated one.  Say so rather than wrap the count.
 	 */
 	KASSERT(pmm_refs[idx] != 0,
 	    "pmm_free_page: frame was reserved, not allocated");
@@ -343,10 +328,9 @@ pmm_free_pages(uint64_t pa, size_t npages)
 		    "pmm_free_pages: range overruns managed area");
 		KASSERT(is_used(idx), "pmm_free_pages: double-free");
 		/*
-		 * See the header: a run is contiguous physical memory handed
-		 * out as one thing, and nothing shares it page by page.  If
-		 * something does, this run cannot be released as a run and
-		 * silently leaking the shared frames would hide the bug.
+		 * A run is handed out as one thing and never shared page by
+		 * page (pmm.h); a shared frame here is a bug to catch, not a
+		 * frame to leak.
 		 */
 		KASSERT(pmm_refs[idx] == 1,
 		    "pmm_free_pages: frame inside a run has other owners");
@@ -470,11 +454,8 @@ pmm_stats(void)
 	    (unsigned long long)freec,
 	    (unsigned long long)(freec << (PAGE_SHIFT - 10)));
 	/*
-	 * Two numbers, not one, for the same reason the filesystem's handle
-	 * generation keeps two: `shared` says the mechanism is doing something
-	 * right now, `nref` says it ever did.  Until something shares a frame
-	 * both stay zero, and that is the whole proof that adding the counts
-	 * changed no behaviour.
+	 * `shared` says frames are shared right now, `nref` that sharing
+	 * ever happened.
 	 */
 	kprintf("pmm: %llu frames shared now, %llu extra owners taken, "
 	    "%llu frames released by their last owner\n",
@@ -486,9 +467,8 @@ pmm_stats(void)
 /* ---- internals ---------------------------------------------------------- */
 
 /*
- * Set a frame's owner count, keeping the "how many frames are shared right
- * now" tally honest.  Caller holds pmm_lock.  Every write to pmm_refs goes
- * through here so the tally cannot drift away from the array it summarises.
+ * Set a frame's owner count and keep pmm_shared_count in step.  Caller
+ * holds pmm_lock.  Every write to pmm_refs goes through here.
  */
 static void
 ref_set(uint64_t idx, uint32_t v)
@@ -557,13 +537,9 @@ mark_range_used(uint64_t base, uint64_t length)
 }
 
 /*
- * Bookkeeping home selection: walk the firmware map, find a MEMMAP_FREE
- * region big enough that does not overlap the kernel image or low
- * 1 MiB.  Pages are allocated linearly starting at the lowest
- * suitable address; this keeps the bitmap close to the kernel for
- * cache friendliness and leaves the bulk of usable memory free for
- * later allocations.  The caller asks for the bitmap and the owner
- * counts as one block, so this stays one search.
+ * Find a home for `bytes_needed` of bookkeeping: the start of the first
+ * MEMMAP_FREE region, clipped above the low 1 MiB and past the kernel
+ * image, with that much room.  PA_INVALID if none.
  */
 static uint64_t
 carve_bitmap_storage(size_t bytes_needed)

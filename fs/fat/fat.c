@@ -37,9 +37,9 @@
 #define	FAT16_BAD		0xFFF7u
 
 /*
- * The one mounted volume.  Lock key: (c) const after fs_fat_init -- the FS is
- * read-only and mounted once at boot, so no lock is needed for the geometry;
- * ata_kread serialises the actual device access under the channel lock.
+ * The one mounted volume.  Lock key: (c) const after fs_fat_init -- the FS
+ * is read-only and mounted once at boot; device access is serialised below
+ * (bio_lock, the ATA channel lock).
  */
 static struct fat_vol {
 	bool		fv_mounted;	/* (c) */
@@ -53,9 +53,8 @@ static struct fat_vol {
 } g_fat;
 
 /*
- * A directory to iterate.  FAT16 keeps the root directory in a fixed sector
- * span OUTSIDE the data area, while every subdirectory is an ordinary cluster
- * chain -- so the walker handles the two cases apart.
+ * A directory to iterate.  FAT12/16 keep the root directory in a fixed
+ * sector span outside the data area; every subdirectory is a cluster chain.
  */
 struct fat_dir {
 	bool		fd_is_root;
@@ -155,11 +154,9 @@ fs_fat_init(void)
 		total = rd32(bpb, 32);
 
 	/*
-	 * Only a 512-byte-sector FAT12/16 with a fixed-size root directory is
-	 * supported.  A FAT32 BPB leaves fat_size_16 and root_entries zero
-	 * (it uses the 32-bit fields at offset 36) -- refuse it rather than
-	 * misread.  ata_kread reads 512-byte sectors, so a different sector
-	 * size cannot be served.
+	 * Only 512-byte-sector FAT12/16 with a fixed root directory.  A FAT32
+	 * BPB leaves fat_size_16 and root_entries zero (it uses the 32-bit
+	 * fields at offset 36), so it is refused rather than misread.
 	 */
 	if (bytes_per_sec != FAT_SECTOR_BYTES || g_fat.fv_sec_per_clus == 0 ||
 	    num_fats == 0 || fat_size == 0 || g_fat.fv_root_entries == 0) {
@@ -236,10 +233,9 @@ path_basename(const char *path)
 }
 
 /*
- * Pack a basename into the 11-byte FAT 8.3 form: up to 8 name chars, then up
- * to 3 extension chars, space-padded, uppercased.  Names that exceed 8.3 are
- * truncated (no ~1 mangling) -- a deliberate limitation, fine for the short
- * names this serves.
+ * Pack a basename into the 11-byte 8.3 form: up to 8 name and 3 extension
+ * chars, space-padded, uppercased.  Longer names are truncated (no ~1
+ * mangling).
  */
 static void
 make_83(const char *basename, char out[11])
@@ -269,10 +265,9 @@ make_83(const char *basename, char out[11])
 }
 
 /*
- * Render an 8.3 entry's name into a NUL-terminated display string
- * ("STANDARD"+"FLF" -> "standard.flf"): trim the space padding and apply the
- * Windows-NT lower-case hint bits (offset 12) so an mkfs-lower-cased short
- * name reads back the way it was written.  "." and ".." pass through verbatim.
+ * Render an 8.3 entry's name as a C string ("STANDARD"+"FLF" ->
+ * "standard.flf"): trim the padding and apply the Windows-NT lower-case
+ * hints (offset 12).  "." and ".." pass through.
  */
 static void
 de_to_name(const uint8_t *de, char out[FS_FAT_NAME_MAX])
@@ -306,9 +301,8 @@ de_to_name(const uint8_t *de, char out[FS_FAT_NAME_MAX])
 }
 
 /*
- * Does this path name the root?  Only separators and "." components -- "/",
- * "//", "/./", "." -- all mean the same directory, and it is the one thing on
- * a FAT16 volume with no directory entry to describe it.
+ * Does this path name the root?  Only separators and "." components ("/",
+ * "//", "/./", ".").  The root is the one directory with no entry.
  */
 static bool
 path_is_root(const char *path)
@@ -332,11 +326,9 @@ path_is_root(const char *path)
 }
 
 /*
- * A stable inode for an entry: its first cluster, which is unique per file on
- * a FAT volume.  Directories always carry a nonzero start cluster, so their
- * inodes are always distinct -- which is what a path walker like tree(1)
- * relies on to detect (and refuse) directory cycles.  An empty file has
- * cluster 0; give it a nonzero synthetic value so it never reads as "no inode".
+ * A stable inode: the first cluster, unique per file.  Directories always
+ * have one, so their inodes are distinct, which tree(1) relies on to detect
+ * cycles.  An empty file (cluster 0) gets a nonzero synthetic value.
  */
 static uint32_t
 synth_ino(const struct fat_ent *e)
@@ -346,10 +338,8 @@ synth_ino(const struct fat_ent *e)
 }
 
 /*
- * Everything one 32-byte on-disk entry has to say.  The raw time and date
- * words are kept rather than converted here: the walkers that only need a
- * name and a size should not pay for a calendar, and stat is the one caller
- * that does.
+ * Everything one 32-byte entry says.  Times stay raw; only stat converts
+ * them.
  */
 static void
 ent_fill(struct fat_ent *e, const uint8_t *de)
@@ -367,11 +357,8 @@ ent_fill(struct fat_ent *e, const uint8_t *de)
 }
 
 /*
- * The permission bits FAT does not have.  One attribute bit distinguishes
- * read-only from writable and that is the whole of what the volume knows, so
- * the answer is one of four constants -- named in fat.h precisely so that
- * a reader who sees 0755 on a filesystem with no owners can find the line
- * that invented it.
+ * The permission bits FAT does not have: one of the four FS_FAT_MODE_*
+ * constants (fat.h), chosen by type and the read-only bit.
  */
 static uint16_t
 ent_mode(const struct fat_ent *e)
@@ -385,15 +372,10 @@ ent_mode(const struct fat_ent *e)
 }
 
 /*
- * Days since 1970-01-01 for a proleptic Gregorian date.  Howard Hinnant's
- * days_from_civil: shift the year to start in March so that the leap day is
- * the LAST day of the year and every other month length falls out of one
- * linear formula (153*m + 2)/5, then count whole 400-year eras.  No table, no
- * loop over years, and no special case except the shift itself.
- *
- * The FAT epoch is 1980, so nothing here is ever handed a negative year; the
- * era arithmetic is written for them anyway because getting it wrong silently
- * off by a day is the classic way this function fails.
+ * Days since 1970-01-01 for a proleptic Gregorian date: Howard Hinnant's
+ * days_from_civil.  The year starts in March, so the leap day is last and
+ * month lengths follow (153*m + 2)/5; then whole 400-year eras are counted.
+ * FAT years start at 1980, but negative years are handled anyway.
  */
 static int64_t
 days_from_civil(int32_t y, uint32_t m, uint32_t d)
@@ -412,16 +394,11 @@ days_from_civil(int32_t y, uint32_t m, uint32_t d)
 }
 
 /*
- * A FAT timestamp as nanoseconds since the Unix epoch.
- *
- * The date word packs (year - 1980, month, day) into 7/4/5 bits and the time
- * word packs (hour, minute, second/2) into 5/6/5 -- which is why a FAT file's
- * mtime is always even.  There is no timezone on the volume: the fields are
- * whatever local time the writer had, and calling that UTC is the only
- * available answer, so this reports it as such rather than guessing an offset.
- *
- * A zero date means the entry recorded no such time (the access date of a
- * file never read, say), which is reported as zero rather than as 1980.
+ * A FAT timestamp as nanoseconds since the Unix epoch.  The date word packs
+ * (year - 1980, month, day) into 7/4/5 bits, the time word (hour, minute,
+ * second/2) into 5/6/5, so seconds are always even.  The volume has no
+ * timezone; the writer's local time is reported as UTC.  A zero date means
+ * no such time was recorded and is reported as 0, not 1980.
  */
 static uint64_t
 fat_time_ns(uint16_t date, uint16_t time)
@@ -466,11 +443,10 @@ fat_next(uint32_t clus)
 /* ---- directory walk ---------------------------------------------------- */
 
 /*
- * Visit each live 8.3 entry of `d` in order, calling fn(de, arg).  Stops and
- * returns fn's value the first time it is nonzero; returns 0 if the directory
- * ended first, or a negative FS_FAT_E_* on I/O error.  Deleted (0xE5),
- * end-of-directory (0x00), and long-name slots are filtered here; the
- * volume-id label is passed through for the visitor to decide on.
+ * Call fn(de, arg) for each live 8.3 entry of `d' in order.  Returns fn's
+ * first nonzero value, 0 if the directory ended first, or a negative
+ * FS_FAT_E_* on I/O error.  Deleted, end and long-name slots are skipped
+ * here; the volume label is left to the visitor.
  */
 static int
 dir_walk(const struct fat_dir *d, fat_visit_fn fn, void *arg)
@@ -572,10 +548,9 @@ dir_find(const struct fat_dir *d, const char name83[11], struct fat_ent *out)
 /* ---- path resolution --------------------------------------------------- */
 
 /*
- * Resolve `path` to the directory it names.  A leading slash and empty / "."
- * components are skipped; each remaining component must name a subdirectory.
- * ".." is not supported (the read-only consumers never emit it).  "" or "/"
- * resolve to the root.
+ * Resolve `path' to the directory it names.  Empty and "." components are
+ * skipped; each other one must name a subdirectory.  No "..".  "" and "/"
+ * are the root.
  */
 static int
 resolve_dir(const char *path, struct fat_dir *out)
@@ -622,21 +597,14 @@ resolve_dir(const char *path, struct fat_dir *out)
 }
 
 /*
- * Resolve `path` to its entry: split off the last component, resolve the
- * leading directories, and look the component up there.  That works for a
- * subdirectory as well as a file -- a subdirectory HAS a directory entry, in
- * its parent, carrying its attributes and its three timestamps.
+ * Resolve `path' to its entry: resolve the parent directories, then look
+ * up the last component there -- a subdirectory has an entry in its parent
+ * too.  The root has none, so it is answered first, with zero (unrecorded)
+ * timestamps.
  *
- * The root is the exception and gets answered first, because FAT16 keeps it
- * in a fixed sector span with no directory entry anywhere: there is nothing
- * on the volume that records when the root was created or what its
- * attributes are.  It is described from what is known and its timestamps stay
- * zero, which is the same "unrecorded" every other missing time reports.
- *
- * On any miss, fall back to the 8.3 basename in the root directory -- the
- * hatch that lets a binary's baked-in macOS path (/usr/local/.../standard.flf),
- * whose leading dirs are absent here, still find a font placed in the root,
- * while a real on-disk path resolves exactly.
+ * On any miss, fall back to the 8.3 basename in the root directory, so a
+ * baked-in macOS path (/usr/local/.../standard.flf) finds a font placed in
+ * the root.
  */
 static int
 resolve_entry(const char *path, struct fat_ent *out)
@@ -648,7 +616,7 @@ resolve_entry(const char *path, struct fat_ent *out)
 	char		*base;
 	size_t		i;
 
-	/* The root, named as itself -- and it is the only path with no entry. */
+	/* The root: the only path with no entry. */
 	if (path_is_root(path)) {
 		out->fe_clus   = 0;
 		out->fe_size   = 0;
@@ -671,11 +639,8 @@ resolve_entry(const char *path, struct fat_ent *out)
 	buf[i] = '\0';
 
 	/*
-	 * A trailing slash names the same thing without one, and "/docs/" used
-	 * to be caught by a directory shortcut that no longer exists.  Strip
-	 * it here so the split below finds a component rather than an empty
-	 * one; the root spelled "/" was already answered above, so this can
-	 * never eat the whole string.
+	 * Strip trailing slashes so the split finds a component; "/" was
+	 * answered above, so this never empties the string.
 	 */
 	while (i > 1 && buf[i - 1] == '/')
 		buf[--i] = '\0';
@@ -736,10 +701,9 @@ fs_fat_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size)
 	clus_bytes = (uint32_t)g_fat.fv_sec_per_clus * FAT_SECTOR_BYTES;
 
 	/*
-	 * Round the buffer up to a whole cluster so each cluster reads in
-	 * directly; the caller is told the real byte size, so the rounding
-	 * tail is simply never looked at.  A zero-length file still gets a
-	 * 1-byte allocation so out_buf is never NULL on success.
+	 * Round up to whole clusters so each reads in directly; the caller
+	 * gets the real size.  An empty file gets one byte, so out_buf is
+	 * never NULL on success.
 	 */
 	bufcap = e.fe_size == 0 ? 1u :
 	    ((e.fe_size + clus_bytes - 1) / clus_bytes) * clus_bytes;
@@ -774,17 +738,8 @@ fs_fat_slurp(const char *path, uint8_t **out_buf, uint32_t *out_size)
 }
 
 /*
- * The ranged read behind fs_pread.  FAT has no extent map: the only way to
- * reach byte N is to follow the cluster chain from the start, which is what
- * the skip loop below does.  That makes a pread O(offset) in chain links --
- * cheap enough here (the links are FAT-sector reads, and the block cache has
- * the FAT resident after the first file), and it is the shape of the
- * filesystem rather than a shortcut in the reader.
- */
-/*
- * Resolve a path to its starting cluster and length -- the expensive half of
- * reading on this filesystem too, since resolving walks a directory per path
- * component.  Paid once, by whoever opens the file.
+ * Resolve a path to its starting cluster and length; resolving walks a
+ * directory per component, so it is paid once, at open.
  */
 int
 fs_fat_open(const char *path, uint64_t *id_out, uint64_t *size_out)
@@ -808,6 +763,11 @@ fs_fat_open(const char *path, uint64_t *id_out, uint64_t *size_out)
 	return (FS_FAT_E_OK);
 }
 
+/*
+ * The ranged read behind fs_pread.  FAT has no extent map, so reaching
+ * byte N means following the chain from the start: O(offset) in chain
+ * links, which are FAT-sector reads the block cache keeps resident.
+ */
 int
 fs_fat_pread(uint64_t id, uint64_t size, uint64_t off, uint8_t *buf,
     uint32_t len, uint32_t *out_got)
@@ -898,17 +858,14 @@ fs_fat_stat2(const char *path, struct fs_fat_statbuf *out)
 	out->fs_size    = e.fe_is_dir ? 0 : e.fe_size;
 	out->fs_ino     = synth_ino(&e);
 	/*
-	 * What the volume spent, which is what st_blocks means: FAT hands out
-	 * whole clusters, so a 1-byte file occupies one of them.  Rounding to
-	 * the sector would have understated every file on a volume whose
-	 * clusters are four sectors wide, and there is nothing to walk for
-	 * this -- the geometry already says it.
+	 * What the volume spent (st_blocks): whole clusters, so a 1-byte
+	 * file occupies one.
 	 */
 	clus_bytes = (uint64_t)g_fat.fv_sec_per_clus * FAT_SECTOR_BYTES;
 	out->fs_alloced = e.fe_is_dir ? 0 :
 	    (((uint64_t)e.fe_size + clus_bytes - 1) / clus_bytes) * clus_bytes;
 	out->fs_mtime_ns = fat_time_ns(e.fe_wdate, e.fe_wtime);
-	/* The access DATE is all FAT keeps -- midnight is the honest time. */
+	/* FAT keeps only the access date; report midnight. */
 	out->fs_atime_ns = fat_time_ns(e.fe_adate, 0);
 	out->fs_btime_ns = fat_time_ns(e.fe_cdate, e.fe_ctime);
 	out->fs_mode    = ent_mode(&e);

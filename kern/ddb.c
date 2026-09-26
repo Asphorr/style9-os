@@ -207,11 +207,8 @@ ddb_regs(const struct trapframe *tf)
 }
 
 /*
- * x <addr> [<count>] -- byte dump.
- *
- * Lazy sanity-check: refuse anything outside the identity-mapped low
- * 1 GiB (which is all we have right now).  Dumping uncaught wild VAs
- * would just fault inside the debugger.
+ * x <addr> [<count>] -- byte dump.  Refuses anything past the 1 GiB boot
+ * identity map, so a wild address cannot fault inside the debugger.
  */
 static void
 ddb_examine(const char *args)
@@ -257,10 +254,9 @@ ddb_examine(const char *args)
 /* ---- introspection commands -------------------------------------- */
 
 /*
- * Walk every live task, then every thread attached to it.  No locks --
- * DDB runs with interrupts disabled and we accept the small chance of
- * a torn read for inspection convenience.  Same trade-off the existing
- * task_list_print / sched_print make.
+ * Walk every live task, then every thread attached to it.  The thread
+ * walk takes no lock: DDB runs with interrupts disabled and accepts the
+ * small chance of a torn read.
  */
 static void
 ddb_ps(void)
@@ -307,7 +303,7 @@ ddb_show(const char *args)
 		return;
 	}
 	if (args[0] == 't' && args[1] == 'h') {
-		/* "thread" -- skip "thread" or just match prefix */
+		/* "thread": matched on "th", then six characters skipped */
 		args = skip_ws(args + 6);
 		if (parse_uint(args, &id) <= 0) {
 			kprintf("ddb: usage: s thread <id>\n");
@@ -360,9 +356,8 @@ ddb_show_task(uint64_t id)
 }
 
 /*
- * Threads are stored per-task, not in a global list, so walk every
- * task and then every thread attached to it.  No ref bumps -- DDB
- * holds the kernel still.
+ * Threads live on per-task lists, so walk every task's.  No refs taken,
+ * as in ddb_ps.
  */
 static void
 ddb_show_thread(uint64_t id)

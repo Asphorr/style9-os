@@ -12,122 +12,84 @@
 #include <stdint.h>
 
 /*
- * The local APIC: the interrupt controller each CPU has of its own.
+ * The local APIC: each CPU's own interrupt controller.
  *
- * WHY IT IS NEEDED HERE and not merely nice to have.  The 8259 and the PIT
- * are ONE chip each for the whole machine: the PIT can tick one interrupt
- * line, so it can debit one CPU's slice, and the per-CPU quantum the
- * scheduler now keeps would be a quantum only the boot CPU ever spends.
- * Every processor needs a timer of its own, and needs a way to be told
- * something by another processor -- a reschedule, a TLB invalidation, the
- * startup sequence itself.  Both live in this chip.
+ * The PIT and the 8259 are one chip each for the whole machine, so the
+ * PIT can debit only one CPU's slice.  Every CPU needs a timer of its own
+ * and a way to be interrupted by another CPU (reschedule, TLB shootdown,
+ * startup); both live here.
  *
- * ⚠ ENABLING IT CAN KILL EVERY LEGACY INTERRUPT, and that is the whole
- * difficulty of this step.  On a PC the 8259's output does not reach the CPU
- * directly; it arrives at the local APIC's LINT0 pin, and passes through
- * only if that pin's LVT entry says ExtINT and is unmasked.  Every LVT entry
- * comes out of reset MASKED, and this kernel software-enables the APIC
- * itself -- so it is this kernel's business to say what LINT0 carries.
- * Whether the firmware had already set "virtual wire mode" up is not known
- * here and deliberately not relied on: lapic_init programs the two legacy
- * pins in the same breath as the enable, which makes the question moot.  The
- * failure mode if that is wrong is loud rather than subtle -- the boot stops
- * dead at the first thing that waits for an interrupt -- which is what made
- * it safe to write and try.
+ * Enabling it can cut off every legacy interrupt.  The 8259's output
+ * reaches the CPU through the APIC's LINT0 pin, only if that LVT entry is
+ * unmasked ExtINT, and every LVT entry is masked out of reset.  Whatever
+ * "virtual wire" setup firmware left is not relied on: lapic_init programs
+ * the legacy pins together with the enable.
  *
- * Registers are memory-mapped (xAPIC).  x2APIC would reach the same
- * registers through MSRs and is deliberately not used: MMIO works on
- * everything, and the day a machine hands us an APIC already in x2APIC mode
- * these reads would fault, so lapic_init checks for that and says so rather
- * than finding out by exception.
+ * xAPIC (MMIO) only.  A machine that hands over an APIC already in x2APIC
+ * mode would fault on these reads, so lapic_init checks and refuses.
  */
 
 /*
- * Vectors above the 8259's 32..47 window.  0xFF for spurious because the
- * low four bits of the spurious vector are hardwired to one on some older
- * implementations, so a vector ending in 0xF is the only portable choice.
+ * Vectors above the 8259's 32..47 window.  Spurious is 0xFF because older
+ * APICs hardwire the low four bits of the spurious vector to one.
  */
 #define	LAPIC_VEC_TIMER		0xF0
 #define	LAPIC_VEC_SPURIOUS	0xFF
 
 /*
- * Find the APIC, map its register page uncacheable, software-enable it, and
- * connect the two legacy pins (LINT0 = ExtINT, LINT1 = NMI) so the 8259 and
- * the NMI line keep reaching this CPU.  Records this CPU's hardware APIC id
- * in its per-CPU block.  Needs pmap up; safe to call with interrupts off,
- * and must be, since it is the interrupt path being rewired.
+ * Find this CPU's APIC, map its registers uncacheable, software-enable it
+ * and program the legacy pins: LINT1 = NMI everywhere, LINT0 = ExtINT on
+ * the boot CPU (so the 8259 keeps reaching it) and masked on APs.  Records
+ * the hardware APIC id in the per-CPU block.  Needs pmap; call with
+ * interrupts off, since it rewires the interrupt path.
  *
- * Returns false and leaves the APIC alone if the machine has none, or has
- * one this code will not drive.  A kernel with no APIC still boots -- the
- * 8259 is untouched -- it just cannot ever start a second processor.
+ * Returns false and leaves the APIC alone if there is none or it is one
+ * this code will not drive.  The kernel then boots on the 8259 alone and
+ * cannot start a second CPU.
  */
 bool		lapic_init(void);
 
 /*
- * Measure the APIC timer's counting rate against the TSC, then prove the
- * timer actually delivers by running it briefly and counting what arrives.
- * Needs the TSC calibrated and interrupts ON, so it runs well after
- * lapic_init.  Leaves the timer masked and spends nobody's slice while it
- * runs; starting it for real is the separate call below.
- *
- * ⚠ The ruler here used to be the PIT and that was WRONG, in a way only a
- * measurement caught: ten delivered PIT interrupts can arrive in ninety
- * milliseconds on this host, and a window that short comes out ten percent
- * fast, which lands directly in the timer's reload count and shortens every
- * slice by the same ten percent.  A counter the CPU reads cannot be hurried;
- * an interrupt that has to be delivered can.
+ * Measure the APIC timer's counting rate against the TSC (not the PIT,
+ * whose interrupts arrive in bursts), then run it briefly and count what
+ * is delivered.  Needs the TSC calibrated and interrupts on.  Leaves the
+ * timer masked and spends nobody's slice; lapic_timer_start starts it.
  */
 void		lapic_timer_probe(void);
 
 /*
- * Hand preemption over from the PIT to this CPU's own timer: relieve the PIT
- * of the slice debit, then run this timer periodic at the rate the PIT was
- * keeping, so that PREEMPT_QUANTUM_TICKS still means the milliseconds it was
- * measured to mean.  Must run after lapic_timer_probe, which is what supplies
- * the counting rate.
+ * Hand the slice debit from the PIT to this CPU's timer, run periodic at
+ * the PIT's rate so PREEMPT_QUANTUM_TICKS keeps its meaning.  After
+ * lapic_timer_probe, which supplies the counting rate.
  *
- * Returns false and leaves preemption with the PIT if there is no APIC, no
- * measured rate, or no PIT rate to match -- a kernel where this fails is a
- * kernel that preempts exactly as it did before.
+ * Returns false, leaving preemption with the PIT, if there is no APIC,
+ * no measured rate, or no PIT rate to match.
  */
 bool		lapic_timer_start(void);
 
 /*
- * The same timer on a processor that arrived after the hand-over, at the rate
- * the boot processor measured.  There is nothing to hand over on an
- * application processor -- the PIT was never debiting its slice, because it
- * had no slice -- so this is only the arming half.
- *
- * Returns false if the boot processor never made the hand-over, in which case
- * the PIT is still debiting and no second CPU can be preempted at all.
+ * The same timer on an AP, at the rate the boot CPU measured; only the
+ * arming half, as the PIT never debited an AP's slice.  Returns false if
+ * the boot CPU never made the hand-over, in which case no AP is
+ * preempted at all.
  */
 bool		lapic_timer_start_ap(void);
 
-/*
- * Whether the slice is being debited by this CPU's timer rather than by the
- * one PIT the machine has.
- */
+/* Whether the APIC timers, not the PIT, debit the slice. */
 bool		lapic_timer_preempting(void);
 
 /*
- * Print what the timers have actually delivered since they took over: their
- * rate over TSC time, and the slice length that rate implies.  The slice is
- * the number that matters -- PREEMPT_QUANTUM_TICKS means 20 ms only while the
- * ticks arrive at the rate they were asked for.  The PIT's count over the same
- * span is printed beside them, where its delivery deficit shows.
- *
- * ONE LINE PER PROCESSOR, because the slice is a per-CPU fact and this is the
- * only place it is visible: a CPU whose timer never started, or started at the
- * wrong rate, or stopped being delivered, differs from its neighbours here and
- * nowhere else.
+ * Print, one line per CPU, what each timer has delivered since the
+ * hand-over: its rate over TSC time and the slice that rate implies --
+ * PREEMPT_QUANTUM_TICKS is 20 ms only while ticks arrive at the rate
+ * asked.  The PIT's count over the same span is printed beside them.
  */
 void		lapic_timer_report(void);
 
 /*
- * End-of-interrupt.  Written by intr_dispatch after any handler for a
- * vector the APIC delivered.  NOT written for the spurious vector, which by
- * architecture has no in-service bit to clear -- acknowledging it would
- * retire somebody else's interrupt.
+ * End-of-interrupt, written by intr_dispatch after the handler of an
+ * APIC-delivered vector.  Never for the spurious vector: it has no
+ * in-service bit, and an EOI would retire somebody else's interrupt.
  */
 void		lapic_eoi(void);
 
@@ -135,46 +97,38 @@ bool		lapic_present(void);
 uint32_t	lapic_id(void);
 
 /*
- * Physical address of the register page, as the MSR gave it, or zero if the
- * APIC was never mapped.  Exists so the ACPI probe can compare firmware's
- * description of this chip against the chip's own answer.
+ * Physical address of the register page per IA32_APIC_BASE, or zero if
+ * never mapped; the ACPI probe checks the MADT against it.
  */
 uint64_t	lapic_base_pa(void);
 
 /*
- * The two messages that start a processor, sent to one destination named by
- * its APIC id.  INIT puts it in a known state; STARTUP tells it where to begin
- * executing, as a page number -- which is why the trampoline has to live in
- * the first megabyte.
+ * The two messages that start a processor, by APIC id.  INIT puts it in a
+ * known state; STARTUP gives the start address as a page number, which is
+ * why the trampoline lives in the first megabyte.
  *
- * Both return false if the message could not be handed to the APIC, and
- * NEITHER says anything about whether the far processor did something with it.
- * That is not knowable from here: the only evidence a start worked is the
- * started processor saying so, which is what cp_online is for.
+ * Both return false only if the APIC would not take the message; whether
+ * the far CPU acted on it is known only when it says so (cp_online).
  */
 bool		lapic_ipi_init(uint32_t apic_id);
 bool		lapic_ipi_startup(uint32_t apic_id, uint64_t tramp_pa);
 
 /*
- * And the everyday one: raise `vec' on the processor with this APIC id, as an
- * ordinary interrupt it will take through the IDT like any other.
+ * Raise `vec' on the processor with this APIC id, as an ordinary interrupt
+ * through its IDT.  Returns false only if the APIC would not take the
+ * message; a caller that needs to know it was acted on needs its own
+ * acknowledgement.
  *
- * Returns false only if the message could not be handed to the APIC.  As with
- * the two above, that is the whole of what is knowable here -- whether the far
- * processor has ACTED on it is a question only the far processor can answer,
- * and every caller of this needs an acknowledgement of its own.
- *
- * ⚠ THE SENDER MUST NOT WAIT FOR A REPLY WHILE HOLDING ANYTHING THE RECEIVER
- * COULD WANT, unless the wait services incoming requests -- a processor with
- * interrupts off cannot answer, and every spinlock in this kernel turns them
- * off.  pmap_tlb_poll is that service, and kern/spinlock.c calls it from the
- * acquire spin for exactly this reason.
+ * The sender must not wait for a reply while holding anything the receiver
+ * could want, unless the wait services incoming requests: every spinlock
+ * turns interrupts off, and a CPU with interrupts off cannot answer.
+ * pmap_tlb_poll is that service; kern/spinlock.c calls it while spinning.
  */
 bool		lapic_ipi_vector(uint32_t apic_id, uint8_t vec);
 
 /*
- * Counting rate of this CPU's APIC timer, in ticks per second, at the
- * divisor lapic_timer_probe measured with.  Zero until it has run.
+ * APIC timer counting rate in ticks per second at the probe's divisor,
+ * as measured on the boot CPU.  Zero until lapic_timer_probe has run.
  */
 uint32_t	lapic_timer_hz(void);
 

@@ -11,18 +11,14 @@
 #include <stddef.h>
 
 /*
- * In-kernel line-oriented shell.
+ * In-kernel line-oriented shell, the fallback when sh.elf cannot be
+ * spawned (see kmain).
  *
- * shell_run reads characters from the keyboard ring buffer, builds a
- * line in a fixed-size buffer, and on '\n' splits the line into argv
- * tokens and dispatches through the command table in cmds.c.  The
- * buffer is static (kmem-free hot path) so the memory subsystem can
- * be stress-tested from inside the shell without the parser itself
- * being a confounder.
- *
- * The command table is shell_cmds[] / shell_ncmds in cmds.c.  Each
- * command returns an int -- 0 == success, non-zero printed as "error
- * N" but otherwise unused.
+ * shell_run receives characters from the keyboard and serial input
+ * ports, builds a line in a static buffer (no kmem use, so the allocator
+ * can be stress-tested from the shell), and on '\n' splits it into argv
+ * and dispatches through shell_cmds[] / shell_ncmds in cmds.c.  A
+ * command returns 0 on success; anything else is printed as "[error N]".
  */
 
 #define	SHELL_LINE_MAX	256

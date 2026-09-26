@@ -6,46 +6,37 @@
  */
 
 /*
- * dyld -- style9's clean-room dynamic linker for the S4 Darwin rung.  This is
- * NOT Apple's dyld: an original implementation written to the published Mach-O
- * format (LC_LOAD_DYLINKER, LC_DYLD_CHAINED_FIXUPS, the export trie).  Built as
- * a freestanding MH_EXECUTE by the real Darwin toolchain (clang + ld64.lld) at
- * a fixed base (0x60000000) so it needs no self-relocation at load and the
- * existing kernel loader maps it as-is.  No libSystem: it issues style9's
- * class-encoded Darwin syscalls directly.
+ * dyld -- style9's clean-room dynamic linker, not Apple's: written to the
+ * published Mach-O format (LC_LOAD_DYLINKER, LC_DYLD_CHAINED_FIXUPS, the
+ * export trie).  Built as a freestanding MH_EXECUTE by clang + ld64.lld at a
+ * fixed base (0x60000000), so it needs no self-relocation and the kernel
+ * loader maps it as-is.  No libSystem: it issues class-encoded Darwin
+ * syscalls directly.
  *
- * The kernel maps the main image plus this dyld into one task and enters here
- * (_dyld_start) with a dyld4-shaped handoff stack:
+ * The kernel maps the main image plus this dyld into one task and enters
+ * _dyld_start with a dyld4-shaped handoff stack:
  *
  *	[ main mach_header ]	<- %rsp
  *	[ argc ]
  *	[ argv[0] ... ][ NULL ]
- *	[ envp NULL ]
+ *	[ envp[0] ... ][ NULL ]
  *	[ apple NULL ]
  *
- * MILESTONE M2: the real link.  _dyld_start reads the main header off the
- * stack; dyld_main parses its load commands, reads the dependency path out of
- * its LC_LOAD_DYLIB, asks the kernel to map that dylib (the map_image
- * backchannel, our stand-in for open()+mmap()), parses the dylib's export
- * trie, then walks the main image's LC_DYLD_CHAINED_FIXUPS chain -- applying
- * rebases (add slide) and binds (resolve the import against the dylib's trie,
- * patch the GOT slot).  Finally it jumps to the main image's LC_MAIN entry, so
- * the program runs its own code through our linker against our libSystem.
+ * dyld_main parses the main image's load commands, maps the closure of its
+ * LC_LOAD_DYLIBs through the map_image backchannel (our stand-in for
+ * open()+mmap()), applies every image's fixups -- chained fixups, or the
+ * classic LC_DYLD_INFO opcode streams -- binding imports against the
+ * dependencies' export tries, and jumps to the main image's LC_MAIN entry.
  *
- * Constraint that keeps this self-hosting: dyld must carry NO bound or rebased
- * pointers of its own (nobody runs ITS fixup chain).  So: no global pointer
- * tables, no `static const char *x = "..."` -- only code, immediates, and char
- * arrays / string literals referenced RIP-relative.  Everything below obeys
- * that.  (Even a stray rebase would be harmless at slide 0, but a bind would
- * be fatal, and dyld imports nothing.)
+ * dyld must carry no bound or rebased pointers of its own, since nobody runs
+ * its fixups: no global pointer tables, no `static const char *x = "..."',
+ * only code, immediates and RIP-relative arrays and literals.  (A stray
+ * rebase would be harmless at slide 0; a bind would be fatal.)
  *
  * Compiled -fno-builtin so the compiler cannot lower a body into a libc call.
  */
 
-/*
- * Fixed-width types straight from the compiler builtins -- no <stdint.h>, so
- * there is no dependency on an SDK or a hosted include path.
- */
+/* Fixed-width types from compiler builtins: no SDK or <stdint.h> needed. */
 typedef __UINT8_TYPE__		uint8_t;
 typedef __UINT16_TYPE__		uint16_t;
 typedef __UINT32_TYPE__		uint32_t;
@@ -121,11 +112,10 @@ struct linkedit_data_command {
 };
 
 /*
- * The two 64-bit chained-pointer formats we bind.  DYLD_CHAINED_PTR_64 stores
- * an unslid vmaddr in a rebase (our own ld64.lld binaries); _OFFSET stores an
- * offset from the image's mach_header (what Apple's linker emits for x86-64
- * binaries -- e.g. figlet).  Bind records are bit-identical across the two; the
- * rebase target interpretation is the only thing that differs (see apply_fixups).
+ * The two 64-bit chained-pointer formats we bind.  A DYLD_CHAINED_PTR_64
+ * rebase holds an unslid vmaddr (our ld64.lld binaries); _OFFSET holds an
+ * offset from the image's mach_header (Apple's linker for x86-64, e.g.
+ * figlet).  Bind records are identical; only the rebase target differs.
  */
 #define	DYLD_CHAINED_PTR_64		2
 #define	DYLD_CHAINED_PTR_64_OFFSET	6
@@ -134,9 +124,9 @@ struct linkedit_data_command {
 /* ---- syscalls ----------------------------------------------------------- */
 
 /*
- * One class-encoded Darwin syscall.  The class is the high byte of `nr`
- * (0x2000000 = BSD/Unix).  Darwin x86-64 passes args in rdi, rsi, rdx (this
- * 3-arg helper); `syscall` clobbers rcx/r11.
+ * One class-encoded Darwin syscall, up to three args (rdi, rsi, rdx).  The
+ * class is the high byte of `nr' (0x2000000 = BSD); `syscall' clobbers
+ * rcx/r11.
  */
 static long
 dsys(long nr, long a, long b, long c)
@@ -151,11 +141,9 @@ dsys(long nr, long a, long b, long c)
 }
 
 /*
- * map_image (style9-private class 0x2A): ask the kernel to map the dylib named
- * by `path` into this task; returns the base it was mapped at, or 0 on
- * failure.  The kernel signals failure with the BSD carry convention, so this
- * captures the carry flag right after `syscall` (exactly as libSystem reads a
- * BSD error) and folds it into a 0 return.
+ * map_image (style9-private class 0x2A): map the dylib at `path' into this
+ * task; returns its base, or 0 on failure.  Failure uses the BSD carry
+ * convention, so the carry flag is captured right after `syscall'.
  */
 static uint64_t
 map_image(const char *path)
@@ -428,12 +416,10 @@ parse_image(uint64_t mh, struct image *im)
 			const uint8_t	*q;
 
 			/*
-			 * The classic (pre-chained-fixups) metadata of a dylib
-			 * built for an older target -- libgmp uses this.  Read
-			 * the rebase/bind/lazy opcode streams and, if no
-			 * LC_DYLD_EXPORTS_TRIE was present, the export trie from
-			 * export_off.  Field offsets are from the dyld_info_command
-			 * layout (loader.h).
+			 * Classic (pre-chained-fixups) metadata, as in libgmp:
+			 * the rebase/bind/lazy opcode streams and, absent an
+			 * LC_DYLD_EXPORTS_TRIE, the export trie.  Offsets are
+			 * dyld_info_command's (loader.h).
 			 */
 			q = (const uint8_t *)lc;
 			rb_off  = rd32(q + 8);
@@ -502,11 +488,10 @@ parse_image(uint64_t mh, struct image *im)
 /* ---- export trie -------------------------------------------------------- */
 
 /*
- * Resolve `sym` in the export trie at [trie, end).  Returns the export's
- * address (an offset from the image's base), or 0 if absent.  Walks edges
- * that prefix the remaining symbol until the symbol is fully consumed at a
- * terminal node, then reads its (flags, address) ULEB pair -- assuming a
- * regular export, which is all our flat libSystem produces.
+ * Resolve `sym' in the export trie at [trie, end): the export's offset from
+ * the image base, or 0 if absent.  Follows edges that prefix the rest of
+ * the symbol to a terminal node and reads its (flags, address) pair,
+ * assuming a regular export (re-exports and resolvers are not handled).
  */
 static uint64_t
 trie_lookup(const uint8_t *trie, const uint8_t *end, const char *sym)
@@ -600,13 +585,11 @@ find_path(const struct linkset *ls, const char *path)
 }
 
 /*
- * Resolve imported `name` for the importing image `im` to a runtime address,
- * or 0 if absent.  A positive lib_ordinal is the 1-based index into `im`'s own
- * LC_LOAD_DYLIB list (Darwin two-level namespace): the symbol is resolved
- * strictly in that one dependency.  The special ordinals -- self (0) and
- * flat-lookup (0xFE) -- search the whole closure instead.  This per-ordinal
- * dispatch is what lets one bind table draw symbols from several dylibs (a
- * gfactor binding both libgmp and libSystem), the multi-dylib capability.
+ * Resolve import `name' of image `im' to a runtime address, or 0.  A
+ * positive lib_ordinal is a 1-based index into the image's own LC_LOAD_DYLIB
+ * list (two-level namespace), searched alone; other ordinals -- self (0),
+ * flat lookup (0xFE) -- search the whole closure.  So one bind table can
+ * draw from several dylibs (gfactor from libgmp and libSystem).
  */
 static uint64_t
 resolve_sym(const struct linkset *ls, const struct image *im,
@@ -638,9 +621,8 @@ resolve_sym(const struct linkset *ls, const struct image *im,
 /* ---- chained fixups ----------------------------------------------------- */
 
 /*
- * Apply `im`'s LC_DYLD_CHAINED_FIXUPS chain.  Rebases get `im`'s slide added;
- * binds resolve the imported symbol through resolve_sym(), which honours each
- * import's lib_ordinal so a bind lands in the dependency that exports it.
+ * Apply the image's LC_DYLD_CHAINED_FIXUPS chain: rebases add the slide,
+ * binds go through resolve_sym() by each import's lib_ordinal.
  */
 static void
 apply_fixups(const struct image *im, const struct linkset *ls)
@@ -743,11 +725,9 @@ apply_fixups(const struct image *im, const struct linkset *ls)
 					target = val & 0xFFFFFFFFFULL;
 					high8  = (val >> 36) & 0xFF;
 					/*
-					 * PTR_64 holds an unslid vmaddr (add the
-					 * slide); PTR_64_OFFSET holds an offset
-					 * from this image's mach_header (add the
-					 * runtime base).  Both fold high8 into the
-					 * pointer's top byte.
+					 * PTR_64: unslid vmaddr + slide.
+					 * PTR_64_OFFSET: runtime base + offset.
+					 * high8 goes in the top byte.
 					 */
 					if (pointer_format ==
 					    DYLD_CHAINED_PTR_64_OFFSET)
@@ -789,9 +769,9 @@ bind_one(const struct image *im, const struct linkset *ls, uint64_t lib_ord,
 }
 
 /*
- * Interpret a classic rebase opcode stream: slide every POINTER the dylib's own
- * segments hold (libgmp's GOT and internal tables).  Rebase type beyond POINTER
- * is ignored -- POINTER is all an x86-64 dylib emits.
+ * Run a classic rebase opcode stream: slide every pointer the dylib's own
+ * segments hold (libgmp's GOT and tables).  The rebase type is ignored;
+ * x86-64 dylibs emit only POINTER.
  */
 static void
 apply_rebases(const struct image *im)
@@ -860,11 +840,10 @@ apply_rebases(const struct image *im)
 }
 
 /*
- * Interpret a classic bind (or lazy-bind) opcode stream.  Each DO_BIND resolves
- * the current symbol through resolve_sym -- honouring the dylib ordinal the
- * stream last selected -- and patches the pointer.  DONE is a separator (the
- * lazy stream emits one per symbol), so iteration runs to `end`; we bind
- * eagerly, so the lazy stream is resolved here too rather than on first call.
+ * Run a classic bind or lazy-bind opcode stream.  Each DO_BIND resolves the
+ * current symbol by the last selected ordinal and patches the pointer.  DONE
+ * is only a separator (the lazy stream has one per symbol), so this runs to
+ * `end'; lazy binds are resolved eagerly here.
  */
 static void
 apply_binds(const struct image *im, const struct linkset *ls,
@@ -974,8 +953,8 @@ link_image(const struct image *im, const struct linkset *ls)
 /* ---- entry -------------------------------------------------------------- */
 
 /*
- * dyld_main: the C body of the linker.  `sp` is the raw handoff stack pointer
- * captured by _dyld_start, pointing at [main_mh][argc][argv...].
+ * dyld_main: the C body of the linker.  `sp' is the handoff stack pointer
+ * from _dyld_start, pointing at [main_mh][argc][argv...].
  */
 void
 dyld_main(uint64_t *sp)
@@ -1024,12 +1003,9 @@ dyld_main(uint64_t *sp)
 	}
 
 	/*
-	 * Map the transitive dependency closure.  The worklist walks every image
-	 * already in `ls` (main first, then each dependency as it is added) and
-	 * maps any LC_LOAD_DYLIB it has not seen before -- so libgmp's own
-	 * dependency on libSystem is satisfied by the copy main already mapped,
-	 * never twice.  `ls.n` grows inside the loop and the `i < ls.n` test
-	 * picks up the freshly mapped images, walking the graph to a fixpoint.
+	 * Map the dependency closure.  `ls' is its own worklist: ls.n grows as
+	 * images are mapped and the loop reaches them too.  A path already
+	 * mapped is reused, so libgmp's libSystem is main's copy.
 	 */
 	for (i = 0; i < ls.n; i++) {
 		for (k = 0; k < ls.im[i].ndeps; k++) {
@@ -1060,33 +1036,24 @@ dyld_main(uint64_t *sp)
 	}
 
 	/*
-	 * Apply every image's fixups.  Order is immaterial: a bind only reads its
-	 * target's export trie (parsed for all images above), not the target's
-	 * applied state.  Each image binds through its own lib_ordinal list, so
-	 * libgmp's imports land in libSystem and gfactor's split between libgmp
-	 * and libSystem.  link_image picks chained fixups or the classic
-	 * LC_DYLD_INFO opcode streams per image.
+	 * Apply every image's fixups.  Order does not matter: a bind reads only
+	 * its target's export trie, parsed above, not its applied state.
 	 */
 	for (i = 0; i < ls.n; i++)
 		link_image(&ls.im[i], &ls);
 
 	/*
-	 * Tell the C library its own name before main runs.  On Darwin there is
-	 * no crt0 to do this -- libSystem's initialiser takes argv[0] off the
-	 * same handoff stack we are reading -- so doing it here is the faithful
-	 * place, not a shortcut.  Without it every diagnostic a program prints
-	 * is prefixed with the wrong program's name.
+	 * Give the C library the program name before main.  Darwin has no crt0
+	 * for this; libSystem's initialiser takes argv[0] off this same stack.
+	 * Without it diagnostics carry the wrong program name.
 	 */
 	set_addr = resolve_sym(&ls, &ls.im[0], 0xFE, "_setprogname");
 	if (set_addr != 0 && argc > 0)
 		((void (*)(const char *))(uintptr_t)set_addr)(argv[0]);
 
 	/*
-	 * And its environment, for the same reason and from the same stack:
-	 * the kernel writes envp after argv, and libSystem's `environ` has to
-	 * point at it before main reads a variable.  A dyld that skipped this
-	 * left every program with a made-up environment however carefully
-	 * its parent had built one.
+	 * Likewise the environment: libSystem's `environ' must point at the
+	 * envp the kernel wrote after argv before main reads a variable.
 	 */
 	set_addr = resolve_sym(&ls, &ls.im[0], 0xFE, "_s9_environ_init");
 	if (set_addr != 0)
@@ -1100,12 +1067,10 @@ dyld_main(uint64_t *sp)
 	    argc, argv, envp, apple);
 
 	/*
-	 * main returned.  Darwin's LC_MAIN convention returns into libSystem's
-	 * exit(3), which runs the atexit handlers before the terminating _exit
-	 * syscall -- coreutils flushes its output line buffer from one of those
-	 * handlers, so issuing the raw exit syscall here (skipping atexit) loses
-	 * any buffered output.  Dispatch through the program's exit() resolved
-	 * from the closure instead; fall back to the syscall if it is absent.
+	 * main returned.  Under LC_MAIN that means exit(3), which runs the
+	 * atexit handlers first; coreutils flushes its output from one, so the
+	 * raw syscall would lose buffered output.  Call the closure's exit(),
+	 * falling back to the syscall if there is none.
 	 */
 	exit_addr = resolve_sym(&ls, &ls.im[0], 0xFE, "_exit");
 	if (exit_addr != 0)
@@ -1117,9 +1082,8 @@ dyld_main(uint64_t *sp)
 }
 
 /*
- * _dyld_start: the raw entry the kernel jumps to.  %rsp is the handoff stack;
- * capture it as the sole argument, 16-align for the SysV call, and hand off to
- * dyld_main, which does not return.
+ * _dyld_start: the kernel's entry point.  Pass %rsp (the handoff stack) as
+ * the argument, 16-align, and call dyld_main, which does not return.
  */
 __asm__(
 	".text\n"

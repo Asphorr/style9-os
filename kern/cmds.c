@@ -378,15 +378,11 @@ cmd_cpu(int argc, char *argv[])
 	unsigned int	n;
 
 	/*
-	 * `cpu census N' arms the instrument of last resort: every N timer
-	 * ticks, one line per processor written straight at the UART -- what is
-	 * running there, how many switches it has done, and, asked of each
-	 * processor by interrupt because nothing else can ask it, the address
-	 * it is executing.  No lock, no console.
-	 *
-	 * It exists because a machine that is busy and getting nothing done
-	 * takes away every other instrument here: they all print, and printing
-	 * is what stops working.  `cpu census 0' puts it away again.
+	 * `cpu census N': every N timer ticks, one line per CPU straight to
+	 * the UART, with no lock and no console -- what is running there, its
+	 * switch count, and the address it is executing (asked by interrupt).
+	 * The last instrument left when a busy machine stops getting anything
+	 * done, printing included.  `cpu census 0' turns it off.
 	 */
 	if (argc >= 3 && streq(argv[1], "census")) {
 		if (parse_uint(argv[2], &n) != 0) {
@@ -423,11 +419,9 @@ cmd_yield(int argc, char *argv[])
 }
 
 /*
- * Tiny "echo server" demo: client sends a request containing its
- * reply port as a port descriptor, server flips a couple of bytes
- * and sends back via that reply port.  All inside kernel_space so
- * we don't need tasks yet -- the same code will work unchanged once
- * each task gets its own port_space.
+ * Tiny "echo server" demo: the client sends a request carrying its reply
+ * port, and the server replies through it with a bare header, msgh_id + 1.
+ * Both ends live in kernel_space.
  */
 struct demo_msg {
 	struct mach_msg_header	hdr;
@@ -533,9 +527,8 @@ cmd_port(int argc, char *argv[])
 			reply.msgh_local   = MACH_PORT_NULL;
 			reply.msgh_voucher = 0;
 			reply.msgh_id      = recv_buf.hdr.msgh_id + 1;
-			/* Pad-out: a malformed-size protection check */
 
-			/* For simplicity send just the header (no extra). */
+			/* Just the header; `echoed' is not sent. */
 			reply.msgh_size = sizeof(reply);
 			rv = mach_msg_send(kernel_space, &reply);
 			if (rv != MACH_MSG_OK) {

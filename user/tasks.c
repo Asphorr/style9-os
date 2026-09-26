@@ -10,10 +10,9 @@
 /*
  * tasks.elf -- ring-3 wrapper around the kernel's "tasks" Mach service.
  *
- * Looks up dev "tasks", RPCs a TASKS_OP_LIST, walks the reply array,
- * and prints a small ps-style table.  Demonstrates that a userspace
- * program can read live kernel state through a port boundary without
- * any kernel-specific syscall surface beyond the generic Mach ABI.
+ * Looks up "tasks", RPCs a TASKS_OP_LIST and prints the reply as a small
+ * ps-style table: live kernel state read through a port, with no syscall
+ * beyond the generic Mach ones.
  */
 
 int

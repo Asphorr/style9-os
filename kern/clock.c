@@ -32,11 +32,9 @@ clock_init(void)
 	kprintf("clock: %u Hz tick, TSC anchor calibrated\n", pit_hz());
 
 	/*
-	 * Anchor wall time.  Read the uptime immediately after the chip so the
-	 * two refer to as nearly the same instant as we can manage; the RTC
-	 * read itself can spin for up to a second waiting out an update, and
-	 * anchoring to a stale uptime would bake that delay into every future
-	 * reading.
+	 * Anchor wall time.  Read the uptime right after the chip: the RTC
+	 * read can spin up to a second waiting out an update, and an uptime
+	 * taken before it would bake that delay into every later reading.
 	 */
 	if (!rtc_read(&t)) {
 		kprintf("clock: no usable RTC -- wall time unavailable\n");
@@ -98,16 +96,11 @@ clock_uptime_us(void)
 	uint64_t	base_us;
 
 	/*
-	 * Sub-tick resolution, which the name has always promised and this
-	 * function used not to deliver: it returned the tick count scaled to
-	 * microseconds, so every reading was a multiple of 10 ms and a caller
-	 * asking for microseconds got three zeroes and no warning.
-	 *
-	 * The PIT tick count is the base -- coarse, but it cannot drift.  The
-	 * TSC delta since the calibration anchor fills in what happened since
-	 * the last tick.  Both halves come from the same latched instant, so
-	 * they compose without a seam, and the result stays monotonic because
-	 * neither anchor ever moves and the TSC only counts up.
+	 * Sub-tick resolution.  The PIT tick count at the calibration anchor
+	 * is the base; the TSC delta since that anchor adds the rest.  Both
+	 * halves come from the same latched instant, so they compose without
+	 * a seam, and the result is monotonic: neither anchor moves and the
+	 * TSC only counts up.
 	 */
 	if (tsc_hz() == 0)			/* before calibration */
 		return ((pit_ticks() * 1000000ULL) / pit_hz());
