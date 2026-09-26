@@ -18,6 +18,7 @@
 #define	KBD_DATA_PORT	0x60
 #define	KBD_STATUS_PORT	0x64
 #define	KBD_STS_OBF	0x01	/* output buffer full -- data byte ready */
+#define	KBD_STS_AUX	0x20	/* ... and it is the mouse's (mouse.c)   */
 #define	KBD_IRQ		1
 
 #define	SC_RELEASE	0x80	/* bit set on key-release scancodes */
@@ -192,10 +193,22 @@ static void
 kbd_irq(struct trapframe *tf)
 {
 	uint8_t	sc;
+	uint8_t	sts;
 	int	c;
 
 	(void)tf;
 
+	/*
+	 * Only a byte that is there, and is the keyboard's.  IRQ1 is latched
+	 * at the 8259 when the byte arrives, but the byte can be gone by the
+	 * time this runs -- mouse_init drains the controller with interrupts
+	 * off -- and a read of an empty data port hands back the last byte
+	 * again: a key pressed twice.  And the one output buffer is shared
+	 * with the mouse; a byte with STS_AUX set is mouse_irq's.
+	 */
+	sts = inb(KBD_STATUS_PORT);
+	if ((sts & KBD_STS_OBF) == 0 || (sts & KBD_STS_AUX) != 0)
+		return;
 	sc = inb(KBD_DATA_PORT);
 
 	if (sc == 0xE0) {
@@ -216,9 +229,22 @@ kbd_irq(struct trapframe *tf)
 int
 kbd_poll_getc(void)
 {
+	uint8_t	sts;
 
-	if ((inb(KBD_STATUS_PORT) & KBD_STS_OBF) == 0)
+	sts = inb(KBD_STATUS_PORT);
+	if ((sts & KBD_STS_OBF) == 0)
 		return (-1);
+
+	/*
+	 * A mouse byte is taken and dropped, not decoded as a scancode.
+	 * Nor can it be left: this polls with interrupts off (ddb), so
+	 * mouse_irq will not come for it, and it would sit in the one
+	 * output buffer ahead of every key typed after it.
+	 */
+	if ((sts & KBD_STS_AUX) != 0) {
+		(void)inb(KBD_DATA_PORT);
+		return (-1);
+	}
 
 	return (kbd_decode_scancode(inb(KBD_DATA_PORT)));
 }

@@ -15,16 +15,23 @@
  * keyboard hangs off (kbd.c), wired to IRQ12 instead of IRQ1.
  *
  * mouse_init brings the aux port up by polling.  It must run in Phase 2,
- * after clock_init: it briefly masks interrupts for the polled exchange,
- * enables the aux port, flips the controller config to raise IRQ12,
- * probes the device two-way (set-defaults / get-id / enable-streaming,
- * each ACKed with 0xFA), then installs the IRQ12 handler and unmasks the
- * line -- plus the IRQ2 cascade, since IRQ12 lives on the slave 8259 --
- * and re-enables interrupts.  Confining all command / ACK traffic to that
- * polled phase keeps the IRQ handler pure: once the line is live it only
- * ever sees streaming data packets, never an ACK byte it might mistake
- * for byte 0 of a packet.  (It cannot run beside kbd_init in Phase 1:
- * IRQ12 firing before clock_init divides by an uncalibrated pit_hz.)
+ * after clock_init: it holds interrupts off for the polled exchange and
+ * the keyboard port at the controller (so no keystroke lands in front of
+ * a reply), enables the aux port, flips the controller config to raise
+ * IRQ12, probes the device two-way (set-defaults / get-id / enable-
+ * streaming, each ACKed with 0xFA), then installs the IRQ12 handler and
+ * unmasks the line -- plus the IRQ2 cascade, since IRQ12 lives on the
+ * slave 8259 -- lets the keyboard go and puts interrupts back as it found
+ * them.  Confining all command / ACK traffic to that polled phase keeps
+ * the IRQ handler pure: once the line is live it only ever sees streaming
+ * data packets, never an ACK byte it might mistake for byte 0 of a
+ * packet.  (It cannot run beside kbd_init in Phase 1: IRQ12 firing before
+ * clock_init divides by an uncalibrated pit_hz.)
+ *
+ * The first answer it does not like ends it: the aux port goes back down,
+ * IRQ12 stays masked, the failed step is logged, and boot carries on
+ * without a mouse.  So does a device id other than 0 -- a wheel mouse
+ * already in four-byte mode, which this three-byte driver would misread.
  *
  * mouse_getpkt / mouse_getpkt_block dequeue completed packets.  The raw
  * 3-byte PS/2 movement-packet layout (scancode-independent) is:

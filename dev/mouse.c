@@ -33,7 +33,10 @@
 /* i8042 controller commands. */
 #define	CTL_READ_CONFIG		0x20
 #define	CTL_WRITE_CONFIG	0x60
+#define	CTL_DISABLE_AUX		0xA7
 #define	CTL_ENABLE_AUX		0xA8
+#define	CTL_DISABLE_KBD		0xAD	/* hold the keyboard's clock           */
+#define	CTL_ENABLE_KBD		0xAE	/* ... and let it go                   */
 #define	CTL_WRITE_TO_AUX	0xD4	/* route the next 0x60 write to mouse  */
 
 #define	CFG_IRQ12		0x02	/* config bit 1: raise IRQ12 on aux    */
@@ -44,6 +47,10 @@
 #define	AUX_ENABLE_STREAM	0xF4
 #define	AUX_SET_DEFAULTS	0xF6
 #define	AUX_ACK			0xFA
+#define	AUX_RESEND		0xFE	/* "say that again"                    */
+
+#define	AUX_ID_STANDARD		0x00	/* the 3-byte-packet mouse             */
+#define	AUX_RETRIES		3	/* resend requests honoured per cmd    */
 
 #define	MOUSE_IRQ		12
 #define	MOUSE_CASCADE_IRQ	2	/* slave reaches the CPU via IRQ2      */
@@ -86,17 +93,19 @@ static struct thread *volatile	mouse_waiter;
 static volatile int		mouse_wake_pending;
 
 static int	aux_command(uint8_t cmd);
-static int	i8042_wait_read(void);
+static int	i8042_command(uint8_t cmd);
+static int	i8042_read_from(bool aux);
 static int	i8042_wait_write(void);
 static void	i8042_drain(void);
 static void	mouse_feed_byte(uint8_t b);
 static void	mouse_irq(struct trapframe *);
+static int	mouse_probe(const char **stepp, int *gotp);
 static void	mouse_ring_push(const uint8_t *pkt);
 
 /*
  * Spin until the controller's input buffer is clear (safe to write) or
  * the bounded budget elapses.  Returns 0 if writable, -1 on timeout --
- * the caller logs and presses on rather than hanging boot on a machine
+ * the caller gives up on the mouse rather than hanging boot on a machine
  * with no PS/2 controller.
  */
 static int
@@ -110,15 +119,41 @@ i8042_wait_write(void)
 	return (-1);
 }
 
-/* Spin until a byte is readable from the controller; 0 / -1 as above. */
+/* Write one controller command byte; 0, or -1 if it would not take one. */
 static int
-i8042_wait_read(void)
+i8042_command(uint8_t cmd)
 {
+
+	if (i8042_wait_write() != 0)
+		return (-1);
+	outb(I8042_CMD, cmd);
+	return (0);
+}
+
+/*
+ * Spin until a byte from the wanted side is readable and return it, or -1
+ * on timeout.  The controller has ONE output buffer for the keyboard, the
+ * mouse and its own replies, so a byte being there is not the byte asked
+ * for: STS_AUX says whether it came from the mouse, and one from the
+ * other side is dropped.  mouse_init holds the keyboard port for the
+ * exchange, so there should be none to drop -- but a reply read from the
+ * wrong device is how an init goes quietly wrong.
+ */
+static int
+i8042_read_from(bool aux)
+{
+	uint8_t	b;
+	uint8_t	sts;
 	int	i;
 
-	for (i = 0; i < I8042_SPIN; i++)
-		if ((inb(I8042_STATUS) & STS_OBF) != 0)
-			return (0);
+	for (i = 0; i < I8042_SPIN; i++) {
+		sts = inb(I8042_STATUS);
+		if ((sts & STS_OBF) == 0)
+			continue;
+		b = inb(I8042_DATA);
+		if (((sts & STS_AUX) != 0) == aux)
+			return (b);
+	}
 	return (-1);
 }
 
@@ -136,81 +171,159 @@ i8042_drain(void)
 }
 
 /*
- * Send one command byte to the aux device and return the byte it replies
- * with (normally AUX_ACK), or -1 if the controller or device never
- * answered.  Polled, used only from mouse_init before IRQ12 is unmasked,
- * so it never races the IRQ path.
+ * Send one command byte to the aux device and return its reply: AUX_ACK
+ * normally, whatever else it said if it refused, -1 if nothing answered.
+ * A resend request is honoured up to AUX_RETRIES times.  Polled, used only
+ * from mouse_init before IRQ12 is unmasked, so it never races the IRQ
+ * path.
  */
 static int
 aux_command(uint8_t cmd)
 {
+	int	i;
+	int	reply;
 
-	if (i8042_wait_write() != 0)
-		return (-1);
-	outb(I8042_CMD, CTL_WRITE_TO_AUX);
-	if (i8042_wait_write() != 0)
-		return (-1);
-	outb(I8042_DATA, cmd);
-	if (i8042_wait_read() != 0)
-		return (-1);
-	return ((int)inb(I8042_DATA));
+	reply = -1;
+	for (i = 0; i <= AUX_RETRIES; i++) {
+		if (i8042_command(CTL_WRITE_TO_AUX) != 0 ||
+		    i8042_wait_write() != 0)
+			return (-1);
+		outb(I8042_DATA, cmd);
+		reply = i8042_read_from(true);
+		if (reply != AUX_RESEND)
+			break;
+	}
+	return (reply);
 }
 
-void
-mouse_init(void)
+/*
+ * The polled half of mouse_init, entered with interrupts off and the
+ * keyboard port held.  Returns the device id, with the device streaming
+ * and the controller raising IRQ12 for it; or -1, with *stepp naming the
+ * step that failed and *gotp what came back instead (-1: nothing did).
+ *
+ * It stops at the first answer it does not like.  Every step after a
+ * failed one would be built on a guess about the controller's state, and
+ * the controller is the keyboard's as much as the mouse's.
+ */
+static int
+mouse_probe(const char **stepp, int *gotp)
 {
-	int	ack_defaults;
-	int	ack_stream;
+	int	config;
 	int	id;
-	uint8_t	config;
+	int	reply;
 
-	/*
-	 * Brought up in Phase 2 (after clock_init), interrupts already on.
-	 * Mask them for the duration: the polled i8042 exchange must be
-	 * atomic against kbd_irq, which drains the same 0x60 data port, and
-	 * IRQ12 must not be delivered until pit_hz() is calibrated (the
-	 * intr_dispatch -> sched_check_timeouts -> clock_uptime_ms path
-	 * divides by it).  Re-enabled at the end.
-	 */
-	intr_disable();
+	reply = -1;
+	*gotp = -1;
 
-	i8042_drain();
-
-	if (i8042_wait_write() == 0)
-		outb(I8042_CMD, CTL_ENABLE_AUX);
+	*stepp = "enable aux port";
+	if (i8042_command(CTL_ENABLE_AUX) != 0)
+		goto fail;
 
 	/*
 	 * Read-modify-write the controller config byte: turn on "raise
 	 * IRQ12" and re-enable the aux clock, preserving every other bit --
 	 * notably bit 0, the keyboard's own IRQ1 enable that kbd_init
-	 * relies on.
+	 * relies on.  Nothing is written unless the read came back: a
+	 * default standing in for the real byte would overwrite exactly
+	 * the bits this is careful to keep.
 	 */
-	config = 0;
-	if (i8042_wait_write() == 0) {
-		outb(I8042_CMD, CTL_READ_CONFIG);
-		if (i8042_wait_read() == 0)
-			config = inb(I8042_DATA);
-	}
+	*stepp = "read config";
+	if (i8042_command(CTL_READ_CONFIG) != 0)
+		goto fail;
+	config = i8042_read_from(false);
+	if (config < 0)
+		goto fail;
 	config |= CFG_IRQ12;
-	config &= (uint8_t)~CFG_AUX_CLOCK_OFF;
-	if (i8042_wait_write() == 0) {
-		outb(I8042_CMD, CTL_WRITE_CONFIG);
-		if (i8042_wait_write() == 0)
-			outb(I8042_DATA, config);
-	}
+	config &= ~CFG_AUX_CLOCK_OFF;
+
+	*stepp = "write config";
+	if (i8042_command(CTL_WRITE_CONFIG) != 0 || i8042_wait_write() != 0)
+		goto fail;
+	outb(I8042_DATA, (uint8_t)config);
 
 	/*
 	 * Probe the device two-way.  A standard PS/2 mouse powers on with
 	 * reporting disabled, ACKs each command with 0xFA, and reports
-	 * device id 0x00.  get-id replies 0xFA then the id byte, so read one
-	 * extra byte for it.  Whatever comes back is logged rather than
-	 * asserted -- the kernel must boot on a box with no mouse.
+	 * device id 0x00; get-id replies 0xFA and then the id byte.
 	 */
-	ack_defaults = aux_command(AUX_SET_DEFAULTS);
-	id = aux_command(AUX_GET_DEVICE_ID);
-	if (id == AUX_ACK)
-		id = (i8042_wait_read() == 0) ? (int)inb(I8042_DATA) : -1;
-	ack_stream = aux_command(AUX_ENABLE_STREAM);
+	*stepp = "set defaults";
+	reply = aux_command(AUX_SET_DEFAULTS);
+	if (reply != AUX_ACK)
+		goto fail;
+
+	*stepp = "get device id";
+	reply = aux_command(AUX_GET_DEVICE_ID);
+	if (reply != AUX_ACK)
+		goto fail;
+	reply = i8042_read_from(true);
+	if (reply < 0)
+		goto fail;
+	id = reply;
+
+	/*
+	 * Id 0 is the plain three-byte mouse this driver reads.  A wheel
+	 * mouse (3) or a five-button one (4) that something has already
+	 * switched into that mode sends FOUR bytes a packet -- set-defaults
+	 * does not switch it back, only a reset does -- and a three-byte
+	 * assembler would read that stream a packet and a third at a time.
+	 * Declined rather than misread.
+	 */
+	*stepp = "device id (not a 3-byte mouse)";
+	if (id != AUX_ID_STANDARD)
+		goto fail;
+
+	*stepp = "enable streaming";
+	reply = aux_command(AUX_ENABLE_STREAM);
+	if (reply != AUX_ACK)
+		goto fail;
+
+	*stepp = NULL;
+	return (id);
+
+fail:
+	*gotp = reply;
+	return (-1);
+}
+
+void
+mouse_init(void)
+{
+	const char	*step;
+	int		 got;
+	int		 id;
+	bool		 kbd_back;
+	bool		 kbd_held;
+	bool		 was_on;
+
+	/*
+	 * Brought up in Phase 2 (after clock_init), interrupts already on.
+	 * Held off for the duration and put back as found: the polled i8042
+	 * exchange must be atomic against kbd_irq, which drains the same
+	 * 0x60 data port, and IRQ12 must not be delivered until pit_hz() is
+	 * calibrated (the intr_dispatch -> sched_check_timeouts ->
+	 * clock_uptime_ms path divides by it).
+	 *
+	 * And the keyboard port is held at the controller: disabling
+	 * interrupts stops kbd_irq, not the keyboard.  A key pressed during
+	 * the exchange would put its byte in the one output buffer, ahead of
+	 * the reply being waited for.  Held, the keyboard keeps the key and
+	 * sends it once the port is let go.
+	 */
+	was_on = intr_save_disable();
+	kbd_held = (i8042_command(CTL_DISABLE_KBD) == 0);
+	i8042_drain();
+
+	id = mouse_probe(&step, &got);
+
+	/*
+	 * A device left half-configured, with nothing unmasked at IRQ12 to
+	 * read it, could put a byte in the shared output buffer that nobody
+	 * ever takes -- and every key after it would wait behind that byte.
+	 * So a failed probe takes the aux port back down.
+	 */
+	if (id < 0)
+		(void)i8042_command(CTL_DISABLE_AUX);
 
 	/*
 	 * Enabling streaming can make the device immediately queue an
@@ -220,15 +333,26 @@ mouse_init(void)
 	 */
 	i8042_drain();
 
-	irq_install(MOUSE_IRQ, mouse_irq);
-	pic_unmask(MOUSE_CASCADE_IRQ);
-	pic_unmask(MOUSE_IRQ);
+	if (id >= 0) {
+		irq_install(MOUSE_IRQ, mouse_irq);
+		pic_unmask(MOUSE_CASCADE_IRQ);
+		pic_unmask(MOUSE_IRQ);
+	}
 
-	intr_enable();
+	kbd_back = (i8042_command(CTL_ENABLE_KBD) == 0);
+	intr_restore(was_on);
 
-	kprintf("mouse: aux up cfg=0x%02x defaults=0x%02x id=0x%02x "
-	    "stream=0x%02x\n", (unsigned)config, (unsigned)(ack_defaults & 0xFF),
-	    (unsigned)(id & 0xFF), (unsigned)(ack_stream & 0xFF));
+	/* Only a port this took and could not return is news. */
+	if (kbd_held && !kbd_back)
+		kprintf("mouse: controller would not take the keyboard "
+		    "port back -- keyboard input is lost\n");
+	if (id >= 0)
+		kprintf("mouse: ready, device id 0x%02x\n", (unsigned)id);
+	else if (got < 0)
+		kprintf("mouse: %s: no answer -- aux port left off\n", step);
+	else
+		kprintf("mouse: %s: got 0x%02x -- aux port left off\n", step,
+		    (unsigned)got);
 }
 
 int
