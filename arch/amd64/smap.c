@@ -46,8 +46,7 @@ smap_init(void)
 	}
 
 	smap_supported = true;
-	kprintf("smap: supported by CPU (not yet enabled -- "
-	    "call smap_enable_runtime after wrapping coverage)\n");
+	kprintf("smap: supported by CPU\n");
 }
 
 /*

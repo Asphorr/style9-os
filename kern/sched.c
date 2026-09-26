@@ -202,7 +202,8 @@ sched_init(void)
 	idle_thread->th_state = THREAD_READY;
 	spin_unlock(&idle_thread->th_lock);
 
-	kprintf("sched: cooperative round-robin, idle id=%llu\n",
+	kprintf("sched: preemptive round-robin, %u-tick quantum, idle id=%llu\n",
+	    (unsigned)PREEMPT_QUANTUM_TICKS,
 	    (unsigned long long)idle_thread->th_id);
 }
 

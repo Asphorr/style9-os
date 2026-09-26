@@ -47,13 +47,13 @@
 #include "macho.h"
 
 /*
- * Initial user %rsp recorded in LC_UNIXTHREAD.  Advisory only: style9's
- * launcher (arch/amd64/usermode.c build_user_arg_stack) lays down the
- * real argc/argv frame and passes its own %rsp to usermode_enter, so the
- * loader ignores this field.  It no longer matches USER_STACK_TOP in
- * arch/amd64/usermode.h.
+ * Initial user %rsp recorded in LC_UNIXTHREAD: USER_STACK_TOP from
+ * arch/amd64/usermode.h, copied because this is a host tool.  Advisory
+ * only: style9's launcher (arch/amd64/usermode.c build_user_arg_stack)
+ * lays down the real argc/argv frame and passes its own %rsp to
+ * usermode_enter, so the loader ignores this field.
  */
-#define	USER_STACK_TOP	0x40010000ULL
+#define	USER_STACK_TOP	0x41000000ULL
 
 #define	MAX_SEGS	16
 

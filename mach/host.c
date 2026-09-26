@@ -9,6 +9,7 @@
 #include <stdint.h>
 
 #include "bootstrap.h"
+#include "cpu.h"
 #include "host.h"
 #include "kprintf.h"
 #include "panic.h"
@@ -88,15 +89,15 @@ host_dispatch_info(const struct mach_msg_header *req, struct port_space *from)
 	uint64_t			used_pages;
 
 	/*
-	 * CPUs are reported as 1/1, whatever number are running.  Memory is
-	 * the physical allocator's totals (as the "stats" service reports
-	 * them), in bytes as HOST_BASIC_INFO has it.
+	 * As HOST_BASIC_INFO has them: max_cpus the processors the firmware
+	 * listed, avail_cpus those running.  Memory is the physical
+	 * allocator's totals (as the "stats" service reports them), in bytes.
 	 */
 	total_pages = pmm_total_pages();
 	used_pages  = pmm_used_pages();
 
-	r.hi_max_cpus    = 1;
-	r.hi_avail_cpus  = 1;
+	r.hi_max_cpus    = cpu_present_count();
+	r.hi_avail_cpus  = cpu_online_count();
 	r.hi_memory_size = total_pages * PAGE_SIZE;
 	r.hi_cpu_type    = HOST_CPU_TYPE_X86_64;
 	r.hi_cpu_subtype = HOST_CPU_SUBTYPE_X86_64_ALL;

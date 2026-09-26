@@ -13,7 +13,6 @@
 #include "bio.h"
 #include "apfs.h"
 #include "apfs_priv.h"
-#include "fs_txn.h"
 #include "kmem.h"
 #include "kprintf.h"
 
@@ -4283,7 +4282,7 @@ extref_split_leaf(uint64_t start, uint64_t xid)
 		(void)free_blocks(paddr, 1);
 		kprintf("apfs: the extent reference tree's root holds %u "
 		    "children and has no room for another -- a third level "
-		    "is a different rung\n",
+		    "is not supported\n",
 		    (unsigned)((struct apfs_btree_node_phys *)root)->
 		    btn_nkeys);
 		goto out;
@@ -4481,7 +4480,7 @@ extref_shrink(uint64_t start, uint64_t keep, uint64_t xid, void *buf,
 		pv = (struct apfs_phys_ext_val *)(bl.bl_vals - voff);
 		if (pv->pe_refcnt != 1) {
 			kprintf("apfs: the run at %llu is named %d times -- "
-			    "shortening a shared run is a different rung\n",
+			    "shortening a shared run is not supported\n",
 			    (unsigned long long)start, (int)pv->pe_refcnt);
 			rv = FS_APFS_E_NOALLOC;
 			goto out;
@@ -4647,7 +4646,7 @@ leaf_insert_fixed(uint8_t *node, uint32_t pos, const void *key, uint32_t klen,
 		return (FS_APFS_E_INVAL);
 	if (!leaf_has_room(node, klen, vlen)) {
 		kprintf("apfs: the object map node holds %u entries and has no "
-		    "room for another -- splitting one is a different rung\n",
+		    "room for another -- splitting one is not supported\n",
 		    (unsigned)bl.bl_nkeys);
 		return (FS_APFS_E_NOALLOC);
 	}
@@ -6227,7 +6226,7 @@ fs_apfs_truncate(uint64_t ino, uint64_t id, uint64_t new_size)
 		return (FS_APFS_E_IO);
 	if (ec.ec_over) {
 		kprintf("apfs: inode %llu has more than %u runs past %llu -- "
-		    "cutting that many at once is a different rung\n",
+		    "cutting that many at once is not supported\n",
 		    (unsigned long long)ino, (unsigned)APFS_TRUNC_MAX,
 		    (unsigned long long)new_size);
 		return (FS_APFS_E_NOALLOC);
@@ -6246,8 +6245,8 @@ fs_apfs_truncate(uint64_t ino, uint64_t id, uint64_t new_size)
 		slot[i] = edit_leaf(&ne, ec.ec_bno[i]);
 		if (slot[i] == APFS_EDIT_LEAVES) {
 			kprintf("apfs: inode %llu keeps its runs in more than "
-			    "%u leaves -- cutting that many at once is a "
-			    "different rung\n", (unsigned long long)ino,
+			    "%u leaves -- cutting that many at once is not "
+			    "supported\n", (unsigned long long)ino,
 			    (unsigned)APFS_EDIT_LEAVES);
 			return (FS_APFS_E_SPREAD);
 		}
@@ -7141,7 +7140,7 @@ unmake_at(uint64_t dir, const char *name, uint64_t now, bool isdir)
 	 */
 	if (!isdir && !ii.ii_orphan && ii.ii_nlink != 1) {
 		kprintf("apfs: inode %llu has %u links and this kernel makes "
-		    "none -- unlinking one of several is a different rung\n",
+		    "none -- unlinking one of several is not supported\n",
 		    (unsigned long long)child, (unsigned)ii.ii_nlink);
 		return (FS_APFS_E_NOALLOC);
 	}
@@ -7693,7 +7692,7 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 		return (FS_APFS_E_NOTFOUND);
 	if (!isdir && ii.ii_nlink != 1) {
 		kprintf("apfs: inode %llu has %u links -- moving one name of "
-		    "several is a different rung\n",
+		    "several is not supported\n",
 		    (unsigned long long)child, (unsigned)ii.ii_nlink);
 		return (FS_APFS_E_NOALLOC);
 	}
@@ -7705,7 +7704,7 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 	 */
 	if (orphan && isdir) {
 		kprintf("apfs: \"%s\" is a directory -- one held open while "
-		    "its name goes away is a rung of its own\n", oname);
+		    "its name goes away is not supported\n", oname);
 		return (FS_APFS_E_ISDIR);
 	}
 	if (child == APFS_ROOT_DIR_INO)
@@ -7767,8 +7766,8 @@ move_once(uint64_t odir, const char *oname, uint64_t ndir, const char *nname,
 				return (FS_APFS_E_NOTFOUND);
 			if (ii.ii_nlink != 1) {
 				kprintf("apfs: inode %llu has %u links -- "
-				    "taking one name of several is a "
-				    "different rung\n",
+				    "taking one name of several is not "
+				    "supported\n",
 				    (unsigned long long)victim,
 				    (unsigned)ii.ii_nlink);
 				return (FS_APFS_E_NOALLOC);
@@ -8811,7 +8810,7 @@ chunk_admit(uint64_t bno)
 			continue;
 		if (ci->ci_bitmap_addr == 0) {
 			kprintf("apfs: chunk @%llu is wholly free and has no "
-			    "bitmap -- making one is a different rung\n",
+			    "bitmap -- making one is not supported\n",
 			    (unsigned long long)ci->ci_addr);
 			return (NULL);
 		}

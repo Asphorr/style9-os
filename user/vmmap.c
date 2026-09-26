@@ -19,12 +19,11 @@
  * Coarse region label from the layout the loader and launcher build:
  * image text at the bottom of the user window, a single-page stack, and
  * vm_allocate memory in vm_map_find_space holes.  vm_map entries carry no
- * section tag, so the labels are guesses.  The kernel's USER_STACK_VA is
- * 0x40FFF000 (arch/amd64/usermode.h); the stack hint below does not
- * match it.
+ * section tag, so the labels are guesses.  The hints copy USER_CODE_VA and
+ * USER_STACK_VA from arch/amd64/usermode.h.
  */
 #define	USER_VA_LO_HINT		0x40000000ULL
-#define	USER_STACK_VA_HINT	0x4000F000ULL
+#define	USER_STACK_VA_HINT	0x40FFF000ULL
 
 static const char *
 region_label(const struct mach_vm_region_entry *e)

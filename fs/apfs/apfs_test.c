@@ -488,7 +488,7 @@ fs_apfs_data_selftest(const char *path)
 	for (i = 0; i < sizeof(before); i++) {
 		if (after[i] == before[i])
 			continue;
-		kprintf("apfs-data: FAIL byte %u of the block the live "
+		kprintf("apfs-data: FAIL byte %u of the block the previous "
 		    "checkpoint names (%llu) changed from 0x%02x to 0x%02x\n",
 		    (unsigned)i, (unsigned long long)old_phys,
 		    (unsigned)before[i], (unsigned)after[i]);
@@ -503,7 +503,7 @@ fs_apfs_data_selftest(const char *path)
 	}
 
 	kprintf("apfs-data: PASS -- %s moved %llu -> %llu, the new run has "
-	    "the write, and the run the live checkpoint still names is "
+	    "the write, and the run the previous checkpoint names is "
 	    "unchanged\n", path, (unsigned long long)old_phys,
 	    (unsigned long long)new_phys);
 out:
@@ -2564,8 +2564,9 @@ fs_apfs_extref_selftest(uint64_t now)
 			rv = fs_apfs_checkpoint();
 		if (rv != FS_APFS_E_OK) {
 			kprintf("apfs-extref: FAIL append %u of %u was "
-			    "refused (%d) -- the very refusal this rung "
-			    "exists to end\n", (unsigned)round,
+			    "refused (%d) -- the very refusal the extent "
+			    "reference tree's growth exists to end\n",
+			    (unsigned)round,
 			    (unsigned)APFS_EXTREF_ROUNDS, rv);
 			goto clean;
 		}

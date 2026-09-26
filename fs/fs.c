@@ -1686,8 +1686,8 @@ fs_grow_selftest(void)
 		 */
 		if (rv == FS_E_SPREAD) {
 			kprintf("apfs-grow: %s keeps its bytes and its inode "
-			    "in different leaves -- appending across two is a "
-			    "different rung; skipped after %u round(s)\n",
+			    "in different leaves -- appending across two is "
+			    "not supported; skipped after %u round(s)\n",
 			    SELFTEST_PATH, (unsigned)rounds);
 			goto out;
 		}
@@ -1900,8 +1900,8 @@ fs_trunc_selftest(void)
 	 */
 	if (rv == FS_E_SPREAD) {
 		kprintf("apfs-trunc: %s no longer keeps its runs and its "
-		    "inode in one leaf -- cutting across two is a different "
-		    "rung; skipped\n", SELFTEST_PATH);
+		    "inode in one leaf -- cutting across two is not "
+		    "supported; skipped\n", SELFTEST_PATH);
 		goto out;
 	}
 	if (rv != FS_E_OK) {
