@@ -9659,14 +9659,31 @@ spine_update(uint64_t oid, uint64_t paddr, uint64_t xid, void *buf)
  * cleanly".  A crash between 3 and 4 leaves that state on purpose:
  * consistent, mountable at the new xid, and marked as interrupted.
  *
- * Ordering holds because bio_write reaches the device before the cache
- * (fs/bio.c) and ata_kwrite ends every write with FLUSH CACHE
- * (dev/ata_drv.c): the order below is the order the disk sees.  Hence not
- * fs_txn, whose transactions are unordered sets of blocks.
+ * The drive may keep any subset of the writes since its last cache flush,
+ * in any order (fs/bio.h), so the order above is imposed with three
+ * barriers and nothing else:
+ *
+ *	- before 3, so the superblock can never land without the objects it
+ *	  names -- everything the transaction wrote, and steps 0 to 2;
+ *	- between 3 and 4, so block zero never names a checkpoint the ring
+ *	  may not hold, and the commit is on the platter when this returns;
+ *	- after 4, so a checkpoint leaves nothing in the drive's cache.
+ *
+ * Three flushes per checkpoint, where every write used to end in one.
  */
 
 static uint64_t	ckpt_n_written;		/* checkpoints committed */
 static uint64_t	ckpt_n_refused;		/* asked for and declined */
+static uint64_t	ckpt_n_barriers;	/* cache flushes asked for */
+
+/* One of the three barriers; FS_APFS_E_IO if the drive refused it. */
+static int
+ckpt_barrier(void)
+{
+
+	ckpt_n_barriers++;
+	return (bio_sync(0) == 0 ? FS_APFS_E_OK : FS_APFS_E_IO);
+}
 
 /*
  * Is slot `s` in the run of `len` slots from `start` in a ring of `blocks`?
@@ -9905,7 +9922,15 @@ fs_apfs_checkpoint(void)
 		goto out;
 	}
 
-	/* 3. the superblock.  Everything above it is already on the platter. */
+	/* Everything the superblock will name, onto the platter first. */
+	if (ckpt_barrier() != FS_APFS_E_OK) {
+		kprintf("apfs-ckpt: the drive would not flush before the "
+		    "superblock -- nothing is committed\n");
+		rv = FS_APFS_E_IO;
+		goto out;
+	}
+
+	/* 3. the superblock. */
 	nx->nx_o.o_oid       = APFS_OBJ_NX_SUPERBLOCK;
 	nx->nx_o.o_xid       = xid;
 	nx->nx_next_xid      = xid + 1;
@@ -9938,15 +9963,32 @@ fs_apfs_checkpoint(void)
 	}
 
 	/*
+	 * Past the superblock write the drive holds the new checkpoint, so it
+	 * is the one this kernel continues from, flush or no flush: another
+	 * xid+1 in the next slot would put two different checkpoints of one
+	 * xid in the ring.  A refused flush is returned, since fsync cannot
+	 * promise the platter, and block zero is not written, since it must
+	 * not land ahead of the ring.
+	 */
+	rv = ckpt_barrier();
+	if (rv != FS_APFS_E_OK)
+		kprintf("apfs-ckpt: xid %llu is with the drive, which would not "
+		    "confirm it is on the platter -- block zero left alone\n",
+		    (unsigned long long)xid);
+
+	/*
 	 * 4. block zero.  Past this point the checkpoint has happened, so a
 	 * failure is reported, not propagated: it only decides whether the
 	 * next fsck calls the container cleanly unmounted.
 	 */
-	if (fs_apfs_write_block(0, sb) != FS_APFS_E_OK)
-		kprintf("apfs-ckpt: xid %llu is committed, but block zero "
-		    "still names %llu -- fsck will call this unclean\n",
-		    (unsigned long long)xid,
-		    (unsigned long long)g_apfs.ac_xid);
+	if (rv == FS_APFS_E_OK) {
+		if (fs_apfs_write_block(0, sb) != FS_APFS_E_OK ||
+		    ckpt_barrier() != FS_APFS_E_OK)
+			kprintf("apfs-ckpt: xid %llu is committed, but block "
+			    "zero may still name %llu -- fsck will call this "
+			    "unclean\n", (unsigned long long)xid,
+			    (unsigned long long)g_apfs.ac_xid);
+	}
 
 	/* And the container this kernel believes in moves with it. */
 	g_apfs.ac_xid           = xid;
@@ -9967,11 +10009,12 @@ fs_apfs_checkpoint(void)
 	if (g_apfs.ac_ip_valid)
 		g_apfs.ac_ipbm_slot = ip_slot;
 
+	/* Written, whatever rv says about the flush after the superblock. */
 	ckpt_n_written++;
-	rv = FS_APFS_E_OK;
+	goto done;
 out:
-	if (rv != FS_APFS_E_OK)
-		ckpt_n_refused++;
+	ckpt_n_refused++;
+done:
 	kfree(buf);
 	kfree(map);
 	kfree(sb);
@@ -10136,10 +10179,11 @@ fs_apfs_stats(void)
 	 * asked for a checkpoint from one that refused them.
 	 */
 	if (ckpt_n_written != 0 || ckpt_n_refused != 0)
-		kprintf("apfs: %llu checkpoint(s) written, %llu refused -- now "
-		    "at xid %llu, superblock in block %llu\n",
-		    (unsigned long long)ckpt_n_written,
+		kprintf("apfs: %llu checkpoint(s) written, %llu refused, %llu "
+		    "cache flush(es) -- now at xid %llu, superblock in block "
+		    "%llu\n", (unsigned long long)ckpt_n_written,
 		    (unsigned long long)ckpt_n_refused,
+		    (unsigned long long)ckpt_n_barriers,
 		    (unsigned long long)g_apfs.ac_xid,
 		    (unsigned long long)g_apfs.ac_sb_bno);
 

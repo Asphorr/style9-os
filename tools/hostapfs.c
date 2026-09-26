@@ -5,10 +5,11 @@
  *	obj/hostapfs obj/style9.apfs [test ...]
  *
  * fs/apfs is ordinary C over a block device.  What it needs from the kernel
- * (bio_read, bio_write, kmalloc, kfree, kprintf, and three ATA hooks for the
- * block autopsy) is stubbed here in a line or two each, so the subsystem and
- * its self-tests run against an image file with no kernel, QEMU or boot: a
- * second, not the four minutes of a boot, and apfsck right after.
+ * (bio_read, bio_write, bio_sync, kmalloc, kfree, kprintf, and three ATA
+ * hooks for the block autopsy) is stubbed here in a line or two each, so the
+ * subsystem and its self-tests run against an image file with no kernel,
+ * QEMU or boot: a second, not the four minutes of a boot, and apfsck right
+ * after.
  *
  * It does not replace the QEMU pass: ring 3, interrupts, the ATA driver and
  * the cache under bio are absent.  This is for the arithmetic -- paddings,
@@ -147,6 +148,15 @@ bio_write(unsigned drive, uint64_t lba, uint32_t nsec, const void *buf)
 		    "%zd\n", nsec, (unsigned long long)lba, n);
 		return (-1);
 	}
+	return (0);
+}
+
+/* A pwrite has no drive cache to lose; ordering is hosttorn's business. */
+int
+bio_sync(unsigned drive)
+{
+
+	(void)drive;
 	return (0);
 }
 

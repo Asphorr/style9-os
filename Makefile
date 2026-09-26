@@ -804,7 +804,7 @@ log: kernel.elf $(DISKIMG)
 
 # THE APFS WRITER, BUILT FOR THE HOST
 #
-# fs/apfs reaches outside itself for eight symbols and no assembler, so it
+# fs/apfs reaches outside itself for nine symbols and no assembler, so it
 # compiles and runs as an ordinary program against an image FILE -- see the
 # header of tools/hostapfs.c for what that buys and what it does not.  Built
 # with the host's own flags rather than CFLAGS: none of -ffreestanding,
@@ -838,10 +838,12 @@ hostcheck: $(HOSTAPFS)
 	apfsck -c $(DISKIMG) && printf 'hostcheck: apfsck is happy\n'
 
 # THE POWER FAILS ON PURPOSE.  hosttorn shares fs/apfs/apfs.c with hostapfs
-# but brings its own eight externs: its bio_write journals a pre-image of
-# every block before touching it and can kill the process mid-write -- which
-# is the instrument, not a debugging aid.  It does NOT link apfs_test.c; its
-# workloads are its own, chosen for what they make a checkpoint carry.
+# but brings its own nine externs: its bio_write journals a pre-image of
+# every block before touching it and can kill the process mid-write, and its
+# bio_sync marks where a drive cache would stop being able to lose writes --
+# which is the instrument, not a debugging aid.  It does NOT link
+# apfs_test.c; its workloads are its own, chosen for what they make a
+# checkpoint carry.
 HOSTTORN = $(OBJDIR)/hosttorn
 TORNSRC	 = tools/hosttorn.c fs/apfs/apfs.c
 
@@ -851,8 +853,9 @@ $(HOSTTORN): $(TORNSRC) | $(OBJDIR)
 	$(HOSTCC) $(HOSTFLAGS) -o $@ $(TORNSRC)
 	@printf 'hosttorn: %s\n' $@
 
-# Every write of five edits becomes a power failure, clean and torn, with a
-# remount, a state check and an apfsck after each one; the image is restored
+# Every write of five edits becomes a power failure -- clean, torn, and with
+# the drive's cache losing what it held -- with a remount, a state check and
+# an apfsck after each one; the image is restored
 # between failures and left as it was found, which the closing apfsck states
 # rather than assumes.  A fresh image first, for the reason hostcheck takes
 # one: a stale $(DISKIMG) is a sweep that starts from the last run's damage.

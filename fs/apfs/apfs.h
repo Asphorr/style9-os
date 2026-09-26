@@ -817,11 +817,15 @@ void	fs_apfs_alloc_selftest(void);
  * commit: before it the container is the previous checkpoint entire, after
  * it the new one, edits of the open transaction included.  Block zero is
  * then made a copy of that superblock, without which fsck calls the
- * container interrupted rather than clean.
+ * container interrupted rather than clean.  Cache flushes before and after
+ * the superblock, and after block zero, make that order the disk's; on
+ * FS_APFS_E_OK the checkpoint is on the platter.
  *
  * Returns FS_APFS_E_OK, or a negative FS_APFS_E_* with nothing committed --
- * except a failure to update block zero, which is reported and not
- * propagated, because by then the checkpoint has happened.
+ * except two failures past the superblock write, when the checkpoint has
+ * happened and this kernel continues from it: a refused flush after the
+ * superblock is returned as FS_APFS_E_IO (the platter is not promised),
+ * and a failure to update block zero is reported and not propagated.
  *
  * The caller must hold the volume lock: this moves state the readers use.
  */

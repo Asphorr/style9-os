@@ -188,7 +188,7 @@ static bool	ata_identify(struct ata_drive *d);
 static int	ata_read(struct ata_drive *d, uint64_t lba, uint32_t count,
 		    void *buf);
 static int	ata_write(struct ata_drive *d, uint64_t lba, uint32_t count,
-		    const void *buf);
+		    const void *buf, bool flush);
 static int	ata_sync(struct ata_drive *d);
 
 static void	ata_select_drive(struct ata_drive *d, uint8_t extra);
@@ -440,7 +440,7 @@ ata_dispatch_for_drive(struct ata_drive *d, const struct mach_msg_header *req,
 		if (count == 0 || count > DEV_BLOCK_MAX_SECTORS)
 			return (MACH_E_INVAL);
 
-		rv = ata_write(d, lba, count, wrq->dbw_data);
+		rv = ata_write(d, lba, count, wrq->dbw_data, true);
 
 		/*
 		 * This write bypasses the block cache, which cannot tell which
@@ -599,10 +599,10 @@ ata_identify(struct ata_drive *d)
 /* ---- READ / WRITE -------------------------------------------------- */
 
 /*
- * One PIO transfer (ata_write likewise, ending in FLUSH CACHE), run under
- * ch_lock so a sibling drive on the channel cannot rewrite the task-file
- * registers mid-command -- except while a read parks in ata_wait_intr with
- * the lock released (see ch_cmd_owner).  Returns MACH_MSG_OK or MACH_E_*.
+ * One PIO transfer (ata_write likewise), run under ch_lock so a sibling
+ * drive on the channel cannot rewrite the task-file registers mid-command
+ * -- except while a read parks in ata_wait_intr with the lock released
+ * (see ch_cmd_owner).  Returns MACH_MSG_OK or MACH_E_*.
  */
 static int
 ata_read(struct ata_drive *d, uint64_t lba, uint32_t count, void *buf)
@@ -720,8 +720,14 @@ ata_read(struct ata_drive *d, uint64_t lba, uint32_t count, void *buf)
 	return (MACH_MSG_OK);
 }
 
+/*
+ * With `flush', end in FLUSH CACHE, so success means the bytes are on the
+ * medium; without, success means the drive accepted them and they may sit
+ * in its write cache until the next FLUSH CACHE (ata_sync).
+ */
 static int
-ata_write(struct ata_drive *d, uint64_t lba, uint32_t count, const void *buf)
+ata_write(struct ata_drive *d, uint64_t lba, uint32_t count, const void *buf,
+    bool flush)
 {
 	struct ata_channel	*ch;
 	const uint8_t		*p;
@@ -816,6 +822,22 @@ ata_write(struct ata_drive *d, uint64_t lba, uint32_t count, const void *buf)
 		    p + s * ATA_SECTOR_BYTES, ATA_SECTOR_BYTES / 2);
 	}
 
+	/* The write's own completion: an error on the last sector shows here. */
+	if (!flush) {
+		if (ata_wait_ready(ch, 0, &sr) != 0) {
+			er = inb(ch->ch_io_base + ATA_REG_ERROR);
+			kprintf("ata: %s write at %llu failed at completion: "
+			    "%s\n", d->d_devname, (unsigned long long)lba,
+			    ata_decode_err(er));
+			ata_cmd_release(ch);
+			spin_unlock(&ch->ch_lock);
+			return (MACH_E_INVAL);
+		}
+		ata_cmd_release(ch);
+		spin_unlock(&ch->ch_lock);
+		return (MACH_MSG_OK);
+	}
+
 	/*
 	 * Flush the drive's write cache, or a power cut can take bytes it
 	 * holds only in RAM.  Wait for idle first: the drive is still
@@ -902,7 +924,16 @@ ata_kwrite(unsigned drive_idx, uint64_t lba, uint32_t count, const void *buf)
 
 	if (drive_idx >= ATA_NDRIVES_MAX || !drives[drive_idx].d_present)
 		return (MACH_E_DEAD);
-	return (ata_write(&drives[drive_idx], lba, count, buf));
+	return (ata_write(&drives[drive_idx], lba, count, buf, false));
+}
+
+int
+ata_ksync(unsigned drive_idx)
+{
+
+	if (drive_idx >= ATA_NDRIVES_MAX || !drives[drive_idx].d_present)
+		return (MACH_E_DEAD);
+	return (ata_sync(&drives[drive_idx]));
 }
 
 /* ---- helpers ------------------------------------------------------- */

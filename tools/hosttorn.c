@@ -2,7 +2,7 @@
  * Power failure on purpose, at every possible moment.
  *
  *	make torncheck
- *	obj/hosttorn obj/style9.apfs [workload] [-k N [-s S]]
+ *	obj/hosttorn obj/style9.apfs [workload] [-k N [-s S | -l 1|2]]
  *
  * Measures the claim the writer rests on: the checkpoint is the volume's
  * only atom.
@@ -36,9 +36,18 @@
  * checked -- it catches one broken byte in a catalog node) must call the
  * volume whole; everywhere else strict apfsck must pass.
  *
- * The model.  Writes land in issue order and a cut keeps a prefix; the
- * kernel's ATA path makes that so by ending every write with FLUSH CACHE.
- * A disk reordering across the prefix is not modelled.
+ * The model.  A write returns once the drive has it; until the next barrier
+ * (bio_sync, a cache flush) a power cut may keep any subset of the writes
+ * since the last one.  Two kinds of point stage that.  An ordered cut keeps
+ * a prefix -- one thing a cache may do -- and tears the next write; it runs
+ * at every write, as before.  A cache cut dies the moment write k lands,
+ * before whatever follows it, and loses either every write since the last
+ * barrier (ALL) or all of them but write k itself (NEWEST, the reordering
+ * that lands the newest write first).  The expected state follows from
+ * which writes survived: the ring superblock whole means new (unclean
+ * while the anchor is missing), otherwise old.  NEWEST at the superblock
+ * is what would catch a missing barrier before it; the dry run also
+ * checks that the barriers sit after the last three writes.
  *
  * Restoring the image.  Every write is journaled with its pre-image before
  * it lands, and between grid points the parent replays the journal
@@ -91,6 +100,22 @@ static long		 cut = -1;	/* die on write cut+1; -1 = never */
 static int		 tear;		/* sectors of the fatal write to land */
 static int		 wpipe = -1;	/* dry run reports W through this */
 static long		 odd_writes;	/* writes that were not one block */
+
+/* The drive's cache: what a cache cut may lose. */
+#define	LOSS_NONE	0
+#define	LOSS_ALL	1	/* every write since the last barrier */
+#define	LOSS_NEWEST	2	/* all of them but the newest */
+#define	MAX_BARRIERS	16
+
+static long		 ccut = -1;	/* die as write ccut lands; -1 = never */
+static int		 loss;		/* LOSS_* for that death */
+static off_t		 barrier_off;	/* journal length at the last barrier */
+static long		 barriers[MAX_BARRIERS]; /* `seen' at each one */
+static int		 nbarriers;
+
+static void		 journal_undo(off_t from);
+static void		 cache_cut(uint64_t lba, size_t len)
+			    __attribute__((noreturn));
 
 /* ---- what fs/apfs needs from the kernel --------------------------------- */
 
@@ -212,6 +237,48 @@ bio_write(unsigned drive, uint64_t lba, uint32_t nsec, const void *buf)
 		return (-1);
 	if (counting)
 		seen++;
+	if (counting && ccut >= 0 && seen == ccut)
+		cache_cut(lba, len);
+	return (0);
+}
+
+/*
+ * A cache cut: the power fails as this write lands, and the drive's cache
+ * gives up what `loss' says.  The journal since the last barrier holds the
+ * pre-image of every write the cache still had; undoing it newest first
+ * leaves the platter as the barrier left it.  NEWEST puts back this write,
+ * whose bytes are on the platter now, after the undo.
+ */
+static void
+cache_cut(uint64_t lba, size_t len)
+{
+	uint8_t	keep[BLKSZ];
+
+	if (loss == LOSS_NEWEST &&
+	    pread(img, keep, len, (off_t)lba * SECTOR) != (ssize_t)len)
+		_exit(BUG_EXIT);
+	journal_undo(barrier_off);
+	if (loss == LOSS_NEWEST &&
+	    pwrite(img, keep, len, (off_t)lba * SECTOR) != (ssize_t)len)
+		_exit(BUG_EXIT);
+	if (sink != NULL)
+		fflush(sink);
+	_exit(TORN_EXIT);
+}
+
+/*
+ * The barrier.  Everything written so far is now safe from a cache cut;
+ * during the measured edit, where it fell is recorded for the dry run.
+ */
+int
+bio_sync(unsigned drive)
+{
+
+	(void)drive;
+	if (undo >= 0)
+		barrier_off = lseek(undo, 0, SEEK_END);
+	if (counting && nbarriers < MAX_BARRIERS)
+		barriers[nbarriers++] = seen;
 	return (0);
 }
 
@@ -570,13 +637,23 @@ static char	logpath[512];
 static char	undopath[512];
 
 /*
+ * Where the barriers fell in the last completed run, measured writes; the
+ * dry run's are kept as the model the cache grid is judged by.
+ */
+static long	run_barriers[MAX_BARRIERS];
+static int	run_nbarriers;
+static long	model_barriers[MAX_BARRIERS];
+static int	model_nbarriers;
+
+/*
  * Run the workload in a child that dies mid-write, or completes when K is
- * at or past W (the dry run is K = -1).  Its output goes to the iteration
- * log; a completed run reports its measured write count, W, through the
- * pipe.
+ * at or past W (the dry run is K = -1).  With a loss other than LOSS_NONE
+ * the death is a cache cut as write K lands, and S is unused.  Its output
+ * goes to the iteration log; a completed run reports its measured write
+ * count, W, and where its barriers fell, through the pipe.
  */
 static int
-run_cut(const struct workload *wl, long k, int s, bool to_stdout)
+run_cut(const struct workload *wl, long k, int s, int l, bool to_stdout)
 {
 	pid_t	pid;
 	int	fds[2];
@@ -601,11 +678,18 @@ run_cut(const struct workload *wl, long k, int s, bool to_stdout)
 			_exit(CLS_NOMOUNT);
 		wl->w_setup();
 		counting = true;
-		cut = k;
-		tear = s;
+		if (l == LOSS_NONE) {
+			cut  = k;
+			tear = s;
+		} else {
+			ccut = k;
+			loss = l;
+		}
 		wl->w_measured();
 		w = seen;
 		(void)!write(wpipe, &w, sizeof(w));
+		(void)!write(wpipe, &nbarriers, sizeof(nbarriers));
+		(void)!write(wpipe, barriers, sizeof(barriers));
 		if (sink != NULL)
 			fflush(sink);
 		_exit(0);
@@ -613,6 +697,10 @@ run_cut(const struct workload *wl, long k, int s, bool to_stdout)
 	close(fds[1]);
 	w = -1;
 	(void)!read(fds[0], &w, sizeof(w));
+	if (w >= 0) {
+		(void)!read(fds[0], &run_nbarriers, sizeof(run_nbarriers));
+		(void)!read(fds[0], run_barriers, sizeof(run_barriers));
+	}
 	close(fds[0]);
 	waitpid(pid, &status, 0);
 	if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
@@ -723,6 +811,13 @@ cls_name(int cls)
 }
 
 static const char *
+loss_name(int l)
+{
+
+	return (l == LOSS_ALL ? "all" : l == LOSS_NEWEST ? "newest" : "none");
+}
+
+static const char *
 fsck_name(int verdict)
 {
 
@@ -731,16 +826,18 @@ fsck_name(int verdict)
 }
 
 /*
- * Put every block back, newest change first, so overlapping writes undo
- * correctly: the first entry for a block, holding the pristine content, is
- * undone last and wins.
+ * Put back every block the journal names from offset `from' on, newest
+ * change first, so overlapping writes undo correctly: the first entry for a
+ * block, holding its content as of `from', is undone last and wins.  The
+ * journal itself is left as it is.
  */
 static void
-restore(void)
+journal_undo(off_t from)
 {
 	static uint8_t	*jrn;
 	static size_t	 cap;
 	uint8_t		*p;
+	off_t		 end;
 	off_t		 sz;
 	size_t		 n;
 	size_t		 count;
@@ -749,14 +846,14 @@ restore(void)
 	uint32_t	 i;
 	size_t		*offs;
 
-	sz = lseek(undo, 0, SEEK_END);
-	if (sz <= 0) {
-		if (sz < 0) {
-			perror("hosttorn: undo lseek");
-			exit(2);
-		}
-		return;
+	end = lseek(undo, 0, SEEK_END);
+	if (end < 0) {
+		perror("hosttorn: undo lseek");
+		exit(2);
 	}
+	sz = end - from;
+	if (sz <= 0)
+		return;
 	if ((size_t)sz > cap) {
 		free(jrn);
 		cap = (size_t)sz;
@@ -767,7 +864,7 @@ restore(void)
 			exit(2);
 		}
 	}
-	if (pread(undo, jrn, (size_t)sz, 0) != (ssize_t)sz) {
+	if (pread(undo, jrn, (size_t)sz, from) != (ssize_t)sz) {
 		fprintf(stderr, "hosttorn: the undo journal would not read "
 		    "back\n");
 		exit(2);
@@ -814,6 +911,14 @@ restore(void)
 		}
 	}
 	free(offs);
+}
+
+/* Put the image back as the grid point found it, and start a new journal. */
+static void
+restore(void)
+{
+
+	journal_undo(0);
 	if (ftruncate(undo, 0) != 0) {
 		perror("hosttorn: undo truncate");
 		exit(2);
@@ -845,7 +950,7 @@ struct point {
 };
 
 static struct point
-grid_point(const struct workload *wl, long k, int s, bool keep)
+grid_point(const struct workload *wl, long k, int s, int l, bool keep)
 {
 	struct point	pt;
 	off_t		before;
@@ -854,7 +959,7 @@ grid_point(const struct workload *wl, long k, int s, bool keep)
 		perror("hosttorn: log truncate");
 		exit(2);
 	}
-	pt.p_cut = run_cut(wl, k, s, false);
+	pt.p_cut = run_cut(wl, k, s, l, false);
 	before = lseek(undo, 0, SEEK_END);
 	pt.p_cls = run_verify(wl, false);
 	if (lseek(undo, 0, SEEK_END) != before) {
@@ -897,6 +1002,32 @@ point_allowed(long k, int s, long w, const struct point *pt)
 	return (pt->p_cls == CLS_OLD && pt->p_fsck == FSCK_CLEAN);
 }
 
+/*
+ * A cache cut as write k lands, judged by which writes survived.  The last
+ * barrier before it covers writes 1..b; the cache holds b+1..k and gives up
+ * all of them (ALL) or all but k (NEWEST).  Write w-1 is the ring
+ * superblock and w the anchor, as for an ordered cut.
+ */
+static bool
+cache_allowed(long k, int l, long w, const struct point *pt)
+{
+	long	b;
+	int	i;
+	bool	sb;
+	bool	anchor;
+
+	b = 0;
+	for (i = 0; i < model_nbarriers; i++)
+		if (model_barriers[i] < k && model_barriers[i] > b)
+			b = model_barriers[i];
+	sb     = w - 1 <= b || (l == LOSS_NEWEST && k == w - 1);
+	anchor = w <= b || (l == LOSS_NEWEST && k == w);
+	if (!sb)
+		return (pt->p_cls == CLS_OLD && pt->p_fsck == FSCK_CLEAN);
+	return (pt->p_cls == CLS_NEW &&
+	    pt->p_fsck == (anchor ? FSCK_CLEAN : FSCK_UNCLEAN));
+}
+
 /* ---- the sweep ---------------------------------------------------------- */
 
 static const int	tears[] = { 0, 1, 4, 7 };
@@ -914,12 +1045,15 @@ sweep(const struct workload *wl)
 {
 	struct point	pt;
 	long		W;
+	long		cached;
 	long		flip;
 	long		window;
 	long		k;
 	unsigned	t;
 	int		devs;
 	int		fsck0;
+	int		l;
+	int		nb;
 
 	/*
 	 * No pristine pre-check: the old state exists only after setup, so the
@@ -930,7 +1064,7 @@ sweep(const struct workload *wl)
 	/* the dry run: complete the workload once, learn W, prove NEW */
 	if (truncate(logpath, 0) != 0 && errno != ENOENT)
 		exit(2);
-	W = run_cut(wl, -1, 0, false);
+	W = run_cut(wl, -1, 0, LOSS_NONE, false);
 	if (W <= 0) {
 		printf("hosttorn: %s: FAIL -- the dry run did not complete "
 		    "(%ld)\n", wl->w_name, W);
@@ -956,6 +1090,25 @@ sweep(const struct workload *wl)
 	restore();
 
 	/*
+	 * The barriers the protocol needs: before the ring superblock (after
+	 * write W-2), before the anchor (after W-1), and after it (after W).
+	 * The cache grid below would find a missing one; this names it.
+	 */
+	nb = run_nbarriers;
+	if (nb < 3 || run_barriers[nb - 3] != W - 2 ||
+	    run_barriers[nb - 2] != W - 1 || run_barriers[nb - 1] != W) {
+		printf("hosttorn: %s: FAIL -- %d barrier(s) in the measured "
+		    "edit, the last three after writes %ld, %ld, %ld; wanted "
+		    "%ld, %ld, %ld\n", wl->w_name, nb,
+		    nb >= 3 ? run_barriers[nb - 3] : -1,
+		    nb >= 2 ? run_barriers[nb - 2] : -1,
+		    nb >= 1 ? run_barriers[nb - 1] : -1, W - 2, W - 1, W);
+		return (1);
+	}
+	model_nbarriers = nb;
+	memcpy(model_barriers, run_barriers, sizeof(model_barriers));
+
+	/*
 	 * The grid.  The flip is discovered (the first clean cut answering
 	 * NEW) and asserted to be write W-1, the ring superblock.  Every point
 	 * is judged by point_allowed; crash-window points are counted.
@@ -967,7 +1120,7 @@ sweep(const struct workload *wl)
 		for (t = 0; t < sizeof(tears) / sizeof(tears[0]); t++) {
 			if (k == W && tears[t] != 0)
 				continue;	/* nothing left to tear */
-			pt = grid_point(wl, k, tears[t], false);
+			pt = grid_point(wl, k, tears[t], LOSS_NONE, false);
 			if (k < W ? (pt.p_cut != -1) : (pt.p_cut != W)) {
 				printf("hosttorn: %s: FAIL -- k=%ld s=%d: "
 				    "the cut child did not die at the cut "
@@ -1000,12 +1153,39 @@ sweep(const struct workload *wl)
 		return (devs + 1);
 	}
 
+	/* The cache grid: a cache cut as each write lands, both losses. */
+	cached = 0;
+	for (k = 1; k <= W; k++) {
+		for (l = LOSS_ALL; l <= LOSS_NEWEST; l++) {
+			pt = grid_point(wl, k, 0, l, false);
+			cached++;
+			if (pt.p_cut != -1) {
+				printf("hosttorn: %s: FAIL -- k=%ld loss=%s: "
+				    "the cut child did not die at the cut "
+				    "(%d)\n", wl->w_name, k, loss_name(l),
+				    pt.p_cut);
+				devs++;
+				continue;
+			}
+			if (!cache_allowed(k, l, W, &pt)) {
+				printf("hosttorn: %s: DEVIATION k=%ld "
+				    "loss=%s -- state=%s fsck=%s (reproduce: "
+				    "obj/hosttorn %s %s -k %ld -l %d)\n",
+				    wl->w_name, k, loss_name(l),
+				    cls_name(pt.p_cls), fsck_name(pt.p_fsck),
+				    img_path, wl->w_name, k, l);
+				devs++;
+			}
+		}
+	}
+
 	printf("hosttorn: %s -- %ld write(s) in the measured edit, %ld "
-	    "power failure(s) staged, old until write %ld and new from it, "
-	    "the anchor lagged at %ld point(s) (whole but unclean), %d "
-	    "deviation(s)\n", wl->w_name, W,
-	    (long)(W * (sizeof(tears) / sizeof(tears[0])) + 1), flip,
-	    window, devs);
+	    "power failure(s) staged in order and %ld with the drive cache "
+	    "losing writes, barriers after writes %ld, %ld and %ld, old until "
+	    "write %ld and new from it, the anchor lagged at %ld point(s) "
+	    "(whole but unclean), %d deviation(s)\n", wl->w_name, W,
+	    (long)(W * (sizeof(tears) / sizeof(tears[0])) + 1), cached,
+	    W - 2, W - 1, W, flip, window, devs);
 	return (devs);
 }
 
@@ -1017,11 +1197,12 @@ main(int argc, char **argv)
 	unsigned		 i;
 	int			 arg;
 	int			 s;
+	int			 l;
 	int			 devs;
 
 	if (argc < 2) {
-		fprintf(stderr, "usage: %s IMAGE [workload] [-k N [-s S]]\n",
-		    argv[0]);
+		fprintf(stderr, "usage: %s IMAGE [workload] [-k N [-s S | "
+		    "-l 1|2]]\n", argv[0]);
 		fprintf(stderr, "workloads:");
 		for (i = 0; i < sizeof(workloads) / sizeof(workloads[0]); i++)
 			fprintf(stderr, " %s", workloads[i].w_name);
@@ -1045,11 +1226,14 @@ main(int argc, char **argv)
 	only = NULL;
 	k = -1;
 	s = 0;
+	l = LOSS_NONE;
 	for (arg = 2; arg < argc; arg++) {
 		if (strcmp(argv[arg], "-k") == 0 && arg + 1 < argc) {
 			k = atol(argv[++arg]);
 		} else if (strcmp(argv[arg], "-s") == 0 && arg + 1 < argc) {
 			s = atoi(argv[++arg]);
+		} else if (strcmp(argv[arg], "-l") == 0 && arg + 1 < argc) {
+			l = atoi(argv[++arg]);
 		} else {
 			for (i = 0; i < sizeof(workloads) /
 			    sizeof(workloads[0]); i++)
@@ -1075,13 +1259,13 @@ main(int argc, char **argv)
 			fprintf(stderr, "hosttorn: -k needs a workload\n");
 			return (2);
 		}
-		pt.p_cut = run_cut(only, k, s, true);
+		pt.p_cut = run_cut(only, k, s, l, true);
 		pt.p_cls = run_verify(only, true);
 		pt.p_fsck = fsck_verdict(true);
-		printf("hosttorn: %s k=%ld s=%d -- cut=%d state=%s fsck=%s; "
-		    "the image is left as the failure left it\n",
-		    only->w_name, k, s, pt.p_cut, cls_name(pt.p_cls),
-		    fsck_name(pt.p_fsck));
+		printf("hosttorn: %s k=%ld s=%d loss=%s -- cut=%d state=%s "
+		    "fsck=%s; the image is left as the failure left it\n",
+		    only->w_name, k, s, loss_name(l), pt.p_cut,
+		    cls_name(pt.p_cls), fsck_name(pt.p_fsck));
 		return (0);
 	}
 

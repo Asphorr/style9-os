@@ -52,10 +52,18 @@ int	bio_read(unsigned drive, uint64_t lba, uint32_t nsec, void *buf);
  * Write `nsec' sectors at `lba'.  Returns 0, or the driver's positive
  * error.  Write-through: the disk first, then resident pages are patched
  * with the new bytes rather than dropped, so the metadata a write just
- * walked stays cached.  Nothing is dirty: on 0 the bytes are on the
- * platter, since ata_kwrite ends with FLUSH CACHE.
+ * walked stays cached.  Nothing is dirty here, but 0 means only that the
+ * drive took the bytes: until bio_sync they may be in its write cache,
+ * and a power cut may keep any subset of them, in any order.
  */
 int	bio_write(unsigned drive, uint64_t lba, uint32_t nsec, const void *buf);
+
+/*
+ * The barrier: returns 0 once every write bio_write has returned 0 for is
+ * on the medium.  Ordering between writes is only what bio_sync puts
+ * between them.
+ */
+int	bio_sync(unsigned drive);
 
 /*
  * Forget everything cached for a device, for writers that bypass this

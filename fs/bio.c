@@ -47,6 +47,7 @@ static uint64_t		bio_n_miss;	/* pages fetched from the device */
 static uint64_t		bio_n_evict;	/* live pages thrown out         */
 static uint64_t		bio_n_write;	/* sector runs written           */
 static uint64_t		bio_n_patch;	/* resident pages a write fixed  */
+static uint64_t		bio_n_sync;	/* (a) cache flushes asked for */
 
 static void
 mem_copy(uint8_t *dst, const uint8_t *src, size_t n)
@@ -309,6 +310,15 @@ bio_write(unsigned drive, uint64_t lba, uint32_t nsec, const void *buf)
 	return (0);
 }
 
+int
+bio_sync(unsigned drive)
+{
+
+	/* Nothing to do in the cache, which holds no dirty pages. */
+	__atomic_fetch_add(&bio_n_sync, 1, __ATOMIC_RELAXED);
+	return (ata_ksync(drive));
+}
+
 void
 bio_invalidate_drive(unsigned drive)
 {
@@ -355,6 +365,9 @@ bio_stats(void)
 	    (unsigned long long)miss, (unsigned long long)evict,
 	    (unsigned)live, (unsigned)BIO_NBUFS);
 	if (wr != 0)
-		kprintf("bio: %llu writes -- %llu resident pages patched\n",
-		    (unsigned long long)wr, (unsigned long long)patch);
+		kprintf("bio: %llu writes -- %llu resident pages patched, "
+		    "%llu cache flushes\n", (unsigned long long)wr,
+		    (unsigned long long)patch,
+		    (unsigned long long)__atomic_load_n(&bio_n_sync,
+		    __ATOMIC_RELAXED));
 }

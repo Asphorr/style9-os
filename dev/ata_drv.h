@@ -40,13 +40,16 @@ void	ata_drv_init(void);
 int	ata_kread(unsigned drive_idx, uint64_t lba, uint32_t count, void *buf);
 
 /*
- * The other direction, same contract.  WRITE SECTORS (EXT) then FLUSH
- * CACHE, so 0 means the drive has the bytes, not merely accepted them.
- * Callers use bio_write (fs/bio.h), since the block cache cannot see a
- * write that goes around it.
+ * The other direction, same contract, and no FLUSH CACHE: 0 means the
+ * drive accepted the bytes, which may sit in its write cache, in any
+ * order, until ata_ksync.  Callers use bio_write and bio_sync (fs/bio.h),
+ * since the block cache cannot see a write that goes around it.
  */
 int	ata_kwrite(unsigned drive_idx, uint64_t lba, uint32_t count,
 	    const void *buf);
+
+/* FLUSH CACHE: every write ata_kwrite returned 0 for is on the medium. */
+int	ata_ksync(unsigned drive_idx);
 
 /* Print per-channel interrupt and wait counters. */
 void	ata_irq_stats(void);
