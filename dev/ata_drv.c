@@ -1104,7 +1104,7 @@ ata_irq(struct ata_channel *ch)
 	 * scheduler call legal from here: it appends to a lock-free list and
 	 * returns, leaving the actual wake to a safe preempt point.
 	 */
-	w = __atomic_exchange_n(&ch->ch_waiter, NULL, __ATOMIC_ACQUIRE);
+	w = __atomic_exchange_n(&ch->ch_waiter, NULL, __ATOMIC_ACQ_REL);
 	if (w != NULL)
 		sched_post_irq_wake(w);
 }
@@ -1186,8 +1186,16 @@ ata_wait_intr(struct ata_channel *ch, uint8_t want, uint8_t *sr_out)
 		 * Install ourselves, then re-check: the interrupt may have
 		 * landed in the gap.  If it did, drop the slot again -- an
 		 * interrupt for the NEXT sector must not find a stale waiter.
+		 *
+		 * The install is an exchange, not a store: a plain store
+		 * may still be in this CPU's store buffer when the re-check
+		 * reads ch_irq_seen, and an interrupt on another processor
+		 * in that window finds the slot empty and wakes nobody --
+		 * a lost wake that costs a whole ATA_INTR_SLICE_MS before
+		 * the deadline looks instead.  kbd_getc_block has the rest.
 		 */
-		__atomic_store_n(&ch->ch_waiter, self, __ATOMIC_RELEASE);
+		(void)__atomic_exchange_n(&ch->ch_waiter, self,
+		    __ATOMIC_ACQ_REL);
 		if (__atomic_load_n(&ch->ch_irq_seen, __ATOMIC_ACQUIRE) != 0) {
 			__atomic_store_n(&ch->ch_waiter, NULL,
 			    __ATOMIC_RELAXED);

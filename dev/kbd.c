@@ -311,9 +311,11 @@ kbd_buf_push(char ch)
 	 * we don't take sched_lock from IRQ context).  The
 	 * wake_pending flag covers the narrow race where the
 	 * consumer is between recheck-and-block and would otherwise
-	 * miss the signal.
+	 * miss the signal.  Release as well as acquire: it is what
+	 * carries the push above to a consumer whose own exchange
+	 * reads this one (see kbd_getc_block).
 	 */
-	w = __atomic_exchange_n(&kbd_waiter, NULL, __ATOMIC_ACQUIRE);
+	w = __atomic_exchange_n(&kbd_waiter, NULL, __ATOMIC_ACQ_REL);
 	if (w != NULL) {
 		__atomic_store_n(&kbd_wake_pending, 1, __ATOMIC_RELEASE);
 		sched_post_irq_wake(w);
@@ -351,9 +353,22 @@ kbd_getc_block(void)
 		 * matters -- the IRQ-side store sequence is push, then
 		 * exchange waiter, then set pending; we mirror it in
 		 * reverse: clear pending, install waiter, recheck.
+		 *
+		 * ⚠ THE INSTALL IS AN EXCHANGE, NOT A STORE, and the
+		 * recheck below is only worth anything because of it.  A
+		 * store followed by a load of a DIFFERENT address is the
+		 * one reordering x86 allows: the recheck can read the head
+		 * index while our name is still in this CPU's store buffer.
+		 * With the IRQ on another processor, it can push a byte in
+		 * that window and exchange the slot empty-handed, and we
+		 * park over a ring with data in it -- woken, if ever, by
+		 * the next keystroke.  With both sides exchanging the one
+		 * slot, the two exchanges fall in a single order and the
+		 * second sees the first: the IRQ finds our name, or ours
+		 * reads the IRQ's and acquires the push that preceded it.
 		 */
 		__atomic_store_n(&kbd_wake_pending, 0, __ATOMIC_RELAXED);
-		__atomic_store_n(&kbd_waiter, self, __ATOMIC_RELEASE);
+		(void)__atomic_exchange_n(&kbd_waiter, self, __ATOMIC_ACQ_REL);
 
 		c = kbd_getc();
 		if (c >= 0) {

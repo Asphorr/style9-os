@@ -321,7 +321,7 @@ mouse_ring_push(const uint8_t *pkt)
 	 * must not take sched_lock from IRQ context); wake_pending covers
 	 * the recheck-and-block race.  Identical to kbd_buf_push.
 	 */
-	w = __atomic_exchange_n(&mouse_waiter, NULL, __ATOMIC_ACQUIRE);
+	w = __atomic_exchange_n(&mouse_waiter, NULL, __ATOMIC_ACQ_REL);
 	if (w != NULL) {
 		__atomic_store_n(&mouse_wake_pending, 1, __ATOMIC_RELEASE);
 		sched_post_irq_wake(w);
@@ -347,9 +347,12 @@ mouse_getpkt_block(uint8_t *out)
 		 * Empty: clear pending, install the waiter, recheck.  Mirror
 		 * of the IRQ-side store order (push, exchange waiter, set
 		 * pending) run in reverse, the way kbd_getc_block does it.
+		 * The install is an exchange so that the recheck cannot be
+		 * satisfied from before it -- kbd_getc_block says why.
 		 */
 		__atomic_store_n(&mouse_wake_pending, 0, __ATOMIC_RELAXED);
-		__atomic_store_n(&mouse_waiter, self, __ATOMIC_RELEASE);
+		(void)__atomic_exchange_n(&mouse_waiter, self,
+		    __ATOMIC_ACQ_REL);
 
 		if (mouse_getpkt(out) == 0) {
 			__atomic_store_n(&mouse_waiter, NULL,

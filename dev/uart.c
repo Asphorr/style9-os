@@ -162,8 +162,10 @@ uart_getc_block(void)
 			return ((unsigned char)c);
 		}
 
+		/* An exchange, not a store -- kbd_getc_block says why. */
 		__atomic_store_n(&uart_wake_pending, 0, __ATOMIC_RELAXED);
-		__atomic_store_n(&uart_waiter, self, __ATOMIC_RELEASE);
+		(void)__atomic_exchange_n(&uart_waiter, self,
+		    __ATOMIC_ACQ_REL);
 
 		if (uart_buf_head != uart_buf_tail) {
 			__atomic_store_n(&uart_waiter, NULL,
@@ -225,7 +227,7 @@ uart_buf_push(char ch)
 	uart_buf[uart_buf_head & UART_BUF_MASK] = ch;
 	uart_buf_head = next;
 
-	w = __atomic_exchange_n(&uart_waiter, NULL, __ATOMIC_ACQUIRE);
+	w = __atomic_exchange_n(&uart_waiter, NULL, __ATOMIC_ACQ_REL);
 	if (w != NULL) {
 		__atomic_store_n(&uart_wake_pending, 1, __ATOMIC_RELEASE);
 		sched_post_irq_wake(w);
