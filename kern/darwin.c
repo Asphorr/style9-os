@@ -2106,9 +2106,13 @@ static struct spinlock		darwin_zombie_lock =
 /* ---- signals ------------------------------------------------------------- */
 
 /*
- * Bit for signal `signo` in the pending / mask words.  Valid signals are
- * 1..DARWIN_NSIG-1; signal 0 (the kill(2) existence probe) and anything out
- * of range map to no bit, so posting them is a silent no-op.
+ * Bit for signal `signo` in the pending / mask words, in Apple's sigset_t
+ * layout: signal n is bit n - 1 (XNU's sigmask(), <signal.h>'s __sigbits).
+ * Masks arrive from user space as-is, and SDK-built binaries fill them
+ * with the <signal.h> macros, so any other layout blocks the wrong
+ * signal.  Valid signals are 1..DARWIN_NSIG-1; signal 0 (the kill(2)
+ * existence probe) and anything out of range map to no bit, so posting
+ * them is a silent no-op.
  */
 static inline uint32_t
 darwin_sigbit(int signo)
@@ -2116,7 +2120,7 @@ darwin_sigbit(int signo)
 
 	if (signo <= 0 || signo >= DARWIN_NSIG)
 		return (0);
-	return ((uint32_t)1 << signo);
+	return ((uint32_t)1 << (signo - 1));
 }
 
 /*
@@ -2255,8 +2259,8 @@ darwin_signal_next(struct task *t, uint64_t *disp_out)
 		    __ATOMIC_ACQUIRE) & ~t->t_sig_mask;
 		if (deliverable == 0)
 			return (0);
-		signo = __builtin_ctz(deliverable);
-		bit   = (uint32_t)1 << signo;
+		signo = __builtin_ctz(deliverable) + 1;
+		bit   = darwin_sigbit(signo);
 		disp  = t->t_sig_handler[signo];
 		if (disp != DARWIN_SIG_DFL && disp != DARWIN_SIG_IGN) {
 			*disp_out = disp;
@@ -2378,7 +2382,7 @@ darwin_signal_deliver_syscall(struct syscall_frame *f, long rv)
 		 * frame cannot be built, terminate instead.
 		 */
 		__atomic_fetch_and(&t->t_sig_pending,
-		    ~((uint32_t)1 << signo), __ATOMIC_RELEASE);
+		    ~darwin_sigbit(signo), __ATOMIC_RELEASE);
 		if (darwin_signal_setup_frame(f, signo, disp, rv) == 0)
 			return;
 	}
@@ -2466,7 +2470,7 @@ darwin_signal_deliver_trap(struct trapframe *tf)
 		return;
 	if (disp != DARWIN_SIG_DFL) {
 		__atomic_fetch_and(&t->t_sig_pending,
-		    ~((uint32_t)1 << signo), __ATOMIC_RELEASE);
+		    ~darwin_sigbit(signo), __ATOMIC_RELEASE);
 		if (darwin_signal_setup_frame_trap(tf, signo, disp) == 0)
 			return;
 	}
@@ -3773,12 +3777,15 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		if (target == NULL)
 			return (darwin_err(f, DARWIN_ESRCH));
 		/*
-		 * The target's disposition decides the mechanism.  Read
-		 * without a lock: sigaction(2), the only writer, writes only
-		 * its own task, so a concurrent change can be missed.
+		 * The target's disposition decides the mechanism.  One
+		 * atomic load, no lock: sigaction(2) writes only its own
+		 * task, and a kill that races it may act on either
+		 * disposition, as if it came just before or just after.
 		 */
-		disp = (sig > 0 && sig < DARWIN_NSIG)
-		    ? target->t_sig_handler[sig] : DARWIN_SIG_DFL;
+		disp = DARWIN_SIG_DFL;
+		if (sig > 0 && sig < DARWIN_NSIG)
+			disp = __atomic_load_n(&target->t_sig_handler[sig],
+			    __ATOMIC_RELAXED);
 		if (sig != 0 && (disp != DARWIN_SIG_DFL ||
 		    darwin_sig_default_is_ignore(sig) ||
 		    target == current_thread->th_task)) {
@@ -3824,8 +3831,10 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		 * commands install a handler only where the signal was not
 		 * already ignored.
 		 */
+		/* Atomic store: kill(2) from another task reads the slot. */
 		old = current_thread->th_task->t_sig_handler[signo];
-		current_thread->th_task->t_sig_handler[signo] = f->sf_arg1;
+		__atomic_store_n(&current_thread->th_task->t_sig_handler[signo],
+		    f->sf_arg1, __ATOMIC_RELAXED);
 		/* arg2 carries libSystem's _sigtramp VA (same for every sig). */
 		if (f->sf_arg2 != 0)
 			current_thread->th_task->t_sig_tramp = f->sf_arg2;

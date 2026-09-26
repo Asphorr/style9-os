@@ -1347,8 +1347,8 @@ struct fs_statbuf {
 	uint8_t		fs_is_dir;
 };
 
-_Static_assert(sizeof(struct fs_dirent) == 280, "must match kern/fs.h");
-_Static_assert(sizeof(struct fs_statbuf) == 72, "must match kern/fs.h");
+_Static_assert(sizeof(struct fs_dirent) == 280, "must match fs/fs.h");
+_Static_assert(sizeof(struct fs_statbuf) == 72, "must match fs/fs.h");
 
 /* fs_stat backchannel: fills *sb; returns 0, or -1 (carry set) if absent. */
 static long
@@ -1644,7 +1644,7 @@ s9_fs_fdpath(int fd, char *buf, size_t cap)
  * Join a directory fd and a relative name into one path.  With AT_FDCWD
  * or an absolute name the fd plays no part.
  */
-#define	AT_FDCWD	(-2)
+#define	AT_FDCWD	(-2)		/* macOS's, and it is not -100 */
 
 static int
 at_path(int fd, const char *name, char *out, size_t cap)
@@ -1734,8 +1734,6 @@ fchdir(int fd)
  */
 #define	DIRFD_BASE	0x7D00		/* far above any real fd number */
 #define	DIRFD_SLOTS	16
-
-#define	AT_FDCWD	(-2)		/* macOS's, and it is not -100 */
 
 static DIR	*dirfd_tab[DIRFD_SLOTS];
 
@@ -3393,9 +3391,10 @@ sigemptyset(void *set)
 }
 
 /*
- * Real set operations on Apple's 32-bit sigset_t (signals 1..31): a
- * program that blocks SIGCHLD, checks for a dead child and then pselects
- * relies on the mask to close the window between the two.
+ * Real set operations on Apple's 32-bit sigset_t (signals 1..31, signal n
+ * in bit n - 1, as <signal.h>'s macros and the kernel have it): a program
+ * that blocks SIGCHLD, checks for a dead child and then pselects relies on
+ * the mask to close the window between the two.
  */
 int
 sigaddset(void *set, int sig)
@@ -3405,7 +3404,7 @@ sigaddset(void *set, int sig)
 		g_errno = 22;			/* EINVAL */
 		return (-1);
 	}
-	*(unsigned int *)set |= 1u << sig;
+	*(unsigned int *)set |= 1u << (sig - 1);
 	return (0);
 }
 
@@ -3415,7 +3414,7 @@ sigismember(const void *set, int sig)
 
 	if (set == NULL || sig < 1 || sig > 31)
 		return (0);
-	return ((*(const unsigned int *)set & (1u << sig)) != 0);
+	return ((*(const unsigned int *)set & (1u << (sig - 1))) != 0);
 }
 
 int
@@ -3647,8 +3646,11 @@ int
 sigdelset(void *set, int sig)
 {
 
-	if (set != NULL && sig >= 1 && sig <= 32)
-		*(unsigned int *)set &= ~(1u << (sig - 1));
+	if (set == NULL || sig < 1 || sig > 31) {
+		g_errno = 22;			/* EINVAL */
+		return (-1);
+	}
+	*(unsigned int *)set &= ~(1u << (sig - 1));
 	return (0);
 }
 
@@ -5181,7 +5183,7 @@ posix_spawn(int *pidp, const char *path, void *const *fap, void *const *attrp,
 		}
 		if (sa != NULL && (sa->sa_flags & POSIX_SPAWN_SETSIGDEF) != 0) {
 			for (sig = 1; sig < 32; sig++)
-				if ((sa->sa_sigdefault & (1u << sig)) != 0)
+				if ((sa->sa_sigdefault & (1u << (sig - 1))) != 0)
 					(void)signal(sig, NULL);
 		}
 		if (sa != NULL && (sa->sa_flags & POSIX_SPAWN_SETSIGMASK) != 0)
