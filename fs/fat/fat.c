@@ -32,9 +32,12 @@
 #define	FAT_DIRENT_END		0x00	/* no further entries          */
 #define	FAT_DIRENT_FREE		0xE5	/* deleted entry               */
 
-/* FAT16 cluster values. */
+/* FAT16 cluster values; fat_next widens FAT12's 0xFF7.. to these. */
 #define	FAT16_EOC_MIN		0xFFF8u	/* >= this == end of chain     */
 #define	FAT16_BAD		0xFFF7u
+
+#define	FAT12_BAD		0xFF7u
+#define	FAT12_MAX_CLUSTERS	4085	/* fewer clusters == FAT12     */
 
 /*
  * The one mounted volume.  Lock key: (c) const after fs_fat_init -- the FS
@@ -43,6 +46,7 @@
  */
 static struct fat_vol {
 	bool		fv_mounted;	/* (c) */
+	bool		fv_fat12;	/* (c) 12-bit FAT entries          */
 	uint8_t		fv_sec_per_clus;/* (c) */
 	uint16_t	fv_root_entries;/* (c) */
 	uint32_t	fv_fat_start;	/* (c) first FAT sector (LBA)      */
@@ -180,11 +184,13 @@ fs_fat_init(void)
 	data_clusters = (total > clus_start) ?
 	    (total - clus_start) / g_fat.fv_sec_per_clus : 0;
 
+	/* The cluster count alone decides the FAT width (FAT spec). */
+	g_fat.fv_fat12   = data_clusters < FAT12_MAX_CLUSTERS;
 	g_fat.fv_mounted = true;
 
 	kprintf("fs_fat: mounted FAT%s on disk0 -- %u sectors, %u clusters "
 	    "(spc=%u), root@%u data@%u\n",
-	    data_clusters < 4085 ? "12" : "16",
+	    g_fat.fv_fat12 ? "12" : "16",
 	    (unsigned)total, (unsigned)data_clusters,
 	    (unsigned)g_fat.fv_sec_per_clus,
 	    (unsigned)g_fat.fv_root_start, (unsigned)g_fat.fv_data_start);
@@ -425,19 +431,45 @@ fat_time_ns(uint16_t date, uint16_t time)
 
 /* ---- FAT chain --------------------------------------------------------- */
 
-/* Next cluster after `clus`, or >= FAT16_EOC_MIN at end / on error. */
+/*
+ * Next cluster after `clus`, or >= FAT16_EOC_MIN at end / on error.  A
+ * FAT12 entry is 12 bits at byte offset clus * 1.5 (the high 12 of the 16
+ * read for an odd cluster, the low 12 for an even one) and can straddle
+ * two sectors.
+ */
 static uint32_t
 fat_next(uint32_t clus)
 {
 	uint8_t		sec[FAT_SECTOR_BYTES];
 	uint32_t	fat_off;
 	uint32_t	fat_sec;
+	uint32_t	in;
+	uint32_t	v;
 
-	fat_off = clus * 2u;
+	if (!g_fat.fv_fat12) {
+		fat_off = clus * 2u;
+		fat_sec = g_fat.fv_fat_start + fat_off / FAT_SECTOR_BYTES;
+		if (read_sector(fat_sec, sec) != FS_FAT_E_OK)
+			return (FAT16_EOC_MIN);
+		return (rd16(sec, fat_off % FAT_SECTOR_BYTES));
+	}
+
+	fat_off = clus + clus / 2u;
 	fat_sec = g_fat.fv_fat_start + fat_off / FAT_SECTOR_BYTES;
+	in      = fat_off % FAT_SECTOR_BYTES;
 	if (read_sector(fat_sec, sec) != FS_FAT_E_OK)
 		return (FAT16_EOC_MIN);
-	return (rd16(sec, fat_off % FAT_SECTOR_BYTES));
+	v = sec[in];
+	if (in + 1 < FAT_SECTOR_BYTES)
+		v |= (uint32_t)sec[in + 1] << 8;
+	else if (read_sector(fat_sec + 1, sec) == FS_FAT_E_OK)
+		v |= (uint32_t)sec[0] << 8;
+	else
+		return (FAT16_EOC_MIN);
+	v = (clus & 1u) != 0 ? v >> 4 : v & 0xFFFu;
+	if (v >= FAT12_BAD)
+		v |= 0xF000u;		/* bad and end-of-chain, as FAT16 */
+	return (v);
 }
 
 /* ---- directory walk ---------------------------------------------------- */
