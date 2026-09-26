@@ -75,8 +75,9 @@ cpu_bsp_init(void)
  *
  * The boot CPU does not call this: it gets CR0.WP from boot.S and the rest
  * from kmain.  fpu_init and syscall_init call the same per-CPU halves used
- * here, so each fact has one copy; smap_enable_runtime sets CR4.SMAP
- * itself, and smap_init_cpu copies it only where smap_enabled says so.
+ * here, so each fact has one copy; smap_enable_runtime and smep_enable set
+ * their CR4 bits on the boot CPU, and smap_init_cpu copies each one only
+ * where the kernel turned it on.
  */
 void
 cpu_state_init(void)

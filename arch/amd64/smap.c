@@ -14,14 +14,25 @@
 
 /*
  * Supervisor Mode Access Prevention.  CPUID.(EAX=7,ECX=0):EBX bit 20
- * advertises SMAP (bit 7 is SMEP, not used here).  smap_init only detects;
- * kmain calls smap_enable_runtime right after it to set CR4.SMAP.  The
- * bracket helpers (smap_user_access_begin/end) are no-ops until then, and
- * once it is set an unbracketed user-pointer dereference #PFs the kernel.
+ * advertises SMAP.  smap_init only detects; kmain calls
+ * smap_enable_runtime right after it to set CR4.SMAP.  The bracket
+ * helpers (smap_user_access_begin/end) are no-ops until then, and once it
+ * is set an unbracketed user-pointer dereference #PFs the kernel.
+ *
+ * Supervisor Mode Execution Prevention (EBX bit 7, CR4.SMEP) lives here
+ * too: an instruction fetch in ring 0 from a user page faults.  Kernel
+ * text sits in the boot identity map, whose entries are supervisor-only,
+ * so nothing legitimate runs from a user page; a kernel jump through a
+ * user-supplied pointer becomes a fault instead of user code at ring 0.
  */
 
-bool	smap_enabled;
-bool	smap_supported;
+#define	CR4_SMEP	((uint64_t)1 << 20)
+#define	CR4_SMAP	((uint64_t)1 << 21)
+
+bool		smap_enabled;
+bool		smap_supported;
+static bool	smep_enabled;		/* (a) set once by smep_enable */
+static bool	smep_supported;		/* (c) const after smap_init   */
 
 void
 smap_init(void)
@@ -40,6 +51,7 @@ smap_init(void)
 	}
 
 	cpuid_count(7, 0, &eax, &ebx, &ecx, &edx);
+	smep_supported = (ebx & (1u << 7)) != 0;
 	if ((ebx & (1u << 20)) == 0) {
 		kprintf("smap: not supported by this CPU\n");
 		return;
@@ -65,7 +77,7 @@ smap_enable_runtime(void)
 		return (true);
 
 	__asm __volatile("mov %%cr4, %0" : "=r"(cr4));
-	cr4 |= (1ull << 21);
+	cr4 |= CR4_SMAP;
 	__asm __volatile("mov %0, %%cr4" : : "r"(cr4));
 
 	smap_enabled = true;
@@ -74,19 +86,43 @@ smap_enable_runtime(void)
 }
 
 /*
- * CR4.SMAP is per-CPU; smap_enabled is not.  A CPU brought up after the
- * enable would otherwise let the kernel touch user memory without a fault,
- * on that CPU only.
+ * Set CR4.SMEP on this CPU.  Returns false if the CPU lacks SMEP.  Called
+ * from kmain next to smap_enable_runtime, before the APs are released.
+ */
+bool
+smep_enable(void)
+{
+	uint64_t	cr4;
+
+	if (!smep_supported) {
+		kprintf("smep: not supported by this CPU\n");
+		return (false);
+	}
+	__asm __volatile("mov %%cr4, %0" : "=r"(cr4));
+	cr4 |= CR4_SMEP;
+	__asm __volatile("mov %0, %%cr4" : : "r"(cr4));
+
+	smep_enabled = true;
+	kprintf("smep: enabled (CR4.SMEP=1)\n");
+	return (true);
+}
+
+/*
+ * CR4.SMAP and CR4.SMEP are per-CPU; the flags saying they are on are
+ * not.  A CPU brought up after the enable would otherwise run without
+ * them, and that CPU alone would let the kernel touch or run user pages.
  */
 void
 smap_init_cpu(void)
 {
 	uint64_t	cr4;
+	uint64_t	want;
 
-	if (!smap_enabled)
+	want = (smap_enabled ? CR4_SMAP : 0) | (smep_enabled ? CR4_SMEP : 0);
+	if (want == 0)
 		return;
 
 	__asm __volatile("mov %%cr4, %0" : "=r"(cr4));
-	cr4 |= (1ull << 21);
+	cr4 |= want;
 	__asm __volatile("mov %0, %%cr4" : : "r"(cr4));
 }

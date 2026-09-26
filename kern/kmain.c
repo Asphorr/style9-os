@@ -376,9 +376,10 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	syscall_init();
 	smap_init();
 	(void)smap_enable_runtime();
+	(void)smep_enable();
 
 	/*
-	 * Now release the parked processors: CR4.SMAP and the SYSCALL
+	 * Now release the parked processors: CR4.SMAP/SMEP and the SYSCALL
 	 * registers, set just above, are the last per-CPU state a thread
 	 * depends on, and a CPU released earlier would run user threads
 	 * without them.
