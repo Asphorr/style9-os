@@ -47,14 +47,22 @@
  * fields under s9launchd_lock.  The lock is dropped around anything
  * heavier -- progreg_spawn, task_request_terminate, arm_keepalive, the
  * reply -- so it nests only over task_is_alive's tasks_lock.
+ *
+ * A spawn therefore lands after the lock was let go, and the cell may
+ * have been stopped, unloaded or reused meanwhile.  STOP and UNLOAD bump
+ * lc_gen; a spawn records the generation it started under and keeps its
+ * child only if it still matches (spawn_begin_locked/spawn_end_locked).
+ * lc_spawning makes a second START, or a keep_alive respawn, wait for
+ * the first instead of starting another.
  */
 
 struct launchd_cell {
 	bool		lc_used;
 	bool		lc_keepalive;	/* respawn on unexpected exit    */
 	uint8_t		lc_state;	/* LAUNCHD_STATE_*               */
-	uint8_t		lc_pad;
+	bool		lc_spawning;	/* a spawn is in flight          */
 	uint32_t	lc_fast_crashes; /* consecutive sub-throttle exits */
+	uint32_t	lc_gen;		/* bumped by STOP and UNLOAD     */
 	uint64_t	lc_task_id;
 	uint64_t	lc_last_spawn_ms; /* clock_uptime_ms at last spawn */
 	char		lc_name[LAUNCHD_NAME_MAX];
@@ -173,6 +181,73 @@ note_spawn_locked(struct launchd_cell *c)
 }
 
 /*
+ * Mark `c' as starting, FAILED until the spawn lands, and return the
+ * generation the spawn belongs to.  Caller holds s9launchd_lock and drops
+ * it around progreg_spawn.
+ */
+static uint32_t
+spawn_begin_locked(struct launchd_cell *c)
+{
+
+	c->lc_spawning = true;
+	c->lc_state    = LAUNCHD_STATE_FAILED;
+	c->lc_task_id  = 0;
+	return (c->lc_gen);
+}
+
+/*
+ * Record a spawn issued for cell `idx' under generation `gen'.  Returns
+ * false, touching nothing, if the cell was stopped, unloaded or reused
+ * since: the child belongs to no entry, and the caller hands it to
+ * spawn_orphaned once the lock is dropped and answers MACH_E_NAME, as if
+ * the label had gone before the request.
+ */
+static bool
+spawn_end_locked(int idx, uint32_t gen, long child_id)
+{
+	struct launchd_cell	*c;
+
+	c = &s9launchd_cells[idx];
+	if (c->lc_gen != gen)
+		return (false);
+	c->lc_spawning = false;
+	if (child_id < 0) {
+		c->lc_state   = LAUNCHD_STATE_FAILED;
+		c->lc_task_id = 0;
+	} else {
+		c->lc_state   = LAUNCHD_STATE_RUNNING;
+		c->lc_task_id = (uint64_t)child_id;
+		note_spawn_locked(c);
+	}
+	return (true);
+}
+
+/* Kill a child whose entry went away while it started.  Unlocked. */
+static void
+spawn_orphaned(const char *program, long child_id)
+{
+
+	if (child_id < 0)
+		return;
+	kprintf("launchd: '%s' was stopped or unloaded while it started -- "
+	    "task %llu terminated\n", program, (unsigned long long)child_id);
+	task_request_terminate((uint64_t)child_id);
+}
+
+/*
+ * Disown what `c' runs or is starting: a spawn in flight will find the
+ * generation moved and kill its child.  Caller holds s9launchd_lock.
+ */
+static void
+disown_locked(struct launchd_cell *c)
+{
+
+	c->lc_gen++;
+	c->lc_spawning = false;
+	c->lc_task_id  = 0;
+}
+
+/*
  * Watch `task_id`'s task-self port for death, tagged with the cell
  * index.  Best-effort: a task already gone is not watched, so an
  * instance that dies within the spawn-to-arm window is not restarted.
@@ -277,6 +352,7 @@ op_load(const struct mach_msg_header *req, struct port_space *from)
 	const uint8_t				*p;
 	size_t					 body_off, body_size, i;
 	long					 child_id;
+	uint32_t				 gen;
 	int					 free_idx;
 	int					 dup_idx;
 
@@ -345,28 +421,27 @@ op_load(const struct mach_msg_header *req, struct port_space *from)
 		copy_bounded(c->lc_program, body.lr_program, LAUNCHD_PROGRAM_MAX);
 		c->lc_keepalive = (body.lr_flags &
 		    LAUNCHD_LOAD_FLAG_KEEPALIVE) != 0;
-		c->lc_state        = LAUNCHD_STATE_FAILED;	/* pessimistic */
-		c->lc_task_id      = 0;
 		c->lc_fast_crashes = 0;
-
-		spin_unlock(&s9launchd_lock);
-
-		child_id = progreg_spawn(c->lc_program);
-
-		spin_lock(&s9launchd_lock);
-		if (child_id < 0) {
-			c->lc_state   = LAUNCHD_STATE_FAILED;
-			c->lc_task_id = 0;
-			reply.ls_status  = (int32_t)child_id;
-		} else {
-			c->lc_state   = LAUNCHD_STATE_RUNNING;
-			c->lc_task_id = (uint64_t)child_id;
-			note_spawn_locked(c);
-			reply.ls_status  = MACH_MSG_OK;
-		}
-		reply.ls_state   = c->lc_state;
-		reply.ls_task_id = c->lc_task_id;
+		gen = spawn_begin_locked(c);
 	}
+	spin_unlock(&s9launchd_lock);
+
+	child_id = progreg_spawn(body.lr_program);
+
+	spin_lock(&s9launchd_lock);
+	if (!spawn_end_locked(free_idx, gen, child_id)) {
+		spin_unlock(&s9launchd_lock);
+		spawn_orphaned(body.lr_program, child_id);
+		reply.ls_status   = MACH_E_NAME;
+		reply.ls_state    = LAUNCHD_STATE_EXITED;
+		reply.ls_task_id  = 0;
+		reply.ls_taskport = MACH_PORT_NULL;
+		reply.ls_pad      = 0;
+		return (svc_reply_inline(req, from, &reply, sizeof(reply)));
+	}
+	reply.ls_status  = child_id < 0 ? (int32_t)child_id : MACH_MSG_OK;
+	reply.ls_state   = s9launchd_cells[free_idx].lc_state;
+	reply.ls_task_id = s9launchd_cells[free_idx].lc_task_id;
 	spin_unlock(&s9launchd_lock);
 
 	/*
@@ -450,9 +525,9 @@ op_unload(const struct mach_msg_header *req, struct port_space *from)
 	prev_state = s9launchd_cells[hit_idx].lc_state;
 	prev_task  = s9launchd_cells[hit_idx].lc_task_id;
 
+	disown_locked(&s9launchd_cells[hit_idx]);
 	s9launchd_cells[hit_idx].lc_used    = false;
 	s9launchd_cells[hit_idx].lc_state   = LAUNCHD_STATE_EXITED;
-	s9launchd_cells[hit_idx].lc_task_id = 0;
 	for (i = 0; i < LAUNCHD_NAME_MAX; i++)
 		s9launchd_cells[hit_idx].lc_name[i] = '\0';
 	for (i = 0; i < LAUNCHD_PROGRAM_MAX; i++)
@@ -532,8 +607,8 @@ op_stop(const struct mach_msg_header *req, struct port_space *from)
 	prev_state = s9launchd_cells[hit_idx].lc_state;
 	prev_task  = s9launchd_cells[hit_idx].lc_task_id;
 
-	s9launchd_cells[hit_idx].lc_state   = LAUNCHD_STATE_STOPPED;
-	s9launchd_cells[hit_idx].lc_task_id = 0;
+	disown_locked(&s9launchd_cells[hit_idx]);
+	s9launchd_cells[hit_idx].lc_state = LAUNCHD_STATE_STOPPED;
 	spin_unlock(&s9launchd_lock);
 
 	if (prev_state == LAUNCHD_STATE_RUNNING && prev_task != 0)
@@ -546,10 +621,10 @@ op_stop(const struct mach_msg_header *req, struct port_space *from)
 }
 
 /*
- * Respawn a non-running entry; a RUNNING one is left alone and reported
- * as success.  The program name is copied under the lock and the spawn
- * issued after dropping it, as in op_load.  hit_idx is assumed to name
- * the same entry after the relock; nothing re-checks it.
+ * Respawn a non-running entry; a RUNNING one, or one already starting, is
+ * left alone and reported as success (task id 0 while it starts).  The
+ * program name is copied under the lock and the spawn issued after
+ * dropping it, as in op_load.
  */
 static int
 op_start(const struct mach_msg_header *req, struct port_space *from)
@@ -560,7 +635,9 @@ op_start(const struct mach_msg_header *req, struct port_space *from)
 	char					 program[LAUNCHD_PROGRAM_MAX];
 	size_t					 body_off, body_size, i;
 	long					 child_id;
+	uint32_t				 gen;
 	int					 hit_idx;
+	bool					 keepalive;
 
 	body_off  = sizeof(struct mach_msg_header);
 	body_size = req->msgh_size > body_off ?
@@ -599,7 +676,8 @@ op_start(const struct mach_msg_header *req, struct port_space *from)
 	}
 
 	refresh_state_locked(&s9launchd_cells[hit_idx]);
-	if (s9launchd_cells[hit_idx].lc_state == LAUNCHD_STATE_RUNNING) {
+	if (s9launchd_cells[hit_idx].lc_spawning ||
+	    s9launchd_cells[hit_idx].lc_state == LAUNCHD_STATE_RUNNING) {
 		reply.ls_task_id = s9launchd_cells[hit_idx].lc_task_id;
 		spin_unlock(&s9launchd_lock);
 		reply.ls_status  = MACH_MSG_OK;
@@ -609,31 +687,31 @@ op_start(const struct mach_msg_header *req, struct port_space *from)
 
 	copy_bounded(program, s9launchd_cells[hit_idx].lc_program,
 	    LAUNCHD_PROGRAM_MAX);
-	s9launchd_cells[hit_idx].lc_state = LAUNCHD_STATE_FAILED;	/* pessimistic */
+	keepalive = s9launchd_cells[hit_idx].lc_keepalive;
+	/* A manual START clears the throttle's count. */
+	s9launchd_cells[hit_idx].lc_fast_crashes = 0;
+	gen = spawn_begin_locked(&s9launchd_cells[hit_idx]);
 	spin_unlock(&s9launchd_lock);
 
 	child_id = progreg_spawn(program);
 
 	spin_lock(&s9launchd_lock);
-	if (child_id < 0) {
-		s9launchd_cells[hit_idx].lc_state   = LAUNCHD_STATE_FAILED;
-		s9launchd_cells[hit_idx].lc_task_id = 0;
-		reply.ls_status  = (int32_t)child_id;
-	} else {
-		/* A manual START clears the throttle's count. */
-		s9launchd_cells[hit_idx].lc_state        = LAUNCHD_STATE_RUNNING;
-		s9launchd_cells[hit_idx].lc_task_id      = (uint64_t)child_id;
-		s9launchd_cells[hit_idx].lc_fast_crashes = 0;
-		note_spawn_locked(&s9launchd_cells[hit_idx]);
-		reply.ls_status  = MACH_MSG_OK;
+	if (!spawn_end_locked(hit_idx, gen, child_id)) {
+		spin_unlock(&s9launchd_lock);
+		spawn_orphaned(program, child_id);
+		reply.ls_status  = MACH_E_NAME;
+		reply.ls_state   = LAUNCHD_STATE_EXITED;
+		reply.ls_task_id = 0;
+		return (svc_reply_inline(req, from, &reply, sizeof(reply)));
 	}
+	reply.ls_status  = child_id < 0 ? (int32_t)child_id : MACH_MSG_OK;
 	reply.ls_state   = s9launchd_cells[hit_idx].lc_state;
 	reply.ls_task_id = s9launchd_cells[hit_idx].lc_task_id;
 	spin_unlock(&s9launchd_lock);
 
 	/* Re-arm the keep_alive watch on the freshly respawned instance. */
 	if (reply.ls_status == MACH_MSG_OK && reply.ls_task_id != 0 &&
-	    s9launchd_cells[hit_idx].lc_keepalive)
+	    keepalive)
 		arm_keepalive(reply.ls_task_id, hit_idx);
 
 	return (svc_reply_inline(req, from, &reply, sizeof(reply)));
@@ -665,19 +743,24 @@ svc_launchd_dispatch(const struct mach_msg_header *req, struct port_space *from)
 
 /*
  * A DEAD_NAME notification for cell `idx`.  Respawn only if the cell is
- * still a RUNNING keep_alive job whose task is really gone: that
- * rejects entries stopped or unloaded on purpose, and a stale
- * notification for a reused cell whose current task is alive.  The
- * spawn and re-arm run outside the lock, as in op_load.
+ * still a keep_alive job whose task is really gone: RUNNING, or EXITED
+ * because a LIST or START noticed the death before this notification
+ * did.  That rejects entries stopped, unloaded or starting on purpose,
+ * and a stale notification for a reused cell whose current task is
+ * alive.  The spawn and re-arm run outside the lock, as in op_load.
  */
 static void
 launchd_handle_death(int idx)
 {
-	char		program[LAUNCHD_PROGRAM_MAX];
-	long		child_id;
-	uint32_t	crashes;
-	bool		respawn;
-	bool		throttled;
+	struct launchd_cell	*c;
+	char			 program[LAUNCHD_PROGRAM_MAX];
+	long			 child_id;
+	uint64_t		 lifetime_ms;
+	uint32_t		 crashes;
+	uint32_t		 gen;
+	bool			 respawn;
+	bool			 throttled;
+	bool			 kept;
 
 	if (idx < 0 || idx >= LAUNCHD_MAX_SERVICES)
 		return;
@@ -685,15 +768,13 @@ launchd_handle_death(int idx)
 	respawn   = false;
 	throttled = false;
 	crashes   = 0;
+	gen       = 0;
+	c         = &s9launchd_cells[idx];
 	spin_lock(&s9launchd_lock);
-	if (s9launchd_cells[idx].lc_used &&
-	    s9launchd_cells[idx].lc_keepalive &&
-	    s9launchd_cells[idx].lc_state == LAUNCHD_STATE_RUNNING &&
-	    !task_is_alive(s9launchd_cells[idx].lc_task_id)) {
-		struct launchd_cell	*c;
-		uint64_t		 lifetime_ms;
-
-		c = &s9launchd_cells[idx];
+	if (c->lc_used && c->lc_keepalive && !c->lc_spawning &&
+	    (c->lc_state == LAUNCHD_STATE_RUNNING ||
+	    c->lc_state == LAUNCHD_STATE_EXITED) &&
+	    c->lc_task_id != 0 && !task_is_alive(c->lc_task_id)) {
 		lifetime_ms = clock_uptime_ms() - c->lc_last_spawn_ms;
 		copy_bounded(program, c->lc_program, LAUNCHD_PROGRAM_MAX);
 		c->lc_task_id = 0;
@@ -701,7 +782,6 @@ launchd_handle_death(int idx)
 		if (lifetime_ms >= LAUNCHD_THROTTLE_MS) {
 			/* Ran long enough: forgive past crashes. */
 			c->lc_fast_crashes = 0;
-			c->lc_state        = LAUNCHD_STATE_FAILED;
 			respawn            = true;
 		} else if (++c->lc_fast_crashes >= LAUNCHD_THROTTLE_MAX) {
 			/* Crash loop: stop respawning until a manual START. */
@@ -709,9 +789,10 @@ launchd_handle_death(int idx)
 			throttled   = true;
 			crashes     = c->lc_fast_crashes;
 		} else {
-			c->lc_state = LAUNCHD_STATE_FAILED;
 			respawn     = true;
 		}
+		if (respawn)
+			gen = spawn_begin_locked(c);
 	}
 	spin_unlock(&s9launchd_lock);
 
@@ -727,20 +808,13 @@ launchd_handle_death(int idx)
 	child_id = progreg_spawn(program);
 
 	spin_lock(&s9launchd_lock);
-	/*
-	 * idx is assumed to name the same job still; nothing re-checks
-	 * that a concurrent UNLOAD did not free and reuse the cell.
-	 */
-	if (child_id < 0) {
-		s9launchd_cells[idx].lc_state   = LAUNCHD_STATE_FAILED;
-		s9launchd_cells[idx].lc_task_id = 0;
-	} else {
-		s9launchd_cells[idx].lc_state   = LAUNCHD_STATE_RUNNING;
-		s9launchd_cells[idx].lc_task_id = (uint64_t)child_id;
-		note_spawn_locked(&s9launchd_cells[idx]);
-	}
+	kept = spawn_end_locked(idx, gen, child_id);
 	spin_unlock(&s9launchd_lock);
 
+	if (!kept) {
+		spawn_orphaned(program, child_id);
+		return;
+	}
 	if (child_id >= 0) {
 		kprintf("launchd: keep_alive respawned '%s' -> task %llu\n",
 		    program, (unsigned long long)child_id);
@@ -823,8 +897,10 @@ launchd_boot_load(const char *label, const char *program, bool keepalive,
 {
 	struct launchd_cell	*c;
 	long			 child_id;
-	int			 free_idx;
 	size_t			 i;
+	uint32_t		 gen;
+	int			 free_idx;
+	bool			 kept;
 
 	spin_lock(&s9launchd_lock);
 	free_idx = -1;
@@ -856,22 +932,19 @@ launchd_boot_load(const char *label, const char *program, bool keepalive,
 		return;
 	}
 
-	c->lc_state = LAUNCHD_STATE_FAILED;	/* pessimistic, pre-spawn */
+	gen = spawn_begin_locked(c);
 	spin_unlock(&s9launchd_lock);
 
 	child_id = progreg_spawn(program);
 
 	spin_lock(&s9launchd_lock);
-	if (child_id < 0) {
-		s9launchd_cells[free_idx].lc_state   = LAUNCHD_STATE_FAILED;
-		s9launchd_cells[free_idx].lc_task_id = 0;
-	} else {
-		s9launchd_cells[free_idx].lc_state   = LAUNCHD_STATE_RUNNING;
-		s9launchd_cells[free_idx].lc_task_id = (uint64_t)child_id;
-		note_spawn_locked(&s9launchd_cells[free_idx]);
-	}
+	kept = spawn_end_locked(free_idx, gen, child_id);
 	spin_unlock(&s9launchd_lock);
 
+	if (!kept) {
+		spawn_orphaned(program, child_id);
+		return;
+	}
 	if (child_id < 0) {
 		kprintf("launchd: catalog job '%s' (%s) spawn failed rv=%ld\n",
 		    label, program, child_id);
@@ -955,8 +1028,10 @@ launchd_subsystem_init(void)
 	for (i = 0; i < LAUNCHD_MAX_SERVICES; i++) {
 		s9launchd_cells[i].lc_used         = false;
 		s9launchd_cells[i].lc_keepalive    = false;
+		s9launchd_cells[i].lc_spawning     = false;
 		s9launchd_cells[i].lc_state        = LAUNCHD_STATE_EXITED;
 		s9launchd_cells[i].lc_fast_crashes = 0;
+		s9launchd_cells[i].lc_gen          = 0;
 		s9launchd_cells[i].lc_task_id      = 0;
 		s9launchd_cells[i].lc_last_spawn_ms = 0;
 		s9launchd_cells[i].lc_name[0]    = '\0';
