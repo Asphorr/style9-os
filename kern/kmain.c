@@ -190,13 +190,7 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	 * thread never has to ask whether it exists.
 	 */
 	kbd_drv_set_sink(darwin_cons_sink);
-	/*
-	 * Mouse comes up here, not beside kbd_init: lighting IRQ12 before
-	 * clock_init would let a pending aux byte fire an IRQ whose
-	 * intr_dispatch -> sched_check_timeouts -> clock_uptime_ms path
-	 * divides by the still-zero pit_hz().  The mouse has no early
-	 * consumer, so deferring it costs nothing.
-	 */
+	/* The mouse has no early consumer, so it comes up with the drivers. */
 	mouse_init();
 	mouse_drv_init();
 	uart_drv_init();

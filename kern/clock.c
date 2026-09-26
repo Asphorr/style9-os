@@ -79,21 +79,32 @@ clock_hz(void)
 	return ((uint64_t)pit_hz());
 }
 
+/*
+ * Uptime is 0 until clock_init has set the PIT rate.  An interrupt taken
+ * earlier -- IRQ1 is live from kbd_init, before the clock -- reaches
+ * sched_check_timeouts, which asks for the time; dividing by the unset
+ * rate would be a #DE in the middle of bring-up.
+ */
 uint64_t
 clock_uptime_ms(void)
 {
+	unsigned int	hz;
 
 	/*
 	 * pit_hz() is at most ~1.2M so ticks * 1000 cannot overflow
 	 * for any realistic uptime.  pit_ticks is monotonic.
 	 */
-	return ((pit_ticks() * 1000ULL) / pit_hz());
+	hz = pit_hz();
+	if (hz == 0)
+		return (0);
+	return ((pit_ticks() * 1000ULL) / hz);
 }
 
 uint64_t
 clock_uptime_us(void)
 {
 	uint64_t	base_us;
+	unsigned int	hz;
 
 	/*
 	 * Sub-tick resolution.  The PIT tick count at the calibration anchor
@@ -102,10 +113,13 @@ clock_uptime_us(void)
 	 * a seam, and the result is monotonic: neither anchor moves and the
 	 * TSC only counts up.
 	 */
+	hz = pit_hz();
+	if (hz == 0)				/* before clock_init */
+		return (0);
 	if (tsc_hz() == 0)			/* before calibration */
-		return ((pit_ticks() * 1000000ULL) / pit_hz());
+		return ((pit_ticks() * 1000000ULL) / hz);
 
-	base_us = (tsc_anchor_ticks() * 1000000ULL) / pit_hz();
+	base_us = (tsc_anchor_ticks() * 1000000ULL) / hz;
 	return (base_us + tsc_to_us(tsc_read() - tsc_anchor_cycles()));
 }
 

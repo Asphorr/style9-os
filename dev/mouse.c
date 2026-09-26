@@ -308,9 +308,7 @@ mouse_init(void)
 	 * Called in Phase 2 (after clock_init) with interrupts on; they are
 	 * held off for the duration and restored as found.  The polled
 	 * exchange must be atomic against kbd_irq, which reads the same data
-	 * port, and IRQ12 must not arrive before pit_hz() is calibrated
-	 * (intr_dispatch -> sched_check_timeouts -> clock_uptime_ms divides
-	 * by it).
+	 * port.
 	 *
 	 * The keyboard port is held too: disabling interrupts stops kbd_irq,
 	 * not the keyboard, and a key pressed now would land in the output
