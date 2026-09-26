@@ -99,12 +99,15 @@ svc_stats_dispatch(const struct mach_msg_header *req, struct port_space *from)
 
 	/*
 	 * A best-effort thread count: t_nthreads is summed without t_lock,
-	 * so the total may be slightly stale.
+	 * so the total may be slightly stale.  The refs keep each task's
+	 * memory there while it is read.
 	 */
-	ntasks  = task_snapshot(tasks, SVC_TASKS_MAX);
+	ntasks  = task_snapshot_ref(tasks, SVC_TASKS_MAX);
 	threads = 0;
 	for (i = 0; i < ntasks; i++)
-		threads += tasks[i]->t_nthreads;
+		threads += __atomic_load_n(&tasks[i]->t_nthreads,
+		    __ATOMIC_RELAXED);
+	task_snapshot_release(tasks, ntasks);
 
 	r.sr_pmm_used_pages    = pmm_used_pages();
 	r.sr_kmem_cached_pages = kmem_cached_pages();
@@ -132,7 +135,7 @@ svc_tasks_dispatch(const struct mach_msg_header *req, struct port_space *from)
 	for (i = 0; i < sizeof(r); i++)
 		((uint8_t *)&r)[i] = 0;
 
-	n = task_snapshot(snap, SVC_TASKS_MAX);
+	n = task_snapshot_ref(snap, SVC_TASKS_MAX);
 	r.tr_count = (uint32_t)n;
 	r.tr_pad   = 0;
 
@@ -147,8 +150,8 @@ svc_tasks_dispatch(const struct mach_msg_header *req, struct port_space *from)
 		/*
 		 * Read outside t_lock, which stays a short leaf:
 		 * port_space_inuse takes ps_lock, vm_map_region_count
-		 * vm_lock.  task_snapshot takes no refs, so this assumes the
-		 * task, its t_port_space and t_map are not reaped meanwhile.
+		 * vm_lock.  The snapshot's ref keeps t_port_space and t_map
+		 * alive; they are destroyed only with the last ref.
 		 */
 		r.tr_entries[i].te_nports     =
 		    (uint32_t)port_space_inuse(t->t_port_space);
@@ -164,6 +167,7 @@ svc_tasks_dispatch(const struct mach_msg_header *req, struct port_space *from)
 				r.tr_entries[i].te_name[j] = t->t_name[j];
 		}
 	}
+	task_snapshot_release(snap, n);
 
 	return (svc_reply_inline(req, from, &r, sizeof(r)));
 }

@@ -255,6 +255,28 @@ task_ref(struct task *t)
 	spin_unlock(&t->t_lock);
 }
 
+/*
+ * A ref on `t', found in task_list under tasks_lock, unless it is dying.
+ * task_deref drops the last ref under t_lock and only then takes
+ * tasks_lock to unlist the task, so a scan can meet a task at zero refs;
+ * task_ref would assert, and a ref taken anyway would outlive the free.
+ * The memory itself is safe to look at: the dying side cannot unlist and
+ * free it while the scan holds tasks_lock.  Lock order tasks_lock ->
+ * t_lock.
+ */
+static bool
+task_ref_listed(struct task *t)
+{
+	bool	live;
+
+	spin_lock(&t->t_lock);
+	live = t->t_refs > 0;
+	if (live)
+		t->t_refs++;
+	spin_unlock(&t->t_lock);
+	return (live);
+}
+
 void
 task_deref(struct task *t)
 {
@@ -709,6 +731,33 @@ task_snapshot(struct task **out, size_t max)
 	return (n);
 }
 
+size_t
+task_snapshot_ref(struct task **out, size_t max)
+{
+	size_t	i, n;
+
+	if (out == NULL || max == 0)
+		return (0);
+
+	n = 0;
+	spin_lock(&tasks_lock);
+	for (i = 0; i < TASK_LIST_MAX && n < max; i++) {
+		if (task_list[i] != NULL && task_ref_listed(task_list[i]))
+			out[n++] = task_list[i];
+	}
+	spin_unlock(&tasks_lock);
+	return (n);
+}
+
+void
+task_snapshot_release(struct task **tasks, size_t n)
+{
+	size_t	i;
+
+	for (i = 0; i < n; i++)
+		task_deref(tasks[i]);
+}
+
 /*
  * task_is_alive: one scan of TASK_LIST_MAX slots under tasks_lock, no
  * ref taken -- a hint, stale once the lock drops (see task.h).
@@ -792,11 +841,12 @@ task_self_port_for(uint64_t task_id)
 /*
  * task_lookup_ref: task_self_port_for's scan, taking the task's own ref
  * under tasks_lock.  NULL for an unknown id -- e.g. a task-self port
- * whose task is gone.  kernel_task is returned like any other; callers
- * that must exclude it check the id.
+ * whose task is gone -- or a task already at zero refs and on its way
+ * out.  kernel_task is returned like any other; callers that must
+ * exclude it check the id.
  *
- * Lock order: tasks_lock -> t_lock (in task_ref), the edge
- * task_request_terminate already takes.
+ * Lock order: tasks_lock -> t_lock (in task_ref_listed), the edge
+ * task_request_terminate also takes.
  */
 struct task *
 task_lookup_ref(uint64_t id)
@@ -808,8 +858,8 @@ task_lookup_ref(uint64_t id)
 	spin_lock(&tasks_lock);
 	for (i = 0; i < TASK_LIST_MAX; i++) {
 		if (task_list[i] != NULL && task_list[i]->t_id == id) {
-			t = task_list[i];
-			task_ref(t);
+			if (task_ref_listed(task_list[i]))
+				t = task_list[i];
 			break;
 		}
 	}
@@ -852,12 +902,11 @@ task_request_terminate(uint64_t task_id)
 			break;
 		}
 	}
-	if (t == NULL || t == kernel_task) {
+	if (t == NULL || t == kernel_task || !task_ref_listed(t)) {
 		spin_unlock(&tasks_lock);
 		return;
 	}
 	__atomic_store_n(&t->t_killed, true, __ATOMIC_RELEASE);
-	task_ref(t);
 	spin_unlock(&tasks_lock);
 
 	spin_lock(&t->t_lock);

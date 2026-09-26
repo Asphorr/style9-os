@@ -252,11 +252,20 @@ void			 task_print(struct task *);
 void			 task_list_print(void);
 
 /*
- * Copy up to `max' live-task pointers into `out'; returns how many.  No
- * refs are taken, so the snapshot is best-effort and for short-lived
- * kernel use (e.g. the `tasks' service building its reply).
+ * Copy up to `max' live-task pointers into `out'; returns how many.
+ *
+ * task_snapshot takes no refs: a task may be torn down the moment the
+ * call returns.  Only for ddb, which must not take t_lock and runs with
+ * the rest of the machine stopped or suspect anyway.
+ *
+ * task_snapshot_ref takes one ref per task (a task already at zero refs
+ * is left out), so its pointers, t_port_space and t_map stay valid until
+ * task_snapshot_release drops them.  The release may be a task's last
+ * ref and tear it down, so no spinlock may be held across it.
  */
 size_t			 task_snapshot(struct task **out, size_t max);
+size_t			 task_snapshot_ref(struct task **out, size_t max);
+void			 task_snapshot_release(struct task **tasks, size_t n);
 
 /*
  * Whether a task with this id is live at the moment of the call.  No ref
