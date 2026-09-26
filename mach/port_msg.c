@@ -960,6 +960,11 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 	 * inside mach_msg_rpc on this same call stack and reads
 	 * p_stash_rv when its send returns.  MOVE_* still drops the
 	 * sender's right, as on the queue path.
+	 *
+	 * Only the arming thread qualifies.  The stash stays armed for the
+	 * whole of the RPC's send, so a server woken by it on another CPU
+	 * can reply first; its CR3 is its own, and the stash VA there is
+	 * whatever the server keeps at that address.  Such a reply queues.
 	 */
 	if (!complex && !has_local) {
 		size_t	want_size;
@@ -967,6 +972,7 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 		want_size = msg->msgh_size;
 		spin_lock(&dest->p_lock);
 		if (dest->p_stash_buf != NULL &&
+		    dest->p_stash_thread == current_thread &&
 		    dest->p_stash_rv == MACH_E_NOMSG &&
 		    !dest->p_dead &&
 		    want_size <= dest->p_stash_size) {
@@ -1785,9 +1791,10 @@ mach_msg_rpc(struct port_space *space, struct mach_msg_header *req,
 	 * MACH_E_NOMSG, and we fall through to the recv.
 	 */
 	spin_lock(&reply_port->p_lock);
-	reply_port->p_stash_buf  = reply_buf;
-	reply_port->p_stash_size = reply_buf_size;
-	reply_port->p_stash_rv   = MACH_E_NOMSG;
+	reply_port->p_stash_buf    = reply_buf;
+	reply_port->p_stash_thread = current_thread;
+	reply_port->p_stash_size   = reply_buf_size;
+	reply_port->p_stash_rv     = MACH_E_NOMSG;
 	spin_unlock(&reply_port->p_lock);
 
 	/*
@@ -1820,9 +1827,10 @@ mach_msg_rpc(struct port_space *space, struct mach_msg_header *req,
 	 */
 	spin_lock(&reply_port->p_lock);
 	stash_rv = reply_port->p_stash_rv;
-	reply_port->p_stash_buf  = NULL;
-	reply_port->p_stash_size = 0;
-	reply_port->p_stash_rv   = MACH_E_NOMSG;
+	reply_port->p_stash_buf    = NULL;
+	reply_port->p_stash_thread = NULL;
+	reply_port->p_stash_size   = 0;
+	reply_port->p_stash_rv     = MACH_E_NOMSG;
 	spin_unlock(&reply_port->p_lock);
 
 	if (rv != MACH_MSG_OK) {

@@ -338,7 +338,11 @@ poke_echo(uint32_t rounds)
 			break;
 		}
 	}
-	printf("  poke 'echo' x %u rounds: ok\n", i);
+	if (i == rounds)
+		printf("  poke 'echo' x %u rounds: ok\n", i);
+	else
+		printf("  poke 'echo': FAIL after %u of %u rounds\n", i,
+		    rounds);
 	(void)mach_port_deallocate(svc);
 }
 
@@ -483,7 +487,7 @@ main(void)
 	 * syscall-free spinner, stop it (entry survives as stopped), start
 	 * it again, LIST after each step, then unload.
 	 */
-	printf("\nlaunchctl v2 STOP/START demo:\n");
+	printf("\nlaunchctl STOP/START demo:\n");
 	if (do_load(launchd, SPIN_LABEL, SPIN_PROGRAM, 0, NULL, NULL) ==
 	    MACH_MSG_OK) {
 		(void)do_list(launchd, "spinner loaded");

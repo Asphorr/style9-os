@@ -51,9 +51,11 @@ struct port {
 
 	/*
 	 * Inline-reply stash (mach_msg_rpc and the send fast path in
-	 * port_msg.c), under p_lock.
+	 * port_msg.c), under p_lock.  p_stash_buf is a VA in the arming
+	 * thread's address space, so only that thread may fill it.
 	 */
 	struct mach_msg_header *p_stash_buf;
+	struct thread	*p_stash_thread;
 	size_t		 p_stash_size;
 	int		 p_stash_rv;
 

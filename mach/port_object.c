@@ -97,6 +97,7 @@ port_create(void)
 	p->p_special      = PORT_SPECIAL_NONE;
 	p->p_special_arg  = NULL;
 	p->p_stash_buf    = NULL;
+	p->p_stash_thread = NULL;
 	p->p_stash_size   = 0;
 	p->p_stash_rv     = MACH_E_NOMSG;
 	p->p_notify_no_senders     = NULL;
