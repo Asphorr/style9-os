@@ -27,15 +27,25 @@
  *				holding i panics if edges[j][i] is
  *				already set (it would close a cycle).
  *
- * Both are mutated only with interrupts disabled on the calling CPU (see
- * witness.h).
+ * A class slot, once published, never changes: registration fills
+ * witness_classes[n] under witness_reg_lock and then stores n + 1 into
+ * witness_nclasses with release, and lookups load the count with acquire
+ * and need no lock.  Edges only ever go from 0 to 1 and are relaxed
+ * atomics; an edge another CPU is setting at the same moment may be seen
+ * one acquire late.
  */
 #define	WITNESS_MAX_CLASSES	48
 
 static const char	*witness_classes[WITNESS_MAX_CLASSES];
 static uint8_t		 witness_nclasses;
 static uint8_t		 witness_edges[WITNESS_MAX_CLASSES][WITNESS_MAX_CLASSES];
+/*
+ * A bare test-and-set lock, not a struct spinlock: taking one of those
+ * would call back into witness.
+ */
+static unsigned int	 witness_reg_lock;
 
+static int		 class_find(const char *name, unsigned int n);
 static int		 class_of(const char *name);
 static uint64_t		 irq_disable_save(void);
 static void		 irq_restore(uint64_t flags);
@@ -79,14 +89,16 @@ witness_acquired(struct spinlock *sl, uintptr_t ra)
 			continue;	/* nested same-class is fine */
 
 		/* The reverse edge (new -> held) already seen: a cycle. */
-		if (witness_edges[new_class][held_class]) {
+		if (__atomic_load_n(&witness_edges[new_class][held_class],
+		    __ATOMIC_RELAXED) != 0) {
 			irq_restore(flags);
 			witness_panic_cycle(new_name, ra,
 			    held_name, me->th_held[i].wh_ra);
 		}
 
 		/* Forward edge: record this observed order. */
-		witness_edges[held_class][new_class] = 1;
+		__atomic_store_n(&witness_edges[held_class][new_class], 1,
+		    __ATOMIC_RELAXED);
 	}
 
 	if (me->th_held_count < THREAD_HELD_LOCKS_MAX) {
@@ -164,25 +176,49 @@ witness_dump_held(struct thread *th)
 
 /* ---- internals --------------------------------------------------- */
 
+/* Index of `name' among the first `n' published classes, or -1. */
+static int
+class_find(const char *name, unsigned int n)
+{
+	unsigned int	i;
+
+	for (i = 0; i < n; i++) {
+		if (witness_classes[i] == name)
+			return ((int)i);
+	}
+	return (-1);
+}
+
 /*
  * Class id of `name', by pointer identity, registering it on first
- * sight; -1 when the table is full.  Called only from witness_acquired,
- * with interrupts disabled; it is the only writer of witness_classes and
- * witness_nclasses.
+ * sight; -1 when the table is full.  Called with interrupts disabled.
+ * Two CPUs meeting a new class at once both reach the lock; the second
+ * finds the first one's slot on its rescan instead of taking another.
  */
 static int
 class_of(const char *name)
 {
-	uint8_t	i;
+	unsigned int	n;
+	int		id;
 
-	for (i = 0; i < witness_nclasses; i++) {
-		if (witness_classes[i] == name)
-			return ((int)i);
+	id = class_find(name,
+	    __atomic_load_n(&witness_nclasses, __ATOMIC_ACQUIRE));
+	if (id >= 0)
+		return (id);
+
+	while (__atomic_exchange_n(&witness_reg_lock, 1u,
+	    __ATOMIC_ACQUIRE) != 0)
+		__asm__ __volatile__ ("pause");
+	n  = witness_nclasses;
+	id = class_find(name, n);
+	if (id < 0 && n < WITNESS_MAX_CLASSES) {
+		witness_classes[n] = name;
+		__atomic_store_n(&witness_nclasses, (uint8_t)(n + 1),
+		    __ATOMIC_RELEASE);
+		id = (int)n;
 	}
-	if (witness_nclasses >= WITNESS_MAX_CLASSES)
-		return (-1);
-	witness_classes[witness_nclasses] = name;
-	return ((int)witness_nclasses++);
+	__atomic_store_n(&witness_reg_lock, 0u, __ATOMIC_RELEASE);
+	return (id);
 }
 
 static uint64_t

@@ -26,9 +26,9 @@
  *
  *	The recursive-acquire check is spinlock.c's, not duplicated here.
  *
- * Every mutation runs with interrupts disabled on the calling CPU, so an
- * interrupt handler taking a lock cannot tear an update; nothing
- * serialises two CPUs against each other.
+ * Every update runs with interrupts disabled on the calling CPU, so an
+ * interrupt handler taking a lock cannot tear it.  Across CPUs, class
+ * registration is serialised and edges are atomic (witness.c).
  *
  * Always compiled in; removing the two hook calls in spinlock.c turns it
  * off.
