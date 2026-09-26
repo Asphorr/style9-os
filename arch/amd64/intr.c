@@ -18,6 +18,8 @@
 #include "lapic.h"
 #include "panic.h"
 #include "pic.h"
+#include "pmap.h"
+#include "pmm.h"
 #include "port.h"
 #include "port_internal.h"
 #include "sched.h"
@@ -79,7 +81,11 @@ static uint32_t	deliver_exception_and_wait(struct port *exc,
 		    const struct trapframe *tf,
 		    uint32_t *rip_advance_out);
 static void	pf_print_err(uint64_t err);
-static void	rip_byte_dump(uint64_t rip);
+static unsigned int rip_bytes(uint64_t rip, bool from_user, uint8_t *buf);
+static void	rip_bytes_print(const uint8_t *buf, unsigned int n);
+
+/* Code bytes an autopsy shows at the faulting RIP. */
+#define	RIP_DUMP_BYTES	16
 
 /*
  * Map an x86 trap vector to an EXC_TYPE_* index into t_exc_ports[].
@@ -284,6 +290,8 @@ intr_panic(const struct trapframe *tf)
 	const char	*name;
 	const char	*ring;
 	uint64_t	 cr2;
+	uint8_t		 code[RIP_DUMP_BYTES];
+	unsigned int	 ncode;
 	bool		 from_user;
 
 	name = (tf->tf_trapno < 32)
@@ -292,7 +300,10 @@ intr_panic(const struct trapframe *tf)
 
 	from_user = (tf->tf_cs & 3) == 3;
 	ring      = from_user ? "ring 3 (user)" : "ring 0 (kernel)";
+	ncode     = rip_bytes((uint64_t)tf->tf_rip, from_user, code);
 
+	/* One console write, so other CPUs' lines land around it. */
+	tty_batch_begin();
 	tty_set_attr(TTY_ATTR(TTY_LIGHT_RED, TTY_BLACK));
 	kprintf("\n*** %s [%s] (vec %u, err=0x%016lx)\n",
 	    name, ring, (unsigned int)tf->tf_trapno,
@@ -327,8 +338,8 @@ intr_panic(const struct trapframe *tf)
 	kprintf("r13=0x%016lx  r14=0x%016lx  r15=0x%016lx\n",
 	    (unsigned long)tf->tf_r13, (unsigned long)tf->tf_r14,
 	    (unsigned long)tf->tf_r15);
-
-	rip_byte_dump((uint64_t)tf->tf_rip);
+	rip_bytes_print(code, ncode);
+	tty_batch_end();
 
 	if (!from_user)
 		backtrace_print((uintptr_t)tf->tf_rbp, 16);
@@ -490,18 +501,33 @@ user_fault_die(struct trapframe *tf)
 	struct task	*t;
 	struct port	*exc;
 	const char	*name;
+	const char	*who;
 	uint64_t	 cr2;
+	uint64_t	 who_id;
 	uint32_t	 task_flags;
 	uint32_t	 verdict;
 	uint32_t	 rip_advance;
+	uint8_t		 code[RIP_DUMP_BYTES];
+	unsigned int	 ncode;
 
 	name = (tf->tf_trapno < 32)
 	    ? exception_names[tf->tf_trapno]
 	    : "(out-of-range)";
 	cr2 = (tf->tf_trapno == 14) ? read_cr2() : 0;
+	who    = "?";
+	who_id = 0;
+	if (current_thread != NULL && current_thread->th_task != NULL) {
+		if (current_thread->th_task->t_name != NULL)
+			who = current_thread->th_task->t_name;
+		who_id = current_thread->th_task->t_id;
+	}
+	ncode = rip_bytes((uint64_t)tf->tf_rip, true, code);
 
+	/* One console write, so other CPUs' lines land around it. */
+	tty_batch_begin();
 	tty_set_attr(TTY_ATTR(TTY_LIGHT_RED, TTY_BLACK));
-	kprintf("\n*** user fault: %s (vec %u, err=0x%lx)\n",
+	kprintf("\n*** user fault in '%s' (task %llu): %s (vec %u, "
+	    "err=0x%lx)\n", who, (unsigned long long)who_id,
 	    name, (unsigned int)tf->tf_trapno,
 	    (unsigned long)tf->tf_err);
 	tty_set_attr(TTY_ATTR(TTY_LIGHT_GRAY, TTY_BLACK));
@@ -522,7 +548,8 @@ user_fault_die(struct trapframe *tf)
 	    (unsigned long)tf->tf_rdi,
 	    (unsigned long)tf->tf_rsi,
 	    (unsigned long)tf->tf_rdx);
-	rip_byte_dump((uint64_t)tf->tf_rip);
+	rip_bytes_print(code, ncode);
+	tty_batch_end();
 
 	/*
 	 * Resolve the port and take a local SEND ref, so it survives a
@@ -616,45 +643,63 @@ pf_print_err(uint64_t err)
 }
 
 /*
- * Dump 16 bytes at the faulting RIP.  A user RIP is readable because the
- * faulting task's pmap is the active one.  Only the range is checked;
- * a RIP outside both known ranges is skipped rather than risk a second
- * fault.
+ * Copy up to RIP_DUMP_BYTES at the faulting RIP into `buf' without
+ * faulting again; returns the count, 0 when nothing there may be read.  A
+ * kernel RIP is read only inside the identity map, [0, VM_USER_VA_LO).  A
+ * user RIP, and only one that faulted in ring 3, is read only from pages
+ * present in the task's pmap: an instruction-fetch fault, or a RIP in the
+ * last bytes of a mapping, would otherwise fault in here and turn a user
+ * fault into a panic.  The copy stops at the first page not present.
+ *
+ * Called before the autopsy takes the console: pmap_extract takes
+ * pm_lock, and the shootdown path prints under pm_lock.
  */
-static void
-rip_byte_dump(uint64_t rip)
+static unsigned int
+rip_bytes(uint64_t rip, bool from_user, uint8_t *buf)
 {
 	const uint8_t	*p;
-	uint8_t		 scratch[16];
+	struct pmap	*pm;
 	unsigned int	 i;
+	unsigned int	 n;
 	bool		 is_user;
 
-	/*
-	 * The two ranges known to be mapped:
-	 *	[0, 1 GiB)			kernel identity map (boot.S)
-	 *	[VM_USER_VA_LO, VM_USER_VA_HI)	user window, [1 GiB, 2 GiB)
-	 */
-	if (rip >= 0x80000000ULL) {
-		kprintf("code @rip: (unmapped range, skip)\n");
-		return;
+	n = RIP_DUMP_BYTES;
+	is_user = rip >= VM_USER_VA_LO && rip < VM_USER_VA_HI;
+	if (is_user) {
+		if (!from_user || current_thread == NULL ||
+		    current_thread->th_task == NULL)
+			return (0);
+		pm = current_thread->th_task->t_pmap;
+		if (pm == NULL || pmap_extract(pm, rip) == PA_INVALID)
+			return (0);
+		if (pmap_extract(pm, rip + n - 1) == PA_INVALID)
+			n = (unsigned int)(PAGE_SIZE - (rip & (PAGE_SIZE - 1)));
+	} else if (rip > VM_USER_VA_LO - n) {
+		return (0);
 	}
 
-	/*
-	 * A user-VA read needs the SMAP bracket.  Copy to a kernel scratch
-	 * buffer inside it, so the tty lock and console output never run
-	 * with AC=1.
-	 */
+	/* A user-VA read needs the SMAP bracket, kept off the console. */
 	p = (const uint8_t *)(uintptr_t)rip;
-	is_user = (rip >= 0x40000000ULL && rip < 0x80000000ULL);
 	if (is_user)
 		smap_user_access_begin();
-	for (i = 0; i < 16; i++)
-		scratch[i] = p[i];
+	for (i = 0; i < n; i++)
+		buf[i] = p[i];
 	if (is_user)
 		smap_user_access_end();
+	return (n);
+}
 
+static void
+rip_bytes_print(const uint8_t *buf, unsigned int n)
+{
+	unsigned int	i;
+
+	if (n == 0) {
+		kprintf("code @rip: (not readable, skipped)\n");
+		return;
+	}
 	kprintf("code @rip:");
-	for (i = 0; i < 16; i++)
-		kprintf(" %02x", (unsigned int)scratch[i]);
+	for (i = 0; i < n; i++)
+		kprintf(" %02x", (unsigned int)buf[i]);
 	kprintf("\n");
 }
