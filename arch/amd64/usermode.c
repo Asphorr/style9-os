@@ -690,6 +690,7 @@ void
 usermode_enter(uint64_t user_rip, uint64_t user_rsp)
 {
 
+	sched_cpu_to_user();
 	__asm__ __volatile__ (
 	    "pushq $0x23		\n"	/* SS               */
 	    "pushq %0			\n"	/* RSP              */
@@ -717,6 +718,7 @@ static void
 usermode_enter_forked(uint64_t user_rip, uint64_t user_rsp)
 {
 
+	sched_cpu_to_user();
 	__asm__ __volatile__ (
 	    "pushq $0x23		\n"	/* SS               */
 	    "pushq %0			\n"	/* RSP              */
@@ -901,7 +903,7 @@ arch_darwin_execve(const unsigned char *image, unsigned long image_size,
 	if (rv < 0) {
 		kprintf("darwin: execve setup failed rv=%ld, task exits\n",
 		    rv);
-		darwin_zombie_record(t->t_id, t->t_darwin_ppid, 127 << 8);
+		darwin_zombie_record(t, 127 << 8);
 		thread_exit();
 		/* NOTREACHED */
 	}

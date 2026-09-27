@@ -30,6 +30,7 @@
 #include "syscall.h"
 #include "task.h"
 #include "thread.h"
+#include "tsc.h"
 #include "tty.h"
 #include "vm.h"
 #include "vm_object.h"
@@ -118,7 +119,8 @@ static void	darwin_lk_drop(uint64_t owner, uint64_t file);
 static void	darwin_lk_stats(void);
 static int	darwin_dup_install(struct task *t, int oldfd, int newfd);
 static bool	darwin_zombie_reap(uint64_t ppid, uint64_t pid,
-		    int *status_out, uint64_t *pid_out);
+		    int *status_out, uint64_t *pid_out, uint64_t *utime_out,
+		    uint64_t *stime_out);
 static long	darwin_cons_read(struct syscall_frame *f, void *ubuf,
 		    size_t n);
 
@@ -2646,6 +2648,8 @@ darwin_dup_install(struct task *t, int oldfd, int newfd)
 struct darwin_zombie {
 	uint64_t	z_pid;
 	uint64_t	z_ppid;
+	uint64_t	z_utime;	/* TSC cycles, its reaped  */
+	uint64_t	z_stime;	/* children's included     */
 	int		z_status;	/* wait4 format            */
 	bool		z_used;
 };
@@ -2845,7 +2849,7 @@ darwin_signal_deliver(struct task *t)
 	 * Default terminate.  The task never reaches exit(2), so record its
 	 * wait4 status here: termsig in the low 7 bits (WIFSIGNALED).
 	 */
-	darwin_zombie_record(t->t_id, t->t_darwin_ppid, signo & 0x7F);
+	darwin_zombie_record(t, signo & 0x7F);
 	thread_exit();
 	/* NOTREACHED */
 }
@@ -2937,7 +2941,7 @@ darwin_signal_deliver_syscall(struct syscall_frame *f, long rv)
 		if (darwin_signal_setup_frame(f, signo, disp, rv) == 0)
 			return;
 	}
-	darwin_zombie_record(t->t_id, t->t_darwin_ppid, signo & 0x7F);
+	darwin_zombie_record(t, signo & 0x7F);
 	thread_exit();
 	/* NOTREACHED */
 }
@@ -3025,7 +3029,7 @@ darwin_signal_deliver_trap(struct trapframe *tf)
 		if (darwin_signal_setup_frame_trap(tf, signo, disp) == 0)
 			return;
 	}
-	darwin_zombie_record(t->t_id, t->t_darwin_ppid, signo & 0x7F);
+	darwin_zombie_record(t, signo & 0x7F);
 	thread_exit();
 	/* NOTREACHED */
 }
@@ -3048,7 +3052,7 @@ darwin_sigreturn_full(uint64_t uctx)
 	    frame.sf_magic != DARWIN_SIGFRAME_MAGIC_FULL) {
 		kprintf("darwin: bad async sigreturn frame @0x%llx\n",
 		    (unsigned long long)uctx);
-		darwin_zombie_record(t->t_id, t->t_darwin_ppid, DARWIN_SIGKILL);
+		darwin_zombie_record(t, DARWIN_SIGKILL);
 		thread_exit();
 		/* NOTREACHED */
 	}
@@ -3143,11 +3147,17 @@ darwin_child_news(unsigned long long ppid)
 }
 
 void
-darwin_zombie_record(unsigned long long pid, unsigned long long ppid,
-    int status)
+darwin_zombie_record(struct task *t, int status)
 {
-	size_t	i;
-	int	slot;
+	uint64_t	pid;
+	uint64_t	ppid;
+	uint64_t	utime;
+	uint64_t	stime;
+	size_t		i;
+	int		slot;
+
+	pid  = t->t_id;
+	ppid = t->t_darwin_ppid;
 
 	/*
 	 * A dead process holds no record locks, and its parent must not find
@@ -3155,6 +3165,19 @@ darwin_zombie_record(unsigned long long pid, unsigned long long ppid,
 	 * thread_exit, too late for that; drop the locks now.
 	 */
 	darwin_lk_drop(pid, 0);
+
+	/*
+	 * What wait4 reports and the parent's RUSAGE_CHILDREN gains: the
+	 * task's time with its reaped children's, as XNU's exit folds p_cru
+	 * into p_ru.  What a killed task runs after this is not counted.
+	 */
+	if (t == current_thread->th_task)
+		sched_cpu_charge();
+	task_cpu_times(t, &utime, &stime);
+	spin_lock(&t->t_lock);
+	utime += t->t_cutime;
+	stime += t->t_cstime;
+	spin_unlock(&t->t_lock);
 
 	spin_lock(&darwin_zombie_lock);
 
@@ -3183,13 +3206,15 @@ darwin_zombie_record(unsigned long long pid, unsigned long long ppid,
 	if (slot < 0) {
 		spin_unlock(&darwin_zombie_lock);
 		kprintf("darwin: zombie table full, status of pid %llu "
-		    "dropped\n", pid);
+		    "dropped\n", (unsigned long long)pid);
 		darwin_signal_notify_parent(ppid);
 		darwin_child_news(ppid);
 		return;
 	}
 	darwin_zombies[slot].z_pid    = pid;
 	darwin_zombies[slot].z_ppid   = ppid;
+	darwin_zombies[slot].z_utime  = utime;
+	darwin_zombies[slot].z_stime  = stime;
 	darwin_zombies[slot].z_status = status;
 	darwin_zombies[slot].z_used   = true;
 	spin_unlock(&darwin_zombie_lock);
@@ -3208,7 +3233,7 @@ darwin_zombie_record(unsigned long long pid, unsigned long long ppid,
  */
 static bool
 darwin_zombie_reap(uint64_t ppid, uint64_t pid, int *status_out,
-    uint64_t *pid_out)
+    uint64_t *pid_out, uint64_t *utime_out, uint64_t *stime_out)
 {
 	size_t	i;
 
@@ -3222,6 +3247,8 @@ darwin_zombie_reap(uint64_t ppid, uint64_t pid, int *status_out,
 			continue;
 		*status_out = darwin_zombies[i].z_status;
 		*pid_out    = darwin_zombies[i].z_pid;
+		*utime_out  = darwin_zombies[i].z_utime;
+		*stime_out  = darwin_zombies[i].z_stime;
 		darwin_zombies[i].z_used = false;
 		spin_unlock(&darwin_zombie_lock);
 		return (true);
@@ -3250,6 +3277,33 @@ darwin_zombie_present_locked(uint64_t ppid, uint64_t pid)
 		return (true);
 	}
 	return (false);
+}
+
+/* TSC cycles as a timeval: whole seconds first, so nothing overflows. */
+static void
+darwin_tv_cycles(struct darwin_timeval *tv, uint64_t cyc)
+{
+	uint64_t	hz;
+
+	hz = tsc_hz();
+	tv->tv_sec  = hz != 0 ? (int64_t)(cyc / hz) : 0;
+	tv->tv_usec = hz != 0 ? (int32_t)(cyc % hz * 1000000ULL / hz) : 0;
+	tv->tv_pad  = 0;
+}
+
+/* Copy out a struct rusage with these times, in cycles, and no counts. */
+static int
+darwin_rusage_out(uint64_t uaddr, uint64_t utime, uint64_t stime)
+{
+	struct darwin_rusage	ru;
+	size_t			i;
+
+	darwin_tv_cycles(&ru.ru_utime, utime);
+	darwin_tv_cycles(&ru.ru_stime, stime);
+	for (i = 0; i < sizeof(ru.ru_counters) / sizeof(ru.ru_counters[0]);
+	    i++)
+		ru.ru_counters[i] = 0;
+	return (syscall_copyout((void *)uaddr, &ru, sizeof(ru)));
 }
 
 /*
@@ -3319,6 +3373,26 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		/* arg1 is the timezone pointer; ignored, as everywhere else. */
 		return (darwin_ok(f, 0));
 	}
+	case DARWIN_SYS_getrusage: {
+		struct task	*t;
+		uint64_t	 utime;
+		uint64_t	 stime;
+
+		t = current_thread->th_task;
+		if ((int)f->sf_arg0 == DARWIN_RUSAGE_SELF) {
+			sched_cpu_charge();
+			task_cpu_times(t, &utime, &stime);
+		} else if ((int)f->sf_arg0 == DARWIN_RUSAGE_CHILDREN) {
+			spin_lock(&t->t_lock);
+			utime = t->t_cutime;
+			stime = t->t_cstime;
+			spin_unlock(&t->t_lock);
+		} else
+			return (darwin_err(f, DARWIN_EINVAL));
+		if (darwin_rusage_out(f->sf_arg1, utime, stime) != 0)
+			return (darwin_err(f, DARWIN_EFAULT));
+		return (darwin_ok(f, 0));
+	}
 	case DARWIN_SYS_chdir: {
 		char			 raw[DARWIN_PATH_MAX];
 		char			 want[DARWIN_PATH_MAX];
@@ -3386,8 +3460,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 
 		t = current_thread->th_task;
 		kprintf("darwin: UNIX exit(%d)\n", (int)f->sf_arg0);
-		darwin_zombie_record(t->t_id, t->t_darwin_ppid,
-		    ((int)f->sf_arg0 & 0xFF) << 8);
+		darwin_zombie_record(t, ((int)f->sf_arg0 & 0xFF) << 8);
 		thread_exit();
 		/* NOTREACHED */
 		return (darwin_ok(f, 0));
@@ -4055,6 +4128,8 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 	case DARWIN_SYS_wait4: {
 		struct task	*t;
 		uint64_t	 got;
+		uint64_t	 utime;
+		uint64_t	 stime;
 		long		 pid;
 		int		 options;
 		int		 status;
@@ -4068,10 +4143,19 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		gen     = 0;
 		for (;;) {
 			if (darwin_zombie_reap(t->t_id,
-			    pid > 0 ? (uint64_t)pid : 0, &status, &got)) {
+			    pid > 0 ? (uint64_t)pid : 0, &status, &got,
+			    &utime, &stime)) {
+				spin_lock(&t->t_lock);
+				t->t_cutime += utime;
+				t->t_cstime += stime;
+				spin_unlock(&t->t_lock);
 				if (f->sf_arg1 != 0 &&
 				    syscall_copyout((void *)f->sf_arg1,
 				    &status, sizeof(status)) != 0)
+					return (darwin_err(f, DARWIN_EFAULT));
+				if (f->sf_arg3 != 0 &&
+				    darwin_rusage_out(f->sf_arg3, utime,
+				    stime) != 0)
 					return (darwin_err(f, DARWIN_EFAULT));
 				kprintf("darwin: UNIX wait4 -> pid %llu "
 				    "status 0x%x\n",
@@ -4479,8 +4563,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			 */
 			kprintf("darwin: UNIX kill(%ld, %d) -> terminate\n",
 			    pid, sig);
-			darwin_zombie_record(target->t_id,
-			    target->t_darwin_ppid, sig & 0x7F);
+			darwin_zombie_record(target, sig & 0x7F);
 			task_request_terminate((uint64_t)pid);
 		}
 		task_deref(target);
@@ -4569,8 +4652,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		    frame.sf_magic != DARWIN_SIGFRAME_MAGIC_FULL)) {
 			kprintf("darwin: bad sigreturn frame @0x%llx\n",
 			    (unsigned long long)uctx);
-			darwin_zombie_record(t->t_id, t->t_darwin_ppid,
-			    DARWIN_SIGKILL);
+			darwin_zombie_record(t, DARWIN_SIGKILL);
 			thread_exit();
 			/* NOTREACHED */
 		}

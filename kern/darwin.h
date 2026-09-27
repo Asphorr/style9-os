@@ -103,6 +103,7 @@
 #define	DARWIN_SYS_pwrite	154
 #define	DARWIN_SYS_statfs64	345	/* statfs$INODE64  */
 #define	DARWIN_SYS_fstatfs64	346	/* fstatfs$INODE64 */
+#define	DARWIN_SYS_getrusage	117
 
 /*
  * struct statfs as a 64-bit-inode program sees it (<sys/mount.h>), 2168
@@ -426,6 +427,21 @@ _Static_assert(sizeof(struct darwin_timeval) == 16,
     "struct timeval is 16 bytes on x86_64 Darwin");
 
 /*
+ * struct rusage (<sys/resource.h>), what getrusage(2) and wait4(2) fill.
+ * Only the two times are kept; the fourteen counters read zero.
+ */
+#define	DARWIN_RUSAGE_SELF	0
+#define	DARWIN_RUSAGE_CHILDREN	(-1)
+
+struct darwin_rusage {
+	struct darwin_timeval	ru_utime;
+	struct darwin_timeval	ru_stime;
+	int64_t			ru_counters[14];	/* ru_maxrss on */
+};
+_Static_assert(sizeof(struct darwin_rusage) == 144,
+    "struct rusage is 144 bytes on x86_64 Darwin");
+
+/*
  * uname(struct darwin_uname *out): the Darwin identity the kernel claims,
  * behind libSystem's uname(3) (guname).  As with fs_stat, a neutral struct
  * that libSystem reshapes into Apple's struct utsname (256-byte fields),
@@ -561,14 +577,14 @@ void	darwin_child_news(unsigned long long ppid);
 
 /*
  * Zombie bookkeeping (kern/darwin.c).  Records {pid, ppid, wait4-format
- * status} for a dying Darwin task so the parent's wait4 can reap it; a
- * ppid of 0 records nothing.  Also drops the dying task's own unreaped
- * zombie children, which no one is left to wait for.  Called on every
- * Darwin death: exit(2), signal termination, kill(2), a bad sigreturn
- * frame, and the execve point-of-no-return failure (arch/amd64/usermode.c).
+ * status, CPU times} for a dying Darwin task `t` so the parent's wait4 can
+ * reap it; a ppid of 0 records nothing.  Also drops the dying task's own
+ * unreaped zombie children, which no one is left to wait for.  Called on
+ * every Darwin death: exit(2), signal termination, kill(2), a bad
+ * sigreturn frame, and the execve point-of-no-return failure
+ * (arch/amd64/usermode.c).
  */
-void	darwin_zombie_record(unsigned long long pid, unsigned long long ppid,
-	    int status);
+void	darwin_zombie_record(struct task *t, int status);
 
 /*
  * Signal subsystem (kern/darwin.c).  darwin_signal_post ORs `signo` into

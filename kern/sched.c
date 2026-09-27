@@ -128,6 +128,8 @@ static void	poke_an_idle_cpu_locked(void);
 static void	enqueue_locked(struct thread *th);
 static void	switch_pmap_if_needed(struct thread *self, struct thread *next);
 static void	switch_user_kstack(struct thread *next);
+static void	cpu_charge_at(struct thread *th, uint64_t now);
+static void	cpu_switch_charge(struct thread *self, struct thread *next);
 
 /*
  * Load the incoming task's CR3 if it is not the outgoing one's.  Same-task
@@ -172,6 +174,68 @@ switch_user_kstack(struct thread *next)
 	    next->th_kstack_size;
 	tss_set_rsp0(ksp);
 	cpu_set_kernel_rsp(ksp);
+}
+
+/*
+ * Charge `th` the cycles since its mark, as user or system time by where it
+ * stands.  Two CPUs' TSCs may disagree a little, so a thread that moved
+ * between them can find its mark ahead of now; that interval counts as none.
+ */
+static void
+cpu_charge_at(struct thread *th, uint64_t now)
+{
+	uint64_t	d;
+
+	d = now > th->th_cpu_mark ? now - th->th_cpu_mark : 0;
+	if (th->th_in_sys)
+		th->th_stime += d;
+	else
+		th->th_utime += d;
+	th->th_cpu_mark = now;
+}
+
+/* At a switch, under sched_lock: close `self`'s interval, open `next`'s. */
+static void
+cpu_switch_charge(struct thread *self, struct thread *next)
+{
+	uint64_t	now;
+
+	now = tsc_read();
+	cpu_charge_at(self, now);
+	next->th_cpu_mark = now;
+}
+
+void
+sched_cpu_to_sys(void)
+{
+	struct thread	*self;
+
+	preempt_disable();
+	self = current_thread;
+	cpu_charge_at(self, tsc_read());
+	self->th_in_sys = true;
+	preempt_enable();
+}
+
+void
+sched_cpu_to_user(void)
+{
+	struct thread	*self;
+
+	preempt_disable();
+	self = current_thread;
+	cpu_charge_at(self, tsc_read());
+	self->th_in_sys = false;
+	preempt_enable();
+}
+
+void
+sched_cpu_charge(void)
+{
+
+	preempt_disable();
+	cpu_charge_at(current_thread, tsc_read());
+	preempt_enable();
 }
 
 /* thread_trampoline releases sched_lock for a new thread through this. */
@@ -464,6 +528,7 @@ thread_yield(void)
 	ctx_switches++;
 	curcpu()->cp_switches++;
 
+	cpu_switch_charge(self, next);
 	switch_pmap_if_needed(self, next);
 	switch_user_kstack(next);
 	thread_switch_asm(&self->th_rsp_save, next->th_rsp_save,
@@ -624,6 +689,7 @@ thread_block_release(int reason, void *target, struct spinlock *external)
 	ctx_switches++;
 	curcpu()->cp_switches++;
 
+	cpu_switch_charge(self, next);
 	switch_pmap_if_needed(self, next);
 	switch_user_kstack(next);
 	thread_switch_asm(&self->th_rsp_save, next->th_rsp_save,
@@ -998,6 +1064,7 @@ sched_handoff_zombie(struct thread *self)
 	ctx_switches++;
 	curcpu()->cp_switches++;
 
+	cpu_switch_charge(self, next);
 	switch_pmap_if_needed(self, next);
 	switch_user_kstack(next);
 	thread_switch_asm(&self->th_rsp_save, next->th_rsp_save,

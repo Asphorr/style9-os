@@ -126,6 +126,16 @@ struct task {
 	struct thread		*t_threads;	/* (t) head of thread list */
 	uint32_t		 t_nthreads;	/* (t) count                */
 	uint32_t		 t_refs;	/* (t) lifetime refs        */
+
+	/*
+	 * CPU time in TSC cycles: of the threads that have left t_threads,
+	 * and of the children wait4 has reaped, their own reaped children's
+	 * included (getrusage's RUSAGE_CHILDREN).  (t)
+	 */
+	uint64_t		 t_utime;
+	uint64_t		 t_stime;
+	uint64_t		 t_cutime;
+	uint64_t		 t_cstime;
 	/*
 	 * Per-type task-level exception ports.  user_fault_die maps the trap
 	 * vector to an EXC_TYPE_* index and posts MACH_EXC_FAULT to
@@ -250,6 +260,14 @@ void			 task_deref(struct task *);
  */
 void			 task_attach_thread(struct task *, struct thread *);
 void			 task_detach_thread(struct task *, struct thread *);
+
+/*
+ * The CPU time a task has used, in TSC cycles: its departed threads' and
+ * its live ones' as last charged.  A caller asking about its own task
+ * calls sched_cpu_charge first to count up to now.
+ */
+void			 task_cpu_times(struct task *, uint64_t *user,
+			    uint64_t *sys);
 
 void			 task_print(struct task *);
 void			 task_list_print(void);

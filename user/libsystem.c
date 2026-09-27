@@ -2451,6 +2451,16 @@ struct s9_timeval {			/* kern/darwin.h's darwin_timeval */
 	int		tv_pad;
 };
 
+/* struct rusage: the two times, then fourteen counters. */
+struct s9_rusage {
+	struct s9_timeval	ru_utime;
+	struct s9_timeval	ru_stime;
+	long			ru_counters[14];
+};
+
+#define	RUSAGE_SELF	0
+#define	RUSAGE_CHILDREN	(-1)
+
 /* The carry-capturing trap wrapper; defined with the process-control block. */
 static long	bsd_call_e(long nr, long a, long b, long c);
 
@@ -2475,23 +2485,40 @@ time(long *t)
 }
 
 /*
- * clock_gettime: every clock id gets the same answer.  Wall time is uptime
- * plus a boot-time anchor nothing can change, so it cannot be stepped or
- * set back -- what MONOTONIC promises; only its zero differs.
+ * clock_gettime: the two CPU-time clocks are getrusage's user and system
+ * time (one thread per process, so they agree); every other id is the
+ * wall clock.  Wall time is uptime plus a boot-time anchor nothing can
+ * change, so it cannot be stepped or set back -- what MONOTONIC promises;
+ * only its zero differs.
  */
 struct s9_timespec {
 	long	tv_sec;
 	long	tv_nsec;
 };
 
+#define	CLOCK_PROCESS_CPUTIME_ID	12
+#define	CLOCK_THREAD_CPUTIME_ID		16
+
 int
 clock_gettime(int clk, struct s9_timespec *ts)
 {
+	struct s9_rusage	ru;
 	struct s9_timeval	tv;
 
-	(void)clk;
 	if (ts == (void *)0)
 		return (-1);
+	if (clk == CLOCK_PROCESS_CPUTIME_ID || clk == CLOCK_THREAD_CPUTIME_ID) {
+		if (bsd_call_e(0x2000075, RUSAGE_SELF, (long)&ru, 0) < 0)
+			return (-1);
+		ts->tv_sec  = ru.ru_utime.tv_sec + ru.ru_stime.tv_sec;
+		ts->tv_nsec = ((long)ru.ru_utime.tv_usec +
+		    ru.ru_stime.tv_usec) * 1000L;
+		if (ts->tv_nsec >= 1000000000L) {
+			ts->tv_sec++;
+			ts->tv_nsec -= 1000000000L;
+		}
+		return (0);
+	}
 	if (gettimeofday(&tv, (void *)0) != 0)
 		return (-1);
 	ts->tv_sec  = tv.tv_sec;
@@ -4026,10 +4053,7 @@ getrlimit(int which, void *rlp)
 	return (0);
 }
 
-/*
- * sysconf: dash asks for the clock tick to scale its times builtin, which
- * times() below answers (always zero).
- */
+/* sysconf: dash asks for the clock tick to scale its times builtin. */
 long
 sysconf(int name)
 {
@@ -4046,17 +4070,52 @@ sysconf(int name)
 	}
 }
 
-/* No CPU accounting yet: every process has consumed zero ticks. */
+#define	CLK_TCK		100
+
+static unsigned long
+tv_ticks(const struct s9_timeval *tv)
+{
+
+	return ((unsigned long)tv->tv_sec * CLK_TCK +
+	    (unsigned long)tv->tv_usec / (1000000 / CLK_TCK));
+}
+
+/*
+ * times(3) as Apple's libc has it: getrusage's times for the process and
+ * its waited-for children, and the time of day, in CLK_TCK ticks.
+ */
 long
 times(void *buf)
 {
-	unsigned long	*t;
-	int		 i;
+	struct s9_rusage	 ru;
+	struct s9_timeval	 now;
+	unsigned long		*t;
 
 	t = (unsigned long *)buf;
-	for (i = 0; i < 4; i++)
-		t[i] = 0;
-	return (0);
+	if (bsd_call_e(0x2000075, RUSAGE_SELF, (long)&ru, 0) < 0)
+		return (-1);
+	t[0] = tv_ticks(&ru.ru_utime);
+	t[1] = tv_ticks(&ru.ru_stime);
+	if (bsd_call_e(0x2000075, RUSAGE_CHILDREN, (long)&ru, 0) < 0)
+		return (-1);
+	t[2] = tv_ticks(&ru.ru_utime);
+	t[3] = tv_ticks(&ru.ru_stime);
+	if (gettimeofday(&now, NULL) != 0)
+		return (-1);
+	return ((long)tv_ticks(&now));
+}
+
+/* clock(3): the process's user and system time in microseconds. */
+unsigned long
+clock(void)
+{
+	struct s9_rusage	ru;
+
+	if (bsd_call_e(0x2000075, RUSAGE_SELF, (long)&ru, 0) < 0)
+		return ((unsigned long)-1);
+	return ((unsigned long)(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) *
+	    1000000UL + (unsigned long)(ru.ru_utime.tv_usec +
+	    ru.ru_stime.tv_usec));
 }
 
 /*
@@ -6549,15 +6608,12 @@ nanosleep(const struct s9_timespec_ns *req, struct s9_timespec_ns *rem)
 	return (0);
 }
 
-/* No per-process CPU accounting is kept to report. */
+/* The kernel keeps the two times; the other fourteen fields read zero. */
 int
 getrusage(int who, void *usage)
 {
 
-	(void)who;
-	(void)usage;
-	g_errno = DARWIN_ENOSYS;
-	return (-1);
+	return ((int)bsd_call_e(0x2000075, who, (long)usage, 0));
 }
 
 /* ---- random numbers, and the machine ------------------------------------- */

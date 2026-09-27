@@ -19,6 +19,7 @@
 #include "spinlock.h"
 #include "task.h"
 #include "thread.h"
+#include "tsc.h"
 
 /* Defined in sched.c; released by trampoline on first dispatch. */
 extern void	sched_post_switch_unlock(void);
@@ -86,6 +87,10 @@ thread_adopt_current(struct task *t, const char *name)
 	th->th_wake_deadline_ms = 0;
 	th->th_timed_out       = 0;
 	th->th_timed_link      = NULL;
+	th->th_cpu_mark        = tsc_read();
+	th->th_utime           = 0;
+	th->th_stime           = 0;
+	th->th_in_sys          = true;
 	th->th_wake_hold       = 0;
 	th->th_irq_queued      = 0;
 	th->th_held_count      = 0;
@@ -194,6 +199,11 @@ thread_create(struct task *t, void (*entry)(void *), void *arg,
 	th->th_wake_deadline_ms  = 0;
 	th->th_timed_out         = 0;
 	th->th_timed_link        = NULL;
+	/* In the kernel until it first enters ring 3. */
+	th->th_cpu_mark          = tsc_read();
+	th->th_utime             = 0;
+	th->th_stime             = 0;
+	th->th_in_sys            = true;
 	th->th_wake_hold         = 0;
 	th->th_irq_queued        = 0;
 	th->th_held_count        = 0;

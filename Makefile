@@ -208,6 +208,7 @@ OBJS	= \
 	$(OBJDIR)/mmaptest_macho.o \
 	$(OBJDIR)/filewrite_macho.o \
 	$(OBJDIR)/lockprobe_macho.o \
+	$(OBJDIR)/cpuprobe_macho.o \
 	$(OBJDIR)/ttyprobe_macho.o \
 	$(OBJDIR)/gstty_macho.o \
 	$(OBJDIR)/gmkdir_macho.o \
@@ -550,6 +551,16 @@ $(OBJDIR)/lockprobe.dwn.o: $(USER_DIR)/lockprobe.c | $(OBJDIR)
 	$(DARWIN_CC) $(DARWIN_CFLAGS) -c $< -o $@
 
 $(OBJDIR)/lockprobe.macho: $(OBJDIR)/lockprobe.dwn.o $(OBJDIR)/libSystem.B.dylib
+	$(DARWIN_LD) $(DARWIN_LDF) -o $@ $< -L$(OBJDIR) -lSystem.B -e _entry \
+	    -pagezero_size $(DYLDHELLO_BASE)
+
+# cpuprobe (CPU-time probe): the same shape, for getrusage and wait4's
+# rusage -- a spin is user time, file reads system time, a sleep neither,
+# a child's time reaches its parent with its own child's.
+$(OBJDIR)/cpuprobe.dwn.o: $(USER_DIR)/cpuprobe.c | $(OBJDIR)
+	$(DARWIN_CC) $(DARWIN_CFLAGS) -c $< -o $@
+
+$(OBJDIR)/cpuprobe.macho: $(OBJDIR)/cpuprobe.dwn.o $(OBJDIR)/libSystem.B.dylib
 	$(DARWIN_LD) $(DARWIN_LDF) -o $@ $< -L$(OBJDIR) -lSystem.B -e _entry \
 	    -pagezero_size $(DYLDHELLO_BASE)
 

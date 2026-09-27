@@ -228,6 +228,19 @@ struct thread {
 	struct thread		*th_timed_link;
 
 	/*
+	 * CPU time, in TSC cycles.  The running thread's cycles since
+	 * th_cpu_mark are charged at every switch and at both ends of a
+	 * syscall: to th_stime while th_in_sys, else to th_utime, so a user
+	 * thread's interrupts count as its user time.  Written by the thread
+	 * itself with preemption off, and th_cpu_mark by the CPU switching to
+	 * it; others only read.
+	 */
+	uint64_t		 th_cpu_mark;
+	uint64_t		 th_utime;
+	uint64_t		 th_stime;
+	bool			 th_in_sys;
+
+	/*
 	 * WITNESS-lite per-thread held-locks stack: each entry is the lock's
 	 * class name (compared by identity, not strcmp) and the RIP that
 	 * acquired it.  Pushed by spin_lock, popped by spin_unlock; used for

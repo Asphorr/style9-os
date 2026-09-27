@@ -234,6 +234,8 @@ syscall_dispatch(struct syscall_frame *f)
 {
 	long	rv;
 
+	sched_cpu_to_sys();
+
 	/*
 	 * Async-kill detection point #1: a kill requested while this thread
 	 * ran in ring 3.  Retire before dispatching; no reply would ever be
@@ -279,6 +281,7 @@ syscall_dispatch(struct syscall_frame *f)
 	    current_thread->th_task->t_personality == TASK_PERSONALITY_DARWIN)
 		darwin_signal_deliver_syscall(f, rv);
 
+	sched_cpu_to_user();
 	return (rv);
 }
 

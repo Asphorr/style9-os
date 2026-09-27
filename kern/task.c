@@ -103,6 +103,10 @@ task_create(const char *name)
 	t->t_threads    = NULL;
 	t->t_nthreads   = 0;
 	t->t_refs       = 1;
+	t->t_utime      = 0;
+	t->t_stime      = 0;
+	t->t_cutime     = 0;
+	t->t_cstime     = 0;
 	t->t_self_port  = NULL;
 	t->t_map        = NULL;
 	t->t_pmap       = NULL;
@@ -382,6 +386,9 @@ task_detach_thread(struct task *t, struct thread *th)
 				prev->th_task_link = cur->th_task_link;
 			t->t_nthreads--;
 			cur->th_task_link = NULL;
+			/* Final: a zombie, charged at its last switch. */
+			t->t_utime += cur->th_utime;
+			t->t_stime += cur->th_stime;
 			break;
 		}
 		prev = cur;
@@ -389,6 +396,25 @@ task_detach_thread(struct task *t, struct thread *th)
 	spin_unlock(&t->t_lock);
 
 	task_deref(t);
+}
+
+void
+task_cpu_times(struct task *t, uint64_t *user, uint64_t *sys)
+{
+	struct thread	*cur;
+	uint64_t	 u;
+	uint64_t	 s;
+
+	spin_lock(&t->t_lock);
+	u = t->t_utime;
+	s = t->t_stime;
+	for (cur = t->t_threads; cur != NULL; cur = cur->th_task_link) {
+		u += __atomic_load_n(&cur->th_utime, __ATOMIC_RELAXED);
+		s += __atomic_load_n(&cur->th_stime, __ATOMIC_RELAXED);
+	}
+	spin_unlock(&t->t_lock);
+	*user = u;
+	*sys  = s;
 }
 
 void

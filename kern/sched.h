@@ -184,6 +184,17 @@ void		sched_handoff_zombie(struct thread *)
 void		sched_reap_zombies(void);
 
 /*
+ * CPU time (th_utime and th_stime in struct thread).  sched_cpu_to_sys
+ * charges the running thread's time since its mark as user time and goes
+ * into a syscall; sched_cpu_to_user charges it as system time and leaves
+ * for ring 3.  sched_cpu_charge charges it where it stands, so that a
+ * reader of the current thread's counters sees them up to now.
+ */
+void		sched_cpu_to_sys(void);
+void		sched_cpu_to_user(void);
+void		sched_cpu_charge(void);
+
+/*
  * Diagnostics.
  */
 void		sched_print(void);
