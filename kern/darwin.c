@@ -250,6 +250,16 @@ extern uint8_t	_binary_libgmp_10_dylib_end[];
 extern uint8_t	_binary_libedit_3_dylib_start[];
 extern uint8_t	_binary_libedit_3_dylib_end[];
 
+/*
+ * sqlite3's two others, both clean-room: libz without a codec
+ * (user/libz_stub.c) and a plain line reader under readline's bottle name
+ * (user/libreadline_stub.c).
+ */
+extern uint8_t	_binary_libz_1_dylib_start[];
+extern uint8_t	_binary_libz_1_dylib_end[];
+extern uint8_t	_binary_libreadline_8_dylib_start[];
+extern uint8_t	_binary_libreadline_8_dylib_end[];
+
 #define	DARWIN_DYLIB_PATH_MAX	256
 
 struct darwin_dylib {
@@ -265,6 +275,11 @@ static const struct darwin_dylib	darwin_dylibs[] = {
 	    _binary_libgmp_10_dylib_start, _binary_libgmp_10_dylib_end },
 	{ "/usr/lib/libedit.3.dylib",
 	    _binary_libedit_3_dylib_start, _binary_libedit_3_dylib_end },
+	{ "/usr/lib/libz.1.dylib",
+	    _binary_libz_1_dylib_start, _binary_libz_1_dylib_end },
+	{ "@@HOMEBREW_PREFIX@@/opt/readline/lib/libreadline.8.dylib",
+	    _binary_libreadline_8_dylib_start,
+	    _binary_libreadline_8_dylib_end },
 };
 
 #define	DARWIN_NDYLIBS	(sizeof(darwin_dylibs) / sizeof(darwin_dylibs[0]))

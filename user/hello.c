@@ -2122,6 +2122,33 @@ demo_darwin_spawn(void)
 	}
 
 	/*
+	 * sqlite3, via user/sqldemo.sh: builds a database on the volume in
+	 * one process and reads it back in others -- rows, a rollback, an
+	 * index over 5000 rows, integrity_check, the math functions.  The
+	 * script prints its own PASS/FAIL lines.
+	 */
+	{
+		mach_port_name_t	 sq_tp;
+		char			*sq_argv[3];
+
+		printf("  >>> sqlite3 -- a REAL Apple database, on the "
+		    "APFS volume <<<\n");
+		sq_argv[0] = "dash";
+		sq_argv[1] = "/bin/sqldemo.sh";
+		sq_argv[2] = NULL;
+		sq_tp = MACH_PORT_NULL;
+		child_id = spawn_args("dash", 2, sq_argv, &sq_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('dash sqldemo.sh') failed "
+			    "(rv=%ld)\n", child_id);
+			return (99);
+		}
+		for (i = 0; i < 65536 && task_alive((uint64_t)child_id); i++)
+			(void)poll_turn();
+		printf("  dash[sqldemo] retired after %d turns\n", i);
+	}
+
+	/*
 	 * guname -a (coreutils uname): prints the Darwin identity uname(2)
 	 * returns, "Darwin style9 23.6.0 ... x86_64".
 	 */

@@ -225,6 +225,17 @@ extern uint8_t	_binary_makedemo_sh_macho_start[];
 extern uint8_t	_binary_makedemo_sh_macho_end[];
 
 /*
+ * sqlite3 (the SQLite 3.53.4 shell), real: a database on the APFS volume,
+ * linking libz and readline besides libSystem.  sqldemo.sh drives it at
+ * boot.
+ */
+extern uint8_t	_binary_sqlite3_macho_start[];
+extern uint8_t	_binary_sqlite3_macho_end[];
+
+extern uint8_t	_binary_sqldemo_sh_macho_start[];
+extern uint8_t	_binary_sqldemo_sh_macho_end[];
+
+/*
  * gfactor (GNU coreutils' factor), real: also links libgmp, so dyld maps
  * the closure gfactor -> libgmp -> libSystem and binds each import against
  * the dylib its lib_ordinal names; big values exercise libgmp.
@@ -385,6 +396,10 @@ progreg_init(void)
 	    _binary_gmake_macho_start, _binary_gmake_macho_end);
 	register_one("makedemo.sh",
 	    _binary_makedemo_sh_macho_start, _binary_makedemo_sh_macho_end);
+	register_one("sqlite3",
+	    _binary_sqlite3_macho_start, _binary_sqlite3_macho_end);
+	register_one("sqldemo.sh",
+	    _binary_sqldemo_sh_macho_start, _binary_sqldemo_sh_macho_end);
 	register_one("gfactor",
 	    _binary_gfactor_macho_start, _binary_gfactor_macho_end);
 	register_one("pipefork",

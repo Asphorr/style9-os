@@ -224,9 +224,13 @@ OBJS	= \
 	$(OBJDIR)/dash_macho.o \
 	$(OBJDIR)/demo_sh_macho.o \
 	$(OBJDIR)/makedemo_sh_macho.o \
+	$(OBJDIR)/sqlite3_macho.o \
+	$(OBJDIR)/sqldemo_sh_macho.o \
 	$(OBJDIR)/libSystem_dylib.o \
 	$(OBJDIR)/libgmp_dylib.o \
 	$(OBJDIR)/libedit_dylib.o \
+	$(OBJDIR)/libz_dylib.o \
+	$(OBJDIR)/libreadline_dylib.o \
 	$(OBJDIR)/ksym.o
 
 all: kernel.elf
@@ -638,6 +642,21 @@ $(OBJDIR)/gmake.macho: extern/gmake.macho | $(OBJDIR)
 $(OBJDIR)/makedemo_sh.macho: $(USER_DIR)/makedemo.sh | $(OBJDIR)
 	cp $< $@
 
+# sqlite3: the SQLite 3.53.4 shell, a Homebrew bottle vendored in
+# extern/sqlite3.macho -- the FOURTEENTH real Apple binary, and the first
+# database.  It links libSystem, zlib and readline (the last two answered by
+# the clean-room stubs below), reads and writes its file at offsets, asks
+# statfs which locking style the volume takes, and allocates through a
+# malloc zone.  Embedded like figlet.
+$(OBJDIR)/sqlite3.macho: extern/sqlite3.macho | $(OBJDIR)
+	cp $< $@
+
+# sqldemo.sh: sqlite3 at boot -- a dash script that builds a database on
+# the APFS volume, reopens it in a second process, and checks what came
+# back.  Carried like demo.sh.
+$(OBJDIR)/sqldemo_sh.macho: $(USER_DIR)/sqldemo.sh | $(OBJDIR)
+	cp $< $@
+
 # clean-room libedit.3.dylib -- dash's interactive line-editor dependency,
 # stubbed (el_init returns NULL -> dash falls back to raw reads; it only
 # consults libedit when stdin is a tty anyway).  Zero imports, so the dyld
@@ -649,6 +668,29 @@ $(OBJDIR)/libedit.dwn.o: $(USER_DIR)/libedit_stub.c | $(OBJDIR)
 $(OBJDIR)/libedit.3.dylib: $(OBJDIR)/libedit.dwn.o
 	$(DARWIN_LD) -dylib $(DARWIN_LDF) -o $@ $< \
 	    -install_name /usr/lib/libedit.3.dylib
+
+# clean-room libz.1.dylib -- sqlite3's archive commands' dependency, without
+# a codec: every stream call fails, crc32 and the bounds are real.  Zero
+# imports; registered under /usr/lib/libz.1.dylib in kern/darwin.c.
+$(OBJDIR)/libz.dwn.o: $(USER_DIR)/libz_stub.c | $(OBJDIR)
+	$(DARWIN_CC) $(DARWIN_CFLAGS) -c $< -o $@
+
+$(OBJDIR)/libz.1.dylib: $(OBJDIR)/libz.dwn.o
+	$(DARWIN_LD) -dylib $(DARWIN_LDF) -o $@ $< \
+	    -install_name /usr/lib/libz.1.dylib
+
+# clean-room libreadline.8.dylib -- a plain line reader for sqlite3 on a
+# terminal.  It imports from libSystem, so it links against it; registered
+# under the bottle's own (unrelocated) install name.
+READLINE_NAME = @@HOMEBREW_PREFIX@@/opt/readline/lib/libreadline.8.dylib
+
+$(OBJDIR)/libreadline.dwn.o: $(USER_DIR)/libreadline_stub.c | $(OBJDIR)
+	$(DARWIN_CC) $(DARWIN_CFLAGS) -c $< -o $@
+
+$(OBJDIR)/libreadline.8.dylib: $(OBJDIR)/libreadline.dwn.o \
+    $(OBJDIR)/libSystem.B.dylib
+	$(DARWIN_LD) -dylib $(DARWIN_LDF) -o $@ $< -L$(OBJDIR) -lSystem.B \
+	    -install_name $(READLINE_NAME)
 
 # libSystem is embedded so the dyld backchannel (kern/darwin.c) can map it by
 # path -- it is a dependency to bind against, not a program to run, so it gets
@@ -675,6 +717,20 @@ $(OBJDIR)/libedit_dylib.o: $(OBJDIR)/libedit.3.dylib
 	    --rename-section .data=.rodata.libedit_dylib		\
 	    --set-section-alignment .data=4096		\
 	    libedit.3.dylib libedit_dylib.o
+
+# libz and libreadline embedded the same way (_binary_libz_1_dylib_*,
+# _binary_libreadline_8_dylib_*).
+$(OBJDIR)/libz_dylib.o: $(OBJDIR)/libz.1.dylib
+	cd $(OBJDIR) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386	\
+	    --rename-section .data=.rodata.libz_dylib			\
+	    --set-section-alignment .data=4096		\
+	    libz.1.dylib libz_dylib.o
+
+$(OBJDIR)/libreadline_dylib.o: $(OBJDIR)/libreadline.8.dylib
+	cd $(OBJDIR) && $(OBJCOPY) -I binary -O elf64-x86-64 -B i386	\
+	    --rename-section .data=.rodata.libreadline_dylib		\
+	    --set-section-alignment .data=4096		\
+	    libreadline.8.dylib libreadline_dylib.o
 
 # Wrap a .macho into a kernel-linkable object exposing
 # _binary_<name>_macho_start / _end.  Mirror of the %_elf.o rule.
