@@ -93,20 +93,23 @@ struct vm_map;
  */
 #define	DARWIN_OF_NULL		6
 
+struct darwin_foff;
 struct darwin_pipe;
 
 /*
  * An open file.  A disk-backed one is a handle plus a cursor; the bytes
  * stay on the volume and are read on demand.  The synthetic /bin entries
- * are built into the kernel image, so they keep a buffer instead.
+ * are built into the kernel image, so they keep a buffer instead.  The
+ * cursor is the open file description's, shared with every copy dup(2)
+ * and fork(2) make (kern/darwin.c).
  */
 struct darwin_ofile {
 	struct darwin_pipe	*of_pipe;	/* PIPE_*: shared object   */
+	struct darwin_foff	*of_foff;	/* FILE: the shared cursor */
 	struct fs_handle	 of_handle;	/* FILE: the file, resolved */
 	uint8_t			*of_buf;	/* FILE: image, if no handle */
 	char			*of_path;	/* FILE: what it was named  */
-	uint32_t		 of_size;	/* FILE: valid bytes       */
-	uint32_t		 of_off;	/* FILE: read cursor       */
+	uint32_t		 of_size;	/* FILE: length last seen  */
 	uint32_t		 of_flags;	/* FILE: DARWIN_O_* it was opened with */
 	uint8_t			 of_type;	/* DARWIN_OF_*             */
 };

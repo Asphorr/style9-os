@@ -131,8 +131,8 @@ task_create(const char *name)
 		for (fi = 0; fi < DARWIN_NOFILE; fi++) {
 			t->t_darwin_files[fi].of_pipe = NULL;
 			t->t_darwin_files[fi].of_buf  = NULL;
+			t->t_darwin_files[fi].of_foff = NULL;
 			t->t_darwin_files[fi].of_size = 0;
-			t->t_darwin_files[fi].of_off  = 0;
 			t->t_darwin_files[fi].of_type = DARWIN_OF_FREE;
 		}
 	}

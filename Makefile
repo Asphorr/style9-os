@@ -207,6 +207,7 @@ OBJS	= \
 	$(OBJDIR)/timeprobe_macho.o \
 	$(OBJDIR)/mmaptest_macho.o \
 	$(OBJDIR)/filewrite_macho.o \
+	$(OBJDIR)/lockprobe_macho.o \
 	$(OBJDIR)/ttyprobe_macho.o \
 	$(OBJDIR)/gstty_macho.o \
 	$(OBJDIR)/gmkdir_macho.o \
@@ -535,6 +536,16 @@ $(OBJDIR)/filewrite.dwn.o: $(USER_DIR)/filewrite.c | $(OBJDIR)
 	$(DARWIN_CC) $(DARWIN_CFLAGS) -c $< -o $@
 
 $(OBJDIR)/filewrite.macho: $(OBJDIR)/filewrite.dwn.o $(OBJDIR)/libSystem.B.dylib
+	$(DARWIN_LD) $(DARWIN_LDF) -o $@ $< -L$(OBJDIR) -lSystem.B -e _entry \
+	    -pagezero_size $(DYLDHELLO_BASE)
+
+# lockprobe (record-lock probe): the same shape, for fcntl's F_GETLK,
+# F_SETLK and F_SETLKW between processes -- conflicts, the holder named, a
+# waiter woken by a close, locks dropped at exit, a range split by an unlock.
+$(OBJDIR)/lockprobe.dwn.o: $(USER_DIR)/lockprobe.c | $(OBJDIR)
+	$(DARWIN_CC) $(DARWIN_CFLAGS) -c $< -o $@
+
+$(OBJDIR)/lockprobe.macho: $(OBJDIR)/lockprobe.dwn.o $(OBJDIR)/libSystem.B.dylib
 	$(DARWIN_LD) $(DARWIN_LDF) -o $@ $< -L$(OBJDIR) -lSystem.B -e _entry \
 	    -pagezero_size $(DYLDHELLO_BASE)
 

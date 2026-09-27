@@ -99,6 +99,40 @@
 #define	DARWIN_SYS_mkfifo	132
 #define	DARWIN_SYS_ftruncate	201
 #define	DARWIN_SYS_poll		230
+#define	DARWIN_SYS_pread	153
+#define	DARWIN_SYS_pwrite	154
+#define	DARWIN_SYS_statfs64	345	/* statfs$INODE64  */
+#define	DARWIN_SYS_fstatfs64	346	/* fstatfs$INODE64 */
+
+/*
+ * struct statfs as a 64-bit-inode program sees it (<sys/mount.h>), 2168
+ * bytes.  MNT_RDONLY is the one f_flags bit reported.
+ */
+#define	DARWIN_MFSTYPENAMELEN	16
+#define	DARWIN_MAXPATHLEN	1024
+#define	DARWIN_MNT_RDONLY	0x00000001u
+
+struct darwin_statfs64 {
+	uint32_t	f_bsize;
+	int32_t		f_iosize;
+	uint64_t	f_blocks;
+	uint64_t	f_bfree;
+	uint64_t	f_bavail;
+	uint64_t	f_files;
+	uint64_t	f_ffree;
+	int32_t		f_fsid[2];
+	uint32_t	f_owner;
+	uint32_t	f_type;
+	uint32_t	f_flags;
+	uint32_t	f_fssubtype;
+	char		f_fstypename[DARWIN_MFSTYPENAMELEN];
+	char		f_mntonname[DARWIN_MAXPATHLEN];
+	char		f_mntfromname[DARWIN_MAXPATHLEN];
+	uint32_t	f_flags_ext;
+	uint32_t	f_reserved[7];
+};
+_Static_assert(sizeof(struct darwin_statfs64) == 2168,
+    "struct statfs (64-bit inode) is 2168 bytes");
 
 /* access(2)'s mode word, <unistd.h> spelling. */
 #define	DARWIN_F_OK		0
@@ -177,16 +211,34 @@ _Static_assert(sizeof(struct darwin_pollfd) == 8, "pollfd is 8 bytes");
 #define	DARWIN_SIG_SETMASK	3
 
 /*
- * fcntl(2) commands (Darwin <sys/fcntl.h>).  Only F_DUPFD does anything (a
- * shell saves fds at 10+ with it); the flag commands answer 0, as the fd
- * table has no flag bits (no close-on-exec).
+ * fcntl(2) commands (Darwin <sys/fcntl.h>).  F_DUPFD duplicates (a shell
+ * saves fds at 10+ with it) and the three lock commands keep POSIX record
+ * locks; the flag commands answer 0, as the fd table has no flag bits (no
+ * close-on-exec).
  */
 #define	DARWIN_F_DUPFD		0
 #define	DARWIN_F_GETFD		1
 #define	DARWIN_F_SETFD		2
 #define	DARWIN_F_GETFL		3
 #define	DARWIN_F_SETFL		4
+#define	DARWIN_F_GETLK		7
+#define	DARWIN_F_SETLK		8
+#define	DARWIN_F_SETLKW		9
 #define	DARWIN_F_DUPFD_CLOEXEC	67	/* dash's savefd uses this one */
+
+#define	DARWIN_F_RDLCK		1
+#define	DARWIN_F_UNLCK		2
+#define	DARWIN_F_WRLCK		3
+
+/* struct flock, what the three lock commands point at. */
+struct darwin_flock {
+	int64_t		l_start;
+	int64_t		l_len;		/* 0: to the end, however far */
+	int32_t		l_pid;
+	int16_t		l_type;		/* DARWIN_F_RDLCK/UNLCK/WRLCK */
+	int16_t		l_whence;	/* SEEK_SET/CUR/END */
+};
+_Static_assert(sizeof(struct darwin_flock) == 24, "struct flock is 24 bytes");
 
 /*
  * Mach traps (class 1): positive indices into xnu's mach_trap_table.  They
@@ -197,6 +249,11 @@ _Static_assert(sizeof(struct darwin_pollfd) == 8, "pollfd is 8 bytes");
 #define	DARWIN_MACH_task_self_trap	28
 #define	DARWIN_MACH_host_self_trap	29	/* mach_host_self()            */
 #define	DARWIN_MACH_mach_msg_trap	31	/* classic combined mach_msg() */
+#define	DARWIN_MACH_thread_get_special_reply_port 50
+#define	DARWIN_MACH_mk_timer_create_trap 91
+
+/* What xnu's kern_invalid answers for a trap it does not have. */
+#define	DARWIN_KERN_INVALID_ARGUMENT	4
 
 /*
  * style9-private calls (class DARWIN_SYSCALL_CLASS_STYLE9), issued only by
@@ -413,11 +470,14 @@ struct darwin_uname {
 #define	DARWIN_ENOTTY	25
 #define	DARWIN_EEXIST	17
 #define	DARWIN_EISDIR	21
+#define	DARWIN_EFBIG	27
 #define	DARWIN_ENOSPC	28
 #define	DARWIN_ESPIPE	29
 #define	DARWIN_EROFS	30
 #define	DARWIN_EPIPE	32
 #define	DARWIN_ERANGE	34
+#define	DARWIN_EAGAIN	35
+#define	DARWIN_ENOLCK	77
 #define	DARWIN_ENAMETOOLONG	63
 #define	DARWIN_ENOTDIR	20
 #define	DARWIN_ENOTEMPTY	66
@@ -438,6 +498,8 @@ struct darwin_uname {
 #define	DARWIN_MACH_SEND_INVALID_DATA	0x10000002
 #define	DARWIN_MACH_SEND_INVALID_DEST	0x10000003
 #define	DARWIN_MACH_SEND_TIMED_OUT	0x10000004
+#define	DARWIN_MACH_SEND_NO_BUFFER	0x1000000d
+#define	DARWIN_MACH_SEND_INVALID_TYPE	0x1000000f
 #define	DARWIN_MACH_RCV_INVALID_NAME	0x10004002
 #define	DARWIN_MACH_RCV_TIMED_OUT	0x10004003
 #define	DARWIN_MACH_RCV_TOO_LARGE	0x10004004

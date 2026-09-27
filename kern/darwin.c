@@ -20,6 +20,7 @@
 #include "kprintf.h"
 #include "lapic.h"
 #include "macho.h"
+#include "mutex.h"
 #include "panic.h"
 #include "pmap.h"
 #include "port.h"
@@ -89,7 +90,7 @@
 static long	darwin_unix(struct syscall_frame *f, uint32_t nr);
 static long	darwin_mach(struct syscall_frame *f, uint32_t trap);
 static long	darwin_mach_msg(struct syscall_frame *f);
-static long	darwin_mach_msg_err(long rv, bool sending);
+static long	darwin_mach_msg_err(long rv, bool sending, uint32_t option);
 static long	darwin_style9(struct syscall_frame *f, uint32_t num);
 static long	darwin_s9_map_image(struct syscall_frame *f);
 static long	darwin_s9_fs_stat(struct syscall_frame *f);
@@ -111,7 +112,10 @@ static long	darwin_pipe_read(struct syscall_frame *f,
 		    struct darwin_pipe *p, void *ubuf, size_t n);
 static long	darwin_pipe_write(struct syscall_frame *f,
 		    struct darwin_pipe *p, const void *ubuf, size_t n);
-static void	darwin_ofile_clear(struct darwin_ofile *of);
+static void	darwin_ofile_clear(struct task *t, struct darwin_ofile *of);
+static uint64_t	darwin_lk_file(const struct darwin_ofile *of);
+static void	darwin_lk_drop(uint64_t owner, uint64_t file);
+static void	darwin_lk_stats(void);
 static int	darwin_dup_install(struct task *t, int oldfd, int newfd);
 static bool	darwin_zombie_reap(uint64_t ppid, uint64_t pid,
 		    int *status_out, uint64_t *pid_out);
@@ -602,59 +606,144 @@ darwin_path_dup(const char *path)
 }
 
 /*
+ * The cursor of an open file description.  POSIX gives a descriptor and
+ * every copy of it -- dup(2), dup2(2), F_DUPFD, fork(2) -- one offset, so
+ * what a copy writes lands after what the original wrote (`2>&1`, a
+ * subshell writing into its parent's redirection).  The cell is shared by
+ * reference, freed with its last descriptor.  Its mutex is held across a
+ * read(2), write(2) or lseek(2) through the description, since a parent
+ * and its child may use it on two CPUs at once; the fs lock nests inside.
+ */
+struct darwin_foff {
+	struct mutex	fo_lock;
+	uint64_t	fo_off;		/* (l) */
+	uint32_t	fo_refs;	/* atomic */
+};
+
+static struct darwin_foff *
+darwin_foff_new(void)
+{
+	struct darwin_foff	*fo;
+
+	fo = kmalloc(sizeof(*fo));
+	if (fo == NULL)
+		return (NULL);
+	mutex_init(&fo->fo_lock, "dfoff");
+	fo->fo_off  = 0;
+	fo->fo_refs = 1;
+	return (fo);
+}
+
+static void
+darwin_foff_hold(struct darwin_foff *fo)
+{
+
+	(void)__atomic_add_fetch(&fo->fo_refs, 1, __ATOMIC_RELAXED);
+}
+
+static void
+darwin_foff_drop(struct darwin_foff *fo)
+{
+
+	if (__atomic_sub_fetch(&fo->fo_refs, 1, __ATOMIC_ACQ_REL) == 0)
+		kfree(fo);
+}
+
+/*
  * read(2) from a disk-backed fd, through a kernel bounce buffer: fs_pread
  * writes kernel memory, the user copy needs an SMAP bracket, and no user
  * page should be held while the disk read sleeps.  The bounce is capped at
  * DARWIN_READ_CHUNK so a huge read cannot ask for a huge allocation; the
- * loop still delivers the whole length.
+ * loop still delivers the whole length.  With `atp` NULL the read is at
+ * the description's cursor and moves it (read(2)); otherwise it is at
+ * *atp and moves nothing (pread(2)).
  */
 #define	DARWIN_READ_CHUNK	(64u * 1024u)
 
 static long
 darwin_file_read(struct syscall_frame *f, struct darwin_ofile *of, void *ubuf,
-    size_t n)
+    size_t n, const uint64_t *atp)
 {
-	uint8_t		*bounce;
-	size_t		 done;
-	size_t		 chunk;
-	uint32_t	 got;
-	int		 rv;
+	struct darwin_foff	*fo;
+	uint8_t			*bounce;
+	uint64_t		 at;
+	size_t			 done;
+	size_t			 chunk;
+	uint32_t		 got;
+	int			 err;
+	int			 rv;
 
+	if (n == 0)
+		return (darwin_ok(f, 0));
 	bounce = kmalloc(n < DARWIN_READ_CHUNK ? n : DARWIN_READ_CHUNK);
 	if (bounce == NULL)
 		return (darwin_err(f, DARWIN_ENOMEM));
 
+	fo = NULL;
+	if (atp != NULL)
+		at = *atp;
+	else {
+		fo = of->of_foff;
+		mutex_lock(&fo->fo_lock);
+		at = fo->fo_off;
+	}
+	err = 0;
 	for (done = 0; done < n; done += chunk) {
 		chunk = n - done;
 		if (chunk > DARWIN_READ_CHUNK)
 			chunk = DARWIN_READ_CHUNK;
 		got = 0;
-		rv = fs_pread(&of->of_handle, of->of_off + done, bounce,
+		rv = fs_pread(&of->of_handle, at + done, bounce,
 		    (uint32_t)chunk, &got);
 		if (rv != FS_E_OK) {
-			kfree(bounce);
 			/*
 			 * EIO, except for a /.xid descriptor whose checkpoint
 			 * has left the window: ESTALE.
 			 */
-			return (darwin_err(f, rv == FS_E_GONE ?
-			    DARWIN_ESTALE : DARWIN_EIO));
+			err = rv == FS_E_GONE ? DARWIN_ESTALE : DARWIN_EIO;
+			break;
 		}
 		if (got == 0)			/* end of file, short read */
 			break;
 		if (syscall_copyout((uint8_t *)ubuf + done, bounce,
 		    got) != 0) {
-			kfree(bounce);
-			return (darwin_err(f, DARWIN_EFAULT));
+			err = DARWIN_EFAULT;
+			break;
 		}
 		if (got < chunk) {
 			done += got;
 			break;
 		}
 	}
+	if (fo != NULL) {
+		if (err == 0)
+			fo->fo_off = at + done;
+		mutex_unlock(&fo->fo_lock);
+	}
 	kfree(bounce);
-	of->of_off += (uint32_t)done;
+	if (err != 0)
+		return (darwin_err(f, err));
+	of->of_size = (uint32_t)of->of_handle.fh_size;	/* fs_pread's refresh */
 	return (darwin_ok(f, (long)done));
+}
+
+/*
+ * A file's length now.  of_size is what this descriptor last saw; another
+ * descriptor or process may have grown or cut the file since, so one on
+ * the volume asks it (fs_length refreshes a stale handle).  A built-in
+ * image never changes.
+ */
+static uint64_t
+darwin_file_len(struct darwin_ofile *of)
+{
+	uint64_t	len;
+
+	if (of->of_buf != NULL || of->of_handle.fh_kind == FS_HANDLE_NONE)
+		return (of->of_size);
+	if (fs_length(&of->of_handle, &len) != FS_E_OK)
+		return (of->of_size);
+	of->of_size = (uint32_t)len;
+	return (len);
 }
 
 /*
@@ -692,19 +781,23 @@ darwin_fs_errno(int rv)
  * darwin_file_read.  O_APPEND is resolved per call against the handle's
  * current length, not the open-time one, so two appenders do not overwrite
  * each other.  A write is short only if the filesystem shortened it.
+ * pwrite(2) passes its offset in `atp`: the write lands there, O_APPEND or
+ * not, as on Darwin, and the cursor stays put.
  */
 #define	DARWIN_WRITE_CHUNK	(64u * 1024u)
 
 static long
 darwin_file_write(struct syscall_frame *f, struct darwin_ofile *of,
-    const void *ubuf, size_t n)
+    const void *ubuf, size_t n, const uint64_t *atp)
 {
-	uint8_t		*bounce;
-	uint64_t	 at;
-	size_t		 done;
-	size_t		 chunk;
-	uint32_t	 put;
-	int		 rv;
+	struct darwin_foff	*fo;
+	uint8_t			*bounce;
+	uint64_t		 at;
+	size_t			 done;
+	size_t			 chunk;
+	uint32_t		 put;
+	int			 err;
+	int			 rv;
 
 	if ((of->of_flags & DARWIN_O_ACCMODE) == DARWIN_O_RDONLY)
 		return (darwin_err(f, DARWIN_EBADF));
@@ -717,42 +810,123 @@ darwin_file_write(struct syscall_frame *f, struct darwin_ofile *of,
 	if (bounce == NULL)
 		return (darwin_err(f, DARWIN_ENOMEM));
 
-	at = ((of->of_flags & DARWIN_O_APPEND) != 0) ?
-	    of->of_handle.fh_size : (uint64_t)of->of_off;
+	fo = NULL;
+	if (atp != NULL)
+		at = *atp;
+	else {
+		fo = of->of_foff;
+		mutex_lock(&fo->fo_lock);
+		/* An append's end is found under the fs lock, not here. */
+		if ((of->of_flags & DARWIN_O_APPEND) != 0)
+			at = FS_OFF_APPEND;
+		else
+			at = fo->fo_off;
+	}
+	err = 0;
 	for (done = 0; done < n; done += put) {
 		chunk = n - done;
 		if (chunk > DARWIN_WRITE_CHUNK)
 			chunk = DARWIN_WRITE_CHUNK;
 		if (syscall_copyin(bounce, (const uint8_t *)ubuf + done,
 		    chunk) != 0) {
-			kfree(bounce);
-			return (darwin_err(f, DARWIN_EFAULT));
+			err = DARWIN_EFAULT;
+			break;
 		}
+		/*
+		 * An append puts each chunk at the end as it then stands: a
+		 * write longer than a chunk may interleave with another
+		 * appender's, but never lands on its bytes.
+		 */
 		put = 0;
-		rv = fs_pwrite(&of->of_handle, at + done, bounce,
+		rv = fs_pwrite(&of->of_handle,
+		    at == FS_OFF_APPEND ? FS_OFF_APPEND : at + done, bounce,
 		    (uint32_t)chunk, &put);
 		if (rv != FS_E_OK) {
 			if (done != 0)
 				break;		/* a short write, not an error */
-			kfree(bounce);
 			kprintf("darwin: write to '%s' refused (rv=%d)\n",
 			    of->of_path != NULL ? of->of_path : "?", rv);
-			return (darwin_err(f, darwin_fs_errno(rv)));
+			err = darwin_fs_errno(rv);
+			break;
 		}
 		if (put == 0)
 			break;
 	}
-	kfree(bounce);
+	if (err != 0 && done != 0)
+		err = 0;			/* short, not failed */
 
-	/* fs_pwrite has already grown fh_size if the write ran off the end. */
-	of->of_off  = (uint32_t)(at + done);
+	/*
+	 * fs_pwrite has already grown fh_size if the write ran off the end;
+	 * an append leaves the cursor there.
+	 */
+	if (fo != NULL) {
+		if (err == 0)
+			fo->fo_off = at == FS_OFF_APPEND ?
+			    of->of_handle.fh_size : at + done;
+		mutex_unlock(&fo->fo_lock);
+	}
+	kfree(bounce);
+	if (err != 0)
+		return (darwin_err(f, err));
 	of->of_size = (uint32_t)of->of_handle.fh_size;
 	return (darwin_ok(f, (long)done));
 }
 
-/* Release whatever one slot holds and return it to FREE. */
+/* Copy `src` into `dst[cap]`, cut short and always terminated. */
 static void
-darwin_ofile_clear(struct darwin_ofile *of)
+darwin_strfill(char *dst, const char *src, size_t cap)
+{
+	size_t	i;
+
+	for (i = 0; i + 1 < cap && src[i] != '\0'; i++)
+		dst[i] = src[i];
+	dst[i] = '\0';
+}
+
+/*
+ * statfs(2) and fstatfs(2), 64-bit-inode form: the one mounted volume, seen
+ * from `path` -- read-only under /.xid.  Built in kernel memory, as the
+ * struct is too big for this stack, and copied out whole.
+ */
+static long
+darwin_statfs_out(struct syscall_frame *f, const char *path, void *ubuf)
+{
+	struct darwin_statfs64	*sf;
+	uint64_t		 blocks;
+	uint64_t		 bfree;
+	uint32_t		 bsize;
+	long			 rv;
+
+	sf = kcalloc(1, sizeof(*sf));
+	if (sf == NULL)
+		return (darwin_err(f, DARWIN_ENOMEM));
+	(void)fs_space(&bsize, &blocks, &bfree);
+	sf->f_bsize     = bsize != 0 ? bsize : 4096;
+	sf->f_iosize    = (int32_t)sf->f_bsize;
+	sf->f_blocks    = blocks;
+	sf->f_bfree     = bfree;
+	sf->f_bavail    = bfree;
+	sf->f_fsid[0]   = 1;
+	if (path != NULL && fs_readonly(path))
+		sf->f_flags = DARWIN_MNT_RDONLY;
+	darwin_strfill(sf->f_fstypename, fs_kind(), sizeof(sf->f_fstypename));
+	darwin_strfill(sf->f_mntonname, "/", sizeof(sf->f_mntonname));
+	darwin_strfill(sf->f_mntfromname, "/dev/disk0s1",
+	    sizeof(sf->f_mntfromname));
+
+	rv = syscall_copyout(ubuf, sf, sizeof(*sf));
+	kfree(sf);
+	if (rv != 0)
+		return (darwin_err(f, DARWIN_EFAULT));
+	return (darwin_ok(f, 0));
+}
+
+/*
+ * Release whatever one slot of task t holds and return it to FREE.  A file
+ * takes t's record locks on it along.
+ */
+static void
+darwin_ofile_clear(struct task *t, struct darwin_ofile *of)
 {
 
 	switch (of->of_type) {
@@ -764,6 +938,8 @@ darwin_ofile_clear(struct darwin_ofile *of)
 		 * task teardown and exec end descriptors too.  A directory's
 		 * handle is FS_HANDLE_NONE, which fs_close ignores.
 		 */
+		if (of->of_type == DARWIN_OF_FILE && darwin_lk_file(of) != 0)
+			darwin_lk_drop(t->t_id, darwin_lk_file(of));
 		(void)fs_close(&of->of_handle);
 		if (of->of_buf != NULL)
 			kfree(of->of_buf);
@@ -779,14 +955,16 @@ darwin_ofile_clear(struct darwin_ofile *of)
 	default:
 		break;
 	}
+	if (of->of_foff != NULL)
+		darwin_foff_drop(of->of_foff);
 	of->of_pipe          = NULL;
+	of->of_foff          = NULL;
 	of->of_buf           = NULL;
 	of->of_path          = NULL;
 	of->of_handle.fh_kind = FS_HANDLE_NONE;
 	of->of_handle.fh_id   = 0;
 	of->of_handle.fh_size = 0;
 	of->of_size          = 0;
-	of->of_off           = 0;
 	of->of_flags         = 0;
 	of->of_type          = DARWIN_OF_FREE;
 }
@@ -1300,6 +1478,7 @@ darwin_wait_stats(void)
 {
 
 	darwin_select_stats();
+	darwin_lk_stats();
 	if (darwin_pipe_n_read == 0 && darwin_pipe_n_write == 0 &&
 	    darwin_wait_n_call == 0)
 		return;
@@ -1543,6 +1722,361 @@ darwin_readiness_wait(long (*scan)(void *), void *arg, uint64_t deadline_ms,
 			current_thread->th_wake_deadline_ms = 0;
 		}
 	}
+}
+
+/* ---- record locks: fcntl(2) F_GETLK, F_SETLK, F_SETLKW ------------------- */
+
+/*
+ * POSIX record locks.  One list for the machine, under darwin_lk_lock:
+ * each entry is one process's lock on one byte range of one file, the
+ * file named by its inode.  A process's own locks never conflict; a new
+ * one replaces whatever of its own it overlaps, splitting what sticks out,
+ * so one owner's entries on a file never overlap each other.  Closing any
+ * descriptor on a file drops all of the closer's locks on it, and exit
+ * drops the rest, as POSIX has it.
+ *
+ * F_SETLKW waits on the readiness channel, which every release rings.
+ * There is no deadlock detection: two processes waiting on each other
+ * wait until a signal.
+ */
+#define	DARWIN_LK_MAX	256			/* entries, machine-wide */
+#define	DARWIN_LK_EOF	UINT64_MAX		/* "however far" */
+
+struct darwin_lk {
+	struct darwin_lk	*lk_next;
+	uint64_t		 lk_file;	/* inode */
+	uint64_t		 lk_owner;	/* task id */
+	uint64_t		 lk_start;
+	uint64_t		 lk_end;	/* inclusive */
+	int			 lk_type;	/* DARWIN_F_RDLCK or _WRLCK */
+};
+
+/* One request, in absolute bytes, with the entries it may need. */
+struct darwin_lk_req {
+	struct darwin_lk	*lr_split;	/* spare: a range cut in two */
+	struct darwin_lk	*lr_new;	/* spare: the lock itself */
+	uint64_t		 lr_file;
+	uint64_t		 lr_owner;
+	uint64_t		 lr_start;
+	uint64_t		 lr_end;
+	int			 lr_type;
+};
+
+static struct spinlock	 darwin_lk_lock = SPINLOCK_INIT("dlk");
+static struct darwin_lk	*darwin_lk_head;	/* (k) */
+static uint32_t		 darwin_lk_count;	/* (k) entries */
+static uint32_t		 darwin_lk_peak;	/* (k) most entries at once */
+static uint64_t		 darwin_lk_n_set;	/* (k) F_SETLK(W)s granted */
+static uint64_t		 darwin_lk_n_busy;	/* (k) tries found blocked */
+static uint64_t		 darwin_lk_n_wait;	/* F_SETLKWs that had to wait */
+
+/*
+ * The key a descriptor's file is locked under: its inode.  0 -- a built-in
+ * /bin image, a copy per open -- cannot be locked.
+ */
+static uint64_t
+darwin_lk_file(const struct darwin_ofile *of)
+{
+
+	return (of->of_handle.fh_ino);
+}
+
+static bool
+darwin_lk_overlaps(const struct darwin_lk *lk, const struct darwin_lk_req *r)
+{
+
+	return (lk->lk_file == r->lr_file && lk->lk_start <= r->lr_end &&
+	    r->lr_start <= lk->lk_end);
+}
+
+/* Another owner's lock the request cannot coexist with.  (k) */
+static struct darwin_lk *
+darwin_lk_conflict(const struct darwin_lk_req *r)
+{
+	struct darwin_lk	*lk;
+
+	for (lk = darwin_lk_head; lk != NULL; lk = lk->lk_next) {
+		if (lk->lk_owner == r->lr_owner || !darwin_lk_overlaps(lk, r))
+			continue;
+		if (lk->lk_type == DARWIN_F_WRLCK ||
+		    r->lr_type == DARWIN_F_WRLCK)
+			return (lk);
+	}
+	return (NULL);
+}
+
+/*
+ * Take [lr_start, lr_end] out of the owner's entries on the file, then
+ * put the new lock in if the request is one.  Entries wholly inside go to
+ * *dead, for freeing after the unlock; one sticking out at both ends
+ * splits, and only one can, since the owner's entries do not overlap.
+ * True if any of the owner's entries changed -- a waiter may now fit.  (k)
+ */
+static bool
+darwin_lk_apply(struct darwin_lk_req *r, struct darwin_lk **dead)
+{
+	struct darwin_lk	**pp;
+	struct darwin_lk	*lk;
+	struct darwin_lk	*tail;
+	bool			 changed;
+
+	changed = false;
+	pp = &darwin_lk_head;
+	while ((lk = *pp) != NULL) {
+		if (lk->lk_owner != r->lr_owner || !darwin_lk_overlaps(lk, r)) {
+			pp = &lk->lk_next;
+			continue;
+		}
+		changed = true;
+		if (lk->lk_start >= r->lr_start && lk->lk_end <= r->lr_end) {
+			*pp = lk->lk_next;
+			lk->lk_next = *dead;
+			*dead = lk;
+			darwin_lk_count--;
+			continue;
+		}
+		if (lk->lk_start < r->lr_start && lk->lk_end > r->lr_end) {
+			KASSERT(r->lr_split != NULL, ("darwin_lk: two splits"));
+			tail = r->lr_split;
+			r->lr_split = NULL;
+			*tail = *lk;
+			tail->lk_start = r->lr_end + 1;
+			lk->lk_end = r->lr_start - 1;
+			lk->lk_next = tail;
+			darwin_lk_count++;
+			pp = &tail->lk_next;
+			continue;
+		}
+		if (lk->lk_start < r->lr_start)
+			lk->lk_end = r->lr_start - 1;
+		else
+			lk->lk_start = r->lr_end + 1;
+		pp = &lk->lk_next;
+	}
+	if (r->lr_type != DARWIN_F_UNLCK) {
+		lk = r->lr_new;
+		r->lr_new = NULL;
+		lk->lk_file  = r->lr_file;
+		lk->lk_owner = r->lr_owner;
+		lk->lk_start = r->lr_start;
+		lk->lk_end   = r->lr_end;
+		lk->lk_type  = r->lr_type;
+		lk->lk_next  = darwin_lk_head;
+		darwin_lk_head = lk;
+		darwin_lk_count++;
+	}
+	if (darwin_lk_count > darwin_lk_peak)
+		darwin_lk_peak = darwin_lk_count;
+	return (changed);
+}
+
+static void
+darwin_lk_free(struct darwin_lk *dead)
+{
+	struct darwin_lk	*next;
+
+	for (; dead != NULL; dead = next) {
+		next = dead->lk_next;
+		kfree(dead);
+	}
+}
+
+/*
+ * One attempt at F_SETLK: 1 granted, 0 blocked by another owner, or a
+ * negative errno.  Also F_SETLKW's scan for darwin_readiness_wait.
+ */
+static long
+darwin_lk_try(void *arg)
+{
+	struct darwin_lk_req	*r;
+	struct darwin_lk	*dead;
+	bool			 changed;
+
+	r = arg;
+	dead = NULL;
+	spin_lock(&darwin_lk_lock);
+	if (r->lr_type != DARWIN_F_UNLCK) {
+		if (darwin_lk_conflict(r) != NULL) {
+			darwin_lk_n_busy++;
+			spin_unlock(&darwin_lk_lock);
+			return (0);
+		}
+		/* An unlock is never refused, though it may split. */
+		if (darwin_lk_count + 2 > DARWIN_LK_MAX) {
+			spin_unlock(&darwin_lk_lock);
+			return (-DARWIN_ENOLCK);
+		}
+	}
+	changed = darwin_lk_apply(r, &dead);
+	darwin_lk_n_set++;
+	spin_unlock(&darwin_lk_lock);
+	darwin_lk_free(dead);
+	if (changed)
+		darwin_select_news();
+	return (1);
+}
+
+/* Drop what `owner` holds on `file`, or everywhere if `file` is 0. */
+static void
+darwin_lk_drop(uint64_t owner, uint64_t file)
+{
+	struct darwin_lk	**pp;
+	struct darwin_lk	*lk;
+	struct darwin_lk	*dead;
+
+	dead = NULL;
+	spin_lock(&darwin_lk_lock);
+	pp = &darwin_lk_head;
+	while ((lk = *pp) != NULL) {
+		if (lk->lk_owner == owner &&
+		    (file == 0 || lk->lk_file == file)) {
+			*pp = lk->lk_next;
+			lk->lk_next = dead;
+			dead = lk;
+			darwin_lk_count--;
+			continue;
+		}
+		pp = &lk->lk_next;
+	}
+	spin_unlock(&darwin_lk_lock);
+	if (dead != NULL) {
+		darwin_lk_free(dead);
+		darwin_select_news();
+	}
+}
+
+/*
+ * Entries still held can only be live processes': every exit drops its
+ * owner's.  Read without the lock; a statistic.
+ */
+static void
+darwin_lk_stats(void)
+{
+
+	if (darwin_lk_n_set == 0 && darwin_lk_n_busy == 0)
+		return;
+	kprintf("locks: %llu record lock(s) set, %llu found busy, "
+	    "%llu F_SETLKW wait(s), peak %u entries, %u held now\n",
+	    (unsigned long long)darwin_lk_n_set,
+	    (unsigned long long)darwin_lk_n_busy,
+	    (unsigned long long)darwin_lk_n_wait,
+	    (unsigned)darwin_lk_peak, (unsigned)darwin_lk_count);
+}
+
+/*
+ * fcntl(fd, F_GETLK / F_SETLK / F_SETLKW, struct flock *).  The range is
+ * l_start from l_whence's base, l_len bytes on (before, if negative; to
+ * the end however far, if 0).  A read lock needs a descriptor open for
+ * reading, a write lock one open for writing.
+ */
+static long
+darwin_fcntl_lock(struct syscall_frame *f, struct task *t, int fd, int cmd,
+    void *uflock)
+{
+	struct darwin_flock	 fl;
+	struct darwin_lk_req	 r;
+	struct darwin_ofile	*of;
+	struct darwin_lk	*lk;
+	uint64_t		 base;
+	int64_t			 start;
+	int64_t			 len;
+	uint32_t		 acc;
+	long			 rv;
+
+	of = &t->t_darwin_files[fd];
+	if (of->of_type != DARWIN_OF_FILE)
+		return (darwin_err(f, of->of_type == DARWIN_OF_FREE ?
+		    DARWIN_EBADF : DARWIN_EINVAL));
+	if (syscall_copyin(&fl, uflock, sizeof(fl)) != 0)
+		return (darwin_err(f, DARWIN_EFAULT));
+
+	switch (fl.l_whence) {
+	case 0:
+		base = 0;
+		break;
+	case 1:
+		mutex_lock(&of->of_foff->fo_lock);
+		base = of->of_foff->fo_off;
+		mutex_unlock(&of->of_foff->fo_lock);
+		break;
+	case 2:
+		base = of->of_handle.fh_size;
+		break;
+	default:
+		return (darwin_err(f, DARWIN_EINVAL));
+	}
+	if (fl.l_start > INT64_MAX - (int64_t)base)
+		return (darwin_err(f, DARWIN_EINVAL));
+	start = (int64_t)base + fl.l_start;
+	len = fl.l_len;
+	if (len < 0) {
+		if (len == INT64_MIN)
+			return (darwin_err(f, DARWIN_EINVAL));
+		start += len;
+		len = -len;
+	}
+	if (start < 0 || (len != 0 && len - 1 > INT64_MAX - start))
+		return (darwin_err(f, DARWIN_EINVAL));
+	if (fl.l_type != DARWIN_F_RDLCK && fl.l_type != DARWIN_F_WRLCK &&
+	    fl.l_type != DARWIN_F_UNLCK)
+		return (darwin_err(f, DARWIN_EINVAL));
+
+	r.lr_split = NULL;
+	r.lr_new   = NULL;
+	r.lr_file  = darwin_lk_file(of);
+	r.lr_owner = t->t_id;
+	r.lr_start = (uint64_t)start;
+	r.lr_end   = len == 0 ? DARWIN_LK_EOF : (uint64_t)(start + len - 1);
+	r.lr_type  = fl.l_type;
+	if (r.lr_file == 0)
+		return (darwin_err(f, DARWIN_EINVAL));
+
+	if (cmd == DARWIN_F_GETLK) {
+		if (r.lr_type == DARWIN_F_UNLCK)
+			return (darwin_err(f, DARWIN_EINVAL));
+		spin_lock(&darwin_lk_lock);
+		lk = darwin_lk_conflict(&r);
+		if (lk != NULL) {
+			fl.l_type   = (int16_t)lk->lk_type;
+			fl.l_whence = 0;
+			fl.l_start  = (int64_t)lk->lk_start;
+			fl.l_len    = lk->lk_end == DARWIN_LK_EOF ? 0 :
+			    (int64_t)(lk->lk_end - lk->lk_start + 1);
+			fl.l_pid    = (int32_t)lk->lk_owner;
+		} else
+			fl.l_type = DARWIN_F_UNLCK;
+		spin_unlock(&darwin_lk_lock);
+		if (syscall_copyout(uflock, &fl, sizeof(fl)) != 0)
+			return (darwin_err(f, DARWIN_EFAULT));
+		return (darwin_ok(f, 0));
+	}
+
+	acc = of->of_flags & DARWIN_O_ACCMODE;
+	if ((r.lr_type == DARWIN_F_RDLCK && acc == DARWIN_O_WRONLY) ||
+	    (r.lr_type == DARWIN_F_WRLCK && acc == DARWIN_O_RDONLY))
+		return (darwin_err(f, DARWIN_EBADF));
+
+	r.lr_split = kmalloc(sizeof(*r.lr_split));
+	r.lr_new   = kmalloc(sizeof(*r.lr_new));
+	if (r.lr_split == NULL || r.lr_new == NULL) {
+		rv = -DARWIN_ENOLCK;
+		goto out;
+	}
+	rv = darwin_lk_try(&r);
+	if (rv == 0 && cmd == DARWIN_F_SETLKW) {
+		__atomic_fetch_add(&darwin_lk_n_wait, 1, __ATOMIC_RELAXED);
+		rv = darwin_readiness_wait(darwin_lk_try, &r, 0, false);
+	}
+out:
+	if (r.lr_split != NULL)
+		kfree(r.lr_split);
+	if (r.lr_new != NULL)
+		kfree(r.lr_new);
+	if (rv < 0)
+		return (darwin_err(f, (int)-rv));
+	if (rv == 0)
+		return (darwin_err(f, DARWIN_EAGAIN));
+	return (darwin_ok(f, 0));
 }
 
 /*
@@ -1932,8 +2466,9 @@ darwin_files_teardown(struct task *t)
 
 	for (i = 0; i < DARWIN_NOFILE; i++) {
 		if (t->t_darwin_files[i].of_type != DARWIN_OF_FREE)
-			darwin_ofile_clear(&t->t_darwin_files[i]);
+			darwin_ofile_clear(t, &t->t_darwin_files[i]);
 	}
+	darwin_lk_drop(t->t_id, 0);		/* anything a close missed */
 	darwin_cons_release(t);
 }
 
@@ -1956,10 +2491,7 @@ darwin_files_fork_copy(struct task *parent, struct task *child)
 			break;
 		case DARWIN_OF_DIR:
 		case DARWIN_OF_FILE:
-			/*
-			 * Private cursor.  POSIX shares the offset through the
-			 * open-file description; this does not.
-			 */
+			/* The child shares the parent's cursor (POSIX). */
 			buf = NULL;
 			if (src->of_buf != NULL) {
 				buf = kmalloc(src->of_size != 0 ?
@@ -1979,7 +2511,9 @@ darwin_files_fork_copy(struct task *parent, struct task *child)
 			dst->of_handle = src->of_handle;
 			dst->of_path   = darwin_path_dup(src->of_path);
 			dst->of_size   = src->of_size;
-			dst->of_off    = src->of_off;
+			dst->of_foff   = src->of_foff;
+			if (dst->of_foff != NULL)
+				darwin_foff_hold(dst->of_foff);
 			dst->of_flags  = src->of_flags;
 			/* The source's type: a directory must stay one. */
 			dst->of_type   = src->of_type;
@@ -2029,7 +2563,7 @@ darwin_dup_install(struct task *t, int oldfd, int newfd)
 	}
 	dst = &t->t_darwin_files[newfd];
 	if (dst->of_type != DARWIN_OF_FREE)
-		darwin_ofile_clear(dst);
+		darwin_ofile_clear(t, dst);
 
 	switch (type) {
 	case DARWIN_OF_CONSOLE:
@@ -2060,7 +2594,9 @@ darwin_dup_install(struct task *t, int oldfd, int newfd)
 		dst->of_handle = src->of_handle;
 		dst->of_path   = darwin_path_dup(src->of_path);
 		dst->of_size   = src->of_size;
-		dst->of_off    = src->of_off;
+		dst->of_foff   = src->of_foff;	/* one cursor for both */
+		if (dst->of_foff != NULL)
+			darwin_foff_hold(dst->of_foff);
 		dst->of_flags  = src->of_flags;
 		dst->of_type   = src->of_type;
 		return (0);
@@ -2598,6 +3134,13 @@ darwin_zombie_record(unsigned long long pid, unsigned long long ppid,
 	size_t	i;
 	int	slot;
 
+	/*
+	 * A dead process holds no record locks, and its parent must not find
+	 * any once wait4 says it is dead.  Its files close later, in
+	 * thread_exit, too late for that; drop the locks now.
+	 */
+	darwin_lk_drop(pid, 0);
+
 	spin_lock(&darwin_zombie_lock);
 
 	/*
@@ -2730,7 +3273,8 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			    (const void *)f->sf_arg1, (size_t)f->sf_arg2));
 		case DARWIN_OF_FILE:
 			return (darwin_file_write(f, of,
-			    (const void *)f->sf_arg1, (size_t)f->sf_arg2));
+			    (const void *)f->sf_arg1, (size_t)f->sf_arg2,
+			    NULL));
 		case DARWIN_OF_NULL:
 			/* Swallowed whole; the bytes are not even read. */
 			return (darwin_ok(f, (long)f->sf_arg2));
@@ -2837,6 +3381,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		char				 path[DARWIN_PATH_MAX];
 		char				 raw[DARWIN_PATH_MAX];
 		const struct progreg_entry	*pe;
+		struct darwin_foff		*fo;
 		struct fs_handle		 handle;
 		struct task			*t;
 		uint8_t				*buf;
@@ -2914,7 +3459,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 				t->t_darwin_files[fd].of_path =
 				    darwin_path_dup(path);
 				t->t_darwin_files[fd].of_size  = 0;
-				t->t_darwin_files[fd].of_off   = 0;
+				t->t_darwin_files[fd].of_foff  = NULL;
 				t->t_darwin_files[fd].of_flags = flags;
 				t->t_darwin_files[fd].of_type  = DARWIN_OF_DIR;
 				kprintf("darwin: UNIX open('%s') -> fd=%d "
@@ -3003,12 +3548,16 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		}
 
 		t  = current_thread->th_task;
-		fd = darwin_fd_alloc(t);
+		fo = darwin_foff_new();
+		fd = fo != NULL ? darwin_fd_alloc(t) : -1;
 		if (fd < 0) {
+			if (fo != NULL)
+				darwin_foff_drop(fo);
 			if (buf != NULL)
 				kfree(buf);
 			(void)fs_close(&handle);
-			return (darwin_err(f, DARWIN_EMFILE));
+			return (darwin_err(f, fo != NULL ? DARWIN_EMFILE :
+			    DARWIN_ENOMEM));
 		}
 		t->t_darwin_files[fd].of_buf    = buf;
 		t->t_darwin_files[fd].of_handle = handle;
@@ -3016,7 +3565,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		t->t_darwin_files[fd].of_path =
 		    on_disk ? darwin_path_dup(path) : NULL;
 		t->t_darwin_files[fd].of_size  = size;
-		t->t_darwin_files[fd].of_off   = 0;
+		t->t_darwin_files[fd].of_foff  = fo;
 		t->t_darwin_files[fd].of_flags = flags;
 		t->t_darwin_files[fd].of_type  = DARWIN_OF_FILE;
 		kprintf("darwin: UNIX open('%s') -> fd=%d (%u bytes, %s%s)\n",
@@ -3026,6 +3575,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		return (darwin_ok(f, fd));
 	}
 	case DARWIN_SYS_read: {
+		struct darwin_foff	*fo;
 		struct darwin_ofile	*of;
 		struct task		*t;
 		uint32_t		 avail;
@@ -3055,25 +3605,32 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			return (darwin_err(f, DARWIN_EISDIR));
 		case DARWIN_OF_FILE:
 			/*
-			 * A cursor past the end (ftruncate(2) leaves it) is
-			 * EOF; the subtraction would otherwise wrap.
+			 * On the volume, fs_pread finds the end as it is now
+			 * -- another descriptor may have moved it -- and a
+			 * cursor past it (ftruncate(2) leaves one) reads 0.
 			 */
-			avail = of->of_off < of->of_size ?
-			    of->of_size - of->of_off : 0;
+			if (of->of_buf == NULL)
+				return (darwin_file_read(f, of,
+				    (void *)f->sf_arg1, n, NULL));
+
+			/* Built-in image: the bytes are already here. */
+			fo = of->of_foff;
+			mutex_lock(&fo->fo_lock);
+			avail = fo->fo_off < of->of_size ?
+			    of->of_size - (uint32_t)fo->fo_off : 0;
 			if (n > (size_t)avail)
 				n = avail;
-			if (n == 0)
-				return (darwin_ok(f, 0));
-			if (of->of_buf != NULL) {
-				/* Built-in image: the bytes are already here. */
+			rv = 0;
+			if (n != 0) {
 				rv = syscall_copyout((void *)f->sf_arg1,
-				    of->of_buf + of->of_off, n);
-				if (rv != 0)
-					return (darwin_err(f, DARWIN_EFAULT));
-				of->of_off += (uint32_t)n;
-				return (darwin_ok(f, (long)n));
+				    of->of_buf + fo->fo_off, n);
+				if (rv == 0)
+					fo->fo_off += n;
 			}
-			return (darwin_file_read(f, of, (void *)f->sf_arg1, n));
+			mutex_unlock(&fo->fo_lock);
+			if (rv != 0)
+				return (darwin_err(f, DARWIN_EFAULT));
+			return (darwin_ok(f, (long)n));
 		case DARWIN_OF_PIPE_R:
 			return (darwin_pipe_read(f, of->of_pipe,
 			    (void *)f->sf_arg1, n));
@@ -3209,7 +3766,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 				return (darwin_ok(f, 0));
 			return (darwin_err(f, DARWIN_EBADF));
 		}
-		darwin_ofile_clear(of);
+		darwin_ofile_clear(t, of);
 		return (darwin_ok(f, 0));
 	}
 	case DARWIN_SYS_fsync: {
@@ -3246,9 +3803,11 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		return (darwin_ok(f, 0));
 	}
 	case DARWIN_SYS_lseek: {
+		struct darwin_foff	*fo;
 		struct darwin_ofile	*of;
 		struct task		*t;
 		int64_t			 base;
+		int64_t			 len;
 		int64_t			 off;
 		int64_t			 pos;
 		int			 fd;
@@ -3269,17 +3828,24 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		if (of->of_type != DARWIN_OF_FILE)
 			return (darwin_err(f, DARWIN_EBADF));
 
+		if (whence < 0 || whence > 2)
+			return (darwin_err(f, DARWIN_EINVAL));
+
+		/* The end as it is now, not as this descriptor last saw it. */
+		fo = of->of_foff;
+		mutex_lock(&fo->fo_lock);
+		len = (int64_t)darwin_file_len(of);
 		switch (whence) {
 		case 0:	base = 0;				break; /* SET */
-		case 1:	base = (int64_t)of->of_off;		break; /* CUR */
-		case 2:	base = (int64_t)of->of_size;		break; /* END */
-		default:
-			return (darwin_err(f, DARWIN_EINVAL));
+		case 1:	base = (int64_t)fo->fo_off;		break; /* CUR */
+		default: base = len;				break; /* END */
 		}
 		pos = base + off;
-		if (pos < 0 || pos > (int64_t)of->of_size)
+		if (pos >= 0 && pos <= len)
+			fo->fo_off = (uint64_t)pos;
+		mutex_unlock(&fo->fo_lock);
+		if (pos < 0 || pos > len)
 			return (darwin_err(f, DARWIN_EINVAL));
-		of->of_off = (uint32_t)pos;
 		return (darwin_ok(f, (long)pos));
 	}
 	case DARWIN_SYS_access: {
@@ -3354,6 +3920,94 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		/* The cursor stays put; read(2) handles one past the end. */
 		of->of_size = (uint32_t)of->of_handle.fh_size;
 		return (darwin_ok(f, 0));
+	}
+	case DARWIN_SYS_pread:
+	case DARWIN_SYS_pwrite: {
+		struct darwin_ofile	*of;
+		struct task		*t;
+		uint64_t		 at;
+		uint32_t		 avail;
+		int64_t			 off;
+		size_t			 n;
+		int			 fd;
+
+		fd  = (int)f->sf_arg0;
+		n   = (size_t)f->sf_arg2;
+		off = (int64_t)f->sf_arg3;
+		t   = current_thread->th_task;
+		if (fd < 0 || fd >= DARWIN_NOFILE)
+			return (darwin_err(f, DARWIN_EBADF));
+		of = &t->t_darwin_files[fd];
+		switch (of->of_type) {
+		case DARWIN_OF_FILE:
+			break;
+		case DARWIN_OF_FREE:
+			return (darwin_err(f, DARWIN_EBADF));
+		case DARWIN_OF_DIR:
+			return (darwin_err(f, DARWIN_EISDIR));
+		default:
+			/* A pipe or a terminal has no offsets. */
+			return (darwin_err(f, DARWIN_ESPIPE));
+		}
+		if (off < 0)
+			return (darwin_err(f, DARWIN_EINVAL));
+		at = (uint64_t)off;
+
+		if (nr == DARWIN_SYS_pwrite) {
+			/* Sizes and cursors are 32-bit here. */
+			if (at + n > UINT32_MAX)
+				return (darwin_err(f, DARWIN_EFBIG));
+			return (darwin_file_write(f, of,
+			    (const void *)f->sf_arg1, n, &at));
+		}
+
+		/* pread: read(2) with its own offset, the cursor untouched. */
+		if (of->of_buf == NULL)
+			return (darwin_file_read(f, of, (void *)f->sf_arg1, n,
+			    &at));
+		avail = at < of->of_size ? of->of_size - (uint32_t)at : 0;
+		if (n > (size_t)avail)
+			n = avail;
+		if (n == 0)
+			return (darwin_ok(f, 0));
+		if (syscall_copyout((void *)f->sf_arg1, of->of_buf + at,
+		    n) != 0)
+			return (darwin_err(f, DARWIN_EFAULT));
+		return (darwin_ok(f, (long)n));
+	}
+	case DARWIN_SYS_statfs64: {
+		struct fs_statbuf	sb;
+		char			path[DARWIN_PATH_MAX];
+		char			raw[DARWIN_PATH_MAX];
+		long			len;
+		int			rv;
+
+		len = syscall_copyin_str((const char *)f->sf_arg0, raw,
+		    sizeof(raw));
+		if (len < 0)
+			return (darwin_err(f, DARWIN_EFAULT));
+		if (darwin_path_resolve(current_thread->th_task, raw, path,
+		    sizeof(path)) != 0)
+			return (darwin_err(f, DARWIN_ENAMETOOLONG));
+		rv = fs_stat(path, &sb);
+		if (rv != FS_E_OK)
+			return (darwin_err(f, darwin_fs_errno(rv)));
+		return (darwin_statfs_out(f, path, (void *)f->sf_arg1));
+	}
+	case DARWIN_SYS_fstatfs64: {
+		struct darwin_ofile	*of;
+		int			 fd;
+
+		fd = (int)f->sf_arg0;
+		if (fd < 0 || fd >= DARWIN_NOFILE)
+			return (darwin_err(f, DARWIN_EBADF));
+		of = &current_thread->th_task->t_darwin_files[fd];
+		if (of->of_type != DARWIN_OF_FILE &&
+		    of->of_type != DARWIN_OF_DIR)
+			return (darwin_err(f, of->of_type == DARWIN_OF_FREE ?
+			    DARWIN_EBADF : DARWIN_EINVAL));
+		return (darwin_statfs_out(f, of->of_path,
+		    (void *)f->sf_arg1));
 	}
 	case DARWIN_SYS_mkfifo: {
 		char	raw[DARWIN_PATH_MAX];
@@ -3503,7 +4157,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		}
 		if (wfd < 0) {
 			if (rfd >= 0)
-				darwin_ofile_clear(&t->t_darwin_files[rfd]);
+				darwin_ofile_clear(t, &t->t_darwin_files[rfd]);
 			else
 				darwin_pipe_drop(p, false);
 			darwin_pipe_drop(p, true);
@@ -3672,6 +4326,11 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		case DARWIN_F_GETFL:
 		case DARWIN_F_SETFL:
 			return (darwin_ok(f, 0));
+		case DARWIN_F_GETLK:
+		case DARWIN_F_SETLK:
+		case DARWIN_F_SETLKW:
+			return (darwin_fcntl_lock(f, t, oldfd, cmd,
+			    (void *)f->sf_arg2));
 		default:
 			kprintf("darwin: fcntl(%d, cmd=%d) unsupported\n",
 			    oldfd, cmd);
@@ -4066,10 +4725,17 @@ darwin_mach(struct syscall_frame *f, uint32_t trap)
 	}
 	case DARWIN_MACH_mach_msg_trap:
 		return (darwin_mach_msg(f));
-	default:
+	case DARWIN_MACH_thread_self_trap:
+	case DARWIN_MACH_thread_get_special_reply_port:
+	case DARWIN_MACH_mk_timer_create_trap:
 		/* Port-returning traps signal failure with a null name. */
-		kprintf("darwin: unhandled mach trap %u\n", (unsigned)trap);
+		kprintf("darwin: MACH trap %u has no port to give\n",
+		    (unsigned)trap);
 		return (darwin_ok(f, (long)MACH_PORT_NULL));
+	default:
+		/* The rest return a kern_return_t, where 0 is success. */
+		kprintf("darwin: unhandled mach trap %u\n", (unsigned)trap);
+		return (darwin_ok(f, DARWIN_KERN_INVALID_ARGUMENT));
 	}
 }
 
@@ -4077,10 +4743,11 @@ darwin_mach(struct syscall_frame *f, uint32_t trap)
  * Map a style9 mach_msg result -- MACH_MSG_OK / a positive MACH_E_*, or the
  * negative SYS_E_FAULT a user-range check returns -- onto the Darwin
  * mach_msg_return_t the caller reads.  `sending` selects the SEND_* vs RCV_*
- * code family.
+ * code family.  A send never waits for queue room, so a full queue is a
+ * timeout to a caller that set one and a lack of buffers to one that did not.
  */
 static long
-darwin_mach_msg_err(long rv, bool sending)
+darwin_mach_msg_err(long rv, bool sending, uint32_t option)
 {
 
 	switch (rv) {
@@ -4092,8 +4759,14 @@ darwin_mach_msg_err(long rv, bool sending)
 	case MACH_E_TOOSMALL:
 		return (DARWIN_MACH_RCV_TOO_LARGE);
 	case MACH_E_TIMEOUT:
+	case MACH_E_NOMSG:		/* a zero timeout on an empty queue */
 		return (sending ? DARWIN_MACH_SEND_TIMED_OUT :
 		    DARWIN_MACH_RCV_TIMED_OUT);
+	case MACH_E_NOSPACE:
+		if (!sending)
+			return (DARWIN_MACH_RCV_INVALID_DATA);
+		return ((option & DARWIN_MACH_SEND_TIMEOUT) != 0 ?
+		    DARWIN_MACH_SEND_TIMED_OUT : DARWIN_MACH_SEND_NO_BUFFER);
 	default:
 		return (sending ? DARWIN_MACH_SEND_INVALID_DATA :
 		    DARWIN_MACH_RCV_INVALID_DATA);
@@ -4107,12 +4780,18 @@ darwin_mach_msg_err(long rv, bool sending)
  * 7th (notify) is unsupported.  SEND|RCV sends, then receives into the same
  * buffer, through the syscall_msg_* helpers (range check, SMAP bracket).
  * Returns a mach_msg_return_t in %rax, carry clear.
+ *
+ * Only simple messages pass.  The header is Darwin's byte for byte, the
+ * descriptors are not (Darwin's port descriptor is 12 bytes with the type
+ * in its last byte, ours 8 with it in the first), so a complex send is
+ * refused rather than misread.  No trailer follows a received message.
  */
 static long
 darwin_mach_msg(struct syscall_frame *f)
 {
 	struct mach_msg_header	*msg;
 	uint64_t		 timeout;
+	uint32_t		 bits;
 	uint32_t		 option;
 	uint32_t		 rcv_size;
 	mach_port_name_t	 rcv_name;
@@ -4122,13 +4801,20 @@ darwin_mach_msg(struct syscall_frame *f)
 	option   = (uint32_t)f->sf_arg1;
 	rcv_size = (uint32_t)f->sf_arg3;
 	rcv_name = (mach_port_name_t)f->sf_arg4;
-	timeout  = f->sf_arg5;
+	timeout  = (uint32_t)f->sf_arg5;	/* mach_msg_timeout_t, in ms */
 
 	if (option & DARWIN_MACH_SEND_MSG) {
+		if (syscall_copyin(&bits, &msg->msgh_bits, sizeof(bits)) != 0)
+			return (darwin_ok(f, DARWIN_MACH_SEND_INVALID_DATA));
+		if ((bits & MACH_MSGH_BITS_COMPLEX) != 0) {
+			kprintf("darwin: MACH mach_msg complex send refused\n");
+			return (darwin_ok(f, DARWIN_MACH_SEND_INVALID_TYPE));
+		}
 		rv = syscall_msg_send(msg);
 		if (rv != MACH_MSG_OK) {
 			kprintf("darwin: MACH mach_msg send -> rv=%ld\n", rv);
-			return (darwin_ok(f, darwin_mach_msg_err(rv, true)));
+			return (darwin_ok(f,
+			    darwin_mach_msg_err(rv, true, option)));
 		}
 	}
 	if (option & DARWIN_MACH_RCV_MSG) {
@@ -4139,7 +4825,8 @@ darwin_mach_msg(struct syscall_frame *f)
 			rv = syscall_msg_recv(rcv_name, msg, rcv_size);
 		if (rv != MACH_MSG_OK) {
 			kprintf("darwin: MACH mach_msg recv -> rv=%ld\n", rv);
-			return (darwin_ok(f, darwin_mach_msg_err(rv, false)));
+			return (darwin_ok(f,
+			    darwin_mach_msg_err(rv, false, option)));
 		}
 	}
 
@@ -4425,7 +5112,7 @@ darwin_s9_fs_fstat(struct syscall_frame *f)
 		ds.fds_kind = DARWIN_FDSTAT_CHR;
 		break;
 	case DARWIN_OF_FILE:
-		ds.fds_size = of->of_size;
+		ds.fds_size = (uint32_t)darwin_file_len(of);
 		ds.fds_kind = DARWIN_FDSTAT_REG;
 		ds.fds_ino  = of->of_handle.fh_ino;
 		break;

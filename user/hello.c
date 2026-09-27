@@ -1950,6 +1950,24 @@ demo_darwin_spawn(void)
 		printf("  filewrite retired after %d turns\n", i);
 	}
 
+	/* lockprobe: fcntl record locks between processes. */
+	{
+		mach_port_name_t	lprobe_tp;
+
+		lprobe_tp = MACH_PORT_NULL;
+		printf("  >>> spawning lockprobe -- record locks between "
+		    "processes (F_GETLK / F_SETLK / F_SETLKW) <<<\n");
+		child_id = spawn_args("lockprobe", 0, NULL, &lprobe_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('lockprobe') failed (rv=%ld)\n",
+			    child_id);
+			return (96);
+		}
+		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
+			(void)poll_turn();
+		printf("  lockprobe retired after %d turns\n", i);
+	}
+
 	/*
 	 * ttyprobe: terminal control.  We feed it one byte with no newline,
 	 * which a canonical terminal would hold forever; reading it proves

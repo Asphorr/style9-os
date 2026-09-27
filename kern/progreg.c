@@ -183,6 +183,10 @@ extern uint8_t	_binary_mmaptest_macho_end[];
 extern uint8_t	_binary_filewrite_macho_start[];
 extern uint8_t	_binary_filewrite_macho_end[];
 
+/* lockprobe: probes fcntl record locks between a parent and its children. */
+extern uint8_t	_binary_lockprobe_macho_start[];
+extern uint8_t	_binary_lockprobe_macho_end[];
+
 /*
  * ttyprobe: probes the terminal: a raw setting reaches the kernel and
  * reads back, a file and a pipe answer ENOTTY, the window size is the
@@ -367,6 +371,8 @@ progreg_init(void)
 	    _binary_mmaptest_macho_start, _binary_mmaptest_macho_end);
 	register_one("filewrite",
 	    _binary_filewrite_macho_start, _binary_filewrite_macho_end);
+	register_one("lockprobe",
+	    _binary_lockprobe_macho_start, _binary_lockprobe_macho_end);
 	register_one("ttyprobe",
 	    _binary_ttyprobe_macho_start, _binary_ttyprobe_macho_end);
 	register_one("gstty",

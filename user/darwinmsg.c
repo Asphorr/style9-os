@@ -26,14 +26,21 @@
 /* Darwin class-encoded syscall numbers (high byte = class). */
 #define	SYS_write		0x2000004UL	/* class 2, BSD nr 4   */
 #define	SYS_exit		0x2000001UL	/* class 2, BSD nr 1   */
+#define	MACH_vm_allocate	0x100000AUL	/* class 1, trap 10    */
 #define	MACH_reply_port		0x100001AUL	/* class 1, trap 26    */
 #define	MACH_msg		0x100001FUL	/* class 1, trap 31    */
+
+#define	KERN_INVALID_ARGUMENT	4
 
 /* mach_msg options + dispositions (Darwin <mach/message.h>). */
 #define	MACH_SEND_MSG		0x00000001U
 #define	MACH_RCV_MSG		0x00000002U
+#define	MACH_RCV_TIMEOUT	0x00000100U
 #define	MACH_MSG_SUCCESS	0
+#define	MACH_SEND_INVALID_TYPE	0x1000000F
+#define	MACH_RCV_TIMED_OUT	0x10004003
 #define	MACH_MSG_TYPE_COPY_SEND	19
+#define	MACH_MSGH_BITS_COMPLEX	0x80000000U
 #define	MACH_MSGH_BITS(r, l)	((uint32_t)(((r) & 0xFFU) | (((l) & 0xFFU) << 8)))
 
 #define	MAGIC_ID		0x4D534733	/* 'M','S','G','3' round-trip tag */
@@ -57,6 +64,15 @@ static const char okmsg[] =
     "darwinmsg: mach_msg send+recv OK -- KERN_SUCCESS, msgh_id survived the queue\n";
 static const char bugmsg[] =
     "darwinmsg: BUG -- mach_msg round-trip failed or msgh_id mismatch\n";
+static const char trapok[] =
+    "darwinmsg: a trap the kernel lacks answers KERN_INVALID_ARGUMENT, "
+    "not success\n";
+static const char trapbug[] =
+    "darwinmsg: BUG -- a missing trap claimed to succeed\n";
+static const char cplxok[] =
+    "darwinmsg: a complex send is refused and nothing is queued\n";
+static const char cplxbug[] =
+    "darwinmsg: BUG -- a complex send was not refused cleanly\n";
 
 /* Raw Darwin syscalls via the `syscall' instruction. */
 static inline long
@@ -135,6 +151,25 @@ _start(void)
 		dwrite(okmsg, sizeof(okmsg) - 1);
 	else
 		dwrite(bugmsg, sizeof(bugmsg) - 1);
+
+	/* mach_vm_allocate is not a trap here; it must not say it worked. */
+	if (dsys0(MACH_vm_allocate) == KERN_INVALID_ARGUMENT)
+		dwrite(trapok, sizeof(trapok) - 1);
+	else
+		dwrite(trapbug, sizeof(trapbug) - 1);
+
+	/* A complex send is refused before it reaches p's queue. */
+	m.msgh_bits = MACH_MSGH_BITS_COMPLEX |
+	    MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	m.msgh_remote_port = p;
+	m.msgh_local_port  = 0;
+	kr = dmachmsg(&m, MACH_SEND_MSG, sizeof(m), 0, 0, 0);
+	if (kr == MACH_SEND_INVALID_TYPE &&
+	    dmachmsg(&m, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(m), p,
+	    0) == MACH_RCV_TIMED_OUT)
+		dwrite(cplxok, sizeof(cplxok) - 1);
+	else
+		dwrite(cplxbug, sizeof(cplxbug) - 1);
 
 	(void)dsys3(SYS_exit, 0, 0, 0);
 	__builtin_unreachable();

@@ -152,6 +152,12 @@ int		fs_readonly(const char *path);
 const char	*fs_kind(void);
 
 /*
+ * The mounted volume's block size, blocks and free blocks, for statfs(2).
+ * FS_E_NOMOUNT, with zeroes, when the backend keeps no such count.
+ */
+int		fs_space(uint32_t *bsize, uint64_t *blocks, uint64_t *bfree);
+
+/*
  * Read a whole file into a freshly kmalloc'd buffer (the caller kfree's it).
  * Returns FS_E_OK, or a negative FS_E_*.
  */
@@ -240,6 +246,19 @@ int		fs_pread(struct fs_handle *h, uint64_t off, uint8_t *buf,
  */
 int		fs_pwrite(struct fs_handle *h, uint64_t off,
 		    const uint8_t *buf, uint32_t len, uint32_t *out_put);
+
+/*
+ * fs_pwrite's offset for O_APPEND: the end as it stands under the volume
+ * lock, after the handle is refreshed, so two appenders never land on the
+ * same bytes.
+ */
+#define	FS_OFF_APPEND	UINT64_MAX
+
+/*
+ * A resolved file's length now -- refreshed first if another handle has
+ * changed the volume since this one last looked.
+ */
+int		fs_length(struct fs_handle *h, uint64_t *out_len);
 
 /*
  * Set a resolved file's length, either way, and stamp it.  Shorter: runs

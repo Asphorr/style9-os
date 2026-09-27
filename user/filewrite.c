@@ -36,6 +36,8 @@
  *	14. fsync(2) answers 0 on a written file and fails on a closed fd.
  *	15. The checkpoint fsync published can be read back by number under
  *	    /.xid, and nothing there can be written.
+ *	16. A second descriptor sees the file grow through the first: read,
+ *	    pread, lseek(SEEK_END) and O_APPEND all reach the new bytes.
  *
  * Freestanding: no SDK headers, prototypes declared as <fcntl.h>/<unistd.h>
  * would alias them, entry at _entry (ld -e), relinked low like dyldhello.
@@ -59,6 +61,7 @@ typedef __SIZE_TYPE__	size_t;
 #define	O_EXCL		0x0800
 
 #define	SEEK_SET	0
+#define	SEEK_END	2
 
 #define	ENOENT		2
 #define	EEXIST		17
@@ -93,6 +96,7 @@ extern long	 write(int fd, const void *buf, unsigned long n);
 extern int	 close(int fd);
 extern int	 fsync(int fd);
 extern long	 lseek(int fd, long off, int whence);
+extern long	 pread(int fd, void *buf, unsigned long n, long off);
 extern int	 unlink(const char *path);
 extern int	 mkdir(const char *path, unsigned short mode);
 extern int	 rmdir(const char *path);
@@ -457,7 +461,7 @@ entry(void)
 		else {
 			got = read(fd, buf, sizeof(buf));
 			if (got != (long)slen(FIRST) - 8 ||
-			    !same(buf, FIRST + 8, (size_t)got))
+			    !same(buf, &FIRST[8], (size_t)got))
 				fail("the bytes of an unlinked file are gone "
 				    "while it is still open");
 			else
@@ -590,6 +594,44 @@ entry(void)
 		}
 		(void)unlink(PATH);
 	}
+
+	/*
+	 * 16. Two descriptors, one file.  What one writes past the end the
+	 * other must see: read(2) and pread(2) reach the new bytes,
+	 * lseek(SEEK_END) lands on the new end, and O_APPEND appends after
+	 * them, not over them.  A descriptor that knew only the length it
+	 * was opened at would stop, or write, at the old end.
+	 */
+	fd = open(PATH, O_RDWR | O_CREAT | O_TRUNC, 0644);
+	held = open(PATH, O_RDWR | O_APPEND);
+	if (fd < 0 || held < 0)
+		fail("cannot open one file twice");
+	else if (write(fd, "0123456789", 10) != 10)
+		fail("the first descriptor's write was short");
+	else if (lseek(held, 0, SEEK_END) != 10)
+		fail("lseek(SEEK_END) through a second descriptor missed "
+		    "what the first wrote");
+	else if (lseek(held, 0, SEEK_SET) != 0 ||
+	    read(held, buf, sizeof(buf)) != 10)
+		fail("read(2) through a second descriptor stopped at the "
+		    "old end");
+	else if (pread(held, buf, 4, 8) != 2 || !same(buf, "89", 2))
+		fail("pread(2) through a second descriptor stopped at the "
+		    "old end");
+	else if (write(held, "ab", 2) != 2 ||
+	    slurp(PATH, buf, sizeof(buf)) != 12 ||
+	    !same(buf, "0123456789ab", 12))
+		fail("O_APPEND through a second descriptor did not land "
+		    "after the first's bytes");
+	else
+		printf("filewrite: PASS a second descriptor sees the file "
+		    "grow -- read, pread, lseek(SEEK_END) and O_APPEND all "
+		    "reach the first's bytes\n");
+	if (fd >= 0)
+		(void)close(fd);
+	if (held >= 0)
+		(void)close(held);
+	(void)unlink(PATH);
 
 	if (fails != 0) {
 		printf("filewrite: %d check(s) FAILED\n", fails);

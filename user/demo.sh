@@ -24,4 +24,20 @@ cd ..
 echo "[demo.sh] after cd ..: $(pwd)"
 cd /
 echo "[demo.sh] back at: $(pwd)"
+
+# One open file behind several descriptors: 2>&1 makes a copy, `>&2` a copy
+# of that, and the subshell is a child with copies of its own.  POSIX gives
+# them all one offset, so each write lands after the one before it; with an
+# offset per copy they would land on top of each other.
+f=/etc/shared.txt
+{ echo one; echo two >&2; (echo three); echo four; } > $f 2>&1
+want='one
+two
+three
+four'
+if [ "$(gcat $f)" = "$want" ]; then
+	echo "[demo.sh] PASS -- 2>&1, >&2 and a child share one offset"
+else
+	echo "[demo.sh] FAIL -- the shared file reads '$(gcat $f)'"
+fi
 echo "[demo.sh] done"

@@ -2213,6 +2213,14 @@ fs_apfs_xid(void)
 	return (g_apfs.ac_mounted ? g_apfs.ac_xid : 0);
 }
 
+void
+fs_apfs_space(uint64_t *blocks, uint64_t *bfree)
+{
+
+	*blocks = g_apfs.ac_block_count;
+	*bfree  = __atomic_load_n(&g_apfs.ac_sm_free, __ATOMIC_RELAXED);
+}
+
 /* What the floor stands at; the self-test says it out loud. */
 uint64_t
 view_floor(void)

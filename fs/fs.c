@@ -231,6 +231,20 @@ fs_kind(void)
 	return ("none");
 }
 
+int
+fs_space(uint32_t *bsize, uint64_t *blocks, uint64_t *bfree)
+{
+
+	*bsize  = 0;
+	*blocks = 0;
+	*bfree  = 0;
+	if (!fs_apfs_ready())
+		return (FS_E_NOMOUNT);
+	*bsize = APFS_BLOCK_SIZE;
+	fs_apfs_space(blocks, bfree);
+	return (FS_E_OK);
+}
+
 /*
  * The published past by name (/.xid, see fs.h): how a path is told from a
  * live one, and how a checkpoint is entered and left around one backend
@@ -629,6 +643,8 @@ pwrite_locked(struct fs_handle *h, uint64_t off, const uint8_t *buf,
 
 	/* Refresh first: the checks below are against the current length. */
 	handle_refresh(h);
+	if (off == FS_OFF_APPEND)
+		off = h->fh_size;
 
 	/*
 	 * A write running past the end grows the file first, so a failure to
@@ -691,6 +707,19 @@ fs_pwrite(struct fs_handle *h, uint64_t off, const uint8_t *buf,
 	rv = pwrite_locked(h, off, buf, len, out_put);
 	mutex_unlock(&fs_lock);
 	return (rv);
+}
+
+int
+fs_length(struct fs_handle *h, uint64_t *out_len)
+{
+
+	if (h == NULL || out_len == NULL)
+		return (FS_E_NOTFOUND);
+	mutex_lock(&fs_lock);
+	handle_refresh(h);
+	*out_len = h->fh_size;
+	mutex_unlock(&fs_lock);
+	return (FS_E_OK);
 }
 
 static int

@@ -1356,6 +1356,12 @@ int	fs_apfs_view_list(uint64_t *xids, uint32_t cap, uint32_t *n_out);
 uint64_t fs_apfs_xid(void);
 
 /*
+ * The container's size and free space, in blocks.  Read without the volume
+ * lock: a count a writer is moving is as true as the next one.
+ */
+void	fs_apfs_space(uint64_t *blocks, uint64_t *bfree);
+
+/*
  * Prove the published past reads back exactly, and exactly as far back as
  * promised: a file's earlier lengths and bytes through views of the
  * checkpoints that held them, a name's absence through a view from before it
