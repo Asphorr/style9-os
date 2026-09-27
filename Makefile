@@ -194,6 +194,7 @@ OBJS	= \
 	$(OBJDIR)/selfkill_elf.o \
 	$(OBJDIR)/top_elf.o \
 	$(OBJDIR)/heartbeatd_elf.o \
+	$(OBJDIR)/svcecho_elf.o \
 	$(OBJDIR)/argecho_elf.o \
 	$(OBJDIR)/crasher_elf.o \
 	$(OBJDIR)/machotest_macho.o \
@@ -289,7 +290,7 @@ $(OBJDIR)/style9_%.o: $(LIB_DIR)/style9_%.c | $(OBJDIR)
 # below.  To add one, drop user/<name>.c on disk, append the name here,
 # and register the matching _binary_<name>_elf_start/_end pair in
 # kern/progreg.c.
-USER_PROGRAMS = hello clock tasks sh excchild excchild_ud excchild_thr excchild_resume lsmp vmmap echod launchctl loopchild oolchild selfkill top heartbeatd argecho crasher
+USER_PROGRAMS = hello clock tasks sh excchild excchild_ud excchild_thr excchild_resume lsmp vmmap echod launchctl loopchild oolchild selfkill top heartbeatd argecho crasher svcecho
 
 $(OBJDIR)/%.user.o: $(USER_DIR)/%.c | $(OBJDIR)
 	$(CC) $(USER_CFLAGS) $(DEPFLAGS) -c $< -o $@

@@ -11,11 +11,13 @@
 
 #include "bootstrap.h"
 #include "kprintf.h"
+#include "launchd.h"
 #include "panic.h"
 #include "port.h"
 #include "port_internal.h"
 #include "spinlock.h"
 #include "task.h"
+#include "thread.h"
 
 /* From port_object.c; the first creates the bootstrap port. */
 extern struct port	*port_create_kernel_owned(uint8_t special_kind,
@@ -239,64 +241,123 @@ bootstrap_send_status(const struct mach_msg_header *req,
 }
 
 /*
+ * The name a LOOKUP or CHECK_IN request carries, NUL-terminated in `out`;
+ * false for a request too short to hold one.  A larger msgh_size is fine:
+ * the caller's buffer may be sized for the complex reply.
+ */
+static bool
+bootstrap_request_name(const struct mach_msg_header *req, char *out)
+{
+	const struct bootstrap_lookup_request	*rq;
+	size_t					 i;
+
+	if (req->msgh_size < sizeof(struct mach_msg_header) +
+	    sizeof(struct bootstrap_lookup_request))
+		return (false);
+	rq = (const struct bootstrap_lookup_request *)
+	    ((const uint8_t *)req + sizeof(struct mach_msg_header));
+	for (i = 0; i < BOOTSTRAP_NAME_MAX; i++)
+		out[i] = rq->blr_name[i];
+	out[BOOTSTRAP_NAME_MAX - 1] = '\0';	/* hard cap */
+	return (true);
+}
+
+static int
+bootstrap_reply_not_found(const struct mach_msg_header *req,
+    struct port_space *from)
+{
+	struct mach_msg_header	reply_fail;
+
+	reply_fail.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	reply_fail.msgh_size    = sizeof(reply_fail);
+	reply_fail.msgh_remote  = req->msgh_local;
+	reply_fail.msgh_local   = MACH_PORT_NULL;
+	reply_fail.msgh_voucher = 0;
+	reply_fail.msgh_id      = BOOTSTRAP_REPLY_NOT_FOUND;
+	return (mach_msg_send(from, &reply_fail));
+}
+
+static int	bootstrap_reply_port(const struct mach_msg_header *req,
+		    struct port_space *from, mach_port_name_t svc_name,
+		    uint8_t disposition);
+
+/*
  * BOOTSTRAP_OP_LOOKUP.  A hit replies COMPLEX with one port descriptor
  * carrying COPY_SEND to the service; a miss replies with a bare header,
  * msgh_id BOOTSTRAP_REPLY_NOT_FOUND.
- *
- * The service is named in kernel_space, not in the caller's space, so
- * the hit is sent from kernel_space: the caller's reply port gets a
- * temporary SEND name there, used as msgh_remote with MOVE_SEND so the
- * send consumes it, and pd.name is the service's kernel name.  Delivery
- * then installs a fresh name for the service in the caller's space.
  */
 static int
 bootstrap_dispatch_lookup(const struct mach_msg_header *req,
     struct port_space *from)
+{
+	char			 name_buf[BOOTSTRAP_NAME_MAX];
+	mach_port_name_t	 svc_name;
+
+	if (!bootstrap_request_name(req, name_buf))
+		return (MACH_E_INVAL);
+
+	spin_lock(&registry_lock);
+	svc_name = bootstrap_lookup_locked(name_buf);
+	spin_unlock(&registry_lock);
+
+	if (svc_name == MACH_PORT_NULL)
+		return (bootstrap_reply_not_found(req, from));
+	return (bootstrap_reply_port(req, from, svc_name,
+	    MACH_MSG_TYPE_COPY_SEND));
+}
+
+/*
+ * BOOTSTRAP_OP_CHECK_IN: launchd lets go of the service's receive right
+ * and the reply moves it out of kernel_space.  If the reply does not
+ * take it, the RECEIVE is dropped where it is, and PORT_DESTROYED takes
+ * it back to launchd; the SEND the registry names stays.
+ */
+static int
+bootstrap_dispatch_check_in(const struct mach_msg_header *req,
+    struct port_space *from)
+{
+	char			 name_buf[BOOTSTRAP_NAME_MAX];
+	mach_port_name_t	 recv_name;
+	uint8_t			 rights;
+	int			 rv;
+
+	if (!bootstrap_request_name(req, name_buf))
+		return (MACH_E_INVAL);
+	if (launchd_check_in(name_buf, current_thread->th_task->t_id,
+	    &recv_name) != MACH_MSG_OK)
+		return (bootstrap_reply_not_found(req, from));
+	rv = bootstrap_reply_port(req, from, recv_name,
+	    MACH_MSG_TYPE_MOVE_RECEIVE);
+	if (rv != MACH_MSG_OK && space_lookup(kernel_space, recv_name,
+	    MACH_PORT_RIGHT_RECEIVE, &rights) != NULL)
+		(void)space_drop_one_right(kernel_space, recv_name,
+		    MACH_PORT_RIGHT_RECEIVE);
+	return (rv);
+}
+
+/*
+ * The found reply: COMPLEX, one port descriptor naming `svc_name` in
+ * kernel_space with `disposition`.
+ *
+ * The service is named in kernel_space, not in the caller's space, so
+ * the reply is sent from kernel_space: the caller's reply port gets a
+ * temporary SEND name there, used as msgh_remote with MOVE_SEND so the
+ * send consumes it.  Delivery then installs a fresh name for the service
+ * in the caller's space.
+ */
+static int
+bootstrap_reply_port(const struct mach_msg_header *req,
+    struct port_space *from, mach_port_name_t svc_name, uint8_t disposition)
 {
 	struct {
 		struct mach_msg_header			hdr;
 		struct mach_msg_body			body;
 		struct mach_msg_port_descriptor		pd;
 	} reply_ok;
-	struct mach_msg_header				reply_fail;
-	const struct bootstrap_lookup_request		*rq;
-	const uint8_t					*src;
 	struct port		*reply_port;
-	char			 name_buf[BOOTSTRAP_NAME_MAX];
 	mach_port_name_t	 kernel_reply_name;
-	mach_port_name_t	 svc_name;
 	uint8_t			 dummy;
-	size_t			 i;
 	int			 rv;
-
-	/*
-	 * The name follows the header.  A larger msgh_size is fine: the
-	 * caller's buffer may be sized for the complex reply.
-	 */
-	if (req->msgh_size < sizeof(struct mach_msg_header) +
-	    sizeof(struct bootstrap_lookup_request))
-		return (MACH_E_INVAL);
-
-	src = (const uint8_t *)req + sizeof(struct mach_msg_header);
-	rq  = (const struct bootstrap_lookup_request *)src;
-	for (i = 0; i < BOOTSTRAP_NAME_MAX; i++)
-		name_buf[i] = rq->blr_name[i];
-	name_buf[BOOTSTRAP_NAME_MAX - 1] = '\0';	/* hard cap */
-
-	spin_lock(&registry_lock);
-	svc_name = bootstrap_lookup_locked(name_buf);
-	spin_unlock(&registry_lock);
-
-	if (svc_name == MACH_PORT_NULL) {
-		reply_fail.msgh_bits    =
-		    MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
-		reply_fail.msgh_size    = sizeof(reply_fail);
-		reply_fail.msgh_remote  = req->msgh_local;
-		reply_fail.msgh_local   = MACH_PORT_NULL;
-		reply_fail.msgh_voucher = 0;
-		reply_fail.msgh_id      = BOOTSTRAP_REPLY_NOT_FOUND;
-		return (mach_msg_send(from, &reply_fail));
-	}
 
 	/* The caller's reply port, given a SEND name in kernel_space. */
 	reply_port = space_lookup(from, req->msgh_local,
@@ -322,7 +383,7 @@ bootstrap_dispatch_lookup(const struct mach_msg_header *req,
 
 	reply_ok.pd.name        = svc_name;
 	reply_ok.pd.pad1        = 0;
-	reply_ok.pd.disposition = MACH_MSG_TYPE_COPY_SEND;
+	reply_ok.pd.disposition = disposition;
 	reply_ok.pd.type        = MACH_MSG_PORT_DESCRIPTOR;
 	reply_ok.pd.pad2        = 0;
 
@@ -470,6 +531,8 @@ bootstrap_dispatch(const struct mach_msg_header *req, struct port_space *from)
 		return (bootstrap_dispatch_register(req, from));
 	case BOOTSTRAP_OP_DEREGISTER:
 		return (bootstrap_dispatch_deregister(req, from));
+	case BOOTSTRAP_OP_CHECK_IN:
+		return (bootstrap_dispatch_check_in(req, from));
 	default:
 		return (MACH_E_INVAL);
 	}

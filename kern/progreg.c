@@ -73,6 +73,10 @@ extern uint8_t	_binary_top_elf_end[];
 extern uint8_t	_binary_heartbeatd_elf_start[];
 extern uint8_t	_binary_heartbeatd_elf_end[];
 
+/* svcecho: a launchd Mach service that checks its port in. */
+extern uint8_t	_binary_svcecho_elf_start[];
+extern uint8_t	_binary_svcecho_elf_end[];
+
 extern uint8_t	_binary_argecho_elf_start[];
 extern uint8_t	_binary_argecho_elf_end[];
 
@@ -356,6 +360,8 @@ progreg_init(void)
 	    _binary_top_elf_start, _binary_top_elf_end);
 	register_one("heartbeatd",
 	    _binary_heartbeatd_elf_start, _binary_heartbeatd_elf_end);
+	register_one("svcecho",
+	    _binary_svcecho_elf_start, _binary_svcecho_elf_end);
 	register_one("argecho",
 	    _binary_argecho_elf_start, _binary_argecho_elf_end);
 	register_one("crasher",

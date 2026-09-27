@@ -503,6 +503,65 @@ port_notify_enqueue(struct port *notify_port, uint32_t notify_id,
 }
 
 int
+port_destroyed_post(struct port *notify_port, struct port *p,
+    uint32_t user_tag)
+{
+	struct mach_port_destroyed_notification	*nd;
+	struct port_pending_desc		*descs;
+	struct port_msg				*m;
+	struct thread				*waiter = NULL;
+	int					 rv;
+
+	m = kmalloc(sizeof(*m) +
+	    sizeof(struct mach_port_destroyed_notification));
+	if (m == NULL)
+		return (MACH_E_NOMEM);
+	descs = kcalloc(1, sizeof(struct port_pending_desc));
+	if (descs == NULL) {
+		kfree(m);
+		return (MACH_E_NOMEM);
+	}
+	descs[0].pd_type        = MACH_MSG_PORT_DESCRIPTOR;
+	descs[0].pd_disposition = MACH_PORT_RIGHT_RECEIVE;
+	descs[0].pd_port        = p;
+
+	m->m_next   = NULL;
+	m->m_size   = sizeof(struct mach_port_destroyed_notification);
+	m->m_ndescs = 1;
+	m->m_descs  = descs;
+
+	nd = (struct mach_port_destroyed_notification *)m->m_buf;
+	nd->hdr.msgh_bits    = MACH_MSGH_BITS_COMPLEX |
+	    MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	nd->hdr.msgh_size    = sizeof(*nd);
+	nd->hdr.msgh_remote  = MACH_PORT_NULL;
+	nd->hdr.msgh_local   = MACH_PORT_NULL;
+	nd->hdr.msgh_voucher = 0;
+	nd->hdr.msgh_id      = MACH_NOTIFY_PORT_DESTROYED;
+	nd->body.msgh_descriptor_count = 1;
+	nd->not_port.type        = MACH_MSG_PORT_DESCRIPTOR;
+	nd->not_port.disposition = MACH_MSG_TYPE_MOVE_RECEIVE;
+	nd->not_port.pad1        = 0;
+	nd->not_port.pad2        = 0;
+	nd->not_port.name        = MACH_PORT_NULL;
+	nd->nd_msgid         = user_tag;
+	nd->nd_pad           = 0;
+
+	/* Not free_pending_descs on failure: that would destroy the right. */
+	rv = msg_enqueue(notify_port, m, false, &waiter);
+	if (rv != MACH_MSG_OK) {
+		kfree(descs);
+		kfree(m);
+		return (rv);
+	}
+	if (waiter != NULL) {
+		thread_wake(waiter);
+		thread_unhold(waiter);
+	}
+	return (MACH_MSG_OK);
+}
+
+int
 port_exception_post(struct port *port, uint32_t trapno, uint32_t err,
     uint64_t rip, uint64_t rsp, uint64_t rflags, uint64_t cr2,
     uint64_t task_id, struct port *reply_port)
@@ -1690,6 +1749,7 @@ mach_msg_recv_timed(struct port_space *to, mach_port_name_t recv_name,
 	struct thread	*self;
 	uint64_t	 deadline;
 	uint8_t		 dummy;
+	bool		 moved;
 
 	if (buf == NULL || buf_size < sizeof(struct mach_msg_header))
 		return (MACH_E_INVAL);
@@ -1784,9 +1844,23 @@ mach_msg_recv_timed(struct port_space *to, mach_port_name_t recv_name,
 			 */
 			sched_remove_timed_waiter(self);
 
+			moved = space_lookup(to, recv_name,
+			    MACH_PORT_RIGHT_RECEIVE, &dummy) != p;
+
 			spin_lock(&p->p_lock);
 			port_unbind_waiter_locked(p, self);
 			thread_wait_forget(self);
+
+			/*
+			 * The wake may say the right has gone elsewhere: one
+			 * destroyed with PORT_DESTROYED armed moves on with the
+			 * port alive, and the queue is its new holder's.
+			 */
+			if (moved && !p->p_dead) {
+				spin_unlock(&p->p_lock);
+				self->th_timed_out = 0;
+				return (MACH_E_RIGHT);
+			}
 
 			if (self->th_timed_out) {
 				self->th_timed_out = 0;
@@ -2554,4 +2628,286 @@ port_send_selftest(void)
 	    "back its slot and its ref\n");
 out:
 	(void)port_deallocate(kernel_space, name);
+}
+
+/*
+ * Selftest: PORT_DESTROYED.  The client is a task of its own, so its SEND
+ * name outlives the kernel_space entries the scenes tear down.
+ */
+struct pd_recv {
+	mach_port_name_t	 pr_name;
+	volatile int		 pr_rv;
+	volatile int		 pr_done;
+	struct thread		*pr_thread;
+};
+
+static struct pd_recv	pd_parked;	/* static: outlives the frame */
+
+static void
+pd_recv_entry(void *arg)
+{
+	struct mach_msg_header	 buf;
+	struct pd_recv		*r;
+
+	r = arg;
+	r->pr_rv   = mach_msg_recv_timed(kernel_space, r->pr_name, &buf,
+	    sizeof(buf), PW_HELPER_MS);
+	r->pr_done = 1;
+	thread_exit();
+}
+
+static int
+pd_send(struct port_space *space, mach_port_name_t name, uint32_t id)
+{
+	struct mach_msg_header	hdr;
+
+	ps_hdr(&hdr, MACH_MSG_TYPE_COPY_SEND, name, id);
+	return (mach_msg_send_timed(space, &hdr, MACH_TIMEOUT_NONE));
+}
+
+/* Take the notification off `notify`: the right's new name, or NULL. */
+static mach_port_name_t
+pd_take(mach_port_name_t notify, uint32_t tag)
+{
+	struct mach_port_destroyed_notification	nd;
+
+	if (mach_msg_recv(kernel_space, notify, &nd.hdr, sizeof(nd)) !=
+	    MACH_MSG_OK || nd.hdr.msgh_id != MACH_NOTIFY_PORT_DESTROYED ||
+	    nd.nd_msgid != tag ||
+	    nd.not_port.disposition != MACH_MSG_TYPE_MOVE_RECEIVE)
+		return (MACH_PORT_NULL);
+	return (nd.not_port.name);
+}
+
+/* Receive one message on `name`: is it `id`? */
+static bool
+pd_got(mach_port_name_t name, uint32_t id)
+{
+	struct mach_msg_header	buf;
+
+	return (mach_msg_recv(kernel_space, name, &buf, sizeof(buf)) ==
+	    MACH_MSG_OK && buf.msgh_id == id);
+}
+
+/* A fresh port in kernel_space, with a SEND for the client. */
+static struct port *
+pd_port(struct port_space *cs, mach_port_name_t *name, mach_port_name_t *cname)
+{
+	struct port	*p;
+	uint8_t		 rights;
+
+	*name = port_allocate(kernel_space,
+	    MACH_PORT_RIGHT_RECEIVE | MACH_PORT_RIGHT_SEND);
+	if (*name == MACH_PORT_NULL)
+		return (NULL);
+	p = space_lookup(kernel_space, *name, MACH_PORT_RIGHT_RECEIVE,
+	    &rights);
+	if (p == NULL || space_install(cs, p, MACH_PORT_RIGHT_SEND, cname) !=
+	    MACH_MSG_OK)
+		return (NULL);
+	return (p);
+}
+
+void
+port_destroyed_selftest(void)
+{
+	struct mach_msg_header	 buf;
+	struct task		*client;
+	struct task		*holder;
+	struct port_space	*cs;
+	struct port_space	*hs;
+	struct port		*p;
+	struct port		*n;
+	mach_port_name_t	 notify, dead_notify, name, cname, again;
+	mach_port_name_t	 prev, hp, hn;
+	unsigned int		 i;
+	uint8_t			 rights;
+
+	name = again = dead_notify = MACH_PORT_NULL;
+	client = task_create("pd-client");
+	notify = port_allocate(kernel_space,
+	    MACH_PORT_RIGHT_RECEIVE | MACH_PORT_RIGHT_SEND);
+	if (client == NULL || notify == MACH_PORT_NULL) {
+		kprintf("port-destroyed: FAIL nothing to test with\n");
+		goto out;
+	}
+	cs = client->t_port_space;
+	n  = space_lookup(kernel_space, notify, MACH_PORT_RIGHT_RECEIVE,
+	    &rights);
+	p  = pd_port(cs, &name, &cname);
+	if (n == NULL || p == NULL) {
+		kprintf("port-destroyed: FAIL no ports to test with\n");
+		goto out;
+	}
+
+	/* 0. Not on a port watching itself, and not by a mere sender. */
+	if (port_request_notification(kernel_space, name,
+	    MACH_NOTIFY_PORT_DESTROYED, name, 0, &prev) != MACH_E_INVAL ||
+	    port_request_notification(cs, cname, MACH_NOTIFY_PORT_DESTROYED,
+	    cname, 0, &prev) != MACH_E_RIGHT) {
+		kprintf("port-destroyed: FAIL armed on a port watching itself, "
+		    "or by a sender\n");
+		goto out;
+	}
+
+	/*
+	 * 1. Deallocated with two messages queued.  The same port comes to
+	 *    the notify port under a new name, both messages still there in
+	 *    order, and the client's old name still reaches it.
+	 */
+	if (port_request_notification(kernel_space, name,
+	    MACH_NOTIFY_PORT_DESTROYED, notify, 0xD1, &prev) != MACH_MSG_OK ||
+	    pd_send(cs, cname, 0xA1) != MACH_MSG_OK ||
+	    pd_send(cs, cname, 0xA2) != MACH_MSG_OK) {
+		kprintf("port-destroyed: FAIL could not arm the port or queue "
+		    "on it\n");
+		goto out;
+	}
+	(void)port_deallocate(kernel_space, name);
+	name = pd_take(notify, 0xD1);
+	if (name == MACH_PORT_NULL ||
+	    space_lookup(kernel_space, name, MACH_PORT_RIGHT_RECEIVE,
+	    &rights) != p || !pd_got(name, 0xA1) || !pd_got(name, 0xA2) ||
+	    pd_send(cs, cname, 0xA3) != MACH_MSG_OK || !pd_got(name, 0xA3)) {
+		kprintf("port-destroyed: FAIL a deallocated receive right did "
+		    "not come back whole: the port, its queue, the client's "
+		    "name\n");
+		goto out;
+	}
+
+	/*
+	 * 2. Once only.  Destroyed again, unarmed, the port dies: the
+	 *    client's name is dead and no second notice comes.
+	 */
+	(void)port_deallocate(kernel_space, name);
+	name = MACH_PORT_NULL;
+	if (pd_send(cs, cname, 0xA4) != MACH_E_DEAD ||
+	    mach_msg_recv(kernel_space, notify, &buf, sizeof(buf)) !=
+	    MACH_E_NOMSG) {
+		kprintf("port-destroyed: FAIL a port destroyed a second time "
+		    "came back again, or lived\n");
+		goto out;
+	}
+	(void)port_deallocate(cs, cname);
+
+	/*
+	 * 3. With its task.  A receive right in a task that goes away comes
+	 *    to the notify port, a message still in its queue.
+	 */
+	holder = task_create("pd-holder");
+	p = pd_port(cs, &name, &cname);
+	if (holder == NULL || p == NULL) {
+		kprintf("port-destroyed: FAIL no task to hold the port\n");
+		if (holder != NULL)
+			task_deref(holder);
+		goto out;
+	}
+	hs = holder->t_port_space;
+	if (space_unbind_no_deref(kernel_space, name,
+	    MACH_PORT_RIGHT_RECEIVE) != MACH_MSG_OK ||
+	    space_install_no_ref(hs, p, MACH_PORT_RIGHT_RECEIVE, &hp) !=
+	    MACH_MSG_OK ||
+	    space_install(hs, n, MACH_PORT_RIGHT_SEND, &hn) != MACH_MSG_OK ||
+	    port_request_notification(hs, hp, MACH_NOTIFY_PORT_DESTROYED, hn,
+	    0xD3, &prev) != MACH_MSG_OK ||
+	    pd_send(cs, cname, 0xB1) != MACH_MSG_OK) {
+		kprintf("port-destroyed: FAIL could not hand the port to a "
+		    "task\n");
+		task_deref(holder);
+		goto out;
+	}
+	task_deref(holder);
+	again = pd_take(notify, 0xD3);
+	if (again == MACH_PORT_NULL ||
+	    space_lookup(kernel_space, again, MACH_PORT_RIGHT_RECEIVE,
+	    &rights) != p || !pd_got(again, 0xB1)) {
+		kprintf("port-destroyed: FAIL a receive right whose task went "
+		    "away did not come back with its queue\n");
+		goto out;
+	}
+	(void)port_deallocate(kernel_space, again);
+	again = MACH_PORT_NULL;
+	(void)port_deallocate(kernel_space, name);
+	name = MACH_PORT_NULL;
+	(void)port_deallocate(cs, cname);
+
+	/*
+	 * 4. The notify port dead first: the port dies as it would have.
+	 *    The client's SEND keeps it in memory to look at.
+	 */
+	dead_notify = port_allocate(kernel_space,
+	    MACH_PORT_RIGHT_RECEIVE | MACH_PORT_RIGHT_SEND);
+	p = pd_port(cs, &name, &cname);
+	if (dead_notify == MACH_PORT_NULL || p == NULL ||
+	    port_request_notification(kernel_space, name,
+	    MACH_NOTIFY_PORT_DESTROYED, dead_notify, 0xD4, &prev) !=
+	    MACH_MSG_OK) {
+		kprintf("port-destroyed: FAIL could not arm a port at a notify "
+		    "port\n");
+		goto out;
+	}
+	(void)port_deallocate(kernel_space, dead_notify);
+	dead_notify = MACH_PORT_NULL;
+	(void)port_deallocate(kernel_space, name);
+	name = MACH_PORT_NULL;
+	if (pd_send(cs, cname, 0xA5) != MACH_E_DEAD || !p->p_dead ||
+	    p->p_notify_port_destroyed != NULL) {
+		kprintf("port-destroyed: FAIL a port armed at a dead notify "
+		    "port did not die\n");
+		goto out;
+	}
+	(void)port_deallocate(cs, cname);
+
+	/*
+	 * 5. A receiver parked on the port when its right moves on is told
+	 *    it has gone, and leaves the queue to the new holder.
+	 */
+	p = pd_port(cs, &name, &cname);
+	if (p == NULL || port_request_notification(kernel_space, name,
+	    MACH_NOTIFY_PORT_DESTROYED, notify, 0xD5, &prev) != MACH_MSG_OK) {
+		kprintf("port-destroyed: FAIL could not arm a port to park "
+		    "on\n");
+		goto out;
+	}
+	pd_parked.pr_name   = name;
+	pd_parked.pr_rv     = -1;
+	pd_parked.pr_done   = 0;
+	pd_parked.pr_thread = thread_create(kernel_task, pd_recv_entry,
+	    &pd_parked, "port-parked");
+	if (pd_parked.pr_thread == NULL) {
+		kprintf("port-destroyed: FAIL no thread to park\n");
+		goto out;
+	}
+	thread_start(pd_parked.pr_thread);
+	for (i = 0; i < PS_WAIT_MS &&
+	    p->p_waiters_head != pd_parked.pr_thread; i++)
+		sched_nap_ms(1);
+	(void)port_deallocate(kernel_space, name);
+	name = MACH_PORT_NULL;
+	for (i = 0; i < PS_WAIT_MS && pd_parked.pr_done == 0; i++)
+		sched_nap_ms(1);
+	again = pd_take(notify, 0xD5);
+	if (pd_parked.pr_rv != MACH_E_RIGHT || again == MACH_PORT_NULL ||
+	    pd_send(cs, cname, 0xA6) != MACH_MSG_OK || !pd_got(again, 0xA6)) {
+		kprintf("port-destroyed: FAIL a receiver parked on a port "
+		    "whose right moved on answered %s\n",
+		    mach_msg_strerror(pd_parked.pr_rv));
+		goto out;
+	}
+
+	kprintf("port-destroyed: PASS -- a receive right deallocated, or gone "
+	    "with its task, came to the notify port with its queue and its "
+	    "senders' names; once only; with the notify port dead the port "
+	    "died; a receiver parked on it was told the right had moved\n");
+out:
+	if (again != MACH_PORT_NULL)
+		(void)port_deallocate(kernel_space, again);
+	if (name != MACH_PORT_NULL)
+		(void)port_deallocate(kernel_space, name);
+	if (dead_notify != MACH_PORT_NULL)
+		(void)port_deallocate(kernel_space, dead_notify);
+	if (notify != MACH_PORT_NULL)
+		(void)port_deallocate(kernel_space, notify);
+	if (client != NULL)
+		task_deref(client);
 }

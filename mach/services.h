@@ -187,6 +187,7 @@ _Static_assert(sizeof(struct svc_progreg_reply) == 16 + SVC_PROGREG_BYTES,
 
 /* LOAD-request flag bits (lr_flags). */
 #define	LAUNCHD_LOAD_FLAG_KEEPALIVE	0x1u	/* respawn on unexpected exit */
+#define	LAUNCHD_LOAD_FLAG_MACHSERVICE	0x2u	/* a port under the label  */
 
 /*
  * Entry states.  LOAD always spawns, so a loaded entry is RUNNING or

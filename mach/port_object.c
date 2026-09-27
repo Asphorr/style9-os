@@ -104,6 +104,8 @@ port_create(void)
 	p->p_notify_no_senders     = NULL;
 	p->p_notify_no_senders_id  = 0;
 	p->p_notify_dead_name      = NULL;
+	p->p_notify_port_destroyed    = NULL;
+	p->p_notify_port_destroyed_id = 0;
 	return (p);
 }
 
@@ -122,6 +124,8 @@ port_free(struct port *p)
 	KASSERT(p->p_send_waiters_head == NULL,
 	    "port_free: send waiters still parked");
 	KASSERT(p->p_qresv == 0, "port_free: a sender still holds a slot");
+	KASSERT(p->p_notify_port_destroyed == NULL,
+	    "port_free: PORT_DESTROYED still armed");
 
 	/*
 	 * Drain undelivered messages; their descriptors hold port refs and
@@ -201,6 +205,86 @@ port_release(struct port *p)
 		port_free(p);
 }
 
+/* Take `p` off the member list of `set`, which p_set no longer names. */
+static void
+port_leave_set(struct port *p, struct port_set *set)
+{
+	struct port	*cur, *prev;
+
+	spin_lock(&set->ps_lock);
+	prev = NULL;
+	for (cur = set->ps_members_head; cur != NULL; cur = cur->p_set_link) {
+		if (cur == p) {
+			if (prev == NULL)
+				set->ps_members_head = cur->p_set_link;
+			else
+				prev->p_set_link = cur->p_set_link;
+			set->ps_member_count--;
+			break;
+		}
+		prev = cur;
+	}
+	spin_unlock(&set->ps_lock);
+	p->p_set_link = NULL;
+}
+
+/*
+ * RECEIVE on `p` is being destroyed.  With PORT_DESTROYED armed the right
+ * goes to the notify port instead, inside the notification (Mach's
+ * ipc_port_destroy): the port lives on with its queue, its senders and
+ * their names, and only its receiver changes.  As when it dies, it leaves
+ * its set and its parked receivers are woken, to find the right gone.
+ * One-shot.  False when nothing was armed, the port is already dead, or
+ * the notification could not be queued: then it dies.
+ *
+ * A notify port that is itself in transit can close a cycle, each port's
+ * right in the other's queue, as a MOVE_RECEIVE can; both then leak.
+ */
+static bool
+port_destroyed_divert(struct port *p)
+{
+	struct port	*notify;
+	struct port_set	*member_of;
+	struct thread	*wake_head;
+	struct thread	*hw;
+	uint32_t	 tag;
+	int		 rv;
+
+	spin_lock(&p->p_lock);
+	notify = p->p_notify_port_destroyed;
+	tag    = p->p_notify_port_destroyed_id;
+	p->p_notify_port_destroyed    = NULL;
+	p->p_notify_port_destroyed_id = 0;
+	if (notify == NULL || p->p_dead) {
+		spin_unlock(&p->p_lock);
+		if (notify != NULL)
+			port_deref(notify, MACH_PORT_RIGHT_SEND);
+		return (false);
+	}
+	member_of = p->p_set;
+	p->p_set  = NULL;
+	wake_head = p->p_waiters_head;
+	p->p_waiters_head = p->p_waiters_tail = NULL;
+	for (hw = wake_head; hw != NULL; hw = hw->th_wait_link)
+		thread_hold(hw);
+	spin_unlock(&p->p_lock);
+
+	if (member_of != NULL)
+		port_leave_set(p, member_of);
+	while (wake_head != NULL) {
+		hw = wake_head->th_wait_link;
+		wake_head->th_wait_link = NULL;
+		thread_wake(wake_head);
+		thread_unhold(wake_head);
+		wake_head = hw;
+	}
+
+	rv = port_destroyed_post(notify, p, tag);
+	/* The registration's SEND ref, fired or not. */
+	port_deref(notify, MACH_PORT_RIGHT_SEND);
+	return (rv == MACH_MSG_OK);
+}
+
 void
 port_deref(struct port *p, uint8_t rights)
 {
@@ -213,6 +297,14 @@ port_deref(struct port *p, uint8_t rights)
 	struct port_notify_node *dead_name_list = NULL;
 	uint32_t	 notify_no_senders_id = 0;
 	bool		 fire_no_senders = false;
+
+	/* A receive right with somewhere to go goes there, and lives. */
+	if ((rights & MACH_PORT_RIGHT_RECEIVE) != 0 &&
+	    port_destroyed_divert(p)) {
+		rights &= (uint8_t)~MACH_PORT_RIGHT_RECEIVE;
+		if (rights == 0)
+			return;
+	}
 
 	spin_lock(&p->p_lock);
 
@@ -369,25 +461,8 @@ port_deref(struct port *p, uint8_t rights)
 	}
 
 	/* Leave the set, so it holds no pointer to a freed port. */
-	if (member_of != NULL) {
-		spin_lock(&member_of->ps_lock);
-		struct port *cur, *prev = NULL;
-		for (cur = member_of->ps_members_head; cur != NULL;
-		    cur = cur->p_set_link) {
-			if (cur == p) {
-				if (prev == NULL)
-					member_of->ps_members_head =
-					    cur->p_set_link;
-				else
-					prev->p_set_link = cur->p_set_link;
-				member_of->ps_member_count--;
-				break;
-			}
-			prev = cur;
-		}
-		spin_unlock(&member_of->ps_lock);
-		p->p_set_link = NULL;
-	}
+	if (member_of != NULL)
+		port_leave_set(p, member_of);
 
 	if (last)
 		port_free(p);

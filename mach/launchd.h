@@ -29,4 +29,15 @@
 void	launchd_subsystem_init(void);
 void	launchd_load_catalog(void);
 
+/*
+ * BOOTSTRAP_OP_CHECK_IN's half in launchd: hand over the receive right of
+ * the Mach service kept under `label` to its job's task `task_id`, as the
+ * kernel_space name it sits under.  Launchd lets go of it here; the
+ * caller moves it out, and if that fails, drops the RECEIVE there, which
+ * PORT_DESTROYED brings back.  MACH_E_NAME for no such service,
+ * MACH_E_RIGHT for another task or a right already out.
+ */
+int	launchd_check_in(const char *label, uint64_t task_id,
+	    mach_port_name_t *recv_out);
+
 #endif /* !_MACH_LAUNCHD_H_ */

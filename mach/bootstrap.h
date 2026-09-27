@@ -52,16 +52,22 @@
  *	mach_msg_header	(not complex, msgh_id = req.msgh_id)
  *	struct bootstrap_status_reply (MACH_MSG_OK or MACH_E_*)
  *
+ * Check-in (Darwin's bootstrap_check_in), from a launchd job for the
+ * Mach service launchd keeps under its label: as a lookup, but the
+ * descriptor carries the receive right, MOVE_RECEIVE.  Refused, as not
+ * found, to any task but the job's, and while the right is out.
+ *
  * A lookup succeeded if the reply is COMPLEX; register and deregister
  * report in bsr_status.  Wire structs are ABI-stable, as in port.h.
  */
 
 #define	BOOTSTRAP_NAME_MAX		32
-#define	BOOTSTRAP_MAX_SERVICES		16
+#define	BOOTSTRAP_MAX_SERVICES		32
 
 #define	BOOTSTRAP_OP_LOOKUP		1
 #define	BOOTSTRAP_OP_REGISTER		2
 #define	BOOTSTRAP_OP_DEREGISTER		3
+#define	BOOTSTRAP_OP_CHECK_IN		4
 
 #define	BOOTSTRAP_REPLY_NOT_FOUND	0xFFFFFFFFu
 

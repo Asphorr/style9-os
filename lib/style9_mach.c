@@ -170,6 +170,44 @@ bootstrap_lookup(const char *service)
 }
 
 /*
+ * bootstrap_check_in: from a launchd job, the receive right of the Mach
+ * service launchd keeps under `service`, as bootstrap_lookup asks but with
+ * BOOTSTRAP_OP_CHECK_IN.  MACH_PORT_NULL if refused.
+ */
+mach_port_name_t
+bootstrap_check_in(const char *service)
+{
+	struct {
+		struct mach_msg_header			hdr;
+		struct bootstrap_lookup_request		body;
+	} req;
+	struct {
+		struct mach_msg_header			hdr;
+		struct mach_msg_body			body;
+		struct mach_msg_port_descriptor		pd;
+	} reply;
+	size_t	i;
+
+	for (i = 0; i < BOOTSTRAP_NAME_MAX; i++)
+		req.body.blr_name[i] = '\0';
+	for (i = 0; service[i] != '\0' && i < BOOTSTRAP_NAME_MAX - 1; i++)
+		req.body.blr_name[i] = service[i];
+
+	req.hdr.msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	req.hdr.msgh_size    = sizeof(req);
+	req.hdr.msgh_remote  = MACH_PORT_BOOTSTRAP;
+	req.hdr.msgh_local   = MACH_PORT_NULL;
+	req.hdr.msgh_voucher = 0;
+	req.hdr.msgh_id      = BOOTSTRAP_OP_CHECK_IN;
+
+	if (mach_msg_rpc(&req.hdr, &reply.hdr, sizeof(reply), 1000) !=
+	    MACH_MSG_OK || reply.hdr.msgh_id == BOOTSTRAP_REPLY_NOT_FOUND ||
+	    (reply.hdr.msgh_bits & MACH_MSGH_BITS_COMPLEX) == 0)
+		return (MACH_PORT_NULL);
+	return (reply.pd.name);
+}
+
+/*
  * bootstrap_register_service: BOOTSTRAP_OP_REGISTER is a COMPLEX message
  * carrying one port descriptor (COPY_SEND of `port') followed by the
  * service name; the reply carries bsr_status.

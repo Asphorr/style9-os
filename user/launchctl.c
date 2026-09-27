@@ -36,6 +36,11 @@
 #define	THR_LABEL	"com.style9.flaky"
 #define	THR_PROGRAM	"crasher"	/* exits immediately -> throttle */
 
+#define	MS_LABEL	"com.style9.svcecho"
+#define	MS_PROGRAM	"svcecho"	/* a Mach service, checks in */
+#define	MS_CRASH	0x5EC0DEADu	/* svcecho exits on this */
+#define	MS_WAIT_MS	4000u
+
 /* ---- helpers --------------------------------------------------------- */
 
 static mach_port_name_t
@@ -379,6 +384,91 @@ arm_dead_name(mach_port_name_t taskport)
 	return (notify);
 }
 
+/* A bare request to `svc`, with a SEND made from `reply` if there is one. */
+static void
+ms_req(struct mach_msg_header *h, mach_port_name_t svc,
+    mach_port_name_t reply, uint32_t id)
+{
+
+	h->msgh_bits    = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND,
+	    reply != MACH_PORT_NULL ? MACH_MSG_TYPE_MAKE_SEND : 0);
+	h->msgh_size    = sizeof(*h);
+	h->msgh_remote  = svc;
+	h->msgh_local   = reply;
+	h->msgh_voucher = 0;
+	h->msgh_id      = id;
+}
+
+/* Send `id` to `svc` and wait for its echo on `reply`. */
+static int
+ms_ask(mach_port_name_t svc, mach_port_name_t reply, uint32_t id)
+{
+	struct mach_msg_header	req;
+	struct mach_msg_header	ans;
+
+	ms_req(&req, svc, reply, id);
+	return (mach_msg_send(&req) == MACH_MSG_OK &&
+	    mach_msg_recv_timed(reply, &ans, sizeof(ans), MS_WAIT_MS) ==
+	    MACH_MSG_OK && ans.msgh_id == id);
+}
+
+/*
+ * A Mach service's port outlives its job.  launchd makes the port and the
+ * job checks the receive right in; when the job dies, PORT_DESTROYED
+ * brings the right back to launchd with its queue, for the instance
+ * keep_alive starts next.  The crash request and one behind it go in
+ * together: the dying instance reads only the first, and the respawned
+ * one answers the second, sent to the name looked up before the crash.
+ */
+static void
+machservice_demo(mach_port_name_t launchd)
+{
+	struct mach_msg_header	req;
+	mach_port_name_t	svc;
+	mach_port_name_t	reply;
+	mach_port_name_t	taskport;
+	uint64_t		first;
+	int			ok;
+
+	printf("\nlaunchctl Mach service demo:\n");
+	first    = 0;
+	taskport = MACH_PORT_NULL;
+	if (do_load(launchd, MS_LABEL, MS_PROGRAM,
+	    LAUNCHD_LOAD_FLAG_KEEPALIVE | LAUNCHD_LOAD_FLAG_MACHSERVICE,
+	    &first, &taskport) != MACH_MSG_OK) {
+		printf("launchctl: FAIL the Mach service did not load\n");
+		return;
+	}
+	svc   = bootstrap_lookup(MS_LABEL);
+	reply = mach_port_allocate(MACH_PORT_RIGHT_RECEIVE |
+	    MACH_PORT_RIGHT_SEND);
+	ok = svc != MACH_PORT_NULL && reply != MACH_PORT_NULL &&
+	    ms_ask(svc, reply, 0x100);
+	if (ok) {
+		ms_req(&req, svc, MACH_PORT_NULL, MS_CRASH);
+		ok = mach_msg_send(&req) == MACH_MSG_OK &&
+		    ms_ask(svc, reply, 0x200) && !task_alive(first);
+	}
+	if (ok)
+		printf("launchctl: PASS a Mach service that crashed kept its "
+		    "port: the request queued behind the crash was answered "
+		    "by the respawned instance, through the name looked up "
+		    "before it\n");
+	else
+		printf("launchctl: FAIL a request queued behind a Mach "
+		    "service's crash went unanswered, or the old instance "
+		    "answered it\n");
+	(void)do_list(launchd, "after the service's crash (expect running, "
+	    "NEW task_id)");
+	(void)do_unload(launchd, MS_LABEL);
+	if (svc != MACH_PORT_NULL)
+		(void)mach_port_deallocate(svc);
+	if (reply != MACH_PORT_NULL)
+		(void)mach_port_deallocate(reply);
+	if (taskport != MACH_PORT_NULL)
+		(void)mach_port_deallocate(taskport);
+}
+
 int
 main(void)
 {
@@ -543,6 +633,8 @@ main(void)
 		(void)do_list(launchd, "after crash loop (expect throttled)");
 		(void)do_unload(launchd, THR_LABEL);
 	}
+
+	machservice_demo(launchd);
 
 	(void)mach_port_deallocate(launchd);
 	return (0);

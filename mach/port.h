@@ -123,8 +123,19 @@ typedef uint32_t	mach_port_name_t;
  *				MACH_PORT_TYPE_DEAD_NAME).  Multi-registrant:
  *				every watcher is notified, each on its own
  *				notify port with its own tag.
+ *
+ *	MACH_NOTIFY_PORT_DESTROYED
+ *				the receive right was about to be destroyed
+ *				(deallocated, its task died, a message holding
+ *				it was dropped).  It comes to the notify port
+ *				instead, in the message, so the port does not
+ *				die: its queue, its senders and their names
+ *				stay as they were.  Registered by the receiver;
+ *				a supervisor gets back a crashed server's port.
+ *				If the notify port is dead, the port dies.
  */
 #define	MACH_NOTIFY_FIRST		64
+#define	MACH_NOTIFY_PORT_DESTROYED	(MACH_NOTIFY_FIRST + 5)
 #define	MACH_NOTIFY_NO_SENDERS		(MACH_NOTIFY_FIRST + 6)
 #define	MACH_NOTIFY_SEND_ONCE		(MACH_NOTIFY_FIRST + 7)
 #define	MACH_NOTIFY_DEAD_NAME		(MACH_NOTIFY_FIRST + 8)
@@ -298,6 +309,23 @@ struct mach_notify_header {
 
 _Static_assert(sizeof(struct mach_notify_header) == 32,
     "mach_notify_header must be 32 bytes (wire format)");
+
+/*
+ * MACH_NOTIFY_PORT_DESTROYED: complex, its one descriptor the receive
+ * right (disposition MOVE_RECEIVE), under a new name in the receiver's
+ * space; nd_msgid the registration's tag.
+ */
+/* WIRE FORMAT.  ABI-stable. */
+struct mach_port_destroyed_notification {
+	struct mach_msg_header		hdr;
+	struct mach_msg_body		body;
+	struct mach_msg_port_descriptor	not_port;
+	uint32_t			nd_msgid;
+	uint32_t			nd_pad;
+};
+
+_Static_assert(sizeof(struct mach_port_destroyed_notification) == 44,
+    "mach_port_destroyed_notification must be 44 bytes (wire format)");
 
 /*
  * An exception message (msgh_id MACH_EXC_FAULT), posted when a ring-3
@@ -619,18 +647,19 @@ int			 port_mod_refs(struct port_space *,
 
 /*
  * Arrange for a notification to be posted to `notify_port_name` when the
- * port at `name` reaches `notify_type`: MACH_NOTIFY_NO_SENDERS (caller
- * holds RECEIVE on `name`) or MACH_NOTIFY_DEAD_NAME (caller holds SEND).
- * Any other type, or a port watching itself, is MACH_E_INVAL.  The
- * caller needs SEND on the notify port.  `notify_msgid` comes back in
- * nh_msgid, to tell sources sharing one notify port apart.
+ * port at `name` reaches `notify_type`: MACH_NOTIFY_NO_SENDERS or
+ * MACH_NOTIFY_PORT_DESTROYED (caller holds RECEIVE on `name`), or
+ * MACH_NOTIFY_DEAD_NAME (caller holds SEND).  Any other type, or a port
+ * watching itself, is MACH_E_INVAL.  The caller needs SEND on the notify
+ * port.  `notify_msgid` comes back in nh_msgid (nd_msgid), to tell
+ * sources sharing one notify port apart.
  *
- * NO_SENDERS has one slot: registering again replaces the target.
- * DEAD_NAME has one watch per notify target, so every SEND holder can be
- * told; re-arming a target only updates its tag.  *prev_out is always
- * MACH_PORT_NULL -- tracking a replaced target is the caller's job.  The
- * kernel holds a SEND ref on the notify port until the notification
- * fires or the source's RECEIVE is released.
+ * NO_SENDERS and PORT_DESTROYED have one slot each: registering again
+ * replaces the target.  DEAD_NAME has one watch per notify target, so
+ * every SEND holder can be told; re-arming a target only updates its tag.
+ * *prev_out is always MACH_PORT_NULL -- tracking a replaced target is the
+ * caller's job.  The kernel holds a SEND ref on the notify port until the
+ * notification fires or the source's RECEIVE is released.
  */
 int			 port_request_notification(struct port_space *space,
 			    mach_port_name_t name, uint32_t notify_type,
@@ -807,5 +836,13 @@ void			 port_wait_selftest(void);
  * killed mid-wait held.
  */
 void			 port_send_selftest(void);
+
+/*
+ * Boot selftest: a receive right destroyed with PORT_DESTROYED armed --
+ * deallocated, or with its task -- reaches the notify port with the
+ * queue and the senders' names intact; once only; and a port whose
+ * notify port is dead dies as before.
+ */
+void			 port_destroyed_selftest(void);
 
 #endif /* !_SYS_PORT_H_ */

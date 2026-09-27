@@ -376,6 +376,7 @@ struct mach_port_snapshot_entry {
 #define	BOOTSTRAP_OP_LOOKUP		1
 #define	BOOTSTRAP_OP_REGISTER		2
 #define	BOOTSTRAP_OP_DEREGISTER		3
+#define	BOOTSTRAP_OP_CHECK_IN		4
 #define	BOOTSTRAP_REPLY_NOT_FOUND	0xFFFFFFFFu
 #define	BOOTSTRAP_NAME_MAX		32
 
@@ -573,6 +574,7 @@ long	task_get_vm_regions(uint64_t task_id,
  * registered or anything failed.
  */
 mach_port_name_t bootstrap_lookup(const char *service);
+mach_port_name_t bootstrap_check_in(const char *service);
 
 /*
  * Publish `port' (a SEND right; the caller keeps its own) as `service'.
@@ -805,6 +807,7 @@ int		task_get_special_port(mach_port_name_t task, uint32_t which,
 #define	LAUNCHD_PROGRAM_MAX	24
 
 #define	LAUNCHD_LOAD_FLAG_KEEPALIVE	0x1u
+#define	LAUNCHD_LOAD_FLAG_MACHSERVICE	0x2u
 
 #define	LAUNCHD_STATE_RUNNING	0
 #define	LAUNCHD_STATE_EXITED	1

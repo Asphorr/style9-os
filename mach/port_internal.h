@@ -69,6 +69,9 @@ struct port {
 	 *	DEAD_NAME	set by SEND holders; fires when RECEIVE is
 	 *			dropped.  A list with one node per notify
 	 *			target, so every watcher is told.
+	 *	PORT_DESTROYED	set by this port's receiver; fires instead of
+	 *			RECEIVE dropping, and takes the right with it
+	 *			(port_destroyed_divert).  One slot.
 	 *
 	 * Each registration holds a SEND ref on its notify port until it
 	 * fires or RECEIVE drops, released by port_deref.
@@ -76,6 +79,8 @@ struct port {
 	struct port		*p_notify_no_senders;
 	uint32_t		 p_notify_no_senders_id;
 	struct port_notify_node	*p_notify_dead_name;
+	struct port		*p_notify_port_destroyed;
+	uint32_t		 p_notify_port_destroyed_id;
 };
 
 struct port_set {
@@ -223,5 +228,13 @@ int		 space_unbind_no_deref(struct port_space *,
  */
 int		 port_notify_enqueue(struct port *notify_port,
 		    uint32_t notify_id, uint32_t user_tag);
+
+/*
+ * port_msg.c: queue MACH_NOTIFY_PORT_DESTROYED on `notify_port`, carrying
+ * `p`'s receive right with its ref, which the message owns once this
+ * succeeds.  On failure the right is still the caller's.
+ */
+int		 port_destroyed_post(struct port *notify_port, struct port *p,
+		    uint32_t user_tag);
 
 #endif /* !_MACH_PORT_INTERNAL_H_ */

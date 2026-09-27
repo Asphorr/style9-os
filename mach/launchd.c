@@ -67,6 +67,18 @@ struct launchd_cell {
 	uint64_t	lc_last_spawn_ms; /* clock_uptime_ms at last spawn */
 	char		lc_name[LAUNCHD_NAME_MAX];
 	char		lc_program[LAUNCHD_PROGRAM_MAX];
+
+	/*
+	 * A Mach service (LAUNCHD_LOAD_FLAG_MACHSERVICE): a port launchd
+	 * makes and registers under the label, so clients keep one name for
+	 * it across the job's lives.  The job checks the receive right in;
+	 * PORT_DESTROYED, armed at the death port, brings it back with its
+	 * queue when the job dies.  kernel_space names; lc_svc_recv is
+	 * MACH_PORT_NULL while the right is out.
+	 */
+	struct port	*lc_svc_port;	/* identity, for the right's return */
+	mach_port_name_t lc_svc_send;	/* the SEND the registry names    */
+	mach_port_name_t lc_svc_recv;	/* RECEIVE, while launchd has it  */
 };
 
 /*
@@ -95,7 +107,9 @@ static struct port		*s9launchd_port;	/* (c) */
  * SEND in kernel_space).  For each running keep_alive job, load, start
  * and respawn arm a DEAD_NAME watch on the child's task-self port,
  * tagged with the cell index; the child's death lands here and the
- * worker respawns it.
+ * worker respawns it.  A Mach service's receive right comes back here
+ * too, as PORT_DESTROYED with the same tag, ahead of the job's DEAD_NAME
+ * (task_deref destroys the space before the task port).
  */
 static mach_port_name_t		 s9launchd_death_name;	/* (c) */
 static struct port		*s9launchd_death_port;	/* (c) */
@@ -271,6 +285,142 @@ arm_keepalive(uint64_t task_id, int idx)
 	port_deref(sp, MACH_PORT_RIGHT_SEND);
 }
 
+/* ---- Mach services ---------------------------------------------------- */
+
+/*
+ * A Mach service's port: RECEIVE and SEND under one kernel_space name,
+ * registered with bootstrap as `label`.  Unlocked.
+ */
+static int
+svc_create(const char *label, mach_port_name_t *name_out,
+    struct port **port_out)
+{
+	mach_port_name_t	name;
+	uint8_t			rights;
+	int			rv;
+
+	name = port_allocate(kernel_space,
+	    MACH_PORT_RIGHT_RECEIVE | MACH_PORT_RIGHT_SEND);
+	if (name == MACH_PORT_NULL)
+		return (MACH_E_NOSPACE);
+	rv = bootstrap_register(label, name);
+	if (rv != MACH_MSG_OK) {
+		(void)port_deallocate(kernel_space, name);
+		return (rv);
+	}
+	*name_out = name;
+	*port_out = space_lookup(kernel_space, name, MACH_PORT_RIGHT_RECEIVE,
+	    &rights);
+	return (MACH_MSG_OK);
+}
+
+/*
+ * Unregister and let go of a service.  A receive right launchd still has
+ * is armed, so it comes back once, to svc_returned, which finds no cell
+ * for it and destroys it; one a job has comes back when the job dies.
+ * Unlocked.
+ */
+static void
+svc_destroy(const char *label, mach_port_name_t send, mach_port_name_t recv)
+{
+	mach_port_name_t	kn;
+
+	if (send == MACH_PORT_NULL)
+		return;
+	(void)bootstrap_unregister(label, &kn);
+	if (recv != MACH_PORT_NULL && recv != send)
+		(void)port_deallocate(kernel_space, recv);
+	(void)port_deallocate(kernel_space, send);
+}
+
+/* PORT_DESTROYED on the receive right at `recv`, back to the death port. */
+static int
+svc_arm(mach_port_name_t recv, int idx)
+{
+	mach_port_name_t	prev;
+
+	return (port_request_notification(kernel_space, recv,
+	    MACH_NOTIFY_PORT_DESTROYED, s9launchd_death_name, (uint32_t)idx,
+	    &prev));
+}
+
+/*
+ * The receive right of cell `idx`'s service, back from a job that died,
+ * now at `name` in kernel_space.  Armed again before the cell has it, so
+ * no check-in can take it unarmed; kept for the next instance, with the
+ * messages queued meanwhile.  A right with no cell to go to (unloaded,
+ * the cell reused) is destroyed.
+ */
+static void
+svc_returned(int idx, mach_port_name_t name)
+{
+	struct launchd_cell	*c;
+	struct port		*p;
+	char			 label[LAUNCHD_NAME_MAX + 1];
+	uint8_t			 rights;
+	bool			 keep;
+
+	p = space_lookup(kernel_space, name, MACH_PORT_RIGHT_RECEIVE, &rights);
+	c = NULL;
+	keep = false;
+	if (p != NULL && idx >= 0 && idx < LAUNCHD_MAX_SERVICES) {
+		c = &s9launchd_cells[idx];
+		spin_lock(&s9launchd_lock);
+		keep = c->lc_used && c->lc_svc_port == p &&
+		    c->lc_svc_recv == MACH_PORT_NULL;
+		spin_unlock(&s9launchd_lock);
+	}
+	if (keep)
+		keep = svc_arm(name, idx) == MACH_MSG_OK;
+	if (keep) {
+		spin_lock(&s9launchd_lock);
+		keep = c->lc_used && c->lc_svc_port == p &&
+		    c->lc_svc_recv == MACH_PORT_NULL;
+		if (keep) {
+			c->lc_svc_recv = name;
+			copy_bounded(label, c->lc_name, LAUNCHD_NAME_MAX);
+			label[LAUNCHD_NAME_MAX] = '\0';
+		}
+		spin_unlock(&s9launchd_lock);
+	}
+	if (!keep) {
+		(void)port_deallocate(kernel_space, name);
+		return;
+	}
+	kprintf("launchd: '%s' service port is back from its job, %zu "
+	    "message(s) queued for the next\n", label,
+	    port_queue_len(kernel_space, name));
+}
+
+int
+launchd_check_in(const char *label, uint64_t task_id,
+    mach_port_name_t *recv_out)
+{
+	struct launchd_cell	*c;
+	size_t			 i;
+	int			 rv;
+
+	rv = MACH_E_NAME;
+	spin_lock(&s9launchd_lock);
+	for (i = 0; i < LAUNCHD_MAX_SERVICES; i++) {
+		c = &s9launchd_cells[i];
+		if (!c->lc_used || c->lc_svc_port == NULL ||
+		    !eq_bounded(c->lc_name, label, LAUNCHD_NAME_MAX))
+			continue;
+		if (c->lc_task_id != task_id || task_id == 0 ||
+		    c->lc_svc_recv == MACH_PORT_NULL) {
+			rv = MACH_E_RIGHT;
+			break;
+		}
+		*recv_out = c->lc_svc_recv;
+		c->lc_svc_recv = MACH_PORT_NULL;
+		rv = MACH_MSG_OK;
+		break;
+	}
+	spin_unlock(&s9launchd_lock);
+	return (rv);
+}
+
 /*
  * Reply to req->msgh_local with a bare [header | body] message, as in
  * services.c.  At most 1024 bytes of body.
@@ -349,12 +499,16 @@ op_load(const struct mach_msg_header *req, struct port_space *from)
 {
 	struct svc_launchctl_load_req		body;
 	struct svc_launchctl_status_reply	reply;
+	struct port				*svc_port;
 	const uint8_t				*p;
+	char					 label[LAUNCHD_NAME_MAX + 1];
 	size_t					 body_off, body_size, i;
 	long					 child_id;
+	mach_port_name_t			 svc_name;
 	uint32_t				 gen;
 	int					 free_idx;
 	int					 dup_idx;
+	int					 rv;
 
 	body_off  = sizeof(struct mach_msg_header);
 	body_size = req->msgh_size > body_off ?
@@ -372,6 +526,26 @@ op_load(const struct mach_msg_header *req, struct port_space *from)
 	 */
 	if (body.lr_name[0] == '\0' || body.lr_program[0] == '\0')
 		return (MACH_E_INVAL);
+
+	/* A Mach service's port exists before its job, as on Darwin. */
+	copy_bounded(label, body.lr_name, LAUNCHD_NAME_MAX);
+	label[LAUNCHD_NAME_MAX] = '\0';
+	svc_name = MACH_PORT_NULL;
+	svc_port = NULL;
+	if ((body.lr_flags & LAUNCHD_LOAD_FLAG_MACHSERVICE) != 0) {
+		rv = svc_create(label, &svc_name, &svc_port);
+		if (rv != MACH_MSG_OK) {
+			kprintf("launchd: no Mach service port for '%s': %s\n",
+			    label, mach_msg_strerror(rv));
+			reply.ls_status   = rv;
+			reply.ls_state    = LAUNCHD_STATE_FAILED;
+			reply.ls_task_id  = 0;
+			reply.ls_taskport = MACH_PORT_NULL;
+			reply.ls_pad      = 0;
+			return (svc_reply_inline(req, from, &reply,
+			    sizeof(reply)));
+		}
+	}
 
 	spin_lock(&s9launchd_lock);
 	free_idx = -1;
@@ -392,6 +566,7 @@ op_load(const struct mach_msg_header *req, struct port_space *from)
 
 	if (dup_idx >= 0) {
 		spin_unlock(&s9launchd_lock);
+		svc_destroy(label, svc_name, svc_name);
 		reply.ls_status  = MACH_E_INVAL;
 		reply.ls_state   = LAUNCHD_STATE_FAILED;
 		reply.ls_task_id = 0;
@@ -401,6 +576,7 @@ op_load(const struct mach_msg_header *req, struct port_space *from)
 	}
 	if (free_idx < 0) {
 		spin_unlock(&s9launchd_lock);
+		svc_destroy(label, svc_name, svc_name);
 		reply.ls_status  = MACH_E_NOSPACE;
 		reply.ls_state   = LAUNCHD_STATE_FAILED;
 		reply.ls_task_id = 0;
@@ -422,9 +598,16 @@ op_load(const struct mach_msg_header *req, struct port_space *from)
 		c->lc_keepalive = (body.lr_flags &
 		    LAUNCHD_LOAD_FLAG_KEEPALIVE) != 0;
 		c->lc_fast_crashes = 0;
+		c->lc_svc_port = svc_port;
+		c->lc_svc_send = svc_name;
+		c->lc_svc_recv = svc_name;
 		gen = spawn_begin_locked(c);
 	}
 	spin_unlock(&s9launchd_lock);
+
+	/* Armed before the job exists, so none of its lives takes it bare. */
+	if (svc_name != MACH_PORT_NULL)
+		(void)svc_arm(svc_name, free_idx);
 
 	child_id = progreg_spawn(body.lr_program);
 
@@ -481,10 +664,13 @@ op_unload(const struct mach_msg_header *req, struct port_space *from)
 	struct svc_launchctl_byname_req		body;
 	struct svc_launchctl_status_reply	reply;
 	const uint8_t				*p;
+	char					 label[LAUNCHD_NAME_MAX + 1];
 	size_t					 body_off, body_size, i;
 	int					 hit_idx;
 	uint8_t					 prev_state;
 	uint64_t				 prev_task;
+	mach_port_name_t			 svc_send;
+	mach_port_name_t			 svc_recv;
 
 	body_off  = sizeof(struct mach_msg_header);
 	body_size = req->msgh_size > body_off ?
@@ -524,10 +710,18 @@ op_unload(const struct mach_msg_header *req, struct port_space *from)
 
 	prev_state = s9launchd_cells[hit_idx].lc_state;
 	prev_task  = s9launchd_cells[hit_idx].lc_task_id;
+	svc_send   = s9launchd_cells[hit_idx].lc_svc_send;
+	svc_recv   = s9launchd_cells[hit_idx].lc_svc_recv;
+	copy_bounded(label, s9launchd_cells[hit_idx].lc_name,
+	    LAUNCHD_NAME_MAX);
+	label[LAUNCHD_NAME_MAX] = '\0';
 
 	disown_locked(&s9launchd_cells[hit_idx]);
 	s9launchd_cells[hit_idx].lc_used    = false;
 	s9launchd_cells[hit_idx].lc_state   = LAUNCHD_STATE_EXITED;
+	s9launchd_cells[hit_idx].lc_svc_port = NULL;
+	s9launchd_cells[hit_idx].lc_svc_send = MACH_PORT_NULL;
+	s9launchd_cells[hit_idx].lc_svc_recv = MACH_PORT_NULL;
 	for (i = 0; i < LAUNCHD_NAME_MAX; i++)
 		s9launchd_cells[hit_idx].lc_name[i] = '\0';
 	for (i = 0; i < LAUNCHD_PROGRAM_MAX; i++)
@@ -541,6 +735,7 @@ op_unload(const struct mach_msg_header *req, struct port_space *from)
 	 */
 	if (prev_state == LAUNCHD_STATE_RUNNING && prev_task != 0)
 		task_request_terminate(prev_task);
+	svc_destroy(label, svc_send, svc_recv);
 
 	reply.ls_status  = MACH_MSG_OK;
 	reply.ls_state   = prev_state;
@@ -829,26 +1024,33 @@ static void	launchd_parse_catalog(const char *text);
 static void	launchd_worker(void *arg) __attribute__((noreturn));
 
 /*
- * The worker, a kernel_task thread: receive on the death port for ever
- * and hand each DEAD_NAME notification to launchd_handle_death.
- * Anything else, and receive errors, are ignored.
+ * The worker, a kernel_task thread: receive on the death port for ever,
+ * handing each DEAD_NAME notification to launchd_handle_death and each
+ * PORT_DESTROYED to svc_returned.  Anything else, and receive errors, are
+ * ignored.  The buffer holds either: one too small for a message leaves
+ * it at the head of the queue, and the worker spinning on it.
  */
 static void
 launchd_worker(void *arg)
 {
-	struct mach_notify_header	nh;
-	int				rv;
+	union {
+		struct mach_notify_header		nh;
+		struct mach_port_destroyed_notification	nd;
+	} u;
+	int	rv;
 
 	(void)arg;
 
 	for (;;) {
 		rv = mach_msg_recv_block(kernel_space, s9launchd_death_name,
-		    &nh.hdr, sizeof(nh));
+		    &u.nh.hdr, sizeof(u));
 		if (rv != MACH_MSG_OK)
 			continue;
-		if (nh.hdr.msgh_id != (uint32_t)MACH_NOTIFY_DEAD_NAME)
-			continue;
-		launchd_handle_death((int)nh.nh_msgid);
+		if (u.nh.hdr.msgh_id == (uint32_t)MACH_NOTIFY_DEAD_NAME)
+			launchd_handle_death((int)u.nh.nh_msgid);
+		else if (u.nh.hdr.msgh_id ==
+		    (uint32_t)MACH_NOTIFY_PORT_DESTROYED)
+			svc_returned((int)u.nd.nd_msgid, u.nd.not_port.name);
 	}
 }
 

@@ -725,12 +725,14 @@ port_request_notification(struct port_space *space, mach_port_name_t name,
 		return (MACH_E_INVAL);
 
 	/*
-	 * NO_SENDERS is registered by the receiver (all senders gone),
-	 * DEAD_NAME by a SEND holder (the port died).  SEND_ONCE needs no
-	 * registration; other types are not supported.
+	 * NO_SENDERS and PORT_DESTROYED are registered by the receiver (all
+	 * senders gone; the right about to be destroyed), DEAD_NAME by a
+	 * SEND holder (the port died).  SEND_ONCE needs no registration;
+	 * other types are not supported.
 	 */
 	switch (notify_type) {
 	case MACH_NOTIFY_NO_SENDERS:
+	case MACH_NOTIFY_PORT_DESTROYED:
 		required = MACH_PORT_RIGHT_RECEIVE;
 		break;
 	case MACH_NOTIFY_DEAD_NAME:
@@ -752,8 +754,9 @@ port_request_notification(struct port_space *space, mach_port_name_t name,
 
 	/*
 	 * A port cannot watch itself: for NO_SENDERS the kernel's SEND ref
-	 * would keep a sender alive for ever, and a DEAD_NAME notice would
-	 * go to the port that just died.
+	 * would keep a sender alive for ever, a DEAD_NAME notice would go to
+	 * the port that just died, and a PORT_DESTROYED right would be queued
+	 * on itself, for good.
 	 */
 	if (source == notify_port)
 		return (MACH_E_INVAL);
@@ -784,17 +787,23 @@ port_request_notification(struct port_space *space, mach_port_name_t name,
 	}
 
 	/*
-	 * NO_SENDERS has one slot.  The new SEND ref is taken before the
-	 * swap, so a concurrent fire finds a live ref; the replaced
-	 * registration's ref is dropped after it.  port_deref releases the
-	 * new one when it fires or when RECEIVE goes.
+	 * NO_SENDERS and PORT_DESTROYED have one slot each.  The new SEND ref
+	 * is taken before the swap, so a concurrent fire finds a live ref;
+	 * the replaced registration's ref is dropped after it.  port_deref
+	 * releases the new one when it fires or when RECEIVE goes.
 	 */
 	port_ref(notify_port, MACH_PORT_RIGHT_SEND);
 
 	spin_lock(&source->p_lock);
-	prev_target                    = source->p_notify_no_senders;
-	source->p_notify_no_senders    = notify_port;
-	source->p_notify_no_senders_id = notify_msgid;
+	if (notify_type == MACH_NOTIFY_NO_SENDERS) {
+		prev_target                    = source->p_notify_no_senders;
+		source->p_notify_no_senders    = notify_port;
+		source->p_notify_no_senders_id = notify_msgid;
+	} else {
+		prev_target = source->p_notify_port_destroyed;
+		source->p_notify_port_destroyed    = notify_port;
+		source->p_notify_port_destroyed_id = notify_msgid;
+	}
 	spin_unlock(&source->p_lock);
 
 	if (prev_target != NULL)

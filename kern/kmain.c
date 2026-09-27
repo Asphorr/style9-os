@@ -400,6 +400,7 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	 */
 	port_wait_selftest();
 	port_send_selftest();
+	port_destroyed_selftest();
 
 	/*
 	 * The kill-vs-lock scenes: both spawn a task and kill it, one in the
