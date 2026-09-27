@@ -338,9 +338,9 @@ int		fs_readdir(const char *path, uint32_t index,
 /*
  * Boot self-test of the write path.  A read-back cannot prove a write
  * reached the disk, so it checks what a plausible-but-wrong writer gets
- * wrong -- the bytes around a partial-block write survive, a write
- * starting past the end is refused, the mtime moves -- and leaves a marker
- * for the next boot to find.  Skipped when no writable volume is mounted.
+ * wrong -- the bytes around a partial-block write survive, the mtime
+ * moves -- and leaves a marker for the next boot to find.  Skipped when no
+ * writable volume is mounted.
  */
 void		fs_write_selftest(void);
 

@@ -871,9 +871,19 @@ void	fs_apfs_data_selftest(const char *path);
  * grows into it and only the length changes; otherwise a run is taken,
  * zeroed, and entered in both trees that name a file's blocks (lengthening
  * the last run when the new one touches it).  A full leaf is split once and
- * the grow retried.  Returns FS_APFS_E_OK or a negative FS_APFS_E_*.
+ * the grow retried.  Every byte between the old length and the new reads
+ * as zero afterwards: the slack of the last block, which a truncation
+ * inside it leaves as it was, is written over.  Returns FS_APFS_E_OK or a
+ * negative FS_APFS_E_*.
  */
 int	fs_apfs_grow(uint64_t ino, uint64_t id, uint64_t new_size);
+
+/*
+ * fs_apfs_grow ahead of a write landing at `off`: the bytes from `off` on
+ * are left for the write, so an append zeroes nothing it would overwrite.
+ */
+int	fs_apfs_grow_for_write(uint64_t ino, uint64_t id, uint64_t new_size,
+	    uint64_t off);
 
 /*
  * Make a file shorter; `ino` and `id` as for fs_apfs_grow.  A run reaching

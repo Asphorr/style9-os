@@ -311,7 +311,7 @@ struct darwin_fdstat {
 	 * compares it to refuse copying a file onto itself.
 	 */
 	uint64_t	fds_ino;
-	uint32_t	fds_size;	/* byte length (regular files)   */
+	uint64_t	fds_size;	/* byte length (regular files)   */
 	uint8_t		fds_kind;	/* DARWIN_FDSTAT_*               */
 };
 

@@ -768,7 +768,7 @@ darwin_file_read(struct syscall_frame *f, struct darwin_ofile *of, void *ubuf,
 	kfree(bounce);
 	if (err != 0)
 		return (darwin_err(f, err));
-	of->of_size = (uint32_t)of->of_handle.fh_size;	/* fs_pread's refresh */
+	of->of_size = of->of_handle.fh_size;	/* fs_pread's refresh */
 	return (darwin_ok(f, (long)done));
 }
 
@@ -787,7 +787,7 @@ darwin_file_len(struct darwin_ofile *of)
 		return (of->of_size);
 	if (fs_length(&of->of_handle, &len) != FS_E_OK)
 		return (of->of_size);
-	of->of_size = (uint32_t)len;
+	of->of_size = len;
 	return (len);
 }
 
@@ -868,7 +868,10 @@ darwin_file_write(struct syscall_frame *f, struct darwin_ofile *of,
 			at = fo->fo_off;
 	}
 	err = 0;
-	for (done = 0; done < n; done += put) {
+	/* No byte of a file lies past off_t's reach. */
+	if (at != FS_OFF_APPEND && n > (uint64_t)INT64_MAX - at)
+		err = DARWIN_EFBIG;
+	for (done = 0; err == 0 && done < n; done += put) {
 		chunk = n - done;
 		if (chunk > DARWIN_WRITE_CHUNK)
 			chunk = DARWIN_WRITE_CHUNK;
@@ -913,7 +916,7 @@ darwin_file_write(struct syscall_frame *f, struct darwin_ofile *of,
 	kfree(bounce);
 	if (err != 0)
 		return (darwin_err(f, err));
-	of->of_size = (uint32_t)of->of_handle.fh_size;
+	of->of_size = of->of_handle.fh_size;
 	return (darwin_ok(f, (long)done));
 }
 
@@ -2045,7 +2048,7 @@ darwin_fcntl_lock(struct syscall_frame *f, struct task *t, int fd, int cmd,
 		mutex_unlock(&of->of_foff->fo_lock);
 		break;
 	case 2:
-		base = of->of_handle.fh_size;
+		base = darwin_file_len(of);	/* the end as it is now */
 		break;
 	default:
 		return (darwin_err(f, DARWIN_EINVAL));
@@ -3501,7 +3504,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		struct fs_handle		 handle;
 		struct task			*t;
 		uint8_t				*buf;
-		uint32_t			 size;
+		uint64_t			 size;
 		uint32_t			 k;
 		uint32_t			 flags;
 		long				 len;
@@ -3656,11 +3659,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 					    darwin_fs_errno(rv)));
 				}
 			}
-			if (handle.fh_size > 0xFFFFFFFFULL) {
-				(void)fs_close(&handle);
-				return (darwin_err(f, DARWIN_ENOMEM));
-			}
-			size = (uint32_t)handle.fh_size;
+			size = handle.fh_size;
 		}
 
 		t  = current_thread->th_task;
@@ -3684,8 +3683,8 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		t->t_darwin_files[fd].of_foff  = fo;
 		t->t_darwin_files[fd].of_flags = flags;
 		t->t_darwin_files[fd].of_type  = DARWIN_OF_FILE;
-		kprintf("darwin: UNIX open('%s') -> fd=%d (%u bytes, %s%s)\n",
-		    path, fd, (unsigned)size,
+		kprintf("darwin: UNIX open('%s') -> fd=%d (%llu bytes, %s%s)\n",
+		    path, fd, (unsigned long long)size,
 		    on_disk ? "on the volume" : "built in",
 		    writing ? ", for writing" : "");
 		return (darwin_ok(f, fd));
@@ -3733,7 +3732,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			fo = of->of_foff;
 			mutex_lock(&fo->fo_lock);
 			avail = fo->fo_off < of->of_size ?
-			    of->of_size - (uint32_t)fo->fo_off : 0;
+			    (uint32_t)(of->of_size - fo->fo_off) : 0;
 			if (n > (size_t)avail)
 				n = avail;
 			rv = 0;
@@ -3928,6 +3927,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		int64_t			 pos;
 		int			 fd;
 		int			 whence;
+		bool			 ok;
 
 		fd     = (int)f->sf_arg0;
 		off    = (int64_t)f->sf_arg1;
@@ -3956,11 +3956,16 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		case 1:	base = (int64_t)fo->fo_off;		break; /* CUR */
 		default: base = len;				break; /* END */
 		}
-		pos = base + off;
-		if (pos >= 0 && pos <= len)
+		/*
+		 * Past the end is allowed on a file on the volume: a write
+		 * there leaves a gap of zeros.  A built-in cannot be written.
+		 */
+		ok = !__builtin_add_overflow(base, off, &pos) && pos >= 0 &&
+		    (pos <= len || of->of_handle.fh_kind != FS_HANDLE_NONE);
+		if (ok)
 			fo->fo_off = (uint64_t)pos;
 		mutex_unlock(&fo->fo_lock);
-		if (pos < 0 || pos > len)
+		if (!ok)
 			return (darwin_err(f, DARWIN_EINVAL));
 		return (darwin_ok(f, (long)pos));
 	}
@@ -4034,7 +4039,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		if (rv != FS_E_OK)
 			return (darwin_err(f, darwin_fs_errno(rv)));
 		/* The cursor stays put; read(2) handles one past the end. */
-		of->of_size = (uint32_t)of->of_handle.fh_size;
+		of->of_size = of->of_handle.fh_size;
 		return (darwin_ok(f, 0));
 	}
 	case DARWIN_SYS_pread:
@@ -4069,19 +4074,15 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			return (darwin_err(f, DARWIN_EINVAL));
 		at = (uint64_t)off;
 
-		if (nr == DARWIN_SYS_pwrite) {
-			/* Sizes and cursors are 32-bit here. */
-			if (at + n > UINT32_MAX)
-				return (darwin_err(f, DARWIN_EFBIG));
+		if (nr == DARWIN_SYS_pwrite)
 			return (darwin_file_write(f, of,
 			    (const void *)f->sf_arg1, n, &at));
-		}
 
 		/* pread: read(2) with its own offset, the cursor untouched. */
 		if (of->of_buf == NULL)
 			return (darwin_file_read(f, of, (void *)f->sf_arg1, n,
 			    &at));
-		avail = at < of->of_size ? of->of_size - (uint32_t)at : 0;
+		avail = at < of->of_size ? (uint32_t)(of->of_size - at) : 0;
 		if (n > (size_t)avail)
 			n = avail;
 		if (n == 0)
@@ -5273,7 +5274,7 @@ darwin_s9_fs_fstat(struct syscall_frame *f)
 		ds.fds_kind = DARWIN_FDSTAT_CHR;
 		break;
 	case DARWIN_OF_FILE:
-		ds.fds_size = (uint32_t)darwin_file_len(of);
+		ds.fds_size = darwin_file_len(of);
 		ds.fds_kind = DARWIN_FDSTAT_REG;
 		ds.fds_ino  = of->of_handle.fh_ino;
 		break;

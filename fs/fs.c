@@ -648,13 +648,13 @@ pwrite_locked(struct fs_handle *h, uint64_t off, const uint8_t *buf,
 
 	/*
 	 * A write running past the end grows the file first, so a failure to
-	 * grow is a write that did not happen rather than half of one.  A
-	 * write starting beyond the end is refused by fs_apfs_pwrite: the gap
-	 * would be a sparse file.
+	 * grow is a write that did not happen rather than half of one.  One
+	 * starting beyond the end leaves a gap that reads as zeros, written
+	 * out: there are no sparse files.
 	 */
-	if (off <= h->fh_size && off + (uint64_t)len > h->fh_size) {
-		rv = apfs_err(fs_apfs_grow(h->fh_ino, h->fh_id,
-		    off + (uint64_t)len));
+	if (off + (uint64_t)len > h->fh_size) {
+		rv = apfs_err(fs_apfs_grow_for_write(h->fh_ino, h->fh_id,
+		    off + (uint64_t)len, off));
 		if (rv != FS_E_OK)
 			return (rv);
 		h->fh_size = off + (uint64_t)len;
@@ -1548,18 +1548,6 @@ fs_write_selftest(void)
 
 	if (fs_stat(SELFTEST_PATH, &st0) != FS_E_OK) {
 		kprintf("apfs-write: FAIL cannot stat before\n");
-		goto done;
-	}
-
-	/*
-	 * A write starting past the end is refused (FS_E_NOALLOC), neither
-	 * clamped nor grown into: the gap would be a sparse file.  One that
-	 * merely runs off the end lengthens the file (fs_grow_selftest).
-	 */
-	rv = fs_pwrite(&h, h.fh_size + 4096, (const uint8_t *)marker, 8, &put);
-	if (rv != FS_E_NOALLOC) {
-		kprintf("apfs-write: FAIL a write starting past the end was "
-		    "not refused (rv=%d)\n", rv);
 		goto done;
 	}
 

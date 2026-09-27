@@ -5826,6 +5826,11 @@ grow_once(uint64_t ino, uint64_t id, uint64_t new_size, uint64_t *full_leaf)
 	if (new_size > alloced) {
 		blocks = (new_size - alloced + APFS_BLOCK_SIZE - 1) /
 		    APFS_BLOCK_SIZE;
+		/* The allocator counts in 32 bits: a wrapped count lies. */
+		if (blocks > UINT32_MAX) {
+			rv = FS_APFS_E_NOALLOC;
+			goto out;
+		}
 		near = 0;
 		if (alloced > 0) {
 			last.el_id    = id;
@@ -6093,12 +6098,73 @@ broken:
  * Once, not in a loop: a single record cannot need two splits, so a second
  * refusal is not a full node.
  */
+/*
+ * Zero [from, to) of a file past its length and inside its allocation, a
+ * block at a time.  The allocation is fs_apfs_pwrite's bound here: these
+ * bytes are covered by extents but not yet by the length.
+ */
+static int
+zero_slack(uint64_t id, uint64_t alloced, uint64_t from, uint64_t to)
+{
+	uint8_t		*zero;
+	uint64_t	 pos;
+	uint64_t	 n;
+	uint32_t	 put;
+	int		 rv;
+
+	zero = kmalloc(APFS_BLOCK_SIZE);
+	if (zero == NULL)
+		return (FS_APFS_E_NOMEM);
+	mem_zero(zero, APFS_BLOCK_SIZE);
+	rv = FS_APFS_E_OK;
+	for (pos = from; pos < to; pos += n) {
+		n = APFS_BLOCK_SIZE - pos % APFS_BLOCK_SIZE;
+		if (n > to - pos)
+			n = to - pos;
+		rv = fs_apfs_pwrite(id, alloced, pos, zero, (uint32_t)n, &put);
+		if (rv != FS_APFS_E_OK)
+			break;
+	}
+	kfree(zero);
+	return (rv);
+}
+
 int
 fs_apfs_grow(uint64_t ino, uint64_t id, uint64_t new_size)
 {
-	uint8_t		*scratch;
-	uint64_t	 full;
-	int		 rv;
+
+	return (fs_apfs_grow_for_write(ino, id, new_size, new_size));
+}
+
+int
+fs_apfs_grow_for_write(uint64_t ino, uint64_t id, uint64_t new_size,
+    uint64_t off)
+{
+	struct inode_info	 ii;
+	uint8_t			*scratch;
+	uint64_t		 full;
+	uint64_t		 to;
+	int			 rv;
+
+	if (!g_apfs.ac_mounted)
+		return (FS_APFS_E_NOMOUNT);
+	if (inode_info(ino, &ii) != FS_APFS_E_OK)
+		return (FS_APFS_E_NOTFOUND);
+
+	/*
+	 * Grown into, the allocation past the length changes only the length,
+	 * and it may hold what a truncation inside a block left there.  Zeroed
+	 * first, up to where the caller's write begins, so a failure below
+	 * leaves nothing visible behind.
+	 */
+	to = off < new_size ? off : new_size;
+	if (to > ii.ii_alloced)
+		to = ii.ii_alloced;
+	if (to > ii.ii_size) {
+		rv = zero_slack(id, ii.ii_alloced, ii.ii_size, to);
+		if (rv != FS_APFS_E_OK)
+			return (rv);
+	}
 
 	full = 0;
 	rv = grow_once(ino, id, new_size, &full);

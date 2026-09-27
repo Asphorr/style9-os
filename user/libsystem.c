@@ -1464,7 +1464,7 @@ lstat_inode64(const char *path, void *buf)
  */
 struct s9_fdstat {			/* kern/darwin.h's darwin_fdstat */
 	uint64_t	fds_ino;
-	uint32_t	fds_size;
+	uint64_t	fds_size;
 	uint8_t		fds_kind;	/* 0 reg / 1 chr / 2 fifo / 3 dir */
 };
 
@@ -1507,7 +1507,7 @@ fstat64(int fd, void *buf)
 		break;
 	default:				/* regular file */
 		*(uint16_t *)(p + 4) = 0x81A4u;	/* S_IFREG | 0644 */
-		*(int64_t  *)(p + 96) = (int64_t)(uint64_t)ds.fds_size;
+		*(int64_t  *)(p + 96) = (int64_t)ds.fds_size;
 		break;
 	}
 	*(uint16_t *)(p + 6)   = 1;			/* st_nlink   */

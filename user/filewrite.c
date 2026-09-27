@@ -41,6 +41,10 @@
  *	17. utimes(2) sets both times to the microsecond and stat reads
  *	    them back; futimes(2) with no times sets both to now; a missing
  *	    name is ENOENT.
+ *	18. lseek past the end reads nothing there, and a write there
+ *	    leaves a gap of zeros, across a block edge; cut inside a block
+ *	    by ftruncate and grown back, a file reads zeros where the cut
+ *	    bytes were.
  *
  * Freestanding: no SDK headers, prototypes declared as <fcntl.h>/<unistd.h>
  * would alias them, entry at _entry (ld -e), relinked low like dyldhello.
@@ -131,6 +135,7 @@ extern int	 close(int fd);
 extern int	 fsync(int fd);
 extern long	 lseek(int fd, long off, int whence);
 extern long	 pread(int fd, void *buf, unsigned long n, long off);
+extern int	 ftruncate(int fd, long len);
 extern int	 unlink(const char *path);
 extern int	 mkdir(const char *path, unsigned short mode);
 extern int	 rmdir(const char *path);
@@ -165,6 +170,17 @@ same(const char *a, const char *b, size_t n)
 
 	for (i = 0; i < n; i++)
 		if (a[i] != b[i])
+			return (0);
+	return (1);
+}
+
+static int
+zeros(const char *a, size_t n)
+{
+	size_t	i;
+
+	for (i = 0; i < n; i++)
+		if (a[i] != 0)
 			return (0);
 	return (1);
 }
@@ -709,6 +725,40 @@ entry(void)
 			(void)close(fd);
 		(void)unlink(PATH);
 	}
+
+	/*
+	 * 18. Past the end.  The gap runs from byte 10 across the block edge
+	 * at 4096 to 5000.  Then the file is cut to 4, inside its first block,
+	 * and grown back to 10: those six bytes were "EFGHIJ" and are still in
+	 * the block's slack, but what reads back must be zeros.
+	 */
+	fd = open(PATH, O_RDWR | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0 || write(fd, "ABCDEFGHIJ", 10) != 10)
+		fail("cannot make a file to write past the end of");
+	else if (lseek(fd, 5000, SEEK_SET) != 5000 ||
+	    read(fd, buf, sizeof(buf)) != 0)
+		fail("lseek past the end was refused, or a read there found "
+		    "bytes");
+	else if (write(fd, "xy", 2) != 2 || lseek(fd, 0, SEEK_END) != 5002)
+		fail("a write past the end did not land there");
+	else if (pread(fd, buf, sizeof(buf), 10) != (long)sizeof(buf) ||
+	    !zeros(buf, sizeof(buf)) ||
+	    pread(fd, buf, sizeof(buf), 3900) != (long)sizeof(buf) ||
+	    !zeros(buf, sizeof(buf)) ||
+	    pread(fd, buf, 16, 4990) != 12 || !zeros(buf, 10) ||
+	    !same(buf + 10, "xy", 2))
+		fail("the gap a write past the end left is not zeros");
+	else if (ftruncate(fd, 4) != 0 || ftruncate(fd, 10) != 0 ||
+	    pread(fd, buf, 16, 0) != 10 || !same(buf, "ABCD", 4) ||
+	    !zeros(buf + 4, 6))
+		fail("bytes cut off by ftruncate came back when the file grew");
+	else
+		printf("filewrite: PASS a write past the end leaves zeros "
+		    "behind it, across a block edge, and cut bytes grown back "
+		    "over read as zeros\n");
+	if (fd >= 0)
+		(void)close(fd);
+	(void)unlink(PATH);
 
 	if (fails != 0) {
 		printf("filewrite: %d check(s) FAILED\n", fails);
