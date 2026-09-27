@@ -191,6 +191,10 @@ extern uint8_t	_binary_lockprobe_macho_end[];
 extern uint8_t	_binary_cpuprobe_macho_start[];
 extern uint8_t	_binary_cpuprobe_macho_end[];
 
+/* randprobe: probes /dev/urandom, getentropy and arc4random. */
+extern uint8_t	_binary_randprobe_macho_start[];
+extern uint8_t	_binary_randprobe_macho_end[];
+
 /*
  * ttyprobe: probes the terminal: a raw setting reaches the kernel and
  * reads back, a file and a pipe answer ENOTTY, the window size is the
@@ -390,6 +394,8 @@ progreg_init(void)
 	    _binary_lockprobe_macho_start, _binary_lockprobe_macho_end);
 	register_one("cpuprobe",
 	    _binary_cpuprobe_macho_start, _binary_cpuprobe_macho_end);
+	register_one("randprobe",
+	    _binary_randprobe_macho_start, _binary_randprobe_macho_end);
 	register_one("ttyprobe",
 	    _binary_ttyprobe_macho_start, _binary_ttyprobe_macho_end);
 	register_one("gstty",

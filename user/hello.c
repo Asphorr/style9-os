@@ -1986,6 +1986,24 @@ demo_darwin_spawn(void)
 		printf("  cpuprobe retired after %d turns\n", i);
 	}
 
+	/* randprobe: the kernel's random numbers. */
+	{
+		mach_port_name_t	rprobe_tp;
+
+		rprobe_tp = MACH_PORT_NULL;
+		printf("  >>> spawning randprobe -- /dev/urandom, getentropy, "
+		    "arc4random <<<\n");
+		child_id = spawn_args("randprobe", 0, NULL, &rprobe_tp);
+		if (child_id < 0) {
+			printf("  spawn_args('randprobe') failed (rv=%ld)\n",
+			    child_id);
+			return (96);
+		}
+		for (i = 0; i < 8192 && task_alive((uint64_t)child_id); i++)
+			(void)poll_turn();
+		printf("  randprobe retired after %d turns\n", i);
+	}
+
 	/*
 	 * ttyprobe: terminal control.  We feed it one byte with no newline,
 	 * which a canonical terminal would hold forever; reading it proves

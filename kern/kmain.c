@@ -43,6 +43,7 @@
 #include "pmap.h"
 #include "pmm.h"
 #include "port.h"
+#include "random.h"
 #include "sched.h"
 #include "shell.h"
 #include "smap.h"
@@ -182,6 +183,12 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 
 	kmain_memory_smoke();
 	kmain_run_tests();
+
+	/*
+	 * After the tests, whose interrupts it folds in, and before anything
+	 * that could ask for a random byte.
+	 */
+	random_init();
 
 	kbd_drv_init();
 	/*

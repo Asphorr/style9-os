@@ -92,6 +92,12 @@ struct vm_map;
  * any volume) nor the console (nothing reaches the screen).
  */
 #define	DARWIN_OF_NULL		6
+/*
+ * /dev/random and /dev/urandom, one device as on Darwin: reads come from
+ * the kernel's generator (kern/random.h) and never block, writes are
+ * stirred into its pool.
+ */
+#define	DARWIN_OF_RANDOM	7
 
 struct darwin_foff;
 struct darwin_pipe;

@@ -25,6 +25,7 @@
 #include "pmap.h"
 #include "port.h"
 #include "progreg.h"
+#include "random.h"
 #include "sched.h"
 #include "spinlock.h"
 #include "syscall.h"
@@ -102,6 +103,7 @@ static long	darwin_s9_fs_fdpath(struct syscall_frame *f);
 static long	darwin_s9_pselect(struct syscall_frame *f);
 static inline uint32_t darwin_sigbit(int signo);
 static bool	darwin_streq(const char *a, const char *b);
+static uint8_t	darwin_dev_type(const char *path);
 static const struct progreg_entry *darwin_bin_find(const char *name);
 static const struct progreg_entry *darwin_bin_lookup(const char *path);
 static void	darwin_select_news(void);
@@ -769,6 +771,54 @@ darwin_file_read(struct syscall_frame *f, struct darwin_ofile *of, void *ubuf,
 	if (err != 0)
 		return (darwin_err(f, err));
 	of->of_size = of->of_handle.fh_size;	/* fs_pread's refresh */
+	return (darwin_ok(f, (long)done));
+}
+
+/*
+ * /dev/random: reads are filled from the generator and writes stirred into
+ * its pool, a chunk at a time; neither blocks.  A kill ends a long read
+ * short, as a signal would on Darwin.
+ */
+#define	DARWIN_RANDOM_CHUNK	256
+
+static long
+darwin_random_read(struct syscall_frame *f, void *ubuf, size_t n)
+{
+	uint8_t	buf[DARWIN_RANDOM_CHUNK];
+	size_t	done;
+	size_t	chunk;
+
+	for (done = 0; done < n; done += chunk) {
+		if (done != 0 && task_kill_pending(current_thread->th_task))
+			break;
+		chunk = n - done < sizeof(buf) ? n - done : sizeof(buf);
+		random_bytes(buf, chunk);
+		if (syscall_copyout((uint8_t *)ubuf + done, buf, chunk) != 0) {
+			if (done == 0)
+				return (darwin_err(f, DARWIN_EFAULT));
+			break;
+		}
+	}
+	return (darwin_ok(f, (long)done));
+}
+
+static long
+darwin_random_write(struct syscall_frame *f, const void *ubuf, size_t n)
+{
+	uint8_t	buf[DARWIN_RANDOM_CHUNK];
+	size_t	done;
+	size_t	chunk;
+
+	for (done = 0; done < n; done += chunk) {
+		chunk = n - done < sizeof(buf) ? n - done : sizeof(buf);
+		if (syscall_copyin(buf, (const uint8_t *)ubuf + done,
+		    chunk) != 0) {
+			if (done == 0)
+				return (darwin_err(f, DARWIN_EFAULT));
+			break;
+		}
+		random_add(buf, chunk);
+	}
 	return (darwin_ok(f, (long)done));
 }
 
@@ -1652,6 +1702,7 @@ darwin_fd_ready(struct task *t, int fd, uint32_t want, bool *bad)
 	case DARWIN_OF_FILE:
 	case DARWIN_OF_DIR:
 	case DARWIN_OF_NULL:
+	case DARWIN_OF_RANDOM:
 		got = want;
 		break;
 	case DARWIN_OF_CONSOLE:
@@ -2535,6 +2586,7 @@ darwin_files_fork_copy(struct task *parent, struct task *child)
 		switch (src->of_type) {
 		case DARWIN_OF_CONSOLE:
 		case DARWIN_OF_NULL:
+		case DARWIN_OF_RANDOM:
 			dst->of_type = src->of_type;
 			break;
 		case DARWIN_OF_DIR:
@@ -2616,6 +2668,7 @@ darwin_dup_install(struct task *t, int oldfd, int newfd)
 	switch (type) {
 	case DARWIN_OF_CONSOLE:
 	case DARWIN_OF_NULL:
+	case DARWIN_OF_RANDOM:
 		dst->of_type = type;
 		return (0);
 	case DARWIN_OF_DIR:
@@ -3378,6 +3431,9 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		case DARWIN_OF_NULL:
 			/* Swallowed whole; the bytes are not even read. */
 			return (darwin_ok(f, (long)f->sf_arg2));
+		case DARWIN_OF_RANDOM:
+			return (darwin_random_write(f,
+			    (const void *)f->sf_arg1, (size_t)f->sf_arg2));
 		default:
 			return (darwin_err(f, DARWIN_EBADF));
 		}
@@ -3402,6 +3458,19 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		    syscall_copyout((void *)f->sf_arg0, &tv, sizeof(tv)) != 0)
 			return (darwin_err(f, DARWIN_EFAULT));
 		/* arg1 is the timezone pointer; ignored, as everywhere else. */
+		return (darwin_ok(f, 0));
+	}
+	case DARWIN_SYS_getentropy: {
+		uint8_t	buf[DARWIN_GETENTROPY_MAX];
+		size_t	n;
+
+		/* As xnu, after OpenBSD: at most 256 bytes a call. */
+		n = (size_t)f->sf_arg1;
+		if (n > sizeof(buf))
+			return (darwin_err(f, DARWIN_EINVAL));
+		random_bytes(buf, n);
+		if (syscall_copyout((void *)f->sf_arg0, buf, n) != 0)
+			return (darwin_err(f, DARWIN_EFAULT));
 		return (darwin_ok(f, 0));
 	}
 	case DARWIN_SYS_getrusage: {
@@ -3524,21 +3593,19 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			return (darwin_err(f, DARWIN_ENAMETOOLONG));
 
 		/*
-		 * /dev: three names, no directory.  /dev/console and /dev/tty
+		 * /dev: five names, no directory.  /dev/console and /dev/tty
 		 * (what ttyname(3) returns) open the console; /dev/null is the
-		 * sink.  Answered before the volume, which might otherwise
-		 * create a plain file called null.
+		 * sink; /dev/random and /dev/urandom are the generator.
+		 * Answered before the volume, which might otherwise create a
+		 * plain file called null.
 		 */
-		if (darwin_streq(path, "/dev/null") ||
-		    darwin_streq(path, "/dev/console") ||
-		    darwin_streq(path, "/dev/tty")) {
+		if (darwin_dev_type(path) != DARWIN_OF_FREE) {
 			fd = darwin_fd_alloc(current_thread->th_task);
 			if (fd < 0)
 				return (darwin_err(f, DARWIN_EMFILE));
 			t = current_thread->th_task;
 			t->t_darwin_files[fd].of_flags = (uint32_t)f->sf_arg1;
-			t->t_darwin_files[fd].of_type  = path[5] == 'n' ?
-			    DARWIN_OF_NULL : DARWIN_OF_CONSOLE;
+			t->t_darwin_files[fd].of_type  = darwin_dev_type(path);
 			return (darwin_ok(f, fd));
 		}
 
@@ -3751,6 +3818,8 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 			    (void *)f->sf_arg1, n));
 		case DARWIN_OF_NULL:
 			return (darwin_ok(f, 0));	/* always at its end */
+		case DARWIN_OF_RANDOM:
+			return (darwin_random_read(f, (void *)f->sf_arg1, n));
 		default:
 			return (darwin_err(f, DARWIN_EBADF));
 		}
@@ -3939,7 +4008,8 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		if (of->of_type == DARWIN_OF_PIPE_R ||
 		    of->of_type == DARWIN_OF_PIPE_W)
 			return (darwin_err(f, DARWIN_ESPIPE));
-		if (of->of_type == DARWIN_OF_NULL)
+		if (of->of_type == DARWIN_OF_NULL ||
+		    of->of_type == DARWIN_OF_RANDOM)
 			return (darwin_ok(f, 0));	/* every offset is 0 */
 		if (of->of_type != DARWIN_OF_FILE)
 			return (darwin_err(f, DARWIN_EBADF));
@@ -3995,9 +4065,7 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 				return (darwin_err(f, DARWIN_EROFS));
 			return (darwin_ok(f, 0));
 		}
-		if (darwin_streq(path, "/dev/null") ||
-		    darwin_streq(path, "/dev/console") ||
-		    darwin_streq(path, "/dev/tty"))
+		if (darwin_dev_type(path) != DARWIN_OF_FREE)
 			return (darwin_ok(f, 0));
 		rv = fs_stat(path, &sb);
 		if (rv != FS_E_OK)
@@ -5271,6 +5339,7 @@ darwin_s9_fs_fstat(struct syscall_frame *f)
 		break;
 	case DARWIN_OF_CONSOLE:
 	case DARWIN_OF_NULL:
+	case DARWIN_OF_RANDOM:
 		ds.fds_kind = DARWIN_FDSTAT_CHR;
 		break;
 	case DARWIN_OF_FILE:
@@ -5377,6 +5446,22 @@ darwin_streq(const char *a, const char *b)
 		if (a[i] == '\0')
 			return (true);
 	}
+}
+
+/* What a /dev name opens, or DARWIN_OF_FREE for none of the five. */
+static uint8_t
+darwin_dev_type(const char *path)
+{
+
+	if (darwin_streq(path, "/dev/null"))
+		return (DARWIN_OF_NULL);
+	if (darwin_streq(path, "/dev/console") ||
+	    darwin_streq(path, "/dev/tty"))
+		return (DARWIN_OF_CONSOLE);
+	if (darwin_streq(path, "/dev/random") ||
+	    darwin_streq(path, "/dev/urandom"))
+		return (DARWIN_OF_RANDOM);
+	return (DARWIN_OF_FREE);
 }
 
 /*

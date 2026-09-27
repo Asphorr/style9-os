@@ -106,6 +106,8 @@
 #define	DARWIN_SYS_getrusage	117
 #define	DARWIN_SYS_utimes	138
 #define	DARWIN_SYS_futimes	139
+#define	DARWIN_SYS_getentropy	500
+#define	DARWIN_GETENTROPY_MAX	256	/* bytes one call may ask for */
 
 /*
  * struct statfs as a 64-bit-inode program sees it (<sys/mount.h>), 2168

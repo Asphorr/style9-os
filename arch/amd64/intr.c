@@ -22,6 +22,7 @@
 #include "pmm.h"
 #include "port.h"
 #include "port_internal.h"
+#include "random.h"
 #include "sched.h"
 #include "smap.h"
 #include "spinlock.h"
@@ -207,6 +208,9 @@ intr_dispatch(struct trapframe *tf)
 		intr_panic(tf);
 		/* NOTREACHED */
 	}
+
+	/* When a device or a timer interrupts is worth a little entropy. */
+	random_intr(tf->tf_trapno, tf->tf_rip);
 
 	if (tf->tf_trapno < 48) {
 		irq = (unsigned int)(tf->tf_trapno - 32);

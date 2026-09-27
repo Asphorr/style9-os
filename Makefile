@@ -152,6 +152,7 @@ OBJS	= \
 	$(OBJDIR)/sched.o	\
 	$(OBJDIR)/tsc.o		\
 	$(OBJDIR)/clock.o	\
+	$(OBJDIR)/random.o	\
 	$(OBJDIR)/shell.o	\
 	$(OBJDIR)/cmds.o	\
 	$(OBJDIR)/stress.o	\
@@ -209,6 +210,7 @@ OBJS	= \
 	$(OBJDIR)/filewrite_macho.o \
 	$(OBJDIR)/lockprobe_macho.o \
 	$(OBJDIR)/cpuprobe_macho.o \
+	$(OBJDIR)/randprobe_macho.o \
 	$(OBJDIR)/ttyprobe_macho.o \
 	$(OBJDIR)/gstty_macho.o \
 	$(OBJDIR)/gmkdir_macho.o \
@@ -561,6 +563,15 @@ $(OBJDIR)/cpuprobe.dwn.o: $(USER_DIR)/cpuprobe.c | $(OBJDIR)
 	$(DARWIN_CC) $(DARWIN_CFLAGS) -c $< -o $@
 
 $(OBJDIR)/cpuprobe.macho: $(OBJDIR)/cpuprobe.dwn.o $(OBJDIR)/libSystem.B.dylib
+	$(DARWIN_LD) $(DARWIN_LDF) -o $@ $< -L$(OBJDIR) -lSystem.B -e _entry \
+	    -pagezero_size $(DYLDHELLO_BASE)
+
+# randprobe (random-number probe): the same shape, for /dev/urandom,
+# /dev/random, getentropy and arc4random -- spread, limits, fork.
+$(OBJDIR)/randprobe.dwn.o: $(USER_DIR)/randprobe.c | $(OBJDIR)
+	$(DARWIN_CC) $(DARWIN_CFLAGS) -c $< -o $@
+
+$(OBJDIR)/randprobe.macho: $(OBJDIR)/randprobe.dwn.o $(OBJDIR)/libSystem.B.dylib
 	$(DARWIN_LD) $(DARWIN_LDF) -o $@ $< -L$(OBJDIR) -lSystem.B -e _entry \
 	    -pagezero_size $(DYLDHELLO_BASE)
 

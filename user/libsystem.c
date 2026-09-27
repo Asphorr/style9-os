@@ -2293,18 +2293,19 @@ fscanf(FILE *fp, const char *fmt, ...)
 int	__mb_cur_max = 1;		/* C locale: single-byte encoding */
 
 /*
- * isatty: the fs_fstat backchannel reports a console fd as
- * DARWIN_FDSTAT_CHR, which counts as a tty; files, pipes and bad fds do
- * not.  This is what puts a no-argument dash into interactive mode.
+ * isatty: a terminal is what answers TIOCGETA, as Apple's libc decides
+ * it.  /dev/null and /dev/random are character devices but not terminals;
+ * they, files and pipes answer ENOTTY.  This is what puts a no-argument
+ * dash into interactive mode.
  */
+int	tcgetattr(int fd, void *termios_p);
+
 int
 isatty(int fd)
 {
-	struct s9_fdstat	ds;
+	unsigned char	tio[72];		/* struct termios */
 
-	if (bsd_call(0x2A000005, fd, (long)&ds, 0) < 0)
-		return (0);			/* bad fd -> not a tty   */
-	return (ds.fds_kind == 1);		/* DARWIN_FDSTAT_CHR -> tty */
+	return (tcgetattr(fd, tio) == 0);
 }
 
 char *
@@ -6629,23 +6630,67 @@ random(void)
 	return ((long)((x * 0x2545F4914F6CDD1DULL) >> 33));
 }
 
-/* Seeded from the TSC, the time of day and the pid. */
+/*
+ * getentropy(2): up to 256 bytes from the kernel's generator, which
+ * never blocks.
+ */
+int
+getentropy(void *buf, size_t n)
+{
+
+	return ((int)bsd_call_e(0x20001F4, (long)buf, (long)n, 0));
+}
+
+/* Seeded from the kernel's generator, as Apple's from /dev/random. */
 void
 srandomdev(void)
 {
-	struct s9_timeval	tv;
-	uint32_t		hi;
-	uint32_t		lo;
 
-	__asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
-	tv.tv_sec  = 0;
-	tv.tv_usec = 0;
-	(void)gettimeofday(&tv, NULL);
-	random_state ^= ((uint64_t)hi << 32 | lo) ^
-	    ((uint64_t)tv.tv_sec << 20) ^ (uint64_t)tv.tv_usec ^
-	    ((uint64_t)getpid() << 40);
+	(void)getentropy(&random_state, sizeof(random_state));
 	if (random_state == 0)
 		random_state = 1;
+}
+
+/*
+ * arc4random(3): straight from the kernel, one call a request.  Apple's
+ * keeps a ChaCha20 state in the process; this has no state to reseed
+ * after a fork, and costs a syscall.
+ */
+void
+arc4random_buf(void *buf, size_t n)
+{
+	uint8_t	*p;
+	size_t	 take;
+
+	for (p = buf; n > 0; p += take, n -= take) {
+		take = n < 256 ? n : 256;
+		(void)getentropy(p, take);
+	}
+}
+
+uint32_t
+arc4random(void)
+{
+	uint32_t	v;
+
+	arc4random_buf(&v, sizeof(v));
+	return (v);
+}
+
+/* Uniform below `bound`: draws under 2**32 % bound would favour some. */
+uint32_t
+arc4random_uniform(uint32_t bound)
+{
+	uint32_t	min;
+	uint32_t	v;
+
+	if (bound < 2)
+		return (0);
+	min = (uint32_t)-bound % bound;
+	do
+		v = arc4random();
+	while (v < min);
+	return (v % bound);
 }
 
 /* No host UUID is kept. */
