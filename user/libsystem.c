@@ -6374,11 +6374,9 @@ fstatfs_inode64(int fd, void *buf)
 
 /*
  * What the volume cannot do yet, said so: no whole-file locks (flock), no
- * filesystem controls (fsctl), no symbolic links, no setting of times.
- * sqlite3 locks with fcntl ranges, or with a lock directory, not flock.
+ * filesystem controls (fsctl), no symbolic links.  sqlite3 locks with
+ * fcntl ranges, or with a lock directory, not flock.
  */
-#define	DARWIN_ENOSYS	78
-
 int
 flock(int fd, int op)
 {
@@ -6416,20 +6414,14 @@ int
 utimes(const char *path, const void *times)
 {
 
-	(void)path;
-	(void)times;
-	g_errno = DARWIN_ENOSYS;
-	return (-1);
+	return ((int)bsd_call_e(0x200008A, (long)path, (long)times, 0));
 }
 
 int
 futimes(int fd, const void *times)
 {
 
-	(void)fd;
-	(void)times;
-	g_errno = DARWIN_ENOSYS;
-	return (-1);
+	return ((int)bsd_call_e(0x200008B, fd, (long)times, 0));
 }
 
 void

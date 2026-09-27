@@ -1274,6 +1274,13 @@ int	fs_apfs_pwrite(uint64_t id, uint64_t size, uint64_t off,
 int	fs_apfs_touch(uint64_t oid, uint64_t mtime_ns);
 
 /*
+ * utimes: set an inode's access and modification times, and its change
+ * time to `now_ns`, the same way.
+ */
+int	fs_apfs_utimes(uint64_t oid, uint64_t atime_ns, uint64_t mtime_ns,
+	    uint64_t now_ns);
+
+/*
  * Set an inode's permission bits, and its change time with them.  Only the
  * low twelve bits are the caller's: the type bits must match the directory
  * entry's type, which apfsck checks.

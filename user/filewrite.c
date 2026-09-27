@@ -38,6 +38,9 @@
  *	    /.xid, and nothing there can be written.
  *	16. A second descriptor sees the file grow through the first: read,
  *	    pread, lseek(SEEK_END) and O_APPEND all reach the new bytes.
+ *	17. utimes(2) sets both times to the microsecond and stat reads
+ *	    them back; futimes(2) with no times sets both to now; a missing
+ *	    name is ENOENT.
  *
  * Freestanding: no SDK headers, prototypes declared as <fcntl.h>/<unistd.h>
  * would alias them, entry at _entry (ld -e), relinked low like dyldhello.
@@ -47,6 +50,7 @@ typedef __UINT8_TYPE__	uint8_t;
 typedef __UINT16_TYPE__	uint16_t;
 typedef __UINT32_TYPE__	uint32_t;
 typedef __UINT64_TYPE__	uint64_t;
+typedef __INT32_TYPE__	int32_t;
 typedef __INT64_TYPE__	int64_t;
 typedef __SIZE_TYPE__	size_t;
 
@@ -88,6 +92,36 @@ struct dirent {
 extern void	*opendir(const char *path) __asm__("_opendir$INODE64");
 extern struct dirent *readdir(void *dp) __asm__("_readdir$INODE64");
 extern int	 closedir(void *dp);
+
+/* The macOS $INODE64 struct stat, 144 bytes; only the times are read. */
+struct stat {
+	int32_t		st_dev;
+	uint16_t	st_mode;
+	uint16_t	st_nlink;
+	uint64_t	st_ino;
+	uint32_t	st_uid;
+	uint32_t	st_gid;
+	int32_t		st_rdev;
+	int32_t		st_pad;
+	int64_t		st_atime;
+	int64_t		st_atimensec;
+	int64_t		st_mtime;
+	int64_t		st_mtimensec;
+	int64_t		st_rest[10];	/* ctime .. qspare */
+};
+_Static_assert(sizeof(struct stat) == 144, "the $INODE64 struct stat");
+
+struct timeval {
+	int64_t		tv_sec;
+	int32_t		tv_usec;
+	int32_t		tv_pad;
+};
+
+extern int	 stat(const char *path, struct stat *sb)
+		    __asm__("_stat$INODE64");
+extern int	 utimes(const char *path, const struct timeval tv[2]);
+extern int	 futimes(int fd, const struct timeval tv[2]);
+extern int	 gettimeofday(struct timeval *tv, void *tz);
 
 extern int	*__error(void);		/* Apple's <errno.h>: errno == *__error() */
 extern int	 open(const char *path, int flags, ...);
@@ -632,6 +666,49 @@ entry(void)
 	if (held >= 0)
 		(void)close(held);
 	(void)unlink(PATH);
+
+	/* 17. Setting the times. */
+	{
+		struct timeval	tv[2];
+		struct timeval	now;
+		struct stat	st;
+
+		tv[0].tv_sec  = 1000000000;
+		tv[0].tv_usec = 500000;
+		tv[0].tv_pad  = 0;
+		tv[1].tv_sec  = 1234567890;
+		tv[1].tv_usec = 250000;
+		tv[1].tv_pad  = 0;
+		fd = open(PATH, O_RDWR | O_CREAT | O_TRUNC, 0644);
+		if (fd < 0 || write(fd, "x", 1) != 1)
+			fail("cannot make a file to set the times of");
+		else if (utimes(PATH, tv) != 0 || stat(PATH, &st) != 0)
+			fail("utimes(2), or the stat after it, was refused");
+		else if (st.st_atime != 1000000000 ||
+		    st.st_atimensec != 500000000 ||
+		    st.st_mtime != 1234567890 ||
+		    st.st_mtimensec != 250000000)
+			fail("stat did not read back the times utimes set");
+		else if (gettimeofday(&now, NULL) != 0 ||
+		    futimes(fd, NULL) != 0 || stat(PATH, &st) != 0)
+			fail("futimes(2) with no times was refused");
+		else if (st.st_mtime < now.tv_sec - 5 ||
+		    st.st_mtime > now.tv_sec + 5 ||
+		    st.st_atime != st.st_mtime ||
+		    st.st_atimensec != st.st_mtimensec)
+			fail("futimes(2) with no times did not set both to "
+			    "now");
+		else if (utimes("/etc/no-such-file", tv) != -1 ||
+		    *__error() != ENOENT)
+			fail("utimes(2) on a missing name was not ENOENT");
+		else
+			printf("filewrite: PASS utimes sets both times to the "
+			    "microsecond and stat reads them back; futimes "
+			    "with none sets both to now\n");
+		if (fd >= 0)
+			(void)close(fd);
+		(void)unlink(PATH);
+	}
 
 	if (fails != 0) {
 		printf("filewrite: %d check(s) FAILED\n", fails);

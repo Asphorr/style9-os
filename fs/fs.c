@@ -1151,6 +1151,37 @@ fs_chmod(const char *path, uint16_t mode)
 	return (rv);
 }
 
+int
+fs_utimes(const char *path, uint64_t atime_ns, uint64_t mtime_ns)
+{
+	struct fs_apfs_statbuf	asb;
+	uint64_t		now_ns;
+	int			rv;
+
+	mutex_lock(&fs_lock);
+	if (!fs_apfs_ready()) {
+		mutex_unlock(&fs_lock);
+		return (fs_fat_ready() ? FS_E_ROFS : FS_E_NOMOUNT);
+	}
+	if (fs_readonly(path)) {
+		mutex_unlock(&fs_lock);
+		return (FS_E_ROFS);
+	}
+	rv = apfs_err(fs_apfs_stat(path, &asb));
+	if (rv != FS_E_OK) {
+		mutex_unlock(&fs_lock);
+		return (rv);
+	}
+	now_ns = (uint64_t)clock_walltime_us() * 1000ULL;
+	rv = apfs_err(fs_apfs_utimes(asb.afs_ino, atime_ns, mtime_ns, now_ns));
+	if (rv == FS_E_OK) {
+		rv = ckpt_policy();
+		fs_gen++;
+	}
+	mutex_unlock(&fs_lock);
+	return (rv);
+}
+
 static int
 stat_locked(const char *path, struct fs_statbuf *out)
 {

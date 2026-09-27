@@ -104,6 +104,8 @@
 #define	DARWIN_SYS_statfs64	345	/* statfs$INODE64  */
 #define	DARWIN_SYS_fstatfs64	346	/* fstatfs$INODE64 */
 #define	DARWIN_SYS_getrusage	117
+#define	DARWIN_SYS_utimes	138
+#define	DARWIN_SYS_futimes	139
 
 /*
  * struct statfs as a 64-bit-inode program sees it (<sys/mount.h>), 2168

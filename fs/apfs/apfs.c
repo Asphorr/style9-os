@@ -3559,16 +3559,20 @@ inode_where(uint64_t oid, uint64_t *bno_out)
 }
 
 /*
- * Amend an inode's fixed part: a touch moves the times, a chmod the
- * permission bits and the change time.  The mode is amended in its low bits
- * only: apfsck checks an inode's type against the directory entry naming it
- * ("file mode doesn't match dentry type"), and chmod(2) leaves the type.
+ * Amend an inode's fixed part: a write moves the modification time, a chmod
+ * the permission bits, utimes the access and modification times; every
+ * amendment sets the change time to `now`.  The mode is amended in its low
+ * bits only: apfsck checks an inode's type against the directory entry
+ * naming it ("file mode doesn't match dentry type"), and chmod(2) leaves
+ * the type.
  */
-#define	INODE_AMEND_TIME	0x1u	/* modification and change times   */
-#define	INODE_AMEND_MODE	0x2u	/* permission bits, and change time */
+#define	INODE_AMEND_MTIME	0x1u	/* modification time to `mtime`   */
+#define	INODE_AMEND_MODE	0x2u	/* permission bits to `perm`      */
+#define	INODE_AMEND_ATIME	0x4u	/* access time to `atime`         */
 
 static int
-inode_amend(uint64_t oid, uint32_t what, uint64_t ns, uint16_t perm)
+inode_amend(uint64_t oid, uint32_t what, uint64_t now, uint16_t perm,
+    uint64_t atime, uint64_t mtime)
 {
 	struct btree_layout	 bl;
 	struct apfs_inode_val	*iv;
@@ -3621,12 +3625,14 @@ inode_amend(uint64_t oid, uint32_t what, uint64_t ns, uint16_t perm)
 			goto out;
 		}
 		iv = (struct apfs_inode_val *)(bl.bl_vals - voff);
-		if ((what & INODE_AMEND_TIME) != 0)
-			iv->ai_mod_time = ns;
+		if ((what & INODE_AMEND_MTIME) != 0)
+			iv->ai_mod_time = mtime;
+		if ((what & INODE_AMEND_ATIME) != 0)
+			iv->ai_access_time = atime;
 		if ((what & INODE_AMEND_MODE) != 0)
 			iv->ai_mode = (uint16_t)((iv->ai_mode & APFS_S_IFMT) |
 			    (perm & 07777u));
-		iv->ai_change_time = ns;
+		iv->ai_change_time = now;
 		rv = FS_APFS_E_OK;
 		break;
 	}
@@ -3679,7 +3685,16 @@ int
 fs_apfs_touch(uint64_t oid, uint64_t mtime_ns)
 {
 
-	return (inode_amend(oid, INODE_AMEND_TIME, mtime_ns, 0));
+	return (inode_amend(oid, INODE_AMEND_MTIME, mtime_ns, 0, 0, mtime_ns));
+}
+
+int
+fs_apfs_utimes(uint64_t oid, uint64_t atime_ns, uint64_t mtime_ns,
+    uint64_t now_ns)
+{
+
+	return (inode_amend(oid, INODE_AMEND_ATIME | INODE_AMEND_MTIME, now_ns,
+	    0, atime_ns, mtime_ns));
 }
 
 /*
@@ -3692,7 +3707,7 @@ int
 fs_apfs_chmod(uint64_t oid, uint16_t perm, uint64_t now_ns)
 {
 
-	return (inode_amend(oid, INODE_AMEND_MODE, now_ns, perm));
+	return (inode_amend(oid, INODE_AMEND_MODE, now_ns, perm, 0, 0));
 }
 
 /* ---- growing -------------------------------------------------------------- */

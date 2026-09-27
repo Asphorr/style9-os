@@ -623,6 +623,34 @@ darwin_path_dup(const char *path)
 }
 
 /*
+ * The path descriptor `fd` was opened by, into `out`: 0, or the errno.  With
+ * no vnodes this is how fchmod and futimes find their file.  A pipe, the
+ * console or a built-in has none: EINVAL.
+ */
+static int
+darwin_fd_path(struct task *t, int fd, char *out, size_t cap)
+{
+	struct darwin_ofile	*of;
+	size_t			 n;
+
+	if (fd < 0 || fd >= DARWIN_NOFILE)
+		return (DARWIN_EBADF);
+	of = &t->t_darwin_files[fd];
+	if (of->of_type == DARWIN_OF_FREE)
+		return (DARWIN_EBADF);
+	if ((of->of_type != DARWIN_OF_FILE && of->of_type != DARWIN_OF_DIR) ||
+	    of->of_path == NULL)
+		return (DARWIN_EINVAL);
+	for (n = 0; of->of_path[n] != '\0'; n++) {
+		if (n + 1 >= cap)
+			return (DARWIN_ENAMETOOLONG);
+		out[n] = of->of_path[n];
+	}
+	out[n] = '\0';
+	return (0);
+}
+
+/*
  * The cursor of an open file description.  POSIX gives a descriptor and
  * every copy of it -- dup(2), dup2(2), F_DUPFD, fork(2) -- one offset, so
  * what a copy writes lands after what the original wrote (`2>&1`, a
@@ -4332,35 +4360,17 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 	case DARWIN_SYS_fchmod: {
 		char			 path[DARWIN_PATH_MAX];
 		char			 raw[DARWIN_PATH_MAX];
-		struct darwin_ofile	*of;
 		struct task		*t;
 		long			 len;
 		uint16_t		 mode;
 		int			 rv;
-		int			 fd;
 
 		t = current_thread->th_task;
 		if (nr == DARWIN_SYS_fchmod) {
-			/*
-			 * No vnodes: an fd is chmod'ed by the path it was
-			 * opened by.  A pipe, the console or a built-in has
-			 * none: EINVAL.
-			 */
-			fd = (int)f->sf_arg0;
-			if (fd < 0 || fd >= DARWIN_NOFILE)
-				return (darwin_err(f, DARWIN_EBADF));
-			of = &t->t_darwin_files[fd];
-			if ((of->of_type != DARWIN_OF_FILE &&
-			    of->of_type != DARWIN_OF_DIR) ||
-			    of->of_path == NULL)
-				return (darwin_err(f, DARWIN_EINVAL));
-			for (len = 0; of->of_path[len] != '\0'; len++) {
-				if (len >= (long)sizeof(path) - 1)
-					return (darwin_err(f,
-					    DARWIN_ENAMETOOLONG));
-				path[len] = of->of_path[len];
-			}
-			path[len] = '\0';
+			rv = darwin_fd_path(t, (int)f->sf_arg0, path,
+			    sizeof(path));
+			if (rv != 0)
+				return (darwin_err(f, rv));
 			mode = (uint16_t)((uint32_t)f->sf_arg1 & 07777u);
 		} else {
 			len = syscall_copyin_str((const char *)f->sf_arg0, raw,
@@ -4381,6 +4391,60 @@ darwin_unix(struct syscall_frame *f, uint32_t nr)
 		}
 		kprintf("darwin: UNIX chmod('%s') -- the mode is %04o now\n",
 		    path, (unsigned)mode);
+		return (darwin_ok(f, 0));
+	}
+	case DARWIN_SYS_utimes:
+	case DARWIN_SYS_futimes: {
+		char			 path[DARWIN_PATH_MAX];
+		char			 raw[DARWIN_PATH_MAX];
+		struct darwin_timeval	 tv[2];
+		struct task		*t;
+		uint64_t		 ns[2];
+		int			 rv;
+		int			 i;
+
+		t = current_thread->th_task;
+		if (nr == DARWIN_SYS_futimes) {
+			rv = darwin_fd_path(t, (int)f->sf_arg0, path,
+			    sizeof(path));
+			if (rv != 0)
+				return (darwin_err(f, rv));
+		} else {
+			if (syscall_copyin_str((const char *)f->sf_arg0, raw,
+			    sizeof(raw)) < 0)
+				return (darwin_err(f, DARWIN_EFAULT));
+			if (darwin_path_resolve(t, raw, path,
+			    sizeof(path)) != 0)
+				return (darwin_err(f, DARWIN_ENAMETOOLONG));
+		}
+
+		/* No times: both now.  Else [0] is access, [1] modification. */
+		if (f->sf_arg1 == 0) {
+			ns[0] = (uint64_t)clock_walltime_us() * 1000ULL;
+			ns[1] = ns[0];
+		} else {
+			if (syscall_copyin(tv, (const void *)f->sf_arg1,
+			    sizeof(tv)) != 0)
+				return (darwin_err(f, DARWIN_EFAULT));
+			/* APFS keeps unsigned nanoseconds since the epoch. */
+			for (i = 0; i < 2; i++) {
+				if (tv[i].tv_sec < 0 ||
+				    tv[i].tv_sec > (int64_t)(UINT64_MAX /
+				    1000000000ULL) - 1 ||
+				    tv[i].tv_usec < 0 ||
+				    tv[i].tv_usec >= 1000000)
+					return (darwin_err(f, DARWIN_EINVAL));
+				ns[i] = (uint64_t)tv[i].tv_sec * 1000000000ULL +
+				    (uint64_t)tv[i].tv_usec * 1000ULL;
+			}
+		}
+
+		rv = fs_utimes(path, ns[0], ns[1]);
+		if (rv != FS_E_OK) {
+			kprintf("darwin: utimes('%s') refused (rv=%d)\n",
+			    path, rv);
+			return (darwin_err(f, darwin_fs_errno(rv)));
+		}
 		return (darwin_ok(f, 0));
 	}
 	case DARWIN_SYS_ioctl: {

@@ -316,6 +316,14 @@ int		fs_rename(const char *opath, const char *npath);
  */
 int		fs_chmod(const char *path, uint16_t mode);
 
+/*
+ * fs_utimes: set the access and modification times of an existing name,
+ * in nanoseconds since the epoch; the change time becomes now.  FAT
+ * answers FS_E_ROFS, as it is read-only here.
+ */
+int		fs_utimes(const char *path, uint64_t atime_ns,
+		    uint64_t mtime_ns);
+
 /* Metadata for a path.  Returns FS_E_OK and fills *out, or a negative FS_E_*. */
 int		fs_stat(const char *path, struct fs_statbuf *out);
 
