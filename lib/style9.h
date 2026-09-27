@@ -68,6 +68,7 @@ typedef long long		int64_t;
 #define	SYS_SPAWN_RETURNS_TASKPORT 26
 #define	SYS_SPAWN_ARGS		27
 #define	SYS_CONS_FEED		28
+#define	SYS_MSG_SEND_TIMED	29
 
 #define	SYS_E_NOSYS		(-1)
 #define	SYS_E_FAULT		(-2)
@@ -243,6 +244,7 @@ typedef uint32_t		mach_port_name_t;
 #define	MACH_E_TOOSMALL			7
 #define	MACH_E_NOMEM			8
 #define	MACH_E_TIMEOUT			9
+#define	MACH_E_INTR			10
 
 #define	MACH_TIMEOUT_NONE		((uint64_t)0)
 #define	MACH_TIMEOUT_FOREVER		((uint64_t)~0ull)
@@ -434,6 +436,8 @@ struct bootstrap_status_reply {
 mach_port_name_t mach_port_allocate(uint8_t rights);
 int		mach_port_deallocate(mach_port_name_t name);
 int		mach_msg_send(const struct mach_msg_header *msg);
+int		mach_msg_send_timed(const struct mach_msg_header *msg,
+		    uint64_t timeout_ms);
 int		mach_msg_recv(mach_port_name_t name,
 		    struct mach_msg_header *buf, size_t buf_size);
 int		mach_msg_recv_timed(mach_port_name_t name,

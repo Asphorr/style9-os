@@ -84,6 +84,7 @@ thread_adopt_current(struct task *t, const char *name)
 	th->th_wake_hog        = NULL;
 	th->th_wake_qlen       = 0;
 	th->th_trusted_send    = false;
+	th->th_kernel_send     = false;
 	th->th_wake_deadline_ms = 0;
 	th->th_timed_out       = 0;
 	th->th_timed_link      = NULL;
@@ -196,6 +197,7 @@ thread_create(struct task *t, void (*entry)(void *), void *arg,
 	th->th_wake_hog          = NULL;
 	th->th_wake_qlen         = 0;
 	th->th_trusted_send      = false;
+	th->th_kernel_send       = false;
 	th->th_wake_deadline_ms  = 0;
 	th->th_timed_out         = 0;
 	th->th_timed_link        = NULL;

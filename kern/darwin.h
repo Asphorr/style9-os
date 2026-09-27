@@ -518,12 +518,31 @@ struct darwin_uname {
 #define	DARWIN_MACH_SEND_INVALID_DATA	0x10000002
 #define	DARWIN_MACH_SEND_INVALID_DEST	0x10000003
 #define	DARWIN_MACH_SEND_TIMED_OUT	0x10000004
+#define	DARWIN_MACH_SEND_INTERRUPTED	0x10000007
 #define	DARWIN_MACH_SEND_NO_BUFFER	0x1000000d
 #define	DARWIN_MACH_SEND_INVALID_TYPE	0x1000000f
 #define	DARWIN_MACH_RCV_INVALID_NAME	0x10004002
 #define	DARWIN_MACH_RCV_TIMED_OUT	0x10004003
 #define	DARWIN_MACH_RCV_TOO_LARGE	0x10004004
-#define	DARWIN_MACH_RCV_INVALID_DATA	0x10004005
+#define	DARWIN_MACH_RCV_INTERRUPTED	0x10004005
+#define	DARWIN_MACH_RCV_INVALID_DATA	0x10004008
+#define	DARWIN_MACH_RCV_PORT_DIED	0x10004009
+#define	DARWIN_MACH_RCV_INVALID_TRAILER	0x1000400f
+
+/*
+ * The trailer a receive asks for, in the option's top byte: a type, of
+ * which only format 0 exists, and how many elements past the basic 8
+ * bytes.  Only the basic trailer is given.
+ */
+#define	DARWIN_MACH_RCV_TRAILER_TYPE(o)		(((o) >> 28) & 0xFu)
+#define	DARWIN_MACH_RCV_TRAILER_ELEMENTS(o)	(((o) >> 24) & 0xFu)
+
+struct darwin_mach_trailer {
+	uint32_t	msgh_trailer_type;	/* MACH_MSG_TRAILER_FORMAT_0 */
+	uint32_t	msgh_trailer_size;
+};
+_Static_assert(sizeof(struct darwin_mach_trailer) == 8,
+    "mach_msg_trailer_t is 8 bytes");
 
 struct syscall_frame;
 struct task;

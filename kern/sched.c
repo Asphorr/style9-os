@@ -585,8 +585,12 @@ sched_nap_ms(uint64_t ms)
 	self->th_timed_out = 0;
 }
 
-void
-thread_block_release(int reason, void *target, struct spinlock *external)
+/*
+ * The park behind thread_block_release and thread_block_release_intr.  A
+ * kill retires the thread here, or, with `intr`, returns false instead.
+ */
+static bool
+block_release(int reason, void *target, struct spinlock *external, bool intr)
 {
 	struct thread	*self, *next;
 
@@ -634,6 +638,8 @@ thread_block_release(int reason, void *target, struct spinlock *external)
 		spin_unlock(&sched_lock);
 		if (external != NULL)
 			spin_unlock(external);
+		if (intr)
+			return (false);
 		thread_exit();
 		/* NOTREACHED */
 	}
@@ -650,7 +656,7 @@ thread_block_release(int reason, void *target, struct spinlock *external)
 		if (external != NULL)
 			spin_unlock(external);
 		spin_unlock(&sched_lock);
-		return;
+		return (true);
 	}
 
 	spin_lock(&self->th_lock);
@@ -732,9 +738,26 @@ thread_block_release(int reason, void *target, struct spinlock *external)
 	 */
 	if (current_thread->th_task != kernel_task &&
 	    current_thread->th_mutex_depth == 0 &&
-	    task_kill_pending(current_thread->th_task))
+	    task_kill_pending(current_thread->th_task)) {
+		if (intr)
+			return (false);
 		thread_exit();
-	/* NOTREACHED if killed */
+	}
+	return (true);
+}
+
+void
+thread_block_release(int reason, void *target, struct spinlock *external)
+{
+
+	(void)block_release(reason, target, external, false);
+}
+
+bool
+thread_block_release_intr(int reason, void *target, struct spinlock *external)
+{
+
+	return (block_release(reason, target, external, true));
 }
 
 void

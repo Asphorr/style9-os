@@ -85,6 +85,7 @@ port_create(void)
 	p->p_has_receive     = false;
 	p->p_dead        = false;
 	p->p_qlen        = 0;
+	p->p_qresv       = 0;
 	p->p_qmax        = DEFAULT_QMAX;
 	p->p_qhead       = NULL;
 	p->p_qtail       = NULL;
@@ -120,6 +121,7 @@ port_free(struct port *p)
 	    "port_free: recv waiters still parked");
 	KASSERT(p->p_send_waiters_head == NULL,
 	    "port_free: send waiters still parked");
+	KASSERT(p->p_qresv == 0, "port_free: a sender still holds a slot");
 
 	/*
 	 * Drain undelivered messages; their descriptors hold port refs and
@@ -169,6 +171,34 @@ port_ref(struct port *p, uint8_t rights)
 		p->p_refs++;
 	}
 	spin_unlock(&p->p_lock);
+}
+
+/*
+ * A ref that is no right: it keeps `p` in memory and is no sender, for a
+ * send by the receiver to its own port (MAKE_SEND, MAKE_SEND_ONCE), which
+ * must not look like the last sender leaving when it ends.
+ */
+void
+port_hold(struct port *p)
+{
+
+	spin_lock(&p->p_lock);
+	p->p_refs++;
+	spin_unlock(&p->p_lock);
+}
+
+void
+port_release(struct port *p)
+{
+	bool	last;
+
+	spin_lock(&p->p_lock);
+	KASSERT(p->p_refs > 0, "port_release: refs underflow");
+	p->p_refs--;
+	last = (p->p_refs == 0);
+	spin_unlock(&p->p_lock);
+	if (last)
+		port_free(p);
 }
 
 void
@@ -675,7 +705,8 @@ mach_msg_strerror(int code)
 	case MACH_E_NOMSG:	return ("no message available");
 	case MACH_E_TOOSMALL:	return ("receive buffer too small");
 	case MACH_E_NOMEM:	return ("out of memory");
-	case MACH_E_TIMEOUT:	return ("recv timed out");
+	case MACH_E_TIMEOUT:	return ("timed out");
+	case MACH_E_INTR:	return ("interrupted by a kill");
 	default:		return ("?");
 	}
 }

@@ -92,7 +92,9 @@
 static long	darwin_unix(struct syscall_frame *f, uint32_t nr);
 static long	darwin_mach(struct syscall_frame *f, uint32_t trap);
 static long	darwin_mach_msg(struct syscall_frame *f);
-static long	darwin_mach_msg_err(long rv, bool sending, uint32_t option);
+static long	darwin_mach_msg_err(long rv, bool sending);
+static long	darwin_mach_rcv_fixup(struct mach_msg_header *umsg,
+		    uint32_t rcv_size, mach_port_name_t rcv_name);
 static long	darwin_style9(struct syscall_frame *f, uint32_t num);
 static long	darwin_s9_map_image(struct syscall_frame *f);
 static long	darwin_s9_fs_stat(struct syscall_frame *f);
@@ -4973,19 +4975,22 @@ darwin_mach(struct syscall_frame *f, uint32_t trap)
  * Map a style9 mach_msg result -- MACH_MSG_OK / a positive MACH_E_*, or the
  * negative SYS_E_FAULT a user-range check returns -- onto the Darwin
  * mach_msg_return_t the caller reads.  `sending` selects the SEND_* vs RCV_*
- * code family.  A send never waits for queue room, so a full queue is a
- * timeout to a caller that set one and a lack of buffers to one that did not.
+ * code family.  A full queue is a timeout: a send waits for room, up to
+ * MACH_SEND_TIMEOUT's bound; NOSPACE is only KERNEL_QMAX, past which even
+ * a send-once message finds no buffer.
  */
 static long
-darwin_mach_msg_err(long rv, bool sending, uint32_t option)
+darwin_mach_msg_err(long rv, bool sending)
 {
 
 	switch (rv) {
 	case MACH_E_NAME:
 	case MACH_E_RIGHT:
-	case MACH_E_DEAD:
 		return (sending ? DARWIN_MACH_SEND_INVALID_DEST :
 		    DARWIN_MACH_RCV_INVALID_NAME);
+	case MACH_E_DEAD:
+		return (sending ? DARWIN_MACH_SEND_INVALID_DEST :
+		    DARWIN_MACH_RCV_PORT_DIED);
 	case MACH_E_TOOSMALL:
 		return (DARWIN_MACH_RCV_TOO_LARGE);
 	case MACH_E_TIMEOUT:
@@ -4993,14 +4998,84 @@ darwin_mach_msg_err(long rv, bool sending, uint32_t option)
 		return (sending ? DARWIN_MACH_SEND_TIMED_OUT :
 		    DARWIN_MACH_RCV_TIMED_OUT);
 	case MACH_E_NOSPACE:
-		if (!sending)
-			return (DARWIN_MACH_RCV_INVALID_DATA);
-		return ((option & DARWIN_MACH_SEND_TIMEOUT) != 0 ?
-		    DARWIN_MACH_SEND_TIMED_OUT : DARWIN_MACH_SEND_NO_BUFFER);
+		return (sending ? DARWIN_MACH_SEND_NO_BUFFER :
+		    DARWIN_MACH_RCV_INVALID_DATA);
+	case MACH_E_INTR:
+		return (sending ? DARWIN_MACH_SEND_INTERRUPTED :
+		    DARWIN_MACH_RCV_INTERRUPTED);
 	default:
 		return (sending ? DARWIN_MACH_SEND_INVALID_DATA :
 		    DARWIN_MACH_RCV_INVALID_DATA);
 	}
+}
+
+/*
+ * The PORT_* type an Apple receiver reads for a right that came with a
+ * message sent with disposition `disp`; the numbers are the MOVE_* ones.
+ */
+static uint8_t
+darwin_port_type(uint8_t disp)
+{
+
+	switch (disp) {
+	case MACH_MSG_TYPE_MOVE_RECEIVE:
+		return (MACH_MSG_TYPE_MOVE_RECEIVE);
+	case MACH_MSG_TYPE_MOVE_SEND:
+	case MACH_MSG_TYPE_COPY_SEND:
+	case MACH_MSG_TYPE_MAKE_SEND:
+		return (MACH_MSG_TYPE_MOVE_SEND);
+	case MACH_MSG_TYPE_MOVE_SEND_ONCE:
+	case MACH_MSG_TYPE_MAKE_SEND_ONCE:
+		return (MACH_MSG_TYPE_MOVE_SEND_ONCE);
+	default:
+		return (0);
+	}
+}
+
+/*
+ * Turn a message just received into `umsg` into what XNU's receive gives.
+ * The header the other way round: msgh_remote is the reply right, if one
+ * came, msgh_local the port received on, each disposition now the type of
+ * the right held.  For a port set that is the set's name, not the
+ * member's.  Then the basic trailer after the message, 4-byte aligned.
+ * With no room for it the answer is MACH_RCV_TOO_LARGE and the message is
+ * gone, its reply right destroyed, as XNU destroys a message too large
+ * for the buffer without MACH_RCV_LARGE.  Returns 0 or the Darwin error.
+ */
+static long
+darwin_mach_rcv_fixup(struct mach_msg_header *umsg, uint32_t rcv_size,
+    mach_port_name_t rcv_name)
+{
+	struct mach_msg_header		h;
+	struct darwin_mach_trailer	tr;
+	uint64_t			at;
+	uint8_t				remote;
+	uint8_t				local;
+
+	if (syscall_copyin(&h, umsg, sizeof(h)) != 0)
+		return (DARWIN_MACH_RCV_INVALID_DATA);
+	remote = MACH_MSGH_BITS_REMOTE(h.msgh_bits);
+	local  = MACH_MSGH_BITS_LOCAL(h.msgh_bits);
+
+	at = ((uint64_t)h.msgh_size + 3) & ~(uint64_t)3;
+	if (at + sizeof(tr) > rcv_size) {
+		if (local != 0 && h.msgh_local != MACH_PORT_NULL)
+			(void)port_deallocate(
+			    current_thread->th_task->t_port_space,
+			    h.msgh_local);
+		return (DARWIN_MACH_RCV_TOO_LARGE);
+	}
+
+	h.msgh_bits   = (h.msgh_bits & MACH_MSGH_BITS_COMPLEX) |
+	    MACH_MSGH_BITS(darwin_port_type(local), darwin_port_type(remote));
+	h.msgh_remote = local != 0 ? h.msgh_local : MACH_PORT_NULL;
+	h.msgh_local  = rcv_name;
+	tr.msgh_trailer_type = 0;
+	tr.msgh_trailer_size = sizeof(tr);
+	if (syscall_copyout(umsg, &h, sizeof(h)) != 0 ||
+	    syscall_copyout((uint8_t *)umsg + at, &tr, sizeof(tr)) != 0)
+		return (DARWIN_MACH_RCV_INVALID_DATA);
+	return (0);
 }
 
 /*
@@ -5009,12 +5084,17 @@ darwin_mach_msg_err(long rv, bool sending, uint32_t option)
  * usual registers; send_size is ignored in favour of msgh_size, and the
  * 7th (notify) is unsupported.  SEND|RCV sends, then receives into the same
  * buffer, through the syscall_msg_* helpers (range check, SMAP bracket).
- * Returns a mach_msg_return_t in %rax, carry clear.
+ * MACH_SEND_TIMEOUT and MACH_RCV_TIMEOUT bound the two waits with the one
+ * timeout.  Returns a mach_msg_return_t in %rax, carry clear.
  *
  * Only simple messages pass.  The header is Darwin's byte for byte, the
  * descriptors are not (Darwin's port descriptor is 12 bytes with the type
  * in its last byte, ours 8 with it in the first), so a complex send is
- * refused rather than misread.  No trailer follows a received message.
+ * refused rather than misread.  A received message comes back as XNU
+ * gives it, trailer and all (darwin_mach_rcv_fixup); one too large for
+ * the buffer itself stays queued, where XNU would destroy it.  Only the
+ * basic trailer is kept: one with elements (a sequence number, the
+ * sender's audit token) is refused rather than filled with guesses.
  */
 static long
 darwin_mach_msg(struct syscall_frame *f)
@@ -5040,14 +5120,23 @@ darwin_mach_msg(struct syscall_frame *f)
 			kprintf("darwin: MACH mach_msg complex send refused\n");
 			return (darwin_ok(f, DARWIN_MACH_SEND_INVALID_TYPE));
 		}
-		rv = syscall_msg_send(msg);
+		rv = syscall_msg_send_timed(msg,
+		    (option & DARWIN_MACH_SEND_TIMEOUT) != 0 ? timeout :
+		    MACH_TIMEOUT_FOREVER);
 		if (rv != MACH_MSG_OK) {
 			kprintf("darwin: MACH mach_msg send -> rv=%ld\n", rv);
-			return (darwin_ok(f,
-			    darwin_mach_msg_err(rv, true, option)));
+			return (darwin_ok(f, darwin_mach_msg_err(rv, true)));
 		}
 	}
 	if (option & DARWIN_MACH_RCV_MSG) {
+		if (DARWIN_MACH_RCV_TRAILER_TYPE(option) != 0 ||
+		    DARWIN_MACH_RCV_TRAILER_ELEMENTS(option) != 0) {
+			kprintf("darwin: MACH mach_msg asked for trailer type "
+			    "%u with %u elements; only the basic one is kept\n",
+			    DARWIN_MACH_RCV_TRAILER_TYPE(option),
+			    DARWIN_MACH_RCV_TRAILER_ELEMENTS(option));
+			return (darwin_ok(f, DARWIN_MACH_RCV_INVALID_TRAILER));
+		}
 		if (option & DARWIN_MACH_RCV_TIMEOUT)
 			rv = syscall_msg_recv_timed(rcv_name, msg, rcv_size,
 			    timeout);
@@ -5055,8 +5144,12 @@ darwin_mach_msg(struct syscall_frame *f)
 			rv = syscall_msg_recv(rcv_name, msg, rcv_size);
 		if (rv != MACH_MSG_OK) {
 			kprintf("darwin: MACH mach_msg recv -> rv=%ld\n", rv);
-			return (darwin_ok(f,
-			    darwin_mach_msg_err(rv, false, option)));
+			return (darwin_ok(f, darwin_mach_msg_err(rv, false)));
+		}
+		rv = darwin_mach_rcv_fixup(msg, rcv_size, rcv_name);
+		if (rv != 0) {
+			kprintf("darwin: MACH mach_msg recv -> 0x%lx\n", rv);
+			return (darwin_ok(f, rv));
 		}
 	}
 

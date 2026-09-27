@@ -38,6 +38,8 @@ static long	sys_yield(void);
 static long	sys_port_alloc(uint8_t rights);
 static long	sys_port_dealloc(mach_port_name_t name);
 static long	sys_msg_send(const struct mach_msg_header *umsg);
+static long	sys_msg_send_timed(const struct mach_msg_header *umsg,
+		    uint64_t timeout_ms);
 static long	sys_msg_recv(mach_port_name_t name,
 		    struct mach_msg_header *ubuf, size_t ubuf_size);
 static long	sys_msg_recv_timed(mach_port_name_t name,
@@ -140,6 +142,10 @@ syscall_dispatch_body(struct syscall_frame *f)
 	case SYS_MSG_SEND:
 		return (sys_msg_send(
 		    (const struct mach_msg_header *)f->sf_arg0));
+	case SYS_MSG_SEND_TIMED:
+		return (sys_msg_send_timed(
+		    (const struct mach_msg_header *)f->sf_arg0,
+		    (uint64_t)f->sf_arg1));
 	case SYS_MSG_RECV:
 		return (sys_msg_recv((mach_port_name_t)f->sf_arg0,
 		    (struct mach_msg_header *)f->sf_arg1,
@@ -631,6 +637,14 @@ sys_port_dealloc(mach_port_name_t name)
 long
 syscall_msg_send(const struct mach_msg_header *umsg)
 {
+
+	return (syscall_msg_send_timed(umsg, MACH_TIMEOUT_FOREVER));
+}
+
+long
+syscall_msg_send_timed(const struct mach_msg_header *umsg,
+    uint64_t timeout_ms)
+{
 	uint32_t	msgh_size;
 
 	if (!user_range_ok((uint64_t)(uintptr_t)umsg,
@@ -648,8 +662,8 @@ syscall_msg_send(const struct mach_msg_header *umsg)
 	if (!user_range_ok((uint64_t)(uintptr_t)umsg, msgh_size))
 		return (SYS_E_FAULT);
 
-	return ((long)mach_msg_send(current_thread->th_task->t_port_space,
-	    umsg));
+	return ((long)mach_msg_send_timed(
+	    current_thread->th_task->t_port_space, umsg, timeout_ms));
 }
 
 static long
@@ -657,6 +671,13 @@ sys_msg_send(const struct mach_msg_header *umsg)
 {
 
 	return (syscall_msg_send(umsg));
+}
+
+static long
+sys_msg_send_timed(const struct mach_msg_header *umsg, uint64_t timeout_ms)
+{
+
+	return (syscall_msg_send_timed(umsg, timeout_ms));
 }
 
 long

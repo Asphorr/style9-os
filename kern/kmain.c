@@ -399,6 +399,7 @@ kmain(uint32_t mb_magic, uint32_t mb_info)
 	 * test arranges the corruption rather than racing for it.
 	 */
 	port_wait_selftest();
+	port_send_selftest();
 
 	/*
 	 * The kill-vs-lock scenes: both spawn a task and kill it, one in the

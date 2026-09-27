@@ -11,6 +11,7 @@
 
 #include "bootstrap.h"
 #include "clock.h"
+#include "host.h"
 #include "kmem.h"
 #include "kprintf.h"
 #include "panic.h"
@@ -65,11 +66,16 @@ msg_validate(const struct mach_msg_header *h)
 }
 
 /*
- * Append a message.  If a thread is parked on this port or on its port
- * set, hand one out through *waiter_out for the caller to wake after our
- * locks are dropped (thread_wake takes sched_lock; lock order is port ->
- * sched).  Set waiters go first: the usual shape is one server parked on
- * a set of many ports.
+ * Append a message.  With `reserved` it fills the slot msg_reserve held
+ * for it, which is given up whether or not the port has died; without,
+ * it is the kernel's own (a notification, an exception) and held to
+ * KERNEL_QMAX only.
+ *
+ * If a thread is parked on this port or on its port set, hand one out
+ * through *waiter_out for the caller to wake after our locks are dropped
+ * (thread_wake takes sched_lock; lock order is port -> sched).  Set
+ * waiters go first: the usual shape is one server parked on a set of many
+ * ports.
  *
  * The waiter comes out held (thread_hold, taken under the list's lock
  * while it is provably alive): before the caller's wake it can be killed,
@@ -77,7 +83,8 @@ msg_validate(const struct mach_msg_header *h)
  * owes a thread_unhold after its thread_wake.
  */
 static int
-msg_enqueue(struct port *p, struct port_msg *m, struct thread **waiter_out)
+msg_enqueue(struct port *p, struct port_msg *m, bool reserved,
+    struct thread **waiter_out)
 {
 	struct thread	*w = NULL;
 	struct port_set	*set;
@@ -85,11 +92,15 @@ msg_enqueue(struct port *p, struct port_msg *m, struct thread **waiter_out)
 	*waiter_out = NULL;
 
 	spin_lock(&p->p_lock);
+	if (reserved) {
+		KASSERT(p->p_qresv > 0, "msg_enqueue: no slot was reserved");
+		p->p_qresv--;
+	}
 	if (p->p_dead) {
 		spin_unlock(&p->p_lock);
 		return (MACH_E_DEAD);
 	}
-	if (p->p_qlen >= p->p_qmax) {
+	if (!reserved && p->p_qlen + p->p_qresv >= KERNEL_QMAX) {
 		spin_unlock(&p->p_lock);
 		return (MACH_E_NOSPACE);
 	}
@@ -234,6 +245,142 @@ port_unbind_send_waiter_locked(struct port *p, struct thread *th)
 	}
 }
 
+/*
+ * Hold a slot on `p` for a message about to be built, before anything of
+ * it moves, so a send that cannot have one leaves the sender as it was.
+ * `always` (a send-once right, a kernel object's reply) is held to
+ * KERNEL_QMAX and never waits.  Otherwise wait for room up to
+ * `timeout_ms` on the send-waiter list, which receives pop a thread at a
+ * time.  The caller holds a ref on `p`.  The wait gives way to a kill,
+ * MACH_E_INTR: the caller has things to give back, which a thread retired
+ * in the park would take with it.
+ */
+static int
+msg_reserve(struct port *p, bool always, uint64_t timeout_ms)
+{
+	struct thread	*self;
+	struct thread	*next;
+	uint64_t	 deadline;
+	bool		 live;
+	int		 rv;
+
+	deadline = 0;
+	if (timeout_ms != MACH_TIMEOUT_FOREVER &&
+	    timeout_ms != MACH_TIMEOUT_NONE)
+		deadline = clock_uptime_ms() + timeout_ms;
+	self = current_thread;
+
+	spin_lock(&p->p_lock);
+	for (;;) {
+		if (p->p_dead) {
+			rv = MACH_E_DEAD;
+			break;
+		}
+		if (p->p_qlen + p->p_qresv <
+		    (always ? KERNEL_QMAX : p->p_qmax)) {
+			p->p_qresv++;
+			spin_unlock(&p->p_lock);
+			return (MACH_MSG_OK);
+		}
+		if (always) {
+			rv = MACH_E_NOSPACE;
+			break;
+		}
+		if (timeout_ms == MACH_TIMEOUT_NONE ||
+		    (deadline != 0 && clock_uptime_ms() >= deadline)) {
+			rv = MACH_E_TIMEOUT;
+			break;
+		}
+
+		KASSERT(self->th_wait_link == NULL &&
+		    p->p_send_waiters_tail != self,
+		    "send: already on this port's send-waiter list");
+		if (p->p_send_waiters_tail == NULL) {
+			p->p_send_waiters_head = self;
+			p->p_send_waiters_tail = self;
+		} else {
+			p->p_send_waiters_tail->th_wait_link = self;
+			p->p_send_waiters_tail = self;
+		}
+		thread_wait_note(self, &p->p_send_waiters_head,
+		    &p->p_send_waiters_tail, &p->p_lock);
+		self->th_timed_out = 0;
+		if (deadline != 0) {
+			self->th_wake_deadline_ms = deadline;
+			sched_add_timed_waiter(self);
+		}
+		live = thread_block_release_intr(THREAD_BLOCK_PORT, p,
+		    &p->p_lock);
+
+		/* Off both lists, whatever ended the park, as in the recv. */
+		sched_remove_timed_waiter(self);
+		self->th_timed_out = 0;
+		spin_lock(&p->p_lock);
+		port_unbind_send_waiter_locked(p, self);
+		thread_wait_forget(self);
+		if (!live) {
+			rv = MACH_E_INTR;
+			break;
+		}
+	}
+
+	/*
+	 * Leaving without a slot.  A receive that freed one may have popped
+	 * this thread to take it: pass the wake on, or the next sender
+	 * sleeps with room there.
+	 */
+	next = NULL;
+	if (p->p_qlen + p->p_qresv < p->p_qmax)
+		next = port_extract_send_waiter_locked(p);
+	spin_unlock(&p->p_lock);
+	if (next != NULL) {
+		thread_wake(next);
+		thread_unhold(next);
+	}
+	return (rv);
+}
+
+/* Give back a slot msg_reserve held, for a send that failed after it. */
+static void
+msg_unreserve(struct port *p)
+{
+	struct thread	*w;
+
+	spin_lock(&p->p_lock);
+	KASSERT(p->p_qresv > 0, "msg_unreserve: no slot was reserved");
+	p->p_qresv--;
+	w = port_extract_send_waiter_locked(p);
+	spin_unlock(&p->p_lock);
+	if (w != NULL) {
+		thread_wake(w);
+		thread_unhold(w);
+	}
+}
+
+/*
+ * The ref a send holds on its destination: of the kind of the right it
+ * names the port by, or with `kind` 0 (MAKE_*) a hold.
+ */
+static void
+dest_ref(struct port *p, uint8_t kind)
+{
+
+	if (kind == 0)
+		port_hold(p);
+	else
+		port_ref(p, kind);
+}
+
+static void
+dest_unref(struct port *p, uint8_t kind)
+{
+
+	if (kind == 0)
+		port_release(p);
+	else
+		port_deref(p, kind);
+}
+
 static struct port_msg *
 msg_dequeue(struct port *p, struct thread **send_waiter_out)
 {
@@ -307,8 +454,9 @@ pd_ool_drop(struct port_pending_desc *pd)
  * port cannot be torn down under the send.  The caller owns that ref;
  * this does not drop it.
  *
- * Best-effort: a dead notify port or a full queue drops the notification.
- * There is no dead-letter backstop.
+ * p_qmax does not apply (KERNEL_QMAX): a notification is one-shot, and
+ * whoever can fill the queue could otherwise suppress it for good.  A dead
+ * notify port drops it; there is no dead-letter backstop.
  */
 int
 port_notify_enqueue(struct port *notify_port, uint32_t notify_id,
@@ -342,7 +490,7 @@ port_notify_enqueue(struct port *notify_port, uint32_t notify_id,
 	nh->nh_msgid         = user_tag;
 	nh->nh_pad           = 0;
 
-	rv = msg_enqueue(notify_port, m, &waiter);
+	rv = msg_enqueue(notify_port, m, false, &waiter);
 	if (rv != MACH_MSG_OK) {
 		kfree(m);
 		return (rv);
@@ -422,7 +570,7 @@ port_exception_post(struct port *port, uint32_t trapno, uint32_t err,
 	eh->eh_cr2           = cr2;
 	eh->eh_task_id       = task_id;
 
-	rv = msg_enqueue(port, m, &waiter);
+	rv = msg_enqueue(port, m, false, &waiter);
 	if (rv != MACH_MSG_OK) {
 		free_pending_descs(descs, m->m_ndescs);
 		kfree(m);
@@ -859,6 +1007,14 @@ mach_msg_send_trusted(struct port_space *from,
 int
 mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 {
+
+	return (mach_msg_send_timed(from, umsg, MACH_TIMEOUT_FOREVER));
+}
+
+int
+mach_msg_send_timed(struct port_space *from,
+    const struct mach_msg_header *umsg, uint64_t timeout_ms)
+{
 	struct mach_msg_header	 hdr_copy;
 	const struct mach_msg_header *msg;
 	int			 rv;
@@ -869,8 +1025,12 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 	size_t			 i, hdrs_off;
 	uint8_t			 remote_disp, local_disp;
 	uint8_t			 remote_right;
+	uint8_t			 need_right;
+	uint8_t			 dest_kind;
 	bool			 has_local;
 	bool			 complex;
+	bool			 kernel_send;
+	bool			 reserved = false;
 	uint8_t			 dummy_rights;
 
 	if (umsg == NULL)
@@ -906,13 +1066,27 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 	has_local   = (hdr_copy.msgh_local != MACH_PORT_NULL) &&
 	    (local_disp != 0);
 
+	/*
+	 * The right the destination is named by.  MAKE_* is the receiver
+	 * sending to its own port, through a right made for the message.
+	 */
 	switch (remote_disp) {
 	case MACH_MSG_TYPE_COPY_SEND:
 	case MACH_MSG_TYPE_MOVE_SEND:
 		remote_right = MACH_PORT_RIGHT_SEND;
+		need_right   = MACH_PORT_RIGHT_SEND;
 		break;
 	case MACH_MSG_TYPE_MOVE_SEND_ONCE:
 		remote_right = MACH_PORT_RIGHT_SEND_ONCE;
+		need_right   = MACH_PORT_RIGHT_SEND_ONCE;
+		break;
+	case MACH_MSG_TYPE_MAKE_SEND:
+		remote_right = MACH_PORT_RIGHT_SEND;
+		need_right   = MACH_PORT_RIGHT_RECEIVE;
+		break;
+	case MACH_MSG_TYPE_MAKE_SEND_ONCE:
+		remote_right = MACH_PORT_RIGHT_SEND_ONCE;
+		need_right   = MACH_PORT_RIGHT_RECEIVE;
 		break;
 	default:
 		return (MACH_E_INVAL);
@@ -938,7 +1112,7 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 
 	msg = (const struct mach_msg_header *)m->m_buf;
 
-	dest = space_lookup(from, msg->msgh_remote, remote_right,
+	dest = space_lookup(from, msg->msgh_remote, need_right,
 	    &dummy_rights);
 	if (dest == NULL) {
 		kfree(m);
@@ -1020,12 +1194,18 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 	 * first, so the dispatcher never sees a stale name.
 	 */
 	if (dest->p_special != PORT_SPECIAL_NONE) {
+		bool	saved = false;
 		int	special_rv;
 
 		if (remote_disp == MACH_MSG_TYPE_MOVE_SEND ||
 		    remote_disp == MACH_MSG_TYPE_MOVE_SEND_ONCE) {
 			(void)space_drop_one_right(from,
 			    msg->msgh_remote, remote_right);
+		}
+		/* What the dispatcher sends, it sends as the kernel. */
+		if (current_thread != NULL) {
+			saved = current_thread->th_kernel_send;
+			current_thread->th_kernel_send = true;
 		}
 		switch (dest->p_special) {
 		case PORT_SPECIAL_TASK_SELF: {
@@ -1060,6 +1240,8 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 			special_rv = MACH_E_INVAL;
 			break;
 		}
+		if (current_thread != NULL)
+			current_thread->th_kernel_send = saved;
 		/* Now that the dispatcher has read them, deallocate-on-send. */
 		apply_ool_deallocate(msg, from);
 		kfree(m);
@@ -1068,9 +1250,24 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 
 	/*
 	 * A ref on dest of the sender's right's kind, held across the
-	 * enqueue whether the right is moved or copied.
+	 * enqueue whether the right is moved or copied; by MAKE_*, a hold.
 	 */
-	port_ref(dest, remote_right);
+	dest_kind = need_right == MACH_PORT_RIGHT_RECEIVE ? 0 : remote_right;
+	dest_ref(dest, dest_kind);
+
+	/*
+	 * A slot, before any right moves.  A send-once message and a kernel
+	 * object's reply never wait for one (KERNEL_QMAX).
+	 */
+	kernel_send = current_thread != NULL && current_thread->th_kernel_send;
+	rv = msg_reserve(dest, remote_right == MACH_PORT_RIGHT_SEND_ONCE ||
+	    kernel_send, timeout_ms);
+	if (rv != MACH_MSG_OK) {
+		dest_unref(dest, dest_kind);
+		kfree(m);
+		return (rv);
+	}
+	reserved = true;
 
 	/*
 	 * MOVE_* gives up the sender's right; other rights under the same
@@ -1214,67 +1411,20 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 
 	{
 		struct thread	*waiter;
-		struct thread	*self;
 
-		/*
-		 * Enqueue with backpressure: on a full queue, park on
-		 * p_send_waiters until a receive frees a slot
-		 * (port_extract_send_waiter_locked), then retry.  If the
-		 * port dies meanwhile, port_deref's RECEIVE-drop path wakes
-		 * the list and the retry sees p_dead: MACH_E_DEAD.
-		 */
-		for (;;) {
-			rv = msg_enqueue(dest, m, &waiter);
-			if (rv == MACH_MSG_OK)
-				break;
-			if (rv != MACH_E_NOSPACE)
-				goto fail;
-
-			spin_lock(&dest->p_lock);
-			if (dest->p_dead) {
-				spin_unlock(&dest->p_lock);
-				rv = MACH_E_DEAD;
-				goto fail;
-			}
-			if (dest->p_qlen < dest->p_qmax) {
-				spin_unlock(&dest->p_lock);
-				continue;
-			}
-			self = current_thread;
-			KASSERT(self->th_wait_link == NULL &&
-			    dest->p_send_waiters_tail != self,
-			    "send: already on this port's send-waiter list");
-			self->th_wait_link = NULL;
-			if (dest->p_send_waiters_tail == NULL) {
-				dest->p_send_waiters_head = self;
-				dest->p_send_waiters_tail = self;
-			} else {
-				dest->p_send_waiters_tail->th_wait_link =
-				    self;
-				dest->p_send_waiters_tail = self;
-			}
-			thread_wait_note(self, &dest->p_send_waiters_head,
-			    &dest->p_send_waiters_tail, &dest->p_lock);
-			thread_block_release(THREAD_BLOCK_PORT, dest,
-			    &dest->p_lock);
-			/*
-			 * Off the list before going round again,
-			 * unconditionally, as in the recv loop below.
-			 */
-			spin_lock(&dest->p_lock);
-			port_unbind_send_waiter_locked(dest, self);
-			thread_wait_forget(self);
-			spin_unlock(&dest->p_lock);
-			/* Loop and retry. */
-		}
+		/* Into the reserved slot; only the port's death stops it. */
+		rv = msg_enqueue(dest, m, true, &waiter);
+		reserved = false;
+		if (rv != MACH_MSG_OK)
+			goto fail;
 		if (waiter != NULL) {
 			thread_wake(waiter);
 			thread_unhold(waiter);
 		}
 	}
 
-	/* The ref taken after lookup, of the sender's right's kind. */
-	port_deref(dest, remote_right);
+	/* The ref taken after lookup. */
+	dest_unref(dest, dest_kind);
 	return (MACH_MSG_OK);
 
 fail:
@@ -1282,8 +1432,10 @@ fail:
 	free_pending_descs(descs, ndescs);
 	if (m != NULL)
 		kfree(m);
+	if (reserved)
+		msg_unreserve(dest);
 	if (dest != NULL)
-		port_deref(dest, remote_right);
+		dest_unref(dest, dest_kind);
 	return (rv);
 }
 
@@ -2154,6 +2306,252 @@ drain:
 	kprintf("port-wait: PASS -- a park that never slept left the list "
 	    "empty, a waiter was still reachable behind two timeouts, and "
 	    "two threads that died on the list took themselves off\n");
+out:
+	(void)port_deallocate(kernel_space, name);
+}
+
+/*
+ * Selftest: what a full queue does to a sender.  This thread fills the
+ * port to p_qmax itself, so each scene is arranged, not raced for.
+ */
+#define	PS_TIMEOUT_MS	30u
+#define	PS_WAIT_MS	4000u
+
+struct ps_sender {
+	struct port_space	*ss_space;
+	mach_port_name_t	 ss_name;
+	volatile int		 ss_rv;
+	volatile int		 ss_done;
+	struct thread		*ss_thread;
+};
+
+static struct ps_sender	ps_helper;	/* static: they outlive the frame */
+static struct ps_sender	ps_victim;
+
+static void
+ps_hdr(struct mach_msg_header *h, uint8_t disp, mach_port_name_t to,
+    uint32_t id)
+{
+
+	h->msgh_bits    = MACH_MSGH_BITS(disp, 0);
+	h->msgh_size    = sizeof(*h);
+	h->msgh_remote  = to;
+	h->msgh_local   = MACH_PORT_NULL;
+	h->msgh_voucher = 0;
+	h->msgh_id      = id;
+}
+
+/* Send once, with no bound on the wait, and record how it ended. */
+static void
+ps_sender_entry(void *arg)
+{
+	struct mach_msg_header	 hdr;
+	struct ps_sender	*s;
+
+	s = arg;
+	ps_hdr(&hdr, MACH_MSG_TYPE_COPY_SEND, s->ss_name, 0x5E4D);
+	s->ss_rv   = mach_msg_send(s->ss_space, &hdr);
+	s->ss_done = 1;
+	thread_exit();
+}
+
+static bool
+ps_start(struct ps_sender *s, struct task *t, struct port_space *space,
+    mach_port_name_t name, const char *what)
+{
+
+	s->ss_space  = space;
+	s->ss_name   = name;
+	s->ss_rv     = -1;
+	s->ss_done   = 0;
+	s->ss_thread = thread_create(t, ps_sender_entry, s, what);
+	if (s->ss_thread == NULL)
+		return (false);
+	thread_start(s->ss_thread);
+	return (true);
+}
+
+void
+port_send_selftest(void)
+{
+	struct mach_msg_header	 hdr;
+	struct mach_msg_header	 buf;
+	struct task		*victim_task;
+	struct port		*p;
+	mach_port_name_t	 name;
+	mach_port_name_t	 host;
+	uint64_t		 t0;
+	uint32_t		 refs;
+	uint32_t		 sends;
+	unsigned int		 i;
+	uint8_t			 rights;
+	int			 rv;
+
+	name = port_allocate(kernel_space,
+	    MACH_PORT_RIGHT_RECEIVE | MACH_PORT_RIGHT_SEND);
+	if (name == MACH_PORT_NULL) {
+		kprintf("port-send: FAIL no port to test with\n");
+		return;
+	}
+	p = space_lookup(kernel_space, name, MACH_PORT_RIGHT_RECEIVE, &rights);
+	if (p == NULL) {
+		kprintf("port-send: FAIL the port just made cannot be found\n");
+		goto out;
+	}
+	for (i = 0; i < DEFAULT_QMAX; i++) {
+		ps_hdr(&hdr, MACH_MSG_TYPE_COPY_SEND, name, i);
+		rv = mach_msg_send_timed(kernel_space, &hdr,
+		    MACH_TIMEOUT_NONE);
+		if (rv != MACH_MSG_OK) {
+			kprintf("port-send: FAIL filling the queue stopped at "
+			    "%u: %s\n", i, mach_msg_strerror(rv));
+			goto out;
+		}
+	}
+
+	/*
+	 * 1. No wait: MACH_E_TIMEOUT at once, and a MOVE_SEND keeps its
+	 *    right, the answer coming before anything moved.
+	 */
+	refs  = p->p_refs;
+	sends = p->p_send_count;
+	ps_hdr(&hdr, MACH_MSG_TYPE_MOVE_SEND, name, 1);
+	rv = mach_msg_send_timed(kernel_space, &hdr, MACH_TIMEOUT_NONE);
+	if (rv != MACH_E_TIMEOUT ||
+	    space_lookup(kernel_space, name, MACH_PORT_RIGHT_SEND,
+	    &rights) == NULL || p->p_refs != refs ||
+	    p->p_send_count != sends || p->p_qlen != DEFAULT_QMAX ||
+	    p->p_qresv != 0) {
+		kprintf("port-send: FAIL a send to a full queue with no wait "
+		    "answered %s, or took the sender's right with it\n",
+		    mach_msg_strerror(rv));
+		goto out;
+	}
+
+	/* 2. A bounded wait ends at its deadline, and off the waiter list. */
+	t0 = clock_uptime_ms();
+	ps_hdr(&hdr, MACH_MSG_TYPE_COPY_SEND, name, 2);
+	rv = mach_msg_send_timed(kernel_space, &hdr, PS_TIMEOUT_MS);
+	if (rv != MACH_E_TIMEOUT || clock_uptime_ms() - t0 < PS_TIMEOUT_MS ||
+	    p->p_send_waiters_head != NULL || p->p_qresv != 0) {
+		kprintf("port-send: FAIL a send bounded at %u ms answered %s "
+		    "after %llu ms, or stayed on the waiter list\n",
+		    PS_TIMEOUT_MS, mach_msg_strerror(rv),
+		    (unsigned long long)(clock_uptime_ms() - t0));
+		goto out;
+	}
+
+	/*
+	 * 3. Past p_qmax, none of them waiting: a message through a
+	 *    send-once right, a notification, a kernel object's reply.
+	 */
+	ps_hdr(&hdr, MACH_MSG_TYPE_MAKE_SEND_ONCE, name, 3);
+	rv = mach_msg_send_timed(kernel_space, &hdr, MACH_TIMEOUT_NONE);
+	if (rv != MACH_MSG_OK || p->p_qlen != DEFAULT_QMAX + 1) {
+		kprintf("port-send: FAIL a send-once message to a full queue "
+		    "answered %s\n", mach_msg_strerror(rv));
+		goto out;
+	}
+	rv = port_notify_enqueue(p, MACH_NOTIFY_SEND_ONCE, 3);
+	if (rv != MACH_MSG_OK || p->p_qlen != DEFAULT_QMAX + 2) {
+		kprintf("port-send: FAIL a notification to a full queue "
+		    "answered %s\n", mach_msg_strerror(rv));
+		goto out;
+	}
+	host = MACH_PORT_NULL;
+	rv = host_self_acquire(kernel_space, &host);
+	if (rv == MACH_MSG_OK) {
+		ps_hdr(&hdr, MACH_MSG_TYPE_COPY_SEND, host, HOST_OP_PAGE_SIZE);
+		hdr.msgh_local = name;
+		rv = mach_msg_send_timed(kernel_space, &hdr,
+		    MACH_TIMEOUT_NONE);
+		(void)port_deallocate(kernel_space, host);
+	}
+	if (rv != MACH_MSG_OK || p->p_qlen != DEFAULT_QMAX + 3) {
+		kprintf("port-send: FAIL the host port's reply to a full queue "
+		    "answered %s\n", mach_msg_strerror(rv));
+		goto out;
+	}
+
+	/*
+	 * 4. A slot freed lets a parked sender in.  Each receive pops the
+	 *    helper to look; the one that brings the queue under p_qmax
+	 *    admits it.
+	 */
+	if (!ps_start(&ps_helper, kernel_task, kernel_space, name,
+	    "port-send")) {
+		kprintf("port-send: FAIL no thread to send with\n");
+		goto out;
+	}
+	for (i = 0; i < PS_WAIT_MS &&
+	    p->p_send_waiters_head != ps_helper.ss_thread; i++)
+		sched_nap_ms(1);
+	if (p->p_send_waiters_head != ps_helper.ss_thread) {
+		kprintf("port-send: FAIL the helper never parked on the full "
+		    "queue\n");
+		goto out;
+	}
+	for (i = 0; i < 4; i++) {
+		rv = mach_msg_recv(kernel_space, name, &buf, sizeof(buf));
+		if (rv != MACH_MSG_OK) {
+			kprintf("port-send: FAIL a receive from the full queue "
+			    "answered %s\n", mach_msg_strerror(rv));
+			goto out;
+		}
+	}
+	for (i = 0; i < PS_WAIT_MS && ps_helper.ss_done == 0; i++)
+		sched_nap_ms(1);
+	if (ps_helper.ss_done == 0 || ps_helper.ss_rv != MACH_MSG_OK ||
+	    p->p_qlen != DEFAULT_QMAX || p->p_qresv != 0) {
+		kprintf("port-send: FAIL a sender parked on a full queue was "
+		    "not let in when a receive made room\n");
+		goto out;
+	}
+
+	/*
+	 * 5. A sender killed while it waits gives back all it held: its
+	 *    message, its slot, its ref on the port.  Retired in the park,
+	 *    it would have kept them.
+	 */
+	victim_task = task_create("port-sender");
+	if (victim_task == NULL) {
+		kprintf("port-send: FAIL no task to kill\n");
+		goto out;
+	}
+	rv = space_install(victim_task->t_port_space, p, MACH_PORT_RIGHT_SEND,
+	    &host);
+	if (rv != MACH_MSG_OK || !ps_start(&ps_victim, victim_task,
+	    victim_task->t_port_space, host, "port-sender")) {
+		kprintf("port-send: FAIL no sender to kill\n");
+		task_deref(victim_task);
+		goto out;
+	}
+	refs  = p->p_refs;
+	sends = p->p_send_count;
+	for (i = 0; i < PS_WAIT_MS &&
+	    p->p_send_waiters_head != ps_victim.ss_thread; i++)
+		sched_nap_ms(1);
+	task_request_terminate(victim_task->t_id);
+	for (i = 0; i < PS_WAIT_MS && ps_victim.ss_done == 0; i++)
+		sched_nap_ms(1);
+	if (ps_victim.ss_done == 0 || ps_victim.ss_rv != MACH_E_INTR ||
+	    p->p_refs != refs || p->p_send_count != sends ||
+	    p->p_qresv != 0 || p->p_send_waiters_head != NULL ||
+	    p->p_qlen != DEFAULT_QMAX) {
+		kprintf("port-send: FAIL a sender killed on a full queue "
+		    "answered %s and left %u refs where %u were, %zu slots "
+		    "held\n", mach_msg_strerror(ps_victim.ss_rv),
+		    (unsigned)p->p_refs, (unsigned)refs, p->p_qresv);
+		task_deref(victim_task);
+		goto out;
+	}
+	task_deref(victim_task);
+
+	kprintf("port-send: PASS -- a full queue timed a sender out at once "
+	    "and at its deadline, its right still its own; a send-once "
+	    "message, a notification and a kernel reply went past it; a "
+	    "freed slot let a parked sender in; a sender killed mid-wait gave "
+	    "back its slot and its ref\n");
 out:
 	(void)port_deallocate(kernel_space, name);
 }

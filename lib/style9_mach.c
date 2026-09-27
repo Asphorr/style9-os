@@ -93,6 +93,14 @@ mach_msg_send(const struct mach_msg_header *msg)
 }
 
 int
+mach_msg_send_timed(const struct mach_msg_header *msg, uint64_t timeout_ms)
+{
+
+	return ((int)syscall2(SYS_MSG_SEND_TIMED, (long)msg,
+	    (long)timeout_ms));
+}
+
+int
 mach_msg_recv(mach_port_name_t name, struct mach_msg_header *buf,
     size_t buf_size)
 {

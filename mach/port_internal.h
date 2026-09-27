@@ -37,7 +37,8 @@ struct port {
 	bool		 p_has_receive;		/* (p) receive right exists  */
 	bool		 p_dead;		/* (p) no longer deliverable */
 	size_t		 p_qlen;		/* (p) messages queued       */
-	size_t		 p_qmax;		/* (c) bound on qlen         */
+	size_t		 p_qresv;		/* (p) slots senders hold    */
+	size_t		 p_qmax;		/* (c) bound on qlen + qresv */
 	struct port_msg	*p_qhead;		/* (p) FIFO head             */
 	struct port_msg	*p_qtail;		/* (p) FIFO tail             */
 	struct thread	*p_waiters_head;	/* (p) threads in recv_block */
@@ -154,6 +155,16 @@ struct port_space {
 /* ---- tunables -------------------------------------------------------- */
 
 #define	DEFAULT_QMAX		1024
+
+/*
+ * A message through a send-once right, a kernel notification and a kernel
+ * object's reply are not held to p_qmax, only to this, as XNU sends its
+ * own with MACH_SEND_ALWAYS.  A send-once right can only be made by the
+ * receiver, and each carries one message; a queue past p_qmax this way
+ * cannot block anyone.
+ */
+#define	KERNEL_QMAX		(4 * DEFAULT_QMAX)
+
 #define	INITIAL_SPACE_CAP	16
 #define	MAX_MSG_BYTES		4096
 
@@ -170,6 +181,8 @@ struct port	*port_create(void);
 void		 port_free(struct port *);
 void		 port_ref(struct port *, uint8_t rights);
 void		 port_deref(struct port *, uint8_t rights);
+void		 port_hold(struct port *);
+void		 port_release(struct port *);
 
 /*
  * Link a DEAD_NAME watch onto `watched`.  The caller passes `notify`
@@ -204,8 +217,9 @@ int		 space_unbind_no_deref(struct port_space *,
 
 /*
  * port_msg.c: queue a kernel notification on `notify_port`, msgh_id
- * `notify_id` and nh_msgid `user_tag`.  Best-effort: dropped if the
- * queue is full or the port dead.  The caller keeps the ref it holds.
+ * `notify_id` and nh_msgid `user_tag`.  A full queue does not stop it;
+ * a dead port, KERNEL_QMAX or no memory drops it.  The caller keeps the
+ * ref it holds.
  */
 int		 port_notify_enqueue(struct port *notify_port,
 		    uint32_t notify_id, uint32_t user_tag);

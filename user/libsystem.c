@@ -6765,6 +6765,7 @@ host_info_ask(struct s9_host_info *out)
 	struct {
 		struct s9_mach_header	h;
 		struct s9_host_info	body;
+		uint32_t		trailer[2];	/* mach_msg_trailer_t */
 	} m;
 	long	kr;
 
@@ -6786,7 +6787,7 @@ host_info_ask(struct s9_host_info *out)
 	kr = mach_trap6(MACH_TRAP_msg, (long)&m,
 	    MACH_SEND_MSG | MACH_RCV_MSG | MACH_RCV_TIMEOUT, sizeof(m.h),
 	    sizeof(m), reply, 1000);
-	if (kr != 0 || m.h.msgh_size < sizeof(m))
+	if (kr != 0 || m.h.msgh_size < sizeof(m.h) + sizeof(m.body))
 		return (-1);
 	*out = m.body;
 	return (0);

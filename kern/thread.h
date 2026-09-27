@@ -217,6 +217,13 @@ struct thread {
 	bool			 th_trusted_send;
 
 	/*
+	 * Set while a kernel object's dispatcher runs on this thread, in the
+	 * sender's context (mach_msg_send): the sends it makes, its replies,
+	 * are the kernel's and not held to the destination's queue limit.
+	 */
+	bool			 th_kernel_send;
+
+	/*
 	 * Deadline for a timed park (mach_msg_recv_timed, sched_nap_ms, ...):
 	 * th_wake_deadline_ms is absolute clock_uptime_ms(), and
 	 * sched_check_timeouts posts an IRQ wake once it has passed.

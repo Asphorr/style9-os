@@ -53,6 +53,7 @@
 #define	SYS_SPAWN_RETURNS_TASKPORT 26	/* (const char *name, mach_port_name_t *out) -> task_id */
 #define	SYS_SPAWN_ARGS		27	/* (name, char *const argv[], argc, mach_port_name_t *out) -> task_id */
 #define	SYS_CONS_FEED		28	/* (const char *buf, size_t len) -> bytes fed */
+#define	SYS_MSG_SEND_TIMED	29	/* (struct mach_msg_header *, ms) -> 0/err */
 
 #define	SYS_E_NOSYS	(-1)
 #define	SYS_E_FAULT	(-2)
@@ -134,11 +135,13 @@ long	syscall_copyin_vec(char *const *uargv, char ***blockp, int *argcp,
 
 /*
  * Mach message send/recv core: range check, then the matching mach_msg_*
- * call.  Back SYS_MSG_SEND / SYS_MSG_RECV[_TIMED] and the Darwin mach_msg
- * trap.  Return MACH_MSG_OK (0), a positive MACH_E_*, or SYS_E_FAULT for a
- * bad user pointer.
+ * call.  Back SYS_MSG_SEND[_TIMED] / SYS_MSG_RECV[_TIMED] and the Darwin
+ * mach_msg trap.  Return MACH_MSG_OK (0), a positive MACH_E_*, or
+ * SYS_E_FAULT for a bad user pointer.
  */
 long	syscall_msg_send(const struct mach_msg_header *umsg);
+long	syscall_msg_send_timed(const struct mach_msg_header *umsg,
+	    uint64_t timeout_ms);
 long	syscall_msg_recv(mach_port_name_t name, struct mach_msg_header *ubuf,
 	    size_t ubuf_size);
 long	syscall_msg_recv_timed(mach_port_name_t name,

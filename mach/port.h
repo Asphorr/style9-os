@@ -392,12 +392,14 @@ _Static_assert(sizeof(struct mach_port_snapshot_entry) == 40,
 #define	MACH_E_NOMSG		6	/* recv on empty queue             */
 #define	MACH_E_TOOSMALL		7	/* caller's recv buf too small     */
 #define	MACH_E_NOMEM		8	/* kmalloc failed                  */
-#define	MACH_E_TIMEOUT		9	/* mach_msg_recv_timed deadline    */
+#define	MACH_E_TIMEOUT		9	/* a timed recv or send's deadline */
+#define	MACH_E_INTR		10	/* the waiter's task was killed    */
 
 /*
- * Special timeout values for mach_msg_recv_timed.
- *	NONE	 -- non-blocking poll; returns MACH_E_NOMSG if empty
- *	FOREVER	 -- behaviour identical to mach_msg_recv_block
+ * Special timeout values for mach_msg_recv_timed and mach_msg_send_timed.
+ *	NONE	 -- never wait: MACH_E_NOMSG on an empty queue, MACH_E_TIMEOUT
+ *		    on a full one
+ *	FOREVER	 -- wait without a bound
  */
 #define	MACH_TIMEOUT_NONE	((uint64_t)0)
 #define	MACH_TIMEOUT_FOREVER	((uint64_t)~0ull)
@@ -678,10 +680,23 @@ int			 port_space_inject_send(struct port_space *src,
  * mach_msg_send: queue a copy of `msg` on the port named msgh_remote in
  * `from`, carrying rights and OOL payloads per the descriptors.  The
  * caller's buffer is only read.  Blocks while the queue is full;
- * MACH_E_DEAD if the port dies meanwhile.
+ * MACH_E_DEAD if the port dies meanwhile.  A message through a send-once
+ * right (MOVE_SEND_ONCE, or MAKE_SEND_ONCE by the receiver) never waits:
+ * see KERNEL_QMAX.
  */
 int			 mach_msg_send(struct port_space *from,
 			    const struct mach_msg_header *msg);
+
+/*
+ * mach_msg_send with the wait for queue room bounded by `timeout_ms`, as
+ * for mach_msg_recv_timed: MACH_E_TIMEOUT at the deadline, at once for
+ * MACH_TIMEOUT_NONE.  The wait comes before anything of the message's
+ * moves, so a send that times out leaves the sender's rights as they
+ * were.  MACH_E_INTR if the sender's task is killed while it waits.
+ */
+int			 mach_msg_send_timed(struct port_space *from,
+			    const struct mach_msg_header *msg,
+			    uint64_t timeout_ms);
 
 /*
  * mach_msg_send with the current thread marked a trusted kernel sender:
@@ -784,5 +799,13 @@ size_t			 port_space_snapshot(struct port_space *ps,
  * by being killed mid-park.  Each case is arranged, not raced for.
  */
 void			 port_wait_selftest(void);
+
+/*
+ * Boot selftest: a full queue times a sender out without taking its
+ * rights, lets send-once, notification and kernel-reply messages past,
+ * admits a parked sender when a slot frees, and gives back all a sender
+ * killed mid-wait held.
+ */
+void			 port_send_selftest(void);
 
 #endif /* !_SYS_PORT_H_ */

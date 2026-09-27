@@ -96,6 +96,16 @@ void		thread_block_release(int reason, void *target,
 		    struct spinlock *external);
 
 /*
+ * thread_block_release for a caller holding something it must give back
+ * first: a kill, before the park or after it, returns false instead of
+ * retiring the thread in place.  `external` is dropped either way, and
+ * the thread may still be on the list it noted.  The caller unwinds and
+ * the thread retires at the syscall boundary, holding nothing.
+ */
+bool		thread_block_release_intr(int reason, void *target,
+		    struct spinlock *external);
+
+/*
  * thread_wake: transition `th` from BLOCKED to READY and enqueue it at the
  * head of the queue, since a thread that blocked gave its slice up unused.
  * Also asks for a reschedule, honoured at the next safe point rather than
