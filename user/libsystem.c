@@ -784,6 +784,7 @@ fseek(FILE *fp, long off, int whence)
 		return (-1);
 	fp->eof = 0;
 	fp->aflags &= ~APPLE_SEOF;
+	fp->unget = EOF;			/* a seek undoes ungetc */
 	return (0);
 }
 
@@ -3439,14 +3440,19 @@ alarm(unsigned int secs)
 
 /*
  * The environment.  The default, used when the kernel hands over none, is
- * a single PATH entry for the synthetic /bin (the program registry as a
- * directory, kern/darwin.c), where everything runnable lives.
+ * PATH for the synthetic /bin (the program registry as a directory,
+ * kern/darwin.c), where everything runnable lives, and HOME: the one user
+ * is root, whose home is the root of the volume (there is no /var/root).
  *
  * Older binaries bind the `environ' data symbol, newer ones call
  * _NSGetEnviron(); both reach the same storage (our dyld binds data
  * symbols, so `environ' is simply exported).
  */
-static char	*environ_default[] = { (char *)"PATH=/bin", 0 };
+static char	*environ_default[] = {
+	(char *)"PATH=/bin",
+	(char *)"HOME=/",
+	0
+};
 
 char	**environ = environ_default;
 
@@ -5575,4 +5581,1185 @@ tmpfile(void)
 	if (fp == NULL)
 		close(fd);
 	return (fp);
+}
+
+/* ---- what sqlite3 binds: a database's libc ------------------------------ */
+
+/*
+ * The sqlite3 shell is the first database here.  It reads and writes its
+ * file at offsets (pread/pwrite), asks what volume the file is on (statfs,
+ * which picks its locking style), allocates through a malloc zone, and
+ * gives SQL its math functions over libm.  Its pthread calls serve worker
+ * threads it starts only when told to (PRAGMA threads), so pthread_create
+ * fails honestly and sqlite sorts on its one thread.
+ */
+
+/* ---- libm, on the x87 unit ---------------------------------------------- */
+
+/*
+ * The x87 unit computes the transcendental functions to 64 bits -- fsin,
+ * fcos, fptan and fpatan, fyl2x for logarithms, f2xm1 and fscale for
+ * powers of two -- and the result is rounded once, to double, on return:
+ * close to correctly rounded, not proven so.
+ */
+#define	M_LOG2E_L	1.44269504088896340736L
+#define	M_LN2_L		0.693147180559945309417L
+#define	M_LG2_L		0.301029995663981195214L	/* log10(2) */
+#define	M_2PI_L		6.28318530717958647693L
+#define	M_TWO28		268435456.0
+#define	M_TWO52		4503599627370496.0
+#define	M_TWO63		9223372036854775808.0
+
+union m_dbits {
+	double		d;
+	uint64_t	u;
+};
+
+static double
+m_fabs(double x)
+{
+	union m_dbits	v;
+
+	v.d = x;
+	v.u &= ~((uint64_t)1 << 63);
+	return (v.d);
+}
+
+static double
+m_copysign(double x, double s)
+{
+	union m_dbits	vx;
+	union m_dbits	vs;
+
+	vx.d = x;
+	vs.d = s;
+	vx.u = (vx.u & ~((uint64_t)1 << 63)) | (vs.u & ((uint64_t)1 << 63));
+	return (vx.d);
+}
+
+static double
+m_nan(void)
+{
+	union m_dbits	v;
+
+	v.u = 0x7FF8000000000000ULL;
+	return (v.d);
+}
+
+static double
+m_inf(void)
+{
+	union m_dbits	v;
+
+	v.u = 0x7FF0000000000000ULL;
+	return (v.d);
+}
+
+/* x - n * y with x's sign: fprem, repeated until it reports complete. */
+static long double
+m_fmodl(long double x, long double y)
+{
+	long double	r;
+
+	__asm__("1:\n\t"
+	    "fprem\n\t"
+	    "fnstsw %%ax\n\t"
+	    "testw $0x400, %%ax\n\t"
+	    "jnz 1b"
+	    : "=t"(r) : "0"(x), "u"(y) : "ax", "cc");
+	return (r);
+}
+
+/* fsin, fcos and fptan take |x| < 2^63; reduce anything larger first. */
+static long double
+m_trigarg(double x)
+{
+
+	if (m_fabs(x) >= M_TWO63)
+		return (m_fmodl(x, M_2PI_L));
+	return (x);
+}
+
+/* atan(y / x) in the quadrant of (x, y). */
+static long double
+m_atan2l(long double y, long double x)
+{
+	long double	r;
+
+	__asm__("fpatan" : "=t"(r) : "0"(x), "u"(y) : "st(1)");
+	return (r);
+}
+
+static long double
+m_sqrtl(long double x)
+{
+	long double	r;
+
+	__asm__("fsqrt" : "=t"(r) : "0"(x));
+	return (r);
+}
+
+/* y * log2(x).  x = 0 gives -inf, x < 0 a NaN. */
+static long double
+m_ylog2l(long double y, long double x)
+{
+	long double	r;
+
+	__asm__("fyl2x" : "=t"(r) : "0"(x), "u"(y) : "st(1)");
+	return (r);
+}
+
+/* ln(1 + x), exact near 0, where fyl2xp1 is valid. */
+static long double
+m_log1pl(long double x)
+{
+	long double	r;
+
+	if (x > -0.29L && x < 0.29L) {
+		__asm__("fyl2xp1" : "=t"(r) : "0"(x), "u"(M_LN2_L) : "st(1)");
+		return (r);
+	}
+	return (m_ylog2l(M_LN2_L, 1.0L + x));
+}
+
+/* 2^t: f2xm1 on the fraction, fscale by the whole part. */
+static long double
+m_exp2l(long double t)
+{
+	long double	i;
+	long double	r;
+
+	if (t != t)
+		return (t);
+	if (t > 16384.0L)
+		return (m_inf());
+	if (t < -16500.0L)
+		return (0.0L);
+	__asm__("frndint" : "=t"(i) : "0"(t));
+	__asm__("f2xm1" : "=t"(r) : "0"(t - i));
+	__asm__("fscale" : "=t"(r) : "0"(r + 1.0L), "u"(i));
+	return (r);
+}
+
+/* e^x - 1, exact near 0, where computing e^x first would cancel. */
+static long double
+m_expm1l(long double x)
+{
+	long double	t;
+	long double	r;
+
+	t = x * M_LOG2E_L;
+	if (t > -1.0L && t < 1.0L) {
+		__asm__("f2xm1" : "=t"(r) : "0"(t));
+		return (r);
+	}
+	return (m_exp2l(t) - 1.0L);
+}
+
+double
+sqrt(double x)
+{
+	double	r;
+
+	__asm__("sqrtsd %1, %0" : "=x"(r) : "x"(x));
+	return (r);
+}
+
+double
+sin(double x)
+{
+	long double	r;
+
+	__asm__("fsin" : "=t"(r) : "0"(m_trigarg(x)));
+	return ((double)r);
+}
+
+double
+cos(double x)
+{
+	long double	r;
+
+	__asm__("fcos" : "=t"(r) : "0"(m_trigarg(x)));
+	return ((double)r);
+}
+
+double
+tan(double x)
+{
+	long double	r;
+
+	/* fptan pushes 1.0 above the tangent; pop it. */
+	__asm__("fptan\n\t"
+	    "fstp %%st(0)" : "=t"(r) : "0"(m_trigarg(x)));
+	return ((double)r);
+}
+
+double
+atan2(double y, double x)
+{
+
+	return ((double)m_atan2l(y, x));
+}
+
+double
+atan(double x)
+{
+
+	return ((double)m_atan2l(x, 1.0L));
+}
+
+/* |x| > 1 takes the square root of a negative: a NaN, as it should. */
+double
+asin(double x)
+{
+	long double	l;
+
+	l = x;
+	return ((double)m_atan2l(l, m_sqrtl((1.0L - l) * (1.0L + l))));
+}
+
+double
+acos(double x)
+{
+	long double	l;
+
+	l = x;
+	return ((double)m_atan2l(m_sqrtl((1.0L - l) * (1.0L + l)), l));
+}
+
+double
+exp(double x)
+{
+
+	return ((double)m_exp2l((long double)x * M_LOG2E_L));
+}
+
+double
+log(double x)
+{
+
+	return ((double)m_ylog2l(M_LN2_L, x));
+}
+
+double
+log2(double x)
+{
+
+	return ((double)m_ylog2l(1.0L, x));
+}
+
+double
+log10(double x)
+{
+
+	return ((double)m_ylog2l(M_LG2_L, x));
+}
+
+double
+fmod(double x, double y)
+{
+
+	return ((double)m_fmodl(x, y));
+}
+
+double
+trunc(double x)
+{
+
+	if (!(m_fabs(x) < M_TWO52))	/* already whole, infinite or NaN */
+		return (x);
+	return (m_copysign((double)(int64_t)x, x));
+}
+
+/* y is a whole number; every double of magnitude 2^52 or more is one. */
+static int
+m_isint(double y)
+{
+
+	return (m_fabs(y) >= M_TWO52 || y == trunc(y));
+}
+
+static int
+m_isodd(double y)
+{
+
+	return (m_fabs(y) < 2.0 * M_TWO52 && m_isint(y) &&
+	    m_fmodl(y, 2.0L) != 0.0L);
+}
+
+/*
+ * pow(3): 2^(y log2 x), both steps in 64-bit precision.  The edges
+ * fyl2x would get wrong -- zeros, infinities, negative bases -- are
+ * C99's table, taken first.
+ */
+double
+pow(double x, double y)
+{
+	long double	r;
+	int		neg;
+
+	if (y == 0.0 || x == 1.0)
+		return (1.0);
+	if (x != x || y != y)
+		return (x + y);
+	if (x == 0.0) {
+		neg = m_copysign(1.0, x) < 0.0 && m_isodd(y);
+		r = y > 0.0 ? 0.0L : (long double)m_inf();
+		return (neg ? -(double)r : (double)r);
+	}
+	neg = 0;
+	if (x < 0.0) {
+		if (!m_isint(y))
+			return (m_nan());
+		neg = m_isodd(y);
+		x = -x;
+	}
+	if (x == 1.0)
+		return (neg ? -1.0 : 1.0);
+	if (y == m_inf())
+		r = x > 1.0 ? m_inf() : 0.0;
+	else if (y == -m_inf())
+		r = x > 1.0 ? 0.0 : m_inf();
+	else if (x == m_inf())
+		r = y > 0.0 ? m_inf() : 0.0;
+	else
+		r = m_exp2l(m_ylog2l(y, x));
+	return (neg ? -(double)r : (double)r);
+}
+
+double
+sinh(double x)
+{
+	long double	a;
+	long double	e;
+
+	a = m_fabs(x);
+	if (a > 1000.0)
+		return (m_copysign(m_inf(), x));
+	e = m_expm1l(a);
+	return (m_copysign((double)((e + e / (e + 1.0L)) / 2.0L), x));
+}
+
+double
+cosh(double x)
+{
+	long double	e;
+
+	if (m_fabs(x) > 1000.0)
+		return (m_inf());
+	e = m_exp2l(m_fabs(x) * M_LOG2E_L);
+	return ((double)((e + 1.0L / e) / 2.0L));
+}
+
+double
+tanh(double x)
+{
+	long double	a;
+	long double	e;
+
+	a = m_fabs(x);
+	if (a > 22.0)
+		return (m_copysign(1.0, x));
+	e = m_expm1l(2.0L * a);
+	return (m_copysign((double)(e / (e + 2.0L)), x));
+}
+
+double
+asinh(double x)
+{
+	long double	a;
+	long double	r;
+
+	a = m_fabs(x);
+	if (a > M_TWO28)		/* sqrt(a^2 + 1) is a */
+		r = m_ylog2l(M_LN2_L, a) + M_LN2_L;
+	else
+		r = m_log1pl(a + a * a / (1.0L + m_sqrtl(1.0L + a * a)));
+	return (m_copysign((double)r, x));
+}
+
+double
+acosh(double x)
+{
+	long double	t;
+
+	if (x < 1.0)
+		return (m_nan());
+	if (x > M_TWO28)
+		return ((double)(m_ylog2l(M_LN2_L, x) + M_LN2_L));
+	t = (long double)x - 1.0L;
+	return ((double)m_log1pl(t + m_sqrtl(2.0L * t + t * t)));
+}
+
+double
+atanh(double x)
+{
+	long double	a;
+
+	a = m_fabs(x);
+	if (a > 1.0)
+		return (m_nan());
+	if (a == 1.0)
+		return (m_copysign(m_inf(), x));
+	return (m_copysign((double)(0.5L * m_log1pl(2.0L * a / (1.0L - a))),
+	    x));
+}
+
+/* ---- strings ------------------------------------------------------------- */
+
+size_t
+strlcpy(char *dst, const char *src, size_t size)
+{
+	size_t	n;
+	size_t	k;
+
+	n = strlen(src);
+	if (size != 0) {
+		k = n < size - 1 ? n : size - 1;
+		memcpy(dst, src, k);
+		dst[k] = '\0';
+	}
+	return (n);
+}
+
+size_t
+strlcat(char *dst, const char *src, size_t size)
+{
+	size_t	d;
+
+	for (d = 0; d < size && dst[d] != '\0'; d++)
+		continue;
+	if (d == size)
+		return (size + strlen(src));
+	return (d + strlcpy(dst + d, src, size - d));
+}
+
+/* The _FORTIFY_SOURCE forms: `objsize` is what the compiler knew of dst. */
+size_t
+__strlcpy_chk(char *dst, const char *src, size_t size, size_t objsize)
+{
+
+	if (size > objsize)
+		abort();
+	return (strlcpy(dst, src, size));
+}
+
+size_t
+__strlcat_chk(char *dst, const char *src, size_t size, size_t objsize)
+{
+
+	if (size > objsize)
+		abort();
+	return (strlcat(dst, src, size));
+}
+
+/* ---- malloc zones -------------------------------------------------------- */
+
+/*
+ * <malloc/malloc.h>.  Every zone is the one heap; a zone is only the
+ * struct its callers reach through.  sqlite3 asks a block's size as
+ * zone->size(zone, p), so the members through zone_name sit where
+ * Apple's malloc_zone_t has them; the rest (batch calls, introspection,
+ * version 0) are NULL.
+ */
+typedef struct malloc_zone {
+	void		*reserved1;
+	void		*reserved2;
+	size_t		(*size)(struct malloc_zone *, const void *);
+	void		*(*malloc)(struct malloc_zone *, size_t);
+	void		*(*calloc)(struct malloc_zone *, size_t, size_t);
+	void		*(*valloc)(struct malloc_zone *, size_t);
+	void		(*free)(struct malloc_zone *, void *);
+	void		*(*realloc)(struct malloc_zone *, void *, size_t);
+	void		(*destroy)(struct malloc_zone *);
+	const char	*zone_name;
+	void		*rest[10];
+} malloc_zone_t;
+
+/* The usable size malloc() recorded in the block's header. */
+size_t
+malloc_size(const void *p)
+{
+
+	if (p == NULL)
+		return (0);
+	return (*(const size_t *)(const void *)((const unsigned char *)p -
+	    16));
+}
+
+static size_t
+zone_size(malloc_zone_t *z, const void *p)
+{
+
+	(void)z;
+	return (malloc_size(p));
+}
+
+static void *
+zone_malloc(malloc_zone_t *z, size_t n)
+{
+
+	(void)z;
+	return (malloc(n));
+}
+
+static void *
+zone_calloc(malloc_zone_t *z, size_t n, size_t size)
+{
+
+	(void)z;
+	return (calloc(n, size));
+}
+
+static void
+zone_free(malloc_zone_t *z, void *p)
+{
+
+	(void)z;
+	free(p);
+}
+
+static void *
+zone_realloc(malloc_zone_t *z, void *p, size_t n)
+{
+
+	(void)z;
+	return (realloc(p, n));
+}
+
+static void
+zone_destroy(malloc_zone_t *z)
+{
+
+	(void)z;
+}
+
+static malloc_zone_t	default_zone = {
+	.size      = zone_size,
+	.malloc    = zone_malloc,
+	.calloc    = zone_calloc,
+	.free      = zone_free,
+	.realloc   = zone_realloc,
+	.destroy   = zone_destroy,
+	.zone_name = "DefaultMallocZone",
+};
+
+malloc_zone_t *
+malloc_default_zone(void)
+{
+
+	return (&default_zone);
+}
+
+malloc_zone_t *
+malloc_create_zone(size_t start_size, unsigned flags)
+{
+	malloc_zone_t	*z;
+
+	(void)start_size;
+	(void)flags;
+	z = malloc(sizeof(*z));
+	if (z != NULL) {
+		memcpy(z, &default_zone, sizeof(*z));
+		z->zone_name = NULL;
+	}
+	return (z);
+}
+
+/* The name is kept by reference, not copied as Apple's is. */
+void
+malloc_set_zone_name(malloc_zone_t *z, const char *name)
+{
+
+	if (z != NULL)
+		z->zone_name = name;
+}
+
+void *
+malloc_zone_malloc(malloc_zone_t *z, size_t n)
+{
+
+	(void)z;
+	return (malloc(n));
+}
+
+void
+malloc_zone_free(malloc_zone_t *z, void *p)
+{
+
+	(void)z;
+	free(p);
+}
+
+void *
+malloc_zone_realloc(malloc_zone_t *z, void *p, size_t n)
+{
+
+	(void)z;
+	return (realloc(p, n));
+}
+
+/* ---- threads, of which there is one -------------------------------------- */
+
+/*
+ * A mutex can never be contended, so these succeed doing nothing, like
+ * pthread_mutex_lock above.  No second thread can be started: EAGAIN, the
+ * answer for "no resources for another thread".
+ */
+#define	DARWIN_EAGAIN	35
+#define	DARWIN_ESRCH	3
+
+int
+pthread_mutex_init(void *m, const void *attr)
+{
+
+	(void)m;
+	(void)attr;
+	return (0);
+}
+
+int
+pthread_mutex_destroy(void *m)
+{
+
+	(void)m;
+	return (0);
+}
+
+int
+pthread_mutex_trylock(void *m)
+{
+
+	(void)m;
+	return (0);
+}
+
+int
+pthread_mutexattr_init(void *attr)
+{
+
+	(void)attr;
+	return (0);
+}
+
+int
+pthread_mutexattr_destroy(void *attr)
+{
+
+	(void)attr;
+	return (0);
+}
+
+int
+pthread_mutexattr_settype(void *attr, int type)
+{
+
+	(void)attr;
+	(void)type;
+	return (0);
+}
+
+int
+pthread_create(void *thread, const void *attr, void *(*fn)(void *),
+    void *arg)
+{
+
+	(void)thread;
+	(void)attr;
+	(void)fn;
+	(void)arg;
+	return (DARWIN_EAGAIN);
+}
+
+int
+pthread_join(void *thread, void **value)
+{
+
+	(void)thread;
+	(void)value;
+	return (DARWIN_ESRCH);		/* none was ever started */
+}
+
+/* ---- files at an offset, and the volume under them ----------------------- */
+
+long
+pread(int fd, void *buf, size_t n, long off)
+{
+
+	return (bsd_call4_e(0x2000099, fd, (long)buf, (long)n, off));
+}
+
+long
+pwrite(int fd, const void *buf, size_t n, long off)
+{
+
+	return (bsd_call4_e(0x200009A, fd, (long)buf, (long)n, off));
+}
+
+int	statfs_inode64(const char *path, void *buf) __asm__("_statfs$INODE64");
+int	fstatfs_inode64(int fd, void *buf) __asm__("_fstatfs$INODE64");
+
+int
+statfs_inode64(const char *path, void *buf)
+{
+
+	return ((int)bsd_call_e(0x2000159, (long)path, (long)buf, 0));
+}
+
+int
+fstatfs_inode64(int fd, void *buf)
+{
+
+	return ((int)bsd_call_e(0x200015A, fd, (long)buf, 0));
+}
+
+/*
+ * What the volume cannot do yet, said so: no whole-file locks (flock), no
+ * filesystem controls (fsctl), no symbolic links, no setting of times.
+ * sqlite3 locks with fcntl ranges, or with a lock directory, not flock.
+ */
+#define	DARWIN_ENOSYS	78
+
+int
+flock(int fd, int op)
+{
+
+	(void)fd;
+	(void)op;
+	g_errno = DARWIN_ENOTSUP;
+	return (-1);
+}
+
+int
+fsctl(const char *path, unsigned long request, void *data,
+    unsigned int options)
+{
+
+	(void)path;
+	(void)request;
+	(void)data;
+	(void)options;
+	g_errno = DARWIN_ENOTSUP;
+	return (-1);
+}
+
+int
+symlink(const char *target, const char *path)
+{
+
+	(void)target;
+	(void)path;
+	g_errno = DARWIN_ENOTSUP;
+	return (-1);
+}
+
+int
+utimes(const char *path, const void *times)
+{
+
+	(void)path;
+	(void)times;
+	g_errno = DARWIN_ENOSYS;
+	return (-1);
+}
+
+int
+futimes(int fd, const void *times)
+{
+
+	(void)fd;
+	(void)times;
+	g_errno = DARWIN_ENOSYS;
+	return (-1);
+}
+
+void
+clearerr(FILE *fp)
+{
+
+	if (fp == NULL)
+		return;
+	fp->eof = 0;
+	fp->aflags &= ~APPLE_SEOF;
+}
+
+void
+rewind(FILE *fp)
+{
+
+	(void)fseek(fp, 0, 0);			/* SEEK_SET */
+	clearerr(fp);
+}
+
+/* ---- processes: popen, system, sleeping ---------------------------------- */
+
+/*
+ * popen(3) and system(3) run `/bin/sh -c cmd`, as POSIX has them, over
+ * fork and execve (the kernel gives a Darwin task dash for sh).  popen
+ * keeps each stream's child for pclose to reap.  system does not ignore
+ * SIGINT and SIGQUIT while it waits.
+ */
+#define	POPEN_MAX	8
+
+static struct {
+	FILE	*pp_fp;
+	int	 pp_pid;
+} popen_tab[POPEN_MAX];
+
+static int
+sh_c_wait(int pid)
+{
+	int	status;
+
+	while (waitpid(pid, &status, 0) < 0) {
+		if (g_errno != 4)		/* EINTR */
+			return (-1);
+	}
+	return (status);
+}
+
+FILE *
+popen(const char *cmd, const char *mode)
+{
+	char	*argv[4];
+	FILE	*fp;
+	int	 fds[2];
+	int	 i;
+	int	 pid;
+	int	 rd;
+
+	if (cmd == NULL || mode == NULL ||
+	    (mode[0] != 'r' && mode[0] != 'w')) {
+		g_errno = 22;			/* EINVAL */
+		return (NULL);
+	}
+	for (i = 0; i < POPEN_MAX && popen_tab[i].pp_fp != NULL; i++)
+		continue;
+	if (i == POPEN_MAX) {
+		g_errno = 24;			/* EMFILE */
+		return (NULL);
+	}
+	if (pipe(fds) != 0)
+		return (NULL);
+	rd = mode[0] == 'r';
+	pid = fork();
+	if (pid < 0) {
+		(void)close(fds[0]);
+		(void)close(fds[1]);
+		return (NULL);
+	}
+	if (pid == 0) {
+		/* The child's end of the pipe is its stdout, or its stdin. */
+		(void)dup2(rd ? fds[1] : fds[0], rd ? 1 : 0);
+		(void)close(fds[0]);
+		(void)close(fds[1]);
+		argv[0] = "sh";
+		argv[1] = "-c";
+		argv[2] = (char *)cmd;
+		argv[3] = NULL;
+		(void)execve("/bin/sh", argv, environ);
+		_exit(127);
+	}
+	(void)close(rd ? fds[1] : fds[0]);
+	fp = fdopen_extsn(rd ? fds[0] : fds[1], rd ? "r" : "w");
+	if (fp == NULL) {
+		(void)close(rd ? fds[0] : fds[1]);
+		(void)sh_c_wait(pid);
+		return (NULL);
+	}
+	popen_tab[i].pp_fp  = fp;
+	popen_tab[i].pp_pid = pid;
+	return (fp);
+}
+
+int
+pclose(FILE *fp)
+{
+	int	i;
+	int	pid;
+
+	for (i = 0; i < POPEN_MAX; i++) {
+		if (fp != NULL && popen_tab[i].pp_fp == fp)
+			break;
+	}
+	if (i == POPEN_MAX) {
+		g_errno = 10;			/* ECHILD */
+		return (-1);
+	}
+	pid = popen_tab[i].pp_pid;
+	popen_tab[i].pp_fp = NULL;
+	(void)fclose(fp);
+	return (sh_c_wait(pid));
+}
+
+int
+system(const char *cmd)
+{
+	char	*argv[4];
+	int	 pid;
+
+	if (cmd == NULL)
+		return (1);			/* there is a shell */
+	pid = fork();
+	if (pid < 0)
+		return (-1);
+	if (pid == 0) {
+		argv[0] = "sh";
+		argv[1] = "-c";
+		argv[2] = (char *)cmd;
+		argv[3] = NULL;
+		(void)execve("/bin/sh", argv, environ);
+		_exit(127);
+	}
+	return (sh_c_wait(pid));
+}
+
+struct s9_timespec_ns {
+	long	tv_sec;
+	long	tv_nsec;
+};
+
+/*
+ * nanosleep(2) as a select with no descriptors, rounded up to the
+ * microsecond.  Interrupted, it reports the whole request as remaining:
+ * the kernel does not say how much of the wait was spent.
+ */
+int
+nanosleep(const struct s9_timespec_ns *req, struct s9_timespec_ns *rem)
+{
+	struct s9_timeval	tv;
+
+	if (req == NULL || req->tv_sec < 0 || req->tv_nsec < 0 ||
+	    req->tv_nsec >= 1000000000L) {
+		g_errno = 22;			/* EINVAL */
+		return (-1);
+	}
+	tv.tv_sec  = req->tv_sec;
+	tv.tv_usec = (int)((req->tv_nsec + 999) / 1000);
+	tv.tv_pad  = 0;
+	if (tv.tv_usec == 1000000) {
+		tv.tv_sec++;
+		tv.tv_usec = 0;
+	}
+	if (select(0, NULL, NULL, NULL, &tv) < 0) {
+		if (rem != NULL)
+			*rem = *req;
+		return (-1);
+	}
+	return (0);
+}
+
+/* No per-process CPU accounting is kept to report. */
+int
+getrusage(int who, void *usage)
+{
+
+	(void)who;
+	(void)usage;
+	g_errno = DARWIN_ENOSYS;
+	return (-1);
+}
+
+/* ---- random numbers, and the machine ------------------------------------- */
+
+/*
+ * random(3): xorshift64*, 31 bits a call.  Not the BSD additive
+ * generator, so a seeded sequence differs from Apple's.
+ */
+static uint64_t	random_state = 0x2545F4914F6CDD1DULL;
+
+long
+random(void)
+{
+	uint64_t	x;
+
+	x = random_state;
+	x ^= x >> 12;
+	x ^= x << 25;
+	x ^= x >> 27;
+	random_state = x;
+	return ((long)((x * 0x2545F4914F6CDD1DULL) >> 33));
+}
+
+/* Seeded from the TSC, the time of day and the pid. */
+void
+srandomdev(void)
+{
+	struct s9_timeval	tv;
+	uint32_t		hi;
+	uint32_t		lo;
+
+	__asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+	tv.tv_sec  = 0;
+	tv.tv_usec = 0;
+	(void)gettimeofday(&tv, NULL);
+	random_state ^= ((uint64_t)hi << 32 | lo) ^
+	    ((uint64_t)tv.tv_sec << 20) ^ (uint64_t)tv.tv_usec ^
+	    ((uint64_t)getpid() << 40);
+	if (random_state == 0)
+		random_state = 1;
+}
+
+/* No host UUID is kept. */
+int
+gethostuuid(unsigned char *uuid, const void *wait)
+{
+
+	(void)uuid;
+	(void)wait;
+	g_errno = DARWIN_ENOTSUP;
+	return (-1);
+}
+
+/*
+ * Mach from a Darwin task: the host service's HOST_OP_INFO, asked the way
+ * Apple's host_info() asks -- a send right from host_self_trap, a reply
+ * port from mach_reply_port, one combined send and receive.  Both ports
+ * are kept for the next call.  The reply is mach/host.h's
+ * svc_host_info_reply.
+ */
+#define	MACH_TRAP_reply_port	0x100001AL
+#define	MACH_TRAP_host_self	0x100001DL
+#define	MACH_TRAP_msg		0x100001FL
+#define	MACH_SEND_MSG		0x00000001
+#define	MACH_RCV_MSG		0x00000002
+#define	MACH_RCV_TIMEOUT	0x00000100
+#define	MACH_MSG_TYPE_COPY_SEND	19
+#define	HOST_OP_INFO		2
+
+struct s9_mach_header {
+	uint32_t	msgh_bits;
+	uint32_t	msgh_size;
+	uint32_t	msgh_remote_port;
+	uint32_t	msgh_local_port;
+	uint32_t	msgh_voucher_port;
+	int32_t		msgh_id;
+};
+
+struct s9_host_info {
+	uint32_t	hi_max_cpus;
+	uint32_t	hi_avail_cpus;
+	uint64_t	hi_memory_size;
+	uint32_t	hi_cpu_type;
+	uint32_t	hi_cpu_subtype;
+	uint64_t	hi_memory_free;
+};
+
+/* A class-1 Mach trap: the result in %rax, no carry convention. */
+static long
+mach_trap6(long nr, long a, long b, long c, long d, long e, long f)
+{
+	register long	r10 __asm__("r10");
+	register long	r8  __asm__("r8");
+	register long	r9  __asm__("r9");
+	long		ret;
+
+	r10 = d;
+	r8  = e;
+	r9  = f;
+	__asm__ __volatile__("syscall"
+	    : "=a"(ret)
+	    : "a"(nr), "D"(a), "S"(b), "d"(c), "r"(r10), "r"(r8), "r"(r9)
+	    : "rcx", "r11", "memory");
+	return (ret);
+}
+
+static int
+host_info_ask(struct s9_host_info *out)
+{
+	static uint32_t	host;
+	static uint32_t	reply;
+	struct {
+		struct s9_mach_header	h;
+		struct s9_host_info	body;
+	} m;
+	long	kr;
+
+	if (host == 0)
+		host = (uint32_t)mach_trap6(MACH_TRAP_host_self, 0, 0, 0, 0,
+		    0, 0);
+	if (reply == 0)
+		reply = (uint32_t)mach_trap6(MACH_TRAP_reply_port, 0, 0, 0,
+		    0, 0, 0);
+	if (host == 0 || reply == 0)
+		return (-1);
+
+	memset(&m, 0, sizeof(m));
+	m.h.msgh_bits        = MACH_MSG_TYPE_COPY_SEND;
+	m.h.msgh_size        = sizeof(m.h);
+	m.h.msgh_remote_port = host;
+	m.h.msgh_local_port  = reply;
+	m.h.msgh_id          = HOST_OP_INFO;
+	kr = mach_trap6(MACH_TRAP_msg, (long)&m,
+	    MACH_SEND_MSG | MACH_RCV_MSG | MACH_RCV_TIMEOUT, sizeof(m.h),
+	    sizeof(m), reply, 1000);
+	if (kr != 0 || m.h.msgh_size < sizeof(m))
+		return (-1);
+	*out = m.body;
+	return (0);
+}
+
+static int
+sysctl_out(void *oldp, size_t *oldlenp, const void *val, size_t len)
+{
+
+	if (oldlenp == NULL) {
+		g_errno = 22;			/* EINVAL */
+		return (-1);
+	}
+	if (oldp != NULL) {
+		if (*oldlenp < len) {
+			g_errno = 12;		/* ENOMEM */
+			return (-1);
+		}
+		memcpy(oldp, val, len);
+	}
+	*oldlenp = len;
+	return (0);
+}
+
+/*
+ * sysctlbyname(3) for the names asked of it: the CPU counts and RAM size,
+ * from the host service.  hw.ncpu is the processors the firmware listed,
+ * the active/logical/physical counts those running.  Other names are
+ * ENOENT; nothing can be set.
+ */
+int
+sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp,
+    size_t newlen)
+{
+	struct s9_host_info	hi;
+	uint64_t		q;
+	int			v;
+
+	if (newp != NULL || newlen != 0) {
+		g_errno = 1;			/* EPERM */
+		return (-1);
+	}
+	if (name == NULL || strncmp(name, "hw.", 3) != 0) {
+		g_errno = 2;			/* ENOENT */
+		return (-1);
+	}
+	if (host_info_ask(&hi) != 0) {
+		g_errno = 5;			/* EIO */
+		return (-1);
+	}
+	if (strcmp(name, "hw.ncpu") == 0 ||
+	    strcmp(name, "hw.logicalcpu_max") == 0 ||
+	    strcmp(name, "hw.physicalcpu_max") == 0) {
+		v = (int)hi.hi_max_cpus;
+		return (sysctl_out(oldp, oldlenp, &v, sizeof(v)));
+	}
+	if (strcmp(name, "hw.activecpu") == 0 ||
+	    strcmp(name, "hw.logicalcpu") == 0 ||
+	    strcmp(name, "hw.physicalcpu") == 0) {
+		v = (int)hi.hi_avail_cpus;
+		return (sysctl_out(oldp, oldlenp, &v, sizeof(v)));
+	}
+	if (strcmp(name, "hw.memsize") == 0) {
+		q = hi.hi_memory_size;
+		return (sysctl_out(oldp, oldlenp, &q, sizeof(q)));
+	}
+	g_errno = 2;				/* ENOENT */
+	return (-1);
 }
