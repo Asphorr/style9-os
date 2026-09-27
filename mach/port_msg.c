@@ -1084,6 +1084,20 @@ mach_msg_send(struct port_space *from, const struct mach_msg_header *umsg)
 
 	hdrs_off = sizeof(struct mach_msg_header);
 
+	/*
+	 * A reply right travels only with both a name and a disposition;
+	 * short of either, neither reaches the receiver.  deliver_msg reads
+	 * local bits as a right waiting in m_descs, and a queued message
+	 * with the bits but no name had it index past the array.
+	 */
+	if (!has_local) {
+		struct mach_msg_header	*qh;
+
+		qh = (struct mach_msg_header *)m->m_buf;
+		qh->msgh_bits  &= ~MACH_MSGH_BITS(0, 0xFFu);
+		qh->msgh_local  = MACH_PORT_NULL;
+	}
+
 	if (complex) {
 		const struct mach_msg_body *body;
 		size_t			 walk_off;
